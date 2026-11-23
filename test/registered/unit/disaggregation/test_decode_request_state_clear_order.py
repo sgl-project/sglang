@@ -1,180 +1,157 @@
 """A PD decode row's DeepSeek-V4 request-scoped state (C128 ring, pending pairs)
-is reset before the peer writes the transferred part of it. Under overlap the
-row's previous owner can still have a redundant forward in flight that writes
-this state, so a send held behind that forward must reset after it; a send not
-held must not go out while the reset is still queued on the device."""
+is reset before the prefill peer writes the transferred part of it. Two other
+writers can land after a reset that is not ordered:
+
+- under overlap, the row's previous owner can still have one redundant forward
+  in flight, and it writes the same row;
+- the peer's RDMA follows no stream, so once the destination is sent it can
+  write the row while the reset is still queued on the device.
+
+Each case delays the device with a sleep kernel so the unordered interleaving
+is the one that runs, then checks the row's bytes: the reset's values, with the
+peer's write intact and nothing of the old owner left."""
 
 import unittest
-from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest import mock
 
 import torch
 
-from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
-from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.mem_cache import deepseek_v4_memory_pool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 ROW = 3
+HEAD_DIM = 128
+# ~0.1 s at GPU clocks: long past any host-side launch latency.
+SLEEP_CYCLES = 200_000_000
+STALE, PEER = 7.0, 5.0
+# The part of the row the peer's transfer writes.
+PEER_SLICE = slice(HEAD_DIM, HEAD_DIM + 16)
 
 
-class _Streams:
-    """Stand-in device module. Work issued on a stream stays queued until an
-    event recorded after it is synchronized; an event recorded on a stream is
-    what a held send waits for."""
-
-    def __init__(self):
-        self.schedule = "schedule"
-        self.forward = "forward"
-        self.current = self.schedule
-        self.queued = []  # (stream, work) not yet known complete on the host
-        self.log = []  # (stream, work) in issue order
-
-    def issue(self, work):
-        self.queued.append((self.current, work))
-        self.log.append((self.current, work))
-
-    @contextmanager
-    def stream(self, stream):
-        previous, self.current = self.current, stream
-        try:
-            yield
-        finally:
-            self.current = previous
-
-    def Event(self):
-        streams = self
-
-        class _Event:
-            def record(self, stream=None):
-                self.stream = stream or streams.current
-                self.upto = [w for w in streams.queued if w[0] == self.stream]
-                streams.log.append((self.stream, "event"))
-
-            def synchronize(self):
-                for work in self.upto:
-                    if work in streams.queued:
-                        streams.queued.remove(work)
-
-        return _Event()
+def _pool():
+    """A pool whose request-scoped state is one online C128 row per request."""
+    pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+    kv_score = torch.full((8, 3 * HEAD_DIM), STALE, device="cuda")
+    pool.compress_state_pools = [
+        SimpleNamespace(
+            request_scoped=True,
+            ratio=128,
+            kv_score_buffer=SimpleNamespace(kv_score=kv_score),
+        )
+    ]
+    return pool, kv_score
 
 
-def _queue(streams, *, enable_overlap, defer_publish, hisparse=False):
+def _queue(pool, *, enable_overlap, defer_publish, forward_stream):
     queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
     queue.scheduler = SimpleNamespace(
         enable_overlap=enable_overlap,
-        enable_hisparse=hisparse,
-        forward_stream=streams.forward,
-        device_module=streams,
+        forward_stream=forward_stream,
+        device_module=torch.cuda,
     )
     queue._defer_publish = defer_publish
-    queue.transfer_backend = TransferBackend.MOONCAKE
-    queue.draft_token_to_kv_pool = None
-    queue.token_to_kv_pool_allocator = SimpleNamespace(
-        page_size=1, translate_kv_indices_for_transfer=lambda ids: ids
-    )
-    queue.req_to_token_pool = SimpleNamespace(
-        req_to_token=torch.arange(64, dtype=torch.int32).reshape(4, 16)
-    )
-    queue.kv_manager = SimpleNamespace(
-        kv_args=SimpleNamespace(
-            state_types=[StateType.DSV4_REQUEST_STATE], state_sub_pools=[None]
-        )
-    )
-    queue.transfer_queue = SimpleNamespace(enable_staging=False)
-    pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-    pool.request_state_transfer_indices = Mock(return_value=[0, 1])
-    pool.clear_request_scoped_state = Mock(
-        side_effect=lambda row: streams.issue("clear")
-    )
     queue.token_to_kv_pool = pool
+    queue.transfer_queue = SimpleNamespace(enable_staging=False)
     queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(alloc=lambda: 0)
-    queue._storage = Mock(return_value=Mock(move_epoch=Mock(return_value=0)))
-    queue._record_receive = Mock()
+    queue._record_receive = mock.Mock()
     queue._num_published_destinations = 0
     return queue
 
 
-def _publish(queue, streams, *, fill_len=8, dst_kv_indices=None):
-    req = SimpleNamespace(
-        kv=SimpleNamespace(req_pool_idx=ROW),
-        time_stats=Mock(),
-        bootstrap_host="prefill",
-    )
-    receiver = Mock()
-    # What a send not held finds queued on the device when it goes out.
-    receiver.send_metadata.side_effect = lambda *a, **k: streams.log.append(
-        ("host", "send", tuple(streams.queued))
-    )
-    entry = DecodeRequest(req=req, kv_receiver=receiver)
-    queue._publish_destination(
-        entry,
-        dst_kv_indices=(
-            torch.arange(fill_len) if dst_kv_indices is None else dst_kv_indices
-        ),
-        prefix_len=0,
-        total_prefix_len=0,
-        fill_len=fill_len,
-    )
-    return entry
+def _entry(on_send=None):
+    req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=ROW), time_stats=mock.Mock())
+    receiver = mock.Mock()
+    if on_send is not None:
+        receiver.send_metadata.side_effect = lambda *args, **kwargs: on_send()
+    return DecodeRequest(req=req, kv_receiver=receiver)
 
 
+def _peer_writes(kv_score):
+    """The peer's transfer: ordered after nothing on this side's streams."""
+    with torch.cuda.stream(torch.cuda.Stream()):
+        kv_score[ROW, PEER_SLICE].fill_(PEER)
+
+
+def _publish(queue, entry, kv_indices):
+    """What `_publish_destination` does once the payloads are built."""
+    send_waits = queue._send_waits_for_forward(non_blocking=False, to_device=True)
+    queue._clear_request_state(ROW, send_waits_for_forward=send_waits)
+    queue._send_kv_metadata(entry, kv_indices, 1, state_indices=[[0]])
+    return send_waits
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+@mock.patch.object(deepseek_v4_memory_pool, "ONLINE_C128", True)
 class TestRequestStateClearOrder(CustomTestCase):
-    def test_a_held_send_clears_after_the_forward_in_flight(self):
-        """The send waits for the forward stream's event: the clear runs on that
-        stream before it, so the previous owner's late writes precede it."""
-        streams = _Streams()
-        queue = _queue(streams, enable_overlap=True, defer_publish=False)
+    def assert_reset_then_peer(self, kv_score):
+        torch.cuda.synchronize()
+        expected = torch.zeros(3 * HEAD_DIM)
+        expected[:HEAD_DIM] = float("-inf")
+        expected[PEER_SLICE] = PEER
+        self.assertTrue(torch.equal(kv_score[ROW].cpu(), expected))
 
-        entry = _publish(queue, streams)
+    def test_a_held_send_lands_after_the_old_owners_forward_and_the_reset(self):
+        """Overlap without a deferred publish: the previous owner's redundant
+        forward still writes the row when its destination is published."""
+        pool, kv_score = _pool()
+        forward, schedule = torch.cuda.Stream(), torch.cuda.Stream()
+        queue = _queue(
+            pool, enable_overlap=True, defer_publish=False, forward_stream=forward
+        )
+        with torch.cuda.stream(schedule):
+            # A first allocation on a stream can reach cudaMalloc, which waits
+            # for the whole device; the scheduler's stream has its blocks cached.
+            kv_indices = torch.arange(4, device="cuda")
+            torch.empty(1 << 20, device="cuda")
+        torch.cuda.synchronize()
+        with torch.cuda.stream(forward):
+            torch.cuda._sleep(SLEEP_CYCLES)
+            kv_score[ROW].fill_(STALE)
+        entry = _entry()
 
-        self.assertIsNotNone(entry.pending_metadata)
-        forward_work = [w for s, w, *_ in streams.log if s == "forward"]
-        self.assertEqual(forward_work, ["clear", "event"])
-        queue.token_to_kv_pool.clear_request_scoped_state.assert_called_once_with(ROW)
+        # Unlike the legacy default stream, the scheduler's own stream does not
+        # wait for the forward stream implicitly.
+        with torch.cuda.stream(schedule):
+            self.assertTrue(_publish(queue, entry, kv_indices))
 
-    def test_a_send_not_held_goes_out_after_the_clear_completed(self):
-        """A deferred publish (one iteration later) and a scheduler without
-        overlap send at once: the clear stays on the current stream, and the
-        send waits until it has run, whatever readbacks precede the send."""
-        for enable_overlap, defer_publish in ((True, True), (False, False)):
+        # The held send goes out once its event is done (`publish_pending_metadata`).
+        ready = entry.pending_metadata[0]
+        while not ready.query():
+            pass
+        _peer_writes(kv_score)
+        self.assert_reset_then_peer(kv_score)
+
+    def test_an_unheld_send_goes_out_after_the_reset_ran(self):
+        """No overlap, and a deferred publish: the destination is sent at once.
+        Its page indices are empty, as for a HiSparse request of 1-3 tokens, so
+        reading them back does not wait for the device."""
+        for enable_overlap, defer_publish in ((False, False), (True, True)):
             with self.subTest(overlap=enable_overlap, deferred=defer_publish):
-                streams = _Streams()
+                pool, kv_score = _pool()
                 queue = _queue(
-                    streams, enable_overlap=enable_overlap, defer_publish=defer_publish
+                    pool,
+                    enable_overlap=enable_overlap,
+                    defer_publish=defer_publish,
+                    forward_stream=torch.cuda.Stream(),
                 )
+                entry = _entry(on_send=lambda: _peer_writes(kv_score))
+                publishing = torch.cuda.Stream()
+                with torch.cuda.stream(publishing):
+                    # Work queued earlier keeps this stream busy.
+                    torch.cuda._sleep(SLEEP_CYCLES)
+                    send_waits = _publish(
+                        queue, entry, torch.empty(0, dtype=torch.int64, device="cuda")
+                    )
 
-                entry = _publish(queue, streams)
-
-                self.assertIsNone(entry.pending_metadata)
-                self.assertIn(("schedule", "clear"), streams.log)
-                self.assertEqual(streams.log[-1], ("host", "send", ()))
-
-    def test_a_short_hisparse_request_without_overlap_sends_after_the_clear(self):
-        """A HiSparse request of 1-3 tokens holds no compressed host entry, so
-        the destination's page readback is empty and does not wait on the
-        device; its C128 state still transfers, so the clear must be done."""
-        for fill_len in (1, 2, 3):
-            with self.subTest(fill_len=fill_len):
-                streams = _Streams()
-                queue = _queue(
-                    streams, enable_overlap=False, defer_publish=False, hisparse=True
-                )
-
-                entry = _publish(
-                    queue,
-                    streams,
-                    fill_len=fill_len,
-                    dst_kv_indices=torch.empty(0, dtype=torch.int64),
-                )
-
-                self.assertIsNone(entry.pending_metadata)
-                self.assertEqual(streams.log[-1], ("host", "send", ()))
+                self.assertFalse(send_waits)
+                entry.kv_receiver.send_metadata.assert_called_once()
+                self.assert_reset_then_peer(kv_score)
 
 
 if __name__ == "__main__":
