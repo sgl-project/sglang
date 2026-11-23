@@ -584,9 +584,8 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # The draft stages run the plain four steps, or Mega-mHC within the stage:
-        # no fused post across stages, so they need nothing from `bind_next` and
-        # never hand anything forward.
+        # Draft stages fuse nothing across stages (plain steps, or Mega-mHC within
+        # the stage), so they need nothing from `bind_next` and hand nothing forward.
         assert self.attn_hc is not None and self.ffn_hc is not None
         if self._mega_draft and hidden_states.shape[0] > 0:
             return self._forward_hc_mega(
@@ -632,9 +631,8 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Mega-mHC takes the attention seam's combine, norm and triplet in one
-        # launch, and the attention post with the FFN's in another; the FFN post
-        # stays plain, so the stage hands forward what the plain path does.
+        # Two launches: the attention seam, then its post with the FFN seam; the FFN
+        # post stays plain, so the stage hands forward what the plain path does.
         opened = mhc.mega_draft_open(
             hc=self.attn_hc, residual=hidden_states, pre=prev_pre
         )

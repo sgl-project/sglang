@@ -859,7 +859,7 @@ def _hip_flydsl_mega_mhc_nopost(
 ) -> HcState:
     """No-post Mega-mHC on gfx950: this hyper-connection's combine, norm and triplet
     in one launch; ``pre`` None takes stream 0."""
-    _, normalized, stats = _run_flydsl_mega_mhc(hc, residual, pre)
+    _, normalized, stats = _run_flydsl_mega_mhc(hc=hc, residual=residual, pre=pre)
     return HcState(residual, pre, HcNormed(normalized), stats)
 
 
@@ -884,9 +884,7 @@ def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
     ):
         return state
     # The first layer has no pre: identity pre takes stream 0, as `_combine` does.
-    opened = _hip_flydsl_mega_mhc_nopost(
-        hc=hc, residual=state.residual, pre=state.pre
-    )
+    opened = _hip_flydsl_mega_mhc_nopost(hc=hc, residual=state.residual, pre=state.pre)
     state.release()
     return opened
 
@@ -907,7 +905,7 @@ def mega_draft_open(
     """A draft stage's attention seam in one no-post launch: the sublayer input
     ``norm(sum_k pre[k] * R[k])`` (stream 0 without a pre, as `_combine`) and the
     triplet from ``residual``, which `mix_stats` would compute."""
-    return _hip_flydsl_mega_mhc_nopost(hc, residual, pre)
+    return _hip_flydsl_mega_mhc_nopost(hc=hc, residual=residual, pre=pre)
 
 
 def mega_draft_post(y: torch.Tensor, opened: HcState, nxt: HcSubLayer) -> HcState:
