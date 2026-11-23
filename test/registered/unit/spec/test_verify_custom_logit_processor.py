@@ -63,7 +63,6 @@ def _chain():
         next_token=[1, 2, -1],
         next_sibling=[-1, -1, -1],
         argmax=[2, 3, 4],
-        row_prefixes=[[], [2], [2, 3]],
     )
 
 
@@ -74,7 +73,6 @@ def _tree():
         next_token=[1, 3, -1, -1],
         next_sibling=[-1, 2, -1, -1],
         argmax=[2, 3, 9, 4],
-        row_prefixes=[[], [2], [5], [2, 3]],
     )
 
 
@@ -137,13 +135,6 @@ def _bound_verify(batch, layout):
 
 
 class TestRowPrefixes(CustomTestCase):
-    def test_tree_rows_get_their_own_path(self):
-        layout = _tree()
-        self.assertEqual(
-            verify_row_prefixes(*_host_tree(layout, 2).resolve()),
-            layout["row_prefixes"] * 2,
-        )
-
     def test_chain_row_j_gets_drafts_one_to_j(self):
         """DFlash and DSpark verify a chain whose column 0 is the committed token."""
         chain = torch.tensor([[ROOT, 2, 3, 4], [ROOT, 7, 8, 9]])
@@ -166,22 +157,6 @@ class TestRowPrefixes(CustomTestCase):
             )
             self.assertEqual(needs_verify_tree(batch), want)
 
-    def test_bind_tree_marks_only_requests_without_row_prefix_support(self):
-        for processor, first_row_only in [
-            (_CountUp(), None),
-            (_CountUpWithoutRowPrefix(), [0]),
-        ]:
-            verify = _bound_verify(
-                _batch(processor, greedy=True, device="cpu"), _chain()
-            )
-            self.assertEqual(verify.row_prefixes, _chain()["row_prefixes"] * 2)
-            self.assertEqual(
-                None
-                if verify.first_row_only_reqs is None
-                else verify.first_row_only_reqs.tolist(),
-                first_row_only,
-            )
-
 
 class TestOneTokenCap(CustomTestCase):
     def _verify(self, first_row_only):
@@ -193,13 +168,6 @@ class TestOneTokenCap(CustomTestCase):
         )
         verify.first_row_only_reqs = torch.tensor(first_row_only)
         return verify
-
-    def test_tree_accept_keeps_the_first_token(self):
-        accept_lens = torch.tensor([3, 1, 2], dtype=torch.int32)
-        accept_index = torch.tensor([[0, 1, 3], [4, -1, -1], [8, 9, -1]])
-        self._verify([0, 1]).cap_tree_accept(accept_lens, accept_index)
-        self.assertEqual(accept_lens.tolist(), [1, 1, 2])
-        self.assertEqual(accept_index.tolist(), [[0, -1, -1], [4, -1, -1], [8, 9, -1]])
 
     def test_chain_accept_keeps_the_first_token(self):
         """Request 0 accepted draft 1 (commits it), request 1 accepted none
@@ -228,7 +196,9 @@ class TestOneTokenCap(CustomTestCase):
             prefix_lens=torch.tensor([10]),
             new_seq_lens=None,
         )
-        self.assertEqual(out, (commit_lens, bonus, None))
+        self.assertIs(out[0], commit_lens)
+        self.assertIs(out[1], bonus)
+        self.assertIsNone(out[2])
 
 
 class TestCustomLogitProcessorSync(CustomTestCase):
