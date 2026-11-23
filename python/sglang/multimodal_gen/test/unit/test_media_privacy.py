@@ -289,10 +289,13 @@ def test_request_logger_requires_opt_in_for_reproduction_inputs():
         DiffusionRequestLogger,
     )
 
-    assert ServerArgs.log_requests_level == 0
+    assert ServerArgs.log_requests is False and ServerArgs.log_requests_level == 0
     req = SimpleNamespace(
         request_id="test",
-        sampling_params=SimpleNamespace(prompt="secret-text", seed=12345),
+        sampling_params=SimpleNamespace(
+            prompt="secret-text", negative_prompt="private-negative", seed=12345
+        ),
+        prompt_embeds="private-embedding",
     )
     result = SimpleNamespace(error="secret-text")
     for level in range(4):
@@ -300,6 +303,8 @@ def test_request_logger_requires_opt_in_for_reproduction_inputs():
         _, record = logger._batch_record([req])
         assert ("seed" in record.get("sampling_params", {})) == (level >= 1)
         assert ("prompt" in record) == (level >= 2)
+        assert ("negative_prompt" in record) == (level >= 2)
+        assert "private-embedding" not in str(record)
         assert "secret-text" not in str(logger._result_view(result))
 
 

@@ -3306,7 +3306,7 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Verbosity level for request logging. "
             "0: Log request metadata only (request_id). "
             "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
-            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "2: Also log prompt/negative prompt (first and last 1,024 characters of long text). "
             "3: Log metadata + sampling config + full prompt/negative prompt.",
         )
         parser.add_argument(
