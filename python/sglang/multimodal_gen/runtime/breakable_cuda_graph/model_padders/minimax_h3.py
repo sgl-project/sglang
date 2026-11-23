@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -14,10 +15,20 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )
 
-# Read only inside the attention graph break. The host boundaries belong to
-# the live CFG branch and must never be closed over by a captured segment.
-live_packed_bounds: ContextVar[tuple[int, ...] | None] = ContextVar(
-    "minimax_h3_live_packed_bounds", default=None
+
+@dataclass
+class H3PackedPrompt:
+    """Static inputs for one request branch; only step-varying kwargs are copied on replay."""
+
+    bounds: tuple[int, ...]
+    text_len: int
+    capture_varlen: bool = False
+    offsets: tuple[torch.Tensor, torch.Tensor] | None = None
+    by_bucket: dict[int, dict] = field(default_factory=dict)
+
+
+live_packed_prompt: ContextVar[H3PackedPrompt | None] = ContextVar(
+    "h3_live_packed_prompt", default=None
 )
 
 
@@ -115,72 +126,66 @@ def supports_live_packed_bounds(call_kwargs: dict) -> bool:
     )
 
 
+def _with_tail(cu: torch.Tensor) -> torch.Tensor:
+    return cu if cu.numel() == 3 else torch.cat((cu, cu[-1:]))
+
+
 def pad_minimax_h3_prompt_kwargs(
     call_kwargs: dict, current_model: Any, buckets: tuple[int, ...]
 ) -> dict:
-    if not supports_live_packed_bounds(call_kwargs):
+    branch = live_packed_prompt.get()
+    if branch is None:
+        # Unscoped callers must retain all host metadata in their signature.
         return call_kwargs
-    prompt = call_kwargs["prompt_embeds"]
-    text_len = prompt.shape[0]
+    text_len = branch.text_len
     bucket = bcg_utils.select_text_bucket(text_len, buckets)
     if bucket is None:
         return call_kwargs
-    packed = call_kwargs["packed_seq_params"]
-    used = packed["cu_seqlens_q_host"][1]
-    source_seq = call_kwargs["x"].shape[1]
-    text_pos = _position_ids(call_kwargs["text_pos_info"])
-    out = dict(call_kwargs)
-    # request-local row lists have prompt-dependent shapes, so keep them out
-    # of bucketed BCG signatures and rebuild the rows in the eager break
-    out.pop("local_embedding_layout", None)
-    # Request-static H3 denoising normally carries the live refined-text
-    # length as a host integer to avoid a per-step device scalar read. Host
-    # integers are baked into BCG signatures, however, so different prompt
-    # lengths would miss the same text bucket. Make only the BCG-padded copy a
-    # scalar tensor; the eager embedding break reads its updated replay value.
-    refined_len = out.get("refined_prompt_embeds_length")
-    if refined_len is not None and not torch.is_tensor(refined_len):
-        out["refined_prompt_embeds_length"] = torch.tensor(
-            int(refined_len),
-            dtype=torch.int64,
-            device=prompt.device,
-        )
-    if text_len < bucket:
-        out["prompt_embeds"] = bcg_utils.pad_tensor_dim(prompt, dim=0, target=bucket)
-        # These rows exist only to stabilize the BCG input signature. The
-        # model's eager embedding break trims prompt/text_pos/refiner metadata
-        # back to ``text_len`` before any projection or attention, so their
-        # values never enter the model.
-        dummy_text_pos = torch.arange(
-            used,
-            used + (bucket - text_len),
-            dtype=text_pos.dtype,
-            device=text_pos.device,
-        )
-        out["text_pos_info"] = _replace_position_ids(
-            out["text_pos_info"], torch.cat((text_pos.view(-1), dummy_text_pos))
-        )
 
-    # Do not grow the main packed sequence to media_rows + bucket. Changing
-    # the SP row partition changes GEMM shapes and is measurably non-bitwise
-    # even though dummy rows live in an independent attention segment. A
-    # capture is therefore reusable only inside the request's existing
-    # packed sequence shape. Image and video releases use different alignments.
-    # Host-only txt_len/video_spans are used by the stage to prepare attention
-    # metadata before the DiT call. Baking them into a graph key specializes
-    # every prompt; the eager attention break reads this branch's live bounds.
-    out["packed_seq_params"] = {
-        "cu_seqlens_q": packed["cu_seqlens_q"],
-        "max_seqlen_q": source_seq,
-        "bcg_live_bounds": True,
-    }
-    refiner_cu = torch.tensor(
-        [0, text_len, bucket], dtype=torch.int32, device=prompt.device
-    )
-    out["refiner_packed_seq_params"] = {
-        "cu_seqlens_q": refiner_cu,
-        "max_seqlen_q": bucket,
-    }
+    if bucket not in branch.by_bucket:
+        prompt = call_kwargs["prompt_embeds"]
+        text_pos = _position_ids(call_kwargs["text_pos_info"])
+        used, total = branch.bounds[1], branch.bounds[-1]
+        # Canonical [0, live, total] buffers allow aligned and padded prompts
+        # to share a graph. The same offsets serve every warmup bucket.
+        if branch.offsets is None:
+            packed_cu = call_kwargs["packed_seq_params"]["cu_seqlens_q"]
+            refiner_cu = call_kwargs["refiner_packed_seq_params"]["cu_seqlens_q"]
+            branch.offsets = (_with_tail(packed_cu), _with_tail(refiner_cu))
+        packed_cu, refiner_cu = branch.offsets
+        updates = {
+            "packed_seq_params": {
+                "cu_seqlens_q": packed_cu,
+                "max_seqlen_q": total,
+                "bcg_live_bounds": True,
+                "bcg_capture_varlen": branch.capture_varlen,
+            },
+            "refiner_packed_seq_params": {
+                "cu_seqlens_q": refiner_cu,
+                "max_seqlen_q": bucket,
+            },
+        }
+        if call_kwargs.get("refined_prompt_embeds_length") is not None:
+            # Only the presence of refined embeddings affects the graph. The
+            # eager embedding break reads the request's actual host length.
+            updates["refined_prompt_embeds_length"] = bucket
+        if text_len < bucket:
+            updates["prompt_embeds"] = bcg_utils.pad_tensor_dim(
+                prompt, dim=0, target=bucket
+            )
+            dummy = torch.arange(
+                used,
+                used + bucket - text_len,
+                dtype=text_pos.dtype,
+                device=text_pos.device,
+            )
+            updates["text_pos_info"] = _replace_position_ids(
+                call_kwargs["text_pos_info"], torch.cat((text_pos.view(-1), dummy))
+            )
+        branch.by_bucket[bucket] = updates
+
+    out = {**call_kwargs, **branch.by_bucket[bucket]}
+    out.pop("local_embedding_layout", None)
     return out
 
 
