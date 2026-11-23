@@ -286,6 +286,7 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         policy.policy = CacheAwarePolicy.SHORTEST_PREFILL_FIRST
         policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
         policy.shortest_prefill_aging_factor = 0.0
+        policy.shortest_prefill_load_scaling = None
         adder = self._adder(strict=True)
         prompt, prefix, chunks = 4096, 0, []
         while prefix < prompt:
