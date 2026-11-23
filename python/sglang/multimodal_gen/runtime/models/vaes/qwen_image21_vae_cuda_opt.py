@@ -40,6 +40,7 @@ checkpoint loading and weight transfer are unaffected.
 
 from __future__ import annotations
 
+import math
 from types import MethodType
 
 import torch
@@ -477,10 +478,50 @@ def _replace_children(root: nn.Module, child_cls: type, make) -> int:
     return len(targets)
 
 
+def _attention_forward(self, x: torch.Tensor) -> torch.Tensor:
+    """Single-head attention as an explicit matmul + softmax on the quality gate.
+
+    The block feeds ``[B*T, 1, S, D]`` (single head, ``S`` = H*W, ``D`` = the
+    decoder's mid-block width) to SDPA. On gfx1151 there is no fused attention
+    backend for that shape, so SDPA dispatches to the math kernel, which upcasts
+    q/k/v to fp32; the explicit bf16 matmul is ~22x faster there (102 ms vs
+    4.5 ms at 4096x1152) and stays within the same rounding tier as the other
+    quality-gated paths.
+    """
+    from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
+        QwenImage21AttentionBlock,
+    )
+
+    gate = getattr(self, "_sgl_gate", None)
+    if (
+        gate is None
+        or not gate.enabled
+        or self.spatial_parallel
+        or x.dim() != 5
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or torch.compiler.is_compiling()
+    ):
+        return QwenImage21AttentionBlock.forward(self, x)
+    identity = x
+    batch_size, channels, time, height, width = x.size()
+    x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
+    x = self.norm(x)
+    qkv = self.to_qkv(x).reshape(batch_size * time, 1, channels * 3, -1)
+    qkv = qkv.permute(0, 1, 3, 2).contiguous()
+    q, k, v = qkv.chunk(3, dim=-1)
+    scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(q.shape[-1]))
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    x = (probs @ v).squeeze(1).permute(0, 2, 1)
+    x = x.reshape(batch_size * time, channels, height, width)
+    x = self.proj(x).view(batch_size, time, channels, height, width)
+    return x.permute(0, 2, 1, 3, 4) + identity
+
+
 def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
     """Install the Qwen-Image 2.1 decoder fast paths; other VAEs pass through."""
     from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
         AutoencoderKLQwenImage21,
+        QwenImage21AttentionBlock,
         QwenImage21CausalConv3d,
         QwenImage21Decoder3d,
         QwenImage21Resample,
@@ -492,15 +533,20 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, AutoencoderKLQwenImage21):
         return vae
-    if not current_platform.is_cuda() or current_platform.is_rocm():
+    if not (current_platform.is_cuda() or current_platform.is_hip()):
         return vae
     decoder = vae.decoder if vae.config.load_decoder else None
     if type(decoder) is not QwenImage21Decoder3d or vae.spatial_parallel:
         return vae
+    is_hip = torch.version.hip is not None
     gate = VaeFastPathGate()
-    n_norm = _install_norm_silu(
-        decoder, gate, QwenImage21ResidualBlock, QwenImage21RMS_norm
-    )
+    # The RMSNorm+SiLU kernels are native CUDA; on HIP the wrapper would only
+    # add the bias pass and a Python hop, so it stays off there.
+    n_norm = 0
+    if not is_hip:
+        n_norm = _install_norm_silu(
+            decoder, gate, QwenImage21ResidualBlock, QwenImage21RMS_norm
+        )
     n_conv = _replace_children(decoder, QwenImage21CausalConv3d, FoldedPadConv2d)
     for module in decoder.modules():
         if type(module) is QwenImage21ResidualBlock:
@@ -521,18 +567,27 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
     for module in decoder.modules():
         if type(module) is QwenImage21ResidualUpBlock:
             module.forward = MethodType(_residual_up_block_forward, module)
+    n_attn = 0
+    if is_hip:
+        # No fused SDPA backend for [B*T, 1, S, D]; the math kernel upcasts to fp32.
+        for module in decoder.modules():
+            if type(module) is QwenImage21AttentionBlock:
+                module._sgl_gate = gate
+                module.forward = MethodType(_attention_forward, module)
+                n_attn += 1
     decoder._sgl_gate = gate
     decoder._sgl_channels_last = False
     decoder.forward = MethodType(_decoder_layout_forward, decoder)
     register_vae_fast_path_gate(vae, gate)
     logger.info(
         "Qwen-Image 2.1 VAE: %d fused RMSNorm+SiLU sites, %d convs with folded padding, "
-        "%d channels_last upsamplers, %d folded upsample+conv pairs "
-        "(channels_last decode and the fold at quality lossless/high).",
+        "%d channels_last upsamplers, %d folded upsample+conv pairs, %d explicit-attention "
+        "blocks (channels_last decode and the fold at quality lossless/high).",
         n_norm,
         n_conv,
         n_up,
         n_fold,
+        n_attn,
     )
     return vae
 

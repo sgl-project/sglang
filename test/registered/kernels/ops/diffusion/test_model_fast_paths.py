@@ -148,6 +148,7 @@ from sglang.multimodal_gen.runtime.models.vaes import (
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
+    QwenImage21AttentionBlock,
     QwenImage21Resample,
 )
 from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
@@ -2058,6 +2059,37 @@ def test_qwen21_vae_extra_high_decode_is_close_and_lossless_is_restored(
     # gate off: layout and kernels revert, output is bit-identical again
     assert torch.equal(optimized.decode(z), expected)
     assert not optimized.decoder._sgl_channels_last
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None, reason="HIP: the CUDA-only kernels stay unmounted"
+)
+@torch.no_grad()
+def test_qwen21_vae_installs_the_portable_families_on_hip(qwen21_vae_gates):
+    reference = _qwen21_vae()
+    optimized = qwen21_vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    assert set(optimized.state_dict()) == set(reference.state_dict())
+
+    # The RMSNorm+SiLU kernels are native CUDA; on HIP the wrapper would only
+    # add the bias pass and a Python hop, so it must not be mounted.
+    assert not _modules_of(optimized, qwen21_vae_opt.FusedChannelRMSNormSiLU)
+    assert _modules_of(optimized, qwen21_vae_opt.FoldedPadConv2d)
+    assert _modules_of(optimized, qwen21_vae_opt.FusedUpsample2xConv)
+    attention = _modules_of(optimized, QwenImage21AttentionBlock)
+    assert attention and all(
+        m._sgl_gate is optimized.decoder._sgl_gate for m in attention
+    )
+
+    z = _qwen21_latent()
+    expected = reference.decode(z)
+    # gate off restores the original chain bit for bit
+    with use_vae_fast_path(optimized, False):
+        assert torch.equal(optimized.decode(z), expected)
+    with use_vae_fast_path(optimized, True):
+        fast = optimized.decode(z)
+    assert fast.shape == expected.shape
+    rel = ((fast.float() - expected.float()).norm() / expected.float().norm()).item()
+    assert rel < 3e-2, rel
 
 
 @requires_inline_ptx
