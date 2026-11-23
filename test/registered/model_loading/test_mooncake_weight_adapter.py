@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.weight_cache.model_adapters.layers import LayerLayoutBuilder
 from sglang.srt.weight_cache.mooncake_weight_adapter import (
     build_mooncake_transfer_groups,
@@ -107,6 +108,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
     @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_native_gqa_replica_groups_and_vocab_padding_reshard(self):
         import msgspec
+
         from sglang.srt.layers.linear import QKVParallelLinear
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
         from sglang.srt.weight_cache.weight_heterogeneous_transfer import (

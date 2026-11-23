@@ -475,6 +475,7 @@ def main():
     )
     args = parser.parse_args()
     import torch
+
     from sglang.srt.platforms import current_platform
 
     uuids = [

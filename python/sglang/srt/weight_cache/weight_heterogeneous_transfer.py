@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
