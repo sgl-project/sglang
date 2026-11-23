@@ -887,16 +887,10 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
         )
 
     def test_sampling_logprobs_without_new_tokens_are_not_aborted(self):
-        for sampling_params in ({"top_k": _TOP_K},):
-            with self.subTest(sampling_params=sampling_params):
-                output = self._post_sampling_logprobs(
-                    {"max_new_tokens": 0, **sampling_params}
-                )
-                self.assertEqual(output["meta_info"]["completion_tokens"], 0)
-                self.assertEqual(output["output_ids"], [])
-                self.assertEqual(
-                    output["meta_info"]["output_token_sampling_logprobs"], []
-                )
+        output = self._post_sampling_logprobs({"max_new_tokens": 0, "top_k": _TOP_K})
+        self.assertEqual(output["meta_info"]["completion_tokens"], 0)
+        self.assertEqual(output["output_ids"], [])
+        self.assertEqual(output["meta_info"]["output_token_sampling_logprobs"], [])
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):

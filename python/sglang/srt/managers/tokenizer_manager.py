@@ -515,7 +515,6 @@ def _add_sampling_output_to_meta_info(
     chunk: Optional[SamplingMaskChunk],
     finished: bool,
 ):
-    """Add the sampling logprobs and mask rows a request asked for."""
     # An unfiltered request is not captured (Req.captures_sampling): nothing to add.
     if not state.filters_sampling:
         return
@@ -2197,8 +2196,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ) -> None:
-        """Keep whether the request filters sampling for its response. Call it
-        before the abort check: a request aborted before dispatch still answers."""
+        # Called before the abort check: a request aborted before dispatch still answers.
         state = self.rid_to_state.get(tokenized_obj.rid)
         if state is not None:
             state.filters_sampling = tokenized_obj.sampling_params.filters_sampling()

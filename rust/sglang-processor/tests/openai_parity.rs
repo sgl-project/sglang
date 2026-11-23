@@ -292,6 +292,7 @@ fn without_defaults(body: Value, fixture: &Value, endpoint: &Value) -> Value {
     if endpoint == "chat" {
         for (name, default) in [
             ("logprob_start_len", json!(-1)),
+            ("return_sampling_logprobs", json!(false)),
             ("return_sampling_mask", json!(false)),
             ("modalities", json!([])),
         ] {

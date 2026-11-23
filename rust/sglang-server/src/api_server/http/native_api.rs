@@ -709,15 +709,16 @@ const SAMPLING_LOGPROBS_MODE_REMOVED: &str = "sampling_logprobs_mode was removed
      return_sampling_mask for the sampling support with its logprobs.";
 
 /// Whether Python reads `return_sampling_logprobs` as set: `true`, or for a
-/// batch of `n` prompts a list with `true` for one of them (Python reads no
-/// entry past them). A list sent with a single prompt is set unless empty.
+/// batch of `n` prompts a list with an entry other than `false` or null for one
+/// of them (Python reads no entry past them). A list sent with a single prompt
+/// is set unless empty.
 fn return_sampling_logprobs_set(flag: &serde_json::Value, batch: Option<usize>) -> bool {
     match (flag, batch) {
         (serde_json::Value::Null | serde_json::Value::Bool(false), _) => false,
         (serde_json::Value::Array(flags), Some(n)) => flags
             .iter()
             .take(n)
-            .any(|flag| flag.as_bool() == Some(true)),
+            .any(|flag| !matches!(flag, serde_json::Value::Null | serde_json::Value::Bool(false))),
         (serde_json::Value::Array(flags), None) => !flags.is_empty(),
         _ => true,
     }
@@ -1778,7 +1779,7 @@ mod tests {
                 "return_sampling_logprobs is not supported by the Rust server",
             ),
             (
-                serde_json::json!({"text": ["a", "b"], "return_sampling_logprobs": [false, true]}),
+                serde_json::json!({"text": ["a", "b"], "return_sampling_logprobs": [false, 1]}),
                 "return_sampling_logprobs is not supported by the Rust server",
             ),
             (
