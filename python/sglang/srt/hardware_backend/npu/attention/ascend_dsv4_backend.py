@@ -36,7 +36,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -2659,7 +2659,7 @@ class DeepseekV4AscendAttnBackend(
         self._graph_table_high_water: dict[str, int] = {}
         self.prepare_in_graph = (
             envs.SGLANG_NPU_PREPARE_METADATA_IN_GRAPH.get()
-            and self._supports_shared_read(model_runner)
+            and self._supports_shared_read_metadata(model_runner)
             and get_disagg().disaggregation_mode != "prefill"
         )
 
@@ -2678,24 +2678,31 @@ class DeepseekV4AscendAttnBackend(
             )
 
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
+        return (
+            self._supports_shared_read_metadata(model_runner)
+            and envs.SGLANG_ENABLE_WAR_BARRIER.get()
+            and not get_schedule().disable_overlap_schedule
+        )
+
+    def _supports_shared_read_metadata(self, model_runner: ModelRunner) -> bool:
+        # Metadata capture can be enabled independently of scheduler WAR barriers.
         # V4.1's low-ratio page/state planning is outside this V4 read-done path.
         if any(
             ratio in (1, 2)
             for ratio in model_runner.model_config.hf_config.compress_ratios
         ):
             return False
+        if model_runner.req_to_token_pool.holds_state_slots:
+            return False
         if not model_runner.spec_algorithm.is_dspark():
-            return super()._supports_shared_read(model_runner)
+            return True
         if model_runner.is_draft_worker or not is_deepseek_v4(
             model_runner.spec_aux_config.draft_model_config.hf_config
         ):
             return False
         # The target event also covers the draft inject's precomputed addresses.
         # Deferred KV stores carry reads into the next round and keep the old barrier.
-        return not (
-            model_runner.req_to_token_pool.holds_state_slots
-            or envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get()
-        )
+        return not envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get()
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         if self._is_dspark_algorithm and not (

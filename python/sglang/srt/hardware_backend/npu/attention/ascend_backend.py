@@ -7,11 +7,7 @@ import torch
 import torch_npu
 from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
 
-from sglang.srt.configs.model_config import (
-    AttentionArch,
-    is_deepseek_dsa,
-    is_deepseek_v4,
-)
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -64,7 +60,6 @@ from sglang.srt.model_executor.forward_context import has_forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
-    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -571,21 +566,19 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        supports_shared_read = self._supports_shared_read(model_runner)
-        self.shared_read_enabled = (
-            supports_shared_read
-            and envs.SGLANG_ENABLE_WAR_BARRIER.get()
-            and not get_schedule().disable_overlap_schedule
-        )
+        self.shared_read_enabled = self._supports_shared_read(model_runner)
         self._shared_read_runner = model_runner
 
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
-        if not (self.use_dsa or is_deepseek_v4(model_runner.model_config.hf_config)):
+        if not self.use_dsa:
             return False
         # Hybrid targets and their drafts share the state-bearing request pool.
         if model_runner.req_to_token_pool.holds_state_slots:
             return False
-        return True
+        return (
+            envs.SGLANG_ENABLE_WAR_BARRIER.get()
+            and not get_schedule().disable_overlap_schedule
+        )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         if not self.shared_read_enabled:
@@ -600,21 +593,16 @@ class AscendAttnBackend(AttentionBackend):
         # The final eager preparation replaces any earlier phase's event.
         runner = self._shared_read_runner
         runner.shared_read_done_event = None
-        if envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
-            return
         mode = forward_batch.forward_mode
         if mode.is_draft_extend_v2() and not has_forward_context():
             # NPU always re-plans draft extend after padding on the forward
             # stream; its plan-stream preparation is not the publication point.
             return
         if mode == ForwardMode.EXTEND:
-            # Ordinary target prefill uses the existing runner publisher. NextN's
-            # last reader is the draft; Scheduler already fences HiCache copies
-            # on the forward stream shared by target and draft.
+            # Ordinary target prefill publishes through the shared EagerRunner path.
             if (
                 not self.is_draft_worker
                 or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
-                or get_memory().enable_lmcache
             ):
                 return
         elif not (
