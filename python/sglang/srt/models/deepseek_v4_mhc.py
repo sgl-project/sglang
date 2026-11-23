@@ -112,6 +112,8 @@ class HcConfig(NamedTuple):
     hidden: int
     pre_from_prev: bool
     cp_prefill: bool
+    # TOP: every row count runs true_on_policy.dsv41_mhc's single program, with no fused boundary.
+    top: bool = False
 
 
 class HcSubLayer(NamedTuple):
@@ -302,7 +304,7 @@ def make_boundary(
 
 
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
-    if not cfg.pre_from_prev:
+    if not cfg.pre_from_prev or cfg.top:
         return False
     decode_like = forward_batch.forward_mode.is_decode() or (
         forward_batch.forward_mode.is_target_verify() and x.shape[0] > 0
@@ -337,6 +339,19 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     )
 
     cfg = hc.cfg
+    if cfg.top:
+        from sglang.srt.true_on_policy import dsv41_mhc
+
+        return dsv41_mhc.mix_stats(
+            x,
+            hc.fn,
+            hc.scale,
+            hc.base,
+            mult=cfg.mult,
+            sinkhorn_iters=cfg.sinkhorn_iters,
+            rms_eps=cfg.rms_eps,
+            eps=cfg.eps,
+        )
 
     x_flat = x.flatten(1)
 
@@ -479,6 +494,13 @@ def _combine(
 
     if apply_pre is None:
         return norm(x[:, 0, :])
+    # The fused hc_combine_norm is not row-invariant (true_on_policy.dsv41_mhc).
+    if cfg.top:
+        from sglang.srt.true_on_policy import dsv41_mhc
+
+        if quantize:
+            raise NotImplementedError("[top] V4.1 mHC combine emits no MXFP8 input")
+        return dsv41_mhc.combine(x, apply_pre, norm)
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
     hopper_fused = (
@@ -532,6 +554,10 @@ def post(
     """``R'[i] = post[i] * x + sum_j comb[j][i] * R[j]``, by whichever kernel fits."""
     if x.shape[0] == 0:
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
+    if cfg.top:
+        from sglang.srt.true_on_policy import dsv41_mhc
+
+        return dsv41_mhc.post(x, residual, post_mix, comb)
 
     if _is_npu:
         if not is_npu_arch35():
@@ -671,6 +697,9 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
+    # The boundary fusions are picked by seam and row count; TOP runs the plain post at every row count.
+    if cfg.top:
+        return HcState(post(cfg, y, residual, post_mix, comb), pre)
     if (
         next is not None
         and next.norm_fusable
@@ -749,6 +778,10 @@ def run_attn_post(
     folds ``next``'s norm); the attention may decline the handover even when asked,
     so the type is the ground truth."""
     if isinstance(out, AttnOutput):
+        if hc.cfg.top:
+            raise NotImplementedError(
+                "[top] V4.1 attention output is never deferred to a fused all-reduce post"
+            )
         from sglang.kernels.ops.communication.all_reduce_mhc import (
             all_reduce_mhc_post_combine_norm,
         )
@@ -788,6 +821,10 @@ def run_moe_post(
         can_fuse_all_reduce,
     )
 
+    if hc.cfg.top and isinstance(out, MoEOutput) and is_deferred_finalize(out.routed):
+        raise NotImplementedError(
+            "[top] V4.1 MoE output is never finalized inside the mHC post"
+        )
     if (
         isinstance(out, MoEOutput)
         and is_deferred_finalize(out.routed)

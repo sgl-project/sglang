@@ -265,6 +265,8 @@ def _dequantize_k_cache_paged_kernel(
     ).to(tl.int64)
     tmask = token_ids < num_tokens
     loc = tl.load(page_table_ptr + token_ids, mask=tmask, other=0).to(tl.int64)
+    # A negative id selects nothing; its output row is left unwritten.
+    tmask = tmask & (loc >= 0)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -370,6 +372,9 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
     token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    # A negative id selects nothing; its output row is left unwritten.
+    if loc < 0:
+        return
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -408,6 +413,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
     token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    # A negative id selects nothing; its output row is left unwritten.
+    if loc < 0:
+        return
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE

@@ -131,6 +131,22 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        from sglang.srt.true_on_policy.config import is_true_on_policy_enabled
+
+        if is_true_on_policy_enabled():
+            # TOP runs the target's fused head; the eager FP32 F.linear below is batch-variant.
+            if x.numel() == 0:  # an idle attention-DP rank
+                return x.new_empty((x.shape[0], x.shape[-1]))
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)

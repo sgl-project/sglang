@@ -28,6 +28,21 @@ logger = logging.getLogger(__name__)
 
 _IS_SM120 = is_sm120_supported()
 
+
+def _with_spare_row(lens: torch.Tensor) -> torch.Tensor:
+    """``lens`` in storage that holds one more row.
+
+    When every length is zero (the decode graph's warm-up batch), each SM's
+    schedule entry starts at row ``num_rows`` and DeepGEMM's SM90 paged MQA
+    scheduler reads ``context_lens[num_rows]``. Without the spare row that read
+    is past the storage, and faults when the storage ends where mapped memory
+    ends.
+    """
+    spare = lens.new_zeros((lens.shape[0] + 1, *lens.shape[1:]))
+    spare[:-1].copy_(lens)
+    return spare[:-1]
+
+
 """
 Some comments on the common terms used in DeepSeekV4Backend:
 
@@ -224,6 +239,7 @@ class PagedIndexerMetadata:
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
+            self.compressed_seq_lens = _with_spare_row(self.compressed_seq_lens)
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)

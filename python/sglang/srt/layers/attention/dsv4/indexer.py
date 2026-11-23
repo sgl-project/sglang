@@ -58,6 +58,8 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy.dsv4_indexer import ordered_topk_transform
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
@@ -521,6 +523,7 @@ class C4IndexerBackendMixin:
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self.top_ordered_topk = is_true_on_policy_enabled()
         self.flashinfer_topk_transform: Callable[..., None] = (
             topk_transform_flashinfer_fused
             if envs.SGLANG_DSA_FUSE_TOPK.get()
@@ -951,7 +954,18 @@ class C4IndexerBackendMixin:
             topk_plan: Optional[torch.Tensor] = None,
         ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
-            if self.dsa_topk_backend.is_torch():
+            # TOP's sparse attention reads the selection in ascending order, ties to the smaller position
+            # (true_on_policy.dsv4_indexer); the fused v2 top-k + page transform leaves no step for that order.
+            if self.top_ordered_topk:
+                ordered_topk_transform(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.compressed_page_size,
+                    row_raw_indices,
+                )
+            elif self.dsa_topk_backend.is_torch():
                 topk_transform_pytorch_vectorized(
                     logits,
                     c4_seq_lens[rows],
