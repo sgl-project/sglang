@@ -250,6 +250,9 @@ class LinearBase(torch.nn.Module):
     # method then skips its own input quantization. An explicit opt-in, so a
     # stray tuple cannot silently bypass quantization.
     _accepts_prequantized_fp4: bool = False
+    # The Marlin lock buffer, which the kernel writes on every call: valid in
+    # this process only, so a weight snapshot gives each reader its own.
+    _process_local_fields = frozenset({"workspace"})
     tp_group: GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None = None
 
     def __init__(

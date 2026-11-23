@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weight cache model loader — loads model weights from a Weight Cache Daemon.
 
-Zero-copy mode: param.data points directly to transport-mapped GPU memory.
-The daemon picks the backend (--weight-cache-transport) and names it in its
-response. With torch_ipc the engine depends on the daemon staying alive; with
-vmm_fd the engine's own mappings keep the weights valid.
+Zero-copy: the engine builds the model on the meta device and installs the
+daemon's load-diff snapshot (weight_cache/load_diff.py): every tensor the
+loaded model held, as a view of transport-mapped GPU memory, and every plain
+value that loading changed. The daemon picks the backend
+(--weight-cache-transport) and names it in its response. With torch_ipc the
+engine depends on the daemon staying alive; with vmm_fd the engine's own
+mappings keep the weights valid.
 """
 
+import hashlib
+import json
 import logging
 import os
 import signal
@@ -25,13 +30,21 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.weight_cache import load_diff
+from sglang.srt.weight_cache.schema import SnapshotManifest, StorageMeta
 
 from .protocol import (
+    DRAFT_ROLE,
+    PROTOCOL_VERSION,
+    TARGET_ROLE,
     CacheConfig,
+    ProtocolVersionError,
     check_ipc_quant_support,
+    check_protocol_version,
     compute_env_stamp,
     get_quant_method_name,
     get_socket_path,
+    handshake_with_daemon,
     hash_quant_config,
     recv_msg,
     send_msg,
@@ -104,6 +117,7 @@ class WeightCacheModelLoader(BaseModelLoader):
 
     - socket file missing            -> fall back to disk load
     - connection refused             -> raise (daemon crashed after binding)
+    - protocol version mismatch      -> raise (another SGLang version)
     - CacheConfig mismatch           -> raise (do NOT disk-load on a shared GPU
                                         holding a different config's weights;
                                         also surfaces fingerprint drift bugs)
@@ -129,6 +143,10 @@ class WeightCacheModelLoader(BaseModelLoader):
         self._fallback_load_format = fallback_load_format
         self.preloaded_weights_bytes = 0
         self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
+        # Which of the daemon's models this loader fetches (protocol.py):
+        # the target, or a speculative decoding draft (weight_cache/draft.py).
+        self.role = TARGET_ROLE
+        self._tag = "[WeightCacheModelLoader]"
 
     def load_model(
         self,
@@ -144,6 +162,10 @@ class WeightCacheModelLoader(BaseModelLoader):
         """
         self.preloaded_weights_bytes = 0
         tic = time.perf_counter()
+        # A draft runner fetches the daemon's draft: the same path, another model
+        if getattr(model_config, "is_draft_model", False):
+            self.role = DRAFT_ROLE
+            self._tag = f"[WeightCacheModelLoader {DRAFT_ROLE}]"
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
         # unsupported model fails explicitly instead of silently disk-loading
@@ -187,7 +209,7 @@ class WeightCacheModelLoader(BaseModelLoader):
                     f"metadata: {preloaded_weights_bytes=}"
                 )
             logger.info(
-                f"[WeightCacheModelLoader] Fetched {len(entries)} tensors from daemon "
+                f"{self._tag} Fetched {len(entries)} storages from daemon "
                 f"(transport={self._transport_backend.name}) "
                 f"in {time.perf_counter() - tic:.2f}s"
             )
@@ -198,16 +220,14 @@ class WeightCacheModelLoader(BaseModelLoader):
 
             quant_config = _get_quantization_config(model_config, self.load_config)
 
-            model = self._load_zero_copy_mode(
-                model_config,
-                device_config,
-                entries,
-                quant_config,
-            )
+            if self.role == DRAFT_ROLE:
+                self._check_draft_stamp(cache_data.get("draft_stamp"))
+            model = self._install(model_config, device_config, cache_data, quant_config)
         except BaseException:
-            # Drop whatever the transport mapped for the failed load. A model
-            # that did load keeps its mappings until the process exits.
-            self._transport_backend.close()
+            # Until load_diff.install runs, nothing refers to what the
+            # transport mapped: drop it. From then on _install keeps it.
+            if self._transport_backend not in _LOADED_MODEL_TRANSPORTS:
+                self._transport_backend.close()
             raise
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
@@ -215,13 +235,6 @@ class WeightCacheModelLoader(BaseModelLoader):
         # process_weights_after_loading on the weights before exporting
         # IPC handles. Running it again would double-process (e.g.,
         # re-quantize already-quantized weights), corrupting tensor data.
-
-        # Rebuild stale tensor views. Some modules store tensor views as
-        # plain attributes (not parameters/buffers) during __init__. When
-        # the model is initialized on meta device and then weights are
-        # replaced via IPC mapping, these views still point to the old
-        # meta storage. We must recreate them from the now-valid tensors.
-        self._rebuild_stale_views(model)
 
         # With torch_ipc the model points into the daemon's GPU memory via CUDA
         # IPC. If the daemon dies, those pointers dangle, so watch it and fail
@@ -233,7 +246,7 @@ class WeightCacheModelLoader(BaseModelLoader):
         )
 
         logger.info(
-            f"[WeightCacheModelLoader] Loaded model via IPC "
+            f"{self._tag} Loaded model via IPC "
             f"(mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
         )
@@ -293,7 +306,8 @@ class WeightCacheModelLoader(BaseModelLoader):
             f"pid={daemon_pid}"
         )
 
-    def _resolve_engine_quant(self, model_config):
+    @staticmethod
+    def _resolve_engine_quant(model_config):
         """Return (quant_method, quant_config) matching the daemon's fingerprint.
 
         Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
@@ -308,89 +322,73 @@ class WeightCacheModelLoader(BaseModelLoader):
         return quant_method, quant_config
 
     @staticmethod
-    def _rebuild_stale_views(model):
-        """Rebuild tensor views that went stale after IPC weight replacement.
+    def _check_draft_stamp(daemon_stamp) -> None:
+        """The daemon built its draft where this runner builds it (draft.py):
+        refuse it unless what that scope sets beyond CacheConfig agrees."""
+        from .draft import draft_stamp
 
-        RadixLinearAttention.conv_weights is a view of conv1d.weight created
-        during __init__. After IPC mapping replaces conv1d.weight with a new
-        tensor, the old view still points to meta-device storage. Recreate
-        it from the now-valid parameter.
-        """
-        try:
-            from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-        except ImportError:
-            return
-
-        count = 0
-        for _, module in model.named_modules():
-            conv1d = getattr(module, "conv1d", None)
-            attn = getattr(module, "attn", None)
-            if conv1d is not None and isinstance(attn, RadixLinearAttention):
-                if hasattr(conv1d, "weight") and conv1d.weight is not None:
-                    attn.refresh_conv_weights(conv1d.weight)
-                    if hasattr(conv1d, "bias") and conv1d.bias is not None:
-                        attn.bias = conv1d.bias
-                    count += 1
-
-        if count > 0:
-            logger.info(
-                f"[WeightCacheModelLoader] Rebuilt {count} stale conv_weights views"
+        here = draft_stamp()
+        if daemon_stamp != here:
+            raise RuntimeError(
+                f"[WeightCacheModelLoader {DRAFT_ROLE}] The daemon built the draft "
+                f"under other settings than this engine's draft runner (daemon: "
+                f"{daemon_stamp}, here: {here}); its weights would not fit this "
+                f"engine. Run the same SGLang and speculative decoding settings on "
+                f"both."
             )
 
     @staticmethod
-    def _set_module_tensor(model, name, tensor, is_param=True):
-        """Replace or register a parameter/buffer in the model by its full dotted name.
+    def cache_config(model_config) -> CacheConfig:
+        """The fingerprint a runner states for ``model_config``, from the
+        parallel layout in effect. A daemon states its draft's with this same
+        code, in the scope the engine's draft runner loads in."""
+        parallel = get_parallel()
+        quant_method, quant_config = WeightCacheModelLoader._resolve_engine_quant(
+            model_config
+        )
+        return CacheConfig(
+            model_path=model_config.model_path,
+            model_arch=(
+                model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
+                else ""
+            ),
+            tp_size=parallel.tp_size,
+            tp_rank=parallel.tp_rank,
+            pp_size=parallel.pp_size,
+            pp_rank=parallel.pp_rank,
+            dp_size=parallel.dp_size,
+            ep_size=parallel.moe_ep_size,
+            # The configured width, as the daemon states it: the MoE
+            # communicator is wider when it aliases attention CP.
+            moe_dp_size=parallel.moe_dp_size,
+            moe_dp_rank=parallel.moe_dp_rank,
+            moe_ep_rank=parallel.moe_ep_rank,
+            attn_dp_size=parallel.attn_dp_size,
+            enable_dp_lm_head=parallel.enable_dp_lm_head,
+            attn_cp_size=parallel.attn_cp_size,
+            moe_dense_tp_size=parallel.moe_dense_tp_size,
+            moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+            quant_method=quant_method,
+            quant_config_hash=hash_quant_config(quant_config),
+            dtype=str(model_config.dtype),
+            revision=model_config.revision or "",
+            **compute_env_stamp(),
+        )
 
-        This is necessary because setting param.data on a meta-device tensor
-        raises a type mismatch error (meta and CUDA tensors have incompatible
-        dispatch keys). Instead, we walk the module tree and use setattr to
-        replace the entire parameter/buffer object.
-
-        If the attribute already exists as a parameter/buffer, it is replaced.
-        If it doesn't exist (e.g. post-quantization params like weight_scale),
-        it is registered as a new parameter or buffer.
-        """
-        parts = name.split(".")
-        obj = model
-        for part in parts[:-1]:
-            obj = getattr(obj, part)
-        leaf_name = parts[-1]
-        if is_param:
-            # requires_grad=False: the memory is shared with the daemon and must
-            # be treated as read-only, and SGLang is inference-only, so autograd
-            # must never write into it.
-            new_param = nn.Parameter(tensor, requires_grad=False)
-            setattr(obj, leaf_name, new_param)
-        else:
-            # register_buffer raises KeyError if the name already exists as a
-            # parameter or plain attribute (not a buffer). This happens when
-            # process_weights_after_loading converts a parameter to a buffer
-            # (e.g. Mamba's A_log). Remove the old attribute first.
-            if leaf_name in obj._parameters:
-                del obj._parameters[leaf_name]
-            elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
-                delattr(obj, leaf_name)
-            obj.register_buffer(leaf_name, tensor)
-
-    def _load_zero_copy_mode(
-        self,
-        model_config,
-        device_config,
-        entries,
-        quant_config,
+    def _install(
+        self, model_config, device_config, cache_data, quant_config
     ) -> nn.Module:
-        """Zero-copy load: use the daemon's tensors as the model's weights.
-
-        The model is initialized on the meta device (no memory allocation),
-        then each parameter and buffer is replaced with, or registered as, the
-        tensor imported through the selected transport. The engine and daemon
-        share the same physical GPU memory.
-        """
+        """Build the model on the meta device and install the daemon's
+        load-diff snapshot in it: every tensor the daemon's model held, as a
+        view of a mapped storage, and every plain value that loading changed,
+        then check the result (load_diff.install). Nothing is post-processed
+        again: the daemon ran process_weights_after_loading before exporting,
+        and running it twice would corrupt the weights."""
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
-        # Initialize model on meta device to avoid any GPU/CPU memory allocation.
-        # This creates the model structure with the correct parameter shapes/dtypes
-        # but without allocating actual storage.
+        tic = time.perf_counter()
+        # Initialize the model on the meta device: no memory is allocated.
         with set_default_torch_dtype(model_config.dtype):
             with torch.device("meta"):
                 model = _initialize_model(
@@ -398,129 +396,149 @@ class WeightCacheModelLoader(BaseModelLoader):
                     self.load_config,
                     quant_config,
                 )
+        built_s = time.perf_counter() - tic
 
-        # Build lookup dicts of existing parameter/buffer names in the
-        # meta-device model. Post-quantization parameters (e.g. weight_scale
-        # from FP8) are created by process_weights_after_loading, which the
-        # daemon already ran. These params exist in the daemon's entries but
-        # NOT in the meta-device model — we must register them as new attrs.
-        # Use dicts (not sets) so we can do O(1) shape/dtype validation
-        # without re-traversing the model tree on every lookup.
-        # remove_duplicate=False mirrors the daemon's export (which keys tied
-        # weights under every name) so a tied parameter is recognized under all
-        # of its names here too.
-        existing_params = {
-            name: param
-            for name, param in model.named_parameters(remove_duplicate=False)
+        backend = self._transport_backend
+        manifest = cache_data["manifest"]
+        storages = {
+            name: backend.import_tensor(entry)
+            for name, entry in cache_data["entries"].items()
         }
-        existing_buffers = {name: buf for name, buf in model.named_buffers()}
-        existing_names = set(existing_params) | set(existing_buffers)
-
-        imported_refs = []
-        imported_count = 0
-        mismatched = []
-        new_params_count = 0
-        map_tic = time.perf_counter()
-
-        # Iterate over ALL daemon entries (not just model params/buffers).
-        # This ensures post-quantization parameters (weight_scale, etc.)
-        # that were created by process_weights_after_loading are also mapped.
-        for name, entry in entries.items():
-            imported_tensor = self._transport_backend.import_tensor(entry)
-            is_param = entry.get("is_param", True)
-
-            if name in existing_names:
-                # Existing parameter/buffer — validate shape/dtype
-                if name in existing_params:
-                    ref_param = existing_params[name]
-                else:
-                    ref_param = existing_buffers[name]
-                if (
-                    imported_tensor.shape != ref_param.shape
-                    or imported_tensor.dtype != ref_param.dtype
-                ):
-                    mismatched.append(
-                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
-                        f"vs model={ref_param.shape}/{ref_param.dtype}"
-                    )
-                    del imported_tensor
-                    continue
-
-            # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
-            imported_refs.append(imported_tensor)
-            imported_count += 1
-
-            if name not in existing_names:
-                new_params_count += 1
-
-        if mismatched:
-            raise RuntimeError(
-                f"[WeightCacheModelLoader] {len(mismatched)} tensor(s) have "
-                f"shape/dtype mismatch between the IPC daemon and the "
-                f"meta-initialized model. The quantization method passed the "
-                f"IPC allowlist gate (check_ipc_quant_support), so this is NOT an "
-                f"unsupported-quant case — it indicates the daemon's weight "
-                f"fingerprint is incomplete or the daemon/client configs drifted "
-                f"(a bug to fix), not merely uninitialized weights:\n"
-                + "\n".join(mismatched)
-            )
-
-        # After mapping every daemon entry, any tensor still on the meta device
-        # is one the daemon did NOT provide. Filling it with torch.empty() would
-        # hand the model uninitialized GPU memory — silently producing wrong
-        # output, the worst failure mode for a load path. Hard-error and list the
-        # offenders instead.
-        #
-        # The daemon exports the full state_dict AND non-persistent buffers
-        # (e.g. rotary embedding cos_sin_cache), so a correct setup leaves nothing
-        # on meta here. A non-empty list means the daemon's export is incomplete,
-        # or the model has a genuinely-recomputable buffer that must be recomputed
-        # explicitly (not filled with garbage) — add that handling here if needed.
-        still_on_meta_params = [
-            name
-            for name, param in model.named_parameters()
-            if param.device.type == "meta"
-        ]
-        still_on_meta_buffers = [
-            name for name, buf in model.named_buffers() if buf.device.type == "meta"
-        ]
-
-        if still_on_meta_params or still_on_meta_buffers:
-            raise RuntimeError(
-                f"[WeightCacheModelLoader] After IPC mapping, "
-                f"{len(still_on_meta_params)} parameter(s) and "
-                f"{len(still_on_meta_buffers)} buffer(s) remain on the meta device "
-                f"— the daemon did not export them. Refusing to fill them with "
-                f"uninitialized memory, which would silently produce wrong output. "
-                f"This means the daemon's export is incomplete, or a recomputable "
-                f"buffer needs explicit recompute logic here.\n"
-                f"  params: {still_on_meta_params[:10]}"
-                f"{'...' if len(still_on_meta_params) > 10 else ''}\n"
-                f"  buffers: {still_on_meta_buffers[:10]}"
-                f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
-            )
-
-        map_elapsed = time.perf_counter() - map_tic
-
-        # Keep the imported tensors referenced from the model. With torch_ipc
-        # each one owns its IPC mapping, which GC would close; vmm_fd mappings
-        # are owned by the transport backend kept below.
-        if imported_refs:
-            model._ipc_imported_tensors = imported_refs
-        # Keep transport backend alive for the model lifetime (VMM backend owns
-        # VA mappings that must stay mapped while tensors are in use). A tensor
-        # can outlive the model object, so the mappings are not released with
-        # the model: they stay until the process exits.
-        model._weight_cache_transport_backend = self._transport_backend
-        _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
-
-        logger.info(
-            f"[WeightCacheModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
+        storages.update(
+            (name, torch.frombuffer(bytearray(data), dtype=torch.uint8))
+            for name, data in manifest["host"].items()
         )
-
+        # Equal on every rank of one load, as SnapshotManifest asks; the
+        # publish vote mints it once the snapshot loader serves the cache.
+        shared = {
+            k: v for k, v in cache_data["config"].items() if not k.endswith("_rank")
+        }
+        digest = hashlib.sha256(
+            json.dumps(shared, sort_keys=True, default=str).encode()
+        )
+        snapshot = SnapshotManifest(
+            version=f"weight-cache-{digest.hexdigest()[:16]}",
+            storages={
+                name: StorageMeta(nbytes=nbytes, device=device)
+                for name, (nbytes, device) in manifest["storages"].items()
+            },
+            load_diff=manifest["load_diff"],
+            attestation=b"",
+            source={},
+        )
+        # Keep the transport backend alive for as long as the process: from
+        # here on the model, or a cache it shares, may refer to the mapped
+        # storages, even when the install fails (nothing is put back). VMM
+        # mappings are owned by the backend; a tensor can outlive the model.
+        _LOADED_MODEL_TRANSPORTS.append(backend)
+        model = load_diff.install(skeleton=model, manifest=snapshot, storages=storages)
+        # Keep the imported storages referenced from the model. With torch_ipc
+        # each one owns its IPC mapping, which GC would close; vmm_fd mappings
+        # are owned by the transport backend kept above.
+        model._ipc_imported_tensors = list(storages.values())
+        model._weight_cache_transport_backend = backend
+        logger.info(
+            f"{self._tag} Installed the daemon's snapshot "
+            f"(build_s={built_s:.3f}, install_s="
+            f"{time.perf_counter() - tic - built_s:.3f})"
+        )
         return model
+
+    @staticmethod
+    def _check_response(result, engine_config, role: str = TARGET_ROLE) -> None:
+        """Refuse a fetch_state response before any handle is opened or fd
+        mapped: another protocol version, another model than ``role`` asked
+        for, a config mismatch, or storages that do not add up (a transport
+        entry for every GPU storage, each a whole uint8 storage of its size,
+        and the bytes of every CPU storage). The load_diff bytes themselves
+        are checked by load_diff.install."""
+        if not isinstance(result, dict):
+            raise RuntimeError("[WeightCacheModelLoader] Invalid daemon response")
+        if result.get("status") == "protocol_mismatch":
+            raise ProtocolVersionError(result.get("message", result))
+        check_protocol_version(result.get("protocol_version"))
+        if result.get("status") == "error":
+            raise RuntimeError(
+                f"[WeightCacheModelLoader] The daemon refused the {role} model: "
+                f"{result.get('message')}"
+            )
+        # A daemon that predates roles answers every request with its target
+        if result.get("status") == "ok" and result.get("role", TARGET_ROLE) != role:
+            raise RuntimeError(
+                f"[WeightCacheModelLoader] The daemon answered a request for its "
+                f"{role} model with its {result.get('role', TARGET_ROLE)} model: "
+                f"it does not serve speculative decoding drafts. Run the same "
+                f"SGLang in the engine and the daemon."
+            )
+        if result.get("status") != "ok" or result.get("config") != (
+            engine_config.to_dict()
+        ):
+            daemon_config = result.get("daemon_config", result.get("config"))
+            raise RuntimeError(
+                f"[WeightCacheModelLoader] Daemon config mismatch!\n"
+                f"  Engine config: {engine_config.to_dict()}\n"
+                f"  Daemon config: {daemon_config}"
+            )
+        manifest, entries = result.get("manifest"), result.get("entries")
+        mismatch = "the daemon's response does not match its manifest"
+        if not (
+            isinstance(manifest, dict)
+            and type(manifest.get("load_diff")) is bytes
+            and isinstance(manifest.get("storages"), dict)
+            and isinstance(manifest.get("host"), dict)
+            and isinstance(entries, dict)
+            and all(
+                type(name) is str
+                and type(meta) is list
+                and len(meta) == 2
+                and type(meta[0]) is int
+                and meta[0] > 0
+                and type(meta[1]) is str
+                for name, meta in manifest["storages"].items()
+            )
+        ):
+            raise load_diff.SnapshotError(mismatch, ["malformed"])
+        host = manifest["host"]
+        expected = {
+            name: nbytes
+            for name, (nbytes, _) in manifest["storages"].items()
+            if name not in host
+        }
+        # The transport moves the storages on the daemon's device only.
+        devices = {manifest["storages"][name][1] for name in expected}
+        if (
+            set(entries) != set(expected)
+            or not set(host) <= set(manifest["storages"])
+            or len(devices) > 1
+        ):
+            raise load_diff.SnapshotError(
+                mismatch,
+                [
+                    f"{len(entries)} transport entries and {len(host)} byte strings "
+                    f"for {len(manifest['storages'])} storages"
+                ],
+            )
+        for name, data in host.items():
+            nbytes, device = manifest["storages"][name]
+            if type(data) is not bytes or len(data) != nbytes or device != "cpu":
+                raise load_diff.SnapshotError(
+                    mismatch, [f"storage {name}: not {nbytes} bytes on the CPU"]
+                )
+        for name, nbytes in expected.items():
+            entry = entries[name]
+            if not (
+                isinstance(entry, dict)
+                and entry.get("shape") == [nbytes]
+                and entry.get("dtype") == "uint8"
+                # vmm_fd describes where in its allocation: the whole storage
+                and entry.get("storage_offset", 0) == 0
+                and entry.get("stride", [1]) == [1]
+                and entry.get("storage_nbytes", nbytes) == nbytes
+            ):
+                raise load_diff.SnapshotError(
+                    "the daemon's response does not match its manifest",
+                    [f"storage {name}: not {nbytes} bytes"],
+                )
 
     def _fetch_from_cache(self, model_config, device_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
@@ -575,53 +593,15 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
+            # A daemon of another version refuses here, before it reads a
+            # config or exports any handle or fd.
+            handshake_with_daemon(sock)
+
             # Build engine's config fingerprint
-            parallel = get_parallel()
-            tp_size = parallel.tp_size
-            tp_rank = parallel.tp_rank
-
-            pp_size = parallel.pp_size
-            pp_rank = parallel.pp_rank
-
-            ep_size = parallel.moe_ep_size
-            # The configured width, as the daemon states it: the MoE
-            # communicator is wider when it aliases attention CP.
-            moe_dp_size = parallel.moe_dp_size
-            moe_dp_rank = parallel.moe_dp_rank
-            moe_ep_rank = parallel.moe_ep_rank
-
-            quant_method, quant_config = self._resolve_engine_quant(model_config)
-
-            engine_config = CacheConfig(
-                model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                pp_size=pp_size,
-                pp_rank=pp_rank,
-                dp_size=parallel.dp_size,
-                ep_size=ep_size,
-                moe_dp_size=moe_dp_size,
-                moe_dp_rank=moe_dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_dp_size=parallel.attn_dp_size,
-                enable_dp_lm_head=parallel.enable_dp_lm_head,
-                attn_cp_size=parallel.attn_cp_size,
-                moe_dense_tp_size=parallel.moe_dense_tp_size,
-                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
-                quant_method=quant_method,
-                quant_config_hash=hash_quant_config(quant_config),
-                dtype=str(model_config.dtype),
-                revision=model_config.revision or "",
-                **compute_env_stamp(),
-            )
+            engine_config = self.cache_config(model_config)
 
             logger.info(
-                f"[WeightCacheModelLoader] Requesting weights from daemon at "
+                f"{self._tag} Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
                 f"model={engine_config.model_path}, "
                 f"arch={engine_config.model_arch}, "
@@ -630,17 +610,17 @@ class WeightCacheModelLoader(BaseModelLoader):
                 f"dtype={engine_config.dtype}"
             )
 
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
+            send_msg(
+                sock,
+                {
+                    "type": "fetch_state",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "config": engine_config.to_dict(),
+                    "role": self.role,
+                },
+            )
             result = recv_msg(sock)
-
-            if result.get("status") != "ok":
-                daemon_config = result.get("daemon_config", {})
-                raise RuntimeError(
-                    f"[WeightCacheModelLoader] Daemon config mismatch!\n"
-                    f"  Engine config: {engine_config.to_dict()}\n"
-                    f"  Daemon config: {daemon_config}"
-                )
-
+            self._check_response(result, engine_config, self.role)
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
             check_served_transport(self.weight_cache_transport, backend_name)
             self._transport_backend = get_client_transport_backend(backend_name)
@@ -667,6 +647,9 @@ class WeightCacheModelLoader(BaseModelLoader):
             download_dir=self.load_config.download_dir,
             model_loader_extra_config=self.load_config.model_loader_extra_config,
             tp_rank=self.load_config.tp_rank,
+            # Which layers a draft runner loads, and the group it loads in
+            draft_model_idx=self.load_config.draft_model_idx,
+            load_group=self.load_config.load_group,
         )
         loader_cls = self._fallback_loader_cls or DefaultModelLoader
         fallback = loader_cls(fallback_config)
