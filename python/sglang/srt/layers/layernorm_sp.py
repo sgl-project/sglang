@@ -119,9 +119,12 @@ def _minimax_m3_sp_supported() -> bool:
     )
     # A breakable graph captures the whole forward, logits included, so each
     # bucket decides SP once from its padded size; other captured backends do not.
+    # MegaMoE reads unsharded forward_batch.num_token_non_padded on padded buckets,
+    # so only allow breakable prefill graphs when a2a_backend != "megamoe".
+    prefill_backend = get_exec().graph.cuda_graph_config.prefill.backend
     graph_ok = (
-        get_exec().graph.cuda_graph_config.prefill.backend
-        in (Backend.DISABLED, Backend.BREAKABLE)
+        prefill_backend == Backend.DISABLED
+        or (prefill_backend == Backend.BREAKABLE and a2a_backend != "megamoe")
         or _max_prefill_bucket() < MINIMAX_M3_SP_MIN_TOKENS
     )
     return (
@@ -357,8 +360,15 @@ def _sp_exit_tokens(input_ids, forward_mode) -> Optional[int]:
 def _peer_store(dst: torch.Tensor, src: torch.Tensor) -> None:
     """Elementwise store into peer-mapped memory; ``copy_`` there takes the slower
     driver peer memcpy."""
+    assert src.element_size() in (1, 2), (
+        f"unsupported element size {src.element_size()}"
+    )
     dtype = torch.int16 if src.element_size() == 2 else torch.uint8
     torch.bitwise_or(src.view(dtype), 0, out=dst.view(dtype))
+
+
+# Cap symmetric-memory preallocation (~2.4 GB at hidden=6144); larger prefills fall back to NCCL.
+_PUSH_COMM_MAX_TOKENS = 32768
 
 
 class _PushComm:
@@ -490,8 +500,11 @@ def _init_push_comm(*, hidden: int) -> None:
     )
 
     tp_group = get_parallel().tp_group
-    max_tokens = ceil_align(
-        recommended_max_tokens(include_prefill=True, floor=_max_prefill_bucket()), 2
+    max_tokens = min(
+        ceil_align(
+            recommended_max_tokens(include_prefill=True, floor=_max_prefill_bucket()), 2
+        ),
+        _PUSH_COMM_MAX_TOKENS,
     )
     if max_tokens < MINIMAX_M3_SP_MIN_TOKENS:
         return

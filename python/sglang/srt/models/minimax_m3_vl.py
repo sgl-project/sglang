@@ -325,13 +325,20 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             forward_mode=forward_batch.forward_mode,
         )
 
-        if self.pp_group.is_last_rank and not get_embedding:
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-                aux_hidden_states,
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            hidden_states, _ = layernorm_sp.maybe_exit_gather(
+                hidden_states=hidden_states,
+                hidden_states_before_norm=None,
+                input_ids=input_ids,
+                forward_mode=forward_batch.forward_mode,
             )
         return hidden_states
 
