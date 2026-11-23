@@ -131,6 +131,40 @@ def make_indices(indices):
     return indices
 
 
+def fake_umbp_import():
+    """Stand-in for _import_umbp_client so UMBPStore builds without MoRI."""
+
+    class FakeUMBPConfig:
+        def __init__(self):
+            self.role = None
+            self.dram = SimpleNamespace(capacity_bytes=0)
+            self.ssd = SimpleNamespace(
+                enabled=False,
+                storage_dir="/tmp",
+                capacity_bytes=0,
+                ssd_backend="file",
+                spdk_proxy_tenant_id=0,
+                spdk_proxy_tenant_quota_bytes=0,
+            )
+            self.distributed = None
+            self.standalone_process = None
+
+        @classmethod
+        def from_environment(cls):
+            return cls()
+
+    class FakeUMBPClient:
+        def __init__(self, _config):
+            pass
+
+    fake_role = SimpleNamespace(
+        Standalone="standalone",
+        SharedSSDLeader="leader",
+        SharedSSDFollower="follower",
+    )
+    return (FakeUMBPClient, FakeUMBPConfig, fake_role, None, None, None, None, None)
+
+
 class TestUMBPStore(unittest.TestCase):
     def test_standalone_process_configuration(self):
         from sglang.srt.mem_cache.storage.umbp import umbp_store
@@ -323,6 +357,29 @@ class TestUMBPStore(unittest.TestCase):
         self.assertTrue(store.exists("test-model_clear_key_0_k"))
         store.clear()
         self.assertFalse(store.exists("test-model_clear_key_0_k"))
+
+    def test_long_prefix_rejected_at_init_only_for_spdk(self):
+        umbp_module = import_umbp_store_module()
+        long_model = "m" * 200
+        spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                "dram_capacity_bytes": 1024,
+                "ssd_enabled": True,
+                "ssd_backend": "spdk",
+            },
+        )
+        dram = MockStorageConfig(
+            model_name=long_model,
+            extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False},
+        )
+
+        with patch.object(
+            umbp_module, "_import_umbp_client", return_value=fake_umbp_import()
+        ):
+            with self.assertRaisesRegex(ValueError, "SPDK"):
+                umbp_module.UMBPStore(spdk)
+            umbp_module.UMBPStore(dram).close()
 
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
