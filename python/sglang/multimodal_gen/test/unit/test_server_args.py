@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import zmq
@@ -76,6 +77,7 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.cli import generate as cli_generate
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -2519,6 +2521,36 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         # the decoder's untiled decode needs the headroom the full size leaves
         args = self._ltx25(load_diffusion_decoder=True)
         self.assertEqual(args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_offline_generate_plans_memory_with_the_requested_diffusion_decoder(self):
+        # `sglang generate --use-diffusion-decoder` loads the decoder as well
+        def from_cli_args(args, unknown_args=None, default_args=None):
+            return self._ltx25(**(default_args or {}))
+
+        cli_args = SimpleNamespace(
+            use_diffusion_decoder=True,
+            config=None,
+            diffusers_kwargs=None,
+            output_file_path=None,
+            perf_dump_path=None,
+        )
+        sampling_params_cls = Mock()
+        sampling_params_cls.get_cli_args.return_value = {
+            "prompt": "a cat",
+            "use_diffusion_decoder": True,
+        }
+        with (
+            patch.object(ServerArgs, "from_cli_args", side_effect=from_cli_args),
+            patch.object(
+                cli_generate,
+                "_resolve_cli_sampling_params_cls",
+                return_value=sampling_params_cls,
+            ),
+            patch.object(cli_generate.DiffGenerator, "from_pretrained") as load,
+        ):
+            cli_generate.generate_cmd(cli_args)
+        server_args = load.call_args.kwargs["server_args"]
+        self.assertEqual(server_args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
 
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(

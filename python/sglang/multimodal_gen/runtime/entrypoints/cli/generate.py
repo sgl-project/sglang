@@ -156,7 +156,12 @@ def maybe_dump_performance(
 
 def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the generate command."""
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
+    # A request for the diffusion decoder loads it. ServerArgs plans memory
+    # placement when it is built, so it has to know by then.
+    default_args = None
+    if getattr(args, "use_diffusion_decoder", False):
+        default_args = {"load_diffusion_decoder": True}
+    server_args = ServerArgs.from_cli_args(args, unknown_args, default_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}
