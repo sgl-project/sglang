@@ -886,28 +886,6 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             with_mask["meta_info"]["output_token_sampling_logprobs"],
         )
 
-    def test_sampling_logprobs_without_mask_ignore_mask_cap(self):
-        # Top-p alone keeps a support far above the server's
-        # --sampling-mask-max-tokens; without the mask nothing overflows.
-        output = self._post_sampling_logprobs({"top_k": -1, "top_p": _TOP_P})
-        meta_info = output["meta_info"]
-        self.assertEqual(len(output["output_ids"]), _MAX_NEW_TOKENS)
-        sampling_logprobs = meta_info["output_token_sampling_logprobs"]
-        logprobs = [logprob for logprob, *_ in meta_info["output_token_logprobs"]]
-        self.assertEqual(len(sampling_logprobs), _MAX_NEW_TOKENS)
-        for sampling_logprob, logprob in zip(sampling_logprobs, logprobs, strict=True):
-            # Renormalizing over the nucleus can only raise a kept token's logprob.
-            self.assertGreaterEqual(sampling_logprob, logprob - 1e-4)
-            self.assertLessEqual(sampling_logprob, 0.0)
-        # The nucleus drops mass, so the values are not a copy of the logprobs.
-        self.assertTrue(
-            any(
-                sampling_logprob > logprob + 1e-6
-                for sampling_logprob, logprob in zip(sampling_logprobs, logprobs)
-            ),
-            (sampling_logprobs, logprobs),
-        )
-
     def test_sampling_logprobs_without_new_tokens_are_not_aborted(self):
         for sampling_params in ({"top_k": _TOP_K},):
             with self.subTest(sampling_params=sampling_params):

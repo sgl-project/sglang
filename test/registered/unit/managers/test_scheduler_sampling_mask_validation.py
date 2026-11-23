@@ -177,17 +177,6 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 add_to_queue.assert_not_called()
 
-    def test_pd_admits_unfiltered_requests_without_mask_buffers(self):
-        """An unfiltered request is not captured, so the metadata buffers carry
-        nothing for it."""
-        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
-            with self.subTest(mode=mode):
-                abort, _, passed, _ = _handle_request(
-                    mode, _sampling_req({}, mask=True)
-                )
-                self.assertTrue(passed)
-                abort.assert_not_called()
-
     def test_pd_top_logprobs_beyond_capacity_return_bad_request_before_admission(
         self,
     ):

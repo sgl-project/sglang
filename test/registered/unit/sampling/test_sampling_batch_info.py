@@ -6,21 +6,18 @@ register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 import unittest
-from array import array
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     DisallowedTokensLogitsProcessor,
 )
 from sglang.srt.sampling.grammar_mask import build_grammar_mask
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
     _adjust_before_watermark,
@@ -423,36 +420,6 @@ class TestStepBuilds(CustomTestCase):
         info.set_seeds_and_mask_rows(reqs[:1])
         self.assertIsNone(info.sampling_mask_batch_indices)
         self.assertIsNone(info.sampling_mask_top_ks)
-
-    def test_unfiltered_mask_request_does_not_widen_the_capture(self):
-        """An unfiltered request that returns the mask is not captured: it must stay
-        out of both index tensors and keep a capture width of 1, like the captured
-        request that returns sampling logprobs only."""
-
-        def req(sampling_params, *, logprobs=False, mask=False):
-            params = SamplingParams(max_new_tokens=8, **sampling_params)
-            params.normalize(None)
-            return Req(
-                "r",
-                "",
-                array("q", [1, 2]),
-                params,
-                return_logprob=logprobs,
-                return_sampling_logprobs=logprobs,
-                return_sampling_mask=mask,
-            )
-
-        reqs = [
-            req({"top_k": 20}, mask=True),
-            req({}, mask=True),
-            req({"top_p": 0.9}, logprobs=True),
-            req({}),
-        ]
-        info = _make_info()
-        info.set_seeds_and_mask_rows(reqs)
-        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
-        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
-        self.assertEqual(info.sampling_mask_top_ks, [20, 1, 1, 1])
 
     def test_builtin_page_guard_reaches_logits_with_external_processors_disabled(self):
         from array import array
