@@ -60,12 +60,13 @@ jobs:
               prNumber = context.payload.pull_request.number;
             } else if (context.eventName === 'workflow_run') {
               const wr = context.payload.workflow_run;
-              // Only pull_request runs are the PR gate. The AMD workflow also
+              // Only PR-event runs are the PR gate (pull_request_target for the
+              // NVIDIA workflows, pull_request for AMD). The AMD workflow also
               // accepts workflow_dispatch for a single stage, and such a run on
               // a PR branch is PR-associated; refreshing off it would rewrite
               // the block from a run the rows below deliberately ignore.
-              if (wr.event !== 'pull_request') {
-                core.info(`Triggering run event '${wr.event}' is not pull_request; skipping.`);
+              if (wr.event !== 'pull_request' && wr.event !== 'pull_request_target') {
+                core.info(`Triggering run event '${wr.event}' is not a PR event; skipping.`);
                 return;
               }
               if (wr.pull_requests && wr.pull_requests.length > 0) {
@@ -127,7 +128,8 @@ jobs:
                 // Every row reports the PR gate, so exclude other events for
                 // this SHA: all three workflows also accept workflow_dispatch,
                 // and for AMD that is a single stage rather than the full gate.
-                event: 'pull_request',
+                // The NVIDIA workflows run on pull_request_target, AMD on pull_request.
+                event: workflowFile.startsWith('pr-test-amd') ? 'pull_request' : 'pull_request_target',
                 per_page: 10,
               });
               return data.workflow_runs.find((run) => run.conclusion !== 'skipped')

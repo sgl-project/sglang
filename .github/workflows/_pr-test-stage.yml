@@ -100,8 +100,16 @@ env:
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
+
+# Jobs here run PR code (pull_request_target callers): a read-only token,
+# and checkouts don't persist it.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   run:
@@ -132,6 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
       - name: Resolve runner_config
@@ -221,7 +230,8 @@ jobs:
       - name: Export precision baseline env
         if: inputs.scheduled
         env:
-          BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+          # Repo secrets never reach pull_request_target runs: they carry PR code.
+          BASELINE_HF_TOKEN: ${{ github.event_name != 'pull_request_target' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
           {
             echo "SGLANG_PRECISION_BASELINE_DIR=/tmp/sglang_precision_baselines"
@@ -238,7 +248,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
-          HF_MUSE_SPARK_TOKEN: ${{ inputs.runner_config == '8-gpu-b300' && secrets.HF_MUSE_SPARK_TOKEN || '' }}
+          HF_MUSE_SPARK_TOKEN: ${{ github.event_name != 'pull_request_target' && inputs.runner_config == '8-gpu-b300' && secrets.HF_MUSE_SPARK_TOKEN || '' }}
           # Read only by test_runai_model_loader.py (nightly 1-gpu); inert elsewhere.
           # Left unconditional because an `env:` key cannot be omitted, and an empty
           # value would reach the runai streamer as a malformed limit.
@@ -283,7 +293,7 @@ jobs:
         with:
           artifact-suffix: ${{ matrix.partition }}
           tracker-issue: "26340"
-          bot-token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          bot-token: ${{ github.event_name != 'pull_request_target' && secrets.GH_PAT_FOR_PULL_REQUEST || '' }}
 
       - name: Cleanup venv
         if: always()

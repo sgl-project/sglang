@@ -19,8 +19,16 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: "1"
+
+# Jobs here run PR code (pull_request_target callers): a read-only token,
+# and checkouts don't persist it.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   run:
@@ -31,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
       - uses: ./.github/actions/check-pr-test-health

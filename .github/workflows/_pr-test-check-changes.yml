@@ -46,6 +46,14 @@ on:
       continue_on_error:
         value: ${{ jobs.run.outputs.continue_on_error }}
 
+# Jobs here run PR code (pull_request_target callers): a read-only token,
+# and checkouts don't persist it.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
 jobs:
   run:
     name: check-changes
@@ -69,6 +77,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
@@ -218,7 +227,7 @@ jobs:
 
       - name: Resolve CI labels
         id: ci-labels
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         uses: actions/github-script@v8
         with:
           script: |
