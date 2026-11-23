@@ -1,3 +1,4 @@
+import time
 from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -5,11 +6,16 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    PrefillStats,
+    SchedulerMetricsReporter,
+)
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -106,6 +112,73 @@ def _free_req(req, _tree_cache, *, checkpoint):
     req.kv.req_pool_idx = None
     req.kv.mark_kv_released()
     req.kv.mamba_pool_idx = None
+
+
+class TestPDTailGraphLogging(CustomTestCase):
+    def test_pd_result_reports_each_batches_actual_tail_replay_status(self):
+        """PD prefill must forward its stored verdict to the real batch logger."""
+        with get_context().override_server_args(
+            disaggregation_mode="prefill", enable_decoder_swa_bounded_replay=True
+        ):
+            scheduler = _Scheduler()
+            scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+            scheduler.forward_ct = 0
+            scheduler.waiting_queue = []
+            scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+            scheduler.pool_stats_observer = SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_prefill_usage_msg_parts=lambda: ["full token usage: 0.00"]
+                )
+            )
+            scheduler.kv_events_publisher = Mock()
+            reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+            reporter.scheduler = scheduler
+            reporter.is_stats_logging_rank = True
+            reporter.current_scheduler_metrics_enabled = False
+            reporter.last_prefill_stats_tic = time.perf_counter() - 1
+            reporter.stats = SimpleNamespace()
+            reporter._graph_backend_label = "cuda graph"
+            reporter.enable_mfu_metrics = False
+            scheduler.metrics_reporter = reporter
+            batch = SimpleNamespace(
+                reqs=[],
+                chunked_req=None,
+                spec_info=None,
+                forward_iter=None,
+                prefill_stats=PrefillStats(
+                    log_input_tokens=0,
+                    log_hit_tokens=0,
+                    new_token_ratio=1.0,
+                    num_running_reqs=SimpleNamespace(total=0),
+                    num_new_seqs=0,
+                ),
+                dp_cooperation_info=None,
+            )
+            # Process already-completed results in order, rather than reading
+            # mutable worker/model state from a later forward.
+            verdicts = (True, False, None)
+            results = [
+                GenerationBatchResult(
+                    next_token_ids=torch.empty(0, dtype=torch.int64),
+                    can_run_cuda_graph=True,
+                    tail_cuda_graph_replayed=verdict,
+                )
+                for verdict in verdicts
+            ]
+            with self.assertLogs(
+                "sglang.srt.managers.scheduler_components.metrics_reporter",
+                level="INFO",
+            ) as captured:
+                for result in results:
+                    scheduler.process_batch_result_disagg_prefill(batch, result)
+            self.assertEqual(len(captured.output), 3)
+            self.assertIn(
+                "cuda graph: True, tail cuda graph: True,", captured.output[0]
+            )
+            self.assertIn(
+                "cuda graph: True, tail cuda graph: False,", captured.output[1]
+            )
+            self.assertNotIn("tail cuda graph:", captured.output[2])
 
 
 @pytest.mark.parametrize(

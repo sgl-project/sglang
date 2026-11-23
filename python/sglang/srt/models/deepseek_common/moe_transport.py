@@ -166,6 +166,14 @@ class MoeRowTransport(ComputeTransport):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
+                cp = getattr(forward_batch, "attn_cp_metadata", None)
+                if (
+                    getattr(cp, "local_index", None) is not None
+                    and cp.moe_local_token_count is forward_batch.num_token_non_padded
+                ):
+                    # Tail graphs own this local count. Attention breaks only
+                    # refresh live rows; never route stale bucket padding.
+                    _mask_dp_pad_rows(hidden_states, forward_batch)
                 hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (

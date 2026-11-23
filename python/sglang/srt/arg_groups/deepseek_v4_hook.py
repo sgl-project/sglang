@@ -425,11 +425,20 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "both servers use the same block size and target/draft KV layout."
             )
 
+    # CP keeps its late layers in one eager BCG break. Only CUDA interleave
+    # has the CP-local input adapter and the full-row output bridge.
+    cp_bounded_bcg = (
+        get_platform().is_cuda
+        and cfg.cp_strategy == "interleave"
+        and cfg.pp_size == 1
+        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+    )
     incompatible = (
         (
             "prefill CP with the prefill CUDA graph",
             (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
-            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+            and not cp_bounded_bcg,
         ),
         (
             "the prefill CUDA graph",
@@ -459,6 +468,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+        logger.info("DeepSeek-V4.1 decoder SWA bounded replay resolved to True")
         return
 
     if cfg.enable_decoder_swa_bounded_replay is False:

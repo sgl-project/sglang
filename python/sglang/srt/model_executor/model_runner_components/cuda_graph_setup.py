@@ -461,6 +461,25 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    # Tail graphs are independent of the outer prefill graph. Capture them
+    # after the ordinary runners, before hooks and init-finished publication.
+    # DSpark drafts need not expose a target model body. Keep this optional
+    # target-only step out of draft/deferred setup and standalone models.
+    tail = None
+    if not model_runner.is_draft_worker and not defer_distributed_setup:
+        language_model = getattr(model_runner.model, "model", None)
+        tail = getattr(language_model, "decoder_replay_tail", None)
+    if tail is not None:
+        memory_gb, seconds = tail.capture_at_startup(
+            model_runner, eager_runner, prefill.runner
+        )
+        prefill = GraphCapture(
+            runner=prefill.runner,
+            memory_phase=prefill.memory_phase,
+            memory_usage_gb=prefill.memory_usage_gb + memory_gb,
+            capture_time=prefill.capture_time + seconds,
+        )
+
     if finalize:
         finalize_cuda_graph_capture(model_runner)
 

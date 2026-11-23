@@ -82,10 +82,13 @@ class _Graph:
 
 
 class RowBucketGraphRunner:
-    def __init__(self, *, row_step: int, max_rows: int, label: str) -> None:
+    def __init__(
+        self, *, row_step: int, max_rows: int, label: str, log_capture: bool = True
+    ) -> None:
         self.row_step = row_step
         self.max_rows = max_rows - max_rows % row_step
         self.label = label
+        self.log_capture = log_capture
         self._graphs: dict[tuple, _Graph] = {}
         self._static: dict[tuple, List[torch.Tensor]] = {}
         self._warm = False
@@ -93,10 +96,11 @@ class RowBucketGraphRunner:
         self.capture_bytes = 0
 
     def ready(self, num_tokens: int) -> bool:
-        """Whether graphs may run from this step on; every extend forward reports
-        its token count here. Kernels that size cached workspaces lazily by row
-        count reallocate them on a bigger step, which would leave earlier captures
-        reading freed memory; a full prefill chunk has grown them all."""
+        """Conservative full-chunk readiness gate for lazy callers.
+
+        Startup-prepared callers warm their token and request axes explicitly;
+        this token threshold alone does not establish workspace address stability.
+        """
         if not self._warm:
             chunk = get_schedule().chunked_prefill_size
             self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
@@ -123,6 +127,9 @@ class RowBucketGraphRunner:
         bucket_from: Optional[int] = None,
         out_rows: Optional[int] = None,
         global_num_rows: Optional[int] = None,
+        local_num_rows: int | None = None,
+        allow_capture: bool = True,
+        capture_all_buckets: bool = True,
     ) -> List[Optional[torch.Tensor]]:
         """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
         it on first use. ``key`` names what besides row count and input shapes
@@ -130,9 +137,26 @@ class RowBucketGraphRunner:
         replay with the breaks' and the body's batch; ``bucket_from`` picks the
         bucket from another row count. Returns views valid until the next replay,
         cut to ``out_rows`` rows. ``global_num_rows`` opts into a separate GLOBAL
-        device count and localizes the LOCAL count for the bucket's TP shards."""
+        device count and localizes the LOCAL count for the bucket's TP shards.
+        local_num_rows bounds valid local rows when live includes CP collective
+        padding; eager breaks still receive every physical live row.
+        allow_capture=False requires the exact graph before touching static inputs.
+        capture_all_buckets=False records only this bucket, using its own metadata.
+        """
+        if not allow_capture and not self.can_replay(
+            key=key,
+            live=live,
+            forward_batch=forward_batch,
+            bucket_from=bucket_from,
+            global_num_rows=global_num_rows,
+        ):
+            raise RuntimeError(f"{self.label}: graph was not captured during startup")
         num_rows = live[0].shape[0]
         out_rows = num_rows if out_rows is None else out_rows
+        if local_num_rows is not None:
+            assert global_num_rows is None
+            assert 0 <= local_num_rows <= num_rows, (local_num_rows, num_rows)
+            assert forward_batch.num_token_non_padded is not None
         rows = self.bucket_rows(num_rows if bucket_from is None else bucket_from)
         assert rows is not None, (num_rows, bucket_from)
         if global_num_rows is not None:
@@ -142,12 +166,7 @@ class RowBucketGraphRunner:
         static = self._static_inputs(input_key, live)
         for buf, t in zip(static, live):
             buf[:num_rows].copy_(t)
-        count_key = (
-            forward_batch.num_token_non_padded is not None,
-            global_num_rows is not None,
-            forward_batch.attn_tp_sequence_sharded,
-        )
-        graph_key = (key, input_key, count_key)
+        graph_key = self._graph_key(key, live, forward_batch, global_num_rows)
         # The eager breaks read the step's real row count off this view.
         step_batch = copy.copy(forward_batch)
         step_batch.global_num_token_non_padded_cpu = num_rows
@@ -163,7 +182,8 @@ class RowBucketGraphRunner:
                 # Largest first, so smaller buckets reuse the pool memory the
                 # larger ones took; a bucket below this step's rows cannot be
                 # captured here (the breaks write every live row).
-                for r in range(self.max_rows, rows - 1, -self.row_step):
+                first = self.max_rows if capture_all_buckets else rows
+                for r in range(first, rows - 1, -self.row_step):
                     if (r, graph_key) not in self._graphs:
                         self._graphs[(r, graph_key)] = self._capture(
                             r,
@@ -173,6 +193,7 @@ class RowBucketGraphRunner:
                             body,
                             batch_scope,
                             global_num_rows=global_num_rows,
+                            local_num_rows=local_num_rows,
                         )
             graph = self._graphs[(rows, graph_key)]
             if graph.packed_token_counts is not None:
@@ -189,12 +210,37 @@ class RowBucketGraphRunner:
                 )
                 step_batch.num_token_non_padded = graph.num_token_non_padded
             elif graph.num_token_non_padded is not None:
-                graph.num_token_non_padded.fill_(num_rows)
+                graph.num_token_non_padded.fill_(
+                    num_rows if local_num_rows is None else local_num_rows
+                )
                 step_batch.num_token_non_padded = graph.num_token_non_padded
             with batch_scope(step_batch, [buf[:rows] for buf in static]):
                 with graph_pool_replay_scope():
                     graph.graph.replay()
         return [None if t is None else t[:out_rows] for t in graph.outputs]
+
+    @staticmethod
+    def _graph_key(key, live, forward_batch, global_num_rows):
+        return (
+            key,
+            tuple((t.dtype, t.shape[1:]) for t in live),
+            (
+                forward_batch.num_token_non_padded is not None,
+                global_num_rows is not None,
+                forward_batch.attn_tp_sequence_sharded,
+            ),
+        )
+
+    def can_replay(
+        self, *, key, live, forward_batch, bucket_from=None, global_num_rows=None
+    ) -> bool:
+        rows = self.bucket_rows(
+            live[0].shape[0] if bucket_from is None else bucket_from
+        )
+        return (
+            rows,
+            self._graph_key(key, live, forward_batch, global_num_rows),
+        ) in self._graphs
 
     def _static_inputs(self, input_key, live) -> List[torch.Tensor]:
         static = self._static.get(input_key)
@@ -214,6 +260,7 @@ class RowBucketGraphRunner:
         batch_scope: BatchScope,
         *,
         global_num_rows: Optional[int] = None,
+        local_num_rows: int | None = None,
     ) -> _Graph:
         start = time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]
@@ -260,7 +307,8 @@ class RowBucketGraphRunner:
             capture_batch.num_token_non_padded = num_token_non_padded
         elif forward_batch.num_token_non_padded is not None:
             num_token_non_padded = torch.full_like(
-                forward_batch.num_token_non_padded, num_rows
+                forward_batch.num_token_non_padded,
+                num_rows if local_num_rows is None else local_num_rows,
             )
             capture_batch.num_token_non_padded = num_token_non_padded
         with (
@@ -310,7 +358,7 @@ class RowBucketGraphRunner:
                     cuda_graph=graph,
                     pool=pool,
                     stream=ctx.stream,
-                    # Captured while serving: other threads may use CUDA meanwhile.
+                    # Worker initialization can overlap background CUDA work.
                     capture_error_mode="thread_local",
                 ),
             ):
@@ -327,7 +375,7 @@ class RowBucketGraphRunner:
         used = free_before - torch.cuda.mem_get_info()[0]
         self.capture_seconds += seconds
         self.capture_bytes += used
-        if get_parallel().tp_rank == 0:
+        if self.log_capture and get_parallel().tp_rank == 0:
             logger.info(
                 "%s: captured %d rows (%d segments) in %.2f s, %.3f GiB; "
                 "%d graphs, %.2f s, %.3f GiB",
