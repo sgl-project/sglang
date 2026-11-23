@@ -698,6 +698,7 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                cache_controller.forward_on_fence_stream = self.enable_overlap
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -3474,6 +3475,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
+                filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
 
@@ -3547,6 +3549,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)

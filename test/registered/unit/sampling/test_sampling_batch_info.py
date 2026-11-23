@@ -328,6 +328,7 @@ class TestStepBuilds(CustomTestCase):
         stop_ids=None,
         eos_id=2,
         mask_mode=None,
+        filler_seed=0,
     ):
         req = MagicMock()
         req.sampling_params.top_k = top_k
@@ -340,7 +341,7 @@ class TestStepBuilds(CustomTestCase):
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
         req.grammar = None
-        req.filler_sampling_seed = None
+        req.filler_seed = filler_seed
         req.return_sampling_mask = mask_mode is not None
         req.sampling_logprobs_mode = mask_mode
         req.tokenizer.additional_stop_token_ids = None
@@ -373,23 +374,20 @@ class TestStepBuilds(CustomTestCase):
         info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
         self.assertIsNone(info.sampling_seed)
 
-    def test_unseeded_row_keeps_its_filler_seed_across_steps(self):
-        """An unseeded request samples with one random seed in every seeded step,
-        wherever its row is, and unseeded once no seeded row is left."""
+    def test_unseeded_row_samples_with_its_filler_seed(self):
+        """An unseeded request samples with its own filler seed in every seeded
+        step, wherever its row is, and unseeded once no seeded row is left."""
         seeded, a, b = (
             self._make_req(seed=123, top_k=50),
-            self._make_req(),
-            self._make_req(),
+            self._make_req(filler_seed=456),
+            self._make_req(filler_seed=789),
         )
         info = _make_info()
         info.set_seeds_and_mask_rows([seeded, a])
-        seed_a = info.sampling_seed[1].item()
-        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.sampling_seed.tolist(), [123, 456])
 
         info.set_seeds_and_mask_rows([b, a, seeded])
-        self.assertEqual(info.sampling_seed[1].item(), seed_a)
-        self.assertNotEqual(info.sampling_seed[0].item(), seed_a)
-        self.assertEqual(info.sampling_seed[2].item(), 123)
+        self.assertEqual(info.sampling_seed.tolist(), [789, 456, 123])
 
         info.set_seeds_and_mask_rows([b, a])
         self.assertIsNone(info.sampling_seed)

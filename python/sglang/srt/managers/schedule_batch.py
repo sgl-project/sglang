@@ -496,6 +496,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        filler_seed: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -570,11 +571,11 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
+        # Seed this row samples with in a seeded batch when it has no sampling_seed.
+        self.filler_seed = filler_seed
         # Index in the scheduler's PenaltyStatusPool, held while the request uses
         # a penalty; a retraction keeps it.
         self.penalty_index: Optional[int] = None
-        # The random seed this unseeded request samples with in a seeded step.
-        self.filler_sampling_seed: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
         self.page_guard_state: Optional[PageGuardState] = None

@@ -172,7 +172,7 @@ def configure_last_layer_ffn(
         and is_cuda()
         and get_parallel().tp_size == 1
         and model.pp_group.world_size == 1
-        and not get_parallel().enable_dp_attention
+        and get_parallel().attn_dp_size == 1
         and get_parallel().attn_cp_size == 1
         and get_exec().graph.cuda_graph_config.prefill.backend
         in (Backend.DISABLED, Backend.BREAKABLE)
