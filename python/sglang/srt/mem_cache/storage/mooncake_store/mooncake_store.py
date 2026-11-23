@@ -1867,7 +1867,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str], probe_only: bool = False) -> List[int]:
-        if probe_only:
+        if probe_only and hasattr(self.store, "batch_probe_key"):
             return self.store.batch_probe_key(key_strs)
         return self.store.batch_is_exist(key_strs)
 
