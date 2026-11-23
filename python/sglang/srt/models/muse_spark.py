@@ -1820,6 +1820,36 @@ class MuseSparkTextForCausalLM(nn.Module):
         if _hopper_kernels_enabled():
             self._dflash_context_projector = projector
 
+    def warm_eager_gemms(self, rows: int) -> None:
+        """Run the eager GEMMs (SP o_proj, FP32 router, input-logprob lm_head) once per row count
+        up to ``rows``, largest first: a shape's first cuBLASLt use stalls the host."""
+        ms = list(self.modules())
+        fw = next(
+            (
+                m._sp_full_weight
+                for m in ms
+                if getattr(m, "_sp_full_weight", None) is not None
+            ),
+            None,
+        )
+        gw = next(
+            (
+                m._split2_hilo
+                for m in ms
+                if getattr(m, "_split2_hilo", None) is not None
+            ),
+            None,
+        )
+        h = self.lm_head.weight.new_zeros(rows, self.config.hidden_size)
+        lp_rows = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
+        for t in range(rows, 0, -1):
+            if fw is not None:
+                torch.mm(h[:t], fw.t())
+            if gw is not None:
+                torch.mm(h[:t], gw, out_dtype=torch.float32)
+            if t <= lp_rows:
+                self.logits_processor._compute_lm_head(h[:t], self.lm_head)
+
     def supports_tree_verify(self) -> bool:
         """Token-tree verify needs the fused Hopper attention (tree masks)."""
         return self.model.language_model.hopper_kernels

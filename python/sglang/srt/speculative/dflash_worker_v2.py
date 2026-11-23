@@ -1201,44 +1201,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             h = dm._tp_split_fc(w.new_zeros(t, w.shape[1]))
             if kv and h is not None:
                 torch.mm(h, kv.flat_kv_weight.t())
-        # Row-split fc, KV and the target's SP o_proj GEMMs up to a chunk,
-        # largest first so every output reuses the first one's allocator block.
+        # Row-split fc and KV GEMMs up to a chunk, largest first so every output
+        # reuses the first one's allocator block; then the target's own eager GEMMs.
         n = max(get_schedule().chunked_prefill_size or 0, rows)
         x, h = (
             w.new_zeros(-(-n // get_parallel().tp_group.world_size), w.shape[1]),
             w.new_zeros(n, w.shape[0]),
-        )
-        tm = self.target_worker.model_runner.model
-        # lp: lm_head GEMM of the input-logprob chunks
-        ms, lp = list(tm.modules()), getattr(tm, "logits_processor", None)
-        fw = next(
-            (
-                m._sp_full_weight
-                for m in ms
-                if getattr(m, "_sp_full_weight", None) is not None
-            ),
-            None,
-        )
-        # fp32 router GEMM
-        gw = next(
-            (
-                m._split2_hilo
-                for m in ms
-                if getattr(m, "_split2_hilo", None) is not None
-            ),
-            None,
         )
         for t in range(n, 0, -1):
             if t <= x.shape[0]:
                 torch.mm(x[:t], w.t())
             if kv and t >= rows:
                 torch.mm(h[:t], kv.flat_kv_weight.t())
-            if fw is not None:
-                torch.mm(h[:t], fw.t())
-            if gw is not None:
-                torch.mm(h[:t], gw, out_dtype=torch.float32)
-            if lp is not None and t <= envs.SGLANG_LOGPROB_CHUNK_SIZE.get():
-                lp._compute_lm_head(h[:t], tm.lm_head)
+        warm_target = getattr(
+            self.target_worker.model_runner.model, "warm_eager_gemms", None
+        )
+        if warm_target is not None:
+            warm_target(n)
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -2397,9 +2376,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         self, target_hidden: torch.Tensor, tree_perm: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """`project_target_hidden`, its rows in committed order when `tree_perm` is given."""
-        if tree_perm is not None:
+        # one projection GEMM (no row split): rows do not depend on their order, so reorder the narrow output
+        late = (
+            tree_perm is not None
+            and getattr(self.draft_model, "projects_rows", False)
+            and target_hidden.shape[0] < 512
+        )
+        if tree_perm is not None and not late:
             target_hidden = _tree_hidden(target_hidden, tree_perm)
-        return self.draft_model.project_target_hidden(target_hidden)
+        ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+        return _tree_hidden(ctx_hidden, tree_perm) if late else ctx_hidden
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
