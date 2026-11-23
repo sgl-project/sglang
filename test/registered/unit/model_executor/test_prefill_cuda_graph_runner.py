@@ -905,7 +905,9 @@ class TestPrefillCudaGraphRunnerBodyTables(CustomTestCase):
         )
         body = MagicMock()
         runner_module.set_external_prefill_body(runner.model_runner.model, body)
-        forward_batch = SimpleNamespace(moe_num_token_non_padded=None)
+        forward_batch = SimpleNamespace(
+            moe_num_token_non_padded=None, moe_dp_real_rows=None
+        )
         runner._init_forward_metadata_for_capture(forward_batch, "bucket")
         runner._prepare_forward_metadata_for_replay(
             forward_batch, SimpleNamespace(), "bucket"
