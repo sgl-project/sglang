@@ -881,7 +881,7 @@ Notes:
 - Ngram speculative decoding **only supports CUDA**.
 - It currently **does not support** DP attention (`--attn-dp-size` > 1).
 - It disables the overlap scheduler and mixed chunked prefill.
-- If `--speculative-ngram-max-bfs-breadth > 1` (thus `speculative_eagle_topk > 1`) and `page_size > 1`, use `--attention-backend flashinfer`; otherwise the server will error.
+- If `--speculative-ngram-max-bfs-breadth > 1` (thus `speculative_eagle_topk > 1`) and `page_size > 1`, use `--attention-backend flashinfer`, or `intel_xpu` on Intel XPU; otherwise the server will error.
 
 ```bash Command
 python3 -m sglang.launch_server \
