@@ -66,6 +66,7 @@ class StableDiffusion3Pipeline(LoRAPipeline, ComposedPipelineBase):
     """StableDiffusion3 pipeline implementation."""
 
     pipeline_name = "StableDiffusion3Pipeline"
+    neg_cond_without_cfg_supported = True
 
     _required_config_modules = [
         "text_encoder",

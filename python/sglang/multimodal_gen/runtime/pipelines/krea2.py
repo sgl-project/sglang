@@ -31,6 +31,7 @@ _TEXT_MAX_LENGTH = 512
 
 class Krea2Pipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "Krea2Pipeline"
+    neg_cond_without_cfg_supported = True
 
     from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
     from sglang.multimodal_gen.configs.sample.krea2 import Krea2SamplingParams

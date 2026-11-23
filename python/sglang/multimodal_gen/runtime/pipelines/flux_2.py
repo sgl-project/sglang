@@ -35,6 +35,7 @@ def compute_empirical_mu(batch: Req, server_args: ServerArgs):
 
 class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "Flux2Pipeline"
+    neg_cond_without_cfg_supported = True
 
     _required_config_modules = [
         "text_encoder",

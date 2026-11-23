@@ -46,6 +46,7 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
+    neg_cond_without_cfg_supported = True
 
     # Used when the checkpoint is a single safetensors file with no
     # model_index.json to derive these from.

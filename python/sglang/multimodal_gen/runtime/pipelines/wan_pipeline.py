@@ -30,6 +30,7 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
     """
 
     pipeline_name = "WanPipeline"
+    neg_cond_without_cfg_supported = True
 
     _required_config_modules = [
         "text_encoder",
