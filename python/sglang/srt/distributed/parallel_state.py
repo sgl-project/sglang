@@ -2737,9 +2737,9 @@ def initialize_model_parallel(
         if (
             is_hip()
             and decode_context_parallel_size == tensor_model_parallel_size
-            # DCP must not inherit TP's QuickAllReduce: the MHA merge all-reduces
-            # bf16 outputs, which a quantized QR regime would round.
-            and _TP.qr_comm is None
+            # DCP must not reach TP's QuickAllReduce: its MHA merge all-reduces bf16,
+            # which a quantized QR regime would round. A disabled QR never dispatches.
+            and (_TP.qr_comm is None or _TP.qr_comm.disabled)
         ):
             # Full-width DCP preserves TP rank order.
             _DCP = _TP

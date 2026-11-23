@@ -12,6 +12,7 @@ This file doubles as the torchrun worker script.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 
@@ -26,6 +27,13 @@ register_amd_ci(est_time=90, suite="base-c-test-large-8-gpu-amd-mi35x")
 WORLD = 8
 ROWS = 4
 COLS = 64
+# (custom all-reduce, ROCM_QUICK_REDUCE_QUANTIZATION): QR absent, built but disabled
+# (NONE, the default and Kimi-K3.1's setting), and enabled with a quantized regime.
+MODES = {
+    "no-custom-ar": (False, "NONE"),
+    "qr-disabled": (True, "NONE"),
+    "qr-int8": (True, "INT8"),
+}
 
 
 def _inputs(rank: int, step: int, device: torch.device) -> dict[str, torch.Tensor]:
@@ -80,10 +88,11 @@ def _check(mode: str, out: dict[str, torch.Tensor], expected: dict[str, torch.Te
             raise AssertionError(f"{mode}: DCP {name} mismatch")
 
 
-def _worker(custom_all_reduce: bool) -> None:
+def _worker(mode: str) -> None:
     import sglang.srt.distributed.parallel_state as ps
     from sglang.test.test_utils import publish_build_topology
 
+    custom_all_reduce, _ = MODES[mode]
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -97,12 +106,20 @@ def _worker(custom_all_reduce: bool) -> None:
     ps.initialize_model_parallel()
     tp, dcp = ps._TP, ps._DCP
 
-    if tp.qr_comm is None:
-        assert dcp is tp, "full-width DCP must reuse the QR-free TP coordinator"
-    else:
-        assert dcp is not tp, "DCP must not share a TP coordinator with QuickAllReduce"
+    qr_runs = tp.qr_comm is not None and not tp.qr_comm.disabled
+    if mode == "qr-int8":
+        assert qr_runs, "gfx950 TP must build an enabled QuickAllReduce here"
+    if qr_runs:
+        assert dcp is not tp, "DCP must not share a TP coordinator whose QR runs"
         assert dcp.qr_comm is None
-    probe = torch.ones(ROWS, COLS, dtype=torch.bfloat16, device=device)
+    else:
+        assert dcp is tp, (
+            "full-width DCP must reuse a TP coordinator whose QR never runs"
+        )
+    # 8 MB of bf16: inside QR's size range at TP8, so the check below is not vacuous.
+    probe = torch.ones(4096, 1024, dtype=torch.bfloat16, device=device)
+    if qr_runs:
+        assert tp.qr_comm.should_quick_allreduce(probe)
     method = dcp._resolve_outplace_all_reduce_method(probe)
     assert method != "qr", "DCP all-reduce must never take QuickAllReduce"
 
@@ -137,27 +154,36 @@ def _worker(custom_all_reduce: bool) -> None:
     ps.destroy_model_parallel()
     ps.destroy_distributed_environment()
     if rank == 0:
-        print(
-            f"ALL PASSED (custom_all_reduce={custom_all_reduce}, dcp_is_tp={dcp is tp})"
-        )
+        print(f"ALL PASSED ({mode}, dcp_is_tp={dcp is tp})")
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 @pytest.mark.skipif(not is_hip(), reason="DCP reuses the TP coordinator on ROCm only")
-@pytest.mark.parametrize("custom_all_reduce", [False, True])
-def test_dcp8_collectives_eager_and_graph(custom_all_reduce: bool) -> None:
+@pytest.mark.parametrize("mode", list(MODES))
+def test_dcp8_collectives_eager_and_graph(mode: str) -> None:
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"needs {WORLD} GPUs")
+    # A loopback rendezvous: --standalone resolves the hostname, which containers may not.
     cmd = [
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--standalone",
+        "--nnodes=1",
         f"--nproc_per_node={WORLD}",
+        "--master_addr=127.0.0.1",
+        f"--master_port={_free_port()}",
         __file__,
-        "--custom-all-reduce" if custom_all_reduce else "--no-custom-all-reduce",
+        f"--mode={mode}",
     ]
+    env = dict(os.environ, ROCM_QUICK_REDUCE_QUANTIZATION=MODES[mode][1])
     result = subprocess.run(
         cmd,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -168,6 +194,8 @@ def test_dcp8_collectives_eager_and_graph(custom_all_reduce: bool) -> None:
 
 if __name__ == "__main__":
     if "LOCAL_RANK" in os.environ:
-        _worker(custom_all_reduce="--custom-all-reduce" in sys.argv)
+        _worker(
+            mode=next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--mode="))
+        )
     else:
         sys.exit(pytest.main([__file__, "-v", "-s"]))

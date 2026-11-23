@@ -513,17 +513,16 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             parallel_state.destroy_model_parallel()
 
 
-def _init_tp8_dcp(is_hip, dcp_size=8, tp_has_quick_allreduce=False):
+def _init_tp8_dcp(is_hip, dcp_size=8, tp_quick_allreduce=None):
+    """tp_quick_allreduce: None (no QR communicator), "disabled" or "enabled"."""
     created = {}
 
     def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
         group = Mock()
         group.device_group = Mock()
-        group.qr_comm = (
-            Mock()
-            if tp_has_quick_allreduce and kwargs.get("group_name") == "tp"
-            else None
-        )
+        group.qr_comm = None
+        if tp_quick_allreduce is not None and kwargs.get("group_name") == "tp":
+            group.qr_comm = Mock(disabled=tp_quick_allreduce == "disabled")
         created[kwargs.get("group_name", "unknown")] = group
         return group
 
@@ -581,16 +580,24 @@ def test_non_hip_full_width_dcp_keeps_separate_group():
     assert dcp_destroys == 1
 
 
-def test_hip_full_width_dcp_keeps_separate_group_when_tp_has_quick_allreduce():
-    """DCP must not inherit TP's QuickAllReduce: a quantized QR regime would round
-    the bf16 all-reduce of DCP's MHA merge, so DCP keeps its own QR-free group."""
+def test_hip_full_width_dcp_keeps_separate_group_when_tp_quick_allreduce_runs():
+    """DCP must not reach an enabled TP QuickAllReduce: a quantized QR regime would
+    round the bf16 all-reduce of DCP's MHA merge, so DCP keeps its own QR-free group."""
     created, tp, dcp, dcp_destroys, _ = _init_tp8_dcp(
-        is_hip=True, tp_has_quick_allreduce=True
+        is_hip=True, tp_quick_allreduce="enabled"
     )
     assert dcp is not tp
     assert created["dcp"] is dcp
     assert dcp.qr_comm is None
     assert dcp_destroys == 1
+
+
+def test_hip_full_width_dcp_reuses_tp_group_when_tp_quick_allreduce_is_disabled():
+    """A disabled QR (ROCM_QUICK_REDUCE_QUANTIZATION=NONE, the default) never
+    dispatches, so DCP still reuses TP's coordinator."""
+    created, tp, dcp, _, _ = _init_tp8_dcp(is_hip=True, tp_quick_allreduce="disabled")
+    assert "dcp" not in created
+    assert dcp is tp
 
 
 def test_destroy_model_parallel_destroys_each_aliased_group_once():
