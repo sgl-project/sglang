@@ -733,22 +733,17 @@ class CompressorAscendBackendMixin:
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.
-        mirrorless = not self.needs_cpu_seq_lens
-        verify_seq_lens_cpu = (
-            fm.actual_seq_lengths_kv[:bs] if mirrorless else fm.seq_lens_cpu_int[:bs]
-        )
+        verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
         if ragged_layout is not None:
-            verify_lens_cpu = ragged_layout.verify_lens
-            if not mirrorless:
-                verify_lens_cpu = verify_lens_cpu.to("cpu").to(torch.int64)
-                live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
-                    torch.int64
-                ).flatten()[:bs]
-                live_seq_lens_cpu = F.pad(
-                    live_seq_lens_cpu,
-                    (0, bs - live_seq_lens_cpu.numel()),
-                )
-                verify_seq_lens_cpu = live_seq_lens_cpu + verify_lens_cpu
+            verify_lens_cpu = ragged_layout.verify_lens.to("cpu").to(torch.int64)
+            live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
+                torch.int64
+            ).flatten()[:bs]
+            live_seq_lens_cpu = F.pad(
+                live_seq_lens_cpu,
+                (0, bs - live_seq_lens_cpu.numel()),
+            )
+            verify_seq_lens_cpu = live_seq_lens_cpu + verify_lens_cpu
 
         padding_sizes = {}
         for ratio in (4, 128):
@@ -757,15 +752,7 @@ class CompressorAscendBackendMixin:
             padding_size = max(1, min(t, t // ratio + bs))
             padding_sizes[ratio] = padding_size
             padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
-            if ragged_layout is None and mirrorless:
-                self._fill_verify_positions_cmp_padding_one_device(
-                    positions,
-                    padding,
-                    ratio,
-                    forward_batch.seq_lens[:bs],
-                    n_draft=n_draft,
-                )
-            elif ragged_layout is None:
+            if ragged_layout is None:
                 self._fill_verify_positions_cmp_padding_one(
                     positions, padding, ratio, verify_seq_lens_cpu, n_draft=n_draft
                 )
