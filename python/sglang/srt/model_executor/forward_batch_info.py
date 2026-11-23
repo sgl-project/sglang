@@ -585,6 +585,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # trailing speculative-verify requests; None (not 0) when there are none, so
     # the two-batch-overlap split, which rejects unknown non-None fields, still runs
     mixed_verify_rows: Optional[int] = None
+    # their dflash_tree (ancestor bits, depths); None: chains
+    mixed_verify_tree: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.

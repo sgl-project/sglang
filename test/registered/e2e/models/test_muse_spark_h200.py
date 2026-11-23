@@ -14,6 +14,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 # Aliased so pytest does not collect the imported `test_`-prefixed helpers as tests.
 from sglang.test.kl_test_utils import (
     _flush_cache,
+    _generate,
+    get_input_ids,
 )
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper as assert_logprobs_match_decode_cache_hit,
@@ -124,6 +126,17 @@ class TestMuseSparkH200(DefaultServerBase):
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
         self._match(assert_logprobs_match_decode_cache_hit)
+
+    def test_tree_verify_greedy_deterministic(self):
+        """Greedy without logprobs takes token-tree verify, which logprob requests skip;
+        at concurrency 1 from an empty cache two passes give identical tokens."""
+        prompts = get_input_ids(self.model)[:4]
+        runs = []
+        for _ in range(2):
+            _flush_cache(self.base_url)
+            outs = [_generate(self.base_url, ids, KL_MAX_NEW_TOKENS) for ids in prompts]
+            runs.append([out["output_ids"] for out in outs])
+        self.assertEqual(runs[0], runs[1])
 
 
 if __name__ == "__main__":

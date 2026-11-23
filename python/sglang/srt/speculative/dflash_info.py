@@ -56,6 +56,8 @@ class DFlashVerifyInput(SpecInput):
     # part of it this verify writes (`IterationIds.write_ids`).
     iteration_ids: Optional[IterationIds] = None
     iteration_cols: Optional[Cols] = None
+    tree_anc: Optional[torch.Tensor] = None
+    tree_depth: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
