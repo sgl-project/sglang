@@ -317,6 +317,11 @@ class RadixCache(BasePrefixCache):
             "lru" if self.disable else self.eviction_policy,
             None if self.disable else params.eviction_policy_config,
         )
+        # A request's priority enters the tree as an eviction sort key
+        # (larger = evicted later). With --schedule-low-priority-values-first
+        # lower values mean higher priority, so the key is negated on the way
+        # in; PriorityStrategy then needs no direction of its own.
+        self.priority_sign = -1 if params.schedule_low_priority_values_first else 1
 
         self.evictable_leaves = set()
         self.reset()
@@ -476,8 +481,10 @@ class RadixCache(BasePrefixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
-        # Radix Cache takes one ref in memory pool
-        priority = req.priority or 0
+        # Radix Cache takes one ref in memory pool; the priority enters the
+        # tree as an eviction sort key (larger = evicted later), flipped when
+        # lower values mean higher priority.
+        priority = (req.priority or 0) * self.priority_sign
         result = self.insert(
             InsertParams(
                 key=radix_key,
