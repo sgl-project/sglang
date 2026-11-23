@@ -7,9 +7,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.utils import setup_state_kv_args
+from sglang.srt.disaggregation.utils import (
+    get_dsa_tail_state_indices,
+    setup_state_kv_args,
+)
 from sglang.srt.hardware_backend.npu import memory_pool_npu
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+    NPUDSATokenToKVPool,
+    NPUMLATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -47,7 +53,7 @@ def _npu_mla(layer_num):
     )
 
 
-def _hybrid_npu_mla(full_layer_ids, state_layer_ids):
+def _hybrid_npu_mla(full_layer_ids, state_layer_ids, *, use_dsa=False):
     return HybridLinearKVPool(
         **_MLA,
         head_num=1,
@@ -55,9 +61,12 @@ def _hybrid_npu_mla(full_layer_ids, state_layer_ids):
         full_attention_layer_ids=list(full_layer_ids),
         mamba_pool=_recurrent_state(state_layer_ids),
         use_mla=True,
+        use_dsa=use_dsa,
         kv_lora_rank=16,
         qk_rope_head_dim=8,
-        full_kv_pool_class=NPUMLATokenToKVPool,
+        index_head_dim=128 if use_dsa else None,
+        kv_cache_dim=24 if use_dsa else None,
+        full_kv_pool_class=NPUDSATokenToKVPool if use_dsa else NPUMLATokenToKVPool,
     )
 
 
@@ -91,8 +100,8 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         # Full-attention layers 0, 2, 4; recurrent layers 1, 3, 5.
         self.target = _hybrid_npu_mla((0, 2, 4), (1, 3, 5))
 
-    def _assert_target_registered(self, kv_args):
-        self.assertEqual(kv_args.kv_buf_groups, 2)
+    def _assert_target_registered(self, kv_args, kv_buf_groups=2):
+        self.assertEqual(kv_args.kv_buf_groups, kv_buf_groups)
         self.assertEqual(kv_args.hidden_kv_layers, _TARGET_LAYERS)
         self.assertTrue(kv_args.is_hybrid_mla_backend)
         self.assertIn(StateType.MAMBA, kv_args.state_types)
@@ -115,6 +124,24 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         kv_args = _register(self.target, None)
         self._assert_target_registered(kv_args)
         self.assertEqual(kv_args.draft_kv_layers, 0)
+
+    def test_uncompressed_hybrid_dsa_registers_index_and_recurrent_state(self):
+        """PD must preserve both hybrid states while compression is disabled.
+
+        Losing the DSA index entry or advertising a nonexistent compressed tail
+        would make prefill and decode register incompatible cache layouts.
+        """
+        self.target = _hybrid_npu_mla((0, 2, 4), (1, 3, 5), use_dsa=True)
+        kv_args = _register(self.target, None)
+        self._assert_target_registered(kv_args, kv_buf_groups=3)
+        self.assertIn(StateType.DSA, kv_args.state_types)
+        self.assertNotIn(StateType.DSA_TAIL, kv_args.state_types)
+        dsa_index = kv_args.state_types.index(StateType.DSA)
+        self.assertEqual(
+            kv_args.state_data_ptrs[dsa_index],
+            self.target.full_kv_pool.get_state_buf_infos()[0],
+        )
+        self.assertEqual(get_dsa_tail_state_indices(self.target, 0, 3), [])
 
 
 if __name__ == "__main__":
