@@ -188,6 +188,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_B = None
         self.lora_output_offset = None
         self.has_lora_output_offset = False
+        self._has_preserved_base_snapshot: bool = False
         self._fused_lora_cache: tuple[tuple, torch.Tensor, torch.Tensor] | None = None
 
     @property
@@ -479,6 +480,12 @@ class BaseLayerWithLoRA(nn.Module):
                           If False, append to existing list (for multi-LoRA support).
             output_offset: Optional constant output term paired with this adapter
         """
+        if merge_weights and self._has_preserved_base_snapshot:
+            raise RuntimeError(
+                "Cannot merge LoRA weights onto a layer with a preserved pre-commit "
+                "base snapshot; call restore_committed_base() first."
+            )
+
         lora_A_param = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
@@ -720,6 +727,11 @@ class BaseLayerWithLoRA(nn.Module):
         unmerge snapshot is the untouched base view — zero-copy, because
         nothing wrote the base storage.
         """
+        if self._has_preserved_base_snapshot:
+            raise RuntimeError(
+                "Cannot install merged weights onto a layer with a preserved pre-commit "
+                "base snapshot; call restore_committed_base() first."
+            )
         self.weight.data = merged
         self.merged = True
         self.cpu_weight = base_view.detach()
@@ -727,6 +739,11 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
+        if not self.disable_lora and self._has_preserved_base_snapshot:
+            raise RuntimeError(
+                "Cannot merge LoRA weights onto a layer with a preserved pre-commit "
+                "base snapshot; call restore_committed_base() first."
+            )
         if strength is not None:
             self.strength = strength
             if self.lora_weights_list:
@@ -851,13 +868,7 @@ class BaseLayerWithLoRA(nn.Module):
         write_dense_weight(self.base_layer, merged)
         self.merged = True
 
-    @torch.no_grad()
-    def unmerge_lora_weights(self) -> None:
-        if not self.merged:
-            raise ValueError(
-                "LoRA weights not merged. Please merge them first before unmerging."
-            )
-
+    def _restore_base_from_snapshot(self) -> None:
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
@@ -873,16 +884,34 @@ class BaseLayerWithLoRA(nn.Module):
             restored = self.cpu_weight.clone()
             write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
 
+    @torch.no_grad()
+    def unmerge_lora_weights(self) -> None:
+        if not self.merged:
+            raise ValueError(
+                "LoRA weights not merged. Please merge them first before unmerging."
+            )
+
+        self._restore_base_from_snapshot()
         self.merged = False
 
-    @torch.no_grad()
-    def commit_merged_as_base(self) -> None:
-        """Promote the currently merged weights to the permanent base.
+    @property
+    def has_preserved_base_snapshot(self) -> bool:
+        return self._has_preserved_base_snapshot
 
-        Re-snapshots ``cpu_weight`` so the merged weights become the restore
-        target and resets adapter bookkeeping (``merged=False``). A later dynamic
-        ``set_lora_weights`` then adds its delta on top of the merged base instead
-        of unmerging it.
+    @torch.no_grad()
+    def commit_merged_as_base(self, *, preserve_base_snapshot: bool = False) -> None:
+        """Promote the currently merged weights to the base.
+
+        Resets adapter bookkeeping (``merged=False``) so a later dynamic
+        ``set_lora_weights`` adds its delta on top of the merged weights instead
+        of unmerging them.
+
+        When ``preserve_base_snapshot`` is False (default), re-snapshots
+        ``cpu_weight`` so the merged weights become the permanent restore
+        target. When True, keeps the existing pre-merge ``cpu_weight`` snapshot
+        intact so ``restore_committed_base`` can later recover the exact
+        original base weights without extra host memory or reverse-merge
+        rounding drift.
         """
         if not self.merged:
             return
@@ -891,25 +920,37 @@ class BaseLayerWithLoRA(nn.Module):
                 "A LoRA with a constant output offset cannot be committed as a "
                 "weight-only base."
             )
-        weight = self.base_layer.weight
-        if isinstance(weight, DTensor):
-            weight = weight.to_local()
+        if preserve_base_snapshot:
+            self._ensure_base_snapshot_owned()
+            self._has_preserved_base_snapshot = True
         else:
-            # Under layerwise offload the parameter is a (1,) placeholder; the
-            # merged weight lives in the manager's CPU view.
-            weight, _ = self._materialized_weight_src()
-        # clone(): to("cpu") may alias storage; we must not mutate this backup.
-        self.cpu_weight = weight.detach().to("cpu").clone()
-        self._base_is_view = False
+            weight = self.base_layer.weight
+            if isinstance(weight, DTensor):
+                weight = weight.to_local()
+            else:
+                # Under layerwise offload the parameter is a (1,) placeholder; the
+                # merged weight lives in the manager's CPU view.
+                weight, _ = self._materialized_weight_src()
+            # clone(): to("cpu") may alias storage; we must not mutate this backup.
+            self.cpu_weight = weight.detach().to("cpu").clone()
+            self._base_is_view = False
+            self._has_preserved_base_snapshot = False
         self.merged = False
         self.disable_lora = True
-        self.lora_weights_list = []
-        self.lora_A = None
-        self.lora_B = None
-        self.lora_output_offset = None
-        self.has_lora_output_offset = False
-        self.lora_path = None
-        self.strength = 1.0
+        self.clear_lora_weights()
+        self._fused_lora_cache = None
+
+    @torch.no_grad()
+    def restore_committed_base(self) -> None:
+        """Restore the pre-commit base weights preserved by ``commit_merged_as_base``."""
+        if not self._has_preserved_base_snapshot:
+            return
+        self._restore_base_from_snapshot()
+        self._has_preserved_base_snapshot = False
+        self.merged = False
+        self.disable_lora = True
+        self.clear_lora_weights()
+        self._fused_lora_cache = None
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):

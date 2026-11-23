@@ -814,7 +814,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             return
 
         for layer in self.lora_layers.values():
-            layer.commit_merged_as_base()
+            layer.commit_merged_as_base(preserve_base_snapshot=True)
         # Keep the adapter loaded for the stage-2 delta; clear merged bookkeeping.
         self.is_lora_merged["transformer"] = False
         self.cur_adapter_strength.pop("transformer", None)
@@ -830,28 +830,38 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         )
 
     def _unmerge_stage1_distilled_from_base(self) -> None:
-        """Restore the base weights and revert to per-request merging.
+        """Restore the original base weights and revert to per-request merging.
 
         Used when a request overrides the stage-1 strength away from the merged
-        value. Subtracts the merged delta, then disables the optimization.
+        value. Restores each layer from its preserved pre-commit snapshot so the
+        base is recovered bit-exactly without a reverse merge.
         """
         if not self._stage1_distilled_in_base:
             return
-        self.set_lora(
-            lora_nickname="ltx2_stage1_distilled",
-            lora_path=self._distilled_lora_path,
-            target="transformer",
-            strength=-float(self._stage1_distilled_base_strength),
-            merge_weights=True,
-        )
-        for layer in self.lora_layers.values():
-            layer.commit_merged_as_base()
+        # Invalidate the baked-in strength and cached phase before mutating any
+        # layer: if restoration fails partway through, _stage1_distilled_in_base
+        # stays True with base_strength=None so the next phase switch retries
+        # and finishes restoring the remaining layers instead of running mixed
+        # weights.
+        self._stage1_distilled_base_strength = None
+        self._active_lora_signature = None
         self.is_lora_merged["transformer"] = False
         self.cur_adapter_strength.pop("transformer", None)
         self.cur_adapter_config.pop("transformer", None)
+        self._invalidate_lora_conditioning()
+        target_modules = [("transformer", self.lora_layers)]
+        with self._weight_update_context(target_modules):
+            for layer in self.lora_layers.values():
+                if layer.has_preserved_base_snapshot:
+                    layer.restore_committed_base()
+                else:
+                    layer.disable_lora = True
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            finish_offload_writeback,
+        )
+
+        finish_offload_writeback()
         self._stage1_distilled_in_base = False
-        self._stage1_distilled_base_strength = None
-        self._active_lora_signature = None
         logger.info("Restored LTX-2 base; reverting to per-request stage-1 merge.")
 
     def _switch_lora_phase_base_merged(
@@ -870,6 +880,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             self.deactivate_lora_weights(target="transformer")
             return True
         if phase == "stage2":
+            if self._stage1_distilled_base_strength is None:
+                self._unmerge_stage1_distilled_from_base()
+                return False
             delta = distilled_lora_strength - float(
                 self._stage1_distilled_base_strength
             )
