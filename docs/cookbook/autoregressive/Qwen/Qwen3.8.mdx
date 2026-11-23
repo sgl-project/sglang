@@ -200,7 +200,7 @@ Nothing else can use it: the fusion needs DP-attention off and the built-in TP M
 
 Recommended: **MI355X + MXFP4, single node, TP8**. MI350X emits the identical command (same gfx950, same 288GB, same `mi35x` image); MI300X is CDNA3, takes the `mi30x` image, and needs two nodes for the FP8 weights.
 
-- **`--mem-fraction-static` looks aggressive on purpose.** With the aiter backend above 8192 context SGLang multiplies it by **0.85** before allocating, so MI355X's `0.9` lands at ≈0.765 and MI300X's `1.0` at ≈0.85. Don't "fix" these downward. MI300X must stay at 1.0 or the weights stop fitting.
+- **`--mem-fraction-static` is the fraction that allocates.** An explicit value is used as-is. Above 8192 context the aiter backend multiplies the fraction by 0.85 only when the flag is left unset. These recipes pass the fraction that reserve used to produce: `0.765` on MI355X/MI350X and `0.85` on MI300X. MI300X must stay at 0.85 or the weights stop fitting.
 - **`--disable-custom-all-reduce` belongs on every MI300X rank** — SGLang resolves it per process, so setting it on one node would leave the two pipeline stages reducing through different code paths.
 - MI300X runs `--kv-cache-dtype fp8_e4m3` with `--page-size 16`: at 8 × 192GB per node the shape is memory-bound.
 

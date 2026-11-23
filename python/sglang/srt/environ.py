@@ -1248,14 +1248,6 @@ class Envs:
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
-    # Above 8192 tokens of context, aiter's non-static workspace is large enough
-    # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
-    # honor an explicitly passed --mem-fraction-static instead. Off by default:
-    # the reserve is load-bearing, and skipping it OOMs long-context aiter serving
-    # that fits comfortably with it (67.32 GiB request against 47.40 GiB free on a
-    # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
-    # scaled fraction is itself too small to hold the model weights.
-    SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
     # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
@@ -2761,7 +2753,20 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    # Opt-in that made aiter keep an explicit --mem-fraction-static. That is
+    # now unconditional: the 0.85 reserve applies only to the automatic
+    # fraction. Setting this (including to 0) does not restore the old scale
+    # of an explicit value; pass a smaller --mem-fraction-static instead.
+    "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION": _DeprecatedEnv(
+        note=(
+            "An explicit --mem-fraction-static is always used as-is with the "
+            "aiter backend. The 0.85 workspace reserve applies only when "
+            "--mem-fraction-static is left unset, and setting this variable "
+            "no longer changes that. Unset it."
+        ),
+    ),
+}
 
 
 def _handle_deprecated_envs():

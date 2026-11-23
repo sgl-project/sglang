@@ -738,8 +738,8 @@ export const config = {
     {
       // MI355X / MXFP4 — single node, TP8. SGLANG_USE_AITER gates the AITER
       // MXFP4-MoE / GEMM / norm / rope kernels; the ROCm image sets it, a
-      // bare-pip host does not. mem-fraction 0.9 is pre-scaling — aiter
-      // multiplies it by 0.85 above 8K context, so ~0.765 effective.
+      // bare-pip host does not. 0.765 is the fraction the old aiter 0.85
+      // scale applied to an explicit 0.9; an explicit value is no longer scaled.
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
@@ -749,7 +749,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.765",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -758,7 +758,7 @@ export const config = {
     },
     {
       // MI350X — identical command to MI355X (same CDNA4 gfx950, same 288GB, same
-      // mi35x ROCm image).
+      // mi35x ROCm image). 0.765 matches the MI355X cell above.
       match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
@@ -768,7 +768,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.765",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -779,7 +779,9 @@ export const config = {
       // MI300X / FP8 — 2 nodes x 8 GPUs, TP8 x PP2 (gfx942 has no MXFP4 hardware,
       // and ~2.4TB of FP8 does not fit 1.5TB per node). --disable-custom-all-reduce
       // puts the intra-node all-reduce on RCCL and must be on every rank;
-      // mem-fraction 1.0 is ~0.85 effective after the aiter scale.
+      // 0.85 is the fraction the old aiter 0.85 scale applied to an explicit
+      // 1.0. An explicit value is no longer scaled, and 0.85 is what fits the
+      // FP8 weights.
       match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "multi-2" },
       verified: true,
       env: [
@@ -795,7 +797,7 @@ export const config = {
         "--page-size 16",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 1.0",
+        "--mem-fraction-static 0.85",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",

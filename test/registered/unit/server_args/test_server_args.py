@@ -8,6 +8,7 @@ import socket
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -110,7 +111,7 @@ from sglang.srt.entrypoints.sidecar import (
     rust_server_sidecar,
     start_sidecar,
 )
-from sglang.srt.environ import REMOVED_ENVS, envs
+from sglang.srt.environ import _DEPRECATED_ENVS, REMOVED_ENVS, envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -2198,6 +2199,133 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
+
+
+class TestAiterExplicitMemFraction(CustomTestCase):
+    """Aiter multiplied an explicit --mem-fraction-static by 0.85 whenever
+    the context length was above 8192. That reserve stays for the automatic
+    fraction; a value the operator passed is the value that allocates.
+    """
+
+    _ENV = "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION"
+
+    def _args(
+        self,
+        *,
+        backend,
+        context_len,
+        raw_mem_fraction,
+        resolved_mem_fraction=None,
+    ):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend=backend,
+            mem_fraction_static=raw_mem_fraction,
+        )
+        args._model_config = SimpleNamespace(
+            context_len=context_len,
+            is_encoder_decoder=False,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            hf_text_config=None,
+        )
+        # Same snapshot the resolution pipeline records before any handler
+        # fills mem_fraction_static.
+        args._raw_input = {"mem_fraction_static": raw_mem_fraction}
+        if raw_mem_fraction is None and resolved_mem_fraction is not None:
+            args._resolved_overrides = [
+                (
+                    "_handle_gpu_memory_settings",
+                    {"mem_fraction_static": resolved_mem_fraction},
+                )
+            ]
+        return args
+
+    def _fraction(self, args):
+        return resolution_result(args, "mem_fraction_static")
+
+    def test_explicit_value_is_not_scaled_on_long_context_aiter(self):
+        for raw in (0.8, 0.0):
+            with self.subTest(raw=raw):
+                args = self._args(
+                    backend="aiter",
+                    context_len=16384,
+                    raw_mem_fraction=raw,
+                )
+                handle_attention_backend_compatibility(args)
+                self.assertEqual(args.mem_fraction_static, raw)
+                self.assertEqual(self._fraction(args), raw)
+
+    def test_automatic_fraction_is_scaled_and_logged(self):
+        args = self._args(
+            backend="aiter",
+            context_len=8193,
+            raw_mem_fraction=None,
+            resolved_mem_fraction=0.88,
+        )
+        with self.assertLogs(
+            "sglang.srt.arg_groups.attention_hook", level="INFO"
+        ) as logs:
+            handle_attention_backend_compatibility(args)
+        self.assertIsNone(args.mem_fraction_static)
+        self.assertEqual(self._fraction(args), 0.88 * 0.85)
+        message = "\n".join(logs.output)
+        self.assertIn("0.880", message)
+        self.assertIn("0.748", message)
+
+    def test_automatic_fraction_is_unchanged_at_context_boundary(self):
+        args = self._args(
+            backend="aiter",
+            context_len=8192,
+            raw_mem_fraction=None,
+            resolved_mem_fraction=0.88,
+        )
+        handle_attention_backend_compatibility(args)
+        self.assertEqual(self._fraction(args), 0.88)
+
+    def test_non_aiter_backend_is_not_scaled(self):
+        for raw, resolved in ((0.8, None), (None, 0.88)):
+            with self.subTest(raw=raw):
+                args = self._args(
+                    backend="fa3",
+                    context_len=16384,
+                    raw_mem_fraction=raw,
+                    resolved_mem_fraction=resolved,
+                )
+                handle_attention_backend_compatibility(args)
+                self.assertEqual(self._fraction(args), 0.8 if raw is not None else 0.88)
+
+    def test_deprecated_env_does_not_change_either_path(self):
+        self.assertIn(self._ENV, _DEPRECATED_ENVS)
+        self.assertNotIn(self._ENV, REMOVED_ENVS)
+        self.assertIsNone(vars(type(envs)).get(self._ENV))
+
+        for value in ("0", "1", "false", "true"):
+            with self.subTest(value=value):
+                os.environ[self._ENV] = value
+                self.addCleanup(os.environ.pop, self._ENV, None)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    _DEPRECATED_ENVS[self._ENV].apply(self._ENV)
+                text = " ".join(str(item.message) for item in caught)
+                self.assertIn(self._ENV, text)
+                self.assertIn("deprecated", text)
+                self.assertIn("--mem-fraction-static", text)
+
+                explicit = self._args(
+                    backend="aiter",
+                    context_len=16384,
+                    raw_mem_fraction=0.8,
+                )
+                automatic = self._args(
+                    backend="aiter",
+                    context_len=16384,
+                    raw_mem_fraction=None,
+                    resolved_mem_fraction=0.8,
+                )
+                handle_attention_backend_compatibility(explicit)
+                handle_attention_backend_compatibility(automatic)
+                self.assertEqual(self._fraction(explicit), 0.8)
+                self.assertEqual(self._fraction(automatic), 0.8 * 0.85)
 
 
 class TestContextParallelServerArgs(CustomTestCase):

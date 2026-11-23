@@ -497,7 +497,6 @@ python -m sglang.launch_server \
 ```bash HiCache (high concurrency)
 PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
   --tp-size 4 \
   --ep-size 4 \
   --page-size 128 \

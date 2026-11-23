@@ -1919,8 +1919,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use an explicitly passed <code>--mem-fraction-static</code> as-is on AITER with context length above 8192, instead of scaling it by 0.85 to reserve non-static attention workspace. Skipping the reserve can OOM long-context serving; set it only when the scaled fraction is too small to hold the model weights.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Deprecated, and ignored. An explicit <code>--mem-fraction-static</code> is always used as-is with the aiter backend. Above 8192 tokens of context, aiter still multiplies an <em>automatic</em> fraction by 0.85 to reserve non-static attention workspace. Setting this variable, including to <code>0</code>, does not bring that scale back for an explicit value; pass a smaller <code>--mem-fraction-static</code> instead. Startup warns when the variable is set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>deprecated</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND</code></td>
