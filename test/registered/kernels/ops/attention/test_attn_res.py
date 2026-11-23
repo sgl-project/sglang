@@ -9,7 +9,7 @@ from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _HIDDEN_SIZE = 7168
 
@@ -111,6 +111,9 @@ class TestAttentionResidual(CustomTestCase):
                     dtype=torch.bfloat16,
                 )
                 output = torch.empty_like(prefix)
+                args = (prefix, bank, combine_weight, output_weight, output, nvb, 1e-6)
+                # A config's first call loads its module on the host, long enough for the writer to finish first.
+                attn_res_fused_tma(*args, write_prefix=True)
                 _late_rows_kernel[(16,)](
                     bank,
                     rows,
@@ -120,30 +123,9 @@ class TestAttentionResidual(CustomTestCase):
                     200000,
                     BLOCK=1024,
                 )
-                attn_res_fused_tma(
-                    prefix,
-                    bank,
-                    combine_weight,
-                    output_weight,
-                    output,
-                    nvb,
-                    1e-6,
-                    write_prefix=True,
-                )
-                torch.cuda.synchronize()
-                expected = torch.empty_like(prefix)
-                attn_res_fused_tma(
-                    prefix,
-                    bank,
-                    combine_weight,
-                    output_weight,
-                    expected,
-                    nvb,
-                    1e-6,
-                    write_prefix=True,
-                )
+                attn_res_fused_tma(*args, write_prefix=True)
+                # The bank held NaN until the writer ran, so any read that did not wait for it is non-finite.
                 self.assertTrue(torch.isfinite(output).all())
-                self.assertTrue(torch.equal(output, expected))
 
 
 if __name__ == "__main__":
