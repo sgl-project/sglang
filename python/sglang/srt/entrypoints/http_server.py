@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import errno
 import inspect
+import ipaddress
 import logging
 import os
 import signal
@@ -133,6 +134,9 @@ from sglang.srt.entrypoints.server_utils import (
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.entrypoints.uvicorn_worker_spawn import (
+    skip_main_reimport_in_spawned_workers,
+)
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -166,6 +170,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    ShutdownReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -186,6 +191,7 @@ from sglang.srt.managers.tokenizer_manager import (
     ServerStatus,
     TokenizerManager,
     get_tokenizer_worker_class,
+    wait_for_schedulers_to_exit,
 )
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
@@ -200,7 +206,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     delete_directory,
@@ -216,6 +222,7 @@ from sglang.srt.utils.json_response import (
     model_json_response,
     orjson_response,
 )
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -253,6 +260,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     Initialization function for multi-process tokenizer mode.
     It read args information from shm and inits tokenizer manager for current process.
     """
+    # Workers do not re-run the launcher module, which applies these filters.
+    suppress_noisy_warnings()
 
     # Read configuration from shared memory
     main_pid = get_main_process_id()
@@ -312,6 +321,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
+        _set_uvicorn_worker_stop_hook(_global_state.tokenizer_manager)
         worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
@@ -438,7 +448,6 @@ async def lifespan(fast_api_app: FastAPI):
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
-            and not (get_serving().smg_grpc_mode or get_serving().grpc_mode)
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
@@ -972,6 +981,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    # The streaming response holds `request` until the request finishes.
+    request.__dict__.pop("_json", None)
     return await serve_generate_request(obj, request)
 
 
@@ -984,11 +995,26 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            # A client may stop reading at a request's finishing event; a proxy
+            # that has not read [DONE] by then sees a cancelled stream. So a
+            # single request's last event, and an error event, go out in one
+            # write with [DONE]. A batch (several prompts, or n > 1) still
+            # writes [DONE] on its own. The tokenizer manager sets is_single
+            # when it normalizes obj, before the first output; one that
+            # normalizes a copy leaves it unset, which reads as a batch.
+            done_sent = False
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
+                    event = b"data: " + dumps_json(out) + b"\n\n"
+                    if (
+                        getattr(obj, "is_single", False)
+                        and out["meta_info"]["finish_reason"] is not None
+                    ):
+                        event += b"data: [DONE]\n\n"
+                        done_sent = True
+                    yield event
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -1006,8 +1032,10 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                     }
                 }
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + dumps_json(out) + b"\n\n"
-            yield b"data: [DONE]\n\n"
+                yield b"data: " + dumps_json(out) + b"\n\ndata: [DONE]\n\n"
+                done_sent = True
+            if not done_sent:
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
             stream_results(),
@@ -1750,18 +1778,18 @@ async def parse_function_call_request(
             chat_encoding_spec=chat.chat_encoding_spec,
             adapter=chat.encoding_adapter,
         )
+        if text_parser is None:
+            # 1) Initialize the parser based on the request body
+            parser = FunctionCallParser(
+                tools=obj.tools,
+                tool_call_parser=obj.tool_call_parser,
+                tokenizer=get_global_state().tokenizer_manager.tokenizer,
+            )
     except ValueError as error:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
     if text_parser is not None:
         normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
     else:
-        # 1) Initialize the parser based on the request body
-        parser = FunctionCallParser(
-            tools=obj.tools,
-            tool_call_parser=obj.tool_call_parser,
-            tokenizer=get_global_state().tokenizer_manager.tokenizer,
-        )
-
         # 2) Call the non-stream parsing method (non-stream)
         normal_text, calls = parser.parse_non_stream(obj.text)
 
@@ -2672,10 +2700,17 @@ class _SigquitForwardingMultiprocess(Multiprocess):
             kill_process_tree(os.getpid())
 
 
-def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+def _run_uvicorn_workers(
+    app_path: str, reserved_socket: Optional[socket.socket] = None, **uvicorn_options
+) -> None:
     """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
     config = uvicorn.Config(app_path, **uvicorn_options)
-    sockets = [config.bind_socket()]
+    if reserved_socket is None:
+        sockets = [config.bind_socket()]
+    else:
+        # The workers take the listener as bind_socket() leaves it.
+        reserved_socket.set_inheritable(True)
+        sockets = _reserved_sockets(config, reserved_socket)
     if "target" in inspect.signature(Multiprocess.__init__).parameters:
         # uvicorn < 0.51 (not pinned on every platform): the supervisor is
         # given the server's run().
@@ -2685,6 +2720,33 @@ def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
     else:
         supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
     supervisor.run()
+
+
+def _set_uvicorn_worker_stop_hook(tokenizer_manager: TokenizerManager) -> None:
+    handler = signal.getsignal(signal.SIGTERM)
+    if inspect.ismethod(handler) and isinstance(handler.__self__, uvicorn.Server):
+        server = handler.__self__
+        tokenizer_manager.set_server_stop_hook(
+            lambda: setattr(server, "should_exit", True)
+        )
+    else:
+        logger.warning(
+            "SIGTERM handler %r is not a uvicorn.Server method; this tokenizer "
+            "worker will exit on SIGTERM without the lifespan shutdown.",
+            handler,
+        )
+
+
+def _shutdown_schedulers_after_http_workers(
+    *,
+    router: MultiTokenizerRouter,
+    subprocess_watchdog: Optional[SubprocessWatchdog],
+) -> None:
+    if subprocess_watchdog is not None:
+        subprocess_watchdog.stop()
+    router.dispatch_to_scheduler(ShutdownReq())
+    wait_for_schedulers_to_exit()
+    kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
 
 class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
@@ -2893,6 +2955,57 @@ def _run_granian_server(
         server.serve()
 
 
+def _reserve_http_socket(server_args: ServerArgs) -> Optional[socket.socket]:
+    """Bind host:port before the model load, for the HTTP server to listen on.
+
+    connect() never picks an explicitly bound port as its source port, so the
+    load cannot take it; until uvicorn listens, clients are refused at once.
+    """
+    if server_args.node_rank >= 1 or envs.SGLANG_RUST_SERVER.get():
+        # Those serve host:port from another process.
+        return None
+    try:
+        version = ipaddress.ip_address(server_args.host).version
+    except ValueError:
+        # uvicorn binds every address a host name resolves to.
+        return None
+
+    family = socket.AF_INET6 if version == 6 else socket.AF_INET
+    sock = socket.socket(family=family)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6 and server_args.tokenizer_worker_num == 1:
+            # uvloop's create_server sets it; uvicorn's worker listener does not.
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((server_args.host, server_args.port))
+    except OSError as error:
+        sock.close()
+        # The port may still free up during the load, so the server's own bind
+        # decides, as before.
+        logger.warning(
+            f"Could not reserve {server_args.host}:{server_args.port} for the HTTP "
+            f"server: {error}"
+        )
+        return None
+    return sock
+
+
+def _reserved_sockets(
+    config: uvicorn.Config, reserved_socket: Optional[socket.socket]
+) -> Optional[List[socket.socket]]:
+    if reserved_socket is None:
+        return None
+    # uvicorn logs this only for a listener it binds itself.
+    address = f"[{config.host}]" if ":" in config.host else config.host
+    logging.getLogger("uvicorn.error").info(
+        "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)",
+        "https" if config.is_ssl else "http",
+        address,
+        config.port,
+    )
+    return [reserved_socket]
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
@@ -2902,10 +3015,13 @@ def _setup_and_run_http_server(
     subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    reserved_socket: Optional[socket.socket] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
-    Called by launch_server after subprocesses have been launched.
+    Called by launch_server after subprocesses have been launched. reserved_socket,
+    if any, is bound to host:port; servers that bind host:port themselves get it
+    closed first.
     """
     # Set global states
     set_global_state(
@@ -2961,6 +3077,8 @@ def _setup_and_run_http_server(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{get_serving().host}:{get_serving().port}"
                 )
+                if reserved_socket is not None:
+                    reserved_socket.close()
                 _run_granian_server(
                     host=get_serving().host,
                     port=get_serving().port,
@@ -3013,7 +3131,9 @@ def _setup_and_run_http_server(
                     )
                     logger.info("SSL certificate auto-refresh enabled.")
                     try:
-                        await server.serve()
+                        await server.serve(
+                            sockets=_reserved_sockets(config, reserved_socket)
+                        )
                     finally:
                         refresher.stop()
 
@@ -3042,7 +3162,7 @@ def _setup_and_run_http_server(
                 tokenizer_manager.set_server_stop_hook(
                     lambda: setattr(server, "should_exit", True)
                 )
-                server.run()
+                server.run(sockets=_reserved_sockets(server.config, reserved_socket))
         else:
             # Multiple tokenizer and http processes.
             # Child processes re-import the app, so no stop hook here.
@@ -3066,6 +3186,8 @@ def _setup_and_run_http_server(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{get_serving().host}:{get_serving().port}"
                 )
+                if reserved_socket is not None:
+                    reserved_socket.close()
                 _run_granian_server(
                     host=get_serving().host,
                     port=get_serving().port,
@@ -3100,16 +3222,24 @@ def _setup_and_run_http_server(
                     "ssl_ca_certs": get_serving().ssl_ca_certs,
                     "ssl_keyfile_password": get_serving().ssl_keyfile_password,
                 }
-                if get_serving().enable_http_worker_reuseport:
-                    config = uvicorn.Config(app_path, **uvicorn_options)
-                    supervisor = _ReusePortMultiprocess(config)
-                    logger.info(
-                        f"Uvicorn running on {config.host}:{config.port} "
-                        f"with {config.workers} SO_REUSEPORT workers"
-                    )
-                    supervisor.run()
-                else:
-                    _run_uvicorn_workers(app_path, **uvicorn_options)
+                with skip_main_reimport_in_spawned_workers():
+                    if get_serving().enable_http_worker_reuseport:
+                        if reserved_socket is not None:
+                            reserved_socket.close()
+                        config = uvicorn.Config(app_path, **uvicorn_options)
+                        supervisor = _ReusePortMultiprocess(config)
+                        logger.info(
+                            f"Uvicorn running on {config.host}:{config.port} "
+                            f"with {config.workers} SO_REUSEPORT workers"
+                        )
+                        supervisor.run()
+                    else:
+                        _run_uvicorn_workers(
+                            app_path, reserved_socket=reserved_socket, **uvicorn_options
+                        )
+            _shutdown_schedulers_after_http_workers(
+                router=tokenizer_manager, subprocess_watchdog=subprocess_watchdog
+            )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
@@ -3180,63 +3310,69 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    # Launch subprocesses
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-        _weight_cache_daemon_procs,
-    ) = Engine._launch_subprocesses(
-        server_args=server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager_func,
-        run_scheduler_process_func=run_scheduler_process_func,
-        run_detokenizer_process_func=run_detokenizer_process_func,
-    )
-
-    if get_parallel().node_rank >= 1:
-        # _launch_subprocesses already blocked until the schedulers exited.
-        return
-
-    if envs.SGLANG_RUST_SERVER.get():
-        # The Rust server serves api-server, tokenizer, and detokenizer, so the
-        # main process has no Python HTTP server / tokenizer manager to run.
-        # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here. A
-        # failed warmup signals this process as a crashed scheduler does.
-        from sglang.srt.rust_server.server import drain_notify_name
-        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
-
-        drain = None
-        # Without a local listener (the DP controller starts the schedulers),
-        # SIGTERM keeps its previous effect. Installed before the sidecar
-        # block, so SIGTERM stops the sidecar first and then reaches the drain.
-        if scheduler_init_result.rust_listener_procs:
-            drain = RustServerSigtermDrain(
-                scheduler_init_result.scheduler_procs,
-                scheduler_init_result.rust_listener_procs,
-                subprocess_watchdog,
-                drain_notify_name(port_args.instance_id),
-            )
-            drain.install()
-        # Every listener is bound before its scheduler reports ready, so the
-        # sidecar can connect at once.
-        with rust_server_sidecar(node_hosts_rust_server()):
-            if launch_callback is not None:
-                launch_callback()
-            if drain is not None:
-                drain.wait()
-            else:
-                scheduler_init_result.block_until_scheduler_exits()
-    else:
-        _setup_and_run_http_server(
-            server_args,
+    reserved_socket = _reserve_http_socket(server_args)
+    try:
+        # Launch subprocesses
+        (
             tokenizer_manager,
             template_manager,
             port_args,
-            scheduler_init_result.scheduler_infos,
+            scheduler_init_result,
             subprocess_watchdog,
-            execute_warmup_func=execute_warmup_func,
-            launch_callback=launch_callback,
+            _weight_cache_daemon_procs,
+        ) = Engine._launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
         )
+
+        if get_parallel().node_rank >= 1:
+            # _launch_subprocesses already blocked until the schedulers exited.
+            return
+
+        if envs.SGLANG_RUST_SERVER.get():
+            # The Rust server serves api-server, tokenizer, and detokenizer, so the
+            # main process has no Python HTTP server / tokenizer manager to run.
+            # Each Rust listener runs its own startup warmup and keeps /health at
+            # 503 until it succeeds, so the main process does not warm up here. A
+            # failed warmup signals this process as a crashed scheduler does.
+            from sglang.srt.rust_server.server import drain_notify_name
+            from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+            drain = None
+            # Without a local listener (the DP controller starts the schedulers),
+            # SIGTERM keeps its previous effect. Installed before the sidecar
+            # block, so SIGTERM stops the sidecar first and then reaches the drain.
+            if scheduler_init_result.rust_listener_procs:
+                drain = RustServerSigtermDrain(
+                    scheduler_init_result.scheduler_procs,
+                    scheduler_init_result.rust_listener_procs,
+                    subprocess_watchdog,
+                    drain_notify_name(port_args.instance_id),
+                )
+                drain.install()
+            # Every listener is bound before its scheduler reports ready, so the
+            # sidecar can connect at once.
+            with rust_server_sidecar(node_hosts_rust_server()):
+                if launch_callback is not None:
+                    launch_callback()
+                if drain is not None:
+                    drain.wait()
+                else:
+                    scheduler_init_result.block_until_scheduler_exits()
+        else:
+            _setup_and_run_http_server(
+                server_args,
+                tokenizer_manager,
+                template_manager,
+                port_args,
+                scheduler_init_result.scheduler_infos,
+                subprocess_watchdog,
+                execute_warmup_func=execute_warmup_func,
+                launch_callback=launch_callback,
+                reserved_socket=reserved_socket,
+            )
+    finally:
+        if reserved_socket is not None:
+            reserved_socket.close()

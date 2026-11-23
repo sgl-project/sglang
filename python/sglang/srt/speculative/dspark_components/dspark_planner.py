@@ -25,7 +25,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -229,7 +228,13 @@ class DSparkVerifyPlanner:
 
     @property
     def is_verify_all(self) -> bool:
-        return self._is_verify_all
+        # A pinned budget (the SPS profiler's --fracs cells) is scheduled even
+        # without a cost table; the scheduler refuses to pin one under an
+        # SGLANG_SIMULATE_ACC_LEN that can run past the trimmed lengths.
+        return self._is_verify_all and (
+            self._budget_planner is None
+            or self._budget_planner.forced_budget_frac is None
+        )
 
     @property
     def mode_value(self) -> str:
@@ -267,6 +272,13 @@ class DSparkVerifyPlanner:
             self._budget_planner.note_non_decode_step()
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
+        if not self.plans_verify_budget(num_reqs=batch.batch_size()):
+            self._budget_planner.note_non_decode_step()
+            draft_input.verify_token_budget = None
+            batch.spec_verify_tier_num_tokens = (
+                batch.batch_size() * self.verify_num_draft_tokens
+            )
+            return
         resolved = future_map.resolve_confidence_cpu(batch)
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
@@ -300,6 +312,51 @@ class DSparkVerifyPlanner:
     def note_non_decode_step(self) -> None:
         if self._budget_planner is not None:
             self._budget_planner.note_non_decode_step()
+
+    def plans_verify_budget(self, *, num_reqs: int) -> bool:
+        """Whether a verify budget can shrink a decode step of ``num_reqs``
+        requests. It cannot when even the shortest plan replays the compact
+        graph of the full block, as for a single request: the step then
+        verifies every draft and prices no budget."""
+        if (
+            self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+            or not self._dynamic_graph_tier
+        ):
+            return True
+        full_tier = self._compact_graph_tier(num_reqs * self.verify_num_draft_tokens)
+        floor_tier = self._compact_graph_tier(
+            num_reqs * max(self._schedule_cfg.min_verify_len, 1)
+        )
+        return full_tier is None or floor_tier != full_tier
+
+    def _plan_verifies_every_draft(
+        self, *, num_reqs: int, budget: Optional[int]
+    ) -> bool:
+        """Whether the plan of ``budget`` replays the compact graph of the full
+        block. Trimming it would only turn verified drafts into padding rows of
+        the same graph, so the step verifies every draft."""
+        if budget is None:
+            return True
+        if not self._dynamic_graph_tier:
+            return False
+        full_tier = self._compact_graph_tier(num_reqs * self.verify_num_draft_tokens)
+        tier_num_tokens = local_verify_tier_num_tokens(
+            bs=num_reqs,
+            verify_token_budget=budget,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+        return full_tier is not None and (
+            self._compact_graph_tier(tier_num_tokens) == full_tier
+        )
+
+    def _compact_graph_tier(self, num_tokens: int) -> Optional[int]:
+        """The captured compact verify graph that holds ``num_tokens`` tokens,
+        or None without one."""
+        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if capture_num_tokens is None or num_tokens > capture_num_tokens[-1]:
+            return None
+        return round_up_grid(num_tokens, capture_num_tokens)
 
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
@@ -341,6 +398,9 @@ class DSparkVerifyPlanner:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
+        if not self.plans_verify_budget(num_reqs=int(req_pool_indices.shape[0])):
+            draft_input.verify_token_budget = None
+            return None
 
         # No collective: the budget derives only from the broadcast draft tokens
         # (via confidence), replicated req_generation, and the static sps table.
@@ -390,11 +450,21 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        num_reqs = int(req_pool_indices.shape[0])
+        if self._ragged_verify_mode is RaggedVerifyMode.COMPACT and (
+            self.is_verify_all
+            or (
+                dp_tier_num_tokens is None
+                and self._plan_verifies_every_draft(
+                    num_reqs=num_reqs if global_num_reqs is None else global_num_reqs,
+                    budget=budget,
+                )
+            )
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+            key = (num_reqs, global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
                     bs=key[0],
@@ -844,21 +914,6 @@ def alloc_verify_window(
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
         iteration_ids=plan,
-    )
-
-
-def apply_logits_adjustments_strided(
-    *,
-    next_token_logits: torch.Tensor,
-    sampling_info,
-    verify_num_draft_tokens: int,
-) -> None:
-    if sampling_info is None:
-        return
-    apply_dflash_verify_logits_adjustments(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=verify_num_draft_tokens,
     )
 
 

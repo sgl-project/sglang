@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -8,6 +9,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    write_memfabric_tent_conf,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -15,6 +20,17 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
+
+MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
+DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
+
+# Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
+MOONCAKE_ENVS = {
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
+}
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -40,7 +56,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
@@ -79,6 +94,22 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection, and both peers
+# must register the same target + draft state sub-pools.
+DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+]
+
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -97,7 +128,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--disaggregation-transfer-backend",
-    "ascend",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--mem-fraction-static",
     0.62,
     "--prefill-max-requests",
@@ -108,9 +139,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     256,
     "--chunked-prefill-size",
     131072,
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",
@@ -122,13 +152,13 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--load-balance-method",
     "round_robin",
     "--enable-prefill-cp",
     "--cp-strategy",
     "interleave",
-    "--enable-cache-report",
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
@@ -139,6 +169,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments.
@@ -159,12 +190,11 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
-    "ascend",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--max-running-requests",
     256,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -183,26 +213,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     4,
     5,
     6,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
+    *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
-# Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment.
+# Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment. The env
+# overrides are applied per class in setUpClass so the Mooncake envs only land
+# on nodes where the Mooncake package is installed.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG = {
     "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     "prefill_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS,
     "decode_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": [],
     "router_envs": {},
 }
 
@@ -223,7 +246,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 ):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
-    model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
+    model_config = None
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
@@ -236,6 +259,36 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
+
+    @classmethod
+    def setUpClass(cls):
+        common_envs = dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS)
+        if MOONCAKE_INSTALLED:
+            common_envs.update(MOONCAKE_ENVS)
+            common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+            common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
+                ("memfabric_hybrid", "lib"), ("mooncake", None)
+            )
+        cls.model_config = {
+            **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG,
+            "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
+            "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
+            "prefill_envs": {
+                **common_envs,
+                **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
+            },
+            "decode_envs": {
+                **common_envs,
+                **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
+            },
+            # The router is launched with --no-tokenizer (workers tokenize
+            # themselves), which cache_aware routing rejects, so keep the
+            # default policy. With one prefill and one decode worker the choice
+            # does not affect routing anyway.
+            "router_args": [],
+            "router_envs": {},
+        }
+        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""

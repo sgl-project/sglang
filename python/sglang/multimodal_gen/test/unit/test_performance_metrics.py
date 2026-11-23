@@ -232,6 +232,18 @@ def test_stage_role_reaches_performance_guard(
         validator._validate_stages(summary)
 
 
+def test_empty_perf_log_dir_disables_the_performance_log(monkeypatch, capsys):
+    """SGLANG_PERF_LOG_DIR="" turns the performance log off; the writer must not
+    try to create "" and warn on stderr for every request."""
+    monkeypatch.setenv("SGLANG_PERF_LOG_DIR", "")
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+
+    PerformanceLogger.log_request_summary(RequestMetrics("no-log"))
+
+    assert capsys.readouterr().err == ""
+
+
 def test_performance_summary_separates_load_and_runtime_peaks():
     summary = PerformanceSummary.from_req_perf_record(
         _perf_record(
