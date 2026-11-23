@@ -342,7 +342,8 @@ def kda_extend_in_graph(
 
     split_size = (
         layer.q_dim
-        if meta.flashinfer is not None and layer.q_dim == layer.k_dim == layer.v_dim
+        if kernel_dispatcher.extend_takes_qkv_planes
+        and layer.q_dim == layer.k_dim == layer.v_dim
         else 0
     )
     conv_output = causal_conv1d_fn(
