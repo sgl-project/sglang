@@ -18,7 +18,7 @@ _is_npu = current_platform.is_npu()
 
 if _is_npu:
     try:
-        from sgl_kernel_npu.operators.attention import la
+        from sgl_kernel_npu.operators.attention import la  # laser attn
     except ImportError as e:
         logger.warning_once(
             "The Laser Attention kernel library is not installed. Laser Attention is "
