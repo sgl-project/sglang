@@ -227,18 +227,28 @@ FP8 checkpoint with EAGLE MTP on eight MI325X GPUs (TP8·EP1), measured with the
 
 Image: `lmsysorg/sglang:v0.5.23-rocm720-mi30x` (`sha256:a3a6eb293187b20012a5abc8f00423e6ab51d0169113a6e58a91da5614200170`). The commands have not been run on MI300X, whose 192 GB of HBM per GPU leaves less room for KV at the same `--mem-fraction-static`.
 
-- **DSA backends.** `--dsa-prefill-backend triton --dsa-decode-backend triton` is the ROCm default, set explicitly because the MI300X/MI325X Deploy cells select TileLang; against TileLang it raised throughput per GPU by 5–8% at concurrency 1 and 4.
+- **DSA backends.** `--dsa-prefill-backend triton --dsa-decode-backend triton` is the ROCm default, set explicitly because the MI300X/MI325X Deploy cells select TileLang; against TileLang it raised throughput per GPU by 5–8% at concurrency 1 and 4, but scored 0.49 points lower on GSM8K than the current TileLang InferenceX recipe (95% CI −0.90 to −0.09). Switching both to `tilelang` keeps the current accuracy (0.9500 against 0.9508) at that throughput cost.
 - **KV cache.** `--kv-cache-dtype bfloat16` is the gfx942 default, set explicitly because SGLang warns when DSA backends are chosen without a KV dtype.
 - **Chunked prefill.** `--chunked-prefill-size 16384` instead of the 131072 in the AMD tip and the low-latency Deploy cell: on an SGLang nightly ROCm image with the KV pool uncapped, a 131072-token chunk at roughly 400K tokens of context under concurrency-6 load ran the GPU out of memory (`HSA_STATUS_ERROR_OUT_OF_RESOURCES`, TileLang DSA kernels); 16384-token chunks also leave more HBM headroom (a single 450K-token prefill peaked at 92% HBM instead of 97%).
 - **Memory fraction.** `--mem-fraction-static 0.85`; at 0.92 the server failed its first long prefills with `hipErrorLaunchOutOfResources` (tested on an SGLang nightly ROCm image).
 - **MTP.** `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` drafts with the checkpoint's nextn layer.
 - **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency; the commands below use concurrency 2 and 4.
-- **HiCache.** `--enable-hierarchical-cache --hicache-host-memory-fraction 0.85 --hicache-io-backend direct --hicache-mem-layout page_first_direct`, with `--hicache-size` and `--hicache-ratio` unset, keeps the host pools of all ranks within 85% of the available host memory (bounded by the container's cgroup limit, after a 10 GiB reserve); on a node with about 975 GiB available to the container that is about 103 GiB per rank (host pools of 97.4 GiB). The concurrency 4–8 sweep used `--hicache-size 110` with the default `kernel` I/O backend and `page_first` layout; this form was measured at concurrency 4 only, within 0.4% of that throughput.
+- **HiCache.** `--enable-hierarchical-cache --hicache-host-memory-fraction 0.80 --hicache-io-backend direct --hicache-mem-layout page_first_direct`, as in the InferenceX recipe, with `--hicache-size` and `--hicache-ratio` unset, keeps the host pools of all ranks within 80% of the available host memory (bounded by the container's cgroup limit, after a 10 GiB reserve); on a node with about 975 GiB available to the container that is about 97 GiB per rank. The concurrency 4–8 sweep used `--hicache-size 110` (GB per rank) with the default `kernel` I/O backend and `page_first` layout; the fraction form was measured at concurrency 4 only, with a fraction of 0.85 (about 103 GiB per rank), within 0.4% of that throughput. A fraction of 0.80 has not been run on this node.
 - **Defaults.** The commands leave `--dsa-topk-backend sgl-kernel`, fused top-k (`SGLANG_DSA_FUSE_TOPK`), `SGLANG_OPT_USE_TOPK_V2=false` (SGLang's default for DSA models on ROCm) and the checkpoint's 1,048,576-token context length at their defaults.
 
 <Warning>
-  **AITER MoE config in this image.** The image's `aiter/configs/model_configs/a8w8_blockscale_tuned_fmoe_glm5_1.csv` selects, on gfx942, a fused-MoE kernel that returns wrong output for GLM-5.2-FP8 at TP8 when a MoE call carries 9–16 tokens. Whether a workload hits it likely depends on its batch shapes: on a repeated pass against the same server, few-shot GSM8K at 16 concurrent requests fell from about 0.95 to 0.876 (−7.5 points), for these commands and for the TileLang configuration alike; the first pass was unaffected. Until an image includes [ROCm/aiter#7750](https://github.com/ROCm/aiter/pull/7750), set `AITER_CONFIG_FMOE` to the image's default list — `aiter/configs/tuned_fmoe.csv` plus every `aiter/configs/model_configs/*tuned_fmoe*.csv`, `:`-separated — with `a8w8_blockscale_tuned_fmoe_glm5_1.csv` replaced by a copy that carries the #7750 row (setting the variable replaces aiter's merged default; the accuracy measurements here did this).
+  **AITER MoE config in this image.** The image's `aiter/configs/model_configs/a8w8_blockscale_tuned_fmoe_glm5_1.csv` selects, on gfx942, a fused-MoE kernel that returns wrong output for GLM-5.2-FP8 at TP8 when a MoE call carries 9–16 tokens. Whether a workload hits it likely depends on its batch shapes: on a repeated pass against the same server, few-shot GSM8K at 16 concurrent requests fell from about 0.95 to 0.876 (−7.5 points), for these commands and for the TileLang configuration alike; the first pass was unaffected. Until an image includes [ROCm/aiter#7750](https://github.com/ROCm/aiter/pull/7750), run the snippet below in the container shell that then launches either command. It writes a copy of the table with the #7750 row and sets `AITER_CONFIG_FMOE` to the image's default list (`tuned_fmoe.csv` plus every `model_configs/*tuned_fmoe*.csv` except the `untuned` ones, `:`-separated) with that copy in place of `a8w8_blockscale_tuned_fmoe_glm5_1.csv`; setting the variable replaces aiter's merged default. The accuracy measurements here used this override.
 </Warning>
+
+```bash AITER MoE config override (aiter#7750)
+A=/sgl-workspace/aiter/aiter/configs
+F=a8w8_blockscale_tuned_fmoe_glm5_1.csv
+OLD='gfx942,304,16,6144,256,257,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_1x128,1,0,16,0,123.614,_ZN5aiter62fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_emsort_16x128_pf3E,0.0%,0.0,,0.0%,123.614,1,1,2,0.0,0.0,'
+NEW='gfx942,304,16,6144,256,257,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_1x128,1,0,1,0,0.0,_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E,0.0%,0.0,,0.0%,0.0,1,1,1,0.0,0.0,'
+awk -v old="$OLD" -v new="$NEW" '$0 == old { $0 = new } 1' "$A/model_configs/$F" > "/tmp/$F"
+diff "$A/model_configs/$F" "/tmp/$F"  # expect exactly one changed row
+export AITER_CONFIG_FMOE="$A/tuned_fmoe.csv:$(ls "$A"/model_configs/*tuned_fmoe*.csv | grep -v -e untuned -e "/$F\$" | tr '\n' ':')/tmp/$F"
+```
 
 ```bash TP8·EP1 GPU KV (concurrency 1–3)
 SGLANG_TIMEOUT_KEEP_ALIVE=900 \
@@ -284,7 +294,7 @@ sglang serve \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-hierarchical-cache \
-  --hicache-host-memory-fraction 0.85 \
+  --hicache-host-memory-fraction 0.80 \
   --hicache-io-backend direct \
   --hicache-mem-layout page_first_direct \
   --watchdog-timeout 1800 \
