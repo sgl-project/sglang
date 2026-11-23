@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import logging
+import mmap
 import os
 import uuid
 from typing import Optional
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 # O_DIRECT needs each transfer's address and length in whole blocks. 4 KiB covers
 # the logical block size of every filesystem in use (512 B or 4 KiB).
 O_DIRECT_ALIGN_BYTES = 4096
+
 # 0 when the platform has no O_DIRECT (macOS); patched in tests.
 _O_DIRECT = getattr(os, "O_DIRECT", 0)
 # 0 before Linux 3.11 and on non-Linux; patched in tests.
@@ -377,6 +379,14 @@ def _warn_inconclusive_probe(step: str, base: str, error: OSError) -> None:
     )
 
 
+def _probe_os_error(error: OSError, step: str, base: str, action: str) -> Optional[str]:
+    """Why O_DIRECT is unusable, or None (after a warning) when ``error`` is transient."""
+    if error.errno not in _DIRECT_IO_UNUSABLE_ERRNOS:
+        _warn_inconclusive_probe(step=step, base=base, error=error)
+        return None
+    return f"{action} failed: {error.strerror} (errno {error.errno})"
+
+
 class NixlFileManager:
     """Handles file system operations for NIXL."""
 
@@ -408,29 +418,44 @@ class NixlFileManager:
 
     # ``addr`` must be page-aligned and ``size`` a page multiple; None means usable.
     def direct_io_error(self, addr: int, size: int) -> Optional[str]:
+        """Probe an O_DIRECT write sourced from ``addr``."""
+        return self._direct_probe_error(self._direct_io_dir_error, addr, size)
+
+    def direct_read_error(self, addr: int, size: int) -> Optional[str]:
+        """Probe an O_DIRECT read into ``addr``; it overwrites ``size`` bytes there.
+
+        A read pins the destination for writing, which a buffer can refuse even
+        when it pins fine as a write source.
+        """
+        return self._direct_probe_error(self._direct_read_dir_error, addr, size)
+
+    def _direct_probe_error(self, dir_probe, addr: int, size: int) -> Optional[str]:
         if not self.base_dirs:
             return None
         if not _O_DIRECT:
             return "O_DIRECT is not available on this platform"
         # Each base dir may be a separate mount that accepts or rejects O_DIRECT.
         for base in self.base_dirs:
-            error = self._direct_io_dir_error(base, addr, size)
+            error = dir_probe(base, addr, size)
             if error is not None:
                 return error
         return None
 
-    def _open_probe_file(self, base: str, direct: bool = True) -> int:
+    def _open_probe_file(
+        self, base: str, direct: bool = True, readable: bool = False
+    ) -> int:
         direct_flag = _O_DIRECT if direct else 0
+        access = os.O_RDWR if readable else os.O_WRONLY
         # The probe must leave nothing behind even on SIGKILL: the L3 cleaner only
         # walks bucket dirs, so a stray probe file in a base dir is never reclaimed.
         if _O_TMPFILE:
             try:
-                return os.open(base, os.O_WRONLY | _O_TMPFILE | direct_flag, 0o644)
+                return os.open(base, access | _O_TMPFILE | direct_flag, 0o644)
             except OSError:
                 # Not every filesystem implements O_TMPFILE.
                 pass
         path = os.path.join(base, f".io_probe.{os.getpid()}.{uuid.uuid4().hex[:8]}")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | direct_flag, 0o644)
+        fd = os.open(path, access | os.O_CREAT | os.O_TRUNC | direct_flag, 0o644)
         try:
             # Unlink right away to mirror O_TMPFILE; the fd stays writable.
             os.unlink(path)
@@ -482,32 +507,57 @@ class NixlFileManager:
             try:
                 fd = self._open_probe_file(base)
             except OSError as e:
-                if e.errno not in _DIRECT_IO_UNUSABLE_ERRNOS:
-                    _warn_inconclusive_probe(step="open", base=base, error=e)
-                    return None
-                return (
-                    f"opening a scratch file under {base} with O_DIRECT failed: "
-                    f"{e.strerror} (errno {e.errno})"
+                return _probe_os_error(
+                    e,
+                    "open",
+                    base,
+                    f"opening a scratch file under {base} with O_DIRECT",
                 )
+            action = f"a page-aligned {size}-byte O_DIRECT write under {base}"
             try:
                 written = os.pwrite(fd, (ctypes.c_char * size).from_address(addr), 0)
             except OSError as e:
-                if e.errno not in _DIRECT_IO_UNUSABLE_ERRNOS:
-                    _warn_inconclusive_probe(step="write", base=base, error=e)
-                    return None
-                return (
-                    f"a page-aligned {size}-byte O_DIRECT write under {base} failed: "
-                    f"{e.strerror} (errno {e.errno})"
-                )
+                return _probe_os_error(e, "write", base, action)
             if written != size:
-                return (
-                    f"a page-aligned {size}-byte O_DIRECT write under {base} moved "
-                    f"only {written} bytes"
-                )
+                return f"{action} moved only {written} bytes"
             return None
         finally:
             if fd is not None:
                 os.close(fd)
+
+    def _direct_read_dir_error(self, base: str, addr: int, size: int) -> Optional[str]:
+        fd = None
+        # Anonymous mmap is page-aligned ordinary memory, so seeding the block cannot
+        # fail for the destination-buffer reason this probe is looking for.
+        seed = mmap.mmap(-1, size)
+        try:
+            try:
+                fd = self._open_probe_file(base, readable=True)
+            except OSError as e:
+                return _probe_os_error(
+                    e,
+                    "open",
+                    base,
+                    f"opening a scratch file under {base} with O_DIRECT",
+                )
+            try:
+                os.pwrite(fd, seed, 0)
+            except OSError as e:
+                return _probe_os_error(
+                    e, "write", base, f"a {size}-byte O_DIRECT write under {base}"
+                )
+            action = f"a page-aligned {size}-byte O_DIRECT read under {base}"
+            try:
+                read = os.preadv(fd, [(ctypes.c_char * size).from_address(addr)], 0)
+            except OSError as e:
+                return _probe_os_error(e, "read", base, action)
+            if read != size:
+                return f"{action} moved only {read} bytes"
+            return None
+        finally:
+            if fd is not None:
+                os.close(fd)
+            seed.close()
 
     def disable_direct_io(self, reason: str) -> None:
         logger.warning(

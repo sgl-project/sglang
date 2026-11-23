@@ -1,3 +1,4 @@
+import ctypes
 import logging
 import os
 import threading
@@ -370,20 +371,25 @@ class HiCacheNixl(HiCacheStorage):
 
     # Probes ``buf`` itself, not a scratch buffer: get_user_pages() pinnability depends
     # on the allocator, and XPU pinned host memory fails it with EFAULT.
-    def _fall_back_if_direct_io_unusable(self, buf: torch.Tensor) -> None:
+    def _fall_back_if_direct_io_unusable(
+        self, buf: torch.Tensor, for_read: bool = False
+    ) -> None:
         if not self.needs_page_alignment:
             return
         try:
             addr = buf.data_ptr()
             aligned = addr + (-addr) % _OS_PAGE_BYTES
             nbytes = buf.numel() * buf.element_size()
+            role = "destination" if for_read else "source"
             if aligned - addr + _OS_PAGE_BYTES > nbytes:
-                # Too small to source an aligned page, so O_DIRECT cannot use it
+                # Too small to hold an aligned page, so O_DIRECT cannot use it
                 # at all; probing past its end would fault for the wrong reason.
                 error = (
-                    f"a {nbytes}-byte source buffer at {addr:#x} cannot hold a "
+                    f"a {nbytes}-byte {role} buffer at {addr:#x} cannot hold a "
                     f"page-aligned {_OS_PAGE_BYTES}-byte block"
                 )
+            elif for_read:
+                error = self._direct_read_error_preserving(aligned)
             else:
                 error = self.file_manager.direct_io_error(aligned, _OS_PAGE_BYTES)
         except Exception as e:
@@ -393,6 +399,29 @@ class HiCacheNixl(HiCacheStorage):
             return
         self.file_manager.disable_direct_io(error)
         self.needs_page_alignment = False
+
+    # The read probe overwrites the block, and a zero-copy target is the host pool,
+    # which holds cached KV when storage attaches to a running (idle) server.
+    def _direct_read_error_preserving(self, aligned: int) -> Optional[str]:
+        saved = ctypes.string_at(aligned, _OS_PAGE_BYTES)
+        try:
+            return self.file_manager.direct_read_error(aligned, _OS_PAGE_BYTES)
+        finally:
+            ctypes.memmove(aligned, saved, _OS_PAGE_BYTES)
+
+    # Zero-copy transfers write tier-3 data from and read it into the pool buffer
+    # itself, and pinning can succeed in one direction and fail in the other.
+    def _fall_back_if_zero_copy_unusable(self, buf: torch.Tensor) -> None:
+        self._fall_back_if_direct_io_unusable(buf)
+        self._fall_back_if_direct_io_unusable(buf, for_read=True)
+
+    # Copy mode reads into bounce_get and writes from bounce_set, two allocations
+    # that pin separately; a failure in either direction drops O_DIRECT for both.
+    def _fall_back_if_bounce_unusable(
+        self, bounce_set: torch.Tensor, bounce_get: torch.Tensor
+    ) -> None:
+        self._fall_back_if_direct_io_unusable(bounce_set)
+        self._fall_back_if_direct_io_unusable(bounce_get, for_read=True)
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -420,7 +449,7 @@ class HiCacheNixl(HiCacheStorage):
                 marker_numel, torch.uint8, pin_memory, "logical_anchor_get"
             )
             self._bounce_set.fill_(1)
-            self._fall_back_if_direct_io_unusable(self._bounce_set)
+            self._fall_back_if_bounce_unusable(self._bounce_set, self._bounce_get)
             logger.info(
                 "HiCacheNixl: registered logical anchor pool with %d-byte markers",
                 self._bounce_page_bytes,
@@ -444,7 +473,7 @@ class HiCacheNixl(HiCacheStorage):
         if self.is_zero_copy:
             # Probe after the alignment decision: a pool that lost zero-copy sources
             # its transfers from the bounce buffer below, not from kv_buffer.
-            self._fall_back_if_direct_io_unusable(kv)
+            self._fall_back_if_zero_copy_unusable(kv)
             self._pre_register_host(kv.data_ptr(), self._span_bytes(kv), "kv_buffer")
         else:
             # One bounce buffer per direction so set/get run lock-free across
@@ -463,7 +492,7 @@ class HiCacheNixl(HiCacheStorage):
             self._bounce_get = self._alloc_registered(
                 slot_numel, page_dtype, pin_memory, "bounce_get"
             )
-            self._fall_back_if_direct_io_unusable(self._bounce_set)
+            self._fall_back_if_bounce_unusable(self._bounce_set, self._bounce_get)
 
         logger.info(
             f"HiCacheNixl: pre-registered host regions for "
@@ -504,7 +533,7 @@ class HiCacheNixl(HiCacheStorage):
             bounce_get = self._alloc_registered(
                 slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
             )
-            self._fall_back_if_direct_io_unusable(bounce_set)
+            self._fall_back_if_bounce_unusable(bounce_set, bounce_get)
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
                 is_zero_copy=False,
@@ -556,7 +585,7 @@ class HiCacheNixl(HiCacheStorage):
         # and a 0-element one (conv-only mamba) sources no transfer.
         for buf in buffers:
             if buf.numel() > 0:
-                self._fall_back_if_direct_io_unusable(buf)
+                self._fall_back_if_zero_copy_unusable(buf)
         return True
 
     def _bounce_slot_numel(self, page_numel: int, element_size: int) -> int:

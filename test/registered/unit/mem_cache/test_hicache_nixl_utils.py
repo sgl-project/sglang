@@ -449,6 +449,60 @@ class TestNixlDirectIOProbe(CustomTestCase):
         self.assertIsNotNone(error)
         self.assertIn("not available", error)
 
+    def _read_only_buffer(self) -> int:
+        """A page-aligned page mapped read-only: a valid O_DIRECT write source that
+        cannot receive an O_DIRECT read."""
+        addr = self._aligned_buffer()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mprotect.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        if libc.mprotect(addr, _PAGE_BYTES, mmap.PROT_READ) != 0:
+            self.skipTest(f"mprotect failed: errno {ctypes.get_errno()}")
+        # Restore before the mapping is closed; addCleanup runs in LIFO order.
+        self.addCleanup(
+            libc.mprotect, addr, _PAGE_BYTES, mmap.PROT_READ | mmap.PROT_WRITE
+        )
+        return addr
+
+    def test_read_probe_rejects_a_buffer_that_only_fails_reads(self):
+        """A read pins its destination for writing, so a buffer can pass the write
+        probe and still fault every tier-3 read; only a read attempt detects it.
+        """
+        addr = self._read_only_buffer()
+
+        self.assertIsNone(self.file_manager.direct_io_error(addr, _PAGE_BYTES))
+        error = self.file_manager.direct_read_error(addr, _PAGE_BYTES)
+
+        self.assertIsNotNone(error)
+        self.assertIn("read", error)
+        self.assertIn(f"errno {errno.EFAULT}", error)
+        self.assertEqual(self._leftover_files(self.test_dir), [])
+
+    def test_read_probe_accepts_page_aligned_host_buffer(self):
+        """A read probe that always failed would silently disable O_DIRECT everywhere."""
+        self.assertIsNone(
+            self.file_manager.direct_read_error(self._aligned_buffer(), _PAGE_BYTES)
+        )
+        self.assertEqual(self._leftover_files(self.test_dir), [])
+
+    def test_read_probe_classifies_errors_like_the_write_probe(self):
+        """EINVAL condemns O_DIRECT for reads too, while a disk error at startup
+        says nothing about the buffer and must keep O_DIRECT."""
+        cases = {errno.EINVAL: False, errno.EIO: True, errno.ENOSPC: True}
+        for code, keeps_direct_io in cases.items():
+            with self.subTest(errno=errno.errorcode[code]):
+                with mock.patch.object(
+                    nixl_utils.os, "preadv", side_effect=OSError(code, "read")
+                ):
+                    error = self.file_manager.direct_read_error(
+                        self._aligned_buffer(), _PAGE_BYTES
+                    )
+
+                if keeps_direct_io:
+                    self.assertIsNone(error)
+                else:
+                    self.assertIn(f"errno {code}", error)
+                self.assertEqual(self._leftover_files(self.test_dir), [])
+
     def test_disable_direct_io_applies_to_later_opens(self):
         """The fallback has to reach files opened after the probe, not just the flag."""
         path = self.file_manager.get_file_path("page-123")

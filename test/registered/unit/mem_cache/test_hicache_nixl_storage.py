@@ -998,6 +998,7 @@ class TestNixlDirectIO(CustomTestCase):
         # the test filesystem supports O_DIRECT.
         hicache = self._make_direct_io_hicache_with_real_probe()
         hicache.file_manager.direct_io_error = lambda addr, size: probe_error
+        hicache.file_manager.direct_read_error = lambda addr, size: probe_error
         return hicache
 
     def _make_direct_io_hicache_with_real_probe(self) -> HiCacheNixl:
@@ -1193,6 +1194,127 @@ class TestNixlDirectIO(CustomTestCase):
 
         self.assertFalse(hicache.file_manager.use_direct_io)
         self.assertFalse(hicache.needs_page_alignment)
+
+    def _register_copy_mode_pool(self, hicache: HiCacheNixl, kind: str):
+        """Register a pool that transfers through bounce buffers; return them as
+        (write source, read destination)."""
+        if kind == "hybrid":
+            hicache.register_mem_host_pool_v2(
+                MockHybridPool(component_bytes=32, stride_page_aligned=False),
+                PoolName.MAMBA,
+            )
+            ctx = hicache._hybrid_pool_ctx[PoolName.MAMBA]
+            return ctx.bounce_set, ctx.bounce_get
+        if kind == "logical_anchor":
+            hicache.register_mem_pool_host(LogicalHostPool(size=8, page_size=2))
+        else:
+            hicache.register_mem_pool_host(MockMemPoolHost(is_zero_copy_mode=False))
+        return hicache._bounce_set, hicache._bounce_get
+
+    def test_read_bounce_probe_failure_drops_o_direct_for_both_directions(self):
+        """Copy mode reads into a different bounce buffer than it writes from, so a
+        write probe that passes does not show tier-3 reads can use O_DIRECT; a read
+        buffer that only fails the read probe must drop O_DIRECT for both directions.
+        """
+        for kind in ("kv", "logical_anchor", "hybrid"):
+            with self.subTest(pool=kind):
+                hicache = self._make_direct_io_hicache()
+                write_probe, written = self._recording_probe()
+                read_probe, read = self._recording_probe("Bad address (errno 14)")
+                hicache.file_manager.direct_io_error = write_probe
+                hicache.file_manager.direct_read_error = read_probe
+
+                bounce_set, bounce_get = self._register_copy_mode_pool(hicache, kind)
+
+                self.assertEqual(
+                    written, [(self._aligned_addr(bounce_set), _PAGE_BYTES)]
+                )
+                self.assertEqual(read, [(self._aligned_addr(bounce_get), _PAGE_BYTES)])
+                # One flag on the shared manager governs both directions' opens.
+                self.assertFalse(hicache.file_manager.use_direct_io)
+                self.assertFalse(hicache.needs_page_alignment)
+                self.assertIs(hicache.registry.file_manager, hicache.file_manager)
+
+    @staticmethod
+    def _zero_copy_pools_holding_kv():
+        """Zero-copy KV and hybrid pools that already hold data, as when storage is
+        attached to a running server whose host cache is warm."""
+        kv_pool = MockMemPoolHost(
+            is_zero_copy_mode=True, num_pages=32, stride_page_aligned=True
+        )
+        kv_pool.kv_buffer.copy_(torch.randn(kv_pool.kv_buffer.shape))
+        hybrid_pool = MockHybridPool(component_bytes=_PAGE_BYTES)
+        for buf in hybrid_pool.get_hybrid_pool_buffer():
+            buf.copy_(torch.randint(0, 256, buf.shape, dtype=buf.dtype))
+        return kv_pool, hybrid_pool
+
+    def _register_zero_copy_pools(self, hicache, kv_pool, hybrid_pool):
+        hicache.register_mem_pool_host(kv_pool)
+        hicache.register_mem_host_pool_v2(hybrid_pool, PoolName.MAMBA)
+        self.assertTrue(hicache.is_zero_copy)
+        self.assertTrue(hicache._hybrid_pool_ctx[PoolName.MAMBA].is_zero_copy)
+
+    def test_zero_copy_read_probe_keeps_cached_kv(self):
+        """Zero-copy reads land in the pool buffers themselves, so they must pass a
+        read probe; that probe overwrites a block, and a late-attached pool already
+        holds cached KV there, which must survive even a probe that raises.
+        """
+        for raises in (False, True):
+            with self.subTest(probe_raises=raises):
+                hicache = self._make_direct_io_hicache()
+                kv_pool, hybrid_pool = self._zero_copy_pools_holding_kv()
+                buffers = [kv_pool.kv_buffer, *hybrid_pool.get_hybrid_pool_buffer()]
+                expected = [buf.clone() for buf in buffers]
+                read = []
+
+                def scribbling_read_probe(addr, size):
+                    # Stands in for the O_DIRECT read that overwrites the block.
+                    read.append((addr, size))
+                    ctypes.memset(addr, 0xA5, size)
+                    if raises:
+                        raise OSError("probe failed after the read landed")
+                    return None
+
+                hicache.file_manager.direct_read_error = scribbling_read_probe
+                self._register_zero_copy_pools(hicache, kv_pool, hybrid_pool)
+
+                if not raises:
+                    self.assertEqual(
+                        read, [(self._aligned_addr(b), _PAGE_BYTES) for b in buffers]
+                    )
+                    self.assertTrue(hicache.file_manager.use_direct_io)
+                else:
+                    self.assertFalse(hicache.file_manager.use_direct_io)
+                for i, (buf, want) in enumerate(zip(buffers, expected)):
+                    self.assertTrue(torch.equal(buf, want), f"buffer {i} changed")
+
+    def test_zero_copy_read_only_probe_failure_drops_o_direct(self):
+        """A pool buffer that pins as a write source but not as a read destination
+        would fail every zero-copy prefetch under O_DIRECT, so it must fall back."""
+        hicache = self._make_direct_io_hicache()
+        write_probe, _ = self._recording_probe()
+        read_probe, read = self._recording_probe("Bad address (errno 14)")
+        hicache.file_manager.direct_io_error = write_probe
+        hicache.file_manager.direct_read_error = read_probe
+        kv_pool, hybrid_pool = self._zero_copy_pools_holding_kv()
+        self._register_zero_copy_pools(hicache, kv_pool, hybrid_pool)
+
+        self.assertEqual(read, [(self._aligned_addr(kv_pool.kv_buffer), _PAGE_BYTES)])
+        self.assertFalse(hicache.file_manager.use_direct_io)
+        self.assertFalse(hicache.needs_page_alignment)
+
+    def test_real_zero_copy_read_probe_keeps_cached_kv(self):
+        """The real O_DIRECT read probe must leave a warm zero-copy pool's bytes
+        exactly as they were."""
+        self._skip_unless_o_direct_opens()
+        hicache = self._make_direct_io_hicache_with_real_probe()
+        kv_pool, hybrid_pool = self._zero_copy_pools_holding_kv()
+        buffers = [kv_pool.kv_buffer, *hybrid_pool.get_hybrid_pool_buffer()]
+        expected = [buf.clone() for buf in buffers]
+        self._register_zero_copy_pools(hicache, kv_pool, hybrid_pool)
+
+        for i, (buf, want) in enumerate(zip(buffers, expected)):
+            self.assertTrue(torch.equal(buf, want), f"buffer {i} changed")
 
     def test_hybrid_pool_probe_falls_back_to_buffered_io(self):
         """Hybrid v2 pools own their own zero-copy buffers, so probing only the KV
