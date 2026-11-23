@@ -93,7 +93,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -108,7 +108,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

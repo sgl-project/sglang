@@ -25,7 +25,7 @@ Pick your hardware to generate the launch command. Each GPU has one tensor-paral
 - **Spec Decode → Off** — the default. Standard decoding.
 - **Spec Decode → MTP (NEXTN)** — speculative decoding with the MTP layer built into the checkpoint, on the same layout. On the measured GPUs it is slower than standard decoding; see [MTP (NEXTN)](#mtp-nextn).
 
-The B200 and GB300 recipes ran on the release weights through full 1319-question GSM8K, text, reasoning, tool-call, image and video probes, and speed benchmarks; the MTP recipes also passed long-context retrieval. Their badges read **Final Verification In Progress**. The other GPUs use the model card's layouts and are not verified.
+The B200 and GB300 recipes ran on the release weights through full 1319-question GSM8K, text, reasoning, tool-call, image and video probes, and speed benchmarks; the MTP recipes also passed long-context retrieval. The other GPUs use the model card's layouts and are not verified.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.2-air.jsx";
@@ -76,12 +76,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
     <tr style={{borderBottom: "1px solid rgba(127,127,127,0.2)"}}>
       <td style={{textAlign: "left", padding: "6px 8px"}}>2× B200</td>
       <td style={{textAlign: "left", padding: "6px 8px"}}>TP2</td>
-      <td style={{textAlign: "left", padding: "6px 8px"}}>Final verification in progress, MTP and standard decoding</td>
+      <td style={{textAlign: "left", padding: "6px 8px"}}>Verified, MTP and standard decoding</td>
     </tr>
     <tr style={{borderBottom: "1px solid rgba(127,127,127,0.2)"}}>
       <td style={{textAlign: "left", padding: "6px 8px"}}>4× GB300</td>
       <td style={{textAlign: "left", padding: "6px 8px"}}>TP4</td>
-      <td style={{textAlign: "left", padding: "6px 8px"}}>Final verification in progress, MTP and standard decoding</td>
+      <td style={{textAlign: "left", padding: "6px 8px"}}>Verified, MTP and standard decoding</td>
     </tr>
     <tr style={{borderBottom: "1px solid rgba(127,127,127,0.2)"}}>
       <td style={{textAlign: "left", padding: "6px 8px"}}>4× B300, H200 or H20-3e</td>
