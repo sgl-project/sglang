@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     NPUDecodeContextParallelMetadata,
+    dcp_extend_crop_free,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
 )
@@ -614,7 +615,11 @@ def prepare_dcp_extend_metadata_npu(
         return None
     # The gather plan needs extend_seq_lens_cpu, so the backend fills it in.
     return NPUDecodeContextParallelMetadata(
-        **{f.name: getattr(metadata, f.name) for f in fields(metadata)}
+        **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
+        extend_crop_free=dcp_extend_crop_free(
+            extend_prefix_lens_cpu,
+            m.indexer.index_topk if m.indexer is not None else None,
+        ),
     )
 
 
