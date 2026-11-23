@@ -388,9 +388,7 @@ class TestUMBPStore(unittest.TestCase):
             extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False},
         )
 
-        with patch.object(
-            umbp_module, "_import_umbp_client", return_value=imported
-        ):
+        with patch.object(umbp_module, "_import_umbp_client", return_value=imported):
             umbp_module.UMBPStore(standalone_external_spdk).close()
             clients_before = len(built_clients)
             with self.assertRaisesRegex(ValueError, "longest anchor key"):
