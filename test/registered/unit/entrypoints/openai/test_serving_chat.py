@@ -846,6 +846,33 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
+    def test_multimodal_model_decodes_the_prompt_only_for_media_requests(self):
+        self.template_manager.jinja_template_content_format = "openai"
+        text_only = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi"}]
+        )
+        result = self.chat._apply_jinja_template(text_only, None, is_multimodal=True)
+        self.assertIsNone(result.prompt)
+        self.tm.tokenizer.decode.assert_not_called()
+
+        self.tm.tokenizer.decode.return_value = "decoded prompt"
+        self.assertEqual(
+            self.chat._engine_prompt(result, is_multimodal=True),
+            ("text", "decoded prompt"),
+        )
+
+        with_image = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "img"}}],
+                }
+            ],
+        )
+        result = self.chat._apply_jinja_template(with_image, None, is_multimodal=True)
+        self.assertEqual(result.prompt, "decoded prompt")
+
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
         answer from the bags; `ServerArgs` keeps the launcher's seed."""
