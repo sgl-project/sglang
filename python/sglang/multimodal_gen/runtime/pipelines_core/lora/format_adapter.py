@@ -217,21 +217,23 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
 _BFL_FLUX_ATTN_KEY = re.compile(
     r"(?:^|\.)double_blocks\.\d+\.(?:img|txt)_attn\.(?:qkv|proj)\."
 )
-_DOWN_UP_SUFFIX = re.compile(r"\.lora_(down|up)(?=\.weight$|$)")
+_DOWN_UP_SUFFIX = re.compile(r"\.lora_(down|up)(?:\.weight)?$")
 
 
 def _bfl_flux_down_up_as_a_b(
     state_dict: Mapping[str, torch.Tensor],
 ) -> Mapping[str, torch.Tensor]:
-    """Rename `lora_down`/`lora_up` to `lora_A`/`lora_B` in a BFL-layout FLUX
-    LoRA, so it is detected and converted like its `lora_A`/`lora_B` twin."""
+    """Rename `lora_down`/`lora_up` (with or without `.weight`) to
+    `lora_A.weight`/`lora_B.weight` in a BFL-layout FLUX LoRA, so it is detected
+    and converted, alpha included, like its `lora_A`/`lora_B` twin."""
     if not any(
         _BFL_FLUX_ATTN_KEY.search(k) and _DOWN_UP_SUFFIX.search(k) for k in state_dict
     ):
         return state_dict
     return {
         _DOWN_UP_SUFFIX.sub(
-            lambda m: ".lora_A" if m.group(1) == "down" else ".lora_B", k
+            lambda m: ".lora_A.weight" if m.group(1) == "down" else ".lora_B.weight",
+            k,
         ): v
         for k, v in state_dict.items()
     }
