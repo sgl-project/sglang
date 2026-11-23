@@ -128,9 +128,9 @@ def register_memory_region(model, transfer_engine):
         )
         weight_addr_set.add(weight.data_ptr())
 
-    import torch
+    from sglang.srt.utils.device import get_device_module
 
-    memory_snapshot = torch.cuda.memory.memory_snapshot()
+    memory_snapshot = get_device_module().memory_snapshot()
     weight_blocks_for_reg_mr = []
     # Blocks in each segment have continuous physical addresses,
     # so they can be merged for memory registration.
@@ -158,6 +158,15 @@ def register_memory_region(model, transfer_engine):
                         current_weight_block = (address, size)
         if current_weight_block is not None:
             weight_blocks_for_reg_mr.append(current_weight_block)
+
+    # Without this, registration is a silent no-op and only the loading instance
+    # fails, on an unreadable remote address.
+    if weight_addr_set and not weight_blocks_for_reg_mr:
+        raise RuntimeError(
+            f"{get_device_module().__name__}.memory_snapshot() reported no "
+            f"active_allocated block for any of the {len(weight_addr_set)} weight "
+            "tensors, so no memory region can be registered."
+        )
 
     # Register merged memory blocks that hold weights.
     for weight_block in weight_blocks_for_reg_mr:
