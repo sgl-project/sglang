@@ -46,8 +46,19 @@ def _compute_capability_major() -> int:
 
 _CC_MAJOR = _compute_capability_major()
 
+# On SM90+ (and for fp16 on any arch) fused_marlin_moe sets use_atomic_add, so the
+# split-K partials are summed with atomic adds whose order varies run to run. The
+# clamp this test guards is #if SGL_CUDA_ARCH < 900, i.e. it only covers the
+# pre-Hopper barrier path, so bitwise reproducibility is only asserted there.
+_ATOMIC_REDUCE_REASON = (
+    "SM90+ takes the atomicAdd split-K reduce, whose accumulation order is not "
+    "bitwise stable (separate from the #44999 barrier corruption); the "
+    "one-block-per-SM clamp only covers the pre-Hopper barrier path"
+)
+
 
 @unittest.skipIf(_skip_reason() is not None, _skip_reason() or "")
+@unittest.skipIf(_CC_MAJOR >= 9, _ATOMIC_REDUCE_REASON)
 class TestMarlinMoEDeterminism(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -152,11 +163,6 @@ class TestMarlinMoEDeterminism(CustomTestCase):
                 f"iteration {iteration}: output differs from the first call",
             )
 
-    @unittest.skipIf(
-        _CC_MAJOR >= 9,
-        "SM90+ takes the atomicAdd reduce, whose accumulation order is not "
-        "bitwise stable (separate from the #44999 corruption)",
-    )
     def test_single_token_decode_is_bitwise_identical(self):
         """Decode-shaped calls (M=1) must also be reproducible."""
         probe = self._inputs(1, 777)
