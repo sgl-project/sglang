@@ -946,8 +946,9 @@ class MambaPoolHost(HostKVCache):
         for i in range(0, len(indices), self.page_size):
             # Emit component pointers in stable order: temporal first (dropped
             # for conv-only models with no ssm state), then conv_0..conv_n.
-            # _get_hybrid_page_component_keys drops the temporal key under the
-            # same condition, keeping keys and buffers aligned.
+            # Component keys are positional in this order; the first key keeps
+            # the legacy _temporal suffix even for conv-only pools, whose
+            # conv_0 component is therefore stored under it.
             if self.temporal_state_elem_size > 0:
                 temporal_ptr = (
                     temporal_base_ptr

@@ -129,8 +129,13 @@ class NixlBackendConfig:
 
 def host_page_align(extra_config: Optional[dict]) -> int:
     """Bytes a host pool rounds each page's stride up to, so that HiCacheNixl can
-    move its pages in place: O_DIRECT_ALIGN_BYTES under O_DIRECT, otherwise 1."""
-    if NixlBackendConfig(extra_config).needs_page_alignment():
+    move its pages in place: O_DIRECT_ALIGN_BYTES under O_DIRECT or an explicit
+    DOCA_MEMOS selection, otherwise 1."""
+    config = NixlBackendConfig(extra_config)
+    if (
+        config.needs_page_alignment()
+        or config.get_specified_plugin().upper() == "DOCA_MEMOS"
+    ):
         return O_DIRECT_ALIGN_BYTES
     return 1
 

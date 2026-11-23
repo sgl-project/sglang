@@ -36,7 +36,7 @@ The connector supports both the legacy tensor-oriented API (`get` / `set`) and t
 ### HiCacheNixl
 The main storage connector that provides:
 - Single and batch tensor set/get operations
-- Automatic backend selection (3FS > POSIX > GDS_MT > GDS > OBJ)
+- Automatic backend selection (3FS > POSIX > GDS_MT > GDS > OBJ > DOCA_MEMOS)
 - High-performance file-based (or) object based storage access using NIXL
 - Automatic zero-copy enablement when HiCache host memory layout is `page_first` or `page_first_direct`
 - MLA-aware storage naming and backend-local MLA backup skipping on non-zero TP ranks
@@ -330,7 +330,8 @@ If NIXL operations fail:
 - Check that NIXL is properly installed
 - Verify that required plugins are available
 - Ensure file permissions are correct for test directories
-- For OBJ plugins, verify `bucket` or `AWS_DEFAULT_BUCKET` is set
+- For the S3 OBJ plugin, verify `bucket` or `AWS_DEFAULT_BUCKET` is set (DOCA_MEMOS needs no bucket)
+- For DOCA_MEMOS, verify `SGLANG_HUGEPAGE_MODE=required`, `SGLANG_HUGEPAGE_SIZE=2MB`, and that host pools are hugetlb-backed
 - Check the NIXL diagnostic log emitted when the mem pool is registered; it includes:
   - `mem_pool_device_type`
   - `is_mla_model`
@@ -407,6 +408,8 @@ The NIXL backend selection follows this priority order:
     - Best for filesystems benefiting from batch operations and smaller IOs.
 5. **OBJ** - Amazon S3 based Object Storage
     - Key-value based storage
+6. **DOCA_MEMOS** - NVIDIA DOCA MEMOS object storage (if available)
+    - Key-value based storage over DOCA devices; requires hugetlb-backed host pools
 The system automatically selects the best available backend, with POSIX as the default fallback.
 
 

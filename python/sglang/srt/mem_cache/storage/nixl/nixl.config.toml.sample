@@ -151,6 +151,8 @@ bucket = ""
 ########################################
 # Configuration for DOCA_MEMOS backend.
 # Requires pre-allocated hugepages (``sysctl vm.nr_hugepages``).
+# To select DOCA_MEMOS, set active = true below AND set active = false in
+# [plugin.posix] above: the first active plugin in this file wins.
 
 # [plugin.doca_memos]
 # active = true
