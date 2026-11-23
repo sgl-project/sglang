@@ -355,7 +355,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
-        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
         # True if the DSA or MLA prefill-CP flavor is active. These flavors
@@ -1636,13 +1635,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.dp_real_rows.fill_(torch.iinfo(torch.int64).max)
         else:
             self.dp_real_rows.copy_(counts)
-
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
 
     def load_batch(
         self,
