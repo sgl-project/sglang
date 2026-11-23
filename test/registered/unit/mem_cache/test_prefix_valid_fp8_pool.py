@@ -406,29 +406,46 @@ class TestFp8StorePoolDispatch(CustomTestCase):
         if not _triton_fp8_supported():
             self.skipTest("Ordinary fused E4M3 stores require CUDA SM89+")
 
-    def test_store_routes_by_row_shape(self):
-        """Equal K/V rows take the fused store, which leaves the inputs as they
-        were; unequal rows keep the eager writer, which divides them in place."""
-        loc = torch.tensor([2, 5, 3], device=DEVICE)
-        lengths = torch.ones(3, dtype=torch.int32, device=DEVICE)
+    def test_store_dispatch_and_preservation(self):
+        """Check real pools, layer overrides and arena neighbors. Asymmetric
+        rows and E5M2 retain eager mutation/overflow behavior."""
+        loc = torch.tensor([2, 5, 0], device=DEVICE)
+        lengths = torch.tensor([1, 1, 0], dtype=torch.int32, device=DEVICE)
         scales = (
             torch.tensor(0.375, device=DEVICE),
             torch.tensor(1.75, device=DEVICE),
         )
-        for row_dim, v_row_dim, fused in ((128, 128, True), (128, 64, False)):
-            for name, pool in _make_store_pools(row_dim, v_row_dim).items():
-                with self.subTest(pool=name, v_row_dim=v_row_dim):
-                    k = torch.randn(
-                        (3, 1, row_dim), dtype=torch.bfloat16, device=DEVICE
-                    )
+        for v_row_dim, dtype, fused in (
+            (128, fp8_dtype, True),
+            (64, fp8_dtype, False),
+            (128, torch.float8_e5m2, False),
+        ):
+            for name, pool in _make_store_pools(128, v_row_dim, dtype).items():
+                with self.subTest(pool=name, v_row_dim=v_row_dim, dtype=dtype):
+                    k = torch.randn((3, 1, 128), dtype=torch.bfloat16, device=DEVICE)
                     v = torch.randn(
                         (3, 1, v_row_dim), dtype=torch.bfloat16, device=DEVICE
                     )
+                    k[0, 0, 0], v[0, 0, 0] = 1e6, -1e6  # E5M2 must produce infinities.
+                    if name == "view":
+                        arena = pool._arena
+                        arena.raw.fill_(0x5A)
+                        before = arena.raw.clone()
+                        untouched = torch.ones_like(arena.raw, dtype=torch.bool)
+                        for buffer in (pool.k_buffer[1], pool.v_buffer[1]):
+                            offset = buffer.data_ptr() - arena.raw.data_ptr()
+                            row_bytes = buffer[0].numel() * buffer.element_size()
+                            for slot in (2, 5):
+                                start = (
+                                    offset
+                                    + slot * buffer.stride(0) * buffer.element_size()
+                                )
+                                untouched[start : start + row_bytes] = False
                     with assert_prefix_commit(
                         k,
                         v,
-                        pool.k_buffer[0].view(fp8_dtype),
-                        pool.v_buffer[0].view(fp8_dtype),
+                        pool.get_key_buffer(1),
+                        pool.get_value_buffer(1),
                         loc.view(-1, 1),
                         lengths,
                         *scales,
@@ -440,60 +457,12 @@ class TestFp8StorePoolDispatch(CustomTestCase):
                             k,
                             v,
                             *scales,
+                            layer_id_override=1,
                         )
-
-    def test_unified_store_preserves_other_layers_and_arena_bytes(self):
-        """A token's stride spans all layers; writing one must not damage its neighbors."""
-        pool = _make_store_pools(128, 128)["view"]
-        arena = pool._arena
-        arena.raw.fill_(0x5A)
-        before = arena.raw.clone()
-        untouched = torch.ones_like(arena.raw, dtype=torch.bool)
-        loc = torch.tensor([2, 5, 0], device=DEVICE)
-        for buffer in (pool.k_buffer[1], pool.v_buffer[1]):
-            offset = buffer.data_ptr() - arena.raw.data_ptr()
-            for slot in (2, 5):
-                start = offset + slot * buffer.stride(0)
-                untouched[start : start + 128] = False
-        k = torch.randn((3, 1, 128), dtype=torch.bfloat16, device=DEVICE)
-        v = torch.randn_like(k)
-        lengths = torch.tensor([1, 1, 0], dtype=torch.int32, device=DEVICE)
-        with assert_prefix_commit(
-            k,
-            v,
-            pool.get_key_buffer(1),
-            pool.get_value_buffer(1),
-            loc.view(-1, 1),
-            lengths,
-            0.1,
-            1.3,
-        ):
-            pool.set_kv_buffer(
-                SimpleNamespace(layer_id=0),
-                KVWriteLoc(loc, physical=True),
-                k,
-                v,
-                0.1,
-                1.3,
-                layer_id_override=1,
-            )
-        assert_bytes_equal(arena.raw[untouched], before[untouched], "other arena bytes")
-
-    def test_e5m2_store_keeps_eager_overflow_behavior(self):
-        """E5M2 eager overflow is infinity, so an E4M3-style saturating path is invalid."""
-        dtype = torch.float8_e5m2
-        for name, pool in _make_store_pools(128, 128, dtype=dtype).items():
-            with self.subTest(pool=name):
-                k = torch.full((1, 1, 128), 1e6, dtype=torch.bfloat16, device=DEVICE)
-                v = -k
-                loc = torch.tensor([2], device=DEVICE)
-                pool.set_kv_buffer(
-                    SimpleNamespace(layer_id=0), KVWriteLoc(loc, physical=True), k, v
-                )
-                assert_bytes_equal(pool.get_key_buffer(0)[2], k.to(dtype)[0], "E5M2 K")
-                assert_bytes_equal(
-                    pool.get_value_buffer(0)[2], v.to(dtype)[0], "E5M2 V"
-                )
+                    if name == "view":
+                        assert_bytes_equal(
+                            arena.raw[untouched], before[untouched], "other arena bytes"
+                        )
 
 
 class TestDflashFp8PrefixCommit(CustomTestCase):

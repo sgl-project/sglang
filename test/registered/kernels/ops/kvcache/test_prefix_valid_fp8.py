@@ -156,21 +156,9 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
                             )
 
 
-# Slot 0 is the reserved CUDA-graph padding slot, so its row must not be written.
-STORE_SLOTS = (3, 0, 7, 1, 12)
-
-
 def _store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
     return _try_set_kv_buffer_fp8(
-        k=k,
-        v=v,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        indices=loc,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        row_dim=k.shape[-1],
-        size_limit=k_cache.shape[0],
+        k, v, k_cache, v_cache, loc, k_scale, v_scale, k.shape[-1], k_cache.shape[0]
     )
 
 
@@ -207,10 +195,9 @@ class TestSetKvBufferFp8Kernel(CustomTestCase):
         if not memory_pool._triton_fp8_supported():
             self.skipTest("Ordinary fused E4M3 stores require CUDA SM89+")
 
-    def test_matches_eager_bytes_for_every_scale_form(self):
-        """Absent, host and device scales, a tile tail and strided rows all
-        write the bytes of eager division; slot 0 and the inputs stay as they were."""
-        loc = torch.tensor(STORE_SLOTS, device=DEVICE)
+    def test_matches_eager_bytes(self):
+        """Check rounding/overflow, layouts, empty writes and padding together;
+        the oracle also checks every untouched slot and both source tensors."""
         scale_forms = {
             "none": (None, None),
             # Not exact in BF16 or FP16, so the divisor rounding is exercised.
@@ -223,77 +210,47 @@ class TestSetKvBufferFp8Kernel(CustomTestCase):
             "v_only_device": (None, _scale(1.3)),
         }
         for dtype in SOURCE_DTYPES:
-            for row_dim, strided in ((63, True), (256, False), (1030, False)):
-                for form, (k_scale, v_scale) in scale_forms.items():
-                    with self.subTest(dtype=dtype, row_dim=row_dim, scales=form):
-                        torch.manual_seed(row_dim)
-                        shape = (len(STORE_SLOTS), 2, row_dim)
-                        source = torch.randn(shape, dtype=dtype, device=DEVICE)
-                        if strided:
-                            k, v = source[:, :1], source[:, 1:]
-                        else:
-                            k, v = source[:, :1].clone(), source[:, 1:].clone()
-                        k_cache, v_cache = make_kv_cache(16, row_dim)
-                        with _assert_store(
-                            k,
-                            v,
-                            k_cache,
-                            v_cache,
-                            loc,
-                            k_scale,
-                            v_scale,
-                        ):
-                            self.assertTrue(
-                                _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
-                            )
-
-    def test_saturates_out_of_range_values(self):
-        """Magnitudes past the FP8 limit store the limit, NaN stays NaN and
-        zero keeps its sign."""
-        fp8_max = torch.finfo(fp8_dtype).max
-        values = [
-            float("-inf"),
-            -1000.0,
-            -fp8_max,
-            -1.0625,
-            -0.0,
-            0.0,
-            1.0625,
-            fp8_max,
-            1000.0,
-            float("inf"),
-            float("nan"),
-        ]
-        loc = torch.tensor([3], device=DEVICE)
-        for dtype in SOURCE_DTYPES:
-            for scale in (None, 0.5):
-                with self.subTest(dtype=dtype, scale=scale):
-                    k = torch.tensor(values, dtype=dtype, device=DEVICE).view(1, 1, -1)
-                    v = k.flip(-1).contiguous()
-                    k_cache, v_cache = make_kv_cache(8, len(values))
-                    with _assert_store(k, v, k_cache, v_cache, loc, scale, scale):
-                        self.assertTrue(
-                            _store(k, v, k_cache, v_cache, loc, scale, scale)
-                        )
-
-    def test_all_bf16_fp16_values_follow_eager_cast(self):
-        """Do not replace source-rounded division with FP32 reciprocal scaling."""
-        loc = torch.tensor([1], device=DEVICE)
-        for dtype in (torch.bfloat16, torch.float16):
-            values = (
-                torch.arange(65536, dtype=torch.int32, device=DEVICE)
-                .to(torch.int16)
-                .view(dtype)
-                .view(1, 1, -1)
+            # Every BF16/FP16 pattern; for FP32 also probe either side of ties.
+            bits = torch.arange(65536, dtype=torch.int32, device=DEVICE).to(torch.int16)
+            values = bits.view(torch.float16 if dtype == torch.float32 else dtype).to(
+                dtype
             )
-            k, v = values, values.flip(-1)
-            k_cache, v_cache = make_kv_cache(2, values.numel())
-            for scale in (None, 0.1, _scale(0.1)):
-                with self.subTest(dtype=dtype, scale=scale):
-                    with _assert_store(k, v, k_cache, v_cache, loc, scale, scale):
-                        self.assertTrue(
-                            _store(k, v, k_cache, v_cache, loc, scale, scale)
-                        )
+            if dtype == torch.float32:
+                inf = torch.full_like(values, float("inf"))
+                values = torch.cat(
+                    (
+                        values,
+                        torch.nextafter(values, -inf),
+                        torch.nextafter(values, inf),
+                    )
+                )
+            for row_dim, strided, empty in (
+                (256, False, True),
+                (63, True, False),
+                (256, False, False),
+                (1030, True, False),
+            ):
+                rows = 0 if empty else (values.numel() + row_dim - 1) // row_dim + 1
+                k = values[
+                    torch.arange(rows * row_dim, device=DEVICE) % values.numel()
+                ].view(rows, 1, row_dim)
+                source = torch.cat((k, k.flip(-1)), dim=1)
+                k, v = source[:, :1], source[:, 1:]
+                if not strided:
+                    k, v = k.contiguous(), v.contiguous()
+                loc = torch.arange(rows, 0, -1, device=DEVICE)
+                if rows:
+                    # Extra row is padding; all value patterns remain covered.
+                    loc[-1] = 0
+                for form, scales in scale_forms.items():
+                    with self.subTest(
+                        dtype=dtype, row_dim=row_dim, empty=empty, scales=form
+                    ):
+                        k_cache, v_cache = make_kv_cache(rows + 3, row_dim)
+                        with _assert_store(k, v, k_cache, v_cache, loc, *scales):
+                            self.assertTrue(
+                                _store(k, v, k_cache, v_cache, loc, *scales)
+                            )
 
     def test_graph_replay_reads_current_scales_and_locations(self):
         """Absent K/V scales are independent; a device scale initially equal to
@@ -328,24 +285,13 @@ class TestSetKvBufferFp8Kernel(CustomTestCase):
                     with _assert_store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
                         graph.replay()
 
-    def test_empty_write_preserves_cache(self):
-        k = torch.empty((0, 1, 128), dtype=torch.bfloat16, device=DEVICE)
-        k_cache, v_cache = make_kv_cache(2, 128)
-        loc = torch.empty(0, dtype=torch.int64, device=DEVICE)
-        with _assert_store(k, k, k_cache, v_cache, loc, None, None):
-            self.assertTrue(_store(k, k, k_cache, v_cache, loc, None, None))
-
     def test_declines_scales_and_devices_it_does_not_take(self):
         """A per-channel, non-fp32 or off-device scale, a CPU pool and a GPU
         below SM89 report False and write nothing, so the eager path still runs."""
         row_dim = 64
         cases = {
             "per_channel": (DEVICE, torch.full((row_dim,), 0.5, device=DEVICE), True),
-            "fp64": (
-                DEVICE,
-                torch.tensor(0.5, dtype=torch.float64, device=DEVICE),
-                True,
-            ),
+            "fp64": (DEVICE, _scale(0.5).double(), True),
             "off_device": (DEVICE, torch.tensor(0.5), True),
             "cpu_pool": ("cpu", None, True),
             "pre_sm89": (DEVICE, None, False),
