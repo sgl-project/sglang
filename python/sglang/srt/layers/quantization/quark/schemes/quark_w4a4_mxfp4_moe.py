@@ -1207,13 +1207,37 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
-        # Clamped SwiGLU-OAI (gemm1_alpha, gemm1_clamp_limit) is applied in
-        # _apply_triton_w4a16; only gemm1_beta != 1 is unsupported here.
         cfg = self.moe_runner_config
         if cfg.gemm1_beta not in (None, 1, 1.0):
             raise NotImplementedError(
                 f"W4A16 triton path supports gemm1_beta=1, got {cfg.gemm1_beta}"
             )
+        # The W4A16 fallback consumes StandardDispatchOutput (it needs
+        # topk_output). An all-to-all backend such as DeepEP dispatches a
+        # different result with no topk_output and would fail in the forward,
+        # so reject it here, at load, instead of mid-forward.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_none():
+            raise NotImplementedError(
+                "Quark MXFP4 W4A16 MoE fallback only supports standard dispatch; "
+                "an all-to-all MoE backend (e.g. DeepEP) has no topk_output. "
+                "Disable --moe-a2a-backend for this path."
+            )
+        # Resolve the activation once, here, so the eager forward does no per-call
+        # work. The clamped SwiGLU-OAI (up + 1) bias is correct only for the
+        # OpenAI variant, which sets gemm1_alpha; a clamp configured without an
+        # alpha is a different mode and is not supported (it would wrongly apply
+        # the +1 bias, e.g. gate=1, up=0 -> ~0.846 instead of 0).
+        clamp_limit = float(cfg.gemm1_clamp_limit or cfg.swiglu_limit or 0.0)
+        alpha = cfg.gemm1_alpha
+        if clamp_limit and alpha is None:
+            raise NotImplementedError(
+                "W4A16 clamped MoE supports only the SwiGLU-OAI variant "
+                "(gemm1_alpha set); got a clamp with no alpha."
+            )
+        self._w4a16_clamp_limit = clamp_limit
+        self._w4a16_alpha = float(alpha) if alpha is not None else None
         logger.info_once(
             "Quark MXFP4 MoE on consumer RDNA: no FP4 hardware, running the W4A4 MXFP4 "
             "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
@@ -1258,6 +1282,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         num_tokens, top_k = topk_ids.shape
 
+        if num_tokens == 0:
+            # Idle rank (e.g. attention-DP): with no tokens the final
+            # view(num_tokens, top_k, -1) cannot infer the hidden dim. Return the
+            # empty combine input before the grouped GEMMs. x is (0, hidden_size).
+            return StandardCombineInput(hidden_states=x)
+
         # Expert-major routing for triton_kernels: row i of the grouped GEMM is flat
         # slot combine[i] (= token * top_k + j), sorted by expert id. Everything
         # stays on device (no bincount) so this is CUDA-graph capturable.
@@ -1281,15 +1311,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             gather_indx=gather,
             precision_config=self.w13_precision_config,
         )
-        clamp_limit = float(
-            self.moe_runner_config.gemm1_clamp_limit
-            or self.moe_runner_config.swiglu_limit
-            or 0.0
-        )
-        if clamp_limit:
-            alpha = float(self.moe_runner_config.gemm1_alpha or 1.702)
+        if self._w4a16_clamp_limit:
             act = _clamped_swiglu_oai(
-                gate_up, self.intermediate_size, alpha, clamp_limit
+                gate_up,
+                self.intermediate_size,
+                self._w4a16_alpha,
+                self._w4a16_clamp_limit,
             ).to(x.dtype)
         else:
             act = torch.empty(

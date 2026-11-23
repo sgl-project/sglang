@@ -1,7 +1,7 @@
-"""Quark MXFP4 MoE W4A16 (triton_kernels) path on consumer RDNA.
+"""Quark MXFP4 MoE W4A16 (triton_kernels) path on consumer RDNA and gfx942.
 
-The path must only replace the AITER path on consumer RDNA (gfx11 / gfx120);
-other AMD GPUs, including gfx1250, keep AITER.
+The path replaces the AITER path on consumer RDNA (gfx11 / gfx120) and on gfx942
+(CDNA3, no FP4 MoE kernel); other AMD GPUs, including gfx1250, keep AITER.
 With EP > 1 the dispatcher maps experts owned by other ranks to -1; the W4A16
 path must drop those slots instead of indexing with -1 (a GPU memory fault).
 """
@@ -98,8 +98,9 @@ class TestQuarkMxfp4MoeW4A16Gate(unittest.TestCase):
         # Re-import with the real device so later tests see the real gate.
         self.addCleanup(importlib.reload, quark_w4a4_mxfp4_moe)
 
-    def test_gfx942_keeps_the_aiter_path(self):
-        self.assertFalse(_w4a16_enabled_on("gfx942:sramecc+:xnack-"))
+    def test_gfx942_uses_the_w4a16_path(self):
+        # gfx942 (CDNA3) has no FP4 MoE kernel, so it joins consumer RDNA on W4A16.
+        self.assertTrue(_w4a16_enabled_on("gfx942:sramecc+:xnack-"))
 
     def test_gfx1250_keeps_the_aiter_path(self):
         # gfx1250 (MI455) also starts with gfx12, so a gfx12 prefix would misfire.
@@ -160,10 +161,22 @@ class TestQuarkMxfp4MoeW4A16ExpertParallel(unittest.TestCase):
         self.assertTrue(torch.equal(out, torch.zeros_like(out)))
 
     def test_clamped_swiglu_config_is_rejected(self):
+        # A clamp with no alpha is not the SwiGLU-OAI variant; it must raise
+        # rather than silently apply the (up + 1) OAI bias.
         clamped = MoeRunnerConfig(activation="silu", gemm1_clamp_limit=7.0)
 
         with self.assertRaises(NotImplementedError):
             _build_rank(self.weights, slice(None), clamped)
+
+    def test_clamped_swiglu_oai_config_is_supported(self):
+        # The OpenAI variant (alpha + clamp, e.g. MiniMax-M3 / gpt-oss) is the
+        # supported clamped path and must build and run.
+        oai = MoeRunnerConfig(
+            activation="silu", gemm1_alpha=1.702, gemm1_clamp_limit=7.0
+        )
+        scheme, layer = _build_rank(self.weights, slice(None), oai)
+        out = _run(scheme, layer, self.hidden_states, self.topk_weights, self.topk_ids)
+        self.assertEqual(out.shape, self.hidden_states.shape)
 
 
 if __name__ == "__main__":

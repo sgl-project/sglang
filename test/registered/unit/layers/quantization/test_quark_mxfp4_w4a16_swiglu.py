@@ -43,3 +43,7 @@ def test_clamped_swiglu_clamps_gate_and_up():
     torch.testing.assert_close(
         out, torch.full((1, inter), float(expected)), rtol=1e-4, atol=1e-4
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
