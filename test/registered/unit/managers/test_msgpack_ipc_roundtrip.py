@@ -42,6 +42,7 @@ from sglang.srt.managers.io_struct import (
     msgpack_encode,
     row_output_ids,
 )
+from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
 )
@@ -58,7 +59,7 @@ from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 
 def _round_trip(obj):
@@ -367,6 +368,22 @@ class TestRequestStatsRoundTrip(CustomTestCase):
                 self.assertIsInstance(
                     decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
                 )
+
+
+class TestFinishReasonRoundTrip(CustomTestCase):
+    def test_a_length_finish_keeps_its_ignored_stop_object(self):
+        expected_finished_reasons = [
+            FINISH_LENGTH(3, ignored_stop_position=2).to_json()
+        ]
+        for cls in (BatchTokenIDOutput, BatchStrOutput):
+            with self.subTest(type=cls.__name__):
+                obj = _batch_output(
+                    cls, rids=["a"], finished_reasons=expected_finished_reasons
+                )
+
+                decoded = _double_hop(obj)
+
+                self.assertEqual(decoded.finished_reasons, expected_finished_reasons)
 
 
 class TestDetokenizeRoundTrip(CustomTestCase):

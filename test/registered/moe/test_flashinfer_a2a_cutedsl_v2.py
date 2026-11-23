@@ -52,7 +52,7 @@ class TestCuteDslFlashinferA2A(CustomTestCase):
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
                 "--moe-a2a-backend",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
                 "--max-prefill-tokens",
                 "4096",
                 "--disable-radix-cache",

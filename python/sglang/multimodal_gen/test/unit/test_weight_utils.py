@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for multimodal weight-loading utilities."""
 
+import json
 import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -224,7 +226,13 @@ class TestDitParameterCount(CustomTestCase):
             partial = Path(tmpdir) / "partial"
             _write_sharded_transformer(partial)
             (partial / "transformer" / "shard-2.safetensors").unlink()
-            header = SimpleNamespace(parameter_count={"F32": 10, "BF16": 2})
+            both_reading = Barrier(2, timeout=10)
+
+            def header(*, repo_id, filename, revision):
+                self.assertEqual((repo_id, revision), ("org/model", "abc"))
+                both_reading.wait()
+                return SimpleNamespace(parameter_count={"F32": 10, "BF16": 2})
+
             for snapshot in (
                 Mock(side_effect=LocalEntryNotFoundError("not cached")),
                 Mock(return_value=str(partial)),
@@ -236,7 +244,7 @@ class TestDitParameterCount(CustomTestCase):
                     patch(f"{_LOADER_UTILS}.hf_hub_download", return_value=str(index)),
                     patch(
                         f"{_LOADER_UTILS}.parse_safetensors_file_metadata",
-                        return_value=header,
+                        side_effect=header,
                     ) as parse,
                 ):
                     self.assertEqual(
@@ -245,14 +253,32 @@ class TestDitParameterCount(CustomTestCase):
                         ),
                         24,
                     )
-                    self.assertEqual(
+                    self.assertCountEqual(
                         [call.kwargs["filename"] for call in parse.call_args_list],
                         [
                             "transformer/shard-1.safetensors",
                             "transformer/shard-2.safetensors",
                         ],
                     )
-                    self.assertEqual(parse.call_args.kwargs["revision"], "abc")
+
+    def test_one_bad_hub_shard_does_not_report_a_partial_size(self):
+        def header(*, filename, **kwargs):
+            if filename.endswith("shard-2.safetensors"):
+                raise OSError("range request failed")
+            return SimpleNamespace(parameter_count={"F32": 10})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index = Path(tmpdir) / "index.json"
+            index.write_text(_TWO_SHARD_INDEX)
+            with (
+                patch.dict(os.environ, {"SGLANG_USE_MODELSCOPE": "0"}),
+                patch(_SNAPSHOT_DOWNLOAD, side_effect=LocalEntryNotFoundError("miss")),
+                patch(f"{_LOADER_UTILS}.hf_hub_download", return_value=str(index)),
+                patch(f"{_LOADER_UTILS}.parse_safetensors_file_metadata", header),
+            ):
+                self.assertIsNone(
+                    dit_parameter_count("org/model", subfolder=None, revision=None)
+                )
 
     def test_unreachable_hub_or_modelscope_leaves_the_dit_unsized(self):
         for use_modelscope, hub_download in (
@@ -293,6 +319,26 @@ def _write_pipeline(root: Path) -> None:
 
 class TestCheckpointComponentSizes(CustomTestCase):
     SIZES = {"transformer": (17, 58), "text_encoder": (4, 16)}
+
+    def test_batchnorm_step_counter_does_not_unsize_the_checkpoint(self):
+        # FLUX.2's VAE stores a BatchNorm, whose num_batches_tracked is int64
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_pipeline(root)
+            (root / "vae").mkdir()
+            bn = torch.nn.BatchNorm2d(8)
+            safetensors_save_file(
+                {f"bn.{k}": v for k, v in bn.state_dict().items()},
+                root / "vae" / "diffusion_pytorch_model.safetensors",
+            )
+            index = json.loads((root / "model_index.json").read_text())
+            index["vae"] = ["diffusers", "V"]
+            (root / "model_index.json").write_text(json.dumps(index))
+
+            self.assertEqual(
+                checkpoint_component_sizes(tmpdir, subfolder=None, revision=None),
+                {**self.SIZES, "vae": (32, 128)},
+            )
 
     def test_sizes_every_weighted_component(self):
         with tempfile.TemporaryDirectory() as tmpdir:
