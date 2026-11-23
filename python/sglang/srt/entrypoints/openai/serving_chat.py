@@ -473,6 +473,13 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+        self._mm_processor_takes_prompt_ids = bool(
+            getattr(
+                getattr(self.tokenizer_manager, "mm_processor", None),
+                "prefer_tokenized_input",
+                False,
+            )
+        )
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
@@ -1161,15 +1168,21 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         # A lossy text round-trip makes the rendered prompt unusable, so send the
         # ids instead. Only when nothing needs placeholder expansion: with media
-        # attached the MM processor still has to tokenize the text itself.
-        prefers_prompt_ids = (
-            self._prompt_text_round_trip_is_lossy
-            and isinstance(processed_messages.prompt_ids, list)
+        # attached the MM processor still has to tokenize the text itself, unless
+        # it expands placeholders in ids, so the prompt is not tokenized again.
+        has_prompt_ids = (
+            isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
-            and not (
-                processed_messages.image_data
-                or processed_messages.video_data
-                or processed_messages.audio_data
+        )
+        prefers_prompt_ids = has_prompt_ids and (
+            self._mm_processor_takes_prompt_ids
+            or (
+                self._prompt_text_round_trip_is_lossy
+                and not (
+                    processed_messages.image_data
+                    or processed_messages.video_data
+                    or processed_messages.audio_data
+                )
             )
         )
         if (
