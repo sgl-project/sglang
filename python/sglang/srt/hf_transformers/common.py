@@ -47,6 +47,8 @@ from sglang.srt.configs.all_configs import (
     Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     HYV4Config,
+    HYV4FlashConfig,
+    HYV4FlashTextConfig,
     InklingAudioConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -100,6 +102,7 @@ from sglang.srt.configs.all_configs import (
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
+from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
@@ -156,6 +159,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         GigaChat35Config,
         GraniteMoeHybridConfig,
         HYV4Config,
+        HYV4FlashConfig,
+        HYV4FlashTextConfig,
         DotsVLMConfig,
         DotsOCRConfig,
         Dots3Config,
@@ -186,6 +191,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MiniCPMV4_6VisionConfig,
         MiniCPMV4_7Config,
         InklingModelConfig,
+        Inkling2MMConfig,
+        Inkling2ModelConfig,
         InklingAudioConfig,
         InklingVisionConfig,
         InklingMMConfig,

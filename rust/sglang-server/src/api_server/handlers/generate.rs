@@ -8,7 +8,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::request::{GenerateRequest, PromptTokenIdsSlot, RequestKind};
 use crate::message::response::ResponseItem;
 use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission};
@@ -148,9 +148,12 @@ impl CoreHandle {
             result = self.prepare_generations(std::slice::from_mut(&mut request)) => result?,
         }
         let metrics = self.request_metrics(&request, created_at);
+        let prompt_token_ids = request.prompt_token_ids.clone();
         self.submit_generation(request, generation)
             .await
-            .map(|runtime| self.generation_call(runtime, metrics, record, Some(in_flight)))
+            .map(|runtime| {
+                self.generation_call(runtime, metrics, record, Some(in_flight), prompt_token_ids)
+            })
     }
 
     /// Submit core-owned work without exposing it through the public Abort
@@ -177,9 +180,12 @@ impl CoreHandle {
         let metrics = log_metrics
             .then(|| self.request_metrics(&request, created_at))
             .flatten();
+        let prompt_token_ids = request.prompt_token_ids.clone();
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(|runtime| self.generation_call(runtime, metrics, record, in_flight))
+            .map(|runtime| {
+                self.generation_call(runtime, metrics, record, in_flight, prompt_token_ids)
+            })
     }
 
     /// Python logs a request once it is normalized, before tokenization or
@@ -218,12 +224,12 @@ impl CoreHandle {
         // A body is a batch here even with one item (a list); the core's own
         // requests are one only when they are several.
         let batch = matches!(received, ReceivedAs::Body { .. }) || requests.len() > 1;
-        let mut records = self
+        // No records without a request log.
+        let records = self
             .receive(&requests, received, batch, true)
             .into_iter()
             .map(Some)
-            .collect::<Vec<_>>();
-        records.resize_with(requests.len(), || None);
+            .chain(std::iter::repeat_with(|| None));
         // One refused item refuses the batch before any item is prepared.
         self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
@@ -259,8 +265,11 @@ impl CoreHandle {
         {
             let rid = request.rid.clone();
             let metrics = self.request_metrics(&request, created_at);
+            let prompt_token_ids = request.prompt_token_ids.clone();
             let call = match self.submit_generation(request, generation).await {
-                Ok(call) => self.generation_call(call, metrics, record, Some(in_flight)),
+                Ok(call) => {
+                    self.generation_call(call, metrics, record, Some(in_flight), prompt_token_ids)
+                }
                 // Cancellation may happen during preparation or while waiting
                 // for intake. Keep this slot without rolling back siblings.
                 Err(CoreError::Cancelled(_)) => {
@@ -305,6 +314,7 @@ impl CoreHandle {
         metrics: Option<RequestMetrics>,
         record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
+        prompt_token_ids: Option<PromptTokenIdsSlot>,
     ) -> CoreCall {
         CoreCall::new(
             runtime,
@@ -313,6 +323,7 @@ impl CoreHandle {
             metrics,
             record,
             in_flight,
+            prompt_token_ids,
         )
     }
 
@@ -359,10 +370,8 @@ impl CoreHandle {
     /// rank 0 of a single-rank deployment is ignored, a rank outside the
     /// deployment's `[0, dp_size)` is refused. Then this listener's own: it
     /// feeds only its own DP rank's scheduler, so it refuses a request naming
-    /// another. The HTTP generation routes hand such a request to that rank's
-    /// listener before it gets here (`http::dp_relay`); one that still
-    /// arrives (over gRPC, or with no listener known for the rank) fails
-    /// rather than run on the wrong rank.
+    /// another rather than run it on the wrong rank. Clients reach each rank
+    /// at its own listener, which DP rank 0 publishes.
     fn check_routed_dp_rank(&self, rank: Option<i64>) -> Result<(), CoreError> {
         let Some(rank) = rank else {
             return Ok(());
@@ -419,6 +428,9 @@ pub(crate) struct CoreCall {
     /// every output (see [`CoreOutput`](crate::api_server::core::CoreOutput)).
     weight_version: Option<Arc<str>>,
     dp_rank: Option<u32>,
+    /// Where intake leaves the prompt ids of a request that asked for them,
+    /// stamped on every output once there.
+    prompt_token_ids: Option<PromptTokenIdsSlot>,
     /// Observes every runtime item as the call receives it.
     metrics: Option<RequestMetrics>,
     /// Logs the request's `Finish` and keeps its crash-dump entry.
@@ -435,6 +447,7 @@ impl CoreCall {
         metrics: Option<RequestMetrics>,
         mut record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
+        prompt_token_ids: Option<PromptTokenIdsSlot>,
     ) -> Self {
         if let Some(record) = &mut record {
             record.admit();
@@ -444,6 +457,7 @@ impl CoreCall {
             events_finished: false,
             weight_version,
             dp_rank,
+            prompt_token_ids,
             metrics,
             record,
             _in_flight: in_flight,
@@ -477,6 +491,7 @@ impl CoreCall {
                 last_output: LastOutput::default(),
                 abort_deadline: None,
             },
+            None,
             None,
             None,
             None,
@@ -557,6 +572,7 @@ impl CoreCall {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -571,6 +587,10 @@ impl CoreCall {
         if let Some(output) = output {
             output.weight_version = self.weight_version.clone();
             output.dp_rank = self.dp_rank;
+            output.prompt_token_ids = self
+                .prompt_token_ids
+                .as_ref()
+                .and_then(|slot| slot.get().cloned());
         }
         event
     }
