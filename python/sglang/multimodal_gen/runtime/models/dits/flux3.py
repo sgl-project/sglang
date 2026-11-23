@@ -80,6 +80,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -371,7 +372,10 @@ class Flux3LastLayer(nn.Module):
             vec = vec[:, None, :]
         x = self.norm_final(x)
         projection = self.adaLN_modulation[1]
-        if isinstance(projection, Flux3Fp8RowwiseLinear):
+        # An active unmerged LoRA adds its delta in the wrapper's forward.
+        if isinstance(projection, Flux3Fp8RowwiseLinear) or (
+            isinstance(projection, BaseLayerWithLoRA) and projection.lora_active
+        ):
             shift, scale = self.adaLN_modulation(vec).chunk(2, dim=-1)
             return self.linear(x * (scale + 1) + shift)
         # BF16: two half projections avoid materializing the (L, 2 * hidden) product.

@@ -274,9 +274,9 @@ _QKV_PARAM_NAMES_MAPPING: dict[str, str | tuple[str, int, int]] = {
     r"(.*)\.q_proj\.input_scale$": (r"\1.to_qkv.input_scale", 0, 3),
     r"(.*)\.k_proj\.input_scale$": (r"\1.to_qkv.input_scale", 1, 3),
     r"(.*)\.v_proj\.input_scale$": (r"\1.to_qkv.input_scale", 2, 3),
-    r"(.*)\.q_proj\.(lora_A|lora_B)$": (r"\1.to_qkv.\2", 0, 3),
-    r"(.*)\.k_proj\.(lora_A|lora_B)$": (r"\1.to_qkv.\2", 1, 3),
-    r"(.*)\.v_proj\.(lora_A|lora_B)$": (r"\1.to_qkv.\2", 2, 3),
+    r"(.*)\.q_proj\.(lora_A|lora_B|alpha)$": (r"\1.to_qkv.\2", 0, 3),
+    r"(.*)\.k_proj\.(lora_A|lora_B|alpha)$": (r"\1.to_qkv.\2", 1, 3),
+    r"(.*)\.v_proj\.(lora_A|lora_B|alpha)$": (r"\1.to_qkv.\2", 2, 3),
 }
 
 
