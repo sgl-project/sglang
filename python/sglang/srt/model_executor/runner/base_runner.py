@@ -263,20 +263,7 @@ class BaseRunner(ABC):
         if mr.device != "cuda":
             return
 
-        self._pre_initialize_flashinfer_allreduce_workspace()
-        self._pre_initialize_fi_a2a_workspace()
-        self._pre_initialize_dcp_push_combine()
-        self._pre_initialize_pcie_ipc_workspace()
-
-        # Model-owned communication resources may depend on the resolved
-        # request pool and must be compiled/allocated before graph capture.
-        prepare_model_resources = getattr(
-            mr.model, "prepare_before_cuda_graph_capture", None
-        )
-        if prepare_model_resources is not None:
-            prepare_model_resources(mr)
-        prepare_megakernel(mr)
-        self._finalize_symm_workspaces()
+        self.prepare_kernel_resources()
 
         if hybrid_gdn_config(mr.model_config) is not None:
             from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -304,6 +291,24 @@ class BaseRunner(ABC):
             )
 
             pp_parallel_deep_gemm_warmup(self)
+
+    def prepare_kernel_resources(self) -> None:
+        """Prepare communication workspaces without running a dummy forward."""
+        mr = self.model_runner
+        self._pre_initialize_flashinfer_allreduce_workspace()
+        self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_dcp_push_combine()
+        self._pre_initialize_pcie_ipc_workspace()
+
+        # Model-owned communication resources may depend on the resolved
+        # request pool and must be compiled/allocated before graph capture.
+        prepare_model_resources = getattr(
+            mr.model, "prepare_before_cuda_graph_capture", None
+        )
+        if prepare_model_resources is not None:
+            prepare_model_resources(mr)
+        prepare_megakernel(mr)
+        self._finalize_symm_workspaces()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Allocate flashinfer allreduce workspaces; must run before CG capture

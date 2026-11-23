@@ -36,6 +36,8 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_asr_validation",
         "handle_grpc_args",
         "handle_missing_default_values",
+        "validate_vpp_options",
+        "handle_vpp",
         "handle_expert_pack",
         "handle_pd_disaggregation",
         "validate_prefill_only_disable_kv_cache_args",

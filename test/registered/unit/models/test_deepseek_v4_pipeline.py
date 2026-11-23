@@ -122,6 +122,60 @@ class TestVPPConstruction(CustomTestCase):
                 )
             yield deepseek_v4, config
 
+    def test_loader_constructs_only_resolved_vpp_layers(self):
+        from sglang.srt.model_loader import loader
+
+        for rank, expected in ((0, (0, 3, 4, 5, 7, 8)), (1, (1, 2, 6, 9, 10, 11))):
+            with (
+                self.subTest(rank=rank),
+                self.construction(rank, 2) as (module, config),
+            ):
+                config.architectures = ["DeepseekV4ForCausalLM"]
+                model_config = SimpleNamespace(
+                    hf_config=config,
+                    num_hidden_layers=12,
+                    is_generation=True,
+                    is_multimodal=False,
+                )
+                parallel = module.get_parallel()
+                parallel.pp_virtual_stages = 3
+                parallel.pp_vpp_layer_partition = [1, 2, 3, 1, 2, 3]
+                with (
+                    patch.object(loader, "get_parallel", return_value=parallel),
+                    patch.object(
+                        loader,
+                        "get_model_architecture",
+                        return_value=(
+                            module.DeepseekV4ForCausalLM,
+                            "DeepseekV4ForCausalLM",
+                        ),
+                    ),
+                    patch.object(
+                        loader, "resolve_shared_experts_config", return_value=None
+                    ),
+                    patch.object(
+                        loader,
+                        "get_model",
+                        return_value=SimpleNamespace(
+                            override=lambda **kw: nullcontext()
+                        ),
+                    ),
+                    patch.object(loader, "check_stage_producers", return_value=None),
+                ):
+                    model = loader._initialize_model(
+                        model_config, SimpleNamespace(draft_model_idx=None)
+                    )
+                self.assertEqual(model.layer_ids, expected)
+                self.assertEqual(
+                    tuple(
+                        i
+                        for i, layer in enumerate(model.model.layers)
+                        if hasattr(layer, "weight")
+                    ),
+                    expected,
+                )
+                self.assertEqual(model.vpp_layout.virtual_stages, 3)
+
     def test_interleaved_ownership_preserves_global_weight_names_and_endpoints(self):
         from sglang.srt.distributed.vpp_layout import VPPLayout
         from sglang.srt.layers.utils import PPMissingLayer

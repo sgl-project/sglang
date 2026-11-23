@@ -74,6 +74,20 @@ class Parallel(msgspec.Struct):
         int,
         "The async batch depth of pipeline parallelism.",
     ] = 0
+    pp_virtual_stages: A[
+        int,
+        "Logical stages per physical pipeline rank. 1 uses ordinary PP; "
+        "values greater than 1 enable fixed-TP VPP for DeepSeek V4 on CUDA.",
+    ] = 1
+    pp_vpp_layer_partition: A[
+        Optional[list[int]],
+        Arg(
+            help="Layer counts in logical stage order for VPP. Supply "
+            "pp_size * pp_virtual_stages positive counts whose sum is the "
+            "model depth; omitted distributes layers evenly.",
+            nargs="+",
+        ),
+    ] = None
     dp_size: A[
         int,
         Arg(

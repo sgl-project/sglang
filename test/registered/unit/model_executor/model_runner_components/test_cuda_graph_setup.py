@@ -1,4 +1,5 @@
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -249,6 +250,98 @@ def test_align_pipeline_layers_uses_absolute_indices():
         _align_pipeline_layers(
             local_layers, SimpleNamespace(start_layer=0, layers=local_layers)
         )
+
+
+def test_vpp_startup_keeps_workspaces_without_whole_model_warmup(monkeypatch):
+    """A VPP model refuses forward(); startup must still prepare TP resources."""
+    from sglang.srt.distributed.vpp_layout import VPPLayout
+    from sglang.srt.model_executor import graph_shared_output
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+    from sglang.srt.model_executor.runner import base_runner
+    from sglang.srt.model_executor.runner.vpp_runner import VPPStageRunner
+
+    prepared = []
+    mr = SimpleNamespace(
+        device="cpu",
+        is_draft_worker=False,
+        canary_manager=None,
+        model=SimpleNamespace(
+            vpp_layout=VPPLayout(12, 2),
+            shared_experts_config=None,
+            forward=lambda *a, **kw: pytest.fail(
+                "whole-model forward during VPP startup"
+            ),
+            prepare_before_cuda_graph_capture=lambda runner: prepared.append("model"),
+        ),
+    )
+    parallel = SimpleNamespace(
+        num_dp_ranks=1,
+        pp_size=2,
+        attn_tp_size=1,
+    )
+    disabled = SimpleNamespace(backend="disabled")
+    execution = SimpleNamespace(
+        graph=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(prefill=disabled, decode=disabled)
+        )
+    )
+    monkeypatch.setattr(cuda_graph_setup, "get_exec", lambda: execution)
+    monkeypatch.setattr(graph_shared_output, "get_exec", lambda: execution)
+    monkeypatch.setattr(base_runner, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(
+        base_runner,
+        "get_server_return_hidden_states_mode",
+        lambda: CaptureHiddenMode.NULL,
+    )
+    monkeypatch.setattr(base_runner, "TboCudaGraphRunnerPlugin", lambda: None)
+    monkeypatch.setattr(
+        base_runner,
+        "get_model",
+        lambda: SimpleNamespace(override=lambda **kw: nullcontext()),
+    )
+    for name, label in (
+        ("_pre_initialize_flashinfer_allreduce_workspace", "allreduce"),
+        ("_pre_initialize_fi_a2a_workspace", "a2a"),
+        ("_pre_initialize_dcp_push_combine", "dcp"),
+        ("_pre_initialize_pcie_ipc_workspace", "pcie"),
+        ("_finalize_symm_workspaces", "symmetric"),
+    ):
+        monkeypatch.setattr(
+            base_runner.BaseRunner,
+            name,
+            lambda self, label=label: prepared.append(label),
+        )
+    monkeypatch.setattr(
+        base_runner, "prepare_megakernel", lambda runner: prepared.append("plugin")
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "refresh_deep_gemm_layout_memory_budget", lambda runner: None
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "finalize_cuda_graph_capture", lambda runner: None
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup,
+        "EagerRunner",
+        lambda *a, **kw: pytest.fail("shared eager inputs allocated"),
+    )
+    capture = cuda_graph_setup.capture_cuda_graphs(model_runner=mr)
+    assert isinstance(capture.eager_runner, VPPStageRunner)
+    assert prepared == [
+        "allreduce",
+        "a2a",
+        "dcp",
+        "pcie",
+        "model",
+        "plugin",
+        "symmetric",
+    ]
+    assert capture.prefill.runner is None and capture.decode.runner is None
+    assert set(capture.memory_usage.values()) == {0}
+    batch = object()
+    assert capture.eager_runner.load_batch(batch) is batch
+    with pytest.raises(ValueError, match="explicit vpp_stage_id"):
+        capture.eager_runner.execute(batch)
 
 
 if __name__ == "__main__":

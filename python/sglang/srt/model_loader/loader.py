@@ -335,6 +335,15 @@ def _initialize_model(
         "config": model_config.hf_config,
         "quant_config": quant_config,
     }
+    from sglang.srt.configs.vpp import resolve_vpp_layout
+
+    vpp_layout = resolve_vpp_layout(
+        model_config,
+        get_parallel(),
+        is_draft_worker=load_config.draft_model_idx is not None,
+    )
+    if vpp_layout is not None:
+        kwargs["vpp_layout"] = vpp_layout
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():

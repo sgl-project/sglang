@@ -190,7 +190,7 @@ class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
-    eager_runner: EagerRunner
+    eager_runner: BaseRunner
     prefill: GraphCapture
     decode: GraphCapture
 
@@ -420,6 +420,33 @@ def capture_cuda_graphs(
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )
+    if getattr(model_runner.model, "vpp_layout", None) is not None:
+        from sglang.srt.model_executor.runner.vpp_runner import VPPStageRunner
+
+        if any(
+            getattr(get_exec().graph.cuda_graph_config, phase).backend
+            != Backend.DISABLED
+            for phase in Phase.ALL
+        ):
+            raise ValueError("VPP startup requires CUDA graphs disabled in both phases")
+        # Ordinary EagerRunner allocates shared static inputs and warms the
+        # whole model via forward(). Neither is the explicit-stage VPP contract.
+        # Layer-level precompilation remains in ModelRunner.load_model(); stage
+        # kernels initialize lazily on the first real wave.
+        logger.info("VPP: defer stage-forward warmup to the first serving wave")
+        stage_runner = VPPStageRunner(model_runner)
+        refresh_deep_gemm_layout_memory_budget(model_runner)
+        if finalize:
+            finalize_cuda_graph_capture(model_runner)
+        return CudaGraphsCapture(
+            eager_runner=stage_runner,
+            prefill=GraphCapture(
+                runner=None, memory_phase="prefill", memory_usage_gb=0, capture_time=0
+            ),
+            decode=GraphCapture(
+                runner=None, memory_phase="decode", memory_usage_gb=0, capture_time=0
+            ),
+        )
 
     # The eager (no-cuda-graph) phase runner, built AFTER the attention
     # backend so its __init__ can warm up kernels (run-once) and allocate the

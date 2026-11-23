@@ -7,6 +7,7 @@ across representative configurations. A field that moves without a declaration
 or is projected into the wrong namespace therefore fails on observed state.
 """
 
+import argparse
 import copy
 import json
 import os
@@ -15,6 +16,7 @@ import shutil
 import tempfile
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 import msgspec
 import msgspec.structs
@@ -788,6 +790,237 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
                     "these entries changed after they were declared, so the log "
                     f"credits the wrong handler for the end state: {drifted}",
                 )
+
+
+class TestVPPResolution(CustomTestCase):
+    """CLI, published topology and model loading must agree on logical ownership."""
+
+    def setUp(self):
+        super().setUp()
+        environment = dict(os.environ)
+
+        def restore():
+            os.environ.clear()
+            os.environ.update(environment)
+
+        self.addCleanup(restore)
+
+    @staticmethod
+    def model_config(**changes):
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v4"
+            ),
+            num_hidden_layers=12,
+            is_generation=True,
+            is_multimodal=False,
+        )
+        config.__dict__.update(changes)
+        return config
+
+    def test_complete_pipeline_keeps_vpp_eager_after_model_defaults(self):
+        """Later model/backend defaults must not undo the explicit-stage contract."""
+        from sglang.srt.arg_groups.model_override_base import (
+            model_config_of,
+            resolving_view,
+        )
+        from sglang.srt.configs.vpp import resolve_vpp_layout
+
+        config = {
+            **_MINI_CONFIG,
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 12,
+            "num_key_value_heads": 1,
+            "head_dim": 512,
+            "qk_nope_head_dim": 448,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 512,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 16,
+            "sliding_window": 128,
+            "index_head_dim": 128,
+            "rope_scaling": {},
+            "compress_ratios": [4, 128] * 6,
+            "kv_source_layer_ids": list(range(12)),
+        }
+        with tempfile.TemporaryDirectory(prefix="vpp_resolution_") as path:
+            with open(os.path.join(path, "config.json"), "w") as handle:
+                json.dump(config, handle)
+            args = ServerArgs(
+                model_path=path,
+                device="cuda",
+                pp_size=2,
+                pp_virtual_stages=3,
+                random_seed=42,
+            )
+            args.resolve_once()
+            cfg = resolving_view(args)
+            layout = resolve_vpp_layout(model_config_of(args), cfg)
+        self.assertEqual(layout.logical_size, 6)
+        self.assertEqual(cfg.attention_backend, "dsv4")
+        self.assertEqual(
+            (
+                cfg.cuda_graph_config.prefill.backend,
+                cfg.cuda_graph_config.decode.backend,
+            ),
+            ("disabled", "disabled"),
+        )
+        self.assertTrue(cfg.disable_overlap_schedule)
+        self.assertFalse(cfg.enable_attn_tp_input_scattered)
+
+    def test_cli_declarations_survive_publication_and_pickling(self):
+        from sglang.srt.arg_groups.arg_utils import add_cli_args_from_dataclass
+        from sglang.srt.arg_groups.cuda_graph_hook import handle_cuda_graph_config
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+        from sglang.srt.arg_groups.vpp_hook import handle_vpp
+        from sglang.srt.configs.vpp import resolve_vpp_layout
+        from sglang.srt.runtime_context import (
+            get_exec,
+            get_parallel,
+            get_schedule,
+            publish,
+            reset_context,
+        )
+
+        parser = argparse.ArgumentParser()
+        add_cli_args_from_dataclass(parser, Parallel)
+        parsed = parser.parse_args(
+            "--pp-size 2 --pp-virtual-stages 3 "
+            "--pp-vpp-layer-partition 1 2 3 1 2 3".split()
+        )
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            random_seed=42,
+            pp_size=parsed.pp_size,
+            pp_virtual_stages=parsed.pp_virtual_stages,
+            pp_vpp_layer_partition=parsed.pp_vpp_layer_partition,
+        )
+        model_config = self.model_config()
+        with unittest.mock.patch(
+            "sglang.srt.arg_groups.vpp_hook.model_config_of", return_value=model_config
+        ):
+            handle_vpp(args)
+        handle_cuda_graph_config(args)
+        args._resolution_finished = True
+        import pickle
+
+        child = pickle.loads(pickle.dumps(args))
+        self.addCleanup(reset_context)
+        publish(child, role="scheduler")
+        layout = resolve_vpp_layout(model_config, get_parallel())
+        self.assertEqual(layout.layer_ids_for_rank(0), (0, 3, 4, 5, 7, 8))
+        self.assertEqual(layout.layer_ids_for_rank(1), (1, 2, 6, 9, 10, 11))
+        self.assertEqual(
+            [
+                getattr(get_exec().graph.cuda_graph_config, p).backend
+                for p in ("prefill", "decode")
+            ],
+            ["disabled", "disabled"],
+        )
+        self.assertTrue(get_schedule().disable_overlap_schedule)
+        self.assertFalse(args.disable_cuda_graph)  # The startup seed stays raw.
+        self.assertFalse(args.disable_overlap_schedule)
+
+    def test_unsupported_modes_fail_before_model_configuration(self):
+        from sglang.srt.arg_groups.vpp_hook import handle_vpp, validate_vpp_options
+
+        for changes, error in (
+            ({"pp_virtual_stages": 0}, "positive integer"),
+            ({"pp_size": 1}, "--pp-size"),
+            ({"pp_async_batch_depth": -1}, "async batch"),
+            ({"attn_cp_size": 2}, "context parallelism"),
+            ({"enable_attn_tp_input_scattered": True}, "input scattering"),
+            ({"enable_two_batch_overlap": True}, "two-batch overlap"),
+            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+            ({"lora_paths": ["adapter"]}, "LoRA"),
+            ({"speculative_algorithm": "DSPARK"}, "speculative decoding"),
+            ({"device": "cpu"}, "CUDA"),
+            ({"pp_vpp_layer_partition": [2, 4]}, "one positive layer count"),
+        ):
+            with self.subTest(changes=changes):
+                args = ServerArgs(
+                    model_path="dummy",
+                    **{
+                        "device": "cuda",
+                        "pp_size": 2,
+                        "pp_virtual_stages": 2,
+                        **changes,
+                    },
+                )
+                with (
+                    unittest.mock.patch(
+                        "sglang.srt.arg_groups.vpp_hook.model_config_of",
+                        side_effect=AssertionError(
+                            "model config read before validation"
+                        ),
+                    ),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    handle_vpp(args)
+        with (
+            unittest.mock.patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": "6,6"}),
+            self.assertRaisesRegex(ValueError, "unset SGLANG_PP_LAYER_PARTITION"),
+        ):
+            validate_vpp_options(
+                ServerArgs(
+                    model_path="dummy", device="cuda", pp_size=2, pp_virtual_stages=2
+                )
+            )
+
+    def test_model_depth_and_explicit_graphs_cannot_override_vpp_contract(self):
+        from sglang.srt.arg_groups.vpp_hook import handle_vpp
+        from sglang.srt.configs.vpp import resolve_vpp_layout
+
+        for fields in (
+            {"cuda_graph_backend_decode": "full"},
+            {"cuda_graph_config": {"prefill": {"backend": "breakable"}}},
+            {"pp_vpp_layer_partition": [1, 1, 1, 1]},
+        ):
+            with (
+                self.subTest(fields=fields),
+                unittest.mock.patch(
+                    "sglang.srt.arg_groups.vpp_hook.model_config_of",
+                    return_value=self.model_config(),
+                ),
+                self.assertRaises(ValueError),
+            ):
+                handle_vpp(
+                    ServerArgs(
+                        model_path="dummy",
+                        device="cuda",
+                        pp_size=2,
+                        pp_virtual_stages=2,
+                        **fields,
+                    )
+                )
+        topology = SimpleNamespace(
+            pp_size=2, pp_virtual_stages=2, pp_vpp_layer_partition=None
+        )
+        with self.assertRaisesRegex(ValueError, "stage count"):
+            resolve_vpp_layout(self.model_config(num_hidden_layers=3), topology)
+        with self.assertRaisesRegex(ValueError, "draft"):
+            resolve_vpp_layout(self.model_config(), topology, is_draft_worker=True)
+        with self.assertRaisesRegex(ValueError, "V4.1"):
+            resolve_vpp_layout(
+                self.model_config(
+                    hf_config=SimpleNamespace(
+                        architectures=["DeepseekV4ForCausalLM"],
+                        model_type="deepseek_v41",
+                    )
+                ),
+                topology,
+            )
+
+    def test_default_pp_does_not_resolve_a_vpp_model(self):
+        from sglang.srt.arg_groups.vpp_hook import handle_vpp
+        from sglang.srt.configs.vpp import resolve_vpp_layout
+
+        args = ServerArgs(model_path="dummy", device="cpu", pp_size=2)
+        handle_vpp(args)
+        self.assertIsNone(resolve_vpp_layout(object(), args))
+        self.assertEqual(_stash_overlay(args), {})
 
 
 if __name__ == "__main__":

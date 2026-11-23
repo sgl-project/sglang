@@ -120,6 +120,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(validate_prefill_cp_platform, server_args)
     run_hook(handle_hardware_runtime_validation, server_args)
+    from sglang.srt.arg_groups.vpp_hook import handle_vpp, validate_vpp_options
+
+    run_hook(validate_vpp_options, server_args)
     if cfg.model_path.lower() in ["none", "dummy"]:
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
@@ -147,6 +150,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
 
     run_hook(handle_expert_pack, server_args)
+    run_hook(handle_vpp, server_args)
 
     # Validate PD disaggregation flags before CUDA graph config.
     from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -399,5 +403,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+    # Model/backend hooks may derive features rejected by the full-row VPP path.
+    run_hook(validate_vpp_options, server_args)
 
     server_args._resolution_finished = True
