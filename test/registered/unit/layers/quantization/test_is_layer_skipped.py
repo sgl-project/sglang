@@ -286,6 +286,20 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
                     )
                 )
 
+    def test_phi3_fused_tensors_keep_substring_entries(self):
+        """Phi-3 stores qkv_proj and gate_up_proj fused, so "attn.qkv_proj" covers it."""
+        from sglang.srt.models.llama import Phi3ForCausalLM
+
+        mapping = Phi3ForCausalLM.packed_modules_mapping
+        for name, entry in (
+            ("self_attn.qkv_proj", "attn.qkv_proj"),
+            ("mlp.gate_up_proj", "mlp.gate_up_proj"),
+        ):
+            with self.subTest(name=name):
+                prefix = f"model.layers.0.{name}"
+                self.assertTrue(_skipped(prefix, [entry], mapping))
+                self.assertFalse(_skipped(prefix, ["o_proj"], mapping))
+
     def test_bailing_linear_attention_qkv_is_one_tensor(self):
         """Bailing's linear-attention qkv_proj loads one query_key_value tensor."""
         from sglang.srt.models.bailing_moe_linear import BailingMoELinearForCausalLM
