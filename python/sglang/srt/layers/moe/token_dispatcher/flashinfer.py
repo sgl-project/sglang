@@ -405,7 +405,16 @@ class FlashinferDispatcher(BaseDispatcher):
             if x.shape[0] > 0:
                 from flashinfer import mxfp8_quantize
 
-                x, x_sf = mxfp8_quantize(x, False)
+                from sglang.srt.layers.quantization.batch_invariant_quant import (
+                    use_flashinfer_bi_mxfp8_quantizer,
+                )
+
+                if use_flashinfer_bi_mxfp8_quantizer(x):
+                    x, x_sf = mxfp8_quantize(
+                        x, False, backend="auto", batch_invariant=True
+                    )
+                else:
+                    x, x_sf = mxfp8_quantize(x, False)
                 x_sf = x_sf.view(torch.uint8).reshape(
                     x.shape[0], self.hidden_size // 32
                 )

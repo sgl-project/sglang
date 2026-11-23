@@ -1212,11 +1212,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 a_sf_t = dispatch_output.hidden_states_scale
                 a_sf_t = a_sf_t.reshape(hidden_states.shape[0], -1).contiguous()
             else:
+                from sglang.srt.layers.quantization.batch_invariant_quant import (
+                    use_flashinfer_bi_mxfp8_quantizer,
+                )
                 from sglang.srt.layers.quantization.fp8_utils import (
                     flashinfer_mxfp8_quantize,
                 )
 
-                a_q, a_sf = flashinfer_mxfp8_quantize(hidden_states, False)
+                a_q, a_sf = flashinfer_mxfp8_quantize(
+                    hidden_states,
+                    False,
+                    batch_invariant=use_flashinfer_bi_mxfp8_quantizer(hidden_states),
+                )
                 # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
                 # [num_tokens, hidden_size // 32] (no transpose).
                 a_sf_t = (

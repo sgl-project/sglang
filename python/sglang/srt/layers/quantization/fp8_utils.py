@@ -601,6 +601,7 @@ def _fake_flashinfer_mxfp8_quantize(
     _is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     backend: str = "cute-dsl",
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     m = input.numel() // input.shape[-1]
     k_aligned = ((input.shape[-1] + alignment - 1) // alignment) * alignment
@@ -693,23 +694,34 @@ if get_platform().is_blackwell and is_flashinfer_available():
         is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
         backend: str = "cute-dsl",
+        batch_invariant: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """FlashInfer's MXFP8 quantizer. ``batch_invariant`` runs its batch-invariant
+        kernel in place of ``backend``; pass ``use_flashinfer_bi_quantizers(input.device)``."""
+        sf_swizzle_layout = (
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        )
+        if batch_invariant:
+            return _raw_flashinfer_mxfp8_quantize(
+                input,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
+                alignment=alignment,
+                backend="auto",
+                sf_swizzle_layout=sf_swizzle_layout,
+                batch_invariant=True,
+            )
         return _raw_flashinfer_mxfp8_quantize(
             input,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment,
             backend=backend,
-            sf_swizzle_layout=(
-                SfLayout.layout_128x4
-                if is_sf_swizzled_layout
-                else SfLayout.layout_linear
-            ),
+            sf_swizzle_layout=sf_swizzle_layout,
         )
 
     @register_custom_op(
         op_name="flashinfer_mm_mxfp8",
         mutates_args=[],
-        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto": (
+        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto", batch_invariant=False: (
             q_input.new_empty((q_input.shape[0], weight_t.shape[1]), dtype=out_dtype)
         ),
     )
@@ -721,7 +733,21 @@ if get_platform().is_blackwell and is_flashinfer_available():
         out_dtype: torch.dtype,
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
+        batch_invariant: bool = False,
     ) -> torch.Tensor:
+        if batch_invariant:
+            # FlashInfer's batch-invariant MXFP8 kernel replaces the backends and
+            # the autotuner; the dispatch cache only memoizes cute-dsl checks.
+            return _raw_flashinfer_mm_mxfp8(
+                q_input,
+                weight_t,
+                x_scale_u8,
+                weight_scale_t,
+                out_dtype=out_dtype,
+                use_8x4_sf_layout=False,
+                backend="auto",
+                batch_invariant=True,
+            )
         return _flashinfer_mm_mxfp8_impl(
             q_input,
             weight_t,
@@ -2397,6 +2423,57 @@ _SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
 _SM107_CUDNN_MXFP8_MIN_M = 8192
 
 
+_BI_QUANT_MODULE = None
+
+
+def _bi_quant():
+    """The batch-invariant helpers, imported on first use (the file's deferred
+    import rule, see _h20_swapab_opt_out) and then read from this cache."""
+    global _BI_QUANT_MODULE
+    if _BI_QUANT_MODULE is None:
+        from sglang.srt.layers.quantization import batch_invariant_quant
+
+        _BI_QUANT_MODULE = batch_invariant_quant
+    return _BI_QUANT_MODULE
+
+
+@lru_cache(maxsize=None)
+def _log_mxfp8_device_fallback(device: torch.device) -> None:
+    logger.info(
+        "Deterministic MXFP8 linear on %s: FlashInfer's batch-invariant kernels are "
+        "unavailable or opted out; running the pinned-tactic path",
+        device,
+    )
+
+
+@lru_cache(maxsize=None)
+def _log_mxfp8_shape_fallback(
+    n: int, k: int, output_dtype: torch.dtype, backend: str
+) -> None:
+    logger.info(
+        "Deterministic MXFP8 linear (N=%d, K=%d, %s, backend=%s) is outside "
+        "FlashInfer's batch-invariant GEMM; running the pinned-tactic path",
+        n,
+        k,
+        output_dtype,
+        backend,
+    )
+
+
+def _mxfp8_linear_batch_invariant(
+    weight: torch.Tensor, output_dtype: torch.dtype, backend: str, device_ok: bool
+) -> bool:
+    """Whether the dense MXFP8 GEMM runs FlashInfer's batch-invariant kernel: the
+    deterministic mode on this device (``device_ok``, evaluated once per call), one
+    of FlashInfer's 128x4-scale backends and a weight the kernel takes. Other
+    shapes keep the pinned-tactic path. Never reads M."""
+    return (
+        device_ok
+        and backend in ("cutlass", "cute-dsl")
+        and _bi_quant().mm_mxfp8_batch_invariant_shape_ok(weight, output_dtype)
+    )
+
+
 @lru_cache(maxsize=1)
 def _cudnn_mxfp8_reuses_graphs() -> bool:
     # Without override-shape support cuDNN builds a new graph for every distinct M.
@@ -2418,8 +2495,11 @@ def flashinfer_mxfp8_blockscaled_linear(
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time.
 
-    pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
-    reduction order, breaking row-wise batch invariance.
+    Under the deterministic mode the activation quantizer and the GEMM run
+    FlashInfer's batch-invariant kernels (`use_flashinfer_bi_quantizers`): a row's
+    bits do not depend on M or on tuning. pin_tactic covers the shapes outside the
+    batch-invariant GEMM: it skips autotuning, since tactics tuned per M bucket
+    change the fp32 reduction order, breaking row-wise batch invariance.
     """
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -2433,22 +2513,38 @@ def flashinfer_mxfp8_blockscaled_linear(
     if weight.dtype != torch.float8_e4m3fn:
         raise TypeError("MXFP8 weight must be FP8 E4M3.")
 
-    if input_scale is None:
-        q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
-            input_2d, is_sf_swizzled_layout=True, alignment=32
-        )
-    else:
-        q_input = input_2d
-        x_scale_u8 = input_scale
-
     if output_dtype is None:
         if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32):
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
 
+    bi = _bi_quant()
+    mode_on = bi.batch_invariant_or_deterministic()
+    device_ok = mode_on and bi.flashinfer_bi_quant_device_ok(input_2d.device)
+    if mode_on and not device_ok:
+        _log_mxfp8_device_fallback(input_2d.device)
+    if input_scale is None:
+        q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
+            input_2d,
+            is_sf_swizzled_layout=True,
+            alignment=32,
+            batch_invariant=device_ok
+            and k * input_2d.element_size() <= bi.MXFP8_QUANT_MAX_ROW_BYTES,
+        )
+    else:
+        q_input = input_2d
+        x_scale_u8 = input_scale
+
+    batch_invariant = _mxfp8_linear_batch_invariant(
+        weight, output_dtype, backend, device_ok
+    )
+    if device_ok and not batch_invariant:
+        _log_mxfp8_shape_fallback(weight.shape[0], k, output_dtype, backend)
+
     if (
         backend == "cute-dsl"
+        and not batch_invariant
         and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
         and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
         and get_platform().device_sm == 107
@@ -2461,7 +2557,18 @@ def flashinfer_mxfp8_blockscaled_linear(
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
 
-    if pin_tactic:
+    if batch_invariant:
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight.t(),
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="auto",
+            batch_invariant=True,
+        )
+    elif pin_tactic:
         from flashinfer.autotuner import autotune
 
         with autotune(False, skip_ops={"mxfp8_gemm"}):

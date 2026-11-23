@@ -113,6 +113,9 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.quantization.batch_invariant_quant import (
+    use_flashinfer_bi_quantizers,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -1221,6 +1224,10 @@ class MqaAttentionBase(nn.Module):
         """Whether wo_b consumes FlashInfer-swizzled MXFP8, so wo_a can fuse the
         quantization into its epilogue. Not known until wo_b's weights load."""
         quant_method = getattr(self.wo_b, "quant_method", None)
+        if use_flashinfer_bi_quantizers(self.wo_b.weight.device):
+            # The deterministic mode quantizes in wo_b (FlashInfer's
+            # batch-invariant kernel), not in wo_a's epilogue.
+            return False
         return getattr(
             quant_method, "mxfp8_dense_backend", None
         ) == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL and (
@@ -1768,6 +1775,10 @@ class MQALayer(MqaAttentionBase):
             )
 
         ok = all(_takes_swizzled(linear) for linear in linears)
+        if ok and use_flashinfer_bi_quantizers(linears[0].weight.device):
+            # The deterministic mode quantizes in the projections (FlashInfer's
+            # batch-invariant kernel), not in the fused norm / combine kernels.
+            ok = False
         self._accepts_mxfp8_swizzled_input = ok
         return ok
 

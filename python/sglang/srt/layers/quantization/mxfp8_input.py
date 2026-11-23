@@ -57,10 +57,14 @@ def accepts_mxfp8_deepgemm_input(linear) -> bool:
 
 
 def batch_invariant_or_deterministic() -> bool:
-    return (
-        is_batch_invariant_mode_enabled()
-        or get_exec().deterministic.enable_deterministic_inference
-    )
+    """The batch-invariant mode or ``--enable-deterministic-inference``."""
+    if is_batch_invariant_mode_enabled():
+        return True
+    try:
+        exec_config = get_exec()
+    except ValueError:  # no published exec config (kernel tests, offline tools)
+        return False
+    return exec_config.deterministic.enable_deterministic_inference
 
 
 def deepgemm_pair_takes_flashinfer() -> bool:
