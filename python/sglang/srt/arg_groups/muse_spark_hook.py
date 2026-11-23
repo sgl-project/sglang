@@ -32,6 +32,7 @@ MUSE_SPARK_ENV_DEFAULTS = (
 MUSE_SPARK_SM90_ENV_DEFAULTS = (
     (envs.SGLANG_HOPPER_SMALL_M_GEMV, True),
     (envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY, True),
+    (envs.SGLANG_OPT_DFLASH_DRAFT_FAST_PATH, True),
     (envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH, True),
     # Input-logprob chunks run the logits tail eagerly with fp32 full-vocab
     # logits per row; the stock chunk length bounds that memory.
