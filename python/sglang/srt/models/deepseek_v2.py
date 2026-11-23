@@ -200,6 +200,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.models.deepseek_common.moe_transport import (
+    ascend_allgather_row_layout,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _get_llama_4_scaling,
     _is_block_scale_fp8,
@@ -2984,7 +2987,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
+        with (
+            self.ffn_boundary.exit(forward_batch) as ffn_exit,
+            _mlp_ctx,
+            ascend_allgather_row_layout(forward_batch),
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
