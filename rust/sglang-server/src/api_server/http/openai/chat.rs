@@ -33,10 +33,9 @@ use sglang_processor::{
 };
 
 use super::super::auth::DeclaredRoute;
-use super::super::dp_relay::HintRoute;
 use super::completions::completion_usage;
 use super::lowered;
-use super::pd_routing::PDRoutingFields;
+use super::pd_routing::{HintRoute, PDRoutingFields};
 use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
@@ -327,7 +326,7 @@ async fn chat_completions(
         let native = GenerateRequest {
             rid: rid.clone(),
             chat_prompt: Some(choice_prompt),
-            sampling_params: sampling.clone(),
+            sampling_params: sampling.for_sample(index),
             stream,
             return_logprob: want_logprobs,
             logprob_start_len: -1,
@@ -726,6 +725,7 @@ pub(crate) async fn unary_chat_response(
                             name: call.name,
                             arguments: call.arguments,
                         },
+                        custom: None,
                     })
                     .collect();
                 // `parse_chat_response`: calls turn only a stop into `tool_calls`.
@@ -1129,6 +1129,7 @@ fn deepseek_choices(
                 name: call.name,
                 arguments: Some(call.arguments),
             }),
+            custom: None,
         };
         choice(chat_delta(None, None, Some(vec![call]), None), None);
     }
@@ -1210,6 +1211,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
                     bytes: Some(text.as_bytes().to_vec()),
                     token: text,
                     logprob,
+                    token_id: None,
                 }
             })
             .collect();

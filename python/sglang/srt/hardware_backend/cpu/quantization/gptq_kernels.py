@@ -18,43 +18,17 @@ if TYPE_CHECKING:
 __all__ = ["GPTQIntelAMXLinearKernel", "GPTQIntelAMXMoEKernel"]
 
 
-def _normalize_symmetric_qzeros(
-    layer: torch.nn.Module, name: str, quant_config: GPTQConfig
-) -> None:
-    """Adapt explicit symmetric INT4 zeros to the AMX packer's legacy input."""
-    # quantization.__init__ imports GPTQ schemes, which import this module.
-    # Resolve dynamic overrides only after the kernel classes are initialized.
-    from sglang.srt.layers.quantization.utils import get_dynamic_override
-
-    prefix = getattr(layer, "prefix", getattr(layer, "layer_name", ""))
-    sym = get_dynamic_override(
-        quant_config, prefix, "sym", getattr(quant_config, "sym", None)
-    )
-    if sym is not True or quant_config.weight_bits != 4:
-        return
-
-    qzeros = getattr(layer, name)
-    # The CPU GPTQ packer adds 1 to legacy serialized zeros. Some symmetric
-    # checkpoints, including Qwen3.5, already store the mathematical zero 8.
-    # Only normalize an explicitly symmetric tensor made entirely of packed
-    # 8s (0x88888888 as int32). Legacy 7s and asymmetric/unknown formats keep
-    # their existing interpretation. Replacing data never edits mmap storage.
-    if (
-        qzeros.dtype == torch.int32
-        and qzeros.numel() > 0
-        and bool(torch.all(qzeros == -2004318072))
-    ):
-        qzeros.data = torch.full_like(qzeros, 0x77777777)
-
-
 class GPTQIntelAMXLinearKernel:
     def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _normalize_symmetric_qzeros(layer, "qzeros", self.quant_config)
         _amx_process_weight_after_loading(
-            layer, ["qweight", "qzeros", "scales"], None, "gptq"
+            layer,
+            ["qweight", "qzeros", "scales"],
+            None,
+            "gptq",
+            is_symmetric=self.quant_config.is_sym,
         )
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
@@ -86,13 +60,19 @@ class GPTQIntelAMXMoEKernel:
         self.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _normalize_symmetric_qzeros(layer, "w13_qzeros", self.quant_config)
         _amx_process_weight_after_loading(
-            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
+            layer,
+            ["w13_qweight", "w13_qzeros", "w13_scales"],
+            None,
+            "gptq",
+            is_symmetric=self.quant_config.is_sym,
         )
-        _normalize_symmetric_qzeros(layer, "w2_qzeros", self.quant_config)
         _amx_process_weight_after_loading(
-            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
+            layer,
+            ["w2_qweight", "w2_qzeros", "w2_scales"],
+            None,
+            "gptq",
+            is_symmetric=self.quant_config.is_sym,
         )
 
     def apply(
@@ -102,8 +82,9 @@ class GPTQIntelAMXMoEKernel:
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
+        activation = self.moe_runner_config.activation
+        assert activation in ("silu", "gelu"), (
+            f"Only SiLU and GELU activations are supported, got {activation}."
         )
 
         x = dispatch_output.hidden_states
@@ -127,5 +108,6 @@ class GPTQIntelAMXMoEKernel:
             None,  # alpha
             None,  # limit
             True,  # is_vnni
+            activation,
         )
         return StandardCombineInput(hidden_states=output)
