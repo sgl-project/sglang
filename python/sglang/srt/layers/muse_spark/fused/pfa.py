@@ -615,7 +615,7 @@ _SLOT = 128 * 36 * 4
 class _Mod:
     def __init__(self, dev):
         self.dev = dev
-        mod, self.G = cu.device_module(dev, "pfe.cu", _SRC)
+        mod, self.G = cu.device_module(dev, "pfa.cu", _SRC)
         self.ps = torch.empty(self.G * 2 * _CW * _SLOT, dtype=torch.uint8, device=dev)
         self.f = {
             n: cu.function(mod, n, _SMEM.get(n, 0))
