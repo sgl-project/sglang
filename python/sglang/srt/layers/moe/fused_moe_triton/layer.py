@@ -1288,7 +1288,13 @@ class FusedMoE(torch.nn.Module):
                 expert_id=local_expert_id,
             )
 
-    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
+    def loads_checkpoint_expert(self, expert_id: int) -> bool:
+        """Whether this rank loads the checkpoint's routed expert ``expert_id``."""
+        return next(self._weight_loader_expert_ids(None, expert_id), None) is not None
+
+    def _weight_loader_expert_ids(
+        self, param: Optional[torch.nn.Parameter], expert_id: int
+    ):
         """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None

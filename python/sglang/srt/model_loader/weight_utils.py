@@ -35,6 +35,7 @@ from typing import (
 
 import filelock
 import huggingface_hub.constants
+import msgspec
 import numpy as np
 import psutil
 import safetensors.torch
@@ -151,8 +152,15 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
     return None
 
 
-# (name, nbytes) -> (index, count) of this rank among the node's readers, or None.
-CheckpointTensorReaders = Callable[[str, int], Optional[Tuple[int, int]]]
+class CheckpointTensorReaders(msgspec.Struct, frozen=True):
+    # (name, nbytes) -> (index, count) of this rank among the node's readers, or None.
+    readers: Callable[[str, int], Optional[Tuple[int, int]]]
+    # (name, nbytes) -> whether the node reads the tensor; None if experts are not
+    # placed in order, so the node's share cannot be told from the tensor name.
+    node_reads: Optional[Callable[[str, int], bool]] = None
+
+    def __call__(self, name: str, nbytes: int) -> Optional[Tuple[int, int]]:
+        return self.readers(name, nbytes)
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -1334,7 +1342,7 @@ def _prefetch_all_checkpoints(
         torch.distributed.all_reduce(fits, torch.distributed.ReduceOp.MIN, group)
     if readers is None or fits:
         my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
-    elif node_reads := getattr(readers, "node_reads", None):
+    elif (node_reads := readers.node_reads) is not None:
         # Each rank reads all that the node reads of its share of the files.
         files = sorted_files[local_rank::local_world_size]
         my_files = [(path, node_reads) for path in files]

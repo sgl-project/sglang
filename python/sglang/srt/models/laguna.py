@@ -812,8 +812,7 @@ class LagunaForCausalLM(nn.Module):
             for layer_id in moe_layer_ids
             for expert_id in range(self.config.num_experts)
             # Under EP the weight iterators yield only this rank's experts.
-            if next(experts[layer_id]._weight_loader_expert_ids(None, expert_id), None)
-            is not None
+            if experts[layer_id].loads_checkpoint_expert(expert_id)
             for shard_id in ("w1", "w2", "w3")
         }
         missing = expected - loaded_expert_shards

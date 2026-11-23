@@ -458,7 +458,7 @@ def _checkpoint_tensor_readers(
         moe = moe_layers[layer_id]
         if expert_id >= moe._num_global_routed:  # Not one of its routed experts.
             return True
-        return next(moe._weight_loader_expert_ids(None, expert_id), None) is not None
+        return moe.loads_checkpoint_expert(expert_id)
 
     def readers(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
         match = _EXPERT_ID_RE.search(name)
@@ -474,6 +474,7 @@ def _checkpoint_tensor_readers(
     index, count = _node_local_peers(get_parallel().moe_ep_group.ranks)
     location = get_global_expert_location_metadata()
     m = None if location is None else location.physical_to_logical_map_cpu
+    node_reads = None
     if (m is None or torch.equal(m, torch.arange(m.shape[-1]).expand_as(m))) and all(
         moe._expert_storage_rank == moe.moe_ep_rank for moe in moe_layers.values()
     ):
@@ -487,8 +488,7 @@ def _checkpoint_tensor_readers(
             block = expert_id // moe._num_local_routed - moe.moe_ep_rank + index
             return expert_id >= moe._num_global_routed or 0 <= block < count
 
-        readers.node_reads = node_reads
-    return readers
+    return CheckpointTensorReaders(readers=readers, node_reads=node_reads)
 
 
 class DefaultModelLoader(BaseModelLoader):
