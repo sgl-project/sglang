@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
@@ -635,6 +636,21 @@ class SchedulerMetricsReporter:
                 else num_layers
             )
             num_mlp_layers = num_layers
+        # Pure Mamba/SSM stacks (FalconMamba, Mamba, Mamba2 -- see
+        # PURE_SSM_ARCHITECTURES in model_config.py) have no MLP sublayer at
+        # all: every layer is just a Mamba mixer. Neither convention above
+        # expresses "zero MLP layers", so without this they fall through to
+        # `num_mlp_layers = num_layers` and get charged a fake FFN cost built
+        # from `hf_text_config.intermediate_size` -- on these configs that
+        # field is the SSM mixer's own inner/expand dimension (d_inner), not
+        # an FFN size, so the fabricated cost has no basis in the real model.
+        # This was inflating FLOPs/weight-bytes enough to push MFU/MBU over
+        # 100% on falcon-mamba-7b(-instruct). The real Mamba-mixer FLOPs/bytes
+        # aren't estimated here (follow-up); zeroing is the honest fallback.
+        if getattr(model_config, "attention_arch", None) == AttentionArch.SSM:
+            num_mlp_layers = 0.0
+            num_attn_layers = 0.0
+
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
             model_config.get_num_attention_heads(get_parallel().tp_size)
@@ -643,7 +659,8 @@ class SchedulerMetricsReporter:
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
-        intermediate_size = float(intermediate_size) / max(1, get_parallel().tp_size)
+        raw_intermediate_size = float(intermediate_size)
+        intermediate_size = raw_intermediate_size / max(1, get_parallel().tp_size)
 
         dtype_num_bytes = getattr(model_config.dtype, "itemsize", None)
         if dtype_num_bytes is None:
@@ -654,51 +671,194 @@ class SchedulerMetricsReporter:
         w_bytes = float(dtype_num_bytes)
         cache_bytes = float(dtype_num_bytes)
 
-        # Linear-layer FLOPs per token on one GPU.
-        attn_linear_flops = (
-            2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
-            + 2.0 * hidden_size * head_dim * num_attn_heads
+        # Weight-only quantization (W4A16/W8A16-style: GPTQ/AWQ/compressed-tensors)
+        # stores weights at a narrower width than the activation dtype above, so
+        # charging w_bytes at the activation width overcounts weight-read
+        # bandwidth by roughly (activation_bits / weight_bits) -- e.g. ~4x for a
+        # 4-bit-weight model read as if it were bf16. Derive the ratio from the
+        # quantized weight bit-width itself (GPTQ/AWQ flat configs, or
+        # compressed-tensors' per-group `weights.num_bits`) rather than
+        # compressed-tensors' published `global_compression_ratio`: that field
+        # is a whole-model average blended across every parameter, including
+        # layers the quant config leaves unquantized (e.g. lm_head/embeddings),
+        # so it understates the savings on the matmul weights actually modeled
+        # here -- e.g. RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8's
+        # real published config reports global_compression_ratio=1.24, not the
+        # 2.0x its 8-bit weights actually achieve.
+        hf_quant_config = getattr(model_config, "hf_quant_config", None) or {}
+        weight_bits = (
+            hf_quant_config.get("bits")
+            or hf_quant_config.get("num_bits")
+            or hf_quant_config.get("w_bit")
         )
-        mlp_flops = (
-            6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+        if weight_bits is None:
+            for group in (hf_quant_config.get("config_groups") or {}).values():
+                weight_bits = (group or {}).get("weights", {}).get("num_bits")
+                if weight_bits:
+                    break
+        weight_compression_ratio = (
+            (dtype_num_bytes * 8) / float(weight_bits) if weight_bits else None
         )
+        if weight_compression_ratio and weight_compression_ratio > 1:
+            w_bytes = float(dtype_num_bytes) / float(weight_compression_ratio)
+
+        # MLA has a shared per-token KV latent (not per-head K/V like GQA).
+        is_mla = getattr(model_config, "attention_arch", None) == AttentionArch.MLA
+        if is_mla and num_attn_heads > 0:
+            kv_lora_rank = float(getattr(model_config, "kv_lora_rank", 0) or 0)
+            qk_rope_head_dim = float(getattr(model_config, "qk_rope_head_dim", 0) or 0)
+            qk_nope_head_dim = getattr(model_config, "qk_nope_head_dim", None)
+            qk_nope_head_dim = (
+                float(qk_nope_head_dim)
+                if qk_nope_head_dim is not None
+                else max(0.0, head_dim - qk_rope_head_dim)
+            )
+            v_head_dim = getattr(model_config, "v_head_dim", None)
+            v_head_dim = (
+                float(v_head_dim)
+                if v_head_dim is not None
+                else hidden_size / num_attn_heads
+            )
+            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            q_lora_rank = float(getattr(hf_text_config, "q_lora_rank", 0) or 0)
+
+            if q_lora_rank > 0:
+                q_proj_flops = 2.0 * hidden_size * q_lora_rank + 2.0 * q_lora_rank * (
+                    num_attn_heads * qk_head_dim
+                )
+                q_proj_weight_elems = hidden_size * q_lora_rank + q_lora_rank * (
+                    num_attn_heads * qk_head_dim
+                )
+            else:
+                q_proj_flops = 2.0 * hidden_size * num_attn_heads * qk_head_dim
+                q_proj_weight_elems = hidden_size * num_attn_heads * qk_head_dim
+
+            kv_a_dim = kv_lora_rank + qk_rope_head_dim
+            kv_a_proj_flops = 2.0 * hidden_size * kv_a_dim
+            kv_a_proj_weight_elems = hidden_size * kv_a_dim
+            kv_b_out_dim = num_attn_heads * (qk_nope_head_dim + v_head_dim)
+            kv_b_proj_flops = 2.0 * kv_lora_rank * kv_b_out_dim
+            kv_b_proj_weight_elems = kv_lora_rank * kv_b_out_dim
+            o_proj_flops = 2.0 * num_attn_heads * v_head_dim * hidden_size
+            o_proj_weight_elems = num_attn_heads * v_head_dim * hidden_size
+
+            attn_linear_flops = (
+                q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+            )
+            attn_linear_weight_elems_per_layer = (
+                q_proj_weight_elems
+                + kv_a_proj_weight_elems
+                + kv_b_proj_weight_elems
+                + o_proj_weight_elems
+            )
+            attn_dot_flops_per_layer = 2.0 * num_attn_heads * (qk_head_dim + v_head_dim)
+            kv_cache_elems_per_token_per_layer = kv_a_dim
+        else:
+            attn_linear_flops = (
+                2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
+                + 2.0 * hidden_size * head_dim * num_attn_heads
+            )
+            attn_linear_weight_elems_per_layer = attn_linear_flops / 2.0
+            attn_dot_flops_per_layer = 4.0 * num_attn_heads * head_dim
+            kv_cache_elems_per_token_per_layer = 2.0 * num_kv_heads * head_dim
+
+        # MoE FFN: num_experts_per_tok routed experts (+ shared experts) at
+        # moe_intermediate_size, not the dense intermediate_size.
+        moe_tp_size = max(1, get_parallel().moe_tp_size)
+        moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+        num_experts_per_tok = getattr(hf_text_config, "num_experts_per_tok", None)
+        if moe_intermediate_size is None and num_experts_per_tok:
+            total_experts = (
+                getattr(hf_text_config, "num_experts", None)
+                or getattr(hf_text_config, "num_local_experts", None)
+                or getattr(hf_text_config, "n_routed_experts", None)
+            )
+            if total_experts:
+                moe_intermediate_size = raw_intermediate_size
+        if moe_intermediate_size and num_experts_per_tok:
+            moe_intermediate_size = float(moe_intermediate_size) / moe_tp_size
+            shared_expert_count = float(
+                getattr(hf_text_config, "n_shared_experts", None)
+                or getattr(hf_text_config, "num_shared_experts", None)
+                or getattr(hf_text_config, "moe_num_shared_experts", None)
+                or 0
+            )
+            active_expert_units = float(num_experts_per_tok) + shared_expert_count
+            # MoE experts are gated (SwiGLU) in every architecture this estimator
+            # currently special-cases (Mixtral/DeepSeek/Qwen-MoE/OLMoE/GraniteMoE),
+            # so mlp_weight_mult stays at the gated 3x multiplier here -- set
+            # explicitly (rather than left to the dense branch below) so
+            # _ffn_act_bytes_per_token's shared reference to it stays correct
+            # regardless of which branch ran.
+            mlp_weight_mult = 3.0
+            mlp_flops = 6.0 * hidden_size * moe_intermediate_size * active_expert_units
+            mlp_weight_elems_per_layer = (
+                mlp_weight_mult
+                * hidden_size
+                * moe_intermediate_size
+                * active_expert_units
+            )
+            ffn_act_intermediate_size = moe_intermediate_size * active_expert_units
+        else:
+            # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
+            # gated (SwiGLU/GeGLU-style: separate gate_proj + up_proj + down_proj,
+            # 3 weight matrices) or a plain 2-matrix FFN (up/fc_in + down/fc_out).
+            # Gating is a property of the architecture, not the activation
+            # function (GeGLU and a plain GELU FFN can share the same hidden_act),
+            # so key off architectures rather than hidden_act. Default to gated
+            # for every unlisted architecture.
+            _NON_GATED_MLP_ARCHITECTURES = {
+                "GPT2LMHeadModel",
+                "GPTBigCodeForCausalLM",
+                "Starcoder2ForCausalLM",
+                "ApertusForCausalLM",
+                "ArceeForCausalLM",
+                "OPTForCausalLM",
+                "PhiForCausalLM",
+            }
+            model_architectures = (
+                getattr(getattr(model_config, "hf_config", None), "architectures", None)
+                or []
+            )
+            is_gated_mlp = not any(
+                arch in _NON_GATED_MLP_ARCHITECTURES for arch in model_architectures
+            )
+            mlp_flop_mult = 6.0 if is_gated_mlp else 4.0
+            mlp_weight_mult = 3.0 if is_gated_mlp else 2.0
+            mlp_flops = (
+                mlp_flop_mult * hidden_size * intermediate_size
+                if intermediate_size > 0
+                else 0.0
+            )
+            mlp_weight_elems_per_layer = (
+                mlp_weight_mult * hidden_size * intermediate_size
+                if intermediate_size > 0
+                else 0.0
+            )
+            ffn_act_intermediate_size = intermediate_size
+
         self._linear_flops_per_token = max(
             0.0, attn_linear_flops * num_attn_layers + mlp_flops * num_mlp_layers
         )
 
         # Attention dot-product FLOPs coefficient to multiply token-context product.
-        # attn_qk + attn_av = 4 * q * TC * d * L
-        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_attn_layers
+        self._attn_dot_flops_coeff = attn_dot_flops_per_layer * num_attn_layers
 
-        # KV cache bytes (write one K and one V vector per generated token).
-        # Attention-only: Mamba/SSM layers keep their own recurrent state, not
-        # a KV cache, and (like their FLOPs) are intentionally left uncosted
-        # here rather than guessed at.
+        # KV cache bytes per generated token (num_attn_layers, not num_layers).
         self._kv_cache_bytes_per_token = (
-            2.0 * num_attn_layers * num_kv_heads * head_dim * cache_bytes
+            kv_cache_elems_per_token_per_layer * num_attn_layers * cache_bytes
         )
 
-        # Weight read bytes per token: QKV/O projection terms are
-        # attention-only; the MLP projection term is MLP-only. Mamba-layer
-        # weight bytes are intentionally left uncosted, same as their FLOPs.
+        # Weight read bytes per token.
         self._weight_read_bytes_per_token = (
-            hidden_size
-            * head_dim
-            * (num_attn_heads + 2.0 * num_kv_heads)
-            * w_bytes
-            * num_attn_layers
-            + hidden_size * head_dim * num_attn_heads * w_bytes * num_attn_layers
-            + (
-                3.0 * hidden_size * intermediate_size * w_bytes * num_mlp_layers
-                if intermediate_size > 0
-                else 0.0
-            )
+            attn_linear_weight_elems_per_layer * w_bytes * num_attn_layers
+            + mlp_weight_elems_per_layer * w_bytes * num_mlp_layers
         )
 
         # Activation movement bytes per token (coarse approximation). The
         # qkv/attention terms scale with the attention layer count; the FFN
-        # term scales with the MLP layer count. Mamba-layer activation bytes
-        # are intentionally left uncosted, same as their FLOPs.
+        # term scales with the MLP layer count -- same split as the weight-
+        # read/KV-cache bytes above, not the unsplit total layer count.
         self._qkv_act_bytes_per_token = (
             hidden_size * act_bytes * num_attn_layers
             + (num_attn_heads + 2.0 * num_kv_heads)
@@ -709,8 +869,8 @@ class SchedulerMetricsReporter:
             + hidden_size * act_bytes * num_attn_layers
         )
         self._ffn_act_bytes_per_token = (
-            3.0 * intermediate_size * act_bytes * num_mlp_layers
-            if intermediate_size > 0
+            mlp_weight_mult * ffn_act_intermediate_size * act_bytes * num_mlp_layers
+            if ffn_act_intermediate_size > 0
             else 0.0
         )
 

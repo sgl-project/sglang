@@ -17,6 +17,7 @@ from unittest.mock import Mock, call, patch
 import prometheus_client
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
@@ -1997,6 +1998,606 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
             level="WARNING",
         ):
             self._constants(full_attention_layer_ids=[0, 2])
+
+
+def _fake_model_config(
+    *,
+    hidden_size=4096,
+    num_attention_layers=8,
+    head_dim=128,
+    num_attn_heads=32,
+    num_kv_heads=8,
+    attention_arch=None,
+    dtype_itemsize=2,
+    hf_text_config_overrides=None,
+    **model_config_overrides,
+):
+    """Minimal model_config stand-in for _init_estimated_perf_constants()."""
+    hf_text_config_kwargs = {"intermediate_size": 14336}
+    hf_text_config_kwargs.update(hf_text_config_overrides or {})
+    hf_text_config = types.SimpleNamespace(**hf_text_config_kwargs)
+    config = types.SimpleNamespace(
+        hf_text_config=hf_text_config,
+        hidden_size=hidden_size,
+        num_attention_layers=num_attention_layers,
+        head_dim=head_dim,
+        attention_arch=attention_arch,
+        dtype=types.SimpleNamespace(itemsize=dtype_itemsize),
+        get_num_attention_heads=lambda tp_size: num_attn_heads,
+        get_num_kv_heads=lambda tp_size: num_kv_heads,
+    )
+    for key, value in model_config_overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+class TestEstimatedPerfConstants(CustomTestCase):
+    """Covers _init_estimated_perf_constants()'s MLA/MoE-aware FLOPs and bytes."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+
+    def _init(self, model_config):
+        self.scheduler.model_config = model_config
+        self.reporter._init_estimated_perf_constants()
+
+    def test_dense_gqa_matches_generic_formula(self):
+        # Regression guard for the non-MLA/non-MoE path, which must still
+        # reduce to the original dense/GQA formula after the MLA/MoE refactor.
+        hidden, head_dim, heads, kv_heads, layers = 4096, 128, 32, 8, 8
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=layers,
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, 4.0 * heads * head_dim * layers
+        )
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * layers * 2.0,
+        )
+
+    def test_mla_uses_low_rank_shapes_not_generic_gqa(self):
+        hidden, heads, layers = 2048, 16, 4
+        kv_lora_rank, qk_rope, qk_nope, v_head_dim = 64.0, 32.0, 96.0, 96.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope,
+                qk_nope_head_dim=qk_nope,
+                v_head_dim=v_head_dim,
+                hf_text_config_overrides={"q_lora_rank": 0, "intermediate_size": 10944},
+            )
+        )
+        qk_head_dim = qk_nope + qk_rope
+        q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        kv_a_dim = kv_lora_rank + qk_rope
+        kv_a_proj_flops = 2.0 * hidden * kv_a_dim
+        kv_b_out_dim = heads * (qk_nope + v_head_dim)
+        kv_b_proj_flops = 2.0 * kv_lora_rank * kv_b_out_dim
+        o_proj_flops = 2.0 * heads * v_head_dim * hidden
+        attn_linear_flops = (
+            q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+        )
+        attn_dot_flops_per_layer = 2.0 * heads * (qk_head_dim + v_head_dim)
+        mlp_flops = 6.0 * hidden * 10944
+
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, attn_dot_flops_per_layer * layers
+        )
+        # The defining MLA property: KV cache holds one shared latent per
+        # token per layer (kv_a_dim), not num_kv_heads * head_dim.
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token, kv_a_dim * layers * 2.0
+        )
+
+    def test_mla_with_q_lora_rank_compresses_query_projection(self):
+        hidden, heads, layers = 2048, 16, 4
+        q_lora_rank = 384.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=64.0,
+                qk_rope_head_dim=32.0,
+                qk_nope_head_dim=96.0,
+                v_head_dim=96.0,
+                hf_text_config_overrides={
+                    "q_lora_rank": q_lora_rank,
+                    "intermediate_size": 10944,
+                },
+            )
+        )
+        qk_head_dim = 96.0 + 32.0
+        compressed_q_proj_flops = 2.0 * hidden * q_lora_rank + 2.0 * q_lora_rank * (
+            heads * qk_head_dim
+        )
+        uncompressed_q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        # Low-rank Q compression must actually reduce projection FLOPs for a
+        # realistic rank choice, not just change which branch runs.
+        self.assertLess(compressed_q_proj_flops, uncompressed_q_proj_flops)
+
+    def test_moe_with_explicit_moe_intermediate_size_scales_by_active_experts(self):
+        hidden, layers = 4096, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1408,
+                    "num_experts_per_tok": 6,
+                    "n_shared_experts": 2,
+                },
+            )
+        )
+        head_dim, heads, kv_heads = 128, 32, 8
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        active_expert_units = 6 + 2
+        mlp_flops = 6.0 * hidden * 1408 * active_expert_units
+        single_expert_mlp_flops = 6.0 * hidden * 1408
+        # The MLP cost must scale by all active expert units (routed + shared),
+        # not just treat moe_intermediate_size as a single expert's cost.
+        self.assertGreater(mlp_flops, single_expert_mlp_flops)
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
+    def test_moe_without_moe_intermediate_size_falls_back_to_per_expert_size(self):
+        # OLMoE/Mixtral-style configs: no dense layers at all, so there is no
+        # separate moe_intermediate_size -- intermediate_size IS the per-expert
+        # FFN size. Detected via num_experts (also covers num_local_experts /
+        # n_routed_experts).
+        hidden, layers = 2048, 16
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                    "num_experts": 64,
+                },
+            )
+        )
+        head_dim, heads, kv_heads = 128, 32, 8
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        active_expert_units = 8
+        mlp_flops = 6.0 * hidden * 1024 * active_expert_units
+        single_expert_mlp_flops = 6.0 * hidden * 1024
+        # Must scale by all 8 active experts, not silently charge for just one
+        # (the bug: falling through to the dense branch with no multiplier).
+        wrong_total = attn_linear_flops * layers + single_expert_mlp_flops * layers
+        self.assertNotEqual(self.reporter._linear_flops_per_token, wrong_total)
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
+    def test_pure_ssm_has_zero_attention_and_mlp_layers(self):
+        # falcon-mamba-7b(-instruct) et al: every layer is a Mamba mixer, not a
+        # GQA/MLA attention layer and not a dense/MoE FFN layer. Before this
+        # fix, num_attn_layers wrongly fell back to num_layers (the fallback
+        # only has a hybrid-SWA full_attention_layer_ids path, which is never
+        # populated for pure SSM configs), so every Mamba layer was charged
+        # fake attention-linear FLOPs and fake KV-cache bytes on top of the
+        # already-fixed fake MLP cost.
+        self._init(
+            _fake_model_config(
+                hidden_size=4096,
+                num_attention_layers=64,
+                attention_arch=AttentionArch.SSM,
+                hf_text_config_overrides={"intermediate_size": 8192},
+            )
+        )
+        self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(self.reporter._attn_dot_flops_coeff, 0.0)
+        self.assertEqual(self.reporter._kv_cache_bytes_per_token, 0.0)
+        self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
+
+    def test_moe_ffn_act_bytes_scale_by_active_experts_not_dense_intermediate_size(
+        self,
+    ):
+        # _ffn_act_bytes_per_token must track the same per-token FFN size as
+        # mlp_flops/mlp_weight_elems_per_layer (moe_intermediate_size *
+        # active_expert_units), not the stale dense intermediate_size left
+        # over from before the MoE branch existed.
+        hidden, layers = 4096, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                dtype_itemsize=2,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1408,
+                    "num_experts_per_tok": 6,
+                    "n_shared_experts": 2,
+                },
+            )
+        )
+        active_expert_units = 6 + 2
+        expected = 3.0 * (1408 * active_expert_units) * 2.0 * layers
+        wrong_dense_based = 3.0 * 18432 * 2.0 * layers
+        self.assertNotEqual(self.reporter._ffn_act_bytes_per_token, wrong_dense_based)
+        self.assertAlmostEqual(self.reporter._ffn_act_bytes_per_token, expected)
+
+    def test_mla_v_head_dim_equal_to_head_dim_is_not_treated_as_unset(self):
+        # v_head_dim is a real, explicitly-configured field here that happens
+        # to equal head_dim -- using "!= head_dim" as an unset-sentinel must
+        # not discard it in favor of the hidden_size/num_attn_heads guess.
+        hidden, heads, layers, head_dim = 2048, 16, 4, 128.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=64.0,
+                qk_rope_head_dim=32.0,
+                qk_nope_head_dim=96.0,
+                v_head_dim=head_dim,
+                hf_text_config_overrides={"q_lora_rank": 0, "intermediate_size": 10944},
+            )
+        )
+        qk_head_dim = 96.0 + 32.0
+        kv_b_out_dim = heads * (96.0 + head_dim)
+        kv_b_proj_flops = 2.0 * 64.0 * kv_b_out_dim
+        o_proj_flops = 2.0 * heads * head_dim * hidden
+        q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        kv_a_proj_flops = 2.0 * hidden * (64.0 + 32.0)
+        attn_linear_flops = (
+            q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+        )
+        mlp_flops = 6.0 * hidden * 10944
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
+    def test_num_experts_per_tok_alone_does_not_trigger_moe_without_expert_count(self):
+        # num_experts_per_tok present but no num_experts/num_local_experts/
+        # n_routed_experts field at all: must NOT guess intermediate_size is
+        # per-expert -- falls through to the plain dense formula untouched.
+        hidden, layers = 2048, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "intermediate_size": 4096,
+                    "num_experts_per_tok": 8,
+                },
+            )
+        )
+        head_dim, heads, kv_heads = 128, 32, 8
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        dense_mlp_flops = 6.0 * hidden * 4096
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + dense_mlp_flops * layers,
+        )
+
+    def test_moe_mlp_flops_shrink_with_moe_tp_size_not_tp_size(self):
+        def _moe_constants_at(tp_size, moe_ep_size, moe_tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                },
+            )
+            reporter = _make_reporter(self, scheduler)
+            with get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=1,
+                moe_tp_size=moe_tp_size,
+            ):
+                reporter._init_estimated_perf_constants()
+            return reporter
+
+        plain_tp1 = _moe_constants_at(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        plain_tp4 = _moe_constants_at(tp_size=4, moe_ep_size=1, moe_tp_size=4)
+        self.assertGreater(plain_tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            plain_tp1._linear_flops_per_token / 4.0,
+            plain_tp4._linear_flops_per_token,
+        )
+        self.assertAlmostEqual(
+            plain_tp1._weight_read_bytes_per_token / 4.0,
+            plain_tp4._weight_read_bytes_per_token,
+        )
+
+        ep_only = _moe_constants_at(tp_size=4, moe_ep_size=4, moe_tp_size=1)
+        self.assertAlmostEqual(
+            plain_tp1._linear_flops_per_token, ep_only._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            plain_tp1._weight_read_bytes_per_token,
+            ep_only._weight_read_bytes_per_token,
+        )
+
+    def test_moe_fallback_per_expert_size_also_shards_by_moe_tp_size(self):
+        def _moe_fallback_constants_at(tp_size, moe_ep_size, moe_tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,
+                hf_text_config_overrides={
+                    "intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                    "num_experts": 64,
+                },
+            )
+            reporter = _make_reporter(self, scheduler)
+            with get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=1,
+                moe_tp_size=moe_tp_size,
+            ):
+                reporter._init_estimated_perf_constants()
+            return reporter
+
+        tp1 = _moe_fallback_constants_at(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        ep_only = _moe_fallback_constants_at(tp_size=4, moe_ep_size=4, moe_tp_size=1)
+        self.assertGreater(tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            tp1._linear_flops_per_token, ep_only._linear_flops_per_token
+        )
+
+    def test_quant_bits_shrinks_weight_bytes_not_activation_bytes(self):
+        # Weight-only quantization (W4A16/W8A16-style) stores weights narrower
+        # than the activation dtype, so weight-read bytes must shrink by the
+        # bit-width-derived ratio -- but KV-cache/activation bytes, which stay
+        # at full precision for a weight-only scheme, must NOT shrink.
+        #
+        # Deliberately not using compressed-tensors' own published
+        # global_compression_ratio here: that field is a whole-model average
+        # blended across every parameter, including layers the quant config
+        # leaves unquantized (e.g. lm_head/embeddings), so it understates the
+        # savings on the matmul weights this estimator models -- e.g.
+        # RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8's real published
+        # config reports global_compression_ratio=1.24, not the 2.0x its
+        # 8-bit weights actually achieve.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
+        )
+        gptq_style = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            dtype_itemsize=2,
+            hf_quant_config={"bits": 4},
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(gptq_style)
+        # 2 bytes (bf16) * 8 bits/byte / 4 bits = 4x compression ratio.
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 4.0, self.reporter._weight_read_bytes_per_token
+        )
+
+    def test_compressed_tensors_nested_config_groups_bits(self):
+        # compressed-tensors configs nest bits per config group rather than
+        # publishing a flat top-level `bits` field -- confirmed against
+        # RedHatAI/Apertus-8B-Instruct-2509-FP8-dynamic and
+        # ibm-granite/granite-3.3-8b-instruct-FP8's real published configs.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
+        )
+        fp8_dynamic = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            dtype_itemsize=2,
+            hf_quant_config={
+                "config_groups": {"group_0": {"weights": {"num_bits": 8}}}
+            },
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(fp8_dynamic)
+        # 2 bytes (bf16) * 8 bits/byte / 8 bits = 2x compression ratio.
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 2.0, self.reporter._weight_read_bytes_per_token
+        )
+
+    def test_non_gated_mlp_uses_two_matrix_formula(self):
+        # Plain 2-matrix FFNs (GPT-2/GPT-BigCode/StarCoder2's c_fc+c_proj,
+        # Apertus's xIELU up_proj+down_proj with no gate_proj) must be charged
+        # at 4x FLOPs / 2x weight-elems, not the gated 6x/3x SwiGLU multiplier
+        # -- confirmed against the real MLP class source for starcoder2.py
+        # and apertus.py. Gating is keyed off architectures, not hidden_act:
+        # see test_gated_geglu_architecture_not_misclassified_by_activation
+        # for why an activation-name heuristic can't work here.
+        gated = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+            hf_config=types.SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        non_gated = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+            hf_config=types.SimpleNamespace(architectures=["Starcoder2ForCausalLM"]),
+        )
+        self._init(gated)
+        gated_flops = self.reporter._linear_flops_per_token
+        gated_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(non_gated)
+        self.assertAlmostEqual(
+            gated_flops * (4.0 / 6.0), self.reporter._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            gated_weight_bytes * (2.0 / 3.0),
+            self.reporter._weight_read_bytes_per_token,
+        )
+
+    def test_unset_architectures_defaults_to_gated(self):
+        # Regression guard: hf_config/architectures is unset in most of this
+        # test file's fake configs (and in any real config this estimator
+        # doesn't recognize) -- it must keep defaulting to the historical
+        # gated (6x/3x) assumption, not silently flip to non-gated.
+        config = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+        )
+        self._init(config)
+        self.assertAlmostEqual(
+            self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
+        )
+
+    def test_gated_geglu_architecture_not_misclassified_by_activation(self):
+        # Gemma2ForCausalLM's MLP (gemma2.py) is gate_up_proj + down_proj (a
+        # gated, 3-matrix GeGLU FFN) and *requires*
+        # hidden_act == hidden_activation == "gelu_pytorch_tanh". StarCoder2's
+        # MLP (starcoder2.py) is a plain, non-gated c_fc + c_proj FFN that
+        # also commonly uses "gelu_pytorch_tanh". The same activation string
+        # maps to both a gated and a non-gated architecture, so hidden_act
+        # alone can never disambiguate them -- only the architecture can.
+        # Regression guard for a real bug: an earlier activation-name-based
+        # heuristic classified any "gelu_pytorch_tanh" config as non-gated,
+        # which silently undercounted Gemma2's FLOPs/weight-bytes by 1/3.
+        gemma2 = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={
+                "intermediate_size": 1024,
+                "hidden_act": "gelu_pytorch_tanh",
+            },
+            hf_config=types.SimpleNamespace(architectures=["Gemma2ForCausalLM"]),
+        )
+        self._init(gemma2)
+        self.assertAlmostEqual(
+            self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
+        )
+
+    def test_every_known_non_gated_architecture_is_still_recognized(self):
+        # Regression guard, one per real non-gated sglang model class: a
+        # previous version of this fix switched from an activation-name
+        # heuristic (hidden_act in a denylist) to an architecture-name
+        # heuristic, but only ported over the architectures covered by the
+        # motivating examples in the diff (StarCoder2, Apertus) -- silently
+        # dropping ArceeForCausalLM (arcee.py: up_proj-only, hidden_act
+        # "relu2"), OPTForCausalLM (opt.py: fc1+fc2, hidden_act "relu"), and
+        # PhiForCausalLM (phi.py: fc1+fc2, hidden_act "gelu_new"), all of
+        # which the old activation-based heuristic classified correctly.
+        # Each entry here must independently resolve to non-gated.
+        for arch in (
+            "GPT2LMHeadModel",
+            "GPTBigCodeForCausalLM",
+            "Starcoder2ForCausalLM",
+            "ApertusForCausalLM",
+            "ArceeForCausalLM",
+            "OPTForCausalLM",
+            "PhiForCausalLM",
+        ):
+            with self.subTest(arch=arch):
+                config = _fake_model_config(
+                    hidden_size=256,
+                    num_attention_layers=2,
+                    head_dim=0,
+                    hf_text_config_overrides={"intermediate_size": 1024},
+                    hf_config=types.SimpleNamespace(architectures=[arch]),
+                )
+                self._init(config)
+                self.assertAlmostEqual(
+                    self.reporter._linear_flops_per_token, 4.0 * 256 * 1024 * 2
+                )
+
+    def test_pure_ssm_has_zero_mlp_cost(self):
+        # FalconMamba/Mamba/Mamba2 layers are a Mamba mixer only -- no MLP
+        # sublayer at all (see PURE_SSM_ARCHITECTURES in model_config.py).
+        # hf_text_config.intermediate_size on these configs is the SSM
+        # mixer's own inner/expand dimension (d_inner), not an FFN size, and
+        # must not be charged as fake FFN FLOPs/bytes. Confirmed against
+        # falcon-mamba-7b, whose real intermediate_size is the mixer's
+        # d_inner (~2x hidden_size with the default expand factor) -- before
+        # this fix, charging it as an FFN size on every layer was inflating
+        # MFU/MBU past 100%.
+        config = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            num_attn_heads=0,
+            num_kv_heads=0,
+            attention_arch=AttentionArch.SSM,
+            full_attention_layer_ids=[],
+            hf_text_config_overrides={"intermediate_size": 512},
+        )
+        self._init(config)
+        self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
+        self.assertEqual(self.reporter._ffn_act_bytes_per_token, 0.0)
 
 
 if __name__ == "__main__":
