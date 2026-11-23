@@ -1751,16 +1751,14 @@ class ShardedStateLoader(BaseModelLoader):
             )
 
 
-def _gfx942_preshuffles_dense_fp8(
-    model_config: ModelConfig, load_config: LoadConfig
-) -> bool:
-    """Whether this launch preshuffles dense block-FP8 weights on gfx942.
+def _gfx942_preshuffles_dense_fp8(model: nn.Module) -> bool:
+    """Whether the constructed layers preshuffle dense block-FP8 weights on gfx942.
 
-    Fp8LinearMethod decides it: the CK path is on and its own dispatch
-    (--fp8-gemm-backend, MXFP8 conversion) picks the aiter block-FP8 GEMM.
+    The CK path is on and some Fp8LinearMethod dispatched to the aiter block-FP8
+    GEMM (--fp8-gemm-backend, MXFP8 conversion, Quark all end up there).
     """
     from sglang.srt.environ import envs
-    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
     from sglang.srt.layers.quantization.fp8_utils import (
         _use_aiter_gfx942,
         aiter_w8a8_block_fp8_linear,
@@ -1768,11 +1766,11 @@ def _gfx942_preshuffles_dense_fp8(
 
     if not (_use_aiter_gfx942 and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()):
         return False
-    quant_config = _get_quantization_config(model_config, load_config)
-    if not isinstance(quant_config, Fp8Config):
-        return False
-    method = Fp8LinearMethod(quant_config)
-    return method.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+    return any(
+        isinstance(method := getattr(m, "quant_method", None), Fp8LinearMethod)
+        and method.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+        for m in model.modules()
+    )
 
 
 class PreshardedModelLoader(DefaultModelLoader):
@@ -1906,10 +1904,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
             )
-        if _gfx942_preshuffles_dense_fp8(model_config, self.load_config):
-            # The preshuffle changes the stored weight bytes, so a cache dumped with the
-            # plain layout (Triton backend, CK path off) must not match.
-            shard_config["aiter_gfx942_bpreshuffle"] = True
         return shard_config
 
     @staticmethod
@@ -1978,10 +1972,15 @@ class PreshardedModelLoader(DefaultModelLoader):
                         model_config, self.load_config, quant_config
                     )
                 state_dict = meta_model.state_dict()
-                sig_input = sorted(
+                sig_input = [
                     (name, tuple(t.shape), str(t.dtype))
                     for name, t in state_dict.items()
-                )
+                ]
+                if _gfx942_preshuffles_dense_fp8(meta_model):
+                    # Same names and shapes, different stored bytes: a plain-layout
+                    # cache must not be reloaded as preshuffled.
+                    sig_input.append(("<layout>", (), "aiter_gfx942_bpreshuffle"))
+                sig_input.sort()
             del meta_model
             return self._hash_structural_signature(sig_input)
         except Exception as e:
