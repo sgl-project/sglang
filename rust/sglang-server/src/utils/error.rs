@@ -10,7 +10,9 @@ use crate::multi_modality::worker::MediaError;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Error)]
 pub enum Error {
-    #[error("validation failed: {0}")]
+    /// A request the client got wrong. The message is the client-facing text,
+    /// worded as Python's `ValueError` for the same check, so it is shown as is.
+    #[error("{0}")]
     Validation(String),
 
     #[error("tokenize failed: {0}")]
@@ -25,9 +27,9 @@ pub enum Error {
     #[error("detokenize failed: {0}")]
     Detokenize(String),
 
-    /// To-scheduler channel full. Surfaced as backpressure.
+    /// A stage queue was full. Surfaced as backpressure.
     #[error("to_scheduler channel full")]
-    QueueFull,
+    QueueFull(QueueStage),
 
     /// Client went away mid-stream. Drives `Aborted`, not `Failed`.
     #[error("client disconnected")]
@@ -52,6 +54,41 @@ impl Error {
                 | Error::Codec(_)
                 | Error::Internal(_)
         )
+    }
+
+    /// Why the client's request is at fault, as the client reads it, or `None`
+    /// when it is not: the server answers 400 and, like Python's
+    /// `[http_server] Error:` line, logs this reason.
+    pub fn client_fault_reason(&self) -> Option<&str> {
+        match self {
+            Error::Validation(message) | Error::Encode(MediaError::Client(message)) => {
+                Some(message)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The stage queue a request found full: the `stage` label of
+/// `sglang:frontend_queue_full_total`. Intake has none: a request waits for
+/// room in its inbox rather than being refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueStage {
+    Tokenizer,
+    Mm,
+    Scheduler,
+}
+
+impl QueueStage {
+    pub const ALL: [QueueStage; 3] = [Self::Tokenizer, Self::Mm, Self::Scheduler];
+
+    /// The `stage` label, as `sglang:frontend_queue_depth` names the queue.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tokenizer => "tokenizer",
+            Self::Mm => "mm",
+            Self::Scheduler => "scheduler",
+        }
     }
 }
 

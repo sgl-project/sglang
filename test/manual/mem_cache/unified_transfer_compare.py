@@ -352,7 +352,7 @@ def _view_name(bundle, device_pool):
 def _group_name(group, host_pool):
     for name, entry in group.entry_map.items():
         if entry.host_pool is host_pool:
-            return name.value
+            return str(name)
     return None
 
 
@@ -428,7 +428,7 @@ def hicache_summary(bundle, chain: str, page_size: int, layout, backend) -> dict
         host = entry.host_pool
         entries.append(
             {
-                "name": entry.name.value,
+                "name": str(entry.name),
                 "host_cls": type(host).__name__,
                 "host_size": host.size,
                 "host_page_size": host.page_size,
@@ -451,7 +451,7 @@ def hicache_summary(bundle, chain: str, page_size: int, layout, backend) -> dict
             for c, pool in result.component_host_pools.items()
         ),
         "sidecars": [
-            [s.pool_name.value, s.indices_from_pool.value, str(s.hit_policy)]
+            [str(s.pool_name), str(s.indices_from_pool), str(s.hit_policy)]
             for s in result.sidecars
         ],
         # Results from checkouts older than this field record None.

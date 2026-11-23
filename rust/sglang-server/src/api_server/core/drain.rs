@@ -65,6 +65,12 @@ impl DrainState {
         self.draining.load(Ordering::SeqCst)
     }
 
+    /// Whether the drain was begun forced (`SGLANG_FORCE_SHUTDOWN`). A failed
+    /// health probe also skips the wait, but is not a request to force.
+    pub(crate) fn is_forced(&self) -> bool {
+        self.forced.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn set_unhealthy(&self, unhealthy: bool) {
         if self.unhealthy.swap(unhealthy, Ordering::SeqCst) != unhealthy {
             self.changed.notify_waiters();
@@ -169,6 +175,9 @@ mod tests {
             state.force_reason(),
             Some("Signal SIGTERM received while health check failed. Force exiting.")
         );
+        assert!(!state.is_forced(), "a failed probe is not a forced drain");
+        state.begin(true);
+        assert!(state.is_forced());
     }
 
     /// A request admitted after one waiter saw the drain end (on a connection
