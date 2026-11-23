@@ -84,7 +84,9 @@ Reserve enough disk space for both the container image and model weights before 
 </Warning>
 
 Use a SGLang image with the runtime components required by your target platform and deployment mode.
-Replace `IMAGE`, `NAME`, and `MODEL_DIR` below, then start the container.
+Replace `IMAGE`, `NAME`, and `MODEL_DIR` below, then start the container. The commands require
+[Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
+on the host; each selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 For 950PR/DT series PD disaggregation, choose an image that supports DP attention.
 
 <Tabs>
@@ -98,7 +100,7 @@ For 950PR/DT series PD disaggregation, choose an image that supports DP attentio
 #   MODEL_DIR: model weights directory on the host
 # ============================================================
 
-IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash"
+IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050"
 NAME=sglang-glm53-flash-a3
 MODEL_DIR=/path/to/model-weights
 
@@ -106,30 +108,12 @@ docker pull "$IMAGE"
 
 docker run -itd --shm-size=16g --name "$NAME" \
     --privileged=true --net=host \
-    -v /var/queue_schedule:/var/queue_schedule \
+    -e ASCEND_VISIBLE_DEVICES=0-15 \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /usr/local/sbin:/usr/local/sbin \
     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     -v "${MODEL_DIR}:/models/GLM-5.3-Flash" \
-    --device=/dev/davinci0:/dev/davinci0 \
-    --device=/dev/davinci1:/dev/davinci1 \
-    --device=/dev/davinci2:/dev/davinci2 \
-    --device=/dev/davinci3:/dev/davinci3 \
-    --device=/dev/davinci4:/dev/davinci4 \
-    --device=/dev/davinci5:/dev/davinci5 \
-    --device=/dev/davinci6:/dev/davinci6 \
-    --device=/dev/davinci7:/dev/davinci7 \
-    --device=/dev/davinci8:/dev/davinci8 \
-    --device=/dev/davinci9:/dev/davinci9 \
-    --device=/dev/davinci10:/dev/davinci10 \
-    --device=/dev/davinci11:/dev/davinci11 \
-    --device=/dev/davinci12:/dev/davinci12 \
-    --device=/dev/davinci13:/dev/davinci13 \
-    --device=/dev/davinci14:/dev/davinci14 \
-    --device=/dev/davinci15:/dev/davinci15 \
-    --device=/dev/davinci_manager:/dev/davinci_manager \
-    --device=/dev/hisi_hdc:/dev/hisi_hdc \
     --entrypoint=bash \
     "$IMAGE"
 
@@ -147,7 +131,7 @@ docker exec -it "$NAME" bash
 #   MODEL_DIR: model weights directory on the host
 # ============================================================
 
-IMAGE="<your 950PR/DT series image>"
+IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050"
 NAME=sglang-glm53-flash-950pr-dt-series
 MODEL_DIR=/path/to/model-weights
 
@@ -155,22 +139,12 @@ docker pull "$IMAGE"
 
 docker run -itd --shm-size=16g --name "$NAME" \
     --privileged=true --net=host \
-    -v /var/queue_schedule:/var/queue_schedule \
+    -e ASCEND_VISIBLE_DEVICES=0-7 \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /usr/local/sbin:/usr/local/sbin \
     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     -v "${MODEL_DIR}:/models/GLM-5.3-Flash" \
-    --device=/dev/davinci0:/dev/davinci0 \
-    --device=/dev/davinci1:/dev/davinci1 \
-    --device=/dev/davinci2:/dev/davinci2 \
-    --device=/dev/davinci3:/dev/davinci3 \
-    --device=/dev/davinci4:/dev/davinci4 \
-    --device=/dev/davinci5:/dev/davinci5 \
-    --device=/dev/davinci6:/dev/davinci6 \
-    --device=/dev/davinci7:/dev/davinci7 \
-    --device=/dev/davinci_manager:/dev/davinci_manager \
-    --device=/dev/hisi_hdc:/dev/hisi_hdc \
     --entrypoint=bash \
     "$IMAGE"
 
