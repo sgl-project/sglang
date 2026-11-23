@@ -24,7 +24,10 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             _tag_keys=lambda keys: keys,
         )
         self.linker.pools = {
-            name: Mock(get_prepared_layer_range_meta=Mock(return_value=None))
+            name: Mock(
+                prepare_locations=Mock(side_effect=lambda indices: indices),
+                get_prepared_layer_range_meta=Mock(return_value=None),
+            )
             for name in ("kv", "index")
         }
         self.linker.num_layers = 1
@@ -49,7 +52,8 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             return [0] * len(keys)
 
         def locations(indices):
-            fence.synchronize.assert_called_once_with()
+            fence.synchronize_indices.assert_called_once_with()
+            fence.synchronize.assert_not_called()
             return indices
 
         self.store.batch_get_session_start.side_effect = start
