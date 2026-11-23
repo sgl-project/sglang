@@ -114,6 +114,7 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, weight_layout):
         extend_prefix_lens_cpu=prefix_lens,
         extend_prefix_lens=torch.tensor(prefix_lens),
         extend_seq_lens=torch.tensor(suffix_lens),
+        extend_seq_lens_cpu=list(suffix_lens),
         seq_lens=torch.tensor(seq_lens),
         attn_dcp_metadata=SimpleNamespace(dcp_local_prefix_kv_indices=None),
         fetch_mha_one_shot_kv_indices=lambda: torch.arange(total),
