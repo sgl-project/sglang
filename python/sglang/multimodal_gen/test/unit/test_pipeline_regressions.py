@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines.ernie_image import ErnieImagePipeli
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     SanaVideoTextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
     ImageProcessorV2,
     MeshRender,
@@ -143,3 +146,15 @@ def test_diffusers_pipeline_add_stage_accepts_both_argument_orders(legacy_order)
         pipeline.add_stage(stage, "diffusers_execution")
     assert pipeline._stage_name_mapping == {"diffusers_execution": stage}
     assert pipeline._stages == [stage]
+
+
+def test_unknown_sta_mode_reports_the_configured_name():
+    """An unknown STA mode must surface as the enum lookup error that names the
+    configured mode."""
+    stage = DenoisingStage.__new__(DenoisingStage)
+    server_args = SimpleNamespace(
+        attention_backend_config=SimpleNamespace(STA_mode="STA_BOGUS")
+    )
+
+    with pytest.raises(KeyError, match="STA_BOGUS"):
+        stage.prepare_sta_param(SimpleNamespace(), server_args)

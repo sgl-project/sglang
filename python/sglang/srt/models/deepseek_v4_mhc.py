@@ -42,7 +42,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -62,6 +61,7 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
@@ -358,6 +358,29 @@ def mix_stats(
     return coefficients
 
 
+def mix_stats_from_state(
+    hc: HcSubLayer,
+    residual: torch.Tensor,
+    state: HcState,
+    stats_stream: Optional[torch.cuda.Stream] = None,
+) -> HcTriplet:
+    """``mix_stats``, unless the combine already stashed the triplet.
+
+    The A5 NPU combine (``mhc_pre_dpskv4`` with ``cann_recipes_infer_cann920``,
+    see ``_npu_combine_premix``) predicts
+    this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
+    ``state.stats``.  This consumes the fused operator's coefficients exactly
+    like the target model does (``precomputed=state.stats`` through
+    ``run_attn_post`` / ``run_moe_post``), so the draft and the target run the
+    same operator; re-predicting would take the CUDA-only sinkhorn path, which
+    has no Ascend implementation.  Every other platform leaves ``state.stats``
+    unset, so this lands on plain ``mix_stats`` there.
+    """
+    if state.stats is not None:
+        return state.stats
+    return mix_stats(hc, residual, stats_stream)
+
+
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
@@ -387,8 +410,14 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
 
+    bf16_decode_grid = (
+        bf16_parts is not None
+        and get_platform().is_sm100
+        and get_platform().device_sm != 107
+        and x_flat.shape[0] <= 256
+    )
     use_bf16_projection = bf16_parts is not None and (
-        hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+        hopper_medium or bf16_decode_grid or 4096 <= x_flat.shape[0] <= 65536
     )
     hopper_fused_stats = get_platform().is_sm90 and (
         x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
@@ -414,6 +443,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
+                decode_grid=bf16_decode_grid,
             )
         elif parts is not None:
             from sglang.kernels.ops.layernorm.mhc import (
@@ -471,9 +501,28 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
 # ---------------------------------------------------------------------------
 
 
+_deferred_attn_fork: Optional[torch.cuda.Stream] = None
+
+
+def defer_attn_stats_fork(stats_stream: torch.cuda.Stream) -> None:
+    """Hold the attention mix's fork until the attention core starts (its idle SMs),
+    instead of beside the full-grid projection GEMMs."""
+    global _deferred_attn_fork
+    assert _deferred_attn_fork is None
+    _deferred_attn_fork = stats_stream
+
+
+def run_deferred_attn_stats_fork() -> None:
+    global _deferred_attn_fork
+    if _deferred_attn_fork is not None:
+        fork_stats_stream(_deferred_attn_fork)
+        _deferred_attn_fork = None
+
+
 def fork_stats_stream(stats_stream: Optional[torch.cuda.Stream]) -> None:
-    """Let the side stream pick up from here; the layers call it right before
-    each combine (fork position measured indistinguishable across batch sizes)."""
+    """Let the side stream pick up from here; reads call it right before the
+    combine, except MegaAttention attention reads, which defer it to the core
+    (``defer_attn_stats_fork``)."""
     if stats_stream is not None:
         stats_stream.wait_stream(torch.cuda.current_stream())
 
@@ -495,16 +544,70 @@ def combine(
     return _combine(hc, state, quantized)
 
 
+def _npu_combine_premix(
+    hc: HcSubLayer,
+    state: HcState,
+    x: torch.Tensor,
+    apply_pre: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """A5 single-pass mHC pre-mix + coefficient prediction.
+
+    ``combine`` collapses the streams and ``mix_stats`` predicts the triplet in
+    two steps elsewhere; the AscendC kernel does both in one launch -- it folds
+    the residual with the *previous* sublayer's pre-mix and returns this
+    sublayer's own ``(pre, post, comb)``. Those coefficients are stashed on
+    ``state.stats``, which ``_compute_triplet`` prefers over re-predicting, so the
+    post that follows consumes them.
+
+    Recipes: models/deepseek_v4_1/models/modules/op_impls/mhc.py L57-L71
+    (``hc_pre_ascendc``) and modeling_deepseek.py L1621-L1624 / L1638-L1640.
+    """
+    cfg = hc.cfg
+    if x.shape[0] == 0:
+        # Idle / DP-padding rank: nothing to mix, and the coefficient writers
+        # below accept empty batches.
+        state.stats = (
+            x.new_empty((0, cfg.mult), dtype=torch.float32),
+            x.new_empty((0, cfg.mult), dtype=torch.float32),
+            x.new_empty((0, cfg.mult, cfg.mult), dtype=torch.float32),
+        )
+        return hc.norm(x[:, 0, :])
+    if apply_pre is None:
+        # The first sublayer has no previous pre-mix to fold; seed the identity
+        # one-hot (stream 0 on its own).
+        apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
+        apply_pre[:, 0] = 1.0
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+
+    y, post_mix, comb, pre = mhc_pre_dpskv4(
+        x,
+        hc.fn,
+        hc.scale,
+        hc.base,
+        cfg.mult,
+        cfg.sinkhorn_iters,
+        cfg.eps,
+        cfg.rms_eps,
+        pre_mix=apply_pre,
+        return_pre=True,
+        impl="cann_recipes_infer_cann920",
+    )
+    state.stats = (pre, post_mix, comb)
+    return hc.norm(y)
+
+
 def _combine(
     hc: HcSubLayer,
     state: HcState,
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
-    from sglang.kernels.ops.layernorm.mhc import mhc_combine
-
     cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
+    if _is_npu and cfg.pre_from_prev:
+        return _npu_combine_premix(hc, state, x, apply_pre)
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
+
     quantize = quantized is not None
     x_flat = x.flatten(1)
 
@@ -565,16 +668,16 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
-        if not is_npu_arch35():
-            return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
-        # The Ascend 950 build of npu_hc_post is batched -- it requires a leading
-        # batch axis on every operand.
-        return torch.ops.custom.npu_hc_post(
-            x.unsqueeze(0),
-            residual.unsqueeze(0),
-            post_mix.unsqueeze(0),
-            comb.unsqueeze(0),
-        ).squeeze(0)
+        if cfg.pre_from_prev:
+            # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
+            # the base stream, comb its res-mixing matrix, x the sublayer
+            # output and post its post-mix.
+            return torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post_mix)
+        # DSV4: the sgl_kernel_npu wrapper owns the pre-950 / Ascend 950
+        # (batched) npu_hc_post dispatch.
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+
+        return mhc_post_dpskv4(x, residual, post_mix, comb)
 
     if _is_xpu:
         from sglang.srt.models.deepseek_v4 import get_mhc_ops
@@ -674,6 +777,7 @@ def _compute_triplet(
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
     the post reads it."""
+    run_deferred_attn_stats_fork()
     if precomputed is not None:
         return precomputed
     coefficients = mix_stats(hc, residual, stats_stream)
@@ -683,11 +787,56 @@ def _compute_triplet(
 
 
 def _can_use_mega_mhc(cfg: HcConfig) -> bool:
-    return (
-        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
-        and get_platform().is_sm100
-        and not cfg.cp_prefill
+    """Opt-in single-pass Mega-mHC prefill.
+
+    SM100 keeps DeepGEMM. gfx950 DeepSeek-V4.1 (hc_mult 4, hidden 5120) uses
+    aiter ``flydsl_mega_mhc`` and must not also take the fused HIP boundary.
+    Context-parallel prefill is unsupported on both.
+    """
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get() or cfg.cp_prefill:
+        return False
+    if _is_hip:
+        return _is_gfx95_supported and cfg.mult == 4 and cfg.hidden == 5120
+    return get_platform().is_sm100
+
+
+def _hip_flydsl_mega_mhc(
+    y: torch.Tensor,
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb: torch.Tensor,
+    nxt: HcSubLayer,
+) -> HcState:
+    """ROCm Mega-mHC on gfx950. bf16 norm; the next GEMM still quantizes."""
+    from aiter.ops.flydsl import flydsl_mega_mhc
+
+    post_in = post_mix.unsqueeze(-1) if post_mix.ndim == 2 else post_mix
+    residual_out = torch.empty_like(residual)
+    updated, next_post, next_comb, normalized, next_pre = flydsl_mega_mhc(
+        residual,
+        nxt.fn,
+        nxt.scale,
+        nxt.base,
+        nxt.cfg.rms_eps,
+        nxt.cfg.eps,
+        nxt.cfg.eps,
+        2.0,
+        nxt.cfg.sinkhorn_iters,
+        pre,
+        sublayer_out=y,
+        post_layer_mix=post_in,
+        comb_res_mix=comb,
+        norm_weight=nxt.norm.weight,
+        norm_eps=nxt.norm.variance_epsilon,
+        residual_out=residual_out,
+        out_dtype="bf16",
     )
+    if next_post.ndim == 3:
+        next_post = next_post.squeeze(-1)
+    if next_pre.ndim == 3:
+        next_pre = next_pre.squeeze(-1)
+    return HcState(updated, pre, HcNormed(normalized), (next_pre, next_post, next_comb))
 
 
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
@@ -722,6 +871,8 @@ def _post_fusion(
         and _can_use_mega_mhc(cfg)
         and y.shape[0] > 0
     ):
+        if _is_hip:
+            return _hip_flydsl_mega_mhc(y, residual, pre, post_mix, comb, next.hc)
         next_hc = next.hc
         y_fp8 = y_sf = moe_input = None
         if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):

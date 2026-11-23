@@ -23,7 +23,7 @@ Group the new entry under an existing section comment (e.g. `# Logging Options`,
 | `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `HOME`, `PATH` | Distributed launcher / OS | **No.** `os.getenv` only. |
 | Test runner internals (`PYTEST_CURRENT_TEST`, etc.) | Test framework | **No.** `os.getenv` only. |
 
-`SGL_*` is **not** a parallel valid prefix — it's a deprecated legacy alias. `_handle_deprecated_envs()` rewrites `SGL_*` to `SGLANG_*` at import time with a warning. Never define a new `SGL_*` descriptor or `os.getenv("SGL_...")` call site; if you see one in code, it's tech debt to migrate.
+`SGL_*` is **not** a valid prefix — the legacy alias was removed in SGLang 1.0, and server startup stops when an `SGL_<X>` is set for a registered `SGLANG_<X>` (`validate_removed_options`). Never define a new `SGL_*` descriptor or `os.getenv("SGL_...")` call site; if you see one in code, it's tech debt to migrate.
 
 The rule of thumb: if the value's lifecycle is owned by sglang code (we read it, we may want to override it in tests, we may want to rename it), put it in `Envs`. If the value is set by something outside sglang and we only consume it as-is, use `os.getenv`.
 
@@ -131,7 +131,7 @@ The `allow_sglang=True` escape hatch exists for the rare case where you must byp
 
 ## Rule 4 — Naming: `SGLANG_` prefix + verb category
 
-Prefix is always `SGLANG_` for new entries. `SGL_*` is auto-translated to `SGLANG_*` with a warning in `_handle_deprecated_envs()`; never add a new `SGL_*` key.
+Prefix is always `SGLANG_` for new entries; never add a new `SGL_*` key.
 
 The second token signals intent. Pick the right verb up front — renames require an alias entry (Rule 5).
 
@@ -165,7 +165,7 @@ For a rename where the old key must keep working with a warning:
 SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
 ```
 
-Use `EnvBoolWithAlias` / `EnvIntWithAlias` / `EnvStrWithAlias`. The fallback warns and copies the old value over. A legacy `SGL_FOO` needs no alias for `SGLANG_FOO`: the import-time prefix rewrite already covers it. An old name without either prefix (e.g. `FOO`) does need one.
+Use `EnvBoolWithAlias` / `EnvIntWithAlias` / `EnvStrWithAlias`. The fallback warns and copies the old value over.
 
 For a removal, or a var replaced by a CLI flag or another var, add an entry to `_DEPRECATED_ENVS` in `environ.py` and delete the descriptor:
 
@@ -175,6 +175,8 @@ _DEPRECATED_ENVS = {
     "SGLANG_GONE": _DeprecatedEnv(note="Pass --foo instead."),              # warns only
 }
 ```
+
+When the deprecation period ends, delete the alias or the `_DEPRECATED_ENVS` entry and add the old name to `REMOVED_ENVS` in `environ.py` with what to use instead; server startup stops while it is still set (`validate_removed_options`).
 
 A var that only restated the hardware, or only killed an architecture-gated default, is deleted outright with its whole footprint; see the code-cleanup skill's catalog.
 
@@ -190,6 +192,8 @@ Don't silently flip a default during a rename. If the new default disagrees with
 | Temporary env var rolling out to a CLI flag | env var first, then a `_DEPRECATED_ENVS` entry whose `note` names the flag |
 
 Don't add a CLI flag that just forwards to an env var, and don't add an env var that duplicates an existing CLI flag. Pick one surface.
+
+The exception is a secret, such as an API key: it may have both a flag and an env var (`--admin-api-key` and `SGLANG_ADMIN_API_KEY`, the flag wins), because a flag value is visible to anyone who can read the process's argv (`ps`, `/proc/<pid>/cmdline`), and the bundled clients read the same env var so the key is set once. Define it with `secret=True`.
 
 ## Out of scope
 
