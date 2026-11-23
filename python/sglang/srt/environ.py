@@ -1776,6 +1776,9 @@ class Envs:
     # same way whatever else shares its batch. Raise it to buy back bandwidth
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
+    # Opt out of FlashInfer's batch-invariant quantizer and GEMM classes under
+    # the deterministic mode (back to the previous quantizer kernels).
+    SGLANG_DETERMINISTIC_FLASHINFER_QUANT = EnvBool(True)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
     # ROCm CustomAllReduceV2 workspace sharing: auto, fabric or posix_fd
     SGLANG_HIP_VMM_HANDLE_TYPE = EnvStr("auto")
