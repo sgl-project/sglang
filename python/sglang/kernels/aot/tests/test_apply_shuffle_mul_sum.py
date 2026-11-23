@@ -2,6 +2,8 @@ import subprocess
 import sys
 
 import pytest
+import torch
+from sgl_kernel import apply_shuffle_mul_sum
 
 
 def test_apply_shuffle_mul_sum_empty():
@@ -28,6 +30,18 @@ else:
     assert result.returncode == 0, (
         f"exit={result.returncode}\n{result.stdout}{result.stderr}"
     )
+
+
+# 4: fewer elements than one 16-byte vector.
+@pytest.mark.parametrize("width", [4])
+def test_apply_shuffle_mul_sum_odd_widths(width):
+    x = torch.randn((4, width), device="cuda", dtype=torch.float16)
+    y = torch.zeros((2, width), device="cuda", dtype=torch.float16)
+    p = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int32)
+    factors = torch.randn((4,), device="cuda", dtype=torch.float16)
+    apply_shuffle_mul_sum(x, y, p, factors)
+    expected = (x[p.long()].float() * factors[:, None].float()).view(2, 2, -1).sum(1)
+    torch.testing.assert_close(y, expected.half(), atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

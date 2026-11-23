@@ -342,9 +342,8 @@ void get_apply_shuffle_mul_sum_caller(
 
   TORCH_CHECK(permutation.size(0) == m * topk, "permutation size must match m * topk");
 
-  auto scalar_type = output_tensor.scalar_type();
-  uint32_t vec_size = 16 / sizeof(scalar_type);
-  auto blockDim = std::min(row_stride / vec_size, 1024U);
+  uint32_t vec_size = 16 / output_tensor.element_size();
+  auto blockDim = std::max(1U, std::min(row_stride / vec_size, 1024U));
   dim3 block(blockDim);
 
   dim3 grid(m);  // blockIdx.x = j, blockIdx.y = i
