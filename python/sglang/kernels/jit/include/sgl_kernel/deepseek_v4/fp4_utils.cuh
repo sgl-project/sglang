@@ -1,6 +1,5 @@
 #pragma once
 
-#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
@@ -77,12 +76,10 @@ SGL_DEVICE float compressed_kv_scale(float amax) {
 
 /// \brief Quantize compressed KV with its E4M3 scale and return dequantized values.
 SGL_DEVICE fp32x2_t fake_quant_compressed_kv_x2(fp32x2_t x, float scale) {
-#ifdef USE_ROCM
   const fp32x2_t scaled{__fdiv_rn(x.x, scale) + 0.0f, __fdiv_rn(x.y, scale) + 0.0f};
+#ifdef USE_ROCM
   const fp32x2_t grid{e2m1_value(e2m1_code(scaled.x)), e2m1_value(e2m1_code(scaled.y))};
 #else
-  const float inv_scale = device::math::rcp_nr_ftz(scale);
-  const fp32x2_t scaled{__fmaf_rn(x.x, inv_scale, 0.0f), __fmaf_rn(x.y, inv_scale, 0.0f)};
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
   const auto grid = device::cast<fp32x2_t>(fp16x2_t{__nv_cvt_fp4x2_to_halfraw2(code, __NV_E2M1)});
 #endif
