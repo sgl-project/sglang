@@ -2755,24 +2755,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        (
+            success,
+            message,
+            num_paused_requests,
+        ) = await self._weight_update_session_replies(
+            self._update_weights_from_disk_and_commit, obj
         )
-        async with lock_context:
-            (
-                success,
-                message,
-                num_paused_requests,
-            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message, num_paused_requests

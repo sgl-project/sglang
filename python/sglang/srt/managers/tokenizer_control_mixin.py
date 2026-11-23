@@ -9,6 +9,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
+import msgspec
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARef
@@ -480,12 +481,53 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
     ) -> Tuple[bool, str]:
-        results = await self._weight_update_session_replies(communicator, obj)
+        results = await self._weight_update_session_replies(
+            lambda request: self._native_weight_update_replies(communicator, request),
+            obj,
+        )
         return FanOutCommunicator.merge_results(results)
+
+    def _native_weight_update_request(self: TokenizerManager, obj) -> tuple[Any, bool]:
+        # Shards may handle control in different steps. Let the frontend commit
+        # a requested version only after every shard has reported success.
+        if (
+            getattr(obj, "weight_version", None) is not None
+            and get_parallel().num_dp_ranks > 1
+        ):
+            return msgspec.structs.replace(obj, weight_version=None), True
+        return obj, False
+
+    async def _commit_native_weight_version(
+        self: TokenizerManager, obj, success, *, deferred: bool
+    ):
+        version = getattr(obj, "weight_version", None)
+        if not success or version is None:
+            return
+        if deferred:
+            await self.update_weight_version_communicator(
+                UpdateWeightVersionReqInput(
+                    new_version=version, abort_all_requests=False
+                )
+            )
+        self._update_weight_version_if_provided(version)
+
+    async def _native_weight_update_replies(self: TokenizerManager, communicator, obj):
+        request, deferred = self._native_weight_update_request(obj)
+        results = await communicator(request)
+        await self._commit_native_weight_version(
+            obj, all(r.success for r in results), deferred=deferred
+        )
+        return results
+
+    async def _update_weights_from_disk_and_commit(self: TokenizerManager, obj):
+        request, deferred = self._native_weight_update_request(obj)
+        result = await self._wait_for_model_update_from_disk(request)
+        await self._commit_native_weight_version(obj, result[0], deferred=deferred)
+        return result
 
     async def _weight_update_session_replies(
         self: TokenizerManager, communicator, obj
-    ) -> list:
+    ) -> Any:
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -558,7 +600,6 @@ class TokenizerControlMixin:
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
@@ -608,20 +649,12 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
+        success, message = await self._weight_update_session_call(
+            self.update_weights_from_tensor_communicator, obj
+        )
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
@@ -640,15 +673,9 @@ class TokenizerControlMixin:
             )
             logger.info("Starting IPC weight update")
 
-            async with self.is_pause_cond:
-                is_paused = self.is_pause
-                if is_paused:
-                    results = await self.update_weights_from_ipc_communicator(obj)
-
-            if not is_paused:
-                async with self.model_update_lock.writer_lock:
-                    results = await self.update_weights_from_ipc_communicator(obj)
-            success, message = FanOutCommunicator.merge_results(results)
+            success, message = await self._weight_update_session_call(
+                self.update_weights_from_ipc_communicator, obj
+            )
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
@@ -657,7 +684,6 @@ class TokenizerControlMixin:
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
