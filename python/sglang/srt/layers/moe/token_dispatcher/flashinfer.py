@@ -274,6 +274,13 @@ class FlashinferDispatcher(BaseDispatcher):
         super().set_quant_config(quant_config)
         self.prefill_dispatcher.set_quant_config(quant_config)
 
+    @property
+    def prebuild_pending(self) -> bool:
+        return self.prefill_dispatcher.prebuild_pending
+
+    def prebuild(self) -> None:
+        self.prefill_dispatcher.prebuild()
+
     def _dispatch_prefill_allgather(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
