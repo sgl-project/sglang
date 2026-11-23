@@ -294,7 +294,10 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
         prefix = "model.layers.0.attention.qkv_proj"
         # An MLA-layer entry neither splits nor raises on the linear layer.
         self.assertFalse(_skipped(prefix, ["attention.q_proj"], mapping))
+        # "v_proj" is the tail of the runtime name qkv_proj, not a module.
+        self.assertFalse(_skipped(prefix, ["v_proj"], mapping))
         self.assertTrue(_skipped(prefix, ["attention.query_key_value"], mapping))
+        self.assertTrue(_skipped(prefix, ["attention.qkv_proj"], mapping))
 
     def test_gemma4_k_eq_v_skips_configs_without_the_awq_matcher(self):
         """w8a8_fp8 has no packed_modules_mapping and is left untouched."""
@@ -310,6 +313,41 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
         state_before = copy.deepcopy(vars(quant_config))
         _declare_k_eq_v_qkv_shards(text_config, quant_config, "model.layers")
         self.assertEqual(vars(quant_config), state_before)
+
+    def test_auto_round_k_eq_v_layer_follows_its_q_and_k(self):
+        """AutoRound takes Q/K's bits=16 for a K=V qkv_proj, which has no v_proj."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+        from sglang.srt.models.gemma4_causal import _declare_k_eq_v_qkv_shards
+
+        dense = {"bits": 16}
+        quant_config = AutoRoundConfig.from_config(
+            {
+                "quant_method": "auto-round",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "extra_config": {
+                    "model.layers.1.self_attn.q_proj": dense,
+                    "model.layers.1.self_attn.k_proj": dense,
+                },
+            }
+        )
+        _declare_k_eq_v_qkv_shards(
+            SimpleNamespace(
+                attention_k_eq_v=True,
+                layer_types=["sliding_attention", "full_attention"],
+            ),
+            quant_config,
+            "model.layers",
+        )
+        bits, _, _ = quant_config.get_layer_config(
+            torch.nn.Linear(1, 1), "model.layers.1.self_attn.qkv_proj"
+        )
+        self.assertEqual(bits, 16)
 
     def test_moe_wna16_awq_linear_keeps_the_k_eq_v_shards(self):
         """moe_wna16 rebuilds AWQ per linear layer and must keep the model's update."""

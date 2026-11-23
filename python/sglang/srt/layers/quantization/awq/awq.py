@@ -73,6 +73,19 @@ def _names_module(entry: str, path: str) -> bool:
     return False
 
 
+def _names_whole_module(entry: str, path: str) -> bool:
+    # Like _names_module, but also starting on a boundary: "v_proj" does not
+    # name "qkv_proj", while "self_attn.qkv_proj" and "visual" still do.
+    start = path.find(entry)
+    while start != -1:
+        if (start == 0 or path[start - 1] == "." or entry.startswith(".")) and (
+            _names_module(entry, path[start:])
+        ):
+            return True
+        start = path.find(entry, start + 1)
+    return False
+
+
 def _fused_layer_shard_paths(
     quant_config: QuantizationConfig, prefix: str
 ) -> Optional[List[str]]:
@@ -106,14 +119,6 @@ def _fused_layer_shard_paths(
     return [parent + shard for shard in shards]
 
 
-def uses_awq_fused_shard_matcher(quant_config: Optional[QuantizationConfig]) -> bool:
-    from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
-
-    if isinstance(quant_config, MoeWNA16Config):
-        return quant_config.linear_quant_method == "awq"
-    return isinstance(quant_config, (AWQConfig, AWQMarlinConfig))
-
-
 def is_layer_skipped_awq(
     prefix: str,
     *,
@@ -130,7 +135,7 @@ def is_layer_skipped_awq(
     # layer (self_attn.qkv_proj). An entry that matches the fused layer only
     # through a shard name (v_proj in kv_proj) must not decide for all shards.
     for module_name in modules_to_not_convert:
-        if _names_module(module_name, prefix) and not any(
+        if _names_whole_module(module_name, prefix) and not any(
             _names_module(module_name, p) for p in shard_paths
         ):
             return True
