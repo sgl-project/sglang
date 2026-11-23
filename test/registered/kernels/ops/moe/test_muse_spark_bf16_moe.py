@@ -1,5 +1,6 @@
 """Muse Spark BF16 experts on SM90: interleaved gate-up Triton and grouped vs stock."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -104,3 +105,7 @@ def test_cuda_graph_replay():
             t.copy_(v)
         graph.replay()
         assert torch.equal(out, run())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
