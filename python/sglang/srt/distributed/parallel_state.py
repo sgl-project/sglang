@@ -2739,7 +2739,10 @@ def initialize_model_parallel(
             and decode_context_parallel_size == tensor_model_parallel_size
             # DCP must not reach TP's QuickAllReduce: its MHA merge all-reduces bf16,
             # which a quantized QR regime would round. A disabled QR never dispatches.
-            and (_TP.qr_comm is None or _TP.qr_comm.disabled)
+            # Every rank must agree, since the else branch builds groups collectively.
+            and not _any_rank_in_world(
+                _TP.qr_comm is not None and not _TP.qr_comm.disabled
+            )
         ):
             # Full-width DCP preserves TP rank order.
             _DCP = _TP
@@ -2748,9 +2751,8 @@ def initialize_model_parallel(
                 dcp_group_ranks,
                 get_world_group().local_rank,
                 backend,
-                # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
-                # FP32 all-reduce. QuickAllReduce does not serve these collectives,
-                # but its communicator reserves a large workspace on every rank.
+                # DCP's MHA merge all-reduces bf16, which a quantized QR regime would
+                # round, and the QR communicator reserves a large workspace per rank.
                 use_quick_allreduce=False,
                 use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
                 group_name="dcp",
@@ -3316,6 +3318,18 @@ def destroy_model_parallel():
     )
     _SHARED_EXPERTS_TP = _TP = _PP = _DCP = None
     _MOE_EP = _MOE_TP = _MOE_DP = _ATTN_CP = _ATTN_TP = None
+
+
+def _any_rank_in_world(flag: bool) -> bool:
+    """Whether ``flag`` holds on any rank, from one CPU all-reduce over the world."""
+    world = get_world_group()
+    if world.world_size == 1:
+        return flag
+    value = torch.tensor([int(flag)], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        value, op=torch.distributed.ReduceOp.MAX, group=world.cpu_group
+    )
+    return bool(value.item())
 
 
 def _destroy_groups_once(*groups: Optional[GroupCoordinator]) -> None:

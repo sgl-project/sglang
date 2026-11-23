@@ -107,6 +107,8 @@ def _worker(mode: str) -> None:
     tp, dcp = ps._TP, ps._DCP
 
     qr_runs = tp.qr_comm is not None and not tp.qr_comm.disabled
+    if mode == "no-custom-ar":
+        assert tp.qr_comm is None
     if mode == "qr-int8":
         assert qr_runs, "gfx950 TP must build an enabled QuickAllReduce here"
     if mode == "qr-disabled":
@@ -118,7 +120,8 @@ def _worker(mode: str) -> None:
         assert dcp is tp, (
             "full-width DCP must reuse a TP coordinator whose QR never runs"
         )
-    # 8 MB of bf16: inside QR's size range at TP8, so the check below is not vacuous.
+    # 8 MB of bf16, cast to fp16 for QR (ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16=1, pinned
+    # below): inside its INT8 range at TP8 (4 MB up), so the check below is not vacuous.
     probe = torch.ones(4096, 1024, dtype=torch.bfloat16, device=device)
     if qr_runs:
         assert tp.qr_comm.should_quick_allreduce(probe)
@@ -182,7 +185,11 @@ def test_dcp8_collectives_eager_and_graph(mode: str) -> None:
         __file__,
         f"--mode={mode}",
     ]
-    env = dict(os.environ, ROCM_QUICK_REDUCE_QUANTIZATION=MODES[mode][1])
+    env = dict(
+        os.environ,
+        ROCM_QUICK_REDUCE_QUANTIZATION=MODES[mode][1],
+        ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16="1",
+    )
     result = subprocess.run(
         cmd,
         env=env,

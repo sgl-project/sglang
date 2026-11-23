@@ -513,8 +513,11 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             parallel_state.destroy_model_parallel()
 
 
-def _init_tp8_dcp(is_hip, dcp_size=8, tp_quick_allreduce=None):
-    """tp_quick_allreduce: None (no QR communicator), "disabled" or "enabled"."""
+def _init_tp8_dcp(
+    is_hip, dcp_size=8, tp_quick_allreduce=None, other_rank_qr_runs=False
+):
+    """tp_quick_allreduce: None (no QR communicator), "disabled" or "enabled";
+    other_rank_qr_runs: whether another rank's TP group runs QR."""
     created = {}
 
     def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
@@ -549,6 +552,11 @@ def _init_tp8_dcp(is_hip, dcp_size=8, tp_quick_allreduce=None):
             side_effect=mock_init_model_parallel_group,
         ),
         patch.object(parallel_state, "get_world_group") as mock_world_group,
+        patch.object(
+            parallel_state,
+            "_any_rank_in_world",
+            side_effect=lambda flag: flag or other_rank_qr_runs,
+        ),
     ):
         mock_world = Mock()
         mock_world.device_group = Mock()
@@ -590,6 +598,16 @@ def test_hip_full_width_dcp_keeps_separate_group_when_tp_quick_allreduce_runs():
     assert created["dcp"] is dcp
     assert dcp.qr_comm is None
     assert dcp_destroys == 1
+
+
+def test_hip_full_width_dcp_follows_any_rank_whose_tp_quick_allreduce_runs():
+    """Ranks must agree on building DCP groups: if another TP group runs QR, a rank
+    whose own QR is disabled still builds the DCP group instead of aliasing."""
+    created, tp, dcp, _, _ = _init_tp8_dcp(
+        is_hip=True, tp_quick_allreduce="disabled", other_rank_qr_runs=True
+    )
+    assert dcp is not tp
+    assert created["dcp"] is dcp
 
 
 def test_hip_full_width_dcp_reuses_tp_group_when_tp_quick_allreduce_is_disabled():
