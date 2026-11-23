@@ -677,19 +677,16 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         capture_dspark: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_hip import (
+            fused_boundary_this_step,
+        )
         from sglang.srt.models.deepseek_v4_platform_stage import (
             forward_layer_fused_boundary,
         )
 
         model = self._model
         aux: List[torch.Tensor] = []
-        fused_step = False
-        if is_hip():
-            from sglang.srt.models.deepseek_common.amd.deepseek_v4_hip import (
-                fused_boundary_this_step,
-            )
-
-            fused_step = fused_boundary_this_step(forward_batch)
+        fused_step = fused_boundary_this_step(forward_batch)
         for i in self._layer_ids:
             layer = model.layers[i]
             assert layer.engram is None

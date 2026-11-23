@@ -236,5 +236,64 @@ class TestTailKvStore(CustomTestCase):
         torch.testing.assert_close(live.x, q[:3])
 
 
+class TestHipTailMegaMhcSeams(CustomTestCase):
+    def _boundaries(self, *, mega_mhc, prefill):
+        """Which boundary each tail layer takes: "fused" or "seam" (Mega-mHC)."""
+        from sglang.srt.models import deepseek_v4_platform_stage as stage
+
+        taken = []
+
+        class State:
+            residual, pre = None, None
+
+            def materialized(self, cfg):
+                return self
+
+        def layer(i):
+            def forward_hc_pre_from_prev(**kw):
+                taken.append((i, "seam"))
+                return State()
+
+            return SimpleNamespace(
+                engram=None,
+                hc_boundary_fused=True,
+                hc_cfg=None,
+                forward_hc_pre_from_prev=forward_hc_pre_from_prev,
+            )
+
+        def fused_boundary(model, i, state, **kw):
+            taken.append((i, "fused"))
+            return State()
+
+        tail = object.__new__(DecoderReplayTail)
+        tail._model = SimpleNamespace(
+            layers={20: layer(20), 21: layer(21)}, dspark_layers_to_capture=set()
+        )
+        tail._layer_ids = range(20, 22)
+        mode = MagicMock()
+        mode.is_extend_without_speculative.return_value = prefill
+        with (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega_mhc),
+            patch.object(replay_tail, "check_cuda_graph_backend", return_value=True),
+            patch.object(stage, "forward_layer_fused_boundary", fused_boundary),
+        ):
+            tail._layer_stack_hip(
+                State(),
+                positions=None,
+                input_ids=None,
+                input_ids_global=None,
+                forward_batch=SimpleNamespace(forward_mode=mode),
+                capture_dspark=False,
+            )
+        return [kind for _, kind in taken]
+
+    def test_tail_follows_the_model_loop_seam_choice(self):
+        """With Mega-mHC prefill on, a prefill step's tail layers must leave the fused
+        boundary as the layers before the tail do; other steps keep it."""
+        self.assertEqual(self._boundaries(mega_mhc=True, prefill=True), ["seam"] * 2)
+        self.assertEqual(self._boundaries(mega_mhc=True, prefill=False), ["fused"] * 2)
+        self.assertEqual(self._boundaries(mega_mhc=False, prefill=True), ["fused"] * 2)
+
+
 if __name__ == "__main__":
     unittest.main()
