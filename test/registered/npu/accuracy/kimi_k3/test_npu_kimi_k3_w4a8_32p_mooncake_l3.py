@@ -50,6 +50,11 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    # TEMPORARY: MLA defaults the host pool to the ACL backend, whose buffers
+    # are not torch-pinned, and the Mamba state backup kernel then dies with
+    # "host buffer must use pinned memory". Any value other than acl/memfabric
+    # falls back to plain pinned memory.
+    "SGLANG_HICACHE_HOST_MEM_BACKEND": "torch",
 }
 
 # L3 store client: MemFabric TENT transport over the NPU device path, as in the
