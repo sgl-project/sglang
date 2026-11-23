@@ -411,6 +411,7 @@ class LogitsMetadata:
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
+    extend_logits_row_index: Optional[torch.Tensor] = None
 
     # TARGET_VERIFY: keep this batch's logits as vocabulary shards.
     verify_vocab_shards: bool = False
@@ -480,6 +481,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            extend_logits_row_index=forward_batch.extend_logits_row_index,
             draft_extend_select_index=draft_extend_select_index,
         )
 
@@ -960,7 +962,9 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            last_index = logits_metadata.extend_logits_row_index
+            if last_index is None:
+                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
@@ -1252,9 +1256,9 @@ class LogitsProcessor(nn.Module):
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
         ):
-            if (
-                self.defer_verify_gather
-                and logits_metadata.forward_mode.is_target_verify()
+            if self.defer_verify_gather and (
+                logits_metadata.forward_mode.is_target_verify()
+                or logits_metadata.extend_logits_row_index is not None
             ):
                 return logits
             return self._gather_softcap_fused(

@@ -2409,6 +2409,10 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # Opt-in: DFlash verifies the running requests' draft blocks inside the mixed
+    # extend forward (--enable-mixed-chunk) instead of a separate decode round.
+    SGLANG_ENABLE_DFLASH_MIXED_VERIFY = EnvBool(False)
+
     # ===================================================================
     # Muse Spark
     # ===================================================================
