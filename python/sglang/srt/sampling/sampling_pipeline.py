@@ -325,9 +325,9 @@ class VerifyStep(msgspec.Struct):
     ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
         """`adjust_verify_logits` over a verify's logits; `draft_tokens` is
         [bs, width]. A chain verify passes `positions` [bs, width], read by the
-        watermark. A tree verify passes its verify input as `tree`: the penalty
-        walks its `retrieve_next_token` / `retrieve_next_sibling`, and the
-        watermark reads its flat draft tokens, positions, and custom mask."""
+        watermark; a tree verify passes its verify input as `tree` instead: the
+        penalty walks its `retrieve_next_token` / `retrieve_next_sibling`, and
+        the watermark reads its flat draft tokens, positions, and custom mask."""
         batch = self.batch
         apply_watermark = None
         if self.watermark is not None:

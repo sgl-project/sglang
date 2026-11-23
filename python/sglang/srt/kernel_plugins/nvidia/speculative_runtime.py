@@ -42,14 +42,7 @@ class StockVerifyBatch(msgspec.Struct, frozen=True):
 
 def default_local_keys(view: ShardedLogitsView) -> torch.Tensor | None:
     """Build local keys, or decline before any fallback RNG is consumed."""
-    try:
-        from sglang.srt.speculative.sharded_verify import shard_keys
-    except ModuleNotFoundError as exc:
-        if exc.name != "sglang.srt.speculative.sharded_verify":
-            raise
-        # The sharded verifier is a separate runtime optimization. Binding can
-        # land first and must preserve the stock gathered path until it exists.
-        return None
+    from sglang.srt.speculative.sharded_verify import shard_keys
 
     # Temperature sampling is an explicit provider numeric policy.  The stock
     # default never selects the distribution-equivalent Gumbel path, even if a
@@ -100,12 +93,13 @@ def default_post_verify(
 
 def _verify_step(io: PostVerifyIO, batch: StockVerifyBatch) -> VerifyStep:
     """The verify step eagle_sample adjusts and routes with, from the view. The
-    route reads what the stages will apply: the view's grammar mask, watermark,
-    penalties, logit_bias, and custom logit processors (the view has none)."""
+    route takes `VerifyRoute.derive`'s terms, with the view's grammar mask and
+    watermark standing in for `has_grammar` and the sampling info's watermark
+    rows, which the view does not carry; keep the two in step."""
     from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
     from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 
-    sampling = io.sampling
+    sampling = batch.sampling_info
     return VerifyStep(
         batch=batch,
         route=VerifyRoute(

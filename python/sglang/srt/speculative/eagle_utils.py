@@ -5,8 +5,6 @@ import logging
 import math
 from contextlib import contextmanager
 from functools import partial
-from importlib import import_module
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
@@ -22,6 +20,7 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import ShardedLogitsView
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
@@ -73,9 +72,6 @@ _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
 LocalKeysFn = Callable[[Any], Optional[torch.Tensor]]
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
-_ShardedLogitsView = getattr(_provider_spec, "ShardedLogitsView", None)
-_VocabShardView = getattr(_provider_spec, "VocabShardView", None)
 
 logger = logging.getLogger(__name__)
 
@@ -726,47 +722,6 @@ def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     return max(top_ks)
 
 
-def _local_key_view(
-    *,
-    logits: torch.Tensor,
-    vocab_shard: VocabShard,
-    temperatures: Optional[torch.Tensor],
-    seeds: Optional[torch.Tensor],
-    splits: int,
-) -> Any:
-    """Build the canonical provider view when binding is installed.
-
-    Runtime-only trees deliberately do not define or import provider contracts.
-    A structural fallback keeps local runtime tests useful without creating an
-    ordering dependency between the two PRs.
-    """
-    shard = (
-        _VocabShardView(
-            start=vocab_shard.start,
-            valid=vocab_shard.valid,
-            vocab_size=vocab_shard.vocab_size,
-        )
-        if _VocabShardView is not None
-        else SimpleNamespace(
-            start=vocab_shard.start,
-            valid=vocab_shard.valid,
-            vocab_size=vocab_shard.vocab_size,
-        )
-    )
-    fields = dict(
-        values=logits,
-        shard=shard,
-        temperatures=temperatures,
-        seeds=seeds,
-        splits=splits,
-    )
-    return (
-        _ShardedLogitsView(**fields)
-        if _ShardedLogitsView is not None
-        else SimpleNamespace(**fields)
-    )
-
-
 def _sharded_tokens(
     logits: torch.Tensor,
     vocab_shard: VocabShard,
@@ -791,9 +746,9 @@ def _sharded_tokens(
     # remains identical to every other rank.
     splits = key_splits(logits.shape[-1])
     keys = local_keys(
-        _local_key_view(
-            logits=logits,
-            vocab_shard=vocab_shard,
+        ShardedLogitsView(
+            values=logits,
+            shard=vocab_shard,
             temperatures=temperatures,
             seeds=seeds,
             splits=splits,

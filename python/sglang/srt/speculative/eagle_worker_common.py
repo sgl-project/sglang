@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from importlib import import_module
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -80,16 +79,12 @@ def bind_eagle_runtime_hooks(
     model = getattr(target_worker.model_runner, "model", None)
     if model is None:
         return STOCK_SPECULATIVE_RUNTIME_HOOKS
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        bind_speculative_runtime_hooks,
+    )
     from sglang.srt.layers.logits_processor import LogitsProcessor
 
-    # The binding may define no speculative provider hook; the stock hooks apply.
-    provider_binding = import_module("sglang.srt.kernel_plugins.nvidia.binding")
-    bind = getattr(provider_binding, "bind_speculative_runtime_hooks", None)
-    hooks = (
-        STOCK_SPECULATIVE_RUNTIME_HOOKS
-        if bind is None
-        else bind(model, STOCK_SPECULATIVE_RUNTIME_HOOKS)
-    )
+    hooks = bind_speculative_runtime_hooks(model, STOCK_SPECULATIVE_RUNTIME_HOOKS)
 
     processors = [
         module for module in model.modules() if isinstance(module, LogitsProcessor)
@@ -102,16 +97,11 @@ def bind_eagle_runtime_hooks(
         # Only callers whose post-verify consumer understands the shard marker
         # and validated outer target models opt in. Exact class-name matching
         # deliberately excludes MTP draft models and unvalidated subclasses.
-        enable = getattr(processors[0], "enable_sharded_verify", None)
-        if callable(enable):
-            stock_keys = getattr(
-                STOCK_SPECULATIVE_RUNTIME_HOOKS.post_verify, "local_keys", None
-            )
-            local_keys = getattr(hooks.post_verify, "local_keys", None)
-            # The stock policy declines every temperature row.
-            enable(
-                temperature_keys=local_keys is not None and local_keys is not stock_keys
-            )
+        # The stock policy declines every temperature row.
+        processors[0].enable_sharded_verify(
+            temperature_keys=hooks.post_verify.local_keys
+            is not STOCK_SPECULATIVE_RUNTIME_HOOKS.post_verify.local_keys
+        )
     return hooks
 
 

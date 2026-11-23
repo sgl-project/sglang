@@ -10,35 +10,19 @@ reuse :func:`reduce_sharded_token_keys` without owning the collective.
 from __future__ import annotations
 
 import logging
-from importlib import import_module
 from typing import Optional
 
-import msgspec
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.plugin_kernels.nvidia.spec import VocabShardView
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
-_provider_vocab_shard = getattr(_provider_spec, "VocabShardView", None)
-if _provider_vocab_shard is None:
-
-    class VocabShard(msgspec.Struct, frozen=True):
-        """Columns [0, valid) are global token ids ``start + column``."""
-
-        start: int
-        valid: int
-        vocab_size: int
-
-else:
-    # When the optional binding contract is installed, expose its one canonical
-    # shard-view type.  Runtime-only builds retain the structurally identical
-    # local type above and never import a binding-only symbol eagerly.
-    VocabShard = _provider_vocab_shard
+VocabShard = VocabShardView
 
 
 def spec_allows_vocab_shards(spec) -> bool:
