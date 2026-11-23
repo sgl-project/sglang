@@ -1573,13 +1573,20 @@ class CommonKVManager(BaseKVManager):
                 and self.attn_cp_size == 1
                 and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
             )
+            # One KV head per layer: every attention-TP rank holds the whole
+            # target/draft KV and state, so `_resolve_rank_mapping` fans it out or in.
+            replicated_mla_layout = info.attn_cp_size == self.attn_cp_size == 1 and (
+                self.is_mla_backend or self.is_hybrid_mla_backend
+            )
             if (
                 info.attn_tp_size != self.attn_tp_size
                 and not decode_tp_size_aligns_prefill_world_size
+                and not replicated_mla_layout
             ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
-                    "servers (including prefill CP ranks for MLA)"
+                    "DeepSeek-V4.1 DSpark PD requires the same attention TP size "
+                    "on both servers unless both run CP 1 on an MLA pool "
+                    "(prefill CP ranks count toward the TP size for MLA)"
                 )
 
         # None (draftless PP stage, state-only draft) skips the check.
