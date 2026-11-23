@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hardware_backend.sail.moe import mega_gate as sail_mega_gate
 from sglang.srt.hardware_backend.sail.moe import mega_moe as sail_mega_moe
 from sglang.srt.hardware_backend.sail.quantization import mxfp4 as sail_mxfp4
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
@@ -1067,6 +1068,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 )
             )
             stack.enter_context(get_parallel().override(moe_ep_rank=0))
+            stack.enter_context(patch.object(mega_gate_runtime, "_is_sail", False))
             stack.enter_context(patch.dict(sys.modules, {"deep_gemm": deep_gemm}))
             stack.enter_context(patch.object(topk_module, "_is_cuda", True))
             stack.enter_context(
@@ -1079,6 +1081,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         supported = mega_gate_runtime.mega_gate_supported
         with (
             self._mega_gate_env(),
+            self._reject_sail_imports(),
             patch.object(mega_gate_runtime, "_device_sm", 100),
         ):
             self.assertTrue(supported(moe))
@@ -1114,6 +1117,57 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 ):
                     self.assertFalse(use(moe, hidden, decode))
                 self.assertFalse(use(moe, hidden, None))
+
+    def test_sail_mega_gate_requires_compatible_vendor_api_and_decode_rows(self):
+        """Require a compatible API, supported SM, and bounded decode/verify rows."""
+        moe = self._mega_gate_moe()
+        with (
+            self._mega_gate_env(),
+            patch.object(mega_gate_runtime, "_is_sail", True),
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(4096),
+        ):
+            self.addCleanup(sail_mega_gate._sail_mega_gate_available.cache_clear)
+            for sm, vendor_fn, expected in (
+                (88, self._mega_gate_reference, False),
+                (90, self._mega_gate_reference, False),
+                (89, lambda x, weight, top_k: None, False),
+                (89, None, False),
+                (89, self._mega_gate_reference, True),
+            ):
+                with (
+                    self.subTest(sm=sm, vendor_fn=vendor_fn),
+                    patch.object(sail_mega_gate, "_device_sm", sm),
+                    patch("deep_gemm.bf16_mega_gate", vendor_fn),
+                ):
+                    sail_mega_gate._sail_mega_gate_available.cache_clear()
+                    self.assertEqual(
+                        mega_gate_runtime.mega_gate_supported(moe), expected
+                    )
+            hidden = torch.zeros((2048, 256), dtype=torch.bfloat16)
+            for mode, expected in (
+                (ForwardMode.DECODE, True),
+                (ForwardMode.TARGET_VERIFY, True),
+                (ForwardMode.EXTEND, False),
+                (ForwardMode.IDLE, False),
+            ):
+                with self.subTest(mode=mode):
+                    self.assertEqual(
+                        mega_gate_runtime.should_use_mega_gate(
+                            moe, hidden, SimpleNamespace(forward_mode=mode)
+                        ),
+                        expected,
+                    )
+            decode = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            self.assertFalse(
+                mega_gate_runtime.should_use_mega_gate(
+                    moe, torch.zeros((2049, 256), dtype=torch.bfloat16), decode
+                )
+            )
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(16):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, decode)
+                )
 
     def test_mega_gate_routes_vision_hash_and_padding(self):
         for is_hash in (False, True):
