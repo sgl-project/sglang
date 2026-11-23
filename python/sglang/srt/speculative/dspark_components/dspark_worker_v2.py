@@ -1060,7 +1060,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_inputs_ready.record()
 
         sampling_info = batch.sampling_info
-        verify = self.target_worker.model_runner.sampling_pipeline.bind_verify(
+        verify = self.target_worker.model_runner.sampling_pipeline.plan_verify(
             batch, watermark_full_mask=False
         )
         # Simulated acceptance overrides correct_len; the bonus is drawn at that row

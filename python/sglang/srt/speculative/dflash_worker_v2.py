@@ -3558,7 +3558,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
-        verify = self.target_worker.model_runner.sampling_pipeline.bind_verify(
+        verify = self.target_worker.model_runner.sampling_pipeline.plan_verify(
             batch, watermark_full_mask=False
         )
 
