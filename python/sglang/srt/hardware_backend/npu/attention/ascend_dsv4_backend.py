@@ -150,9 +150,6 @@ def _dsv41_a3_ops():
         attention=sparse_flash_mla,
         metadata=sparse_flash_mla_metadata,
         indexer=lightning_indexer_v2,
-        # The public API selects the four-output overload when candidate
-        # arguments are supplied; ordinary top-k still returns two outputs.
-        candidate=lightning_indexer_v2,
         sparse_indexer=sparse_lightning_indexer,
     )
 
@@ -1599,7 +1596,7 @@ class LowRatioCompressAscendBackendMixin:
         if not is_npu_arch35():
             kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
             if candidate:
-                indices, _, blocks, lengths = _dsv41_a3_ops().candidate(
+                indices, _, blocks, lengths = _dsv41_a3_ops().indexer(
                     q_packed,
                     k,
                     w,
@@ -2890,18 +2887,24 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_has_low_ratio = any(
             ratio in (1, 2) for ratio in self._dsv4_compress_ratios
         )
-        if self._dsv4_has_low_ratio and is_npu_arch35():
-            # MQSMLA fixes N1 = 64 and does not shard query heads over TP; a
-            # narrower per-rank width would feed the op the wrong head count.
-            assert self._dsv4_q_head_num == 64, (
-                "DeepSeek-V4.1 on NPU needs all 64 query heads on every rank "
-                f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
-                "the attention TP size."
-            )
-        if self._dsv4_has_low_ratio and not is_npu_arch35():
-            _dsv41_a3_ops()
-            # Resolve the public API here; graph warmup loads the lazy binding.
-            _dsv41_a3_compressor_kernel()
+        if self._dsv4_has_low_ratio:
+            if is_npu_arch35():
+                # MQSMLA fixes N1 = 64 and does not shard query heads over TP.
+                assert self._dsv4_q_head_num == 64, (
+                    "DeepSeek-V4.1 on NPU needs all 64 query heads on every rank "
+                    f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
+                    "the attention TP size."
+                )
+            else:
+                try:
+                    _dsv41_a3_ops()
+                    _dsv41_a3_compressor_kernel()
+                except ImportError as exc:
+                    raise ImportError(
+                        "DeepSeek-V4.1 on Ascend A3 requires sgl-kernel-npu built "
+                        "with the ops_transformer bundle for CANN 9.2.0. "
+                        f"Failed to import an A3 operator: {exc}"
+                    ) from exc
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )

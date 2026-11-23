@@ -126,6 +126,33 @@ Each CANN version requires its own matched set of component versions — do not 
   </Tab>
 </Tabs>
 
+### DeepSeek-V4.1 on A3
+
+The A3 low-ratio attention backend needs five `sgl-kernel-npu` operators:
+`sparse_flash_mla`, `sparse_flash_mla_metadata`, `lightning_indexer_v2` (including
+candidate selection), `sparse_lightning_indexer`, and `compressor_v2`. A wheel
+with only the Python wrappers is not sufficient. This requirement is specific
+to DeepSeek-V4.1 on A3; it does not change the general installation matrix above.
+
+To build the [CANN 9.2.0 operator bundle](https://github.com/sgl-project/sgl-kernel-npu/blob/9503fb118bf919bc35be1756b2f713587fc2f272/third_party/profiles/cann-9.2.0/ops_transformer.json),
+start from a fresh checkout of that kernel revision on A3 with CANN 9.2.0 and
+its environment loaded. The [CompressorV2 component tests](https://github.com/sgl-project/sgl-kernel-npu/pull/958)
+used Python 3.12.15 and torch/torch-npu 2.13.0. From the kernel repository root, run:
+
+```bash
+python3 setup.py --arch-version 2201 --ops all --artifact wheel --third-party ops_transformer -j8
+python3 -m pip install --no-deps --force-reinstall output/sgl_kernel_npu-*.whl
+```
+
+If imports succeed but a native operator is missing or has the wrong signature,
+test the installed wheel on A3 before starting the server:
+
+```bash
+python3 -m pytest -rs --enable-perf=false tests/python/operators/attention/test_sparse_flash_mla.py \
+  tests/python/operators/indexer/test_lightning_indexer_v2.py \
+  tests/python/operators/attention/test_compressor_v2.py
+```
+
 ### Obtain CANN Image
 
 <Warning>
