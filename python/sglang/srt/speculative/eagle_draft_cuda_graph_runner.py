@@ -615,7 +615,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                         attention_variant=attention_variant,
                     ),
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=(
+                        forward_batch
+                        if getattr(self.backend, "uses_capture_batch", False)
+                        else None
+                    ),
                     post_warmup_hook=post_warmup_hook,
                 )
 
@@ -628,7 +632,17 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def execute(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch, *, batch=None):
+        if batch is not None:
+            worker = self.eagle_worker
+            chain = worker.draft_runtime.propose_chain(batch, forward_batch)
+            if chain is not None:
+                return (
+                    worker._topk1_parents_prealloc[:1],
+                    worker._topk1_score_indices_prealloc[:1],
+                    chain,
+                    None,
+                )
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers

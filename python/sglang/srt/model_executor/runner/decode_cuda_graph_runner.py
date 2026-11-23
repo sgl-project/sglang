@@ -1571,7 +1571,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=(
+                        forward_batch
+                        if getattr(self.backend, "uses_capture_batch", False)
+                        else None
+                    ),
                     post_warmup_hook=post_warmup_hook,
                 )
 
@@ -2138,6 +2142,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.attn_backend, forward_batch.forward_mode
             )
         with self.model_context(), timer_ctx, self.backend.replay_session():
+            if (
+                hasattr(self.backend, "try_target_graph")
+                and not self.ragged_verify_mode
+                and self.uocr_graph_io is None
+                and self._resolve_logits_variant(forward_batch) != VERIFY_VOCAB_SHARDS
+            ):
+                result = self.backend.try_target_graph(forward_batch, pp_proxy_tensors)
+                if result is not None:
+                    self.bs = forward_batch.batch_size
+                    return result
             if not self.backend.prepare_replay(forward_batch):
                 self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():

@@ -21,27 +21,7 @@ class DraftLoopIO:
     per_step_out_cache_loc: Any
 
 
-@dataclass(frozen=True)
-class DraftExtendIO:
-    forward_batch: Any
-    select_index: Any
-
-
-@dataclass(frozen=True)
-class DraftExtendOutput:
-    token_ids: Any
-    first_hidden_states: Any
-
-
-class DraftExecutor(Protocol):
-    """One invocation per admitted phase. Graph outputs may be borrowed."""
-
-    def covers(self, phase: Literal["decode", "extend"], batch: Any) -> bool: ...
-    def execute_decode(self, io: DraftLoopIO) -> Any: ...
-    def execute_extend(self, io: DraftExtendIO) -> DraftExtendOutput: ...
-
-
-class NpuBinding(DraftExecutor, Protocol):
+class NpuBinding(Protocol):
     role: str
     mode: str
     pd_decode: bool
@@ -49,12 +29,10 @@ class NpuBinding(DraftExecutor, Protocol):
     def hit(self, route: str) -> None: ...
 
     def build(self, model: Any) -> None: ...
-    def target_supported(self, batch: Any, embeds: Any, proxy: Any) -> bool: ...
-    def run_target(self, batch: Any) -> Any: ...
+    def graph_backend(self, runner: Any, enable_memory_saver: bool) -> Any: ...
     def supports_decode(
         self, batch: Any, forward_batch: Any, hot_token_id: Any
     ) -> bool: ...
-    def supports_extend(self, batch: Any, result: Any, hot_token_id: Any) -> bool: ...
 
 
 @dataclass(frozen=True)

@@ -20,15 +20,20 @@ across the group before invoking the binding's `build` method.
 
 Enable installation with `--enable-npu-megakernel`. The target binding votes across TP ranks before entering a collective, computes decode or verify logits and returns outputs owned by SGLang.
 
-## EAGLE lifecycle
+## Graph and draft lifecycle
 
-1. After weights, pools and attention backends are ready, `init_eagle_draft_runtime` selects the NextN strategy on the draft worker. Bootstrap and the native mode use the ordinary EAGLE implementation.
-2. After verify, `plan_fused_extend` checks model eligibility, executor coverage and outstanding ownership across TP ranks before metadata preparation or speculative writes. An admitted extend selects row `accept_lens - 1`. The host copies the borrowed tokens and selected hidden state and publishes the candidate chain on the request.
-3. At the next draft, `propose_chain` consumes that chain once, validating the request generation, slot and position. Retraction invalidates both a published chain and a decode-side transfer receipt, even if the allocator reuses the same slot. In decode-loop mode the strategy takes the independent extend seed and local write slots and calls the suffix executor once. Both paths feed the existing EAGLE verify input. Verification, target sampling, bonus and request cleanup remain SGLang operations.
-4. An executor returns the complete linear candidate tensor of shape `[batch, N]`. Column zero in decode-loop mode is the seed. Failure after dispatch propagates to the worker.
+An enabled binding can return a phase-specific NPU backend from
+`graph_backend(runner, enable_memory_saver)`. Returning None keeps the platform
+backend. No discovery or device import occurs here on other platforms.
+The provider may opt in to receiving the capture batch with `uses_capture_batch`.
+A runner can then build both a native fallback graph and a separate MK artifact
+on the actual KV pool. Do not nest a BlockRT capture inside a device graph.
 
-## Graph runner integration
-
-Today the external executor owns capture, replay, cache eviction and static input addresses. SGLang prefill/decode graph backends are disabled for this provider configuration. A runner can install phase-specific executors once at worker startup using `NpuEagleDraftRuntime.bind_executors(decode=..., extend=...)`. Both implement `DraftExecutor`: `covers(phase, batch)` is a local, side-effect-free capability query; `execute_decode(DraftLoopIO)` and `execute_extend(DraftExtendIO)` receive inputs after TP admission. The executor deals only with this round. EAGLE owns the cross-round chain and the lifetime of borrowed results.
-
-A future SGLang graph backend still needs platform registration, capture/bucket selection and a source of stable bindings. Its setup can select the target binding and install its EAGLE executors before serving; all ranks must choose the same owner. Change the provider's graph-ownership gate when that backend is available. Do not nest a BlockRT capture inside a host graph capture.
+The normal runner's graph eligibility check still applies. Before native target
+replay the optional backend may return owned decode/verify logits or decline.
+Draft extend and prefill always retain their original metadata and forward.
+Only draft decode may fuse: after independent extend, the graph runner asks the
+strategy to admit the seed, PD transfer generation and physical slots across TP.
+A single replay returns the seed plus N−1 recurrent tokens. It is copied before
+reuse and handed to the ordinary verify path. There is no cross-round chain.
+Decline before writing; do not retry a different forward after execution.
