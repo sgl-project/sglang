@@ -61,9 +61,7 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
         ]
         env = os.environ.copy()
         env.update(DEEPSEEK_V4_BF16_ENVS)
-        env["PYTORCH_NPU_ALLOC_CONF"] = (
-            "expandable_segments:True,pin_memory_expandable_segments:True"
-        )
+        env["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
         _, host, port = DEFAULT_URL_FOR_TEST.split(":")
         server_command = [
             "python3",
@@ -89,7 +87,8 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
             "--enable-dp-lm-head",
             "--kv-cache-dtype",
             "auto",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--enable-return-indexer-topk",
             "--json-model-override-args",
             '{"num_hidden_layers": 6, "compress_ratios": [0, 0, 4, 128, 4, 128], "quantization_config": null}',

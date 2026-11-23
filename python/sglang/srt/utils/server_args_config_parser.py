@@ -38,47 +38,40 @@ def _is_boolean_flag(action: argparse.Action) -> bool:
     )
 
 
+def _is_removed_flag(action: argparse.Action) -> bool:
+    from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
+
+    return isinstance(action, DeprecatedAction) and action.error_message is not None
+
+
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(
-        self,
-        parser: argparse.ArgumentParser = None,
-        boolean_actions: List[str] = None,
-    ):
-        """Initialize with list of store_true action names."""
+    def __init__(self, parser: argparse.ArgumentParser):
         # NOTE: Only boolean flags, store and other single-value actions are supported.
-        if parser is not None:
-            self.parser = parser
-            self.store_true_actions = [
-                key
-                for action in parser._actions
-                if _is_boolean_flag(action)
-                for key in _config_keys(action)
-            ]
-            supported = [
-                a for a in parser._actions if _is_boolean_flag(a) or _takes_one_value(a)
-            ]
-            supported_keys = {key for a in supported for key in _config_keys(a)}
-            self.unsupported_actions = {
-                key: a
-                for a in parser._actions
-                if a.option_strings
-                and a not in supported
-                and "--config" not in a.option_strings
-                and "--help" not in a.option_strings
-                and "-h" not in a.option_strings
-                for key in _config_keys(a)
-                # a key a supported flag also reads, e.g. a shared dest, stays usable
-                if key not in supported_keys
-            }
-        elif boolean_actions is not None:
-            # Legacy interface for compatibility
-            self.store_true_actions = boolean_actions
-            self.unsupported_actions = {}
-        else:
-            self.store_true_actions = []
-            self.unsupported_actions = {}
+        self.parser = parser
+        self.store_true_actions = [
+            key
+            for action in parser._actions
+            if _is_boolean_flag(action)
+            for key in _config_keys(action)
+        ]
+        supported = [
+            a for a in parser._actions if _is_boolean_flag(a) or _takes_one_value(a)
+        ]
+        supported_keys = {key for a in supported for key in _config_keys(a)}
+        self.unsupported_actions = {
+            key: a
+            for a in parser._actions
+            if a.option_strings
+            and a not in supported
+            and "--config" not in a.option_strings
+            and "--help" not in a.option_strings
+            and "-h" not in a.option_strings
+            for key in _config_keys(a)
+            # a key a supported flag also reads, e.g. a shared dest, stays usable
+            if key not in supported_keys
+        }
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """
@@ -177,6 +170,9 @@ class ConfigArgumentMerger:
             key_norm = key.replace("-", "_")
             if key_norm in self.unsupported_actions:
                 action = self.unsupported_actions[key_norm]
+                if _is_removed_flag(action):
+                    # Say what to use instead, as the command line does.
+                    raise ValueError(action.error_message)
                 msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
                 raise ValueError(msg)
             if isinstance(value, bool):
