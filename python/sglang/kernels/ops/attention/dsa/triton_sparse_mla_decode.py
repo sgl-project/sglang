@@ -304,19 +304,3 @@ def triton_sparse_mla_decode_splitk(
         num_warps=4,
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
-
-
-# ---------------------------------------------------------------------------
-# Convenience: auto-select best variant
-# ---------------------------------------------------------------------------
-
-
-def triton_sparse_mla_decode(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    d_v: int = 512,
-) -> torch.Tensor:
-    return triton_sparse_mla_decode_splitk(q_nope, q_rope, kv, indices, sm_scale, d_v)

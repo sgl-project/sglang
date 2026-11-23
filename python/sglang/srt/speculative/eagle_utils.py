@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from contextlib import contextmanager
@@ -25,7 +26,11 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.srt.layers.sampling_renorm import (
+    min_p_renorm_prob,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+)
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -48,6 +53,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -57,7 +63,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.core import WatermarkState
+    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -157,6 +163,105 @@ def _eagle_prefill_tail_tokens(
                 tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
+
+
+# Measured on H200 with GLM-5.3-Flash: the KV-only pass is one more eager draft forward,
+# a fixed CPU cost that batches of at most this many KV-only tokens did not win back.
+_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS = 4096
+
+
+def should_split_prefill_draft_extend(
+    batch: ScheduleBatch,
+    *,
+    mm_input_embeds: Optional[torch.Tensor],
+    draft_prefill_graph_max_tokens: int,
+    target_prefill_graph_max_tokens: int,
+) -> bool:
+    """Whether the draft extend after this prefill runs as a KV-only pass over
+    every request's tokens but its last, plus a pass over the last tokens."""
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    return (
+        batch.forward_mode == ForwardMode.EXTEND
+        and batch.input_embeds is None
+        and batch.replace_embeds is None
+        and batch.tbo_split_seq_index is None
+        # The KV-only pass embeds token ids, which do not cover image tokens.
+        and (
+            mm_input_embeds is not None
+            or all(req.multimodal_inputs is None for req in batch.reqs)
+        )
+        # The KV-only batch would get an empty extend, which the kpool planner rejects.
+        and min(batch.extend_lens) > 1
+        # DSA attends to requests no longer than this densely, which costs little to skip;
+        # the last-token pass would also read their prefixes back from the cache.
+        and batch.seq_lens_cpu.max().item()
+        > envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+        # A captured draft prefill graph replays the full layer for batches it fits.
+        and batch.extend_num_tokens - len(batch.extend_lens)
+        > max(_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS, draft_prefill_graph_max_tokens)
+        # 0 = the target captured no prefill graph. A batch above that bound can
+        # replay none of them, and splitting those measured slower on B300.
+        and (
+            target_prefill_graph_max_tokens == 0
+            or batch.extend_num_tokens <= target_prefill_graph_max_tokens
+        )
+    )
+
+
+def split_prefill_draft_extend(
+    batch: ScheduleBatch, *, tail_tokens: torch.Tensor
+) -> Tuple[ScheduleBatch, ScheduleBatch, torch.Tensor, torch.Tensor]:
+    """Split the prefill's draft extend into a batch of every request's tokens but
+    its last and a batch of the last tokens; also return the prefill rows of each."""
+    extend_lens = batch.extend_lens
+    bs = len(extend_lens)
+    last_rows = torch.tensor(extend_lens, dtype=torch.int64).cumsum(0) - 1
+    keep = torch.ones(batch.extend_num_tokens, dtype=torch.bool)
+    keep[last_rows] = False
+    kv_rows = keep.nonzero().squeeze(1)
+
+    device = batch.input_ids.device
+    if is_pin_memory_available(device):
+        kv_rows, last_rows = kv_rows.pin_memory(), last_rows.pin_memory()
+    kv_rows = kv_rows.to(device, non_blocking=True)
+    last_rows = last_rows.to(device, non_blocking=True)
+
+    # The draft input at a prompt row is the next prompt token.
+    kv_batch = copy.copy(batch)
+    kv_batch.input_ids = batch.input_ids[kv_rows + 1]
+    kv_batch.out_cache_loc = batch.out_cache_loc[kv_rows]
+    kv_batch.extend_lens = [n - 1 for n in extend_lens]
+    kv_batch.extend_num_tokens = batch.extend_num_tokens - bs
+    kv_batch.seq_lens = batch.seq_lens - 1
+    kv_batch.seq_lens_cpu = batch.seq_lens_cpu - 1
+    kv_batch.seq_lens_sum = (
+        batch.seq_lens_sum - bs if batch.seq_lens_sum is not None else None
+    )
+
+    last_batch = copy.copy(batch)
+    last_batch.input_ids = tail_tokens
+    last_batch.out_cache_loc = batch.out_cache_loc[last_rows]
+    last_batch.prefix_lens = [
+        p + n - 1 for p, n in zip(batch.prefix_lens, extend_lens, strict=True)
+    ]
+    last_batch.extend_lens = [1] * bs
+    last_batch.extend_num_tokens = bs
+
+    for sub_batch in (kv_batch, last_batch):
+        # The draft never returns logprobs; the per-token logprob inputs
+        # describe the full prefill rows.
+        sub_batch.return_logprob = False
+        sub_batch.extend_input_logprob_token_ids = None
+        # With MLP sync but no attention DP, each list holds this rank's token
+        # count; a pass padded to the whole prefill would compute all its rows.
+        if batch.global_num_tokens is not None:
+            sub_batch.global_num_tokens = [sub_batch.extend_num_tokens]
+            sub_batch.global_num_tokens_for_logprob = [bs]
+        if batch.draft_global_num_tokens is not None:
+            sub_batch.draft_global_num_tokens = [sub_batch.extend_num_tokens]
+            sub_batch.draft_global_num_tokens_for_logprob = [bs]
+    return kv_batch, last_batch, kv_rows, last_rows
 
 
 def organize_draft_results(
@@ -402,6 +507,12 @@ def eagle_prepare_for_verify(
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
+        # Host upper bound of this batch's final KV lengths: bounds the
+        # backend's replay page-table copies in mirrorless mode without a D2H sync.
+        batch.max_seq_len_host = (
+            max((req.seqlen for req in batch.reqs), default=0)
+            + verify_input.draft_token_num
+        )
         batch.input_ids = verify_input.draft_token
         maybe_detect_oob(
             batch.input_ids,
@@ -712,6 +823,7 @@ def _sharded_sampling_applies(
     batch: ScheduleBatch,
     grammar_mask: Optional[GrammarMask],
     watermark: bool,
+    has_custom_logit_processor: bool,
     has_local_keys: bool = False,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
@@ -721,13 +833,18 @@ def _sharded_sampling_applies(
     gathered path before sampling. Anything that reads or edits full logits also
     stays on the stock gathered path.
     """
+    info = batch.sampling_info
     return (
         _is_cuda
         and verify_input.tree_topk == 1
-        and grammar_mask is None
-        and not watermark
         and sampling_allows_vocab_shards(
-            batch.sampling_info,
+            info,
+            # Not adjusts_logits: info may be the provider's VerifySamplingView.
+            adjusts_logits=grammar_mask is not None
+            or watermark
+            or has_custom_logit_processor
+            or info.step_penalties is not None
+            or info.logit_bias is not None,
             return_logprob=batch.return_logprob,
             has_local_keys=has_local_keys,
         )
@@ -742,12 +859,12 @@ def eagle_sample(
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
     *,
-    watermark_state: Optional[WatermarkState] = None,
-    watermark_full_mask: bool = True,
+    watermark: Optional[VerifyWatermark] = None,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
+    has_custom_logit_processor: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -758,19 +875,8 @@ def eagle_sample(
     injected acceptance's bonus is the target argmax on the compact top-k branch
     too, as on the dense one.
     """
-    from sglang.srt.layers.dp_attention import (
-        is_dp_attention_enabled,
-    )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
-    from sglang.srt.speculative.spec_utils import (
-        SIMULATE_ACC_LEN,
-        SIMULATE_ACC_TOKEN_MODE,
-        generate_simulated_accept_index,
-        generate_simulated_accept_index_device,
-    )
+    from sglang.srt.speculative.target_verify import adjust_verify_logits
     from sglang.srt.utils.async_probe import sanitize_nan_logits
 
     device = batch.device
@@ -791,8 +897,8 @@ def eagle_sample(
         verify_input=verify_input,
         batch=batch,
         grammar_mask=grammar_mask,
-        watermark=watermark_state is not None
-        and sampling_info.has_watermark_candidates,
+        watermark=watermark is not None,
+        has_custom_logit_processor=has_custom_logit_processor,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -803,75 +909,76 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
-
-    # Apply grammar mask if provided
-    if grammar_mask is not None:
-        grammar_mask.apply(next_token_logits)
-
-    watermark_context_hashes = None
-    watermark_selected = None
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        if batch.return_logprob:
-            # compute_spec_logprobs reads logits_output after verify.
-            next_token_logits = next_token_logits.clone()
-        if next_token_logits.is_cuda:
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative_from_tree(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    draft_tokens=verify_input.draft_token,
-                    custom_mask=verify_input.custom_mask,
-                    positions=verify_input.positions,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                    full_mask=watermark_full_mask,
-                )
-            )
-        else:
-            contexts, context_lengths = watermark_state.speculative_contexts(
-                req_pool_indices=batch.req_pool_indices,
-                draft_tokens=verify_input.draft_token,
-                custom_mask=verify_input.custom_mask,
-                positions=verify_input.positions,
-                draft_token_num=verify_input.draft_token_num,
-                full_mask=watermark_full_mask,
-                context_windows=watermark_state.context_windows(sampling_info),
-            )
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    contexts=contexts,
-                    context_lengths=context_lengths,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                )
-            )
-
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+    adjust_verify_logits(
+        next_token_logits,
+        sampling_info=sampling_info,
+        grammar_mask=grammar_mask,
+        draft_tokens=candidates,
+        next_child=verify_input.retrieve_next_token,
+        next_sibling=verify_input.retrieve_next_sibling,
+        has_custom_logit_processor=has_custom_logit_processor,
+    )
+    if watermark is not None:
+        next_token_logits, sampling_info = watermark.apply(
+            next_token_logits,
+            sampling_info=sampling_info,
+            req_pool_indices=batch.req_pool_indices,
+            draft_tokens=verify_input.draft_token,
+            positions=verify_input.positions,
+            draft_token_num=verify_input.draft_token_num,
+            custom_mask=verify_input.custom_mask,
+            # compute_spec_logprobs reads logits_output after verify.
+            keep_logits=batch.return_logprob,
+        )
+
+    return _tree_accept(
+        verify_input=verify_input,
+        batch=batch,
+        logits_output=logits_output,
+        next_token_logits=next_token_logits,
+        vocab_shard=vocab_shard,
+        sampling_info=sampling_info,
+        candidates=candidates,
+        uno_target_max_top_k=uno_target_max_top_k,
+        watermark=watermark is not None,
+        simulated_acc_len=simulated_acc_len,
+        simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
+        local_keys=local_keys,
+    )
+
+
+def _tree_accept(
+    *,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
+    next_token_logits: torch.Tensor,
+    vocab_shard: Optional[VocabShard],
+    sampling_info: SamplingBatchInfo,
+    candidates: torch.Tensor,
+    uno_target_max_top_k: Optional[int],
+    watermark: bool,
+    simulated_acc_len: Optional[torch.Tensor],
+    simulated_acc_len_rng: Optional[torch.Generator],
+    sparse_bonus_argmax: bool,
+    local_keys: Optional[LocalKeysFn],
+):
+    """A gather it still needs is published to ``logits_output``."""
+    from sglang.srt.layers.dp_attention import (
+        is_dp_attention_enabled,
+    )
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+        generate_simulated_accept_index,
+        generate_simulated_accept_index_device,
+    )
+
+    device = batch.device
+    bs = len(batch.seq_lens)
     predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     greedy = _verify_uses_greedy(
@@ -917,8 +1024,7 @@ def eagle_sample(
         simulated_acc_len=simulated_acc_len,
         simulate_acc_len=SIMULATE_ACC_LEN,
         simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-        watermark=watermark_state is not None
-        and sampling_info.has_watermark_candidates,
+        watermark=watermark,
     )
     fused_verify = chain and (greedy or sparse or vocab_shard is not None)
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
@@ -1077,6 +1183,13 @@ def eagle_sample(
             top_k_renorm_prob,
             top_p_renorm_prob,
         )
+        if sampling_info.need_min_p_sampling:
+            target_probs = min_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.min_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -1225,14 +1338,6 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        watermark_state.record_speculative(
-            batch.req_pool_indices,
-            watermark_context_hashes,
-            watermark_selected,
-            accept_index,
-            accept_lens,
-        )
     return predict, accept_lens, accept_index
 
 
@@ -1323,11 +1428,6 @@ def _verify_outputs(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
