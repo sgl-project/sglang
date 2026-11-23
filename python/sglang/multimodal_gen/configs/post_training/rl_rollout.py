@@ -53,20 +53,10 @@ class RLRolloutArgs:
     rollout_return_generated_output: bool = True
 
     def validate(self) -> None:
-        noise = self.rollout_noise_level
-        if isinstance(noise, bool) or not isinstance(noise, (int, float)):
-            raise ValueError(f"rollout_noise_level must be a number, got {noise!r}")
-        if not math.isfinite(float(noise)):
-            raise ValueError(f"rollout_noise_level must be finite, got {noise!r}")
-        if float(noise) < 0.0:
-            raise ValueError(f"rollout_noise_level must be non-negative, got {noise!r}")
-
-        if self.rollout_sde_type not in _VALID_ROLLOUT_SDE_TYPES:
-            raise ValueError(
-                f"rollout_sde_type must be one of {_VALID_ROLLOUT_SDE_TYPES}, "
-                f"got {self.rollout_sde_type!r}"
-            )
-
+        _validate_sde_kernel_values(
+            where="Top level",
+            values={name: getattr(self, name) for name in _STREAM_SDE_KERNEL_FIELDS},
+        )
         self._validate_extra_streams()
         self._validate_extra_stream_sde_args()
 
@@ -120,7 +110,7 @@ class RLRolloutArgs:
                     f"The override of stream {stream!r} sets {unknown}; an override may "
                     f"set only {list(_STREAM_SDE_KERNEL_FIELDS)}"
                 )
-            _validate_override_values(stream=stream, override=override)
+            _validate_sde_kernel_values(where=f"Stream {stream!r}", values=override)
         for stream in self.rollout_extra_streams:
             _validate_stream_sde_kernel(
                 stream=stream,
@@ -228,17 +218,21 @@ class RLRolloutArgs:
         )
 
 
-def _validate_override_values(*, stream: str, override: dict[str, Any]) -> None:
-    # Unlike the top-level fields, override values reach here as sent: no coercion.
-    if "rollout_sde_type" in override and (
-        override["rollout_sde_type"] not in _VALID_ROLLOUT_SDE_TYPES
+def _validate_sde_kernel_values(*, where: str, values: dict[str, Any]) -> None:
+    """Check the type and range of each SDE kernel field in ``values``.
+
+    Shared by the top-level fields and each extra stream's override; an override reaches
+    here as sent, with no coercion, so the types are checked too.
+    """
+    if "rollout_sde_type" in values and (
+        values["rollout_sde_type"] not in _VALID_ROLLOUT_SDE_TYPES
     ):
         raise ValueError(
-            f"Stream {stream!r}: rollout_sde_type must be one of "
-            f"{_VALID_ROLLOUT_SDE_TYPES}, got {override['rollout_sde_type']!r}"
+            f"{where}: rollout_sde_type must be one of "
+            f"{_VALID_ROLLOUT_SDE_TYPES}, got {values['rollout_sde_type']!r}"
         )
-    if "rollout_noise_level" in override:
-        noise = override["rollout_noise_level"]
+    if "rollout_noise_level" in values:
+        noise = values["rollout_noise_level"]
         if (
             isinstance(noise, bool)
             or not isinstance(noise, (int, float))
@@ -246,15 +240,15 @@ def _validate_override_values(*, stream: str, override: dict[str, Any]) -> None:
             or noise < 0
         ):
             raise ValueError(
-                f"Stream {stream!r}: rollout_noise_level must be a finite "
+                f"{where}: rollout_noise_level must be a finite "
                 f"non-negative number, got {noise!r}"
             )
-    if "rollout_log_prob_no_const" in override and not isinstance(
-        override["rollout_log_prob_no_const"], bool
+    if "rollout_log_prob_no_const" in values and not isinstance(
+        values["rollout_log_prob_no_const"], bool
     ):
         raise ValueError(
-            f"Stream {stream!r}: rollout_log_prob_no_const must be a bool, "
-            f"got {override['rollout_log_prob_no_const']!r}"
+            f"{where}: rollout_log_prob_no_const must be a bool, "
+            f"got {values['rollout_log_prob_no_const']!r}"
         )
 
 
