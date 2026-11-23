@@ -174,11 +174,9 @@ class FlyDSLGDNKernel(TritonGDNKernel):
             self._ssm_cache_indices = torch.where(
                 cache_indices >= 0, cache_indices, 0
             ).to(torch.int32)
-        # q/k are strided torch.split views when the fused QKV split is skipped;
-        # AITER's l2norm and K5 need contiguous rows.
         output, h = self._prefill_fn(
-            q.contiguous(),
-            k.contiguous(),
+            q,
+            k,
             v,
             g,
             beta,
