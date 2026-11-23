@@ -2183,7 +2183,6 @@ class MoriKVManager(CommonKVManager):
             dcp_rank,
             packed_state_layer_ids,
             packed_kv_layer_ids,
-            # Always sent, empty unless exchange_aux_item_lens.
             (
                 struct.pack(
                     f"<{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens

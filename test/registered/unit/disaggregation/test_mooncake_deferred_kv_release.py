@@ -246,8 +246,6 @@ class TestMooncakeAbortNotification(
 
 class TestMooncakeAuxLayout(CustomTestCase):
     def test_decode_fails_the_room_of_a_dropped_aux_item(self):
-        """An aux item longer than its buffer's rows is dropped, so the row stays
-        unwritten: the room must fail, whether Success comes after or before."""
         rows = (ctypes.c_ubyte * 16)()
         manager = MooncakeKVManager.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(
