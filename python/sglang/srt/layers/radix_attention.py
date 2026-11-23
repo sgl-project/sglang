@@ -76,6 +76,12 @@ class RadixAttention(nn.Module):
         use_irope: bool = False,
         prefix: str = "",
         use_prefill_attention_wrapper: bool = True,
+        graph_layer_id: Optional[int] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        num_splits: Optional[int] = None,
+        pack_gqa: Optional[bool] = None,
+        window_anchor_at_start: bool = False,
+        strided_lse: bool = False,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -85,7 +91,13 @@ class RadixAttention(nn.Module):
         self.qk_head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
+        self.out_dtype = out_dtype
+        self.num_splits = num_splits
+        self.pack_gqa = pack_gqa
+        self.window_anchor_at_start = window_anchor_at_start
+        self.strided_lse = strided_lse
         self.layer_id = layer_id
+        self._graph_layer_id = graph_layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
@@ -110,6 +122,11 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+
+    @property
+    def graph_layer_id(self) -> int:
+        # Shared KV cache does not make two decoder layers the same graph layer.
+        return self.layer_id if self._graph_layer_id is None else self._graph_layer_id
 
     def forward(
         self,

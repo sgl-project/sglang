@@ -20,7 +20,6 @@ from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import resolve_image_processor_backend
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
@@ -72,9 +71,9 @@ def _convert(data):
         return data
     elif isinstance(data, np.ndarray):
         return torch.tensor(data)
-    elif isinstance(data, list) and isinstance(data[0], np.ndarray):
+    elif isinstance(data, list) and data and isinstance(data[0], np.ndarray):
         return torch.tensor(np.array(data))
-    elif isinstance(data, list) and isinstance(data[0], (int, float)):
+    elif isinstance(data, list) and data and isinstance(data[0], (int, float)):
         return torch.tensor(data)
     else:
         return data
@@ -139,8 +138,7 @@ class EncoderPreprocessor:
 
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
-            use_image_processor_gpu
-            and resolve_image_processor_backend(get_mm()) != "pil"
+            use_image_processor_gpu and get_mm().image_processor_backend != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -171,7 +169,7 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
-        image_processor_backend = resolve_image_processor_backend(get_mm())
+        image_processor_backend = get_mm().image_processor_backend
         image_processor_kwargs = (
             {}
             if image_processor_backend == "auto"
@@ -371,9 +369,11 @@ class EncoderPreprocessor:
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only
             # MMError carries.
-            raise BadRequestError(f"Error while loading data {data}: {e}") from e
+            raise BadRequestError(
+                f"Error while loading data {str(data)[:128]}: {e}"
+            ) from e
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            raise RuntimeError(f"Error while loading data {str(data)[:128]}: {e}")
 
     def _submit_data_loading_tasks(self, items, modalities):
         futures = []
@@ -935,6 +935,9 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
+        if self.model_type == "inkling2" and modality == Modality.IMAGE:
+            # One Inkling2 image token per 40-pixel cell of the (1, rows, cols) grid.
+            return int(grid[0] * grid[1] * grid[2])
         if self.model_type == "muse_spark":
             # Muse's hook returns output grids, after spatial/temporal merging.
             return (

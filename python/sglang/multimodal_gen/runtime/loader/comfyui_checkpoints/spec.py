@@ -83,7 +83,11 @@ class ComfyUICheckpointSpec:
 _ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "convrot_int8"})
 
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
-_SPECS_DISCOVERED = False
+
+
+# Per-layer comfy_quant formats verified on the H3 single-file path: Comfy-Org's
+# int8_convrot and fp8_scaled files. Their w6a8_int8 file has no SGLD kernel.
+_H3_SERIALIZED_FORMATS = frozenset({"int8_tensorwise", "float8_e4m3fn"})
 
 
 def register_comfyui_checkpoint(
@@ -92,27 +96,11 @@ def register_comfyui_checkpoint(
     _SPEC_REGISTRY[pipeline_name] = spec
 
 
-def _discover_checkpoint_specs() -> None:
-    global _SPECS_DISCOVERED
-    if _SPECS_DISCOVERED:
-        return
-    _SPECS_DISCOVERED = True
-    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
-        flux,
-        minimax_h3,
-        qwen_image,
-        qwen_image21,
-        zimage,
-    )
-
-
 def get_comfyui_checkpoint_spec(pipeline_name: str) -> ComfyUICheckpointSpec | None:
-    _discover_checkpoint_specs()
     return _SPEC_REGISTRY.get(pipeline_name)
 
 
 def get_registered_comfyui_pipeline_names() -> list[str]:
-    _discover_checkpoint_specs()
     return sorted(_SPEC_REGISTRY)
 
 
@@ -400,12 +388,14 @@ def load_comfyui_transformer(
                     [model_path]
                 )
             if layer_markers:
-                if not spec.quant_markers and any(
-                    marker.get("format") != "int8_tensorwise"
-                    for marker in layer_markers.values()
-                ):
+                unsupported = {
+                    str(marker.get("format")) for marker in layer_markers.values()
+                } - _H3_SERIALIZED_FORMATS
+                if not spec.quant_markers and unsupported:
                     raise ValueError(
-                        "ComfyUI H3 integrated mode currently supports serialized INT8 ConvRot quantization"
+                        "ComfyUI H3 integrated mode supports serialized "
+                        f"{', '.join(sorted(_H3_SERIALIZED_FORMATS))} layers, not "
+                        f"{', '.join(sorted(unsupported))}"
                     )
                 if (
                     server_args.quantization is not None

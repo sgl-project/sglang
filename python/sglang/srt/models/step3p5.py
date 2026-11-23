@@ -189,6 +189,7 @@ class Step3p5MoEMLP(nn.Module):
 
         if (
             not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(hidden_states, shared_output)
@@ -490,6 +491,7 @@ class Step3p5DecoderLayer(nn.Module):
                 **(
                     dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_nixl()
                     or get_moe_a2a_backend().is_mori()

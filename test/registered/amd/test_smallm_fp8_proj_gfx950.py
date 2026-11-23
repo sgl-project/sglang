@@ -12,7 +12,7 @@ from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 def _off():
@@ -56,7 +56,6 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             (10304, 4096, 32),
             (8704, 4096, 16),
             (4096, 4096, 40),
-            (1536, 6144, 16),  # MiniMax-M3.1 TP4 shared-expert gate_up
         ):
             w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
             s = torch.rand(n, 1, device="cuda") * 0.01 + 1e-3

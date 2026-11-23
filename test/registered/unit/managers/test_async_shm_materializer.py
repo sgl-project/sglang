@@ -249,14 +249,13 @@ class AsyncShmMaterializerTest(CustomTestCase):
         limit_reached = UocrRequestReceiver.recv_limit_reached
         receiver = UocrRequestReceiver(
             recv_from_tokenizer=None,
-            recv_from_rpc=None,
             recv_skipper=None,
             input_blocker=None,
             mm_receiver=None,
             server_args=None,
             model_config=None,
             max_recv_per_poll=-1,
-            stream_output=Mock(),
+            request_retirer=Mock(),
             get_last_batch=lambda: None,
             rust_server_mode=False,
             async_shm_materializer=coordinator,

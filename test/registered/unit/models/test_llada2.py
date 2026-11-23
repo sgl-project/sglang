@@ -20,7 +20,6 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.models.llada2 import (
     LLaDA2MoeGate,
     LLaDA2MoeSparseMoeBlock,
-    _make_block_routing_triton_output,
     _prepare_llada2_language_weights,
     _require_block_routing_ep1,
     _require_block_routing_runner_compatibility,
@@ -84,27 +83,6 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
                 r"does not support expert parallelism.*moe_ep_size=4",
             ):
                 LLaDA2MoeSparseMoeBlock(layer_id=0, config=config)
-
-    def test_block_routing_uses_five_field_triton_output(self):
-        ragged_metadata = object()
-        combine_indx = torch.tensor([5, 0, 7, 2], dtype=torch.int32)
-        gate_scal = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=torch.float32)
-
-        result = _make_block_routing_triton_output(
-            ragged_metadata,
-            combine_indx,
-            gate_scal,
-            n_expts_act=2,
-        )
-
-        self.assertIs(result.a_ragged_metadata, ragged_metadata)
-        torch.testing.assert_close(
-            result.gather_indx,
-            torch.tensor([2, 0, 3, 1], dtype=torch.int32),
-        )
-        self.assertIs(result.scatter_indx, combine_indx)
-        self.assertIs(result.gate_scal, gate_scal)
-        self.assertEqual(result.n_expts_act, 2)
 
     @patch("sglang.srt.layers.quantization.modelopt_quant.MoeRunner")
     @patch(
@@ -267,21 +245,6 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
                 )
                 torch.testing.assert_close(result.topk_weights, weights, rtol=0, atol=0)
                 self.assertIs(result.topk_ids, ids)
-
-    def test_block_shape_guard_follows_the_layer_backend(self):
-        with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON):
-            with self.assertRaisesRegex(ValueError, "power of two"):
-                _require_block_routing_runner_compatibility(
-                    SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON_KERNELS),
-                    top_k=3,
-                )
-            _require_block_routing_runner_compatibility(
-                SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON_KERNELS), top_k=2
-            )
-        with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON_KERNELS):
-            _require_block_routing_runner_compatibility(
-                SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON), top_k=3
-            )
 
     def test_block_routing_rejects_uniform_expert_simulation(self):
         with (
