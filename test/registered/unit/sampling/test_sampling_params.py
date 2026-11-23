@@ -674,6 +674,17 @@ class TestSamplingParamsNormalize(CustomTestCase):
         self.assertEqual(sampling_params.trace_decode_token_ids, [7, 8])
         self.assertEqual(sampling_params.max_new_tokens, 2)
 
+        # Longer than the default max_new_tokens=128 must still replay in full.
+        long_trace = [7] * 200
+        long_params = SamplingParams(
+            trace_decode_token_ids=long_trace, max_new_tokens=16
+        )
+        long_params.normalize(tokenizer=None)
+        long_params.normalize_trace_decode_token_ids(
+            prompt_len=1, context_len=256, vocab_size=32000
+        )
+        self.assertEqual(long_params.max_new_tokens, 200)
+
     def test_trace_decode_token_ids_rejects_sampling_conflicts(self):
         conflict_cases = [
             {"custom_logit_processor": "processor"},

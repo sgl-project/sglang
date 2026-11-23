@@ -177,11 +177,7 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
             ));
         }
         let trace_len = i64::try_from(trace_decode_token_ids.len()).unwrap_or(i64::MAX);
-        g.sampling_params.max_new_tokens = Some(
-            g.sampling_params
-                .max_new_tokens
-                .map_or(trace_len, |max_new_tokens| max_new_tokens.min(trace_len)),
-        );
+        g.sampling_params.max_new_tokens = Some(trace_len);
         return Ok(());
     }
 

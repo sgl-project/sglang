@@ -49,7 +49,7 @@ print("output_token_logprobs:", result["meta_info"]["output_token_logprobs"])
 
 ## Behavior and Logprob Semantics
 
-- **Length and truncation**: the trace is truncated to the remaining context capacity (`context_len - prompt_len - reserved_tokens`). If no tokens remain after truncation, the request is rejected. If `max_new_tokens` is omitted, it defaults to the truncated trace length; if provided, it is capped to `min(max_new_tokens, trace_len)`.
+- **Length and truncation**: the trace is truncated to the remaining context capacity (`context_len - prompt_len - reserved_tokens`). If no tokens remain after truncation, the request is rejected. `max_new_tokens` is automatically overridden to match the truncated trace length.
 - **Stop conditions**: `ignore_eos` is forced to `True`, `min_new_tokens` is set to `0`, and `stop`, `stop_regex`, and `stop_token_ids` are cleared so generation follows the trace sequence to completion.
 - **Logprob mode alignment**:
   - With default `SGLANG_RETURN_ORIGINAL_LOGPROB=0`, trace replay follows the exact same logprob calculation path as normal inference, so replaying a normal run at the same sampling temperature produces matching logprobs.

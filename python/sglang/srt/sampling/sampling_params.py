@@ -566,10 +566,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 "trace_decode_token_ids has no tokens remaining after "
                 "context-length truncation."
             )
-        if self.max_new_tokens is None:
-            self.max_new_tokens = trace_len
-        else:
-            self.max_new_tokens = min(self.max_new_tokens, trace_len)
+        self.max_new_tokens = trace_len
         self.min_new_tokens = 0
         self.ignore_eos = True
         self.stop = None

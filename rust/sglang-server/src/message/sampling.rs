@@ -422,10 +422,7 @@ impl SamplingParams {
 
         if let Some(trace_len) = self.trace_decode_token_ids.as_ref().map(Vec::len) {
             let trace_len = i64::try_from(trace_len).unwrap_or(i64::MAX);
-            self.max_new_tokens = Some(
-                self.max_new_tokens
-                    .map_or(trace_len, |max_new_tokens| max_new_tokens.min(trace_len)),
-            );
+            self.max_new_tokens = Some(trace_len);
             self.min_new_tokens = 0;
             self.ignore_eos = true;
             self.stop_token_ids = None;
