@@ -324,6 +324,17 @@ class TestUMBPStore(unittest.TestCase):
         store.clear()
         self.assertFalse(store.exists("test-model_clear_key_0_k"))
 
+    def test_spdk_guard_placeholder_matches_page_hash_width(self):
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        umbp_module = import_umbp_store_module()
+        self.assertEqual(
+            len(get_hash_str([1, 2, 3, 4])),
+            len(umbp_module._PAGE_HASH_PLACEHOLDER),
+            "SPDK key guard placeholder no longer matches the page hash width; "
+            "update _PAGE_HASH_PLACEHOLDER in umbp_store.py.",
+        )
+
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 

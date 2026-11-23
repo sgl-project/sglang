@@ -6,6 +6,7 @@ Follows the same pattern as MooncakeStore:
 - Key suffix generation per TP rank / PP rank
 """
 
+import hashlib
 import logging
 import os
 import socket
@@ -237,6 +238,13 @@ def _warn_extra_config_scope(extra: dict, distributed_enabled: bool) -> None:
                     "(master_address) and is ignored in standalone/local mode.",
                     key,
                 )
+
+
+# Stands in for a real page hash when sizing the SPDK key guard. Page keys are
+# SHA-256 hex, the same width as get_hash_str (cpp_utils/hash_binding.cpp,
+# kHexLen). If the page hash changes, update this and the guard together.
+# test_umbp_store.py checks this width against get_hash_str.
+_PAGE_HASH_PLACEHOLDER = hashlib.sha256(b"").hexdigest()
 
 
 class UMBPStore(HiCacheStorage):
@@ -967,7 +975,7 @@ class UMBPStore(HiCacheStorage):
             and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
             and not self._kv_anchor_is_logical
         ):
-            keys, _ = self._anchor_keys(["f" * 64])
+            keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
             self._check_spdk_key_budget(keys, "anchor")
 
         # ------------------------------------------------------------------
