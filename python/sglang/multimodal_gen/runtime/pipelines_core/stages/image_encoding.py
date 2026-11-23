@@ -465,7 +465,6 @@ class ImageEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify image encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check("image_embeds", batch.image_embeds, V.list_of_tensors_dims(3))
         return result
 
 
@@ -977,8 +976,6 @@ class ImageVAEEncodingStage(PipelineStage):
                 with autocast_context(vae_dtype, server_args.disable_autocast):
                     if server_args.pipeline_config.vae_tiling:
                         self.vae.enable_tiling()
-                    # if server_args.vae_sp:
-                    #     self.vae.enable_parallel()
                     should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
@@ -1143,7 +1140,4 @@ class ImageVAEEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check(
-        #     "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
-        # )
         return result
