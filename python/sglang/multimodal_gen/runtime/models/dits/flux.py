@@ -1097,7 +1097,7 @@ class FluxTransformerBlock(nn.Module):
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         # Attention.
-        attention_outputs = self.attn(
+        attn_output, context_attn_output = self.attn(
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
@@ -1105,11 +1105,6 @@ class FluxTransformerBlock(nn.Module):
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
-
-        if len(attention_outputs) == 2:
-            attn_output, context_attn_output = attention_outputs
-        elif len(attention_outputs) == 3:
-            attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
         hidden_states = residual_gate_add(
@@ -1130,8 +1125,6 @@ class FluxTransformerBlock(nn.Module):
             hidden_states, ff_output, gate_mlp.unsqueeze(1)
         )
 
-        if len(attention_outputs) == 3:
-            hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
         encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
@@ -1318,18 +1311,9 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             guidance (`torch.Tensor`):
                 Guidance embeddings.
             joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+                Internal attention metadata (such as `attn_mask_meta`) passed along to the attention layers.
 
         """
-        if (
-            joint_attention_kwargs is not None
-            and joint_attention_kwargs.get("scale", None) is not None
-        ):
-            logger.warning(
-                "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-            )
         hidden_states, _ = self.x_embedder(hidden_states)
 
         # Only pass guidance to time_text_embed if the model supports it
@@ -1392,16 +1376,6 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             else _rope_cos_sin_cache(singles_freqs_cis)
         )
         freqs_cis = hoisted_freqs_cis
-
-        if (
-            joint_attention_kwargs is not None
-            and "ip_adapter_image_embeds" in joint_attention_kwargs
-        ):
-            ip_adapter_image_embeds = joint_attention_kwargs.pop(
-                "ip_adapter_image_embeds"
-            )
-            ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
-            joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
         forward_batch = get_forward_context().forward_batch
         spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum

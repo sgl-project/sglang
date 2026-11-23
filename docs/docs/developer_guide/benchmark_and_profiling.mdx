@@ -411,7 +411,7 @@ python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1
 
 This command sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
 
-Additionally, if you want to locate the SGLang Python source code through the cuda kernel in Trace, you need to disable CUDA Graph when starting the service. This can be done by using the `--disable-cuda-graph` parameter in the command to start the service.
+Additionally, if you want to locate the SGLang Python source code through the cuda kernel in Trace, you need to disable CUDA Graph when starting the service. This can be done by using the `--disable-decode-cuda-graph --disable-prefill-cuda-graph` parameter in the command to start the service.
 
 ## Profile with Nsight
 
@@ -503,10 +503,10 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
      python -m sglang.launch_server \
        --model-path meta-llama/Llama-3.1-8B-Instruct \
        --enable-layerwise-nvtx-marker \
-       --disable-cuda-graph
+       --disable-decode-cuda-graph --disable-prefill-cuda-graph
    ```
 
-   Note: NVTX markers are not emitted for kernel launches captured by CUDA graphs. Use `--disable-cuda-graph` to ensure all layerwise NVTX markers are emitted in the trace.
+   Note: NVTX markers are not emitted for kernel launches captured by CUDA graphs. Use `--disable-decode-cuda-graph --disable-prefill-cuda-graph` to ensure all layerwise NVTX markers are emitted in the trace.
 
 2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity. It is an admin endpoint, hence the `SGLANG_ADMIN_API_KEY` above and the bearer header below:
 
@@ -546,11 +546,11 @@ For simpler use cases where you don't need fine-grained control over profiling s
 
 ```bash Command
 # Terminal 1: Start server with layerwise NVTX
-# Note: --disable-cuda-graph ensures all NVTX markers are emitted
+# Note: --disable-decode-cuda-graph --disable-prefill-cuda-graph ensures all NVTX markers are emitted
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --enable-layerwise-nvtx-marker \
-  --disable-cuda-graph
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph
 
 # Terminal 2: Profile the benchmarking client
 nsys profile --trace-fork-before-exec=true \

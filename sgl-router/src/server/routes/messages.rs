@@ -9,12 +9,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
+use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 
-use crate::discovery::ModelId;
 use crate::off_worker;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
@@ -22,17 +21,11 @@ use crate::protocol::anthropic::{
 use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::routes::chat::{
-    chat_completions, enforce_minimax_m31_thinking, MAX_CHAT_BODY_BYTES,
+use crate::server::routes::chat::{chat_completions, enforce_minimax_m31_thinking};
+use crate::server::routes::reply::{
+    is_sse, model_supports_inline_system, rebuild, MAX_REPLY_BYTES,
 };
 use crate::server::routes::tokenize::served_tokenizer;
-
-/// Cap on a buffered non-streaming upstream reply. Pinned to the compiled-in
-/// request default, not the configured request cap: a reply grows with the
-/// generated output, not with the prompt, so raising the request cap for large
-/// prompts should not raise per-reply memory, and lowering it should not start
-/// failing large replies.
-const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
 
 pub(crate) async fn messages(
     State(ctx): State<Arc<AppContext>>,
@@ -101,26 +94,11 @@ fn parse(
     anthropic::to_chat(req, count_only, inline_system).map_err(ApiError::BadRequest)
 }
 
-/// Whether every worker of the served model renders a system message after
-/// the first; a worker that does not report it counts as no.
-fn model_supports_inline_system(ctx: &AppContext) -> bool {
-    let workers = ctx
-        .registry
-        .workers_for(&ModelId(ctx.config.model.id.clone()));
-    !workers.is_empty() && workers.iter().all(|w| w.supports_inline_system())
-}
-
 /// `echo` is `Some((echo, streaming))`, `None` on the error paths.
 async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Response<Body> {
     let (mut parts, body) = resp.into_parts();
-    let is_sse = parts
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/event-stream"));
-
     if let Some((echo, true)) = &echo {
-        if parts.status.is_success() && is_sse {
+        if parts.status.is_success() && is_sse(&parts) {
             parts.headers.remove(header::CONTENT_LENGTH);
             return Response::from_parts(
                 parts,
@@ -182,13 +160,4 @@ pub(crate) async fn envelope_413(req: Request, next: Next) -> Response<Body> {
         parts,
         anthropic::error_body(413, "request body is too large"),
     )
-}
-
-fn rebuild(mut parts: axum::http::response::Parts, body: Vec<u8>) -> Response<Body> {
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    Response::from_parts(parts, Body::from(body))
 }

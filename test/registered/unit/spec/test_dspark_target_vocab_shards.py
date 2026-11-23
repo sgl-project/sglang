@@ -141,12 +141,10 @@ def _sampling(**overrides):
         need_top_k_sampling=False,
         need_top_p_sampling=False,
         need_min_p_sampling=False,
-        acc_additive_penalties=None,
-        acc_scaling_penalties=None,
-        acc_linear_penalties=None,
+        step_penalties=None,
         logit_bias=None,
         sampling_seed=None,
-        has_watermark_candidates=False,
+        watermark=None,
         sampling_mask_batch_indices=None,
         has_custom_logit_processor=False,
         penalizer_orchestrator=None,
@@ -315,7 +313,6 @@ class TestGatherFallback(CustomTestCase):
     def test_run_non_compact_gathers_before_the_adjustments(self):
         _, full = _greedy_case()
         parts = _split(full)
-        seen = []
         executor = TargetVerifyExecutor(
             target_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(
@@ -357,21 +354,17 @@ class TestGatherFallback(CustomTestCase):
                     executor, "_verify_backend_self_adds_seq_lens", return_value=True
                 ),
                 patch.object(executor, "_forward_prepared_verify", return_value=result),
-                patch.object(
-                    dspark_verify,
-                    "apply_dflash_verify_logits_adjustments",
-                    side_effect=lambda **kw: seen.append(kw["next_token_logits"].shape),
-                ),
             ):
                 executor.run_non_compact(
                     batch=batch,
                     draft_input=SimpleNamespace(nxt_kv_lens_cpu=None),
                     verify_ids_2d=torch.zeros(BS, STRIDE, dtype=torch.int64),
                     verify_window=window,
-                    sampling_info=_sampling(),
                     keep_target_shards=keep,
                 )
-            self.assertEqual(seen[-1], (BS * STRIDE, WIDTH if keep else VOCAB))
+            self.assertEqual(
+                out.next_token_logits.shape, (BS * STRIDE, WIDTH if keep else VOCAB)
+            )
             self.assertEqual(out.next_token_logits_vocab_shard is None, not keep)
 
 
@@ -801,11 +794,10 @@ class TestPerStepKeep(CustomTestCase):
             "min-p": (False, dict(need_min_p_sampling=True)),
             "seed": (False, dict(sampling_seed=torch.zeros(BS))),
             "greedy with seed": (True, dict(sampling_seed=torch.zeros(BS), **greedy)),
-            "penalty": (False, dict(acc_additive_penalties=torch.zeros(BS, 1))),
-            "linear penalty": (False, dict(acc_linear_penalties=torch.zeros(BS, 1))),
+            "penalty": (False, dict(step_penalties=object())),
             "logit bias": (False, dict(logit_bias=torch.zeros(BS, 1), **greedy)),
             "custom processor": (False, dict(has_custom_logit_processor=True)),
-            "watermark": (False, dict(has_watermark_candidates=True, **greedy)),
+            "watermark": (False, dict(watermark=object(), **greedy)),
             "sampling mask": (
                 False,
                 dict(sampling_mask_batch_indices=torch.zeros(1), **greedy),
