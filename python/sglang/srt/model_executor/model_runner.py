@@ -1978,6 +1978,18 @@ class ModelRunner:
             placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+        # Capturers consume the number of tokens represented by the captured
+        # graph, not the raw batch size: speculative decoding carries several
+        # tokens per request. Only decode/target-verify graphs are replayed by
+        # the decode runner; piecewise prefill graphs use the live batch and
+        # must not read its stale bs.
+        cuda_graph_num_tokens = None
+        if forward_batch.forward_mode.is_cuda_graph():
+            decode_graph_runner = getattr(self, "decode_cuda_graph_runner", None)
+            if getattr(decode_graph_runner, "bs", None):
+                cuda_graph_num_tokens = decode_graph_runner.bs * getattr(
+                    decode_graph_runner, "captured_req_width", 1
+                )
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
@@ -1985,7 +1997,7 @@ class ModelRunner:
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 

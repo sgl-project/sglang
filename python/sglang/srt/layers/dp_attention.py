@@ -604,9 +604,11 @@ def get_dp_local_slice_cpu(
     global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = dp_slot_in(global_num_tokens)
     local_num_tokens = global_num_tokens[dp_rank]
-    if can_run_graph:
+    if can_run_graph and cuda_graph_batch is not None:
         local_start_pos = dp_rank * cuda_graph_batch
     else:
+        # A piecewise prefill graph can report can_run_graph=True while the
+        # caller has no decode graph batch; use the live rank-padded layout.
         local_start_pos = sum(global_num_tokens[:dp_rank])
     return local_start_pos, local_num_tokens
 
