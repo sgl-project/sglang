@@ -265,6 +265,11 @@ class MarkovSampleStep:
             if _is_npu:
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
+                # Older sgl-kernel-npu releases declare fewer keyword arguments;
+                # drop the unused (None) ones they may not accept.
+                for name in ("softcap", "vocab_limit"):
+                    if kwargs.get(name) is None:
+                        kwargs.pop(name, None)
                 return markov_sample_step_triton(**kwargs)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
