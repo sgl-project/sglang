@@ -276,7 +276,9 @@ __global__ void apply_shuffle_mul_sum_kernel(
   int thread_idx = threadIdx.x;
   int stride = blockDim.x;
 
-  for (int d_vec_idx = thread_idx; d_vec_idx < row_stride / vec_size; d_vec_idx += stride) {
+  // 16-byte vector loads need every row to start 16-byte aligned.
+  int num_vecs = row_stride % vec_size == 0 ? row_stride / vec_size : 0;
+  for (int d_vec_idx = thread_idx; d_vec_idx < num_vecs; d_vec_idx += stride) {
     int d = d_vec_idx * vec_size;
     vec_t sum_vec;
     sum_vec.fill(0.0f);
@@ -302,7 +304,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
   }
 
   //  remainder part
-  int remainder_start = (row_stride / vec_size) * vec_size;
+  int remainder_start = num_vecs * vec_size;
   for (int d = remainder_start + thread_idx; d < row_stride; d += stride) {
     t sum_val = 0.0;
     for (int j = 0; j < topk; ++j) {

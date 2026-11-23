@@ -33,7 +33,8 @@ else:
 
 
 # 4: fewer elements than one 16-byte vector.
-@pytest.mark.parametrize("width", [4])
+# 20: rows that do not start 16-byte aligned.
+@pytest.mark.parametrize("width", [4, 20])
 def test_apply_shuffle_mul_sum_odd_widths(width):
     x = torch.randn((4, width), device="cuda", dtype=torch.float16)
     y = torch.zeros((2, width), device="cuda", dtype=torch.float16)
