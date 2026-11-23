@@ -1064,7 +1064,7 @@ class TestWatermarkServerArgs(CustomTestCase):
     def test_unknown_algorithm_refused_with_watermarking_off(self):
         with self.assertRaisesRegex(ValueError, "unknown --watermark-algorithm"):
             validation_hook.check_watermark_server_args(
-                ServerArgs(model_path="dummy", watermark_algorithm="synthid")
+                ServerArgs(model_path="dummy", watermark_algorithm="kirchenbauer")
             )
 
     def test_every_algorithm_choice_has_an_adapter(self):
@@ -5479,6 +5479,48 @@ class TestRustServerPrefillReplicaDp(CustomTestCase):
                 envs.SGLANG_RUST_SERVER.override(rust_server),
             ):
                 args(**kwargs).check_server_args()
+
+
+class TestShortestPrefillLoadScalingArgs(CustomTestCase):
+    def check(self, **kwargs):
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            page_size=1,
+            chunked_prefill_size=4096,
+            **kwargs,
+        ).check_server_args()
+
+    def test_each_invalid_combination_is_rejected(self):
+        on = dict(
+            schedule_policy="shortest-prefill-first",
+            shortest_prefill_boundary_halving_chunks=1.0,
+        )
+        for kwargs in (
+            dict(on, shortest_prefill_budget_min_ratio=-0.1),
+            dict(on, shortest_prefill_boundary_decay_start_chunks=float("inf")),
+            dict(shortest_prefill_boundary_decay_start_chunks=1.0),
+            dict(on, shortest_prefill_budget_min_ratio=1.5),
+            dict(on, shortest_prefill_budget_doubling_chunks=0.0),
+            dict(
+                on,
+                shortest_prefill_budget_min_ratio=0.0,
+                shortest_prefill_budget_doubling_chunks=1.0,
+            ),
+            dict(shortest_prefill_boundary_halving_chunks=1.0),
+            dict(on, shortest_prefill_aging_factor=0.5),
+            dict(on, dllm_algorithm="LowConfidence"),
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                self.check(**kwargs)
+
+    def test_explicit_zeros_are_accepted(self):
+        self.check(
+            schedule_policy="shortest-prefill-first",
+            shortest_prefill_boundary_halving_chunks=1.0,
+            shortest_prefill_boundary_decay_start_chunks=0.0,
+            shortest_prefill_budget_min_ratio=0.0,
+        )
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
