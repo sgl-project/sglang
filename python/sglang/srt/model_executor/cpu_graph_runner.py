@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import bisect
 import copy
+import functools
 import itertools
 import logging
 import types
@@ -387,6 +388,19 @@ def _disable_cpu_graph_custom_op_aliasing_check():
 
     with functorch_config.patch(check_custom_op_aliasing=False):
         yield
+
+
+@functools.lru_cache(maxsize=1)
+def is_skip_guard_eval_supported() -> bool:
+    """Check if torch.compiler.set_stance supports skip_guard_eval_unsafe."""
+    try:
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "set_stance"):
+            with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+                pass
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def get_capture_skip_cross_attention() -> Optional[bool]:
@@ -1076,6 +1090,7 @@ class CPUGraphRunner:
     prefill_dynamic_graph: Optional[Callable] = None
     prefill_dynamic_graph_bs1: Optional[Callable] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    skip_guard_eval_on_replay: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
@@ -1104,6 +1119,7 @@ class CPUGraphRunner:
         if self.enable_torch_compile:
             _install_cpu_compile_layer_caches(self.model_runner)
         self.enable_dynamic_graph = envs.SGLANG_TORCH_DYNAMIC_SHAPE.get()
+        self.skip_guard_eval_on_replay = self._init_skip_guard_eval()
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.model_is_mrope = model_runner.model_config.model_is_mrope
@@ -1324,6 +1340,33 @@ class CPUGraphRunner:
             raise Exception(
                 f"Capture CPU graph failed: {e}\n{CPU_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _init_skip_guard_eval(self) -> bool:
+        if not self.enable_torch_compile:
+            return False
+        if not envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE.get():
+            return False
+        if not is_skip_guard_eval_supported():
+            logger.warning(
+                "CPUGraphRunner: SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE is enabled, but "
+                "torch.compiler.set_stance(skip_guard_eval_unsafe=True) is not supported "
+                "in PyTorch %s. Dynamo guard evaluation skipping will be disabled.",
+                torch.__version__,
+            )
+            return False
+        log_info_on_rank0(
+            logger,
+            "CPUGraphRunner: Dynamo skip_guard_eval_unsafe is enabled for graph replay.",
+        )
+        return True
+
+    def _get_skip_guard_context(self):
+        if getattr(self, "skip_guard_eval_on_replay", False):
+            try:
+                return torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+            except Exception:
+                return empty_context()
+        return empty_context()
 
     def _get_skip_cross_attention(self, forward_batch: ForwardBatch) -> bool:
         """Return True when cross-attention layers should be skipped.
@@ -1902,15 +1945,30 @@ class CPUGraphRunner:
                     prepared_forward_batch = self.prepare_replay(
                         forward_batch, skip=skip
                     )
-                    with forward_context(
-                        ForwardContext(attn_backend=self.model_runner.attn_backend),
-                        forward_batch=prepared_forward_batch,
-                    ):
-                        output = graphs[prepared_forward_batch.batch_size](
-                            prepared_forward_batch.input_ids,
-                            prepared_forward_batch.positions,
-                            prepared_forward_batch,
-                        )
+                    try:
+                        with (
+                            forward_context(
+                                ForwardContext(
+                                    attn_backend=self.model_runner.attn_backend
+                                ),
+                                forward_batch=prepared_forward_batch,
+                            ),
+                            self._get_skip_guard_context(),
+                        ):
+                            output = graphs[prepared_forward_batch.batch_size](
+                                prepared_forward_batch.input_ids,
+                                prepared_forward_batch.positions,
+                                prepared_forward_batch,
+                            )
+                    except RuntimeError as e:
+                        if "skip_guard_eval_unsafe" in str(e):
+                            logger.error(
+                                "Recompilation was triggered while replaying CPU graph with "
+                                "skip_guard_eval_unsafe enabled for batch_size=%s. "
+                                "Ensure all required batch sizes are captured in cuda_graph_bs / cuda_graph_config.",
+                                prepared_forward_batch.batch_size,
+                            )
+                        raise
             if forward_batch.batch_size in graphs:
                 return output
 

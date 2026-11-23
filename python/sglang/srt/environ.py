@@ -1515,6 +1515,8 @@ class Envs:
     SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
     # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
     SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
+    # Skip Dynamo guard re-evaluation when replaying a captured CPU decode graph
+    SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE = EnvBool(False)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # ===================================================================

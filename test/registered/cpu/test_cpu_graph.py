@@ -18,12 +18,14 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
 )
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.rotary_embedding.utils import rotary_embedding_cpu
 from sglang.srt.model_executor.cpu_graph_runner import (
     CPUGraphRunner,
     _mark_dynamic,
     cpu_graph_patch_boundary_classes,
+    is_skip_guard_eval_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1247,6 +1249,208 @@ class TestCPUGraph(CustomTestCase):
         runner._reset_mamba_cache_if_needed()
         self.assertTrue(torch.all(conv_tensor == 0))
         self.assertTrue(torch.all(temporal_tensor == 0))
+
+    def test_skip_guard_eval_config_and_support(self):
+        self.assertIsInstance(is_skip_guard_eval_supported(), bool)
+        self.assertFalse(envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE.get())
+        runner = _make_cpu_graph_runner()
+        self.assertFalse(runner.skip_guard_eval_on_replay)
+
+        # 1. Disabled when enable_torch_compile is False even if env is True
+        with patch.object(
+            envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE, "get", return_value=True
+        ):
+            runner.enable_torch_compile = False
+            self.assertFalse(runner._init_skip_guard_eval())
+
+        # 2. Disabled when env is False
+        with patch.object(
+            envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE, "get", return_value=False
+        ):
+            runner.enable_torch_compile = True
+            self.assertFalse(runner._init_skip_guard_eval())
+
+        # 3. Enabled when enable_torch_compile and env and supported
+        with (
+            patch.object(
+                envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE, "get", return_value=True
+            ),
+            patch(
+                "sglang.srt.model_executor.cpu_graph_runner.is_skip_guard_eval_supported",
+                return_value=True,
+            ),
+        ):
+            runner.enable_torch_compile = True
+            self.assertTrue(runner._init_skip_guard_eval())
+
+        # 4. Gracefully disabled with warning when unsupported
+        with (
+            patch.object(
+                envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE, "get", return_value=True
+            ),
+            patch(
+                "sglang.srt.model_executor.cpu_graph_runner.is_skip_guard_eval_supported",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.model_executor.cpu_graph_runner.logger.warning"
+            ) as mock_warn,
+        ):
+            runner.enable_torch_compile = True
+            self.assertFalse(runner._init_skip_guard_eval())
+            mock_warn.assert_called_once()
+
+    def test_skip_guard_eval_context_during_decode_replay(self):
+        runner = _make_cpu_graph_runner()
+        runner.is_encoder_decoder = False
+        runner.enable_torch_compile = True
+        runner.skip_guard_eval_on_replay = True
+        runner.disable_padding = False
+        runner.max_bs = 2
+        runner.decode_dynamic_graphs = {}
+        runner.graphs_cross = {}
+
+        executed_with_skip_guard = []
+
+        def mock_compiled_forward(input_ids, positions, fb):
+            import torch._dynamo.eval_frame as ef
+
+            is_active = (
+                ef._is_skip_guard_eval_unsafe_stance()
+                if hasattr(ef, "_is_skip_guard_eval_unsafe_stance")
+                else False
+            )
+            executed_with_skip_guard.append(is_active)
+            return LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4))
+
+        runner.graphs = {2: mock_compiled_forward}
+        mock_fb = SimpleNamespace(
+            batch_size=2,
+            moe_num_token_non_padded=None,
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            positions=torch.zeros(2, dtype=torch.int64),
+        )
+        runner.prepare_replay = lambda fb, skip: mock_fb
+        runner.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+        )
+
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            moe_num_token_non_padded=None,
+        )
+
+        out = runner.execute(forward_batch)
+        self.assertIsNotNone(out)
+        self.assertEqual(len(executed_with_skip_guard), 1)
+        self.assertTrue(executed_with_skip_guard[0])
+
+        import torch._dynamo.eval_frame as ef
+
+        if hasattr(ef, "_is_skip_guard_eval_unsafe_stance"):
+            self.assertFalse(ef._is_skip_guard_eval_unsafe_stance())
+
+        # When skip_guard_eval_on_replay is False, verify skip guard is not used
+        runner.skip_guard_eval_on_replay = False
+        executed_with_skip_guard.clear()
+        out = runner.execute(forward_batch)
+        self.assertIsNotNone(out)
+        self.assertEqual(len(executed_with_skip_guard), 1)
+        self.assertFalse(executed_with_skip_guard[0])
+
+    def test_skip_guard_eval_error_logging(self):
+        runner = _make_cpu_graph_runner()
+        runner.is_encoder_decoder = False
+        runner.enable_torch_compile = True
+        runner.skip_guard_eval_on_replay = True
+        runner.disable_padding = False
+        runner.max_bs = 2
+        runner.decode_dynamic_graphs = {}
+        runner.graphs_cross = {}
+
+        def mock_error_forward(input_ids, positions, fb):
+            raise RuntimeError(
+                "Recompilation triggered with skip_guard_eval_unsafe stance"
+            )
+
+        runner.graphs = {2: mock_error_forward}
+        mock_fb = SimpleNamespace(
+            batch_size=2,
+            moe_num_token_non_padded=None,
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            positions=torch.zeros(2, dtype=torch.int64),
+        )
+        runner.prepare_replay = lambda fb, skip: mock_fb
+        runner.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+        )
+
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            moe_num_token_non_padded=None,
+        )
+
+        with patch(
+            "sglang.srt.model_executor.cpu_graph_runner.logger.error"
+        ) as mock_err:
+            with self.assertRaises(RuntimeError):
+                runner.execute(forward_batch)
+            mock_err.assert_called_once()
+
+    def test_skip_guard_eval_real_compiled_function(self):
+        def toy_forward(input_ids, positions, fb):
+            return LogitsProcessorOutput(
+                next_token_logits=input_ids.float().unsqueeze(-1) * 2.0
+            )
+
+        opt_forward = torch.compile(toy_forward, backend="eager")
+
+        runner = _make_cpu_graph_runner()
+        runner.is_encoder_decoder = False
+        runner.enable_torch_compile = True
+        runner.skip_guard_eval_on_replay = True
+        runner.disable_padding = False
+        runner.max_bs = 2
+        runner.decode_dynamic_graphs = {}
+        runner.graphs_cross = {}
+        runner.graphs = {2: opt_forward}
+
+        capture_ids = torch.tensor([1, 2], dtype=torch.int64)
+        capture_pos = torch.tensor([0, 1], dtype=torch.int64)
+        mock_fb = SimpleNamespace(
+            batch_size=2,
+            moe_num_token_non_padded=None,
+            input_ids=capture_ids,
+            positions=capture_pos,
+        )
+        # Warmup the compiled function once before skip_guard replay
+        opt_forward(capture_ids, capture_pos, mock_fb)
+
+        runner.prepare_replay = lambda fb, skip: mock_fb
+        runner.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+        )
+
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+            input_ids=capture_ids,
+            moe_num_token_non_padded=None,
+        )
+
+        out = runner.execute(forward_batch)
+        expected = torch.tensor([[2.0], [4.0]])
+        self.assertTrue(torch.allclose(out.next_token_logits, expected))
 
     @intel_amx_benchmark(
         extra_args=[
