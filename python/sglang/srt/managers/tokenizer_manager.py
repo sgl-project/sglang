@@ -143,7 +143,9 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
+    get_preserve_last_token_id,
     is_health_check_generate_req,
+    truncate_input_ids,
 )
 from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
@@ -216,7 +218,6 @@ from sglang.srt.speculative.spec_decoding_metrics import (
 from sglang.srt.utils import (
     configure_gc_logging,
     freeze_gc,
-    get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
     print_warning_once,
@@ -508,8 +509,9 @@ def _add_sampling_mask_to_meta_info(
     chunk: Optional[SamplingMaskChunk],
     finished: bool,
 ):
+    flat = state.obj.return_flat_raw_sampling_mask
     if chunk is not None:
-        if state.obj.return_flat_raw_sampling_mask:
+        if flat:
             state.output_token_sampling_mask_chunks.append(chunk)
         else:
             masks, logprobs = chunk.to_lists(
@@ -517,15 +519,16 @@ def _add_sampling_mask_to_meta_info(
             )
             state.output_token_sampling_mask.extend(masks)
             state.output_token_sampling_logprobs.extend(logprobs)
-            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
-            meta_info["output_token_sampling_logprobs"] = (
-                state.output_token_sampling_logprobs
-            )
-            meta_info["output_token_sampling_mask_length"] = len(
-                state.output_token_sampling_mask
-            )
+    if not flat:
+        meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+        meta_info["output_token_sampling_logprobs"] = (
+            state.output_token_sampling_logprobs
+        )
+        meta_info["output_token_sampling_mask_length"] = len(
+            state.output_token_sampling_mask
+        )
     # Built once on the finished response; streaming is rejected.
-    if state.obj.return_flat_raw_sampling_mask and finished:
+    elif finished:
         meta_info.update(
             _build_flat_sampling_mask_fields(
                 state.output_token_sampling_mask_chunks,
@@ -748,7 +751,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
@@ -810,6 +812,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+        self._embedding_preserve_last_token_id = get_preserve_last_token_id(
+            tokenizer=self.tokenizer, is_generation=self.is_generation
+        )
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
@@ -1516,7 +1522,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                del input_ids[_max_req_len:]
+                input_ids[:] = truncate_input_ids(
+                    input_ids,
+                    max_len=_max_req_len,
+                    preserve_last_token_id=self._embedding_preserve_last_token_id,
+                )
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
@@ -2492,7 +2502,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
                     )
-                    if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.get()
                     else nullcontext()
                 ):
                     for i in range(batch_size):
@@ -4030,6 +4040,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and not get_serving().skip_tokenizer_init,
                 finished=True,
             )
+        if is_generate and state.obj.return_sampling_mask:
+            _add_sampling_mask_to_meta_info(meta_info, state, None, finished=True)
 
         output_ids = state.output_ids
         text = state.get_text()
@@ -4051,6 +4063,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         return_b64=state.obj.return_flat_raw_top_logprobs_b64,
                     )
                 )
+            if "output_token_sampling_mask_length" in meta_info:
+                if state.obj.return_flat_raw_sampling_mask:
+                    meta_info.update(
+                        _build_flat_sampling_mask_fields(
+                            [], return_b64=state.obj.return_flat_raw_sampling_mask_b64
+                        )
+                    )
+                else:
+                    meta_info["output_token_sampling_mask_length"] = 0
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []

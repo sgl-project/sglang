@@ -242,7 +242,6 @@ class BaseRunner(ABC):
             if model_runner.is_draft_worker
             else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -605,8 +604,8 @@ class BaseRunner(ABC):
                 )
                 get_flags().capture.enable_torch_compile = False
 
-        # NOTE: aux hidden state capture (eagle3/dflash) is already
-        # configured by init_aux_hidden_state_capture() in initialize().
+        # NOTE: aux hidden state capture (eagle3/dflash) is already configured
+        # by configure_aux_hidden_state_capture() in init_attention_backends().
 
         # Token-axis buffer views and counters.
         input_ids = buffers.input_ids[:num_tokens]

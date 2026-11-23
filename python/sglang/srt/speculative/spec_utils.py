@@ -958,8 +958,6 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 
@@ -1488,10 +1486,6 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
-        # Per branch, not above the dispatch: eagle_prepare_for_decode cumulates
-        # its own, and frequency/presence penalties are counters.
-        if batch.sampling_info.penalizer_orchestrator.is_required:
-            batch.cumulate_penalty_output_tokens()
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput
