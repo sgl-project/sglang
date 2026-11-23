@@ -1270,6 +1270,28 @@ class InputItemNormalizationTestCase(CustomTestCase):
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
 
+    def test_function_call_output_keeps_images(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Screenshot captured."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA"},
+                ],
+            }
+        )
+        self.assertEqual(
+            normalized["content"],
+            [
+                {"type": "text", "text": "Screenshot captured."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
+                },
+            ],
+        )
+
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
             OpenAIServingResponses._normalize_response_message_for_chat(

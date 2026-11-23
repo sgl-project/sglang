@@ -1531,13 +1531,17 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         return content_part
 
-    @staticmethod
-    def _flatten_tool_output(output: Any) -> str:
+    @classmethod
+    def _tool_output_for_chat(cls, output: Any) -> Any:
         """``output`` may be a string or an array of content parts (OpenAI allows
-        both); the chat tool message needs a string."""
-        if isinstance(output, list):
-            return "".join(p.get("text", "") for p in output if isinstance(p, dict))
-        return output
+        both). Text-only arrays flatten to a string; arrays with images keep
+        their parts so the chat template renders the images."""
+        if not isinstance(output, list):
+            return output
+        parts = [p for p in output if isinstance(p, dict)]
+        if any(p.get("type") in ("input_image", "image_url") for p in parts):
+            return [cls._normalize_response_content_part_for_chat(p) for p in parts]
+        return "".join(p.get("text", "") for p in parts)
 
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
@@ -1604,7 +1608,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": cls._flatten_tool_output(message.get("output", "")),
+                "content": cls._tool_output_for_chat(message.get("output", "")),
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
