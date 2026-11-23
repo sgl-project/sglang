@@ -883,6 +883,43 @@ def test_mamba_chunk_scan_lone_request_nonfinite_input_stays_nonfinite(target):
     )
 
 
+@pytest.mark.parametrize("target", ["x", "dt"])
+def test_mamba_chunk_scan_single_seq_with_seq_idx_nonfinite_input_stays_nonfinite(
+    target,
+):
+    """BBuf review (PR 51342): `chunk_has_boundary` (set when a chunk's first and
+    last seq_idx differ) skips both the dt_k ownership mask and the extra
+    per-channel `tl.dot` ownership reduction for any chunk that does not mix
+    sequences, falling back to the plain `cb *= dt_k` / `tl.dot(cb, x)` path. A
+    single packed request -- `seq_idx` given (HAS_SEQ_IDX=True), but only one
+    sequence, so every chunk has chunk_has_boundary=False -- must take that cheap
+    path through every one of its multiple chunks and still land on the same
+    finite/non-finite split as the unpacked (no seq_idx) reference (nan vs inf can
+    differ with fp associativity), exercising the cheap path's correctness
+    independently from the lone-request-no-seq_idx case above (which never enters
+    HAS_SEQ_IDX code at all).
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    chunk_size, lens = 16, [40]
+    offender = (0, 2, target, torch.inf)
+    results = _packed_vs_independent(lens, chunk_size, offender)
+    packed_out, packed_state, alone_out, alone_state = results[0]
+
+    assert not packed_out.isfinite().all(), (
+        "the request's own non-finite input must surface as non-finite even on "
+        "the cheap (no-boundary) path"
+    )
+    assert not packed_state.isfinite().all()
+    torch.testing.assert_close(
+        packed_out.isfinite(),
+        alone_out.isfinite(),
+        msg="finite/non-finite split on the cheap path must match the unpacked reference",
+    )
+
+
 @pytest.mark.parametrize("target", ["x", "B"])
 @pytest.mark.parametrize(
     "chunk_size,lens",
