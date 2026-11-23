@@ -177,7 +177,6 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 logger = init_logger(__name__)
 
 _BATCHED_CFG_MARGIN_BYTES = 1 * 1024**3
-_CFG_BATCH_DECISION_KEY = "_batched_cfg_decision"
 
 # Request-gated DiT fusions and the lowest quality level that may mount each
 # one. A fusion belongs to "lossless" when it keeps the reference math and the
@@ -2226,12 +2225,15 @@ class DenoisingStage(PipelineStage):
             and self._tp_world_size() <= 1
         )
 
-    def _cfg_mask_keeps_attention(self, current_model, batch) -> bool:
+    def _cfg_mask_keeps_attention(self, current_model, batch, server_args) -> bool:
         # Unequal prompt lengths add a padding mask. USPAttention serves a masked
         # call with FA varlen (FA only, SGLANG_VARLEN_FA on) or dense SDPA and
         # refuses Skip Softmax, so any other selected backend would be replaced
-        # or fail.
-        if batch.sampling_params.skip_softmax_params is not None:
+        # or fail. Autotune can swap the impl behind an unchanged enum.
+        if (
+            batch.sampling_params.skip_softmax_params is not None
+            or server_args.enable_attention_backend_autotune
+        ):
             return False
         kept = {AttentionBackendEnum.TORCH_SDPA}
         if attention_layer._VARLEN_FA_ENABLED:
@@ -2246,12 +2248,19 @@ class DenoisingStage(PipelineStage):
         # Aims to keep a request that just fits with serial CFG from running out of
         # memory in the batch-2 forward. Same free-memory source and 1 GiB margin as
         # the component prefetch check (component_residency_strategies.py).
+        device = get_local_torch_device()
         free_bytes = int(
             current_platform.get_available_gpu_memory(
-                device_id=get_local_torch_device().index or 0, empty_cache=False
+                device_id=device.index or 0, empty_cache=False
             )
             * 1024**3
         )
+        if device.type == "cuda":
+            # The previous step's activations stay in the caching allocator: the
+            # driver reports them as used, but the batch-2 forward can reuse them.
+            free_bytes += torch.cuda.memory_reserved(
+                device
+            ) - torch.cuda.memory_allocated(device)
         if need_bytes + _BATCHED_CFG_MARGIN_BYTES <= free_bytes:
             return True
         logger.info_once(
@@ -2321,34 +2330,20 @@ class DenoisingStage(PipelineStage):
             )
             if kwargs is None:
                 return None
-            # Reused while the model and shapes stay the same: after the first
-            # batch-2 step its activations stay reserved by the caching allocator,
-            # which mem_get_info reports as used. Progressive resolution changes the
-            # latent shape and so decides again.
-            decision_key = (
-                id(current_model),
-                tuple(latent_model_input.shape),
-                tuple(kwargs["encoder_hidden_states"].shape),
-                kwargs["encoder_hidden_states_mask"] is None,
+            if kwargs[
+                "encoder_hidden_states_mask"
+            ] is not None and not self._cfg_mask_keeps_attention(
+                current_model, batch, server_args
+            ):
+                return None
+            # The DiT activations of both rows are not allocated yet at this point,
+            # so the estimate covers both, not only the extra row.
+            row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
+                latent_model_input.shape[1],
+                kwargs["encoder_hidden_states"].shape[1],
                 target_dtype,
             )
-            cached_key, batch_ok = batch.extra.get(
-                _CFG_BATCH_DECISION_KEY, (None, None)
-            )
-            if cached_key != decision_key:
-                # The DiT activations of both rows are not allocated yet at this
-                # point, so the estimate covers both, not only the extra row.
-                row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
-                    latent_model_input.shape[1],
-                    kwargs["encoder_hidden_states"].shape[1],
-                    target_dtype,
-                )
-                batch_ok = (
-                    kwargs["encoder_hidden_states_mask"] is None
-                    or self._cfg_mask_keeps_attention(current_model, batch)
-                ) and self._batched_cfg_fits(2 * row_bytes)
-                batch.extra[_CFG_BATCH_DECISION_KEY] = (decision_key, batch_ok)
-            if not batch_ok:
+            if not self._batched_cfg_fits(2 * row_bytes):
                 return None
 
             def twice(x):

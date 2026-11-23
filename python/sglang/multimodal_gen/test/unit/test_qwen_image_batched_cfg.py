@@ -68,18 +68,16 @@ def _request(
     dtype,
     quality=None,
     skip_softmax=None,
-    size=HEIGHT,
-    extra=None,
 ):
     generator = torch.Generator().manual_seed(1)
 
     def randn(*shape):
         return torch.randn(*shape, generator=generator).to(_DEVICE, dtype)
 
-    noise_tokens = (size // 16) * (size // 16)
+    noise_tokens = (HEIGHT // 16) * (WIDTH // 16)
     batch = SimpleNamespace(
-        height=size,
-        width=size,
+        height=HEIGHT,
+        width=WIDTH,
         latents=randn(1, noise_tokens, CHANNELS),
         prompt_embeds=[randn(1, cond_len, TEXT_DIM)],
         negative_prompt_embeds=[randn(1, uncond_len, TEXT_DIM)],
@@ -93,7 +91,7 @@ def _request(
         sampling_params=SimpleNamespace(
             quality=quality, skip_softmax_params=skip_softmax
         ),
-        extra={} if extra is None else extra,
+        extra={},
     )
     latent_input = batch.latents
     if edit:
@@ -132,13 +130,12 @@ def _denoise_step(
     quality=None,
     skip_softmax=None,
     steps=1,
-    memory_queries=None,
-    size=HEIGHT,
-    extra=None,
+    reusable_bytes=0,
+    autotune=False,
 ):
     dtype = next(model.parameters()).dtype
     batch, latent_input = _request(
-        cond_len, uncond_len, edit, dtype, quality, skip_softmax, size, extra
+        cond_len, uncond_len, edit, dtype, quality, skip_softmax
     )
     branch_kwargs = []
     for embeds, prepare in (
@@ -160,11 +157,18 @@ def _denoise_step(
     server_args = SimpleNamespace(
         enable_cfg_parallel=False,
         enable_breakable_cuda_graph=False,
+        enable_attention_backend_autotune=autotune,
         pipeline_config=pipeline_config,
     )
-    free_memory = Mock(return_value=free_gib)
+    free_memory = (
+        Mock(side_effect=free_gib)
+        if isinstance(free_gib, list)
+        else Mock(return_value=free_gib)
+    )
     with (
         patch.object(current_platform, "get_available_gpu_memory", free_memory),
+        patch.object(torch.cuda, "memory_reserved", return_value=reusable_bytes),
+        patch.object(torch.cuda, "memory_allocated", return_value=0),
         patch.object(model, "forward", counting_forward),
         patch.object(
             model,
@@ -194,8 +198,6 @@ def _denoise_step(
                 guidance=None,
                 latents=batch.latents,
             )
-    if memory_queries is not None:
-        memory_queries.append(free_memory.call_count)
     return out, widths
 
 
@@ -440,10 +442,9 @@ def test_mask_unsupported_attention_keeps_unequal_prompts_serial(
 
 
 @requires_cuda
-def test_batched_cfg_decides_once_per_request(single_process_model_parallel):
-    """The memory query runs once, not on every denoising step."""
+def test_batched_cfg_rechecks_memory_every_step(single_process_model_parallel):
+    """Free memory can shrink between steps, e.g. retained trajectory latents."""
     model = _tiny_dit(QwenImageDitConfig())
-    queries = []
     _, widths = _denoise_step(
         QwenImagePipelineConfig(),
         model,
@@ -451,31 +452,46 @@ def test_batched_cfg_decides_once_per_request(single_process_model_parallel):
         3,
         edit=False,
         streamed=True,
+        free_gib=[1024.0, 0.0, 1024.0],
         steps=3,
-        memory_queries=queries,
     )
-    assert widths == [2, 2, 2]
-    assert queries == [1]
+    assert widths == [2, 1, 1, 2]
 
 
 @requires_cuda
-def test_batched_cfg_decides_again_when_resolution_changes(
-    single_process_model_parallel,
+@pytest.mark.parametrize("reusable_gib,expected", [(1024, [2]), (0, [1, 1])])
+def test_reusable_allocator_cache_counts_as_free(
+    single_process_model_parallel, reusable_gib, expected
 ):
-    """Progressive resolution grows the latent inside one request."""
+    """The previous step's activations stay reserved; the driver counts them as used."""
     model = _tiny_dit(QwenImageDitConfig())
-    extra, queries = {}, []
-    for size in (HEIGHT, HEIGHT, 2 * HEIGHT):
-        _, widths = _denoise_step(
-            QwenImagePipelineConfig(),
-            model,
-            7,
-            3,
-            edit=False,
-            streamed=True,
-            memory_queries=queries,
-            size=size,
-            extra=extra,
-        )
-        assert widths == [2]
-    assert queries == [1, 0, 1]
+    _, widths = _denoise_step(
+        QwenImagePipelineConfig(),
+        model,
+        7,
+        3,
+        edit=False,
+        streamed=True,
+        free_gib=0.0,
+        reusable_bytes=reusable_gib * 1024**3,
+    )
+    assert widths == expected
+
+
+@requires_cuda
+@pytest.mark.parametrize("cond_len,uncond_len,expected", [(7, 3, [1, 1]), (5, 5, [2])])
+def test_attention_autotune_keeps_unequal_prompts_serial(
+    single_process_model_parallel, cond_len, uncond_len, expected
+):
+    """Autotune can pick an impl the masked batch-2 path would bypass."""
+    model = _tiny_dit(QwenImageDitConfig())
+    _, widths = _denoise_step(
+        QwenImagePipelineConfig(),
+        model,
+        cond_len,
+        uncond_len,
+        edit=False,
+        streamed=True,
+        autotune=True,
+    )
+    assert widths == expected
