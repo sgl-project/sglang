@@ -4,16 +4,23 @@ load scaling reaches admission."""
 
 import inspect
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -27,8 +34,15 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    InsertParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -115,7 +129,8 @@ class TestHeldRowAdmission(CustomTestCase):
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
         move(waiting, s.waiting_queue)
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        move([final_chunk], s.chunked_reqs)
+        if final_chunk is not None:
+            move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(
@@ -160,7 +175,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.spec_algorithm = None
         # The final chunk and the running requests hold rows; one row is free.
         s.req_to_token_pool = SimpleNamespace(
-            available_size=lambda: NUM_ROWS - len(running) - 1
+            available_size=lambda: (
+                NUM_ROWS - len(running) - int(final_chunk is not None)
+            )
         )
         s.beam_coordinator = SimpleNamespace(
             pending_member_rows=lambda batch: 0, pending_member_rows_of=lambda reqs: 0
@@ -299,6 +316,173 @@ class TestHeldRowAdmission(CustomTestCase):
         _, adder = self._build_batch(s, ScheduleBatch(reqs=running), False)
         self.assertEqual(adder.rem_input_tokens, 1024 + len(running))
         self.assertEqual(adder.rem_chunk_tokens, 1024 + len(running))
+
+
+class TestPrefillCapacityRecovery(CustomTestCase):
+    """A backup's KV lock can outlive its request and a NO_TOKEN decision.
+
+    Use real cache locks, token allocation and PrefillAdder admission. Only the
+    transfer's completion and construction of a model batch are simulated.
+    """
+
+    _scheduler = TestHeldRowAdmission._scheduler
+
+    def setUp(self):
+        self.enterContext(published_topology(pp_max_micro_batch_size=NUM_ROWS))
+        self.allocator = TokenToKVPoolAllocator(
+            size=1024, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
+        )
+        self.cache = RadixCache.create_simulated(mock_allocator=self.allocator)
+        key = RadixKey(array("q", [1] * 512))
+        cached = self.allocator.alloc(512)
+        self.cache.insert(InsertParams(key=key, value=cached))
+        node = self.cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        self.backup_lock = self.cache.lock(node)
+        self.addCleanup(self._finish_backup)
+
+        running = [self._req(f"running-{i}", 1) for i in range(2)]
+        for i, req in enumerate(running):
+            req.kv.req_pool_idx = i
+        self.waiting = self._req("waiting", 600)
+        self.batch = ScheduleBatch(reqs=running)
+        self.scheduler = self._scheduler(
+            DisaggregationMode.NULL, running, None, [self.waiting], PrefillAdder
+        )
+        self.scheduler.tree_cache = self.cache
+        self.scheduler.token_to_kv_pool_allocator = self.allocator
+        self.scheduler.attn_cp_group = SimpleNamespace(world_size=1)
+        self.scheduler.attn_tp_group = SimpleNamespace(world_size=1)
+
+    @staticmethod
+    def _req(rid, prompt_len):
+        return Req(rid, None, array("q", [2] * prompt_len), SamplingParams())
+
+    def _finish_backup(self):
+        self.cache.unlock(self.backup_lock)
+        self.backup_lock = None
+
+    def _try_prefill(self):
+        def build(reqs, *args, **kwargs):
+            raise _BatchBuilt(list(reqs))
+
+        with (
+            patch.object(ScheduleBatch, "init_new", side_effect=build),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            return self.scheduler._get_new_batch_prefill_raw(None, self.batch)
+
+    def _reject_for_capacity(self):
+        new_batch, running_batch = self._try_prefill()
+        self.assertIsNone(new_batch)
+        self.assertIs(running_batch, self.batch)
+        self.assertTrue(self.batch.batch_is_full)
+
+    def test_backup_unlock_retries_waiting_prefill_with_running_requests(self):
+        self._reject_for_capacity()
+        self.assertEqual(self.cache.evictable_size(), 0)
+        self._finish_backup()
+        self.assertEqual(self.cache.evictable_size(), 512)
+
+        with self.assertRaises(_BatchBuilt) as built:
+            self._try_prefill()
+        self.assertEqual(built.exception.args[0], [self.waiting])
+        self.assertFalse(self.batch.batch_is_full)
+        self.assertIsNone(self.batch.prefill_no_token_capacity)
+
+    def test_unchanged_total_capacity_does_not_repeat_admission(self):
+        self._reject_for_capacity()
+        # Free -> evictable changes both counters, but restores no capacity.
+        extra = self.allocator.alloc(128)
+        self.cache.insert(
+            InsertParams(key=RadixKey(array("q", [3] * 128)), value=extra)
+        )
+        self.assertEqual(self.allocator.available_size(), 384)
+        self.assertEqual(self.cache.evictable_size(), 128)
+        with patch.object(
+            self.scheduler,
+            "get_prefill_adder_class",
+            side_effect=AssertionError("unchanged capacity must remain gated"),
+        ):
+            self._try_prefill()
+        self.assertTrue(self.batch.batch_is_full)
+        self.assertEqual(self.batch.prefill_no_token_capacity, 512)
+
+    def test_recovery_still_runs_admission_and_updates_failed_snapshot(self):
+        held = self.allocator.alloc(64)
+        self._try_prefill()
+        self.assertEqual(self.batch.prefill_no_token_capacity, 448)
+        self.allocator.free(held)
+
+        # 512 tokens still cannot admit the 600-token prompt plus generation.
+        self._try_prefill()
+        self.assertTrue(self.batch.batch_is_full)
+        self.assertEqual(self.batch.prefill_no_token_capacity, 512)
+        self.assertEqual(list(self.scheduler.waiting_queue), [self.waiting])
+
+    def test_request_slot_limit_does_not_inherit_old_capacity_failure(self):
+        self._reject_for_capacity()
+        self.batch.batch_is_full = False
+        self.scheduler.get_num_allocatable_reqs = lambda *args, **kwargs: 0
+        self._try_prefill()
+        self.assertTrue(self.batch.batch_is_full)
+        self.assertIsNone(self.batch.prefill_no_token_capacity)
+
+        self._finish_backup()
+        self._try_prefill()
+        self.assertTrue(self.batch.batch_is_full)
+        self.assertIsNone(self.batch.prefill_no_token_capacity)
+
+    def test_multi_resource_budgets_are_not_compared_as_full_tokens(self):
+        class OtherBudget(PrefillBudget):
+            pass
+
+        self.batch.batch_is_full = True
+        for mamba, factory in (
+            (True, None),
+            (False, lambda cache: OtherBudget(self.allocator, cache)),
+        ):
+            with (
+                self.subTest(mamba=mamba),
+                patch.object(self.cache, "supports_mamba", return_value=mamba),
+                patch.object(self.allocator, "create_prefill_budget", factory),
+            ):
+                self.scheduler._record_prefill_no_token(self.batch)
+                self.assertIsNone(self.batch.prefill_no_token_capacity)
+
+    def test_peer_capacity_recovery_reopens_admission_on_all_ranks(self):
+        self._reject_for_capacity()
+        cp, tp = object(), object()
+        self.scheduler.attn_cp_group = SimpleNamespace(world_size=2, cpu_group=cp)
+        self.scheduler.attn_tp_group = SimpleNamespace(world_size=2, cpu_group=tp)
+        for peer_recovered in (False, True):
+            with self.subTest(peer_recovered=peer_recovered):
+                self.batch.batch_is_full = True
+                self.batch.prefill_no_token_capacity = 512
+                votes = []
+
+                def reduce(vote, *, op, group):
+                    self.assertEqual(vote.device.type, "cpu")
+                    votes.append((group, vote.item(), op))
+                    if group is cp and peer_recovered:
+                        vote.fill_(1)
+
+                with (
+                    torch.device("meta"),
+                    patch("torch.distributed.all_reduce", side_effect=reduce),
+                ):
+                    self.scheduler._retry_prefill_after_capacity_recovery(self.batch)
+                self.assertEqual(self.batch.batch_is_full, not peer_recovered)
+                self.assertEqual(
+                    self.batch.prefill_no_token_capacity,
+                    None if peer_recovered else 512,
+                )
+                self.assertEqual(
+                    votes,
+                    [
+                        (cp, 0, torch.distributed.ReduceOp.MAX),
+                        (tp, int(peer_recovered), torch.distributed.ReduceOp.MAX),
+                    ],
+                )
 
 
 class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):

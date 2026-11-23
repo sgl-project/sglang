@@ -4630,6 +4630,46 @@ class Scheduler(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
 
+    def _prefill_retry_capacity(self) -> Optional[int]:
+        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+        # A FULL token count does not describe window/state/shared-pool limits.
+        if self.tree_cache.supports_mamba():
+            return None
+        budget = self.token_to_kv_pool_allocator.create_prefill_budget(self.tree_cache)
+        if type(budget) is not PrefillBudget:
+            return None
+        return budget.remaining_current
+
+    def _record_prefill_no_token(self, batch: ScheduleBatch) -> None:
+        batch.prefill_no_token_capacity = (
+            self._prefill_retry_capacity() if batch.batch_is_full else None
+        )
+
+    def _retry_prefill_after_capacity_recovery(self, batch: ScheduleBatch) -> None:
+        previous = batch.prefill_no_token_capacity
+        if not batch.batch_is_full:
+            batch.prefill_no_token_capacity = None
+            return
+        if previous is None:
+            return
+        current = self._prefill_retry_capacity()
+        recovered = torch.tensor(
+            [int(current is not None and current > previous)],
+            dtype=torch.int,
+            device="cpu",
+        )
+        # All ranks must cross the admission gate together. A recovery on any
+        # rank warrants retrying; normal admission still checks actual budgets.
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group.world_size > 1:
+                torch.distributed.all_reduce(
+                    recovered, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+                )
+        if recovered.item():
+            batch.batch_is_full = False
+            batch.prefill_no_token_capacity = None
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4650,10 +4690,14 @@ class Scheduler(
             # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
+        self._retry_prefill_after_capacity_recovery(running_batch)
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None, running_batch
+
+        # This attempt may finish for a different reason (e.g. request slots).
+        running_batch.prefill_no_token_capacity = None
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4943,6 +4987,7 @@ class Scheduler(
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
                     )
+                    self._record_prefill_no_token(running_batch)
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
