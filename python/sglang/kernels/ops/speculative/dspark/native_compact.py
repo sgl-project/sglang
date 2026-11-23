@@ -243,3 +243,19 @@ def compact_commit_layout(
         _search_steps(lens.numel()),
         BLOCK=128,
     )
+
+
+@triton.jit
+def _small_candidates(ids, indptr, lens, out, width: tl.constexpr, BLOCK: tl.constexpr):
+    req = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    length = tl.load(lens + req)
+    start = tl.load(indptr + req)
+    value = tl.load(ids + start + col, mask=col < length, other=0)
+    tl.store(out + req * width + col, value, mask=col < width)
+
+
+def ragged_candidates(*, ids, indptr, lens, out):
+    _small_candidates[(lens.numel(),)](
+        ids, indptr, lens, out, out.shape[1], BLOCK=triton.next_power_of_2(out.shape[1])
+    )

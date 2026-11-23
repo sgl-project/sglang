@@ -16,6 +16,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 def test_constructor_does_not_resolve_uninitialized_pool(monkeypatch):
     monkeypatch.setenv("SGLANG_DSPARK_COMPACT_NATIVE_ACCEPT", "1")
+    monkeypatch.setenv("SGLANG_DSPARK_COMPACT_POST_FOLD", "1")
     monkeypatch.setattr(torch, "device", lambda _: SimpleNamespace(type="cuda"))
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     resolve_pool = Mock(side_effect=AssertionError("draft KV pool not initialized"))
@@ -27,6 +28,7 @@ def test_constructor_does_not_resolve_uninitialized_pool(monkeypatch):
         commit_ctx=SimpleNamespace(resolve_pool=resolve_pool),
     )
     assert epilogue.native_compact
+    assert epilogue.native_post_fold
     resolve_pool.assert_not_called()
 
 
@@ -35,6 +37,7 @@ def test_capture_falls_back_for_unsupported_pool():
 
     class Epilogue:
         native_compact = True
+        native_post_fold = True
         folds_commit = False
 
         def __call__(self, **kwargs):
@@ -58,6 +61,7 @@ def test_capture_falls_back_for_unsupported_pool():
         epilogue, runner, output, forward_batch, 2
     )
     assert not epilogue.native_compact
+    assert not epilogue.native_post_fold
     assert len(calls) == 1
     assert calls[0]["compact_logits"] is output.next_token_logits
 
