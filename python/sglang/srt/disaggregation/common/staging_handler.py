@@ -891,7 +891,6 @@ def handle_staging_req(
     kv_args,
     attn_tp_size: int,
     prefill_attn_tp_size: int,
-    kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
 ):
@@ -1022,8 +1021,7 @@ class StagingManagerMixin:
 
     Mixed into the managers whose decode thread receives STAGING_REQ messages
     (currently Mooncake and NIXL). Expects the concrete manager to provide
-    ``_staging_handler``, ``_staging_ctx``, ``kv_args``, ``attn_tp_size`` and
-    optionally ``kv_buffer_tensors``.
+    ``_staging_handler``, ``_staging_ctx``, ``kv_args`` and ``attn_tp_size``.
     """
 
     def _is_watermark_ready(
@@ -1052,7 +1050,6 @@ class StagingManagerMixin:
             self.kv_args,
             self.attn_tp_size,
             prefill_tp,
-            getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
         )

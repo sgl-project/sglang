@@ -142,10 +142,10 @@ class ExpertDistributionRecorder(ABC):
     ):
         if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert expert_location_metadata is not None, (
-                "ExpertLocationMetadata is required for expert distribution recording. One possible"
+                "ExpertLocationMetadata is required for expert distribution recording. One possible "
+                "reason is that you are using a model that does not support expert distribution "
+                "recording. Try setting `get_model_config_for_expert_location` in your model."
             )
-            "reason is that you are using a model that does not support expert distribution"
-            "recording. Try setting `get_model_config_for_expert_location` in your model."
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -932,12 +932,6 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._records = []
-
-    def get_single_pass_gatherer_keys(self):
-        return super().get_single_pass_gatherer_keys()
-
-    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
-        return super().get_single_pass_gatherer_key(debug_name)
 
     def append(
         self,
