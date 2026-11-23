@@ -26,15 +26,25 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
-@functools.lru_cache(maxsize=1)
-def is_npu_arch35() -> bool:
-    """Whether the runtime is on NPU architecture 35."""
+def _is_npu_arch(arch: int) -> bool:
     if not is_npu():
         return False
 
     import acl
 
-    return acl.rt.get_device_info(0, 601) == (3510, 0)
+    return acl.rt.get_device_info(0, 601) == (arch, 0)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch22() -> bool:
+    """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
+    return _is_npu_arch(2201)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    return _is_npu_arch(3510)
 
 
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
