@@ -153,8 +153,8 @@ class MooncakeTransferEngine:
         if ret != 0:
             raise RuntimeError(
                 "Failed to enable Mooncake memory registration reuse "
-                f"(ret={ret}); enable it before registering buffers on "
-                "a classic transfer engine."
+                f"(ret={ret}); it requires a classic transfer engine "
+                "without the nvmeof or barex transport."
             )
 
     def register(self, ptr: int, length: int) -> None:
