@@ -959,6 +959,7 @@
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/text_watermarking",
               "docs/advanced_features/synthid_text_watermarking",
+              "docs/advanced_features/trace_replay",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/speculative_decoding",

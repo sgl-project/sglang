@@ -1,0 +1,66 @@
+---
+title: "Trace Replay"
+metatags:
+    description: "Force deterministic decode token trajectories in SGLang while computing real model logprobs for config diffing, train-vs-inference debugging, and reference scoring."
+---
+
+**Trace Replay** forces SGLang's normal (non-speculative) decoder to emit a predetermined sequence of token IDs supplied via `sampling_params.trace_decode_token_ids`, while still computing real per-token log probabilities from the model's forward logits at every step.
+
+Common use cases include:
+- **Inference config diffing**: comparing per-token logprob distributions across quantization formats, tensor parallelism layouts, attention backends, or hardware (CUDA, ROCm, Ascend NPU) along an identical token trajectory.
+- **Train-vs-inference divergence analysis**: replaying training-time rollouts through the serving engine to isolate numerical drift.
+- **Reference scoring**: obtaining exact per-token logprobs for known `(prompt, response)` pairs without early stop/EOS termination.
+
+## Enabling Trace Replay
+
+Because trace replay lazily allocates a device trace table keyed by request-pool slots, it is **disabled by default**. Launch the server with `--enable-trace-replay`:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-0.6B \
+  --enable-trace-replay
+```
+
+Requests that include `trace_decode_token_ids` when `--enable-trace-replay` is not set are rejected with HTTP 400.
+
+## Usage Example
+
+Pass `trace_decode_token_ids` inside `sampling_params` on the native `/generate` endpoint:
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/generate",
+    json={
+        "text": "Once upon a time",
+        "sampling_params": {
+            "trace_decode_token_ids": [15, 284, 1026, 374],
+            "temperature": 0.8,
+        },
+        "return_logprob": True,
+        "top_logprobs_num": 5,
+    },
+)
+result = response.json()
+print("output_ids:", result["output_ids"])
+print("output_token_logprobs:", result["meta_info"]["output_token_logprobs"])
+```
+
+## Behavior and Logprob Semantics
+
+- **Length and truncation**: the trace is truncated to the remaining context capacity (`context_len - prompt_len - reserved_tokens`). If no tokens remain after truncation, the request is rejected. If `max_new_tokens` is omitted, it defaults to the truncated trace length; if provided, it is capped to `min(max_new_tokens, trace_len)`.
+- **Stop conditions**: `ignore_eos` is forced to `True`, `min_new_tokens` is set to `0`, and `stop`, `stop_regex`, and `stop_token_ids` are cleared so generation follows the trace sequence to completion.
+- **Logprob mode alignment**:
+  - With default `SGLANG_RETURN_ORIGINAL_LOGPROB=0`, trace replay follows the exact same logprob calculation path as normal inference, so replaying a normal run at the same sampling temperature produces matching logprobs.
+  - With `SGLANG_RETURN_ORIGINAL_LOGPROB=1`, logprobs are computed from the unmodified raw logits prior to temperature scaling, making replayed logprobs temperature-invariant (matching vLLM's default `raw_logprobs` mode).
+
+## Limitations
+
+Trace replay currently targets **normal (non-speculative) decoding** and rejects requests that combine `trace_decode_token_ids` with:
+- Speculative decoding (`--speculative-algorithm` enabled)
+- `n != 1` or `beam_width > 1`
+- Structured outputs (`json_schema`, `regex`, `ebnf`, `structural_tag`)
+- `custom_logit_processor`, `watermark`, `return_sampling_mask`
+- Thinking/reasoning controls (`max_thinking_tokens`, `thinking_budget`, `require_reasoning`, `--enable-strict-thinking`)
+- Empty traces or non-integer / negative / out-of-vocabulary token IDs

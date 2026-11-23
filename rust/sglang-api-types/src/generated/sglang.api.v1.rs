@@ -1098,7 +1098,7 @@ pub mod finish_reason {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParams {
-    /// JSON: absent = 128, explicit null = no limit (Python `Optional\[int\] =   128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
+    /// JSON: absent = 128, explicit null = no limit (Python `Optional\[int\] =  128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
     /// gRPC entry); no limit needs an explicit large value.
     #[prost(int64, optional, tag = "1")]
     pub max_new_tokens: ::core::option::Option<i64>,
