@@ -185,20 +185,6 @@ class _ReplacingContract(AscendRunnerContract):
         return run_on_slots(base_method, layer, dispatch_output, slots)
 
 
-class _UnscaledContract(AscendRunnerContract):
-    """Mutant: the routed scaling factor never reaches the output."""
-
-    def finish(self, merged, hidden_states, routed_scaling_factor):
-        return super().finish(merged, hidden_states, 1.0)
-
-
-class _DoubleScaledContract(AscendRunnerContract):
-    """Mutant: the routed scaling factor applied a second time."""
-
-    def finish(self, merged, hidden_states, routed_scaling_factor):
-        return super().finish(merged, hidden_states, routed_scaling_factor**2)
-
-
 def _reference(full, dispatch_output):
     return _LinearMoE().apply(full, dispatch_output).hidden_states.sum(1)
 
@@ -506,47 +492,27 @@ class TestPagedForward(CustomTestCase):
 
 
 class TestAscendContract(CustomTestCase):
-    """The Ascend contract serves a runner that combines the top-k outputs itself: a
-    wave returns the layer output for the whole batch, so waves must add their
-    ``[tokens, hidden]`` partials and the routed scaling factor must land exactly once
-    on the combined output (the runner applies the router weights, never the factor)."""
-
-    SCALING = 2.5
-
-    def _combining_layer(self, contract, seed=0):
+    def _combining_layer(self, contract):
         return _paged_layer(
             contract,
-            seed=seed,
-            moe_runner_config=MoeRunnerConfig(routed_scaling_factor=self.SCALING),
+            moe_runner_config=MoeRunnerConfig(routed_scaling_factor=1.8),
             combining=True,
         )
 
     def test_matches_unpaged_combined_output(self):
-        """Consecutive steps (reuse and eviction), one wave (1, 2 tokens) or several
-        (64), with and without padding: each output equals the unpaged layer's weighted
-        top-k sum times the factor, and the slots hold the resident experts."""
+        # A non-unit scale checks that the model still owns the multiply.
         for num_tokens, padded in ((1, False), (2, False), (64, False), (3, True)):
             with self.subTest(num_tokens=num_tokens, padded=padded):
                 method, layer, full = self._combining_layer(AscendRunnerContract())
                 for _ in range(8):
                     d = _step(num_tokens, padded=padded)
                     out = method.apply(layer=layer, dispatch_output=d).hidden_states
-                    torch.testing.assert_close(out, _reference(full, d) * self.SCALING)
+                    torch.testing.assert_close(out, _reference(full, d))
                     for name, host in method.store.host.items():
                         for expert, slot in method.policy.resident.items():
                             torch.testing.assert_close(
                                 getattr(layer, name)[slot], host[expert]
                             )
-
-    def test_a_unit_scaling_factor_is_a_no_op(self):
-        method, layer, full = _paged_layer(
-            AscendRunnerContract(),
-            moe_runner_config=MoeRunnerConfig(routed_scaling_factor=1.0),
-            combining=True,
-        )
-        d = _step(64)
-        out = method.apply(layer=layer, dispatch_output=d).hidden_states
-        torch.testing.assert_close(out, _reference(full, d))
 
     def test_waves_add_not_replace(self):
         """Replacing the merged output with a later wave's drops that wave's routes:
@@ -558,26 +524,13 @@ class TestAscendContract(CustomTestCase):
                 d = _step(num_tokens)
                 method.base_method.rows = 0
                 out = method.apply(layer=layer, dispatch_output=d).hidden_states
-                same = torch.allclose(out, _reference(full, d) * self.SCALING)
+                same = torch.allclose(out, _reference(full, d))
                 self.assertEqual(same, not wrong)
                 entries = d.topk_output.topk_ids.numel()
                 if wrong:
                     self.assertGreater(method.base_method.rows, entries)
                 else:
                     self.assertEqual(method.base_method.rows, entries)
-
-    def test_scaling_lands_exactly_once(self):
-        d = _step(64)
-        for contract, wrong in (
-            (_UnscaledContract(), True),
-            (_DoubleScaledContract(), True),
-            (AscendRunnerContract(), False),
-        ):
-            with self.subTest(contract=type(contract).__name__):
-                method, layer, full = self._combining_layer(contract)
-                out = method.apply(layer=layer, dispatch_output=d).hidden_states
-                same = torch.allclose(out, _reference(full, d) * self.SCALING)
-                self.assertEqual(same, not wrong)
 
     def test_rejects_graphs_and_nz_weights_at_startup(self):
         """The contract refuses, before the checkpoint loads, what the MVP cannot serve:

@@ -1,11 +1,9 @@
 """Paged experts on Ascend: the runner contract of the existing Ascend MoE runner.
 
-The Ascend runner combines the top-k outputs itself (the finalize-routing op applies
-the router weights), so a wave's output is already the layer output for the routes it
-serves, ``[tokens, hidden]``, not per-expert entries: a step's waves add their outputs,
-and the routed scaling factor lands on the combined output once, as with the unpaged
-layer. Its routing tables are as wide as its expert count, so the slot ids reach the
-routing op only when the runner is built with ``num_experts = K``.
+The Ascend runner applies router weights and combines top-k outputs in finalize
+routing. Each wave returns a partial ``[tokens, hidden]`` output. Summing the waves
+matches the unpaged runner's output, and callers handle any separate routed scaling.
+The runner uses ``num_experts = K`` so the routing tables match the slot ids.
 
 Registered with paged experts when this module is imported (from the Ascend runner's
 module), so the shared paged-experts code carries no Ascend imports.
@@ -76,10 +74,9 @@ class AscendRunnerContract(RunnerContract):
         return merged + partial
 
     def finish(self, merged, hidden_states, routed_scaling_factor: float):
+        # Match the unpaged runner's weighted sum. The model owns routed scaling.
         out = hidden_states.new_empty(merged.shape[0], merged.shape[-1])
-        out.copy_(merged[..., : out.shape[-1]])
-        if routed_scaling_factor != 1.0:
-            out.mul_(routed_scaling_factor)
+        out.copy_(merged)
         return out
 
 
