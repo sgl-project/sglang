@@ -1,13 +1,65 @@
 """Paged decode attention with a compact relative bias for Hopper: the split-KV
 partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
-sequence (MTP verify). Each split takes an equal share of the sequence's own keys."""
+sequence (MTP verify). Each split takes an equal share of the sequence's own keys;
+on a global layer's verify, an equal share of their cost, where the keys at least
+the bias extent behind every query run as larger tiles without bias or masks."""
+
+import functools
 
 import torch
 import triton
 import triton.language as tl
 
 MAX_SPLITS = 64
+
+
+@triton.jit
+def _interior_tile(
+    q,
+    m,
+    l,
+    acc,
+    start,
+    b,
+    hk,
+    d,
+    scale,
+    K,
+    V,
+    PageTable,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SP: tl.constexpr,
+    PAGE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    # Every key is valid and at least EXTENT behind every query row: bias 0, no mask.
+    cols = tl.arange(0, TILE)
+    if PAGE % TILE == 0:
+        page = tl.load(PageTable + b * SP + start // PAGE).to(tl.int64)
+        slot = start % PAGE + cols
+        kv_offset = page * SK0 + slot[:, None] * SK1 + hk * SK2 + d[None, :]
+    else:
+        pos = start + cols
+        page = tl.load(PageTable + b * SP + pos // PAGE)
+        kv_offset = (
+            page.to(tl.int64)[:, None] * SK0
+            + (pos % PAGE)[:, None] * SK1
+            + hk * SK2
+            + d[None, :]
+        )
+    k = tl.load(K + kv_offset)
+    s = tl.dot(q, tl.trans(k)) * scale
+    m_new = tl.maximum(m, tl.max(s, 1))
+    m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
+    alpha = tl.exp2((m - m_ref) * 1.4426950408889634)
+    p = tl.exp2((s - m_ref[:, None]) * 1.4426950408889634)
+    l = l * alpha + tl.sum(p, 1)
+    v = tl.load(V + kv_offset)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+    return m_new, l, acc
 
 
 @triton.jit
@@ -40,6 +92,9 @@ def _decode_partials(
     EXTENT: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    INTERIOR: tl.constexpr,
+    INTERIOR_COST: tl.constexpr,
+    MASKED_COST: tl.constexpr,
 ):
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
@@ -51,10 +106,30 @@ def _decode_partials(
     first = 0
     if WINDOW >= 0:
         first = tl.maximum(seqlen - QLEN - WINDOW, 0)
-    tiles = tl.cdiv(seqlen - first // BLOCK_N * BLOCK_N, BLOCK_N)
-    per_split = tl.cdiv(tiles, splits)
-    tile_lo = first // BLOCK_N + split * per_split
-    tile_hi = tl.minimum(tile_lo + per_split, first // BLOCK_N + tiles)
+    if INTERIOR == 0:
+        tiles = tl.cdiv(seqlen - first // BLOCK_N * BLOCK_N, BLOCK_N)
+        per_split = tl.cdiv(tiles, splits)
+        tile_lo = first // BLOCK_N + split * per_split
+        tile_hi = tl.minimum(tile_lo + per_split, first // BLOCK_N + tiles)
+    else:
+        # No window: keys [0, inner) are at least EXTENT behind every query row and
+        # run as INTERIOR-key tiles, the rest as BLOCK_N-key masked tiles. A split
+        # takes an equal share of the cost, a tile costing INTERIOR_COST or
+        # MASKED_COST; it runs the tiles whose cost starts inside its share.
+        tl.static_assert(WINDOW < 0)
+        tl.static_assert(INTERIOR % BLOCK_N == 0)
+        inner = tl.maximum(seqlen - QLEN - EXTENT + 1, 0)
+        big = inner // INTERIOR
+        small_lo = big * (INTERIOR // BLOCK_N)
+        cost = big * INTERIOR_COST
+        total = cost + (tl.cdiv(seqlen, BLOCK_N) - small_lo) * MASKED_COST
+        per_split = tl.cdiv(total, splits)
+        lo = tl.minimum(split * per_split, total)
+        hi = tl.minimum(lo + per_split, total)
+        big_lo = tl.minimum(tl.cdiv(lo, INTERIOR_COST), big)
+        big_hi = tl.minimum(tl.cdiv(hi, INTERIOR_COST), big)
+        tile_lo = small_lo + tl.cdiv(tl.maximum(lo - cost, 0), MASKED_COST)
+        tile_hi = small_lo + tl.cdiv(tl.maximum(hi - cost, 0), MASKED_COST)
 
     rows = tl.arange(0, ROWS)
     head_mask = rows < QLEN * GROUP
@@ -71,6 +146,12 @@ def _decode_partials(
     l = tl.zeros((ROWS,), tl.float32)
     acc = tl.zeros((ROWS, D), tl.float32)
     cols = tl.arange(0, BLOCK_N)
+    if INTERIOR > 0:
+        for tile in range(big_lo, big_hi):
+            m, l, acc = _interior_tile(
+                q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
+                SK0, SK1, SK2, SP, PAGE, INTERIOR,
+            )  # fmt: skip
     for tile in range(tile_lo, tile_hi):
         pos = tile * BLOCK_N + cols
         valid = (pos < seqlen) & (pos >= first)
@@ -113,6 +194,11 @@ def _decode_partials(
     tl.store(OPartial + stat[:, None] * D + d[None, :], acc, head_mask[:, None])
 
 
+@functools.cache
+def _sm_count(device_index):
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def decode_partials(
     q,
     k_cache,
@@ -134,16 +220,21 @@ def decode_partials(
     qlen = tokens // max(batch, 1)
     assert qlen * batch == tokens
     _, page_size, heads_k, _ = k_cache.shape
-    group = heads_q // heads_k
     span = (
         window_size_left + qlen
         if window_size_left is not None
         else page_table.shape[1] * page_size
     )
-    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sms = _sm_count(q.device.index)
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
+    interior, interior_cost, masked_cost, num_stages = 0, 1, 1, 2 if qlen == 1 else 3
+    if qlen > 1 and window_size_left is None:
+        interior, interior_cost, masked_cost, num_stages = _global_verify_tiles(
+            batch * heads_k
+        )
+    group = heads_q // heads_k
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -178,8 +269,22 @@ def decode_partials(
         rel_bias.shape[-1],
         -1 if window_size_left is None else window_size_left,
         block_n,
+        interior,
+        interior_cost,
+        masked_cost,
         num_warps=4,
-        num_stages=2 if qlen == 1 else 3,
+        num_stages=num_stages,
         launch_pdl=True,
     )
     return o, m, l
+
+
+def _global_verify_tiles(units):
+    """(interior tile, its cost, masked tile cost, pipeline stages) for global-layer
+    verify, by sequences x KV heads. Measured on H200 with 2- to 8-token blocks, 2K
+    to 128K keys and main's split counts; re-tune when the kernel changes."""
+    if units < 4:
+        return 128, 2, 1, 2
+    if units < 16:
+        return 64, 4, 3, 2
+    return 64, 3, 4, 3
