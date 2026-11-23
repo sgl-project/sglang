@@ -815,7 +815,6 @@ class TestThreeWindowTree(CustomTestCase):
     def test_windows_released_under_a_running_forward_evict_to_pending_pages(self):
         """The forward in flight still reads the windows its request has just
         passed: when eviction takes their rows, the pages wait for that forward."""
-        from types import SimpleNamespace
         from unittest import mock
 
         from sglang.srt.managers.schedule_batch import ReqKvInfo
