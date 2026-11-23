@@ -719,6 +719,32 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             run_layer(sentinel.next_metadata)[1]["cache_indices"], indices_used
         )
 
+    def test_flydsl_makes_split_qkv_views_contiguous(self):
+        kernel = object.__new__(FlyDSLGDNKernel)
+        kernel._prefill_fn = MagicMock(return_value=(sentinel.output, sentinel.h))
+        kernel._prepare_supported = MagicMock(return_value=True)
+        # forward_extend's torch.split path, taken above MAX_FUSED_QKV_SPLIT_DIM.
+        mixed_qkv = torch.randn(2, 3 * 128, dtype=torch.bfloat16)
+        q, k, v = (t.view(1, 2, 1, 128) for t in torch.split(mixed_qkv, 128, dim=-1))
+        self.assertFalse(q.is_contiguous())
+
+        kernel.extend(
+            q,
+            k,
+            v,
+            torch.empty(1, 2, 1),
+            torch.empty(1, 2, 1),
+            ssm_states=torch.empty(2, 1, 128, 128, dtype=torch.bfloat16),
+            cache_indices=torch.tensor([1], dtype=torch.int64),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            prefill_metadata=sentinel.metadata,
+        )
+
+        kernel_q, kernel_k = kernel._prefill_fn.call_args.args[:2]
+        for kernel_input, view in ((kernel_q, q), (kernel_k, k)):
+            self.assertTrue(kernel_input.is_contiguous())
+            torch.testing.assert_close(kernel_input, view)
+
     def test_flydsl_without_metadata_falls_back_to_triton(self):
         kernel = object.__new__(FlyDSLGDNKernel)
         kernel._prefill_fn = MagicMock()
