@@ -428,11 +428,12 @@ class Cosmos3SamplingParams(SamplingParams):
         pipeline_config = server_args.pipeline_config
         if self.action_stats_path is None:
             self.action_stats_path = getattr(pipeline_config, "action_stats_path", None)
-        distilled_sigmas = pipeline_config.distilled_sigmas
+        distilled_sigmas = getattr(pipeline_config, "distilled_sigmas", None)
+        is_edge = bool(getattr(pipeline_config, "is_edge", False))
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
         self._resolve_variant_defaults(
-            bool(pipeline_config.is_edge),
+            is_edge,
             is_distilled=distilled_sigmas is not None,
         )
 
@@ -462,11 +463,11 @@ class Cosmos3SamplingParams(SamplingParams):
         self._apply_transfer_hint_defaults()
         control_paths = self._resolve_control_paths()
         if control_paths:
-            if pipeline_config.distilled_sigmas is not None:
+            if distilled_sigmas is not None:
                 raise ValueError(
                     "Cosmos3 distilled checkpoints do not support transfer inference"
                 )
-            if pipeline_config.is_edge:
+            if is_edge:
                 raise ValueError(
                     "Cosmos3 Edge checkpoints do not support transfer inference"
                 )

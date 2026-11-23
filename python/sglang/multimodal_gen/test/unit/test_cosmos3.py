@@ -23,6 +23,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+    DiffusersTI2VPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
@@ -33,6 +36,7 @@ from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
     _get_config_info,
+    get_model_info,
     get_non_diffusers_pipeline_name,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -767,6 +771,128 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
         params._adjust(_cosmos3_server_args())
 
         self.assertEqual(params.data_type, DataType.VIDEO)
+
+
+class TestCosmos3DiffusersBackendSamplingParams(unittest.TestCase):
+    """Cosmos3SamplingParams works when --backend diffusers swaps pipeline_config."""
+
+    @staticmethod
+    def _diffusers_server_args(pipeline_config=None):
+        server_args = _cosmos3_size_server_args(
+            pipeline_config or DiffusersTI2VPipelineConfig()
+        )
+        server_args.model_path = "nvidia/Cosmos3-Edge"
+        server_args.backend = "diffusers"
+        return server_args
+
+    def test_diffusers_backend_model_info_and_sampling_params_adjust(self):
+        get_model_info.cache_clear()
+        info = get_model_info("nvidia/Cosmos3-Edge", backend="diffusers")
+        self.assertIsNotNone(info)
+        self.assertIs(info.pipeline_config_cls, DiffusersTI2VPipelineConfig)
+        self.assertIs(info.sampling_param_cls, Cosmos3SamplingParams)
+
+        server_args = self._diffusers_server_args(info.pipeline_config_cls())
+        params = SamplingParams.from_user_sampling_params_args(
+            model_path="nvidia/Cosmos3-Edge",
+            server_args=server_args,
+            prompt="a red cube on a table",
+            width=256,
+            height=256,
+            num_frames=9,
+            fps=8,
+            num_inference_steps=1,
+            seed=42,
+        )
+
+        self.assertIsInstance(params, Cosmos3SamplingParams)
+        self.assertEqual((params.width, params.height), (256, 256))
+        self.assertEqual(params.num_frames, 9)
+        self.assertEqual(params.fps, 8)
+        self.assertEqual(params.num_inference_steps, 1)
+        self.assertEqual(params.data_type, DataType.VIDEO)
+
+    def test_diffusers_backend_build_sampling_params_video_request(self):
+        get_model_info.cache_clear()
+        server_args = self._diffusers_server_args()
+        with mock.patch.object(
+            openai_utils, "get_global_server_args", return_value=server_args
+        ):
+            params = openai_utils.build_sampling_params(
+                "req-diffusers",
+                prompt="a red cube on a table",
+                request_data_type=DataType.VIDEO,
+                width=256,
+                height=256,
+                num_frames=9,
+                fps=8,
+                num_inference_steps=1,
+                seed=42,
+            )
+
+        self.assertIsInstance(params, Cosmos3SamplingParams)
+        self.assertEqual((params.width, params.height), (256, 256))
+        self.assertEqual(params.num_frames, 9)
+        self.assertEqual(params.fps, 8)
+        self.assertEqual(params.num_inference_steps, 1)
+        self.assertEqual(params.data_type, DataType.VIDEO)
+
+    def test_diffusers_backend_unspecified_size_uses_default_resolution(self):
+        get_model_info.cache_clear()
+        server_args = self._diffusers_server_args()
+        params = SamplingParams.from_user_sampling_params_args(
+            model_path="nvidia/Cosmos3-Edge",
+            server_args=server_args,
+            prompt="a red cube on a table",
+            width=None,
+            height=None,
+            num_frames=9,
+        )
+
+        self.assertEqual(
+            (params.width, params.height),
+            Cosmos3SamplingParams().supported_resolutions[0],
+        )
+
+    def test_diffusers_backend_transfer_control_paths_without_native_attrs(self):
+        params = Cosmos3SamplingParams(
+            prompt="transfer request",
+            num_frames=9,
+            control_path="ctrl.mp4",
+            control_hint="edge",
+        )
+        params._adjust(self._diffusers_server_args())
+
+        self.assertEqual(params.data_type, DataType.VIDEO)
+        self.assertEqual(params.guidance_scale, 3.0)
+        self.assertEqual(params.control_guidance, 1.5)
+
+    def test_native_cosmos3_config_preserves_distilled_and_edge_behavior(self):
+        edge_config = Cosmos3Config(is_edge=True)
+        edge_params = Cosmos3SamplingParams(prompt="t", num_frames=81)
+        edge_params._adjust(_cosmos3_size_server_args(edge_config))
+        self.assertEqual((edge_params.width, edge_params.height), (832, 480))
+        self.assertEqual(edge_params.guidance_scale, 5.0)
+        with self.assertRaisesRegex(ValueError, "Edge checkpoints"):
+            Cosmos3SamplingParams(
+                prompt="t",
+                num_frames=9,
+                control_path="ctrl.mp4",
+                control_hint="edge",
+            )._adjust(_cosmos3_size_server_args(edge_config))
+
+        distilled_config = Cosmos3Config(distilled_sigmas=[1.0, 0.5, 0.25])
+        distilled_params = Cosmos3SamplingParams(prompt="t", num_frames=81)
+        distilled_params._adjust(_cosmos3_size_server_args(distilled_config))
+        self.assertEqual(distilled_params.num_inference_steps, 3)
+        self.assertEqual(distilled_params.guidance_scale, 1.0)
+        with self.assertRaisesRegex(ValueError, "distilled checkpoints"):
+            Cosmos3SamplingParams(
+                prompt="t",
+                num_frames=9,
+                control_path="ctrl.mp4",
+                control_hint="edge",
+            )._adjust(_cosmos3_size_server_args(distilled_config))
 
 
 class TestCosmos3ActionEndpoint(unittest.TestCase):
