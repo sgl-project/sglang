@@ -2682,6 +2682,12 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
+        # A landed transfer stays Success; a nonzero count means a chunk can still fail.
+        if (
+            self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Success
+            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) == 0
+        ):
+            return
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",

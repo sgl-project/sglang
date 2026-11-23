@@ -12,7 +12,11 @@ import torch
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
@@ -986,6 +990,92 @@ class TestAllocationIntegration(CustomTestCase):
         queue.add(req, is_rebootstrap=True)
         self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
+
+    def early_prefill_manager(self, port=1):
+        mgr = self.manager("prefill", port)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        return mgr
+
+    def early_sender(self, mgr, room=1):
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", room)
+        mgr.update_status(room, KVPoll.WaitingForInput)
+        return sender
+
+    def conclude_success(self, mgr, room=1):
+        mgr.conclude_transfer(
+            bootstrap_room=room,
+            status=KVPoll.Success,
+            targets=[("decode", 2)],
+        )
+
+    def test_abort_after_drained_success_keeps_success(self):
+        """An abort after the transfer drained must not turn Success into Failed."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        self.conclude_success(mgr)
+        sender.abort()
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
+        self.assertNotIn(1, mgr.failure_records)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_abort_with_deferred_chunk_outstanding_fails(self):
+        """Success is provisional while an earlier deferred chunk can still fail."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        mgr._staging_outstanding[1] = 2
+        self.conclude_success(mgr)
+        mgr._staging_outstanding[1] -= 1
+        sender.abort()
+        mgr._staging_outstanding[1] -= 1
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_abort_after_deferred_chunk_drains_keeps_success(self):
+        """Success becomes final when a deferred chunk drains after the last chunk."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        mgr._staging_outstanding[1] = 2
+        self.conclude_success(mgr)
+        mgr._staging_outstanding[1] -= 2
+        sender.abort()
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
+
+    def test_abort_while_last_chunk_is_still_counted_keeps_failed(self):
+        """The sender cannot tell the concluding chunk's count from a deferred chunk."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        mgr._staging_outstanding[1] = 1
+        self.conclude_success(mgr)
+        sender.abort()
+        mgr._staging_outstanding[1] -= 1
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_split_rank_abort_concludes_failed_on_both_ranks(self):
+        """Ranks that disagree on an abort must both clear the room after consensus."""
+        landed, failed = self.early_prefill_manager(1), self.early_prefill_manager(3)
+        landed_sender = self.early_sender(landed)
+        failed_sender = self.early_sender(failed)
+        self.conclude_success(landed)
+        landed_sender.abort()
+        failed_sender.abort()
+        self.assertEqual(landed_sender.poll(), KVPoll.Success)
+        self.assertEqual(failed_sender.poll(), KVPoll.Failed)
+
+        with self.assertRaises(KVTransferError) as landed_error:
+            landed_sender.failure_exception()
+        with self.assertRaises(KVTransferError) as failed_error:
+            failed_sender.failure_exception()
+        self.assertTrue(landed_error.exception.is_from_another_rank)
+        self.assertFalse(failed_error.exception.is_from_another_rank)
+        for mgr in (landed, failed):
+            self.assertNotIn(1, mgr.request_status)
+            self.assertNotIn(1, mgr.failure_records)
 
 
 if __name__ == "__main__":
