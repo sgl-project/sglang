@@ -416,6 +416,24 @@ For multimodal models, you can use `--mm-feature-transport=cuda_ipc` to optimize
 
 Use this option when you have sufficient GPU memory and want to minimize latency for multimodal inference.
 
+### Qwen3-VL TP Image Preprocessing
+
+For Qwen3-VL and Qwen3-VL-MoE, set `SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS=1` to distribute image resize, normalization, and patchification across TP ranks. This default-off feature requires single-node pure NVIDIA CUDA TP with `--tp-size` greater than one, the fast image processor, and `--mm-feature-transport cpu`.
+
+```bash
+SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS=1 \
+SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
+sglang serve Qwen/Qwen3-VL-2B-Instruct \
+  --tp-size 4 --mm-feature-transport cpu \
+  --disable-prefill-cuda-graph
+```
+
+JPEG decoding uses nvJPEG on the tokenizer GPU when available, then stages decoded uint8 pixels through CPU memory. PNG decoding uses PIL on CPU. TP ranks preprocess their assigned images and broadcast packed inputs before executing the tensor-parallel vision encoder. Image embeddings retain the request's image order. Unsupported image formats or processor settings use the existing processing path.
+
+With ViT CUDA graphs enabled, a layout is captured on its second encounter. The TP preprocessing path retains up to eight layouts with at most 8,192 patches each. Other layouts execute eagerly using the same positional interpolation. Replayed outputs receive independent storage before they are split into image embeddings.
+
+ViT graph serving was validated with eager LLM prefill. Breakable and Full LLM prefill graphs were validated separately with ViT graphs disabled. Their simultaneous execution still needs validation.
+
 ### Multimodal Inputs Limitation
 
 - **Use `--mm-process-config '&#123;"image":&#123;"max_pixels":1048576&#125;,"video":&#123;"fps":3,"max_pixels":602112,"max_frames":60&#125;&#125;'`**: To set `image`, `video`, and `audio` input limits.
