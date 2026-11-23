@@ -1,4 +1,5 @@
-"""ROCm GQA DSpark draft KV ring: what the DSpark worker writes is what the window reads."""
+"""ROCm GQA DSpark draft KV ring: where the DSpark worker places draft KV is where the
+window reads it (a placement and readback test; the KV writes themselves are stubbed)."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -49,6 +50,14 @@ def test_window_reads_what_the_dspark_worker_wrote():
         pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
     )
     kv = torch.full((1 + POOL * rows,), -1.0, dtype=torch.float64, device=device)
+
+    def pool_ids(num_tokens):
+        # Valid rows outside the two requests' ring rows: a path that writes here
+        # instead of through the ring fails on the values read back.
+        return lambda iteration_ids: torch.arange(
+            1, 1 + num_tokens, dtype=torch.int64, device=device
+        )
+
     slots = torch.tensor([3, 9], dtype=torch.int64, device=device)
     # Request 3's prefill wraps the ring twice; request 9's does not wrap.
     prefill_lens = [2 * rows + 17, 40]
@@ -62,6 +71,7 @@ def test_window_reads_what_the_dspark_worker_wrote():
         draft_model_runner=SimpleNamespace(token_to_kv_pool=object(), runner_ids=None),
         swa_ring_size=None,
         draft_kv_ring=ring,
+        ids_for=pool_ids(sum(prefill_lens)),
     )
     prefill = SimpleNamespace(
         extend_lens=prefill_lens,
@@ -90,6 +100,7 @@ def test_window_reads_what_the_dspark_worker_wrote():
             swa_ring_size=None,
             draft_kv_ring=ring,
             inject_target_hidden=inject_target_hidden,
+            ids_for=pool_ids(2 * BLOCK),
         ),
         verify_num_draft_tokens=BLOCK,
     )
