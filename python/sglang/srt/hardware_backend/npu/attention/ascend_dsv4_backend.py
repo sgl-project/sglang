@@ -4409,10 +4409,6 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = None
             fm.actual_seq_lengths_q_pa_cpu = None
 
-        fm.swa_page_table = (
-            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
-        )
-
         if ragged_layout is not None:
             fm.actual_seq_lengths_kv = (
                 (
@@ -4428,9 +4424,34 @@ class DeepseekV4AscendAttnBackend(
                 fm.actual_seq_lengths_kv = fm.seq_lens_cpu_int.to(
                     device=forward_batch.seq_lens.device, dtype=torch.int32
                 )
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and self._dsv4_has_low_ratio
+                and not is_npu_arch35()
+            ):
+                # DSpark supplies the committed device prefix. Request slot 0
+                # is padding and does not own any rows of the verify block.
+                prefix = forward_batch.seq_lens.to(torch.int32)
+                fm.actual_seq_lengths_kv = torch.where(
+                    forward_batch.req_pool_indices != 0, prefix + n_draft, prefix
+                )
+                if self.is_hybrid_swa:
+                    # The base built only full pages. As in graph replay, leave
+                    # one page of slack for the potentially lagging host bound.
+                    hint = forward_batch.max_seq_len_host
+                    max_len = hint + self.page_size if hint else None
+                    full_locs = self.req_to_token[
+                        forward_batch.req_pool_indices, : max_len : self.page_size
+                    ]
+                    fm.block_tables_swa = (
+                        self.full_to_swa_index_mapping[full_locs] // self.page_size
+                    ).to(torch.int32)
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
+        fm.swa_page_table = (
+            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
+        )
         self._init_dspark_sparse_metadata(forward_batch)
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
