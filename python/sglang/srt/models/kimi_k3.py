@@ -180,6 +180,7 @@ _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_gfx95:
     from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
         aggregate_stream_hip,
+        gather_stream_rows_hip,
         k3_bf16_gemm_hip,
         kda_f_b_gemm_hip,
         mono_output_gate_hip,
@@ -3730,12 +3731,8 @@ class KimiK3LinearModel(nn.Module):
         next input instead."""
         hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
         if self.dspark_aux_hidden_stream == "prefix":
-            if (
-                _is_gfx95
-                and hidden_states.shape[0]
-                != self.attn_bank.require().block_residual.shape[0]
-            ):
-                return get_parallel().attn_tp_group.all_gather(hidden_states, dim=0)
+            if _is_gfx95:  # the draft reads every row of a row-sharded stream
+                return gather_stream_rows_hip(self.attn_bank.require(), hidden_states)
             return hidden_states
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]

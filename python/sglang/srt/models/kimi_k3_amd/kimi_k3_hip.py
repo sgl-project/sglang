@@ -71,3 +71,13 @@ def aggregate_stream_hip(
         return mixed
     # the draft reads every row
     return gather_row_shards(mixed, bank.block_residual.shape[0])
+
+
+def gather_stream_rows_hip(
+    bank: AttnResidual, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """``hidden_states`` on every row. Off a stream the row-sharded MoE tail left on
+    this rank's (possibly short or empty) rows, it gathers every rank's rows."""
+    if _bank_rows(bank, hidden_states) is None:
+        return hidden_states
+    return gather_row_shards(hidden_states, bank.block_residual.shape[0])
