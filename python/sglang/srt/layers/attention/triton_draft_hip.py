@@ -187,7 +187,7 @@ def maybe_fill_draft_ring_window_buffer(
     ring = backend.gqa_draft_kv_ring_hip
     if ring is None or backend.use_mla:
         return None
-    from sglang.kernels.ops.speculative.dspark_ring_window_hip import (
+    from sglang.kernels.ops.attention.dspark_ring_window_hip import (
         fill_dspark_ring_window_buffer_hip,
     )
 
