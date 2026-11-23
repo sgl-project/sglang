@@ -162,7 +162,7 @@ class ServerArgsAutoTuner:
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
-    ) -> float | None:
+    ) -> float:
         # explicit per-model > task-type default > global default
         explicit = deployment_config.keep_resident_min_available_gb
         if explicit is not None:
@@ -259,9 +259,7 @@ class ServerArgsAutoTuner:
         )
         all_resident = self._keeps_all_components_resident()
         if all_resident or (
-            min_available_gb is not None
-            and disable_threshold_gb is not None
-            and min_available_gb >= disable_threshold_gb
+            min_available_gb is not None and min_available_gb >= disable_threshold_gb
         ):
             changed = []
             components = set(
@@ -511,6 +509,118 @@ class ServerArgsAutoTuner:
             ", ".join(changed),
         )
 
+    def maybe_plan_extra_dit_residency(self) -> None:
+        """Place the DiTs a deployment loads next to the checkpoint's transformer.
+
+        The model's keep_resident_min_available_gb is the free memory that keeps
+        one DiT resident with the rest of the pipeline; every extra DiT adds its
+        dit_weight_gb. Both resident when that much is free; otherwise every DiT
+        is moved onto the GPU whole for its request and the one that ran last
+        stays there until a request needs another, so only a switch moves
+        weights. Below the one-DiT threshold, or when the policy streams the DiT
+        layer by layer, neither fits and startup fails.
+        """
+        args = self.server_args
+        if args.performance_mode != "auto" or current_platform.is_cpu():
+            return
+        extra_dits = tuple(args.pipeline_config.extra_dit_components(args))
+        if not extra_dits:
+            return
+        dits = ("transformer", *extra_dits)
+        model = args.pipeline_config.__class__.__name__
+        explicit = {
+            name: mode
+            for name in dits
+            if (mode := args.explicit_residency_mode(name)) is not None
+        }
+        if explicit:
+            logger.info(
+                "Auto memory policy for %s: explicit placement decides where "
+                "%s go (%s).",
+                model,
+                ", ".join(dits),
+                ", ".join(f"{name}={mode}" for name, mode in explicit.items()),
+            )
+            return
+        if args.use_fsdp_inference:
+            logger.info(
+                "Auto memory policy for %s: FSDP shards %s across the GPUs.",
+                model,
+                ", ".join(dits),
+            )
+            return
+        available_gb = self._get_min_available_device_memory_gb()
+        if available_gb is None:
+            return
+        deployment_config = self._deployment_config()
+        one_dit_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
+        if deployment_config.dit_weight_gb is None:
+            raise ValueError(
+                f"{model} loads {', '.join(extra_dits)} next to its transformer "
+                "but declares no dit_weight_gb, so the automatic memory policy "
+                "cannot place them; pass --component-residency for each of "
+                f"{', '.join(dits)}"
+            )
+        # tensor parallelism shards the DiT's linear layers across the ranks
+        all_dits_gb = one_dit_gb + len(extra_dits) * (
+            deployment_config.dit_weight_gb / (args.tp_size or 1)
+        )
+        layerwise = (
+            normalize_layerwise_offload_components(args.layerwise_offload_components)
+            or ()
+        )
+        dit_streams = bool(args.dit_layerwise_offload) or bool(
+            {LAYERWISE_OFFLOAD_DIT_GROUP, LAYERWISE_OFFLOAD_ALL_COMPONENTS}
+            & set(layerwise)
+        )
+        variant = (
+            f" (--model-variant {args.model_variant})" if args.model_variant else ""
+        )
+        if dit_streams or available_gb < one_dit_gb:
+            reason = (
+                f"{available_gb:.1f} GiB is free on the least-free selected GPU, "
+                f"and the model needs {one_dit_gb:.1f} GiB to keep one DiT "
+                f"resident with the rest of its pipeline ({all_dits_gb:.1f} GiB "
+                "for all of them)"
+                if available_gb < one_dit_gb
+                else "the policy streams the DiT layer by layer on this GPU"
+            )
+            raise ValueError(
+                f"{model}{variant} loads {len(dits)} DiTs ({', '.join(dits)}), "
+                "and the automatic memory policy cannot keep even one of them "
+                f"on the GPU whole: {reason}. Pass --component-residency "
+                "dit=layerwise-offload to stream every DiT layer by layer, or "
+                "--dit-cpu-offload true to move each request's DiT onto the GPU "
+                f"whole, or use GPUs with at least {one_dit_gb:.1f} GiB free."
+            )
+        if available_gb >= all_dits_gb:
+            args.dit_cpu_offload = False
+            logger.info(
+                "Auto memory policy for %s: %.1f GiB free on the least-free "
+                "selected GPU holds %s with the rest of the pipeline (%.1f GiB), "
+                "so all of them stay resident. Explicit placement flags always "
+                "win.",
+                model,
+                available_gb,
+                ", ".join(dits),
+                all_dits_gb,
+            )
+            return
+        args.dit_cpu_offload = True
+        logger.info(
+            "Auto memory policy for %s: %.1f GiB free on the least-free selected "
+            "GPU holds one DiT with the rest of the pipeline (%.1f GiB) but not "
+            "%s together (%.1f GiB), so they use component offload (the "
+            "placement --dit-cpu-offload selects): a request's DiT moves onto "
+            "the GPU whole and stays there until a request runs another one. "
+            "Explicit placement flags always win.",
+            model,
+            available_gb,
+            one_dit_gb,
+            ", ".join(dits),
+            all_dits_gb,
+        )
+
     def finalize_auto_flags(self) -> None:
         """if some args are unset after all the adjustment, set them to defaults"""
         if not self.could_override_server_args():
@@ -740,9 +850,6 @@ class ServerArgsAutoTuner:
 
         deployment_config = self._deployment_config()
         threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
-        if threshold_gb is None:
-            return components
-
         min_available_gb = self._get_min_available_device_memory_gb()
         if min_available_gb is None or min_available_gb < threshold_gb:
             return components
@@ -929,7 +1036,9 @@ class ServerArgsAutoTuner:
                 empty_cache=False,
             )
             for device_id in range(
-                args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
+                args.base_gpu_id,
+                # num_gpus is the total across nodes; probe only this node's GPUs.
+                args.base_gpu_id + max(1, args.num_gpus // max(1, args.nnodes)),
             )
         )
 
