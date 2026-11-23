@@ -36,7 +36,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
-      3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
+      3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT (4096 by default) when positive
       4. never above the requested value
       5. min_new_tokens <= max_new_tokens afterwards
 
@@ -136,7 +136,12 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         self.assertLessEqual(req.sampling_params.min_new_tokens, max_new_tokens)
         return max_new_tokens
 
-    def test_limit_disabled_by_default(self):
+    def test_default_limit_clips_large_request(self):
+        scheduler = self._new_scheduler(max_req_len=100000, max_total_num_tokens=100000)
+        req = self._new_req(max_new_tokens=8192)
+        self.assertEqual(self._init_and_check(scheduler, req), 4096)
+
+    def test_limit_can_be_disabled(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
             scheduler = self._new_scheduler()
             req = self._new_req(max_new_tokens=64)

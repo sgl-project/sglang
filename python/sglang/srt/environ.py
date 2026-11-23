@@ -710,7 +710,12 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
-    SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
+    # Hard server-side upper bound for one request's max_new_tokens. Requests
+    # above it are rejected with HTTP 400 at validation time (and clipped by
+    # the scheduler as a backstop). Defaults to 4096 so a single request
+    # cannot reserve a whole context window of decode budget; set to 0 or a
+    # negative value to disable the bound.
+    SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(4096)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
@@ -2673,7 +2678,10 @@ class Envs:
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
-    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # Defaults to 128, matching OpenAI's limit on n, so a single request
+    # cannot fan out into thousands of scheduled sub-requests; raise it
+    # (or set a negative value to remove it) for large parallel sampling.
+    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(128)
     # A request-log line that finds the log writer's buffer full: "wait" holds
     # the request until the sink takes it, as in the Python server; "drop"
     # drops the line (counted in sglang:request_log_dropped_lines_total).
