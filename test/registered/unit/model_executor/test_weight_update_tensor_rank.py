@@ -134,7 +134,15 @@ class TestTensorUpdateRebuildsEachIpcTensorOnce(CustomTestCase):
             torch_empty_cache=flush_cache is not None,
         )
         with (
-            get_parallel().override(tp_rank=1),
+            get_parallel().override(
+                tp_rank=1, tp_size=2, attn_tp_size=2, moe_tp_size=2
+            ),
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda outputs, value, group: outputs.__setitem__(
+                    slice(None), [value, value]
+                ),
+            ),
             patch(
                 "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
             ),

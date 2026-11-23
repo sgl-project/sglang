@@ -208,6 +208,7 @@ class SchedulerWeightUpdaterManager:
         selector: str,
         update: Callable[[Any], Tuple[bool, str]],
         session_load: bool = False,
+        release_weights: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, str]:
         success, message = True, "Success"
         attempted = False
@@ -218,6 +219,9 @@ class SchedulerWeightUpdaterManager:
             success, message = self._run_native_update(lambda: update(runner))
             if not success:
                 break
+
+        if release_weights is not None:
+            release_weights()
 
         if success:
             if session_load:
@@ -355,6 +359,13 @@ class SchedulerWeightUpdaterManager:
             except Exception:
                 logger.exception("Failed to deserialize weights on this TP rank")
                 raise
+
+            def release_weights():
+                nonlocal named_tensors
+                # Match the native path: release rebuilt IPC tensors before
+                # torch_empty_cache runs during the cache flush.
+                del named_tensors
+
             # Deserialization either succeeds or raises; there is no recoverable
             # outcome to agree on before the per-runner load agreement below.
             success, message = self._update_native_runners(
@@ -365,6 +376,7 @@ class SchedulerWeightUpdaterManager:
                     load_format=recv_req.load_format,
                 ),
                 session_load=True,
+                release_weights=release_weights,
             )
             if not success:
                 logger.error(message)
