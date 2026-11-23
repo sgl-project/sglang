@@ -43,14 +43,6 @@ on:
         type: string
         default: 'false'
 
-# Jobs here run PR code (pull_request_target callers): a read-only token,
-# and checkouts don't persist it.
-permissions:
-  actions: read
-  contents: read
-  issues: read
-  pull-requests: read
-
 jobs:
   compute-diffusion-partitions:
     if: inputs.multimodal_gen == 'true' && inputs.multimodal_gen_server == 'true'
@@ -63,7 +55,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -227,7 +219,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

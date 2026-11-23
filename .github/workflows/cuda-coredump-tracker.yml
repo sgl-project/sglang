@@ -1,0 +1,51 @@
+name: CUDA Coredump Tracker
+# Signals the coredump tracker issue when a CUDA test run uploaded coredumps
+# (.github/actions/upload-cuda-coredumps). A workflow of its own so the bot
+# token never shares a job with test code or with Rust modules restored from
+# the cache: this job checks nothing out and restores nothing.
+
+on:
+  workflow_run:
+    workflows: ["PR Test Base", "PR Test Extra", "Nightly Test (Nvidia)", "Weekly Test (Nvidia)"]
+    types: [completed]
+
+permissions:
+  actions: read # list the run's artifacts
+
+jobs:
+  signal:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Signal coredumps to tracker issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          TRACKER_ISSUE: "26340"
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          # When this attempt started, so an earlier attempt's artifacts don't count.
+          STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
+          PR_NUM: ${{ github.event.workflow_run.pull_requests[0].number }}
+          EVENT_NAME: ${{ github.event.workflow_run.event }}
+        run: |
+          count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --paginate \
+            --jq ".artifacts[] | select((.name | startswith(\"cuda-coredumps-\")) and .created_at >= \"${STARTED_AT}\") | .name" \
+            | wc -l)
+          echo "Coredump artifacts in this attempt: ${count}"
+          if [ "${count}" -eq 0 ]; then
+            exit 0
+          fi
+          if [ -n "${PR_NUM}" ]; then
+            ref_label="PR #${PR_NUM}"
+          else
+            ref_label="${EVENT_NAME}"
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}"
+          body_json=$(printf '{"body":"@hnyls2002 [Coredump Tracker] %s - %s"}' "${ref_label}" "${run_url}")
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${BOT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/sgl-project/sglang/issues/${TRACKER_ISSUE}/comments" \
+            -d "${body_json}"

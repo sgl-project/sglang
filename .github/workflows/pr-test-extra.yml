@@ -1,12 +1,13 @@
 name: PR Test Extra
 # Label-gated extra CI workflow opted into per-PR via labels.
 #
-# Adds runtime to a PR only when the author asks for it: the PR must carry
-# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-nv-extra` (explicit opt-in
-# to this workflow). The label check happens at runtime in pr-gate.yml via
-# live `gh pr view --json labels`, so reruns after adding the labels via
-# slash command pick up the new label set (workflow-level `if` checks would
-# read the frozen event payload, which never updates on rerun). The same
+# Adds runtime to a PR only when the author asks for it: the PR's head commit
+# must carry a run-ci approval (basic-CI prerequisite, see pr-test-approve.yml)
+# and the PR the `run-ci-nv-extra` label (explicit opt-in to this workflow).
+# Both are checked at runtime in pr-gate.yml (approval-mode commit) through
+# the API, so reruns after an approval or a label added by slash command pick
+# them up (workflow-level `if` checks would read the frozen event payload,
+# which never updates on rerun). The same
 # job graph runs unconditionally on workflow_dispatch / workflow_call so it
 # can be triggered manually or chained from another workflow.
 #
@@ -20,8 +21,9 @@ on:
   # gate in pr-gate.yml then passes.
   # The workflow file comes from the default branch, never the PR, so a PR
   # can't edit the gate or the jobs; pr-gate.yml (approval-mode commit) lets
-  # a run through only for a commit a maintainer approved with run-ci
-  # (pr-test.yml records that approval on the `labeled` event).
+  # a run through only for a head commit a maintainer approved (see
+  # pr-test-approve.yml, which also re-runs this workflow's gated run when
+  # `run-ci-nv-extra` is on the PR).
   pull_request_target:
   workflow_dispatch:
     inputs:
@@ -71,17 +73,20 @@ env:
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
+# Read-only for every job that runs PR code, including the called workflows,
+# which inherit it; jobs that write ask for it themselves.
 permissions:
-  actions: write
+  actions: read
   contents: read
   issues: read
   pull-requests: read
+  statuses: read
 
 jobs:
   # =============================================== check changes ====================================================
-  # The actual `run-ci` + `run-ci-nv-extra` label gate now lives in the
+  # The actual run-ci approval + `run-ci-nv-extra` label gate now lives in the
   # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
-  # the PR's current labels at runtime, so a rerun (e.g. via
+  # the PR's current labels and its head's approval at runtime, so a rerun (e.g. via
   # /run-extra-ci nv, which adds labels via GITHUB_TOKEN — these
   # don't cascade-trigger labeled events) picks up the new label set and
   # passes. The previous workflow-level `if` checked the frozen event
@@ -96,7 +101,7 @@ jobs:
       || needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false')
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
-      git_ref: ${{ inputs.git_ref || github.event.pull_request.head.sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
       pr_test_yml: '.github/workflows/pr-test-extra.yml'
@@ -110,12 +115,8 @@ jobs:
   call-gate:
     # Runs first, on API metadata only.
     if: github.event_name != 'schedule'
-    # Checks the run-ci approval pr-test.yml recorded for this commit.
-    permissions:
-      actions: read
-      contents: read
-      pull-requests: read
-      statuses: read
+    # Reads the run-ci approval of the head commit (statuses: read, from the
+    # top-level permissions).
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-label: run-ci-nv-extra
@@ -134,7 +135,7 @@ jobs:
     with:
       runs_on: x64-kernel-build-node
       job_display_name: Build Wheel
-      git_ref: ${{ inputs.git_ref || github.event.pull_request.head.sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
@@ -154,7 +155,7 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       artifact_name: rust-ext-x86_64-extra
-      git_ref: ${{ inputs.git_ref || github.event.pull_request.head.sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
   # Own build job for the same reason as rust-ext-build above.
@@ -165,7 +166,7 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       artifact_name: sgl-router-x86_64-extra
-      git_ref: ${{ inputs.git_ref || github.event.pull_request.head.sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
   # For the GB300 rows.
@@ -176,7 +177,7 @@ jobs:
     with:
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64-extra
-      git_ref: ${{ inputs.git_ref || github.event.pull_request.head.sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
   simulator-test-cpu:
@@ -279,44 +280,21 @@ jobs:
             exit 1
           fi
 
-  # =============================================== report status on the PR commit ===============================
-  # pull_request_target runs belong to the default branch's commit, so the PR's
-  # required check gets the result as a status on the PR's own commit.
-  report-pr-test-extra-finish:
-    needs: [pr-test-extra-finish]
-    if: always() && github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
-    permissions:
-      statuses: write
-    steps:
-      - uses: actions/github-script@v8
-        with:
-          script: |
-            const result = "${{ needs.pr-test-extra-finish.result }}";
-            const { owner, repo } = context.repo;
-            await github.rest.repos.createCommitStatus({
-              owner, repo, sha: context.payload.pull_request.head.sha, context: "pr-test-extra-finish",
-              state: result === "success" ? "success" : "failure",
-              description: `PR Test Extra: ${result}`,
-              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
-            });
-
   # =============================================== notify pr-states ====================================================
   # Dispatches pr-states.yml after every attempt (initial + every rerun).
   # workflow_run.completed only fires on the initial completion (one
   # workflow_run record across attempts), so we explicitly dispatch —
   # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
   #
-  # Fork PRs are excluded: their pull_request GITHUB_TOKEN is forced
-  # read-only regardless of declared `actions: write`, so dispatch 403s.
-  # Fork PRs get pr-states updates via the workflow_run subscription
-  # there (initial completion) and pull_request_target (push / label).
+  # Fork PRs included: a pull_request_target token is not forced read-only.
   notify-pr-states:
     needs: [pr-test-extra-finish]
     if: |
       always() &&
       github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
+    permissions:
+      actions: write # gh workflow run
     steps:
       - name: Dispatch pr-states refresh
         env:

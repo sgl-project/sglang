@@ -43,14 +43,6 @@ env:
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
-# Jobs here run PR code (pull_request_target callers): a read-only token,
-# and checkouts don't persist it.
-permissions:
-  actions: read
-  contents: read
-  issues: read
-  pull-requests: read
-
 jobs:
   build:
     runs-on: ${{ inputs.runs_on }}
@@ -74,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: "recursive"
-          ref: ${{ inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
 

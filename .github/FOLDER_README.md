@@ -12,7 +12,7 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, and approving a commit for NVIDIA PR Test Base and Extra (adding `run-ci`); write access to the repo grants the same |
 | `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
@@ -29,6 +29,14 @@ is registered under that tier in `scripts/ci/opt_in_ci_tiers.json`;
 without `run-ci`, or on a draft PR, the gate passes with `opted-in=false` and
 the caller's test jobs skip. `pr-test-finish` then fails, so a PR cannot merge
 without running Base CI.
+
+`pr-test.yml` and `pr-test-extra.yml` call the gate with `approval-mode: commit`:
+instead of the `run-ci` label they need a `ci/run-ci-approved` status on the PR's
+head commit. `pr-test-approve.yml` records it when someone with write access or
+`can_tag_run_ci_label` adds `run-ci`, and the slash command handler when such a
+user runs a command that adds it; both go through
+`scripts/ci/utils/run_ci_approval.py`, which holds that rule. A push needs a new
+approval.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where

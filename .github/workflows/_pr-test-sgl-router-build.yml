@@ -27,14 +27,6 @@ on:
 env:
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
-# Jobs here run PR code (pull_request_target callers): a read-only token,
-# and checkouts don't persist it.
-permissions:
-  actions: read
-  contents: read
-  issues: read
-  pull-requests: read
-
 jobs:
   restore:
     runs-on: ubuntu-latest
@@ -48,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
           # What the cache key hashes, plus the actions and scripts this job runs.
           sparse-checkout: |
             sgl-router
@@ -93,7 +85,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -128,6 +120,8 @@ jobs:
 
       # After the glibc check, so a rejected build cannot poison this key.
       - name: Save built binary
+        # Not from pull_request_target runs: their caches count as the default branch's.
+        if: github.event_name != 'pull_request_target'
         uses: actions/cache/save@v4
         with:
           path: sgl-router-bin/sgl-router

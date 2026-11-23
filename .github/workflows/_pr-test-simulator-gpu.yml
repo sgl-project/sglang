@@ -22,14 +22,6 @@ env:
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: "1"
 
-# Jobs here run PR code (pull_request_target callers): a read-only token,
-# and checkouts don't persist it.
-permissions:
-  actions: read
-  contents: read
-  issues: read
-  pull-requests: read
-
 jobs:
   run:
     name: simulator-test-gpu
@@ -40,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - uses: ./.github/actions/check-pr-test-health
 

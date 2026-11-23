@@ -1,0 +1,54 @@
+name: PR Test Approve
+# Adding `run-ci` approves the PR's head commit for pr-test.yml and
+# pr-test-extra.yml, whose gate (pr-gate.yml, approval-mode commit) passes a
+# run only when its head carries the ci/run-ci-approved status recorded here.
+# The approval binds to the head at the moment the label is added, so a later
+# push needs a new one. The slash command handler approves through the same
+# module (scripts/ci/utils/run_ci_approval.py).
+#
+# A separate workflow rather than a `labeled` trigger on pr-test.yml: there a
+# label event would join the run's concurrency group and cancel a GPU run in
+# progress, whatever the label.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  approve:
+    if: github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write # re-run the gated pr-test.yml / pr-test-extra.yml run
+      contents: read
+      pull-requests: read
+      statuses: write # record ci/run-ci-approved
+    steps:
+      # The default ref of pull_request_target, main: the PR is never checked
+      # out, and CI_PERMISSIONS.json is main's.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github
+            scripts/ci
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install PyGithub
+
+      - name: Approve the head commit and run CI on it
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+        run: python scripts/ci/utils/run_ci_approval.py

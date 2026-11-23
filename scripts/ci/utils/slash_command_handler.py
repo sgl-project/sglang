@@ -30,6 +30,14 @@ sys.path.insert(
     ),
 )
 import ci_register as _ci_register  # noqa: E402
+import run_ci_approval as _run_ci_approval  # noqa: E402
+from run_ci_approval import (  # noqa: E402
+    _latest_run_per_workflow,
+    _pr_workflow_runs,
+    _skipped_at_gate,
+    _workflow_file,
+    load_permissions,
+)
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -39,7 +47,6 @@ import ci_register as _ci_register  # noqa: E402
 _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
-PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
@@ -286,33 +293,6 @@ def _strip_format_chars(s):
     return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
-def load_permissions(user_login):
-    """
-    Reads the permissions JSON from the local file system and returns
-    the permissions dict for the specific user.
-    """
-    try:
-        print(f"Loading permissions from {PERMISSIONS_FILE_PATH}...")
-        if not os.path.exists(PERMISSIONS_FILE_PATH):
-            print(f"Error: Permissions file not found at {PERMISSIONS_FILE_PATH}")
-            return None
-
-        with open(PERMISSIONS_FILE_PATH, "r") as f:
-            data = json.load(f)
-
-        user_perms = data.get(user_login)
-
-        if not user_perms:
-            print(f"User '{user_login}' not found in permissions file.")
-            return None
-
-        return user_perms
-
-    except Exception as e:
-        print(f"Failed to load or parse permissions file: {e}")
-        sys.exit(1)
-
-
 def has_sgl_kernel_changes(pr):
     """
     Check if the PR has changes to the AOT kernel directory.
@@ -383,24 +363,31 @@ def handle_tag_run_ci(
 
     tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
     the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
-    their own label, so `run-ci` is always added alongside. Reuses the same
-    `can_tag_run_ci_label` permission for every tier.
+    their own label, so `run-ci` is always added alongside. The commenter
+    needs the permission run_ci_approval.can_approve checks, for every tier.
+
+    Adding `run-ci` here also approves the PR's current head commit for the
+    workflows that gate on a per-commit approval (pr-test.yml,
+    pr-test-extra.yml), as adding the label in the UI does.
 
     Labels added here do not start a run: GITHUB_TOKEN label events do not
     trigger workflows, and opt-in workflows don't listen to `labeled`. The
-    label gate in pr-gate.yml reads the live label set, so the next push, or
-    a rerun of the gated run (/tag-and-rerun-ci), picks the labels up.
+    gate in pr-gate.yml reads the live label set and the head's approval, so
+    the next approved push, or a rerun of the gated run (/tag-and-rerun-ci),
+    picks them up.
 
     Returns True if action was taken, False otherwise.
     """
-    if not user_perms.get("can_tag_run_ci_label", False):
-        print("Permission denied: can_tag_run_ci_label is false.")
+    user_login = comment.user.login
+    if not _run_ci_approval.can_approve(gh_repo, user_login, user_perms):
+        print("Permission denied: needs write access or can_tag_run_ci_label.")
         return False
 
     labels = ["run-ci", *tier_labels]
     print(f"Permission granted. Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
+    _run_ci_approval.record_approval(gh_repo, pr.head.sha, user_login)
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -428,37 +415,6 @@ def _refresh_pr_states(gh_repo, pr):
         )
     except Exception as e:
         print(f"Could not refresh the CI-states block: {e}")
-
-
-def _latest_run_per_workflow(runs):
-    """
-    Collapse a head_sha's workflow runs to the newest run per workflow.
-
-    GitHub can have several runs of the *same* workflow at one commit — a
-    `synchronize` run superseded by a `labeled` run, or a run cancelled by
-    `cancel-in-progress` (pr-test.yml sets it) while its replacement is
-    already in flight. Only the newest one reflects current state; rerunning
-    the older ones spawns duplicates that fight the live run for runners.
-    """
-    latest = {}
-    for run in runs:
-        current = latest.get(run.workflow_id)
-        if current is None or run.id > current.id:
-            latest[run.workflow_id] = run
-    return list(latest.values())
-
-
-def _pr_workflow_runs(gh_repo, pr):
-    """Keep target-event runs scoped to this PR's source repository and branch."""
-    for run in gh_repo.get_workflow_runs(head_sha=pr.head.sha):
-        if run.event == "pull_request_target" and (
-            run.head_branch != pr.head.ref
-            or run.head_repository is None
-            or pr.head.repo is None
-            or run.head_repository.id != pr.head.repo.id
-        ):
-            continue
-        yield run
 
 
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
@@ -544,15 +500,18 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   rerun_failed_jobs() is scoped to a single workflow run.
     # - a run whose tests pr-gate skipped (green, or failed only in
     #   pr-test-finish): run.rerun() once the PR has what that gate needs
-    #   (`run-ci`, not a draft, the workflow's opt-in labels), since
-    #   rerun_failed_jobs() would rerun at most the finish job.
+    #   (`run-ci`, or for the approval workflows an approved head commit; not
+    #   a draft; the workflow's opt-in labels), since rerun_failed_jobs()
+    #   would rerun at most the finish job. This command never approves.
     runs = _latest_run_per_workflow(_pr_workflow_runs(gh_repo, pr))
     labels = {label.name for label in pr.get_labels()}
     can_run = "run-ci" in labels and not pr.draft
+    head_approved = _run_ci_approval.is_approved(gh_repo, head_sha)
     tiers = _load_opt_in_tiers().values()
 
     rerun_count = 0
     left_skipped = False
+    left_unapproved = False
     for run in runs:
         if run.status != "completed":
             # A newer attempt is still in flight - nothing to recover.
@@ -563,7 +522,11 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 for t in tiers
                 if t["label"] and _workflow_file(run) in t["workflows"]
             }
-            ready = can_run and needed <= labels
+            needs_approval = (
+                _workflow_file(run) in _run_ci_approval.APPROVAL_WORKFLOWS
+                and not head_approved
+            )
+            ready = can_run and needed <= labels and not needs_approval
             if run.conclusion == "success" and not ready:
                 continue
             if run.conclusion in ("success", "failure") and _skipped_at_gate(run):
@@ -575,7 +538,8 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                     rerun_count += 1
                 else:
                     print(f"Leaving {run.name}: its gate still skips the tests")
-                    left_skipped = left_skipped or not can_run
+                    left_skipped = left_skipped or not can_run or needs_approval
+                    left_unapproved = left_unapproved or needs_approval
                 continue
             if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
                 # action_required (fork PR awaiting approval) is deliberately
@@ -611,7 +575,15 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             step
             for lacking, step in (
                 (pr.draft, "mark the PR ready for review"),
-                ("run-ci" not in labels, "add the `run-ci` label"),
+                (
+                    "run-ci" not in labels and not left_unapproved,
+                    "add the `run-ci` label",
+                ),
+                (
+                    left_unapproved,
+                    "have a maintainer approve this commit "
+                    "(`/tag-and-rerun-ci`, or add `run-ci` again)",
+                ),
             )
             if lacking
         ]
@@ -623,25 +595,6 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("confused")
     print("No workflow found to rerun.")
     return False
-
-
-def _workflow_file(run):
-    # The runs API may suffix `path` with `@<ref>`.
-    return run.path.split("@", 1)[0]
-
-
-# The pr-gate.yml step that runs only when it skips the caller's tests: a draft
-# PR, or one missing `run-ci` or the workflow's opt-in label.
-GATE_SKIP_STEP = "Skip tests"
-
-
-def _skipped_at_gate(run):
-    """True if pr-gate skipped this run's tests."""
-    return any(
-        step.name == GATE_SKIP_STEP and step.conclusion == "success"
-        for job in run.jobs()
-        for step in job.steps
-    )
 
 
 def _rerun_workflow_run(run):
@@ -741,8 +694,9 @@ def handle_run_hardware_ci(gh_repo, pr, comment, user_perms, selected_tiers):
     tiers' workflows, including successful runs.
 
     Gated on the same two permissions as the steps it performs (the label add
-    needs can_tag_run_ci_label, the re-run can_rerun_failed_ci) rather than a
-    new key, so every user who can already drive CI can drive opt-in CI.
+    and approval need run_ci_approval.can_approve, the re-run
+    can_rerun_failed_ci) rather than a new key, so every user who can already
+    drive CI can drive opt-in CI.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
@@ -775,6 +729,17 @@ def handle_run_hardware_ci(gh_repo, pr, comment, user_perms, selected_tiers):
 
     print("Waiting 5 seconds for labels to propagate...")
     time.sleep(5)
+
+    # The approval workflows' runs may still be deciding at their gate; those
+    # whose gate skipped are re-run here, so the step below finds them in
+    # flight and leaves them alone.
+    for _, gated_message in _run_ci_approval.rerun_gated_runs(
+        gh_repo,
+        pr,
+        pr.head.sha,
+        [p for p in workflow_files if p in _run_ci_approval.APPROVAL_WORKFLOWS],
+    ):
+        print(gated_message)
 
     acted, message = _rerun_tier_workflows(
         gh_repo,
@@ -2071,7 +2036,7 @@ def main():
 
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
+    # Note: /tag-run-ci-label still requires write access or CI_PERMISSIONS.json.
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -2165,6 +2130,16 @@ def main():
         if tagged:
             print("Waiting 5 seconds for label to propagate...")
             time.sleep(5)
+            # Runs of the approval workflows whose gate skipped before the
+            # approval; handle_rerun_failed_ci then finds them in flight.
+            labels = {label.name for label in pr.get_labels()}
+            for _, message in _run_ci_approval.rerun_gated_runs(
+                repo,
+                pr,
+                pr.head.sha,
+                _run_ci_approval.approval_workflows_for(labels),
+            ):
+                print(message)
 
         rerun = handle_rerun_failed_ci(
             repo, pr, comment, user_perms, react_on_success=False

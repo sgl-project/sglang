@@ -103,14 +103,6 @@ env:
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
-# Jobs here run PR code (pull_request_target callers): a read-only token,
-# and checkouts don't persist it.
-permissions:
-  actions: read
-  contents: read
-  issues: read
-  pull-requests: read
-
 jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
@@ -132,6 +124,15 @@ jobs:
     # below in a setup step via $GITHUB_ENV.
     runs-on: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: ${{ fromJson(inputs.job_timeout_minutes) }}
+    # The only stages that get a secret besides GITHUB_TOKEN: b300's tests read
+    # HF_MUSE_SPARK_TOKEN, and the scheduled 8-gpu-h200 stage runs the one test
+    # that writes with HF_TOKEN_PRECISION_STORE. They build the Rust extensions
+    # and sgl-router from source rather than run cached code: a
+    # pull_request_target run (PR code) can write into the default branch's
+    # cache, and a same-run artifact may have come from that cache.
+    env:
+      MUSE_SPARK_STAGE: ${{ github.event_name != 'pull_request_target' && inputs.runner_config == '8-gpu-b300' }}
+      PRECISION_STORE_STAGE: ${{ github.event_name != 'pull_request_target' && inputs.scheduled && inputs.runner_config == '8-gpu-h200' }}
     strategy:
       fail-fast: false
       max-parallel: ${{ (inputs.scheduled && !fromJson(inputs.caller_inputs).full_parallel) && 1 || fromJson(inputs.partitions)[inputs.self_name].max_parallel }}
@@ -141,7 +142,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - name: Resolve runner_config
         id: rc
@@ -186,12 +187,14 @@ jobs:
         if: ${{ !inputs.skip_prebuilt_rust_ext }}
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
+          from_source: ${{ env.MUSE_SPARK_STAGE == 'true' || env.PRECISION_STORE_STAGE == 'true' }}
 
       # The PD fixture needs two GPUs, so 1-gpu pools never launch the router.
       - uses: ./.github/actions/download-sgl-router
         if: ${{ !startsWith(inputs.runner_config, '1-gpu') }}
         with:
           artifact_name: ${{ inputs.sgl_router_artifact }}
+          from_source: ${{ env.MUSE_SPARK_STAGE == 'true' || env.PRECISION_STORE_STAGE == 'true' }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
@@ -230,8 +233,7 @@ jobs:
       - name: Export precision baseline env
         if: inputs.scheduled
         env:
-          # Repo secrets never reach pull_request_target runs: they carry PR code.
-          BASELINE_HF_TOKEN: ${{ github.event_name != 'pull_request_target' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
+          BASELINE_HF_TOKEN: ${{ env.PRECISION_STORE_STAGE == 'true' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
           {
             echo "SGLANG_PRECISION_BASELINE_DIR=/tmp/sglang_precision_baselines"
@@ -248,7 +250,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
-          HF_MUSE_SPARK_TOKEN: ${{ github.event_name != 'pull_request_target' && inputs.runner_config == '8-gpu-b300' && secrets.HF_MUSE_SPARK_TOKEN || '' }}
+          HF_MUSE_SPARK_TOKEN: ${{ env.MUSE_SPARK_STAGE == 'true' && secrets.HF_MUSE_SPARK_TOKEN || '' }}
           # Read only by test_runai_model_loader.py (nightly 1-gpu); inert elsewhere.
           # Left unconditional because an `env:` key cannot be omitted, and an empty
           # value would reach the runai streamer as a malformed limit.
@@ -288,12 +290,12 @@ jobs:
           retention-days: 5
           if-no-files-found: ignore
 
+      # cuda-coredump-tracker.yml signals the tracker issue from these
+      # artifacts, so the bot token never shares a job with the tests.
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
-          tracker-issue: "26340"
-          bot-token: ${{ github.event_name != 'pull_request_target' && secrets.GH_PAT_FOR_PULL_REQUEST || '' }}
 
       - name: Cleanup venv
         if: always()

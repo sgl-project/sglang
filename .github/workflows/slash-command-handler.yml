@@ -9,6 +9,7 @@ permissions:
   pull-requests: write # Required to add labels and reactions
   actions: write       # Required to rerun workflows
   issues: write        # Required for comment reactions in some contexts
+  statuses: write      # Required to record the per-commit run-ci approval
 
 jobs:
   slash_command:
