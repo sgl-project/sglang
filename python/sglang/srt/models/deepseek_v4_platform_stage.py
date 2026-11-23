@@ -123,6 +123,10 @@ class NonCudaDecoderMixin:
         self.next_boundary = None
 
     @cached_property
+    def _mega_mhc_on_decode(self) -> bool:
+        return mhc.mega_mhc_on_decode()
+
+    @cached_property
     def _mega_closed_seam(self) -> bool:
         return mhc.can_use_mega_closed_seam(self.attn_hc)
 
@@ -148,7 +152,7 @@ class NonCudaDecoderMixin:
         self._init_boundaries()
         local_boundary, next_boundary = (
             self._extend_boundaries
-            if mhc.is_local_extend(forward_batch) or mhc.mega_mhc_on_decode()
+            if mhc.is_local_extend(forward_batch) or self._mega_mhc_on_decode
             else (self.local_boundary, self.next_boundary)
         )
         stats_stream = None

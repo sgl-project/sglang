@@ -288,6 +288,8 @@ class TestHipBoundaryExtend(unittest.TestCase):
                         mock.patch.object(mhc, "_is_hip", hip),
                         envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.override(mega_decode),
                     ):
+                        # a new server: each layer resolves the switch once
+                        layer.__dict__.pop("_mega_mhc_on_decode", None)
                         seen.clear()
                         layer.forward_hc_pre_from_prev(
                             None,
