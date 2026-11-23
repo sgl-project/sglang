@@ -297,7 +297,8 @@ Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B
 
 Docker images for Ascend NPU are available in two types:
 
-- **Stable release** — validated version with a specific tag. Recommended for production deployments.
+- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`.
+  Recommended for production deployments.
 - **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann9.1.0-a3`. Use this
   if you need the latest features or bug fixes that have not yet been included in a stable release. CANN 9.2.0 has no
   daily builds published yet, so daily-build tags are currently available only for CANN 9.1.0.
@@ -329,7 +330,7 @@ model-weights or cache mounts from the original command, and drop `-e ASCEND_VIS
 # ============================================================
 
 NAME=sglang
-IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
+IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
 
 # A full A3 Series node exposes /dev/davinci0 through /dev/davinci15 (ids are DIE-level)
 docker run -itd --shm-size=16g --name "$NAME" \
@@ -401,6 +402,6 @@ docker run -itd --shm-size=16g --name "$NAME" \
 </Tabs>
 
 <Note>
-950PR/DT Series containers additionally need `-e ASCEND_USE_FIA=1` (see the examples in the
+`-e ASCEND_USE_FIA=1` in the 950PR/DT Series command above is required (see the examples in the
 [installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation#create-docker-container)).
 </Note>
