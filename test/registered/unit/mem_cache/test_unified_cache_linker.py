@@ -4,7 +4,7 @@ import sys
 import threading
 import unittest
 from array import array
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from itertools import product
@@ -2582,6 +2582,7 @@ class TestTransferReadyEvents(CustomTestCase):
         linker.stats = {"offload": 1}
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()
+        linker.deferred_mamba_removals = deque()
         linker.offload_queue.put(
             (
                 ["transfer"],

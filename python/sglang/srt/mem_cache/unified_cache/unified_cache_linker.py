@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -64,6 +65,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+# One entry per live path tail this rank has seen; the oldest are forgotten
+# first, which only leaves their states to store eviction.
+_MAX_KNOWN_MAMBA_KEYS = 1 << 16
 
 # The token and state components the linker stores, besides the tree's window
 # slots (which it finds by family, whatever ids the tree gives them).
@@ -351,8 +356,9 @@ class UnifiedCacheLinkerWrapper:
         self._drop_superseded_mamba = getattr(
             cache_linker, "supports_mamba_state_removal", False
         )
-        # Mamba keys this rank stored and has not yet superseded.
-        self._own_mamba_keys: set[str] = set()
+        # Mamba keys this rank stored or loaded and has not yet superseded,
+        # oldest first. A loaded key may have been written by another rank.
+        self._known_mamba_keys: OrderedDict[str, None] = OrderedDict()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -612,6 +618,7 @@ class UnifiedCacheLinkerWrapper:
             # The normal insert protects the borrowed prefix and frees duplicate
             # fetched slots. Avoid writing the just-fetched data back to storage.
             mamba = by_pool.get(PoolName.MAMBA)
+            self._remember_loaded_mamba_key(by_pool.values())
             if mamba is not None:
                 sub_pool = storage.tree_sub_pool(ComponentType.MAMBA.name)
                 # A restored checkpoint has no pending ReplaySSM updates.
@@ -740,6 +747,9 @@ class UnifiedCacheLinkerWrapper:
             component_transfers,
             prefix_len,
         )
+        self._remember_loaded_mamba_key(
+            [transfer for _, transfer in component_transfers]
+        )
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable window range as tombstones instead of rebuilding
@@ -847,30 +857,52 @@ class UnifiedCacheLinkerWrapper:
             kept.append(transfer)
         return kept
 
+    def _remember_mamba_key(self, key: str) -> None:
+        self._known_mamba_keys[key] = None
+        self._known_mamba_keys.move_to_end(key)
+        if len(self._known_mamba_keys) > _MAX_KNOWN_MAMBA_KEYS:
+            self._known_mamba_keys.popitem(last=False)
+
+    def _remember_loaded_mamba_key(self, transfers) -> None:
+        if not self._drop_superseded_mamba:
+            return
+        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+        if mamba is not None and mamba.keys:
+            self._remember_mamba_key(mamba.keys[-1])
+
     def _superseded_mamba_keys(
         self, node_id: NodeId, transfers: list[PoolTransfer]
     ) -> Optional[list[str]]:
-        """Keys of Mamba states this rank stored on non-fork ancestors of a node
-        that now stores a newer state on the same path."""
+        """Keys of known Mamba states on the path of a node that now stores a
+        newer state, except at a fork point of this rank's tree.
+
+        A known state is one this rank stored or loaded, so a turn routed to
+        another rank than the previous one still supersedes that turn's state.
+        A fork that only another rank saw is not visible here; that branch
+        recomputes from an earlier state.
+        """
         if not self._drop_superseded_mamba or self.cache.tree_core.is_eagle:
             return None
         mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
         if mamba is None or not mamba.keys:
             return None
+        new_key = mamba.keys[-1]
         page = self.cache.page_size
-        hashes = self.cache.get_prefix_hash_values(node_id)
-        keys = []
-        for info in self.cache.tree_core.collect_path_info([node_id])[0]:
-            if info.node_id == node_id or info.num_children != 1:
-                continue
-            end = info.path_end
-            if end <= 0 or end % page or end // page > len(hashes):
-                continue
-            key = hashes[end // page - 1]
-            if key in self._own_mamba_keys:
-                self._own_mamba_keys.discard(key)
-                keys.append(key)
-        self._own_mamba_keys.add(mamba.keys[-1])
+        forks = {
+            info.path_end // page
+            for info in self.cache.tree_core.collect_path_info([node_id])[0]
+            if info.num_children > 1 and info.path_end % page == 0
+        }
+        keys = [
+            key
+            for pages, key in enumerate(
+                self.cache.get_prefix_hash_values(node_id), start=1
+            )
+            if key != new_key and key in self._known_mamba_keys and pages not in forks
+        ]
+        for key in keys:
+            del self._known_mamba_keys[key]
+        self._remember_mamba_key(new_key)
         return keys or None
 
     def _offload_node(

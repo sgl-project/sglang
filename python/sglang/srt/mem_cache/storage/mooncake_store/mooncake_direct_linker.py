@@ -4,6 +4,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -40,6 +41,14 @@ device_module = get_device_module()
 
 DEFAULT_LOAD_LAYER_GROUP = 8
 DEFAULT_LOAD_THREADS = 4
+# Retry a leased superseded state after the lease lapses; set it above the
+# master's --default_kv_lease_ttl.
+DEFAULT_MAMBA_REMOVE_RETRY_SECS = 65.0
+MAMBA_REMOVE_MAX_RETRIES = 3
+# Mooncake ErrorCode values returned per key by batch_remove.
+_MOONCAKE_REPLICA_IS_NOT_READY = -703
+_MOONCAKE_OBJECT_NOT_FOUND = -704
+_MOONCAKE_OBJECT_HAS_LEASE = -706
 
 
 def _storage_suffix(
@@ -157,6 +166,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
         )
         self.load_mode = extra_config.pop("load_mode", "layer_wise")
+        self.mamba_remove_retry_secs = float(
+            extra_config.get("mamba_remove_retry_secs", DEFAULT_MAMBA_REMOVE_RETRY_SECS)
+        )
+        # (due time, attempt, keys) of superseded states refused while leased.
+        self.deferred_mamba_removals: deque[tuple[float, int, list[str]]] = deque()
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -640,7 +654,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def offload_thread_func(self) -> None:
         while True:
-            task = self.offload_queue.get()
+            try:
+                task = self.offload_queue.get(timeout=self._mamba_retry_timeout())
+            except Empty:
+                self._retry_mamba_removals()
+                continue
             try:
                 if task is None:
                     return
@@ -665,19 +683,47 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+            self._retry_mamba_removals()
 
-    def _remove_mamba_states(self, keys: list[str]) -> None:
+    def _mamba_retry_timeout(self) -> float | None:
+        if not self.deferred_mamba_removals:
+            return None
+        return max(0.0, self.deferred_mamba_removals[0][0] - time.monotonic())
+
+    def _retry_mamba_removals(self) -> None:
+        now = time.monotonic()
+        while (
+            self.deferred_mamba_removals and self.deferred_mamba_removals[0][0] <= now
+        ):
+            _, attempt, keys = self.deferred_mamba_removals.popleft()
+            self._remove_mamba_states(keys, attempt)
+
+    def _remove_mamba_states(self, keys: list[str], attempt: int = 0) -> None:
         # Runs after the newer state is stored, so a path never loses its last state.
+        # No force: a lease means a reader may be mid-transfer, so a leased state
+        # is retried once its lease can have lapsed.
         try:
             results = self.storage.batch_remove_pool_keys(PoolName.MAMBA, keys)
         except Exception:
             logger.warning("Mooncake superseded Mamba removal failed", exc_info=True)
             return
-        removed = sum(1 for r in results if r == 0)
-        self.stats["mamba_removed"] = self.stats.get("mamba_removed", 0) + removed
-        self.stats["mamba_remove_skipped"] = (
-            self.stats.get("mamba_remove_skipped", 0) + len(results) - removed
-        )
+        retry = []
+        for key, code in zip(keys, results):
+            if code == 0:
+                outcome = "mamba_removed"
+            elif code == _MOONCAKE_OBJECT_NOT_FOUND:
+                outcome = "mamba_remove_not_found"
+            elif code in (_MOONCAKE_OBJECT_HAS_LEASE, _MOONCAKE_REPLICA_IS_NOT_READY):
+                outcome = "mamba_remove_leased"
+                if attempt < MAMBA_REMOVE_MAX_RETRIES:
+                    retry.append(key)
+            else:
+                outcome = "mamba_remove_failed"
+            self.stats[outcome] = self.stats.get(outcome, 0) + 1
+        if retry:
+            self.deferred_mamba_removals.append(
+                (time.monotonic() + self.mamba_remove_retry_secs, attempt + 1, retry)
+            )
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
