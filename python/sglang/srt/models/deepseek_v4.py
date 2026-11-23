@@ -2582,10 +2582,10 @@ class MQALayer(MqaAttentionBase):
             elif in_replay_tail_graph():
                 bcg_tail_kv_store(
                     self,
-                    x_linear,
-                    positions,
-                    qkv_a,
-                    q if fuse_q_rope else None,
+                    x=x_linear,
+                    positions=positions,
+                    qkv_a=qkv_a,
+                    q_rope=q if fuse_q_rope else None,
                 )
                 kv = None
             else:
