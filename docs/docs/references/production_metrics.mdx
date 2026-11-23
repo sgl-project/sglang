@@ -119,6 +119,8 @@ sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 
 `sglang:cache_hit_rate` is the hit rate over the tokens admitted in one scheduler reporting interval: token-weighted, excluding tokens that had to be reprocessed after a retraction. It is exported whenever `--enable-metrics` is on and its semantics do not depend on any flag.
 
+Because it is computed per reporting interval, an interval that admits no new prompt reports `0%`. This is most visible while a long prompt is still being chunk-prefilled: continuation chunks add newly computed tokens but no new cache hits. A `0%` value therefore means "nothing new was admitted in this interval", not "the cache stopped working" -- unlike the windowed log line, which is omitted while the window is empty. For dashboards, prefer the counter ratio below or the windowed log line over averaging this gauge.
+
 `--enable-prefix-cache-hit-rate-window` additionally reports a token-weighted hit rate over the most recent **~1000 admitted requests**, using the same sliding-window semantics vLLM uses for its log line (`CachingMetrics`). It is log-only: no new metric is exported.
 
 ```bash Command
