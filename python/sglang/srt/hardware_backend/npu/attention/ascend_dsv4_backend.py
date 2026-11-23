@@ -1329,7 +1329,7 @@ class LowRatioCompressAscendBackendMixin:
         if layer.layer_id == self.tail_source_kv_layer_id:
             run_compressor = False
 
-        query_tokens = self._dsv41_a3_verify_num_tokens(forward_batch)
+        query_tokens = self._dsv41_a3_query_tokens(forward_batch)
         if query_tokens is not None:
             # TP-only padding is not an extra query in the last request. Keep
             # compressor, indexer Q and candidate rows on the same TND geometry.
@@ -2131,14 +2131,19 @@ class LowRatioCompressAscendBackendMixin:
             out[key] = metadata
         return out
 
-    def _dsv41_a3_verify_num_tokens(self, forward_batch):
+    def _dsv41_a3_query_tokens(self, forward_batch) -> int | None:
         mode = getattr(forward_batch, "forward_mode", None)
-        if is_npu_arch35() or mode is None or not mode.is_target_verify():
+        if is_npu_arch35() or mode is None:
             return None
-        # Static verify geometry is known on the host; do not read cu[-1] from
-        # the device during graph capture. Compact verification is rejected.
-        width = int(forward_batch.spec_info.draft_token_num)
-        return int(forward_batch.batch_size) * width
+        if mode.is_target_verify():
+            # Fixed-width verify may be graph-captured: use host geometry.
+            width = int(forward_batch.spec_info.draft_token_num)
+            return int(forward_batch.batch_size) * width
+        if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            # Eager prefill: packed TND rows must end at cu_q[-1], even when
+            # MLP sync padded the token axis for attention TP.
+            return int(self.forward_metadata.actual_seq_lengths_q_pa_cpu[-1])
+        return None
 
     def _dsv41_a3_kv_lengths(self, forward_batch, *, metadata=None):
         fm = self.forward_metadata if metadata is None else metadata
@@ -2202,7 +2207,7 @@ class LowRatioCompressAscendBackendMixin:
                 f"available: {list(fm.kernel_metadata.keys())}."
             )
         if not is_npu_arch35():
-            query_tokens = self._dsv41_a3_verify_num_tokens(forward_batch)
+            query_tokens = self._dsv41_a3_query_tokens(forward_batch)
             attention_q = q if query_tokens is None else q[:query_tokens]
             kwargs = self._dsv41_a3_attention_kwargs(forward_batch, compress_ratio)
             if compress_ratio:
@@ -2375,18 +2380,15 @@ class LowRatioCompressAscendBackendMixin:
         device = forward_batch.positions.device
         positions = forward_batch.positions.reshape(-1).to(torch.int64)
         out_loc = forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
-        mode = getattr(forward_batch, "forward_mode", None)
+        query_tokens = self._dsv41_a3_query_tokens(forward_batch)
         is_a3_verify = (
-            not is_npu_arch35() and mode is not None and mode.is_target_verify()
+            query_tokens is not None and forward_batch.forward_mode.is_target_verify()
         )
         if is_a3_verify and out_loc.numel() < positions.numel():
             out_loc = F.pad(out_loc, (0, positions.numel() - out_loc.numel()))
         n = min(int(positions.numel()), int(out_loc.numel()))
-        if is_a3_verify:
-            n = min(
-                n,
-                self._dsv41_a3_verify_num_tokens(forward_batch),
-            )
+        if query_tokens is not None:
+            n = min(n, query_tokens)
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
         if is_a3_verify:
