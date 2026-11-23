@@ -673,35 +673,36 @@ class DSANPUIndexerMixin:
                 print_info_once(
                     f"DSA Verify indexer request sharding: {shard.rows} query rows per rank"
                 )
+        is_pcp_prefill = is_prefill and uses_prefill_cp
+        query = q.view(-1, self.n_heads, self.head_dim)
+        pcp_shard = None
         if (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-            and not use_quant_indexer
+            is_pcp_prefill
+            and allow_pcp_query_shard
+            and getattr(forward_batch, "dsa_cp_metadata_prepared", False)
+            and block_table is not None
+            and weights.shape[0] == query.shape[0]
+            and (
+                not use_quant_indexer or pool.index_k_store_dtype == torch.float8_e4m3fn
+            )
         ):
-            query = q.view(-1, self.n_heads, self.head_dim)
-            pcp_shard = None
-            if (
-                allow_pcp_query_shard
-                and getattr(forward_batch, "dsa_cp_metadata_prepared", False)
-                and block_table is not None
-                and weights.shape[0] == query.shape[0]
-            ):
-                pcp_shard = build_dsa_pcp_query_shard(
-                    query.shape[0],
-                    actual_seq_lengths_q,
-                    actual_seq_lengths_kv,
-                    block_table,
-                    parallel.attn_tp_size,
-                    parallel.attn_tp_rank,
-                )
-            if pcp_shard is not None:
-                rows = slice(pcp_shard.plan.local_start, pcp_shard.plan.local_end)
-                query, weights = query[rows], weights[rows]
-                actual_seq_lengths_q = pcp_shard.query_ends
-                actual_seq_lengths_kv = pcp_shard.key_lens
-                block_table = pcp_shard.block_table
-                print_info_once("DSA PCP keeps rank-local Top-K for query-sharded SFA")
+            pcp_shard = build_dsa_pcp_query_shard(
+                query.shape[0],
+                actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                block_table,
+                parallel.attn_tp_size,
+                parallel.attn_tp_rank,
+            )
+        if pcp_shard is not None:
+            rows = slice(pcp_shard.plan.local_start, pcp_shard.plan.local_end)
+            query, weights = query[rows], weights[rows]
+            actual_seq_lengths_q = pcp_shard.query_ends
+            actual_seq_lengths_kv = pcp_shard.key_lens
+            block_table = pcp_shard.block_table
+            print_info_once("DSA PCP keeps rank-local Top-K for query-sharded SFA")
+
+        if is_pcp_prefill and not use_quant_indexer:
             topk_indices = self.do_npu_cp_balance_indexer(
                 query,
                 past_key_states,
@@ -710,15 +711,12 @@ class DSANPUIndexerMixin:
                 actual_seq_lengths_kv,
                 block_table,
             )
-            forward_batch.npu_dsa_pcp_query_shard = pcp_shard
-            return topk_indices
         else:
-            if is_prefill and uses_prefill_cp:
+            if is_pcp_prefill:
                 weights = weights.contiguous().view(-1, weights.shape[-1])
                 actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
             elif is_prefill:
                 block_table = block_table[: actual_seq_lengths_q.size(0)]
-            query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
             num_query_tokens = bs
             if shard is not None:
@@ -803,8 +801,10 @@ class DSANPUIndexerMixin:
                 )
             else:
                 forward_batch.npu_indexer_topk_is_local = False
-            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices
+        if is_pcp_prefill:
+            forward_batch.npu_dsa_pcp_query_shard = pcp_shard
+        # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+        return topk_indices
 
     def do_npu_cp_balance_indexer(
         self,

@@ -1911,9 +1911,11 @@ class AscendAttnBackend(AttentionBackend):
         parallel = get_parallel()
         return (
             self.use_dsa
-            and self.kv_cache_dtype == torch.bfloat16
+            and (
+                self.kv_cache_dtype == torch.bfloat16
+                or self.token_to_kv_pool.dsa_kv_cache_store_fp8
+            )
             and self.qk_rope_head_dim > 0
-            and not self.token_to_kv_pool.dsa_kv_cache_store_fp8
             and not self.enable_sparsity_driven_kv_offload
             and not self.graph_mode
             and not get_is_capture_mode()
@@ -1948,6 +1950,7 @@ class AscendAttnBackend(AttentionBackend):
                 layer,
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
+                block_table=block_table,
             )
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
@@ -1986,6 +1989,8 @@ class AscendAttnBackend(AttentionBackend):
         layer,
         actual_seq_qlen,
         actual_seq_lengths_kv,
+        *,
+        block_table: Optional[torch.Tensor] = None,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
         packed = packed_kv.view(torch.float8_e4m3fn)
@@ -2005,7 +2010,11 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=actual_seq_lengths_kv.to(
                 device=q_nope.device, dtype=torch.int32
             ),
-            block_table=self.forward_metadata.block_tables,
+            block_table=(
+                self.forward_metadata.block_tables
+                if block_table is None
+                else block_table
+            ),
             sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
