@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.argparse_actions import NoneChoiceAction
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -1093,7 +1094,8 @@ class ExecMoe(msgspec.Struct):
         Literal[None, "mooncake", "nixl"],
         Arg(
             help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            action=NoneChoiceAction,
+            action_kwargs={"choices": ["none", "mooncake", "nixl"]},
         ),
     ] = None
     enable_elastic_expert_backup: A[

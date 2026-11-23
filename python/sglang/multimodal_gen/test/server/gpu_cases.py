@@ -1416,6 +1416,23 @@ TWO_GPU_CASES = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "flux3_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/flux-3-image-klein",
+            tp_size=2,
+            extras=["--component-residency all=resident --attention-backend fa"],
+        ),
+        DiffusionSamplingParams(
+            prompt="A red fox in snow",
+            output_size="512x512",
+            output_format="png",
+            extras={"seed": 42},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
@@ -1677,10 +1694,14 @@ STANDALONE_FILES = {
         "../unit/test_kandinsky6_sr_decode_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
         "../unit/test_nomas_parallel.py",
+        "../unit/test_qwen3_encoder_graph_cuda.py",
         "../unit/test_qwen_image21_distributed.py",
         "../unit/test_text_encoding_cache.py",
     ],
 }
+
+# the CI planner reads the CUDA registry before platform-specific list replacements
+CUDA_STANDALONE_FILES = STANDALONE_FILES.copy()
 
 # BCG and the component reference suites previously ran in dedicated CUDA jobs.
 if not current_platform.is_cuda():
@@ -1773,6 +1794,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
         # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
         "../unit/test_nomas_parallel.py": 140.0,
+        # 2x B300: 63 s, two spawned TP2 cases
+        "../unit/test_qwen3_encoder_graph_cuda.py": 70.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
         # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
         "../unit/test_text_encoding_cache.py": 120.0,
