@@ -1232,7 +1232,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
-    # See GenerateReqInput.return_sampling_mask.
     return_sampling_mask: bool = False
     # Assemble prompt top logprobs as flat arrays scheduler-side (see
     # GenerateReqInput.return_flat_raw_top_logprobs). The b64 flag stays
@@ -1321,7 +1320,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal PP control bit, set by PP0 before forwarding the request.
     # Keep tail fields append-only to preserve the positional Rust wire schema.
     pp_prefetch_ticketed: bool = False
-    # See GenerateReqInput.return_sampling_logprobs.
     return_sampling_logprobs: bool = False
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None

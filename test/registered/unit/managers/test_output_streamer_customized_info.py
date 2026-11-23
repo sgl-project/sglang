@@ -981,7 +981,6 @@ _IPC_ROUND_TRIPS = {
 
 
 def _chunk_lists(chunk):
-    """A chunk's sampled logprobs, support IDs and support logprobs, row by row."""
     return (chunk.selected_logprobs.tolist(), *chunk.support_rows())
 
 

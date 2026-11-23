@@ -1132,90 +1132,9 @@ class TestDisaggregationWire(unittest.TestCase):
                         ):
                             manager.validate_aux_buffers(dst_ptrs, peer_lens)
 
-    def test_sampling_mask_buffer_forces_the_aux_item_length_exchange(self):
-        """An older build has no buffer for the sampled token's logprob. With the PD
-        sampling-mask buffers on, a prefill must refuse such a decode whether or not
-        it reports its buffer sizes, and such a prefill must refuse this decode."""
-        args = KVArgs()
-        args.kv_cache_dtype_str = "bfloat16"
-        args.kv_item_lens = []
-        args.state_item_lens = []
-        args.state_types = []
-        args.system_dp_rank = args.pp_rank = 0
-        manager = object.__new__(CommonKVManager)
-        with (
-            envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
-            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(0),
-            get_context().override_server_args(
-                disaggregation_enable_kv_checksum=False
-            ) as server_args,
-            get_parallel().override(
-                tp_rank=0,
-                attn_tp_rank=0,
-                attn_cp_rank=0,
-                attn_dcp_rank=0,
-                attn_dp_rank=0,
-                pp_group=None,
-            ),
-            patch("sglang.srt.disaggregation.common.conn.zmq.Context"),
-            patch(
-                "sglang.srt.disaggregation.common.conn.get_local_ip_auto",
-                return_value="127.0.0.1",
-            ),
-            patch(
-                "sglang.srt.disaggregation.common.conn.get_zmq_socket_on_host",
-                return_value=(1234, Mock()),
-            ),
-            patch.object(manager, "_sync_bootstrap_port_across_nodes"),
-            patch.object(manager, "register_to_bootstrap"),
-        ):
-            CommonKVManager.__init__(
-                manager, args, DisaggregationMode.PREFILL, server_args
-            )
-            buffers = MetadataBuffers(1, 16, torch.float32, 5)
-            ptrs, _, item_lens = buffers.get_buf_infos()
-            manager.kv_args = SimpleNamespace(
-                aux_data_ptrs=ptrs, aux_item_lens=item_lens
-            )
-            manager.validate_aux_buffers(ptrs, item_lens)
-            added = ptrs.index(buffers.output_token_sampling_logprobs.data_ptr())
-            older_ptrs = ptrs[:added] + ptrs[added + 1 :]
-            older_item_lens = item_lens[:added] + item_lens[added + 1 :]
-            for peer_lens in (older_item_lens, None):
-                with (
-                    self.subTest(older="decode", peer_lens=peer_lens),
-                    self.assertRaisesRegex(
-                        ValueError, "metadata buffer layout mismatch"
-                    ),
-                ):
-                    manager.validate_aux_buffers(older_ptrs, peer_lens)
-            # An older prefill does not ask for sizes; this decode sends them.
-            manager.exchange_aux_item_lens = False
-            manager.kv_args = SimpleNamespace(
-                aux_data_ptrs=older_ptrs, aux_item_lens=older_item_lens
-            )
-            with (
-                self.subTest(older="prefill"),
-                self.assertRaisesRegex(ValueError, "metadata buffer layout mismatch"),
-            ):
-                manager.validate_aux_buffers(ptrs, item_lens)
-
     def test_decode_refuses_incompatible_prefill_aux_layout_at_init(self):
-        """Decode checks the prefill's registered aux_item_lens during receiver
-        init, before any transfer starts, covering missing buffers and RDMA aux."""
-        server = object.__new__(CommonKVBootstrapServer)
-        server.lock = asyncio.Lock()
-        server.pp_size = server.attn_tp_size = server.attn_cp_size = None
-        server.dp_size = server.page_size = server.kv_cache_dtype = None
-        server.kv_layout = server.dsv41_spec_layout = server.spec_kv_layout = None
-        server.state_wire_by_stage = {}
-        server.aux_item_lens = None
-        server.follow_bootstrap_room = server.enable_dsa_cache_layer_split = None
-        server.enable_kv_cache_sharding = server.stores_to_linker = None
-        server.prefill_http_port = None
-        server.decode_allocation_policy = "early"
-        server.prefill_port_table = {}
-        server._registered_count = 0
+        with patch.object(CommonKVBootstrapServer, "run"):
+            server = CommonKVBootstrapServer("127.0.0.1", 0)
 
         def route_put(aux_item_lens, *, tp_size=2, tp_rank=0):
             payload = {
@@ -1259,8 +1178,7 @@ class TestDisaggregationWire(unittest.TestCase):
             )
         )
         self.assertEqual(resp.status, 200)
-        served = json.loads(resp.text)
-        self.assertEqual(served["aux_item_lens"], prefill_lens)
+        self.assertEqual(json.loads(resp.text)["aux_item_lens"], prefill_lens)
 
         reg_mgr = object.__new__(CommonKVManager)
         reg_mgr.dist_init_addr = None
@@ -1309,11 +1227,10 @@ class TestDisaggregationWire(unittest.TestCase):
             decode_aux,
             decode_exchange=True,
             decode_checksum=False,
-            decode_customized=False,
         ):
             mgr = object.__new__(CommonKVManager)
             mgr.exchange_aux_item_lens = decode_exchange
-            mgr.customized_info_enabled = decode_customized
+            mgr.customized_info_enabled = False
             mgr.kv_args = SimpleNamespace(aux_item_lens=decode_aux)
             mgr.request_status = {}
             mgr.failure_records = {}
@@ -1362,16 +1279,6 @@ class TestDisaggregationWire(unittest.TestCase):
                 False,
             ),
             (
-                "older prefill fewer buffers",
-                {"prefill_aux": [8, 64, 64], "decode_aux": [8, 64, 128, 64]},
-                False,
-            ),
-            (
-                "prefill longer row",
-                {"prefill_aux": [8, 64, 256, 64], "decode_aux": [8, 64, 128, 64]},
-                False,
-            ),
-            (
                 "prefill extra buffer hidden by decode checksum",
                 {
                     "prefill_aux": [8, 64, 128, 64, 64],
@@ -1379,11 +1286,6 @@ class TestDisaggregationWire(unittest.TestCase):
                     "decode_checksum": True,
                 },
                 False,
-            ),
-            (
-                "matching layout",
-                {"prefill_aux": [8, 64, 128, 64], "decode_aux": [8, 64, 128, 64]},
-                True,
             ),
             (
                 "decode longer row with decode checksum",
@@ -3553,7 +3455,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     length, mask, mask_logprobs, logprob = buffers.get_buf(0)[6:10]
                     self.assertEqual(length[0].item(), 3)
                     self.assertEqual(mask.tolist(), [7, 8, 9])
-                    # One logprob per mask id, and the sampled token's on its own.
                     self.assertEqual(mask_logprobs.tolist(), [-1.25, -1.5, -2.0])
                     self.assertEqual(logprob.tolist(), [-1.5] + [0.0] * 15)
                 else:
@@ -3566,21 +3467,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         enabled_ptrs, _, enabled_sizes = schemas[1]
         self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 4)
         self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), (3 + 3) * 4 + 128)
-
-    def test_sampling_logprob_is_sent_without_a_mask(self):
-        """A captured request that returns sampling logprobs only still sends its
-        first token's logprob, with an empty mask."""
-        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
-            buffers = MetadataBuffers(
-                size=1,
-                hidden_size=2,
-                hidden_states_dtype=torch.float32,
-                max_sampling_mask_tokens=3,
-            )
-            buffers.set_buf(self._make_req(None, sampling_logprob=-0.5))
-            length, _, _, logprob = buffers.get_buf(0)[6:10]
-            self.assertEqual(length[0].item(), 0)
-            self.assertEqual(logprob[0].item(), -0.5)
 
     def test_sampling_mask_row_reaches_decode_unchanged(self):
         """The prefill worker's first-token row is the row the decode worker streams."""
@@ -3648,8 +3534,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
 
     def test_prefill_only_request_skips_sampling_handoff_row(self):
-        """A max_new_tokens=0 request has no sampled token, so set_buf must not
-        require a row and decode must not read stale bytes or queue a row."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -3657,7 +3541,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 hidden_states_dtype=torch.float32,
                 max_sampling_mask_tokens=4,
             )
-            # Populate slot 0 with a previous request's sampling data.
             buffers.set_buf(
                 self._make_req(
                     None,

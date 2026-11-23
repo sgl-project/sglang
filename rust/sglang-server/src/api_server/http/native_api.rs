@@ -703,7 +703,6 @@ async fn generate(
     }
 }
 
-/// Python's message for the removed `sampling_logprobs_mode`.
 const SAMPLING_LOGPROBS_MODE_REMOVED: &str = "sampling_logprobs_mode was removed. Set \
      return_sampling_logprobs for each output token's sampling logprob and \
      return_sampling_mask for the sampling support with its logprobs.";

@@ -395,8 +395,6 @@ class TestStepBuilds(CustomTestCase):
         self.assertIsNone(info.sampling_seed)
 
     def test_mask_rows(self):
-        """Mask rows index the captured requests; support rows index, among
-        them, the ones that return the mask."""
         reqs = [
             self._make_req(top_k=5),
             self._make_req(top_k=7, sampling_logprobs=True),

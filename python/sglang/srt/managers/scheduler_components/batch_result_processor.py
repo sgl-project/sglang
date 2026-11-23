@@ -1428,7 +1428,6 @@ class SchedulerBatchResultProcessor:
         """Speculative rows carry one support per draft position; keep the
         accepted prefix, as a list with one entry per accepted token."""
         assert len(batch_indices) == len(num_accept_tokens)
-        # The support row of a captured request that did not ask for the mask.
         empty_support_ids = np.empty(0, dtype=np.int32)
         empty_support_logprobs = np.empty(0, dtype=np.float32)
         support_row = 0
@@ -1503,7 +1502,6 @@ class SchedulerBatchResultProcessor:
             )
         else:
             selected_logprobs = selected_logprobs.tolist()
-            # The support row of a captured request that did not ask for the mask.
             empty_support_ids = np.empty(0, dtype=np.int32)
             empty_support_logprobs = np.empty(0, dtype=np.float32)
             support_row = 0
@@ -1511,7 +1509,6 @@ class SchedulerBatchResultProcessor:
                 captures_support = reqs[batch_index].return_sampling_mask
                 status = int(statuses[row])
                 if not captures_support and status == SamplingMaskStatus.OVERFLOW:
-                    # Without the support there is nothing to overflow.
                     status = SamplingMaskStatus.OK
                 status_by_batch[batch_index] = status
                 if status == SamplingMaskStatus.OK:

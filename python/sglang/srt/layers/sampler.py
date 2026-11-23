@@ -533,7 +533,6 @@ class Sampler(nn.Module):
         support_capture_indices: Optional[torch.Tensor],
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
-        # None exactly when no captured row returns its support.
         return_support = support_capture_indices is not None
         batch_indices = sampling_mask_capture.batch_rows
         weights = sampling_mask_capture.weights
