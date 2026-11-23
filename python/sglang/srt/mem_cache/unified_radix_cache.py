@@ -4546,7 +4546,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _anchor_lacks_mamba_state(self, node_id: NodeId) -> bool:
         return (
-            ComponentType.MAMBA in self.components
+            self._mamba_host_only_checkpoint()
             and not self.tree_core.is_root(node_id)
             and self.tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
             is None
@@ -4592,6 +4592,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
+                req.load_back_refusals = 0
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
@@ -4606,8 +4607,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 return len(new_indices), best_match_node_id
             # A refused load-back falls back to the device anchor and extends from
             # its device Mamba state. A non-root anchor without one (host-only
-            # checkpoints) would extend from zeros, so admission retries instead.
+            # checkpoints) would extend from zeros, so admission retries instead;
+            # past LOAD_BACK_REFUSAL_LIMIT the request matches from root.
             if self._anchor_lacks_mamba_state(last_best_match_device_node_id):
+                req.load_back_refusals += 1
                 return None
 
         return 0, last_best_match_device_node_id

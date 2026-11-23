@@ -175,6 +175,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Consecutive refused host load-backs, with no device state to fall back on,
+# before a queued request matches from root and recomputes its prefix.
+LOAD_BACK_REFUSAL_LIMIT = 3
+
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     mode = CaptureHiddenMode.NULL
@@ -648,6 +652,8 @@ class Req(ReqDllmMixin):
         # Host-hit tokens per window sub-pool.
         self.matched_window_host_hit_lengths: Mapping[str, int] = {}
         self.mamba_host_hit_length = 0
+        # See LOAD_BACK_REFUSAL_LIMIT; a load or a retraction starts it over.
+        self.load_back_refusals = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
@@ -1206,8 +1212,12 @@ class Req(ReqDllmMixin):
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
         # Disable prefix caching when embed overrides are present: same token IDs
-        # with different override vectors must not share cached KV values.
-        if self.positional_embed_overrides is not None:
+        # with different override vectors must not share cached KV values. A
+        # request whose host load-back keeps being refused recomputes instead.
+        if (
+            self.positional_embed_overrides is not None
+            or self.load_back_refusals >= LOAD_BACK_REFUSAL_LIMIT
+        ):
             token_ids_to_match = array("q")
             key_limit = None
 
@@ -1562,6 +1572,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
+        self.load_back_refusals = 0
         self.already_computed = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None

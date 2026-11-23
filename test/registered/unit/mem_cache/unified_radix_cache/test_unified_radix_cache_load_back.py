@@ -6,6 +6,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers.schedule_batch import (
+    LOAD_BACK_REFUSAL_LIMIT,
     Req,
 )
 from sglang.srt.managers.schedule_policy import PrefillAdder
@@ -812,8 +813,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
         self._release_ongoing_load_back_locks(cache)
 
-    @requires_full_mamba_ps1
-    def test_host_only_refusal_without_anchor_state_retries(self):
+    def _host_only_anchor_without_state(self):
+        # Host-only checkpoints anchor on device Full pages that hold no state.
         cache, allocator, req_to_token_pool = self._build_hicache_fixture(
             tree_core_backend="python"
         )
@@ -823,35 +824,72 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         leaf, anchor = chain[-1], chain[-2]
         self._backup_node(cache, leaf)
         cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
-        # Host-only checkpoints anchor on device Full pages that hold no state.
         self._evict_device_component(cache, anchor, ComponentType.MAMBA)
         self.assertIsNone(node_device_value(cache, anchor, ComponentType.MAMBA))
+        return cache, req_to_token_pool, leaf, anchor
 
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        req.last_node = anchor
-        req.mamba_host_hit_length = 1
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-        with (
+    def _patch_host_only_refused_loads(self, cache):
+        return (
             mock.patch.object(
                 cache.components[ComponentType.MAMBA],
                 "_mamba_host_only_checkpoint",
                 return_value=True,
             ),
             mock.patch.object(cache.cache_controller, "load", return_value=None),
-        ):
+        )
+
+    @requires_full_mamba_ps1
+    def test_host_only_refusal_without_anchor_state_retries(self):
+        cache, req_to_token_pool, leaf, anchor = self._host_only_anchor_without_state()
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
+        req.last_node = anchor
+        req.mamba_host_hit_length = 1
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+        host_only, refused_load = self._patch_host_only_refused_loads(cache)
+        with host_only, refused_load:
             loaded = cache.init_load_back(
                 InitLoadBackParams(best_match_node=leaf, host_hit_length=0, req=req)
             )
 
         # Nothing to extend from at the anchor: admission retries, nothing staged.
         self.assertIsNone(loaded)
+        self.assertEqual(req.load_back_refusals, 1)
         self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertIsNone(req.kv.mamba_cow_src_index)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
+
+    @requires_full_mamba_ps1
+    def test_host_only_refusals_fall_back_to_root_match(self):
+        cache, req_to_token_pool, leaf, anchor = self._host_only_anchor_without_state()
+        req = self._make_req(req_to_token_pool)
+        # The chain's tokens plus one, so the match may cover the whole chain.
+        req.origin_input_ids = array("q", [1000, 2000, 3000, 4000])
+        host_only, refused_load = self._patch_host_only_refused_loads(cache)
+        with host_only, refused_load:
+            req.init_next_round_input(cache, cow_mamba=False)
+            self.assertEqual(req.last_node, anchor)
+            self.assertEqual(req.best_match_node, leaf)
+            self.assertTrue(req.needs_host_load_back())
+            for _ in range(LOAD_BACK_REFUSAL_LIMIT):
+                loaded = cache.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=req.best_match_node,
+                        host_hit_length=req.host_hit_length,
+                        req=req,
+                    )
+                )
+                self.assertIsNone(loaded)
+                req.init_next_round_input(cache, cow_mamba=False)
+
+        # The request now recomputes from root: no host hit, so admission does not
+        # reach the load-back again, and the root's zero state is the right one.
+        self.assertEqual(req.prefix_len, 0)
+        self.assertEqual(req.last_node, cache.root_node_handle())
+        self.assertFalse(req.needs_host_load_back())
 
     @requires(
         lambda cfg: (
