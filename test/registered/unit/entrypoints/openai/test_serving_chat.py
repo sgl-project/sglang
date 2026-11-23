@@ -16,6 +16,7 @@ import gc
 import json
 import unittest
 import uuid
+import weakref
 from http import HTTPStatus
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -2036,6 +2037,29 @@ class ServingChatTestCase(CustomTestCase):
                         tools=[tool],
                     )
                     self.assertEqual(served, ("Plan.", answer, []))
+
+    def test_kimi_k3_unwrapped_parser_frees_without_the_collector(self):
+        """A parser for content the kimi_k3 reasoning parser unwrapped holds no
+        reference cycle: with the collector off (--gc-threshold 0), a finished
+        stream's detector and its output buffer must be freed with the parser."""
+        parser = FunctionCallParser(
+            [
+                Tool.model_validate(
+                    {"type": "function", "function": {"name": "read_file"}}
+                )
+            ],
+            "kimi_k3",
+            response_unwrapped=True,
+        )
+        parser.parse_stream_chunk("answer text")
+        parser.parse_stream_end()
+        detector = weakref.ref(parser.detector)
+        gc.disable()
+        try:
+            del parser
+            self.assertIsNone(detector())
+        finally:
+            gc.enable()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         _use_chat_encoding(self.chat, "kimi_k3")

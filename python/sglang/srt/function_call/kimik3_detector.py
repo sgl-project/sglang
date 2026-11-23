@@ -344,13 +344,12 @@ class KimiK3Detector(BaseFormatDetector):
         self._sent_normal_idx = limit
         return pending
 
-    def use_unwrapped_response(self) -> None:
-        """The kimi_k3 reasoning parser has already taken the answer out of its
-        response channel, so markers left in it are answer text."""
-        # Bound once so streams without the reasoning parser run the plain emit.
-        self._emit_normal_text = self._emit_unwrapped_text
 
-    def _emit_unwrapped_text(self, limit: int | None = None) -> str:
+class KimiK3UnwrappedDetector(KimiK3Detector):
+    """KimiK3Detector for content the kimi_k3 reasoning parser has already
+    taken out of its response channel, so markers left in it are answer text."""
+
+    def _emit_normal_text(self, limit: int | None = None) -> str:
         if limit is None:
             limit = len(self._buffer) - partial_suffix_len(
                 self._buffer, [self.bot_token]

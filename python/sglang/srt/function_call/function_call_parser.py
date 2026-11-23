@@ -43,7 +43,10 @@ from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
-from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_detector import (
+    KimiK3Detector,
+    KimiK3UnwrappedDetector,
+)
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
@@ -154,6 +157,8 @@ class FunctionCallParser:
                 kwargs["constrained"] = constrained
                 # Forced calls are parsed in the format of the tag for these tools.
                 kwargs["tools"] = self.structural_tag_tools()
+            if detector_class is KimiK3Detector and response_unwrapped:
+                detector_class = KimiK3UnwrappedDetector
             detector = detector_class(**kwargs)
         else:
             message = removed_choice_message("tool_call_parser", tool_call_parser)
@@ -165,8 +170,6 @@ class FunctionCallParser:
             detector.use_full_assistant_constraint = not any(
                 tool.function.strict for tool in tools
             )
-        if isinstance(detector, KimiK3Detector) and response_unwrapped:
-            detector.use_unwrapped_response()
         if isinstance(tool_choice, dict):
             tool_choice = ToolChoice(function={"name": tool_choice["name"]})
         self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
