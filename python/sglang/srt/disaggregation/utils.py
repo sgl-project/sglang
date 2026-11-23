@@ -1017,6 +1017,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    UNIFLOW = "uniflow"
 
 
 class KVClassType(Enum):
@@ -1113,6 +1114,20 @@ def get_kv_class(
             KVClassType.SENDER: NixlKVSender,
             KVClassType.RECEIVER: NixlKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
+        }
+    elif transfer_backend == TransferBackend.UNIFLOW:
+        from sglang.srt.disaggregation.uniflow import (
+            UniflowKVBootstrapServer,
+            UniflowKVManager,
+            UniflowKVReceiver,
+            UniflowKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.MANAGER: UniflowKVManager,
+            KVClassType.SENDER: UniflowKVSender,
+            KVClassType.RECEIVER: UniflowKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: UniflowKVBootstrapServer,
         }
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.fake import (
