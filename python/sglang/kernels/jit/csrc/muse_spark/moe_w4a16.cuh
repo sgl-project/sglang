@@ -32,9 +32,6 @@ DEVI int mix_rank(int rank, int c) {
   const int nz = __popc(ballot(c > 0)), m = nz - min(5, nz);
   return rank >= m ? rank : rank < (m + 1) / 2 ? 2 * rank : 2 * (m - 1 - rank) + 1;
 }
-DEVI int pwt(u32 n, int tt) {
-  return n ? 64 * (int)((n + tt - 1) / tt) + (int)n : 0;
-}
 #define LD_IDS(ids, t, v0, v1)             \
   {                                        \
     v0 = AS(const int4, ids)[(t) * 2];     \
@@ -513,13 +510,12 @@ __device__ __noinline__ void wp32_fst(
 template <int RW, int NT, int NS, int MW, bool SPX = false>
 DEVI void moe_body(const Params& P) {
   static_assert(!SPX || (RW == 8 && NT >= 8), "SP: NT >= 8 only");
-  // Item: RB = 32 RW rows x T = 8 NT tokens of one expert; M <= 32 MW. KW warps split K; HB: 128-row items; WSC /
-  // LEANC: one copy per stage, back to back; IT2K: <= 32 tokens; GNEW: warps 9-11 gather x; BMT: bm word-major; CEPI:
+  // Item: RB = 32 RW rows x T = 8 NT tokens of one expert; M <= 32 MW. KW warps split K; HB: 128-row items; WSC:
+  // one copy per stage, back to back; IT2K: <= 32 tokens; GNEW: warps 9-11 gather x; BMT: bm word-major; CEPI:
   // producer-reserved signal slots, SP down (CE1: all) items store from registers; SPX: rows to token owners.
   constexpr int KW = 8 / RW;
   constexpr bool HB = RW == 4;
   constexpr bool WSC = KW == 1 && !(NT == 4 && MW == 1);
-  constexpr bool LEANC = WSC;
   constexpr bool IT2K = NT == 4 && MW == 1;
   constexpr int RB = 32 * RW, RGS = RB / 16, KST = 256 * KW, T = 8 * NT, XP = KST * 2 + 16, WB = RGS * 2048 * KW;
   constexpr int WGMIN = KW == 1 ? 3 : 99;
@@ -538,7 +534,7 @@ DEVI void moe_body(const Params& P) {
   constexpr int KSX = HB ? 2 : 4, STX = 16 / (KW * KSX);
   constexpr bool CE1 = MW >= 64 || T * (RB + 4) * 4 > STAGE;
   constexpr bool EWR = SPX && NS == 2 && RW == 8 && MW >= 16;
-  constexpr bool MOE_L2_CLDV = (LEANC && MW >= 4) || HB;
+  constexpr bool MOE_L2_CLDV = (WSC && MW >= 4) || HB;
   constexpr int NSIG = 4;
   extern __shared__ __align__(128) u8 smem[];
   static_assert(NS <= 4);
@@ -1207,7 +1203,7 @@ DEVI void moe_body(const Params& P) {
             }
           }
           lrdy = phase == 1 && rd ? ~0u : 0u;
-        } else if constexpr (LEANC)
+        } else if constexpr (WSC)
           lrdy = phase == 1 && gathered && !xdir ? ~0u : 0u;
         const int nrx = phase == 1 ? 32 : 16;
         const int gj = dg ? gix(gsl, e) : -1, ew = gj >= 0 ? gj : e;
@@ -1240,7 +1236,7 @@ DEVI void moe_body(const Params& P) {
           u8* sbase = stages + s * STAGE;
           const u32 full = bars0 + s * 8;
           const int kc0 = kc_item + st * KW;
-          if constexpr (LEANC) {
+          if constexpr (WSC) {
             const u32 lrest3 = ((1u << (nst - st)) - 1u) << kc0;
             if ((lrdy & lrest3) == lrest3) {
               const u8* wq = wblock(kc0);
@@ -1344,7 +1340,7 @@ DEVI void moe_body(const Params& P) {
             const bool acq = (rmask & need) != need;
             if (acq) {
               rmask = ballot(lane < 16 && ld_acquire(&cnt1[tile * 16 + lane]) >= 512 / RB);
-              if constexpr (LEANC) lrdy = rmask;
+              if constexpr (WSC) lrdy = rmask;
             }
             if (lane == 0 && (rmask & need) != need)
               for (int kw = 0; kw < KW; ++kw)
@@ -1375,7 +1371,7 @@ DEVI void moe_body(const Params& P) {
               __syncwarp();
               fence_async_global();
               gathered = true;
-              if constexpr (LEANC) lrdy = ~0u;
+              if constexpr (WSC) lrdy = ~0u;
             }
             const u8* xreg = AS(const u8, phase == 2 ? P.inter : P.xs) + (size_t)tile * ST1 * T * XP;
             if (wgl) {
@@ -1758,9 +1754,9 @@ DEVI void moe_body(const Params& P) {
 #undef EV8
 #undef TILE_SIG
 #undef MOE_WPA
-#define MOE_INST(PRE, SPX, RW, NT, KS2, NS, MW)                                  \
+#define MOE_INST(PRE, SPX, RW, NT, NS, MW)                                       \
   extern "C" __global__ void __launch_bounds__(384, 1) __cluster_dims__(1, 1, 1) \
-      PRE##_##RW##_##NT##_##KS2##_##NS##_##MW(Params p) {                        \
+      PRE##_##RW##_##NT##_##NS##_##MW(Params p) {                                \
     moe_body<RW, NT, NS, MW, SPX>(p);                                            \
   }
 #define INST(...) MOE_INST(moe, false, __VA_ARGS__)

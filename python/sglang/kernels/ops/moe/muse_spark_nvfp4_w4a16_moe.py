@@ -34,19 +34,20 @@ _TOP_K = 8
 _NUM_LOCAL = 32
 _BLOCK = 35840
 
+# (max tokens, moe_body's (RW, NT, NS, MW), dynamic smem)
 _CONFIGS = (
-    (16, (4, 4, 1, 4, 1), 232448),
-    (32, (8, 4, 1, 4, 1), 232448),
-    (64, (8, 4, 1, 4, 2), 232448),
-    (128, (8, 8, 1, 3, 4), 228352),
-    (256, (8, 8, 1, 3, 8), 232448),
-    (512, (8, 8, 1, 3, 16), 228352),
-    (1024, (8, 8, 1, 3, 32), 229376),
+    (16, (4, 4, 4, 1), 232448),
+    (32, (8, 4, 4, 1), 232448),
+    (64, (8, 4, 4, 2), 232448),
+    (128, (8, 8, 3, 4), 228352),
+    (256, (8, 8, 3, 8), 232448),
+    (512, (8, 8, 3, 16), 228352),
+    (1024, (8, 8, 3, 32), 229376),
 )
-_SP_CONFIGS = tuple(c for c in _CONFIGS if c[0] <= 512) + (
-    (768, (8, 8, 1, 3, 32), 229376),
-    (1024, (8, 16, 1, 2, 32), 230400),
-    (2048, (8, 14, 1, 2, 64), 232448),
+_SP_CONFIGS = tuple(c for c in _CONFIGS if SP_MIN <= c[0] <= 512) + (
+    (768, (8, 8, 3, 32), 229376),
+    (1024, (8, 16, 2, 32), 230400),
+    (2048, (8, 14, 2, 64), 232448),
 )
 _THREADS = 384
 _CTR_WORDS = 65536 + 16384 + 64
@@ -118,9 +119,9 @@ def _compile(name, src):
 
 class _Module:
     def __init__(self):
-        sp_cfgs = [(c, m) for _, c, m in _SP_CONFIGS if c[1] >= 8]
+        sp_cfgs = [(c, m) for _, c, m in _SP_CONFIGS]
         inst = lambda cs: "".join(
-            "INST{}({}, {}, {}, {}, {})\n".format(p, *c)
+            "INST{}({}, {}, {}, {})\n".format(p, *c)
             for p, l in cs
             for c in (x[-2] for x in l)
         )
@@ -307,7 +308,7 @@ def _launch(
 ):
     M = local_ids.shape[0]
     cfg, smem = _config(M, sp is not None)
-    rw, nt, _, _, mw = cfg
+    rw, nt, _, mw = cfg
     dev = x.device
     ws = _workspace(dev.index)
     pmax = M * _TOP_K
@@ -353,7 +354,7 @@ def _launch(
         params.sw13, params.sw2, params.gsrc, params.peer = (
             t.data_ptr() for t in (*dg.stage[:2], dg.gsrc, dg.peer)
         )
-    pdl = cfg[0] != "sp" and cfg[4] <= 4
+    pdl = sp is None and mw <= 4
     cu.launch(
         _module(dev.index).funcs[cfg],
         ws["sms"],
