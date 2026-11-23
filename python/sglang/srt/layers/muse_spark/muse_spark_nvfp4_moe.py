@@ -6,6 +6,9 @@ from typing import cast
 
 import torch
 
+from sglang.srt.layers.muse_spark.muse_spark_humming_moe import (
+    prepare_humming_experts,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4FusedMoEMethod,
     _compute_gemm1_alphas,
@@ -138,11 +141,30 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 delattr(layer, native)
         return result
 
+    @staticmethod
+    def _runs_below_blackwell(moe_runner_backend) -> bool:
+        # Muse also prepares and runs Humming's W4A16 experts itself.
+        return moe_runner_backend.is_marlin() or moe_runner_backend.is_humming()
+
     def process_weights_after_loading(self, layer):
         """Prepare the TRT-LLM layout from native HF parameters in place."""
         backend = getattr(self, "_moe_runner_backend", None)
         if backend is not None and backend.is_marlin():
             return self._process_weights_for_marlin(layer)
+        for weight, scale in (
+            (layer.gate_up_proj, layer.gate_up_proj_weight_scale),
+            (layer.down_proj, layer.down_proj_weight_scale),
+        ):
+            if (
+                scale.dtype != torch.float8_e4m3fn
+                or scale.shape[-1] != weight.shape[-1] * 2 // 16
+            ):
+                raise ValueError(
+                    "Muse NVFP4 requires one FP8 scale per 16 weight elements"
+                )
+        if backend is not None and backend.is_humming():
+            layer.humming_tuning = prepare_humming_experts(layer)
+            return
         input_scale = layer.gate_up_proj_input_scale.max().float()
         output_scale = layer.down_proj_input_scale.max().float()
         if self.quant_config.use_per_token_activation:
@@ -158,17 +180,6 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
         copy_or_rebind_param(layer, "w13_input_scale_quant", input_scale.reciprocal())
         copy_or_rebind_param(layer, "w2_input_scale_quant", output_scale.reciprocal())
-        for weight, scale in (
-            (layer.gate_up_proj, layer.gate_up_proj_weight_scale),
-            (layer.down_proj, layer.down_proj_weight_scale),
-        ):
-            if (
-                scale.dtype != torch.float8_e4m3fn
-                or scale.shape[-1] != weight.shape[-1] * 2 // 16
-            ):
-                raise ValueError(
-                    "Muse NVFP4 requires one FP8 scale per 16 weight elements"
-                )
         self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
 
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:

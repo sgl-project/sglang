@@ -3,7 +3,7 @@
 // Deployment selects hardware, quantization, and strategy; further tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
 // Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
-// Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no
+// Humming W4A16 experts and BF16 at TP16 across two nodes; it has no
 // SP/MegaMoE (SM100-only kernels).
 export const config = {
   modelName: "Muse Spark Open",
@@ -457,9 +457,10 @@ export const config = {
         "--tool-call-parser muse",
       ],
     },
-    // H200: Hopper has no TRT-LLM FP4 MoE, so NVFP4 experts run as Marlin
-    // W4A16. BF16 leaves ~3.6 GB/GPU after weights, and the 1M-context verify
-    // graphs take ~2.9 GB of it, so it runs at 0.88 to keep a usable KV pool.
+    // H200: Hopper has no TRT-LLM FP4 MoE, so NVFP4 experts run as W4A16 GEMMs,
+    // Humming's here (auto selects Marlin). BF16 leaves ~3.6 GB/GPU after
+    // weights, and the 1M-context verify graphs take ~2.9 GB of it, so it runs
+    // at 0.88 to keep a usable KV pool.
     {
       match: { hw: "h200", quant: "nvfp4" },
       nnodes: 1,
@@ -468,6 +469,7 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
+        "--moe-runner-backend humming",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
         "--speculative-algorithm DFLASH",

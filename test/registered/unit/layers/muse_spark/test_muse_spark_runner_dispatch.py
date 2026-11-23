@@ -1,7 +1,8 @@
-"""Muse Spark's custom experts must declare the TRT-LLM dispatch contract."""
+"""Muse Spark's custom experts: the TRT-LLM dispatch contract and the runner
+backends they admit below Blackwell."""
 
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,10 +12,17 @@ from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.moe.token_dispatcher import flashinfer
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import FlashinferA2ADispatchType
+from sglang.srt.layers.muse_spark import muse_spark_fp4_moe
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
+    MuseSparkNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.quantization import modelopt_quant
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.runtime_context import get_context, get_flags, get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -127,6 +135,89 @@ class TestMuseSparkRunnerDispatch(CustomTestCase):
                         torch.testing.assert_close(
                             output.topk_output.topk_ids, topk.topk_ids
                         )
+
+
+def _nvfp4_config():
+    return ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+
+
+@contextmanager
+def _cuda_device(backend: MoeRunnerBackend, capability=(9, 0)):
+    with (
+        get_context().override_server_args(model_path="dummy"),
+        get_flags().moe.override(
+            runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+        ),
+        patch.object(
+            modelopt_quant,
+            "get_platform",
+            return_value=SimpleNamespace(is_blackwell=capability >= (10, 0)),
+        ),
+        patch.object(muse_spark_fp4_moe, "is_cuda", return_value=True),
+        patch.object(
+            muse_spark_fp4_moe, "get_device_capability", return_value=capability
+        ),
+    ):
+        yield
+
+
+def _fp4_experts():
+    return MuseSpark1xFp4Experts(
+        num_experts=4,
+        num_local_experts=2,
+        local_expert_offset=2,
+        hidden_size=128,
+        intermediate_size=128,
+        top_k=2,
+        quant_config=_nvfp4_config(),
+    )
+
+
+class TestMuseSparkFp4BackendAdmission(CustomTestCase):
+    def test_hopper_runs_packed_nvfp4_experts_as_w4a16(self):
+        for backend in (MoeRunnerBackend.MARLIN, MoeRunnerBackend.HUMMING):
+            with self.subTest(backend=backend.value), _cuda_device(backend):
+                experts = _fp4_experts()
+                self.assertTrue(experts.use_w4a16)
+                self.assertEqual(experts.use_humming, backend.is_humming())
+
+    def test_hopper_rejects_the_trtllm_runner(self):
+        with _cuda_device(MoeRunnerBackend.FLASHINFER_TRTLLM):
+            with self.assertRaisesRegex(ValueError, "Blackwell"):
+                _fp4_experts()
+
+    def test_blackwell_rejects_humming(self):
+        """Muse admits humming only where auto picks a W4A16 backend (SM80-SM90);
+        on Blackwell it must fail at startup, not serve an unvalidated path."""
+        with _cuda_device(MoeRunnerBackend.HUMMING, capability=(10, 0)):
+            with self.assertRaisesRegex(ValueError, "SM80-SM90 only"):
+                _fp4_experts()
+
+    def test_humming_checks_the_scale_layout_before_repacking(self):
+        """Humming skips its own tensor validation for unpadded experts, so a
+        checkpoint without one E4M3 scale per 16 weights must fail here."""
+        with _cuda_device(MoeRunnerBackend.HUMMING):
+            method = MuseSparkNvFp4FusedMoEMethod(_nvfp4_config())
+        method._moe_runner_backend = MoeRunnerBackend.HUMMING
+        packed = torch.zeros((2, 256, 64), dtype=torch.uint8)
+        layer = SimpleNamespace(
+            gate_up_proj=packed,
+            gate_up_proj_weight_scale=torch.zeros(
+                (2, 256, 4), dtype=torch.float8_e4m3fn
+            ),
+            down_proj=packed,
+            down_proj_weight_scale=torch.zeros((2, 256, 8), dtype=torch.float8_e4m3fn),
+        )
+        with self.assertRaisesRegex(ValueError, "one FP8 scale per 16"):
+            method.process_weights_after_loading(layer)
+
+    def test_humming_admission_below_blackwell_is_muse_only(self):
+        """Muse prepares and runs Humming's experts itself; the generic ModelOpt
+        NVFP4 MoE method has no Humming path and must keep rejecting it."""
+        with _cuda_device(MoeRunnerBackend.HUMMING):
+            MuseSparkNvFp4FusedMoEMethod(_nvfp4_config())
+            with self.assertRaisesRegex(ValueError, "does not support NVFP4"):
+                ModelOptNvFp4FusedMoEMethod(_nvfp4_config())
 
 
 if __name__ == "__main__":
