@@ -202,7 +202,12 @@ if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
     node_log_dir="${METRICS_DATA_FILE}/node_logs/${HOSTNAME}"
     mkdir -p "${node_log_dir}"
-    cp -a "${log_path}/." "${node_log_dir}/"
+    # dump_pod_logs archives this pod under the same ${HOSTNAME}.log name from
+    # the runner and may win the race, so keep whichever copy landed first
+    # instead of also dropping the test-only log under the case name.
+    if [ ! -f "${node_log_dir}/${HOSTNAME}.log" ]; then
+        cp -a "${log_path}/${tc_name}.log" "${node_log_dir}/${HOSTNAME}.log"
+    fi
     echo "Node log saved to ${node_log_dir}"
 fi
 

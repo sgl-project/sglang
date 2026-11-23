@@ -627,7 +627,8 @@ def dump_pod_logs(namespace, pod_name_key_str, metrics_data_file):
     when one role fails the remaining pods are deleted before they archive
     anything (the prefill pod was the only log in the artifact). Running before
     delete_pod() captures the router, prefill and decode logs no matter how each
-    pod ended; pods that already wrote their own copy are left untouched.
+    pod ended; pods that already wrote their own copy under the same
+    ${pod_name}.log are left untouched.
     """
     if not metrics_data_file:
         return
@@ -642,18 +643,20 @@ def dump_pod_logs(namespace, pod_name_key_str, metrics_data_file):
         if pod_name_key_str not in pod_name:
             continue
         out_dir = os.path.join(metrics_data_file, "node_logs", pod_name)
-        # The pod archives its own log here once its test process exits; skip
-        # those so the same log is not stored twice.
-        if os.path.isdir(out_dir) and any(
-            name.endswith(".log") for name in os.listdir(out_dir)
-        ):
+        # The pod script archives its own stdout as <pod_name>.log once its test
+        # process exits; skip it so the same pod is not stored twice.
+        out_path = os.path.join(out_dir, f"{pod_name}.log")
+        if os.path.isfile(out_path):
             logger.info(f"Pod log already archived by {pod_name}, skipping")
             continue
-        out_path = os.path.join(out_dir, f"{pod_name}.log")
+        # Only a complete snapshot may take the final name: the pod-side copy
+        # and the workflow's fallback both skip when <pod_name>.log exists, so a
+        # truncated file from a failed kubectl would hide the pod's own log.
+        tmp_path = f"{out_path}.tmp"
         try:
             os.makedirs(out_dir, exist_ok=True)
             # Write straight to disk: a router/prefill log can be tens of MB.
-            with open(out_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 result = subprocess.run(
                     [
                         "kubectl",
@@ -673,9 +676,16 @@ def dump_pod_logs(namespace, pod_name_key_str, metrics_data_file):
                     f"kubectl logs {pod_name} failed: {result.stderr.strip()}"
                 )
             else:
+                os.replace(tmp_path, out_path)
                 logger.info(f"Pod log saved to {out_path}")
         except Exception as e:
             logger.warning(f"Failed to archive logs for pod {pod_name}: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 def run_npu_e2e_test_case(
