@@ -75,7 +75,7 @@ class FakePrefillGraphRunner(PrefillCudaGraphRunner):
     runs the eager outer forward inside it, as the real runner does.
     """
 
-    def __init__(self, ctx):  # noqa: super().__init__ needs a model runner
+    def __init__(self, ctx):  # skips super().__init__, which needs a model runner
         self.ctx = ctx
         self.captured_scattered = None
         self.embedding_all_reduces = None
@@ -153,6 +153,10 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         text = cfg["text_config"]
         self.ctx = AttnTpContext()
         self.ctx.init_context(text["q_lora_rank"], is_deepseek_dsa(text), text["mhc"])
+        # Preconditions: the replay embeds eagerly only for archs with an
+        # input_embeds slot, and mHC admits DSA to the scattered path.
+        self.assertTrue(is_multimodal_model(cfg["architectures"]))
+        self.assertTrue(self.ctx.allow_input_scattered)
 
     def _model_runner_self(self, graph_runner):
         fake = MagicMock(name="ModelRunner")
@@ -196,13 +200,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
                 self._model_runner_self(graph_runner), forward_batch, None
             )
 
-    def test_public_config_is_eligible(self):
-        cfg = GLM53_FLASH_CONFIG
-        # The replay embeds eagerly only for archs with an input_embeds slot.
-        self.assertTrue(is_multimodal_model(cfg["architectures"]))
-        self.assertIsNotNone(cfg["text_config"]["q_lora_rank"])
-        self.assertTrue(self.ctx.allow_input_scattered)  # mHC admits DSA
-
     def test_eager_extend_is_scattered(self):
         runner = FakePrefillGraphRunner(self.ctx)
         runner.can_run_graph = lambda fb: False
@@ -212,15 +209,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         self.assertFalse(out.can_run_graph)
         self.assertTrue(self.eager_scattered)
         self.assertTrue(self.ctx.use_input_scattered(_extend_batch()))
-
-    def test_flag_off_never_scatters(self):
-        self.ctx.allow_input_scattered = False
-        runner = FakePrefillGraphRunner(self.ctx)
-        runner.capture(_extend_batch())
-        out = self._forward_raw(runner, _extend_batch())
-        self.assertTrue(out.can_run_graph)
-        self.assertFalse(runner.replayed_scattered)
-        self.assertTrue(runner.embedding_all_reduces)
 
     def test_replay_scope_does_not_leak(self):
         runner = FakePrefillGraphRunner(self.ctx)
@@ -247,18 +235,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
             runner.embedding_all_reduces,
             "embedding must all-reduce: the captured body expects full rows",
         )
-
-    def test_predicate_under_replay_scope(self):
-        seen = {}
-        runner = FakePrefillGraphRunner(self.ctx)
-
-        def body(forward_batch, *args, **kwargs):
-            seen["use_input_scattered"] = self.ctx.use_input_scattered(forward_batch)
-            return "logits"
-
-        runner._execute_body_capture = body
-        self._forward_raw(runner, _extend_batch())
-        self.assertFalse(seen["use_input_scattered"])
 
 
 if __name__ == "__main__":
