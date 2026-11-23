@@ -47,6 +47,10 @@ class EngramConfig:
     # tables, and a directory all of them see, empty for each deployment.
     group_size: int = 0
     group_store: str = ""
+    host_backend: str = ""
+    host_backend_config: Optional[Dict[str, Any]] = dataclasses.field(
+        default=None, repr=False
+    )
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
@@ -59,13 +63,35 @@ class EngramConfig:
             for k, v in raw.items()
             if k not in fields
             or (k in choices and v not in choices[k])
-            or (k not in choices and type(v) is not type(fields[k].default))
+            or (
+                k == "host_backend_config" and v is not None and not isinstance(v, dict)
+            )
+            or (
+                k not in choices
+                and k != "host_backend_config"
+                and type(v) is not type(fields[k].default)
+            )
         ]
         if invalid:
             raise ValueError(
                 f"--engram-config: invalid {', '.join(invalid)}; choices: {choices}"
             )
         config = cls(**raw)
+        if config.host_backend:
+            if (
+                config.placement != EngramPlacement.CPU
+                or config.replication != EngramReplication.NONE
+                or config.lookup not in (EngramLookup.AUTO, EngramLookup.ALL_REDUCE)
+            ):
+                raise ValueError(
+                    "--engram-config: 'host_backend' needs placement 'cpu', "
+                    "replication 'none', and lookup 'auto' or 'all_reduce'."
+                )
+            config = dataclasses.replace(config, lookup=EngramLookup.ALL_REDUCE)
+        elif config.host_backend_config is not None:
+            raise ValueError(
+                "--engram-config: 'host_backend_config' needs 'host_backend'."
+            )
         if config.replication == EngramReplication.GROUP_SHARDS:
             if config.lookup not in (EngramLookup.AUTO, EngramLookup.PEER_READ):
                 raise ValueError(

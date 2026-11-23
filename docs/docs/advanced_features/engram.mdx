@@ -112,6 +112,29 @@ all-reduce.
 - `--engram-config` applies to DeepSeek-V4.1 only; a DeepSeek-V4 checkpoint without Engram layers
   rejects it.
 
+## External host table providers
+
+An installed provider can replace the per-rank CPU table for a CUDA FP8 Engram
+checkpoint. Set `host_backend` to its entry point name in `--engram-config`
+with `placement` set to `cpu`. Pass provider-specific options as the optional
+`host_backend_config` JSON object.
+
+This path uses `replication` `none` and the TP all-reduce. Use `--load-format auto`
+or `safetensors` with a positive `--chunked-prefill-size`. Disable two-batch
+overlap and speculative decoding. The provider must supply the exact
+row range computed by SGLang, and order BF16 row writes on the calling CUDA
+stream, including during graph replay. Serve one checkpoint per instance and
+restart to change the table weights.
+
+Providers register in the `sglang.engram_host_table_backends` entry point group
+and implement `EngramHostTableBackend` in `sglang.srt.layers.engram_host_table`.
+A provider may also override both `begin_lookup` and `finish_lookup` to overlap
+host lookup work with earlier model layers; `host_backend_config.issue` selects
+`relay` (default: publish each layer after the previous Engram layer finishes),
+`early` (publish all Engram layers right after hashing), or `inline`
+(synchronous). Prefetch schedules (`relay` and `early`) require prefill CUDA
+graphs to be disabled.
+
 ## Removed environment variables
 
 Earlier releases chose the placement with environment variables. SGLang 1.0 removed them: a server
