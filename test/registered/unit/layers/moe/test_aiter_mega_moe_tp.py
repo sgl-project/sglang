@@ -77,15 +77,19 @@ def test_startup_check_reads_only_existing_server_args():
     from sglang.srt.runtime_context import override_platform
     from sglang.srt.server_args import ServerArgs
 
-    def args(tp_size):
+    def args(tp_size, **kwargs):
         return ServerArgs(
-            model_path="dummy", tp_size=tp_size, enable_aiter_mega_moe_tp=True
+            model_path="dummy", tp_size=tp_size, enable_aiter_mega_moe_tp=True, **kwargs
         )
 
     with override_platform(is_hip=True):
         check_aiter_mega_moe_tp_compat(args(2))
         with pytest.raises(ValueError, match="--tp-size < 2"):
             check_aiter_mega_moe_tp_compat(args(1))
+        # GLM-5.3-Flash admits LayerNorm SP, whose extend passes give each rank its
+        # own rows; the kernel's fused all-reduce sums the same rows across ranks.
+        with pytest.raises(ValueError, match="LayerNorm sequence parallelism"):
+            check_aiter_mega_moe_tp_compat(args(2, enable_layernorm_sp=True))
 
 
 if __name__ == "__main__":

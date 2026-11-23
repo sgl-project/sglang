@@ -37,6 +37,10 @@ def check_aiter_mega_moe_tp_compat(server_args: ServerArgs) -> None:
         (cfg.nnodes > 1, "multi-node TP (hipIpc symmetric memory is single-node)"),
         (attn_dp_enabled_of(cfg) or cfg.attn_cp_size > 1, "attention DP or CP"),
         (cfg.enable_attn_tp_input_scattered, "scattered attention TP input"),
+        (
+            cfg.enable_layernorm_sp,
+            "LayerNorm sequence parallelism (each TP rank holds its own token rows)",
+        ),
         (cfg.enable_two_batch_overlap, "two-batch overlap"),
         (cfg.enable_single_batch_overlap, "single-batch overlap"),
         (cfg.enable_hierarchical_cache, "HiCache (its copy streams share the GPU)"),
