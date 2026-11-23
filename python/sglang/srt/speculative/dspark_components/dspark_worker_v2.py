@@ -99,6 +99,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     draft_pp_context,
     draft_tp_context,
+    needs_verify_tree,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -1137,8 +1138,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logger.info("Verify ids read from the draft graph output (first step).")
 
         # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        verify_tree = (
+            GrammarTree.from_linear_chain(verify_ids_2d)
+            if needs_verify_tree(batch)
+            else None
         )
 
         fold_eligible = (
@@ -1196,8 +1199,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        verify.build_grammar_mask(
-            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
+        verify.bind_tree(
+            verify_tree, logits_output=logits_output, barrier=grammar_barrier
         )
         target_logits = logits_output.next_token_logits
         # Without sampling info (a simulated greedy accept drops it), nothing
@@ -1253,6 +1256,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+            if verify.first_row_only is not None:
+                # The graph accepts never run with a custom logit processor: it
+                # adjusts the logits.
+                (
+                    accept.correct_len,
+                    accept.commit_lens,
+                    accept.bonus,
+                    accept.new_seq_lens,
+                ) = verify.cap_chain_accept(
+                    out_tokens=accept.out_tokens,
+                    correct_len=accept.correct_len,
+                    commit_lens=accept.commit_lens,
+                    bonus=accept.bonus,
+                    prefix_lens=prefix_lens,
+                )
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
             logits_output=logits_output,

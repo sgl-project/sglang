@@ -33,6 +33,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
+    needs_verify_tree,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
@@ -113,7 +114,7 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
-        self.grammar_tree_host: Optional[tuple] = None
+        self.verify_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
@@ -344,8 +345,9 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        # Staged for the grammar bitmask, derived after the verify launch below.
-        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
+        # Staged for the grammar bitmask and the row prefixes, derived after the
+        # verify launch below.
+        self.verify_tree_host = (mask, req_drafts) if needs_verify_tree(batch) else None
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask_func(
@@ -465,21 +467,21 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            grammar_tree = None
-            if batch.has_grammar:
+            verify_tree = None
+            if self.verify_tree_host is not None:
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
-                mask, req_drafts = self.grammar_tree_host
+                mask, req_drafts = self.verify_tree_host
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
-                grammar_tree = GrammarTree.from_host(
+                verify_tree = GrammarTree.from_host(
                     retrieve_next_token_cpu,
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            verify.build_grammar_mask(
-                grammar_tree,
+            verify.bind_tree(
+                verify_tree,
                 logits_output=logits_output,
                 # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
                 barrier=None,

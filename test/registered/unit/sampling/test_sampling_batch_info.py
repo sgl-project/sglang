@@ -152,10 +152,12 @@ class TestSamplingPipelineOrder(CustomTestCase):
 
     def test_verify_runs_the_watermark_before_the_custom_processor(self):
         """Verify runs sampling's order; the custom processor also processes the
-        unwatermarked logits the watermark keeps for the logprobs."""
+        unwatermarked logits the watermark keeps for the logprobs, both with the
+        rows' draft prefixes."""
         events = []
         logits = torch.zeros(2, 4)
         watermarked = torch.zeros(2, 4)
+        row_prefixes = [[], [0]]
 
         def apply_watermark(logits, *, sampling_info):
             events.append("watermark")
@@ -170,7 +172,9 @@ class TestSamplingPipelineOrder(CustomTestCase):
             patch(
                 f"{module}.apply_custom_logit_processor",
                 side_effect=lambda t, info, **kwargs: events.append(
-                    "custom " + ("logits" if t is logits else "watermarked")
+                    "custom "
+                    + ("logits" if t is logits else "watermarked")
+                    + ("" if kwargs["row_prefixes"] is row_prefixes else " no prefix")
                 ),
             ),
         ):
@@ -180,6 +184,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 grammar_mask=None,
                 draft_tokens=torch.zeros(1, 2, dtype=torch.long),
                 apply_watermark=apply_watermark,
+                row_prefixes=row_prefixes,
             )
 
         self.assertIs(verify_logits, watermarked)

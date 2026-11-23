@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 UOCR_PAGE_GUARD_PROCESSOR = "sglang:uocr-page-guard"
 
+# custom_params key set on each speculative verify row: the draft tokens between
+# the request's committed output and that row.
+ROW_PREFIX_KEY = "__row_prefix__"
+
 
 @lru_cache(maxsize=None)
 def _cache_from_str(json_str: str):
@@ -34,6 +38,12 @@ def _cache_from_str(json_str: str):
 
 class CustomLogitProcessor(ABC):
     """Abstract base class for callable functions."""
+
+    # Whether the processor is right on every speculative verify row: it reads a
+    # row's tokens as req.output_ids followed by params[ROW_PREFIX_KEY], or reads
+    # no history at all. Otherwise verify runs it on each request's first row
+    # only and commits one token per round for that request.
+    supports_row_prefix: bool = False
 
     @abstractmethod
     def __call__(
@@ -60,6 +70,8 @@ class CustomLogitProcessor(ABC):
 
 
 class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
+    supports_row_prefix = True
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -101,6 +113,8 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
     THINKING_END_TOKEN_ID: int
     NEW_LINE_TOKEN_ID: int
 
+    supports_row_prefix = True
+
     def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
         if custom_param_list is None or not custom_param_list:
             return logits
@@ -118,7 +132,8 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             ):
                 continue
             req: Req = param_dict.get("__req__")
-            cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
+            output_ids = [*req.output_ids, *param_dict.get(ROW_PREFIX_KEY, ())]
+            cur_ids: list[int] = [*req.origin_input_ids, *output_ids]
 
             # Check if out of thinking stage
             start_index = _open_thinking_start(
@@ -134,7 +149,7 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
                 continue
 
             # Ensure new line token before thinking end token
-            if not req.output_ids or req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
+            if not output_ids or output_ids[-1] != self.NEW_LINE_TOKEN_ID:
                 logits[i, :] = -float("inf")
                 logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
                 continue
@@ -236,6 +251,7 @@ def _count_markers(st: PageGuardState, output_ids, page_token_id: int) -> None:
 
 def _page_guard(
     req,
+    row_prefix,
     *,
     page_token_id: int,
     max_page_tokens: int,
@@ -277,13 +293,20 @@ def _page_guard(
     # Scanning the whole output every step costs O(output) per token; keep a
     # running count and only read the tail that arrived since the last step.
     _count_markers(st, req.output_ids, page_token_id)
-    if st.marks > st.expected:
+    # A verify row's drafts are not committed, so they stay out of the state.
+    marks, last = st.marks, st.last
+    for i, token in enumerate(row_prefix, start=st.seen):
+        if token == page_token_id:
+            marks += 1
+            last = i
+    seen = st.seen + len(row_prefix)
+    if marks > st.expected:
         return eos_id, None
     if stop_only:
         return None
-    if 0 < max_page_tokens <= st.seen - (st.last + 1):
-        return (page_token_id if st.marks < st.expected else eos_id), None
-    if st.marks < st.expected:
+    if 0 < max_page_tokens <= seen - (last + 1):
+        return (page_token_id if marks < st.expected else eos_id), None
+    if marks < st.expected:
         return None, eos_id
     # The marker past the window's own pages is its stop signal (forced to EOS
     # above), so it must not be masked on the last own page.
@@ -321,7 +344,7 @@ def _repeat_stop_params(params: Dict[str, Any]) -> _RepeatStop:
         return _RepeatStop()
 
 
-def _repeat_stop(req, rep: _RepeatStop, *, vocab_size: int) -> Optional[int]:
+def _repeat_stop(output_ids, rep: _RepeatStop, *, vocab_size: int) -> Optional[int]:
     """EOS if the output ends in a periodic cycle (opt-in), else None.
 
     N-gram blocking can only shift such a cycle's phase, so it needs a hard stop.
@@ -332,7 +355,7 @@ def _repeat_stop(req, rep: _RepeatStop, *, vocab_size: int) -> Optional[int]:
         and rep.eos_id is not None
         and 0 <= rep.eos_id < vocab_size
         and _tail_has_repeat(
-            req.output_ids,
+            output_ids,
             min_pattern_size=rep.min_pattern_size,
             max_pattern_size=rep.max_pattern_size,
             min_count=rep.min_count,
@@ -365,6 +388,7 @@ def _page_guard_action(
         return None
     return _page_guard(
         req,
+        params.get(ROW_PREFIX_KEY, ()),
         page_token_id=page_token_id,
         max_page_tokens=max_page_tokens,
         eos_id=eos_id,
@@ -373,7 +397,9 @@ def _page_guard_action(
     )
 
 
-def _ngram_banned_tokens(req, params: Dict[str, Any], *, vocab_size: int) -> List[int]:
+def _ngram_banned_tokens(
+    req, output_ids, params: Dict[str, Any], *, vocab_size: int
+) -> List[int]:
     """Tokens that would repeat an n-gram inside the sliding window."""
     try:
         ngram_size = int(params.get("ngram_size") or 0)
@@ -386,13 +412,13 @@ def _ngram_banned_tokens(req, params: Dict[str, Any], *, vocab_size: int) -> Lis
     # vLLM hands the processor generated tokens only, so the window
     # slides over the output, not the prompt.
     if params.get(NGRAM_OUTPUT_ONLY_KEY):
-        sequence = req.output_ids[-window_size:]
-    elif len(req.output_ids) >= window_size:
-        sequence = req.output_ids[-window_size:]
+        sequence = output_ids[-window_size:]
+    elif len(output_ids) >= window_size:
+        sequence = output_ids[-window_size:]
     else:
         # only the searched tail can contribute a repeated n-gram
-        prompt_tokens = window_size - len(req.output_ids)
-        sequence = req.origin_input_ids[-prompt_tokens:] + req.output_ids
+        prompt_tokens = window_size - len(output_ids)
+        sequence = req.origin_input_ids[-prompt_tokens:] + output_ids
     if len(sequence) < ngram_size:
         return []
 
@@ -426,6 +452,8 @@ def _ngram_banned_tokens(req, params: Dict[str, Any], *, vocab_size: int) -> Lis
 class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
     """Block repeated n-grams, cap per-page length, optionally stop periodic cycles."""
 
+    supports_row_prefix = True
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -446,8 +474,14 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             if req is None:
                 continue
 
+            row_prefix = params.get(ROW_PREFIX_KEY)
+            output_ids = (
+                req.output_ids + array("q", row_prefix)
+                if row_prefix
+                else req.output_ids
+            )
             rep = _repeat_stop_params(params)
-            forced = _repeat_stop(req, rep, vocab_size=vocab_size)
+            forced = _repeat_stop(output_ids, rep, vocab_size=vocab_size)
             if forced is None:
                 action = _page_guard_action(
                     req, params, eos_id=rep.eos_id, vocab_size=vocab_size
@@ -460,7 +494,9 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
                 edits.force(row=batch_idx, col=forced)
                 continue
 
-            indices = _ngram_banned_tokens(req, params, vocab_size=vocab_size)
+            indices = _ngram_banned_tokens(
+                req, output_ids, params, vocab_size=vocab_size
+            )
             if indices:
                 edits.ban(row=batch_idx, cols=indices)
 
@@ -516,9 +552,16 @@ def apply_custom_logit_processor(
     sampling_info: "SamplingBatchInfo",
     *,
     rows_per_request: int = 1,
+    row_prefixes: Optional[List[List[int]]] = None,
 ):
     """Apply each request's custom logit processor to its `rows_per_request`
-    consecutive logits rows, in place."""
+    consecutive logits rows, in place.
+
+    `row_prefixes`, at speculative verify: per logits row, the draft tokens
+    between the request's committed output and that row. A processor that
+    supports them runs on every row with them in its params; any other runs on
+    each request's first row only, which has no draft token before it.
+    """
     if not sampling_info.has_custom_logit_processor:
         return
 
@@ -533,14 +576,28 @@ def apply_custom_logit_processor(
         if rows_per_request == 1
         else torch.arange(rows_per_request, device=sampling_info.device)
     )
+    params = sampling_info.custom_params
     for entry in sampling_info.custom_logit_processor.values():
         rows, indices = entry.rows, entry.indices
-        custom_params = [
-            sampling_info.custom_params[i]
-            for i in rows
-            for _ in range(rows_per_request)
-        ]
-        if len(rows) == batch_size:
+        first_row_only = (
+            row_prefixes is not None and not entry.processor.supports_row_prefix
+        )
+        if first_row_only:
+            custom_params = [params[i] for i in rows]
+        elif row_prefixes is None:
+            custom_params = [params[i] for i in rows for _ in range(rows_per_request)]
+        else:
+            custom_params = [
+                None
+                if params[i] is None
+                else {
+                    **params[i],
+                    ROW_PREFIX_KEY: row_prefixes[i * rows_per_request + offset],
+                }
+                for i in rows
+                for offset in range(rows_per_request)
+            ]
+        if len(custom_params) == logits.shape[0]:
             # Rows are ascending and duplicate-free, so every row opted in and
             # gather and scatter-back are the identity.
             result = entry.processor(logits, custom_params)
@@ -549,7 +606,9 @@ def apply_custom_logit_processor(
                 # a processor that builds a fresh tensor must still land here.
                 logits.copy_(result)
         else:
-            if token_offsets is not None:
+            if first_row_only:
+                indices = indices * rows_per_request
+            elif token_offsets is not None:
                 indices = (
                     indices[:, None] * rows_per_request + token_offsets
                 ).flatten()
@@ -560,3 +619,17 @@ def apply_custom_logit_processor(
         logger.debug(
             f"Custom logit processor {entry.processor.__class__.__name__} is applied."
         )
+
+
+def first_row_only_requests(
+    sampling_info: "SamplingBatchInfo",
+) -> Optional[torch.Tensor]:
+    """The batch indices of the requests whose custom logit processor does not
+    support row prefixes, so verify ran it on their first row only; None when
+    there are none."""
+    indices = [
+        entry.indices
+        for entry in sampling_info.custom_logit_processor.values()
+        if not entry.processor.supports_row_prefix
+    ]
+    return torch.cat(indices) if indices else None
