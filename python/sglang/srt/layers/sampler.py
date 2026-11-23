@@ -26,7 +26,6 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import (
     is_cuda,
@@ -140,15 +139,6 @@ class Sampler(nn.Module):
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
-    def _preprocess_logits(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
-    ) -> torch.Tensor:
-        """Apply custom logit processors and sanitize non-finite logits."""
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
-        sanitize_nan_logits(logits, "sampler: next_token_logits")
-        return logits
-
     def forward(
         self,
         logits_output: LogitsProcessorOutput,
@@ -163,7 +153,8 @@ class Sampler(nn.Module):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
         Args:
-            logits_output: The logits from the model forward
+            logits_output: The logits from the model forward, adjusted by every
+                stage of `SamplingPipeline` before the sampler
             sampling_info: Metadata for sampling
             return_logprob: If set, store the output logprob information to
                 logits_output
@@ -176,7 +167,6 @@ class Sampler(nn.Module):
             logprob_logits: Optional pre-watermark logits for returned log probabilities.
         """
         logits = logits_output.next_token_logits
-        maybe_detect_nan(logits, "sampler: next_token_logits")
         _trace_e2e_sampler(
             "forward_enter",
             logits_shape=tuple(logits.shape),
@@ -186,13 +176,8 @@ class Sampler(nn.Module):
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
-        # Preprocess logits (custom processors and NaN handling)
-        _trace_e2e_sampler("preprocess_enter")
-        logits = self._preprocess_logits(logits, sampling_info)
-        _trace_e2e_sampler("preprocess_returned")
         target_logprobs = None
         if logprob_logits is not None:
-            logprob_logits = self._preprocess_logits(logprob_logits, sampling_info)
             if sampling_info.is_all_greedy or SGLANG_RETURN_ORIGINAL_LOGPROB:
                 target_logprobs = torch.nn.functional.log_softmax(
                     logprob_logits, dim=-1
@@ -771,15 +756,16 @@ class Sampler(nn.Module):
     def compute_logprobs_only(
         self,
         logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
+        *,
+        preprocess_fn: Callable[[torch.Tensor], torch.Tensor],
     ) -> None:
         logprob_result = self.output_logprob_processor.compute_logprobs_only(
             next_token_logits=logits_output.next_token_logits,
             top_logprobs_nums=top_logprobs_nums,
             token_ids_logprobs=token_ids_logprobs,
-            preprocess_fn=partial(self._preprocess_logits, sampling_info=sampling_info),
+            preprocess_fn=preprocess_fn,
         )
         if logprob_result is not None:
             logprob_result.write_output_to(logits_output)
@@ -1075,62 +1061,3 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-
-def apply_custom_logit_processor(
-    logits: torch.Tensor,
-    sampling_batch_info: SamplingBatchInfo,
-    num_tokens_in_batch: int = 1,
-):
-    """Apply custom logit processors to the logits.
-    This function will modify the logits in-place.
-    num_tokens_in_batch is needed to support spec decoding, where each batch can contain multiple
-    tokens. By default, we assume each batch contains only 1 token.
-    """
-
-    batch_size = len(sampling_batch_info.custom_params)
-    assert logits.shape[0] == batch_size * num_tokens_in_batch, (
-        f"The batch size of logits ({logits.shape[0]}) does not match the number of "
-        f"custom params ({batch_size}) x num_tokens_in_batch ({num_tokens_in_batch})"
-    )
-
-    token_offsets = (
-        None
-        if num_tokens_in_batch == 1
-        else torch.arange(num_tokens_in_batch, device=sampling_batch_info.device)
-    )
-    for entry in sampling_batch_info.custom_logit_processor.values():
-        rows, indices = entry.rows, entry.indices
-        assert len(rows) == indices.numel(), (
-            f"The number of cached processor rows ({len(rows)}) does not match the "
-            f"number of cached device indices ({indices.numel()})"
-        )
-        assert not rows or rows[-1] < batch_size, (
-            f"Cached processor rows {rows} are stale for a batch of {batch_size}"
-        )
-
-        custom_params = [
-            sampling_batch_info.custom_params[i]
-            for i in rows
-            for _ in range(num_tokens_in_batch)
-        ]
-        if len(rows) == batch_size:
-            # Rows are ascending and duplicate-free, so every row opted in and
-            # gather and scatter-back are the identity.
-            result = entry.processor(logits, custom_params)
-            if result is not logits:
-                # The gather path scatters the return value back implicitly, so
-                # a processor that builds a fresh tensor must still land here.
-                logits.copy_(result)
-        else:
-            if token_offsets is not None:
-                indices = (
-                    indices[:, None] * num_tokens_in_batch + token_offsets
-                ).flatten()
-            selected = logits.index_select(0, indices)
-            result = entry.processor(selected, custom_params)
-            logits.index_copy_(0, indices, result.to(logits.dtype))
-
-        logger.debug(
-            f"Custom logit processor {entry.processor.__class__.__name__} is applied."
-        )

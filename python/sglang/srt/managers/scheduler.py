@@ -698,6 +698,7 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                cache_controller.forward_on_fence_stream = self.enable_overlap
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -3474,6 +3475,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
+                filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
 
@@ -3547,6 +3549,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -4357,8 +4360,8 @@ class Scheduler(
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            batch, self.model_config.vocab_size
+        batch.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=batch.device
         )
         # todo hisparse, maybe other info to contain for the new batch
         return batch
@@ -5494,6 +5497,8 @@ class Scheduler(
             batch.sampling_info.watermark = build_watermark_rows(
                 batch.reqs, batch.device
             )
+            batch.sampling_info.set_plugin_state(batch.reqs)
+            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -5940,9 +5945,8 @@ class Scheduler(
         self._copy_result_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
-        # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
+        # The delay_sample_func closure captures forward_batch and logits_output
+        # (which holds next_token_logits). Without clearing these, they stay alive via
         # batch_result in result_queue and batch_record_buf until the next
         # iteration, causing a steady VRAM leak with structured output.
         batch_result.delay_sample_func = None

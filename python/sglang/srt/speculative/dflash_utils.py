@@ -16,11 +16,12 @@ from sglang.kernels.ops.speculative.verify_sampling import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import (
-    apply_custom_logit_processor,
-    top_p_normalize_probs_torch,
+from sglang.srt.layers.sampler import top_p_normalize_probs_torch
+from sglang.srt.layers.sampling_renorm import (
+    min_p_renorm_prob,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
 )
-from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
@@ -219,73 +220,6 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
-
-
-def apply_dflash_verify_logits_adjustments(
-    *,
-    next_token_logits: torch.Tensor,
-    sampling_info: Any,
-    draft_token_num: int,
-    verify_tokens: Optional[torch.Tensor],
-) -> None:
-    """Apply sampling-time logit adjustments for DFlash verify in place.
-
-    `verify_tokens` [bs, draft_token_num]: the anchor, then the drafts. Only
-    penalties read them; None when the step has none.
-    """
-    if sampling_info is None:
-        return
-    if next_token_logits.ndim != 2:
-        raise ValueError(
-            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
-        )
-    if draft_token_num <= 0:
-        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
-
-    bs = sampling_info.temperatures.shape[0]
-    if next_token_logits.shape[0] != bs * draft_token_num:
-        raise ValueError(
-            "next_token_logits row count mismatch for DFlash verify adjustments. "
-            f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
-        )
-
-    grammar_mask = getattr(sampling_info, "grammar_mask", None)
-    logit_bias = getattr(sampling_info, "logit_bias", None)
-
-    logits_3d: Optional[torch.Tensor] = None
-
-    def get_logits_3d() -> torch.Tensor:
-        nonlocal logits_3d
-        if logits_3d is None:
-            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
-        return logits_3d
-
-    # Same order as SamplingBatchInfo.apply_logits_bias.
-    if sampling_info.step_penalties is not None:
-        sampling_info.step_penalties.apply_verify(next_token_logits, verify_tokens)
-
-    if grammar_mask is not None:
-        vocab_mask_bias = torch.zeros(
-            (bs, next_token_logits.shape[1]),
-            dtype=torch.float32,
-            device=next_token_logits.device,
-        )
-        grammar_mask.apply(vocab_mask_bias)
-        get_logits_3d().add_(
-            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
-        )
-
-    if logit_bias is not None:
-        # In the bias's own dtype, so the sum rounds once to the logits dtype.
-        get_logits_3d().add_(logit_bias.to(device=next_token_logits.device)[:, None, :])
-
-    # Last, as Sampler applies it after ModelRunner._preprocess_logits.
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits,
-            sampling_info,
-            num_tokens_in_batch=draft_token_num,
-        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -1224,8 +1158,8 @@ def build_speculative_verify_target_probs(
     from sglang.srt.utils import is_cuda
 
     device = next_token_logits.device
-    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
-    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    need_top_k = sampling_info.need_top_k_sampling
+    need_top_p = sampling_info.need_top_p_sampling
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -1294,6 +1228,11 @@ def build_speculative_verify_target_probs(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
+    if sampling_info.need_min_p_sampling:
+        target_probs = min_p_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(sampling_info.min_ps, draft_token_num, dim=0),
+        )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 

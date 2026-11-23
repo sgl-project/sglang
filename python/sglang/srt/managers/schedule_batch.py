@@ -55,7 +55,7 @@ import sys
 import weakref
 from array import array
 from concurrent.futures import Future
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -148,6 +148,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.logit_bias import LogitBiasEntries
 from sglang.srt.sampling.sampler_params import SamplerParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
@@ -495,6 +496,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        filler_seed: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -569,6 +571,8 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
+        # Seed this row samples with in a seeded batch when it has no sampling_seed.
+        self.filler_seed = filler_seed
         # Index in the scheduler's PenaltyStatusPool, held while the request uses
         # a penalty; a retraction keeps it.
         self.penalty_index: Optional[int] = None
@@ -910,6 +914,14 @@ class Req(ReqDllmMixin):
             self.cache_request_handle,
             attempt_id=self.cache_request_handle.attempt_id + 1,
         )
+
+    @cached_property
+    def logit_bias_entries(self) -> Optional[LogitBiasEntries]:
+        """sampling_params.logit_bias parsed at the first launch, None without
+        one; the request's sampling_params no longer change once it is admitted."""
+        if self.sampling_params.logit_bias is None:
+            return None
+        return LogitBiasEntries.parse(self.sampling_params.logit_bias)
 
     @property
     def seqlen(self) -> int:
@@ -1997,7 +2009,7 @@ def branch_checkpoint(
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
-    # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
+    # === Core: request list (ForwardBatch derives lora_ids / rids / positions from it) ===
     reqs: List[Req]
 
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
@@ -2690,10 +2702,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
-        # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
+        # Per-request sampling state is built at each launch.
+        self.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=self.device
         )
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
@@ -3183,12 +3194,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
+        self.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=self.device
         )
-        # Workers launch some idle batches themselves, without the scheduler's gather.
+        # Workers launch some idle batches themselves, without the scheduler's builds.
         self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
+        self.sampling_info.set_seeds_and_mask_rows([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
         return alloc_tracking_slots(
@@ -3459,7 +3470,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
@@ -3469,9 +3479,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
-        self.sampling_info.merge_batch(
-            other.sampling_info, self_len=len(self.reqs), other_len=len(other.reqs)
-        )
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
