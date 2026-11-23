@@ -47,8 +47,10 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     plan_waves,
 )
 from sglang.srt.layers.moe.paged_experts.runners import (
+    FLASHINFER_CUTLASS,
     MARLIN,
     TRITON,
+    CombiningContract,
     MarlinContract,
     RunnerContract,
     TritonContract,
@@ -448,6 +450,294 @@ class TestPagedForward(CustomTestCase):
         (replay,) = callbacks
         replay()
         torch.testing.assert_close(out, _reference(full, d))
+
+
+class _FakeCombining(CombiningContract):
+    """A combining contract whose runner config is a marker (the test configs are not
+    dataclasses)."""
+
+    MARKER = SimpleNamespace(combines=True)
+
+    def runner_config(self, moe_runner_config, num_slots):
+        return self.MARKER
+
+
+def _combining_layer(contract=None, partial_dtype=None):
+    """A paged layer whose runner sums the top-k outputs itself and, like a runner with a
+    local expert range, computes only ids in ``[0, K)``: other ids are dropped whatever their
+    router weight. ``calls`` records each call's ids and weights."""
+    method, layer, full = _paged_layer(contract or _FakeCombining(), load=True)
+    per_entry = method.base_method.apply
+    calls = []
+
+    def combining_apply(layer, dispatch_output):
+        topk = dispatch_output.topk_output
+        ids = topk.topk_ids.long()
+        calls.append((ids.clone(), topk.topk_weights.clone()))
+        local = (ids >= 0) & (ids < layer.num_local_experts)
+        dropped = dispatch_output._replace(
+            topk_output=topk._replace(topk_ids=ids.masked_fill(~local, -1))
+        )
+        out = per_entry(layer, dropped).hidden_states.sum(1)
+        return SimpleNamespace(
+            hidden_states=out if partial_dtype is None else out.to(partial_dtype)
+        )
+
+    method.base_method.apply = combining_apply
+    return method, layer, full, calls
+
+
+class TestCombiningRunner(CustomTestCase):
+    def test_matches_unpaged_in_one_wave_or_several(self):
+        """Consecutive steps in one wave (1, 2 tokens) or several (64), with padded entries:
+        each output equals the unpaged layer."""
+        for num_tokens, padded in ((1, False), (2, False), (64, False), (3, True)):
+            with self.subTest(num_tokens=num_tokens, padded=padded):
+                method, layer, full, _ = _combining_layer()
+                for _ in range(8):
+                    d = _step(num_tokens, padded=padded)
+                    out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                    torch.testing.assert_close(out, _reference(full, d))
+
+    def test_a_wave_drops_the_entries_of_other_experts_by_id(self):
+        """Every wave sends the entries of experts it does not hold to id K, outside the
+        runner's local experts, with weight 0; ids never exceed K, and across a multi-wave
+        step each routed entry is computed exactly once. A runner without a local expert range
+        (``drops_outside = False``) gets them at slot 0 with weight 0: the output is the same,
+        but every wave computes every entry (the negative control for the id-K path)."""
+
+        class _SlotZero(_FakeCombining):
+            drops_outside = False
+
+        for contract, once in ((_FakeCombining(), True), (_SlotZero(), False)):
+            with self.subTest(contract=type(contract).__name__):
+                method, layer, full, calls = _combining_layer(contract)
+                d = _step(64)
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                torch.testing.assert_close(out, _reference(full, d))
+                self.assertGreater(len(calls), 1)  # several waves
+                computed = sum(int(((ids >= 0) & (ids < K)).sum()) for ids, _ in calls)
+                routed = d.topk_output.topk_ids.numel()
+                for ids, weights in calls:
+                    self.assertLessEqual(int(ids.max()), K)
+                    self.assertTrue(bool((weights[ids == K] == 0).all()))
+                if once:
+                    self.assertEqual(computed, routed)
+                else:
+                    self.assertEqual(computed, routed * len(calls))
+
+    def test_several_waves_add_in_fp32_and_one_wave_is_left_as_is(self):
+        """A runner returning bf16: several waves reach ``finish`` as one FP32 sum, cast to
+        the input's dtype once; a one-wave step reaches it as the runner's own output.
+        Control: the same check on the one-wave step sees bf16."""
+        seen = []
+
+        class _Spy(_FakeCombining):
+            def finish(self, merged, hidden_states, routed_scaling_factor):
+                seen.append(merged.dtype)
+                return super().finish(merged, hidden_states, routed_scaling_factor)
+
+        method, layer, full, calls = _combining_layer(
+            _Spy(), partial_dtype=torch.bfloat16
+        )
+        for num_tokens, dtype in ((64, torch.float32), (1, torch.bfloat16)):
+            with self.subTest(num_tokens=num_tokens):
+                seen.clear()
+                calls.clear()
+                d = _step(num_tokens)
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                self.assertEqual(seen, [dtype])
+                self.assertEqual(out.dtype, d.hidden_states.dtype)
+                self.assertEqual(len(calls) > 1, num_tokens == 64)
+                torch.testing.assert_close(
+                    out, _reference(full, d), atol=0.05 * num_tokens, rtol=0.02
+                )
+
+    def test_the_runner_is_built_with_the_contracts_config(self):
+        """A contract with its own runner config (a combining runner that rejects
+        ``no_combine``, as trtllm-gen does): the runner is rebuilt with it, also for the final
+        K. A combining runner that ignores the field (FlashInfer CUTLASS) is built once with the
+        shared config. Control: a per-entry contract builds it once with the shared config."""
+        cases = (
+            (_FakeCombining(), _FakeCombining.MARKER),
+            (FLASHINFER_CUTLASS, None),
+            (TRITON, None),
+        )
+        for contract, last in cases:
+            with self.subTest(contract=type(contract).__name__):
+                configs = []
+
+                class _Recording(_LinearMoE):
+                    def create_weights(self, layer, num_experts, **kwargs):
+                        for name in ("w13_weight", "w2_weight"):
+                            layer.register_parameter(
+                                name,
+                                torch.nn.Parameter(
+                                    torch.zeros(num_experts, H, H), requires_grad=False
+                                ),
+                            )
+
+                    def create_moe_runner(self, layer, moe_runner_config):
+                        configs.append(moe_runner_config)
+
+                method = PagedExpertsMoEMethod(
+                    base_method=_Recording(),
+                    expert_format=UnquantizedFormat(),
+                    num_experts=E,
+                    num_resident=K,
+                )
+                layer = torch.nn.Module()
+                layer.weight_load_method = None
+                layer.top_k = None
+                layer.quant_method = method
+                _create(method, layer, contract)
+                if last is None:
+                    self.assertEqual(len(configs), 1)
+                    self.assertIsNot(configs[0], _FakeCombining.MARKER)
+                else:
+                    self.assertEqual(len(configs), 2)
+                    self.assertIs(configs[-1], last)
+                    configs.clear()
+                    method._create_runner(layer)  # as sizing does for the final K
+                    self.assertEqual(configs, [last])
+
+    def test_combining_config_turns_the_runners_combine_on(self):
+        """The helper a combining contract that rejects ``no_combine`` returns: K local
+        experts, combine on, nothing else changed. Control: the shared config asks for
+        per-entry outputs."""
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+        base = MoeRunnerConfig(num_experts=E, top_k=TOP_K, hidden_size=H)
+        config = CombiningContract.combining_config(base, K)
+        self.assertEqual(
+            (config.num_local_experts, config.no_combine, config.inplace),
+            (K, False, False),
+        )
+        self.assertEqual((config.num_experts, config.top_k), (E, TOP_K))
+        self.assertTrue(runners.runner_config(base, K).no_combine)
+
+    def test_prefill_bytes_count_the_accumulator_and_one_wave_output(self):
+        """No merged per-entry buffer and no compacted call: an FP32 [tokens, hidden]
+        accumulator and the wave's output, at the padded width. Control: a per-entry
+        contract reserves more for the same step."""
+        combining = CombiningContract().prefill_bytes(100, 64, 10, 8, torch.bfloat16)
+        self.assertEqual(combining, 10 * 256 * (4 + 2))
+        self.assertGreater(
+            TRITON.prefill_bytes(100, 64, 10, 8, torch.bfloat16), combining
+        )
+
+
+class TestContractHooks(CustomTestCase):
+    def test_validate_runs_before_the_checkpoint_loads(self):
+        """A contract's ``validate`` refuses a configuration at ``create_moe_runner``, before
+        any expert loads. Control: the default accepts."""
+
+        class _Refusing(_FakeCombining):
+            def validate(self):
+                raise RuntimeError("refused by the contract")
+
+        with self.assertRaisesRegex(RuntimeError, "refused by the contract"):
+            _paged_layer(_Refusing(), load=False)
+        method, _, _ = _paged_layer(_FakeCombining(), load=False)
+        self.assertIsNotNone(method.loads)
+
+    def test_the_disk_tier_needs_a_cuda_accelerator(self):
+        """The tier registers its host rows with CUDA: another accelerator is refused at
+        ``create_moe_runner`` with a hint to fit the experts in host memory. Control: on CUDA
+        the same tiered layer is created."""
+        with tempfile.TemporaryDirectory() as folder:
+            with patch(_METHOD + "accelerator_type", return_value="npu"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "registers its host rows with CUDA"
+                ):
+                    _tiered_layer(folder, 6, CONTRACTS[0])
+            method, _, _ = _tiered_layer(folder, 6, CONTRACTS[0])
+            self.assertTrue(method.tiered)
+
+
+class TestPinnedHost(CustomTestCase):
+    def test_the_host_allocator_follows_the_accelerator(self):
+        """CUDA (and ROCm, which reports cuda) pins exact-size registered memory; another
+        accelerator gets the host allocator sglang's host KV pools use for it. Control: the
+        CUDA path never calls that table."""
+        from sglang.srt.mem_cache.pool_host import common
+
+        npu_alloc = Mock(return_value=torch.empty(2, 3))
+        pin = Mock(return_value=torch.empty(2, 3))
+        with (
+            patch.dict(common.ALLOC_MEMORY_FUNCS, {"npu": npu_alloc}),
+            patch.object(store_module, "_pin_until_freed", pin),
+        ):
+            with patch.object(store_module, "accelerator_type", return_value="npu"):
+                store_module.pinned_host((2, 3), torch.float32)
+            npu_alloc.assert_called_once_with(
+                dims=(2, 3),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+                allocator=None,
+            )
+            pin.assert_not_called()
+            with patch.object(store_module, "accelerator_type", return_value="cuda"):
+                store_module.pinned_host((2, 3), torch.float32)
+            pin.assert_called_once_with((2, 3), torch.float32)
+            self.assertEqual(npu_alloc.call_count, 1)
+
+
+def _flashinfer_cutlass():
+    try:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            _flashinfer_cutlass_fused_moe,
+        )
+
+        return _flashinfer_cutlass_fused_moe()[0]
+    except (ImportError, RuntimeError):
+        return None
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability() >= (8, 9)
+    and _flashinfer_cutlass() is not None,
+    "needs FlashInfer's CUTLASS MoE (built for SM89 and newer)",
+)
+class TestCutlassDropsIdsOutsideItsExperts(CustomTestCase):
+    def test_a_route_to_id_k_is_not_computed_whatever_its_weight(self):
+        """What the combining contract relies on: with K experts in its tables, FlashInfer's
+        CUTLASS MoE computes nothing for a route to id K, even with router weight 1, so the
+        output equals the step without that route (sent to expert 0 with weight 0).
+        Negative control: the same route to expert 1 with weight 1 changes the output."""
+        moe = _flashinfer_cutlass()
+        torch.manual_seed(0)
+        tokens, hidden, inter, k = 16, 256, 128, 4
+        dev = dict(device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(tokens, hidden, **dev)
+        w13 = torch.randn(k, 2 * inter, hidden, **dev) / hidden**0.5
+        w2 = torch.randn(k, hidden, inter, **dev) / inter**0.5
+        first = torch.randint(0, k, (tokens,), device="cuda")
+
+        def run(second_id, second_weight):
+            ids = torch.stack([first, torch.full_like(first, second_id)], 1).int()
+            weights = torch.stack(
+                [
+                    torch.ones(tokens, device="cuda"),
+                    torch.full((tokens,), second_weight, device="cuda"),
+                ],
+                1,
+            )
+            return moe(
+                input=x,
+                token_selected_experts=ids,
+                token_final_scales=weights,
+                fc1_expert_weights=w13,
+                fc2_expert_weights=w2,
+                output_dtype=torch.bfloat16,
+                quant_scales=None,
+            )[0]
+
+        without = run(0, 0.0)
+        torch.testing.assert_close(run(k, 1.0), without)
+        self.assertFalse(torch.allclose(run(1, 1.0), without))
 
 
 class TestLoading(CustomTestCase):
@@ -1161,12 +1451,42 @@ class TestFormats(CustomTestCase):
 
         self.assertIs(contract_for(runner(MoeRunnerBackend.TRITON)), TRITON)
         self.assertIs(contract_for(runner(MoeRunnerBackend.MARLIN)), MARLIN)
-        # This sums the top-k outputs inside the kernel, so waves cannot be exact.
-        backend = MoeRunnerBackend.FLASHINFER_CUTLASS
+        self.assertIs(
+            contract_for(runner(MoeRunnerBackend.FLASHINFER_CUTLASS)),
+            FLASHINFER_CUTLASS,
+        )
+        self.assertTrue(FLASHINFER_CUTLASS.combines)
+        backend = MoeRunnerBackend.FLASHINFER_TRTLLM  # no contract (yet)
         with self.assertRaisesRegex(RuntimeError, backend.value):
             contract_for(runner(backend))
-        with self.assertRaisesRegex(RuntimeError, "triton or Marlin"):
+        with self.assertRaisesRegex(
+            RuntimeError, "triton, Marlin or flashinfer_cutlass"
+        ):
             contract_for(None)
+
+    def test_a_backend_registers_its_own_contract_once(self):
+        """A backend whose runner lives elsewhere registers its contract by backend value;
+        contract_for finds it, and a second registration for the same backend raises.
+        Control: before registering, the backend has no contract."""
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+        runner = SimpleNamespace(runner_backend=backend)
+        with patch.dict(runners._REGISTERED, clear=True):
+            with self.assertRaisesRegex(RuntimeError, backend.value):
+                contract_for(runner)
+            contract = CombiningContract()
+            runners.register_runner_contract(backend.value, contract)
+            self.assertIs(contract_for(runner), contract)
+            with self.assertRaisesRegex(ValueError, "already registered"):
+                runners.register_runner_contract(backend.value, CombiningContract())
+
+    def test_the_cutlass_contract_takes_only_unquantized_experts(self):
+        """Its quantized formats repack for the runner after loading, which the host store's
+        rows are not checked against: such a layer fails at startup. Control: unquantized."""
+        FLASHINFER_CUTLASS.check_format(UnquantizedFormat())
+        with self.assertRaisesRegex(RuntimeError, "unquantized experts only"):
+            FLASHINFER_CUTLASS.check_format(formats.Fp8BlockFormat())
 
 
 class TestCompat(CustomTestCase):

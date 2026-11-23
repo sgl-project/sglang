@@ -93,6 +93,8 @@ class EagerExecutor:
         )
 
     def _run_waves(self, layer, dispatch_output, waves, routed, topk_ids):
+        """The step's merged entries, or for a runner that combines, its output: one wave's
+        as the runner returns it, several waves' added in FP32."""
         merged = None
         # Every wave's slot map in one upload that does not wait for the GPU. Index E (and -1,
         # which wraps to it) stays -1: padded routing entries are masked.
@@ -109,14 +111,20 @@ class EagerExecutor:
                 # Only padding is outside the wave.
                 merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
                 break
-            merged = self.contract.run_wave(
+            out = self.contract.run_wave(
                 base_method=self.base_method,
                 layer=layer,
                 dispatch_output=dispatch_output,
                 slots=slots,
-                merged=merged,
+                merged=None if self.contract.combines else merged,
                 num_entries=sum(routed[e] for e in wave.experts),
             )
+            if not self.contract.combines or merged is None:
+                merged = out
+            else:
+                if merged.dtype != torch.float32:
+                    merged = merged.float()
+                merged.add_(out)
         if merged is None:  # no routed entry in any wave: only padding
             merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
         return merged
