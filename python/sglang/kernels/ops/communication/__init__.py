@@ -112,3 +112,13 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+# ERNIE 5.5 low-latency attention: combine the local heads, push them to every rank.
+register_kernel(
+    KernelSpec(
+        op="communication.swapab_combine_push",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.communication.ernie55_combine_push:swapab_combine_push",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)

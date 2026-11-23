@@ -140,6 +140,17 @@ def _validate_speculative(cfg: Any) -> None:
         )
 
 
+def _imply_low_latency_decode_envs() -> None:
+    if not envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get():
+        return
+    for env, value in (
+        (envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, True),
+        (envs.SGLANG_SPEC_TP_SYNC, "rng"),
+    ):
+        if not env.is_set():
+            env.set(value)
+
+
 @_register_for(ERNIE5_5_MOE_ARCH)
 def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
@@ -149,6 +160,7 @@ def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
         # Fail before weights load; the MoE layer checks again where it builds
         # the kernel.
         check_megamoe_situ_betas(hf_config)
+    _imply_low_latency_decode_envs()
     overrides: Dict[str, Any] = {
         "attention_backend": "ernie55",
         "page_size": DSV4_PAGE_SIZE,

@@ -52,6 +52,7 @@ from sglang.srt.models.deepseek_v4_dspark import (
     _resolve_dspark_pool,
     build_dspark_v4_confidence_head,
 )
+from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.models.dspark import gather_and_crop_vocab, project_through_lm_head
 from sglang.srt.models.ernie55 import (
     Ernie5_5DecoderLayer,
@@ -61,6 +62,7 @@ from sglang.srt.models.ernie55 import (
     VhaPostMix,
     check_supported_deployment,
 )
+from sglang.srt.models.ernie55_low_latency_mhc import Ernie5_5LowLatencyMhcChain
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -94,7 +96,12 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         return self._gated_q_norm_rope(self.q_norm(q), positions, q_out)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant=None,
+        defer_all_reduce: bool = False,
     ) -> torch.Tensor:
         """The HCA attention's signature, so ``Ernie5_5DecoderLayer`` drives it."""
         # Idle ranks have no draft KV rows but still join the MoE collectives.
@@ -102,7 +109,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
             return torch.zeros_like(x)
         pool = _resolve_dspark_pool()
         attn_backend = get_attn_backend()
-        kv = self.kv_proj_only(x)
+        x_linear = x if x_quant is None else x_quant
+        kv = self.kv_proj_only(x_linear)
         self._store_block_kv(
             kv=kv,
             positions=positions,
@@ -114,7 +122,7 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         if self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = x.new_empty(x.shape[0], _PAD_NUM_HEADS, self.head_dim)
             q_out = q_padded[:, : self.n_local_heads]
-        q = self._compute_q(x, positions, q_out=q_out)
+        q = self._compute_q(x_linear, positions, q_out=q_out)
         o = attn_backend.forward(
             q=q if q_padded is None else q_padded,
             k=kv,
@@ -143,8 +151,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         o = fused_sigmoid_mul(
             o.reshape(o.shape[0], -1), self._take_gate(), round_sigmoid=True
         )
-        out, _ = self.wo_b(o)
-        return out
+        out, _ = self.wo_b(o, skip_all_reduce=defer_all_reduce)
+        return AttnOutput(out) if defer_all_reduce else out
 
 
 class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
@@ -223,6 +231,14 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
                 for stage_id in range(self.num_stages)
             ]
         )
+        self.mhc_chain = None
+        if (
+            envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get()
+            and Ernie5_5LowLatencyMhcChain.supported()
+        ):
+            self.mhc_chain = Ernie5_5LowLatencyMhcChain(
+                self.stages, range(self.num_stages), draft=True
+            )
         self.hc_head = Ernie5_5HcHead(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkV4MarkovHead(
@@ -338,7 +354,11 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
             x = input_embeds
         # The draft stages are not the target's layers the recorder counts.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
+            stages = self.stages
+            if self.mhc_chain is not None:
+                x = self.mhc_chain.forward(positions, x, forward_batch, None)
+                stages = ()
+            for stage in stages:
                 x = stage(positions, x, forward_batch, None)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 

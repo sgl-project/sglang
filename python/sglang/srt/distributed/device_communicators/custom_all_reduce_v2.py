@@ -259,6 +259,8 @@ class CustomAllReduceV2:
         self.max_size = max(self._max_pull_size, self._max_push_size)
         num_pull_blocks = base_config.num_pull_blocks
         num_push_blocks = base_config.num_push_blocks
+        if envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get():
+            num_push_blocks = min(num_push_blocks, 128)
         if max_pull_blocks:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:

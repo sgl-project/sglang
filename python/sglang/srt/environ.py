@@ -2626,6 +2626,7 @@ class Envs:
     # Fusions not bit-exact with the eager ops: the input RMSNorm into mhc_pre,
     # and the VHA postmix into the wo_a fp8 quant.
     SGLANG_OPT_ERNIE5_5_FUSE_INEXACT = EnvBool(True)
+    SGLANG_ERNIE55_LOW_LATENCY_DECODE = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory
