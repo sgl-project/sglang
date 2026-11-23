@@ -26,7 +26,9 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_num_fused_shared_experts,
     is_tbo_enabled,
+    uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -691,8 +693,19 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             config=DeepEPConfig.get_instance().normal_dispatch_config,
             **npu_quantization_opts,
         )
+        # EPLB tracks routed experts only. With per-rank fused shared slots
+        # (DeepEP-class A2A + shared-expert fusion) every rank owns its shared
+        # slots at the tail of its local expert block, so the received counts end
+        # with them. Hand the recorder routed counts only; the counts returned
+        # to the MoE runner below keep the shared tail.
+        num_recv_tokens_per_expert_for_record = num_recv_tokens_per_expert
+        num_fused_shared = get_num_fused_shared_experts()
+        if num_fused_shared and uses_per_rank_fused_shared_slots():
+            num_recv_tokens_per_expert_for_record = (
+                num_recv_tokens_per_expert_for_record[:-num_fused_shared]
+            )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
-            num_recv_tokens_per_expert,
+            num_recv_tokens_per_expert_for_record,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
