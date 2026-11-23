@@ -1,5 +1,7 @@
 """Muse Spark SM90 fused attention vs fp32 torch: pfa (extend / mixed batches) and attn_srv (chain / tree verify)."""
 
+import sys
+
 import pytest
 import torch
 
@@ -175,3 +177,7 @@ def test_tree_verify_equals_chain(window):
             torch.testing.assert_close(
                 tree[i, i], chain[i, d], atol=1 / 64, rtol=1 / 64
             )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
