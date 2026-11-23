@@ -569,6 +569,10 @@ def test_model_lazy_resolver_keeps_transformer_scoped_backend():
         def get_enum():
             return AttentionBackendEnum.CUBE_SPARSE_ATTN
 
+        @staticmethod
+        def dense_fallback_backend():
+            return None
+
     with (
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
@@ -597,14 +601,18 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
             self.kwargs = kwargs
 
     class FakeBackend:
-        def __init__(self, enum):
+        def __init__(self, enum, dense_fallback=None):
             self.enum = enum
+            self.dense_fallback = dense_fallback
 
         def get_enum(self):
             return self.enum
 
         def get_impl_cls(self):
             return FakeImpl
+
+        def dense_fallback_backend(self):
+            return self.dense_fallback
 
     cube = FakeBackend(AttentionBackendEnum.CUBE_SPARSE_ATTN)
     fa = FakeBackend(AttentionBackendEnum.FA)
@@ -630,22 +638,27 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
     )
 
 
-def test_token_refiner_routes_sol_selection_to_dense_aiter():
-    """A few hundred text keys are too few KV blocks for Sol-Attn's routing."""
+def test_token_refiner_routes_sol_selection_to_its_dense_fallback():
+    """A few hundred text keys are too few KV blocks for Sol-Attn's routing, so
+    the refiner takes the dense backend Sol-Attn names."""
 
     class FakeImpl:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
     class FakeBackend:
-        def __init__(self, enum):
+        def __init__(self, enum, dense_fallback=None):
             self.enum = enum
+            self.dense_fallback = dense_fallback
 
         def get_enum(self):
             return self.enum
 
         def get_impl_cls(self):
             return FakeImpl
+
+        def dense_fallback_backend(self):
+            return self.dense_fallback
 
     def build(sparse_capable):
         attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
@@ -657,7 +670,9 @@ def test_token_refiner_routes_sol_selection_to_dense_aiter():
         attention._cube_sparse_capable = sparse_capable
         return attention
 
-    sol = FakeBackend(AttentionBackendEnum.AITER_SOL)
+    sol = FakeBackend(
+        AttentionBackendEnum.AITER_SOL, dense_fallback=AttentionBackendEnum.AITER
+    )
     aiter = FakeBackend(AttentionBackendEnum.AITER)
     refiner, block = build(False), build(True)
     with patch(
@@ -746,7 +761,11 @@ def test_attention_core_serves_sol_the_bcg_padded_pack():
         seen.append(query.shape[1])
         return query, None
 
-    with patch.object(aiter_sol, "sol_attn_bshd", fake_sol_attn_bshd):
+    # Eight rows are too few to route; the test is about the bounds Sol reads.
+    with (
+        patch.object(aiter_sol, "sol_attn_bshd", fake_sol_attn_bshd),
+        patch.object(aiter_sol, "SOL_MIN_USEFUL_KV_BLOCKS", 0),
+    ):
         out = _minimax_h3_attention_core_impl(
             attention,
             q,

@@ -936,11 +936,11 @@ def _minimax_h3_group_attend(
 
 
 # Backends the text-only token refiner swaps for a dense one: cube metadata
-# describes only the packed multimodal sequence, and a few hundred text keys are
-# too few KV blocks for Sol-Attn's routing threshold.
+# describes only the packed multimodal sequence. A backend that names its own
+# dense fallback (Sol-Attn: a few hundred text keys are too few KV blocks to
+# route) is swapped for that one instead.
 _TOKEN_REFINER_DENSE_BACKENDS = {
     AttentionBackendEnum.CUBE_SPARSE_ATTN: AttentionBackendEnum.FA,
-    AttentionBackendEnum.AITER_SOL: AttentionBackendEnum.AITER,
 }
 
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
@@ -1393,7 +1393,9 @@ class MiniMaxH3Attention(nn.Module):
         )
 
     def _set_attention_backend(self, backend) -> None:
-        dense_backend = _TOKEN_REFINER_DENSE_BACKENDS.get(backend.get_enum())
+        dense_backend = backend.dense_fallback_backend() or (
+            _TOKEN_REFINER_DENSE_BACKENDS.get(backend.get_enum())
+        )
         if dense_backend is not None and not self._cube_sparse_capable:
             backend = get_attn_backend(
                 self.head_dim,

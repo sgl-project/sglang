@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_schedule 
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     set_forward_context,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.test.test_utils import CustomTestCase
 
@@ -427,6 +428,104 @@ class TestSolExactKvTokens(_SolTestCase):
             self._forward_varlen(self._build({"recipe": "mxfp8"}), flags)
 
 
+class TestSolFallback(_SolTestCase):
+    """Calls Sol-Attn cannot serve run on the configured dense backend."""
+
+    def setUp(self):
+        super().setUp()
+        self.fallback_selected = []
+        self.fallback_inits = []
+        self.fallback_calls = []
+        test = self
+
+        class _FakeDenseImpl:
+            def __init__(self, **kwargs):
+                test.fallback_inits.append(kwargs)
+
+            def forward(self, query, key, value, attn_metadata=None):
+                test.fallback_calls.append(("forward", query.shape, key.shape))
+                return query
+
+            def forward_varlen(self, query, key, value, **kwargs):
+                test.fallback_calls.append(("forward_varlen", query.shape, kwargs))
+                return query
+
+        def fake_backend(head_size, dtype, supported, selected):
+            test.fallback_selected.append(selected)
+            return SimpleNamespace(get_impl_cls=lambda: _FakeDenseImpl)
+
+        patcher = patch(
+            "sglang.multimodal_gen.runtime.layers.attention.selector."
+            "_cached_get_attn_backend",
+            fake_backend,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _sol_ran(self):
+        return bool(self.sol_calls or self.fused_calls or self.packed_calls)
+
+    def test_layers_sol_cannot_serve_run_on_the_fallback(self):
+        """A causal layer or a head size other than 128 never reaches Sol-Attn;
+        the fallback is built with the layer's own arguments."""
+        for overrides in ({"causal": True}, {"head_size": 64}):
+            with self.subTest(**overrides):
+                self.fallback_inits.clear()
+                self.fallback_calls.clear()
+                impl = self._build(**overrides)
+                self.assertFalse(impl.serves_layer)
+                (init,) = self.fallback_inits
+                for name, value in overrides.items():
+                    self.assertEqual(init[name], value)
+                impl.forward(*self._operands())
+                self.assertEqual(len(self.fallback_calls), 1)
+                self.assertFalse(self._sol_ran())
+
+    def test_calls_sol_cannot_serve_run_on_the_fallback(self):
+        impl = self._build({"recipe": "fp8"})
+        query, key, value = self._operands()
+        short = self._operands(seqlen=BLOCK_TILE[1] * 2)
+        packed = [tensor.squeeze(0) for tensor in self._operands()]
+        calls = {
+            "cross attention": lambda: impl.forward(
+                query, key[:, :512], value[:, :512]
+            ),
+            "fp16": lambda: impl.forward(*self._operands(dtype=torch.float16)),
+            "too short to route": lambda: impl.forward(*short),
+            "several packed sequences": lambda: impl.forward_varlen(
+                *packed,
+                cu_seqlens=None,
+                max_seqlen=1024,
+                cu_seqlens_host=(0, 1024, SEQUENCE),
+            ),
+        }
+        for name, call in calls.items():
+            with self.subTest(name):
+                self.fallback_calls.clear()
+                call()
+                self.assertEqual(len(self.fallback_calls), 1)
+                self.assertFalse(self._sol_ran())
+
+        impl.forward(query, key, value)
+        self.assertTrue(self._sol_ran(), "a long self-attention call stays on Sol")
+        self.assertEqual(self.fallback_selected, [AttentionBackendEnum.AITER])
+
+    def test_fallback_backend_is_configurable(self):
+        impl = self._build({"fallback_backend": "torch_sdpa"})
+        impl.forward(*self._operands(seqlen=BLOCK_TILE[1]))
+        self.assertEqual(self.fallback_selected, [AttentionBackendEnum.TORCH_SDPA])
+        self.assertIs(
+            aiter_sol.AITERSolBackend.dense_fallback_backend(),
+            AttentionBackendEnum.TORCH_SDPA,
+        )
+        for value in ("aiter_sol", "laser_attn", "no_such_backend"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "fallback_backend"),
+            ):
+                self._build({"fallback_backend": value})
+
+
 class TestSolTilt(_SolTestCase):
     """The pooled value tilt needs block K variance, which only aiter's routing
     computes, and the packed entry point, which only it takes."""
@@ -631,47 +730,6 @@ class TestSolConfig(_SolTestCase):
 
 
 class TestSolRejectedCalls(_SolTestCase):
-    def test_rejects_a_head_dim_other_than_128(self):
-        with self.assertRaisesRegex(
-            aiter_sol_dispatch.SolAttnUnsupported, "head_dim == 128"
-        ):
-            self._build(head_size=64)
-
-    def test_rejects_causal_masking(self):
-        # The pooled correction assumes every skipped block is fully
-        # attendable, so there is no causal row to fall back to.
-        with self.assertRaisesRegex(aiter_sol_dispatch.SolAttnUnsupported, "causal"):
-            self._build(causal=True)
-
-    def test_rejects_a_dtype_other_than_bf16(self):
-        impl = self._build()
-        with self.assertRaises(aiter_sol_dispatch.SolAttnUnsupported):
-            impl.forward(*self._operands(dtype=torch.float16), None)
-
-    def test_rejects_a_pack_of_several_sequences(self):
-        # Sol-Attn has no key-padding mask and its pooled blocks would straddle
-        # any boundary other than the end of the sequence, so a pack of two
-        # real segments must be refused rather than attended across the seam.
-        impl = self._build()
-        query, key, value = (
-            tensor.squeeze(0) for tensor in self._operands(seqlen=SEQUENCE)
-        )
-        for max_seqlen in (SEQUENCE // 2, SEQUENCE):
-            with (
-                self.subTest(max_seqlen=max_seqlen),
-                self.assertRaisesRegex(
-                    aiter_sol_dispatch.SolAttnUnsupported, "trailing pad"
-                ),
-            ):
-                impl.forward_varlen(
-                    query,
-                    key,
-                    value,
-                    cu_seqlens=None,
-                    max_seqlen=max_seqlen,
-                    cu_seqlens_host=(0, SEQUENCE // 2, SEQUENCE - 128, SEQUENCE),
-                )
-
     def test_rejects_a_pack_whose_keys_have_their_own_bounds(self):
         # Asymmetric key ranges are a second sequence on the key side, which
         # the single-segment path cannot express.
@@ -687,7 +745,7 @@ class TestSolRejectedCalls(_SolTestCase):
             with (
                 self.subTest(bounds=bounds),
                 self.assertRaisesRegex(
-                    aiter_sol_dispatch.SolAttnUnsupported, "trailing pad"
+                    aiter_sol_dispatch.SolAttnUnsupported, "key-padding mask"
                 ),
             ):
                 impl.forward_varlen(
@@ -708,14 +766,16 @@ class TestSolTrailingPad(_SolTestCase):
         """
         self._patch("_aiter_mha_v4_packed", lambda q, k, v, *args, **kwargs: v + 7)
         impl = self._build()
+        # Long enough that the padded case still has the KV blocks to route.
+        total = 2 * SEQUENCE
         query, key, value = (
-            tensor.squeeze(0) for tensor in self._operands(seqlen=SEQUENCE)
+            tensor.squeeze(0) for tensor in self._operands(seqlen=total)
         )
-        value.copy_((torch.arange(SEQUENCE) % 17).to(value.dtype).view(SEQUENCE, 1, 1))
+        value.copy_((torch.arange(total) % 17).to(value.dtype).view(total, 1, 1))
         for used, bounds in (
-            (SEQUENCE // 2, (0, SEQUENCE // 2, SEQUENCE)),
-            (SEQUENCE, (0, SEQUENCE)),
-            (SEQUENCE, (0, SEQUENCE, SEQUENCE)),
+            (SEQUENCE, (0, SEQUENCE, total)),
+            (total, (0, total)),
+            (total, (0, total, total)),
         ):
             with self.subTest(bounds=bounds):
                 output = impl.forward_varlen(

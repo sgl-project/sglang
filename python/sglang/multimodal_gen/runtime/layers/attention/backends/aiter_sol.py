@@ -19,10 +19,12 @@ import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol_dispatch import (
     SOL_ATTN_HEAD_DIM,
     SOL_ATTN_RECIPES,
+    SOL_MIN_USEFUL_KV_BLOCKS,
     SolAttnUnsupported,
     check_sol_attn_build,
     check_sol_attn_values,
     check_sol_tilt,
+    sol_attn_block_tile,
     sol_attn_bshd,
     sol_attn_routing_mode,
 )
@@ -50,6 +52,7 @@ logger = init_logger(__name__)
 
 _DEFAULT_RECIPE = "fp8"
 _DEFAULT_BETA = 0.5
+_DEFAULT_FALLBACK_BACKEND = AttentionBackendEnum.AITER
 
 
 class AITERSolMetadata(msgspec.Struct, frozen=True):
@@ -68,6 +71,7 @@ class _SolConfig(msgspec.Struct, frozen=True):
     beta_schedule: BetaSchedule | None
     block_tile: tuple[int, int] | None
     tilt_rank: int
+    fallback_backend: AttentionBackendEnum = _DEFAULT_FALLBACK_BACKEND
 
 
 def _parse_block_tile(value: str | None) -> tuple[int, int] | None:
@@ -81,6 +85,26 @@ def _parse_block_tile(value: str | None) -> tuple[int, int] | None:
             f"block_size must be <q_tile>x<kv_tile>, e.g. 128x128, got {value!r}."
         )
     return (int(parts[0]), int(parts[1]))
+
+
+def _parse_fallback_backend(value: str | None) -> AttentionBackendEnum:
+    """Read `fallback_backend`: a dense backend for the calls Sol-Attn cannot serve."""
+    if value is None:
+        return _DEFAULT_FALLBACK_BACKEND
+    name = str(value).strip().upper().replace("-", "_")
+    try:
+        backend = AttentionBackendEnum[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown aiter_sol fallback_backend {value!r}. Set "
+            "--attention-backend-config fallback_backend=<name> to a dense "
+            "attention backend, e.g. aiter."
+        ) from None
+    if backend is AttentionBackendEnum.AITER_SOL or backend.is_sparse:
+        raise ValueError(
+            f"aiter_sol fallback_backend must be a dense backend, got {value!r}."
+        )
+    return backend
 
 
 def _resolve_config() -> _SolConfig:
@@ -102,6 +126,7 @@ def _resolve_config() -> _SolConfig:
         ),
         block_tile=_parse_block_tile(cfg.get("block_size")),
         tilt_rank=int(cfg.get("tilt_rank", 0)),
+        fallback_backend=_parse_fallback_backend(cfg.get("fallback_backend")),
     )
 
 
@@ -115,6 +140,10 @@ class AITERSolBackend(AttentionBackend):
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.AITER_SOL
+
+    @classmethod
+    def dense_fallback_backend(cls) -> AttentionBackendEnum:
+        return _resolve_config().fallback_backend
 
     @staticmethod
     def get_impl_cls() -> type[AITERSolImpl]:
@@ -138,8 +167,14 @@ class AITERSolImpl(AttentionImpl):
 
     Other keys: `beta` (routing threshold, default 0.5), `beta_schedule`
     (`first:last` or one value per denoising step), `block_size`
-    (`<q_tile>x<kv_tile>`, default the recipe's own geometry) and `tilt_rank`
-    (pooled value tilt rank, default 0, which keeps the block means).
+    (`<q_tile>x<kv_tile>`, default the recipe's own geometry), `tilt_rank`
+    (pooled value tilt rank, default 0, which keeps the block means) and
+    `fallback_backend` (default aiter).
+
+    Calls Sol-Attn cannot serve run on `fallback_backend`: every call of a
+    causal layer or of a head size other than 128, and single calls that are
+    cross attention, not BF16, too short to route, or packed from several
+    sequences.
     """
 
     def __init__(
@@ -152,10 +187,29 @@ class AITERSolImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        check_sol_attn_values(head_dim=head_size, is_causal=causal)
         config = _resolve_config()
+        self.fallback_backend = config.fallback_backend
+        self._fallback_args = dict(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            **extra_impl_args,
+        )
+        self._fallback_impl: AttentionImpl | None = None
+        self.serves_layer = head_size == SOL_ATTN_HEAD_DIM and not causal
+        self._layer_fallback_reason = (
+            "causal attention" if causal else f"head size {head_size}"
+        )
+        if not self.serves_layer:
+            self._fallback(self._layer_fallback_reason)
+            return
+        check_sol_attn_values(head_dim=head_size, is_causal=causal)
         check_sol_attn_build(config.recipe, block_tile=config.block_tile)
         check_sol_tilt(config.recipe, config.tilt_rank)
+        self.kv_tile = sol_attn_block_tile(config.recipe, config.block_tile)[1]
         self.recipe = config.recipe
         self.block_tile = config.block_tile
         self.beta = config.beta
@@ -172,6 +226,39 @@ class AITERSolImpl(AttentionImpl):
             self.tilt_rank,
             sol_attn_routing_mode(self.recipe, self.tilt_rank),
         )
+
+    def _fallback(self, reason: str) -> AttentionImpl:
+        """The fallback backend's impl for this layer, built on first use."""
+        if self._fallback_impl is None:
+            from sglang.multimodal_gen.runtime.layers.attention.selector import (
+                _cached_get_attn_backend,
+            )
+
+            backend_cls = _cached_get_attn_backend(
+                self._fallback_args["head_size"],
+                torch.bfloat16,
+                (),
+                self.fallback_backend,
+            )
+            self._fallback_impl = backend_cls.get_impl_cls()(**self._fallback_args)
+        logger.info_once(
+            "aiter_sol runs %s on %s.", reason, self.fallback_backend.name.lower()
+        )
+        return self._fallback_impl
+
+    def _fallback_reason(
+        self, query: torch.Tensor, key: torch.Tensor, seqlen_q: int, seqlen_k: int
+    ) -> str | None:
+        """Why Sol-Attn cannot serve this call, or None when it can."""
+        if not self.serves_layer:
+            return self._layer_fallback_reason
+        if seqlen_q != seqlen_k:
+            return "cross attention"
+        if query.dtype != torch.bfloat16 or key.dtype != torch.bfloat16:
+            return f"{query.dtype} attention"
+        if -(-seqlen_k // self.kv_tile) < SOL_MIN_USEFUL_KV_BLOCKS:
+            return "sequences too short to route"
+        return None
 
     def _total_steps(self) -> int | None:
         """The denoising step count this request runs, or None when no request
@@ -219,10 +306,13 @@ class AITERSolImpl(AttentionImpl):
         """Route the KV blocks, compute the selected ones exactly, and recover
         the rest from pooled K/V.
 
-        Q/K/V are [batch_size, seq_len, num_heads, head_dim] bf16. Key and value
-        may carry a different seq_len than query (cross attention) and fewer
-        heads than query (GQA). Returns the query shape.
+        Q/K/V are [batch_size, seq_len, num_heads, head_dim]. Key and value may
+        carry fewer heads than query (GQA). A call Sol-Attn cannot serve runs on
+        the fallback backend. Returns the query shape.
         """
+        reason = self._fallback_reason(query, key, query.shape[1], key.shape[1])
+        if reason is not None:
+            return self._fallback(reason).forward(query, key, value, attn_metadata)
         del attn_metadata
         output, _ = sol_attn_bshd(
             query,
@@ -271,10 +361,24 @@ class AITERSolImpl(AttentionImpl):
                     bounds=cu_seqlens_host,
                 )
             )
-        if used is None or cu_seqlens_k is not None:
+        if cu_seqlens_k is not None:
             raise SolAttnUnsupported(
-                "AITER Sol-Attn backend serves a packed call only as a single "
-                "sequence with an optional trailing pad; it has no key-padding mask."
+                "AITER Sol-Attn backend serves a packed call only as self "
+                "attention over one sequence; it has no key-padding mask."
+            )
+        reason = (
+            "packed calls of several sequences"
+            if used is None
+            else self._fallback_reason(query, key, used, used)
+        )
+        if reason is not None:
+            return self._fallback(reason).forward_varlen(
+                query,
+                key,
+                value,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
             )
 
         live_output, _ = sol_attn_bshd(

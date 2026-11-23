@@ -349,6 +349,12 @@ def get_attn_backend(
         constraint_backend = be_tuple[0].name.lower()
 
     candidate_backends = [selected_backend]
+    if allowed_fallback_reason is not None and is_cross_attention:
+        preferred_dense = _dense_fallback_of(
+            head_size, dtype, be_tuple, selected_backend
+        )
+        if preferred_dense is not None:
+            candidate_backends.append(preferred_dense)
     if allowed_fallback_reason is not None:
         for candidate in (default_attention_backend, None, *be_tuple):
             if candidate not in candidate_backends:
@@ -447,6 +453,24 @@ def get_attn_backend(
         reason_suffix = f" ({reason})" if reason else ""
         logger.info_once(f"Using {backend_name} attention backend{reason_suffix}")
     return attention_backend_cls
+
+
+def _dense_fallback_of(
+    head_size: int,
+    dtype: torch.dtype,
+    be_tuple: tuple[AttentionBackendEnum, ...],
+    selected_backend: AttentionBackendEnum | None,
+) -> AttentionBackendEnum | None:
+    """The dense backend a sparse selection names for the layers it cannot serve."""
+    if selected_backend is None or not selected_backend.is_sparse:
+        return None
+    try:
+        backend_cls = _cached_get_attn_backend(
+            head_size, dtype, be_tuple, selected_backend
+        )
+    except ValueError:
+        return None
+    return backend_cls.dense_fallback_backend()
 
 
 @cache

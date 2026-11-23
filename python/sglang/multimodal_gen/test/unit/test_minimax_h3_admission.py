@@ -776,25 +776,30 @@ def test_validate_server_args_requires_packed_varlen_backend():
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
-def test_validate_server_args_points_global_sol_at_the_transformer():
-    """A global aiter_sol would reach the causal, head_dim-72 text encoder and
-    fail deep inside component loading."""
+@pytest.mark.parametrize(
+    "global_backend,component_backends,resolved",
+    [
+        ("aiter_sol", {}, (None, None)),
+        (
+            "aiter",
+            {"transformer": "aiter_sol"},
+            (AttentionBackendEnum.AITER_SOL, "transformer"),
+        ),
+    ],
+)
+def test_validate_server_args_selects_sol_for_the_transformer(
+    global_backend, component_backends, resolved
+):
+    """A global aiter_sol is accepted like the component selection: the
+    components Sol-Attn cannot serve, such as the causal, head_dim-72 text
+    encoder, run on its dense fallback."""
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
-        component_attention_backends={},
-        attention_backend="aiter_sol",
+        component_attention_backends=component_backends,
+        attention_backend=global_backend,
         ring_degree=1,
         performance_mode="speed",
-        resolve_component_attention_backend=lambda *_names: (None, None),
-    )
-    with pytest.raises(ValueError, match="transformer=aiter_sol"):
-        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
-
-    server_args.attention_backend = "aiter"
-    server_args.component_attention_backends = {"transformer": "aiter_sol"}
-    server_args.resolve_component_attention_backend = lambda *_names: (
-        AttentionBackendEnum.AITER_SOL,
-        "transformer",
+        resolve_component_attention_backend=lambda *_names: resolved,
     )
     with patch(
         "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"

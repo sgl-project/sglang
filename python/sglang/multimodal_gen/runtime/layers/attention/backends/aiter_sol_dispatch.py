@@ -28,7 +28,7 @@ _SUPPORTED_ARCHS = ("gfx950",)
 
 # Below this many KV blocks the routing threshold's mean and standard deviation
 # describe too few samples to separate anything. A heuristic.
-_MIN_USEFUL_KV_BLOCKS = 16
+SOL_MIN_USEFUL_KV_BLOCKS = 16
 
 
 class SolAttnUnsupported(RuntimeError):
@@ -517,7 +517,7 @@ def _warn_if_kv_too_short(seqlen_k: int, kv_tile: int) -> None:
     if torch.compiler.is_compiling():
         return
     blocks = -(-seqlen_k // kv_tile)
-    if blocks >= _MIN_USEFUL_KV_BLOCKS or blocks in _short_kv_warned:
+    if blocks >= SOL_MIN_USEFUL_KV_BLOCKS or blocks in _short_kv_warned:
         return
     _short_kv_warned.add(blocks)
     logger.warning(
