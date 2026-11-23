@@ -41,7 +41,9 @@ class Fp8IndexerCandidates(NamedTuple):
     indices: torch.Tensor  # [rows, cap] int32, key - ks[row]
     counts: torch.Tensor  # [rows] int32, scores >= T (may exceed cap)
     thresholds: torch.Tensor  # [rows] fp32
-    overflow: torch.Tensor  # [rows] int32, 1 when count > cap
+    overflow: (
+        torch.Tensor
+    )  # [rows] int32, bit 0 for overflow, bit 1 for nonfinite FP32 scores
 
 
 # Fixed cost of a scan unit (pipeline fill, block-end sync) in 256-key tiles; fitted on B200 (128K-1M keys,
@@ -101,14 +103,19 @@ def is_fp8_indexer_supported() -> bool:
 
 
 @cache_once
-def _jit_fp8_indexer_module(num_heads: int, kv_stages: int, q_stages: int) -> Module:
+def _jit_fp8_indexer_module(
+    num_heads: int, kv_stages: int, q_stages: int, fp32_reduction: bool = False
+) -> Module:
     if not is_fp8_indexer_supported():
         raise RuntimeError("fp8_indexer_candidates requires CUDA SM100")
     if num_heads not in FP8_INDEXER_NUM_HEADS:
         raise RuntimeError(
             f"num_heads must be one of {FP8_INDEXER_NUM_HEADS}, got {num_heads}"
         )
-    args = make_cpp_args(num_heads, kv_stages, q_stages)
+    if fp32_reduction:
+        args = make_cpp_args(num_heads, kv_stages, q_stages, True)
+    else:
+        args = make_cpp_args(num_heads, kv_stages, q_stages)
     return load_jit(
         "dsa_prefill_fp8_indexer",
         *args,
@@ -133,6 +140,7 @@ def fp8_indexer_candidates(
     q_stages: int = DEFAULT_Q_STAGES,
     tail_chunks: Optional[int] = None,
     out: Optional[Fp8IndexerCandidates] = None,
+    fp32_reduction: bool = False,
 ) -> Fp8IndexerCandidates:
     """``q_fp8`` is ``[rows, heads, 128]`` with 32 or 64 heads, ``weights``
     ``[rows, heads]``. Row ``r`` scores keys ``j`` in ``[ks[r], ke[r])`` as
@@ -152,10 +160,12 @@ def fp8_indexer_candidates(
     first, see :func:`pick_tail_chunks`); a cached per-device workspace
     coordinates the pieces, so calls on one device must not overlap. Meant for
     calls whose rows see more than ~12K keys; shorter calls are faster
-    on the dense path (DeepGEMM logits + top-k).
+    on the dense path (DeepGEMM logits + top-k). With ``fp32_reduction``,
+    use the legacy DeepGEMM FP32 reduction order, flag nonfinite scores
+    in ``overflow``, and allocate scratch owned by this call's stream.
     """
     rows, num_heads = q_fp8.shape[:2]
-    module = _jit_fp8_indexer_module(num_heads, kv_stages, q_stages)
+    module = _jit_fp8_indexer_module(num_heads, kv_stages, q_stages, fp32_reduction)
     if dense_bound is None:
         dense_bound = topk
     num_blocks = -(-rows // FP8_INDEXER_BLOCK_ROWS[num_heads])
@@ -172,6 +182,18 @@ def fp8_indexer_candidates(
             thresholds=torch.empty((rows,), dtype=torch.float32, device=device),
             overflow=torch.empty((rows,), dtype=torch.int32, device=device),
         )
+    device = q_fp8.device
+    if fp32_reduction:
+        scratch = torch.zeros(
+            max(2 * num_blocks, 4096), dtype=torch.int32, device=device
+        )
+        sample_codes = torch.empty(
+            _num_sms(device) * 32 * 2 * 256 * 2, dtype=torch.int32, device=device
+        )
+        out.overflow.zero_()
+    else:
+        scratch = _workspace(device, 2 * num_blocks)
+        sample_codes = _sample_codes(device)
     module.run(
         q_fp8,
         weights,
@@ -179,8 +201,8 @@ def fp8_indexer_candidates(
         kv_scale,
         ks,
         ke,
-        _workspace(q_fp8.device, 2 * num_blocks),
-        _sample_codes(q_fp8.device),
+        scratch,
+        sample_codes,
         out.scores,
         out.indices,
         out.counts,

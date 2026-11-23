@@ -44,6 +44,17 @@ def _jit_topk_candidates_module(topk: int, dtype: torch.dtype) -> Module:
     )
 
 
+@cache_once
+def _jit_guarded_fp32_topk_candidates_module(topk: int) -> Module:
+    args = make_cpp_args(topk, True)
+    return load_jit(
+        "dsa_prefill_topk_candidates_fp32_guarded",
+        *args,
+        cuda_files=["dsa/litetopk_prefill/topk_candidates_fp32.cuh"],
+        cuda_wrappers=[("run", f"TopKCandidatesFP32Kernel<{args}>::run_guarded")],
+    )
+
+
 def topk_candidates(
     scores: torch.Tensor,
     indices: torch.Tensor,
@@ -52,6 +63,7 @@ def topk_candidates(
     out: torch.Tensor,
     *,
     out_offsets: Optional[torch.Tensor] = None,
+    reject: Optional[torch.Tensor] = None,
 ) -> None:
     """``scores`` fp32 or bf16 ``[rows, cap]`` and ``indices`` int32
     ``[rows, cap]`` (only the first ``min(count[row], cap)`` entries are read: an overflowing row is clipped), ``thr``
@@ -60,6 +72,17 @@ def topk_candidates(
     a bf16 slab's ``-inf`` row holds every key in key order and its
     ``indices`` are not read (the index of slot ``s`` is ``s``);
     ``out_offsets[row]`` is added to every emitted index. bf16 slabs need
-    ``cap`` in [4096, 12288], a multiple of 8."""
+    ``cap`` in [4096, 12288], a multiple of 8. Passing ``reject`` enables
+    cutoff checks for a 4096-column FP32 slab with no offsets. A nonzero
+    input status rejects the row. Only rows with zero output status have
+    valid indices in ``out``."""
+    if reject is not None:
+        if scores.dtype != torch.float32 or out_offsets is not None:
+            raise ValueError(
+                "guarded candidate top-k requires FP32 scores and no offsets"
+            )
+        module = _jit_guarded_fp32_topk_candidates_module(out.shape[1])
+        module.run(scores, indices, count, thr, out, reject)
+        return
     module = _jit_topk_candidates_module(out.shape[1], scores.dtype)
     module.run(scores, indices, count, thr, out_offsets, out)

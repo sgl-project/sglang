@@ -62,6 +62,7 @@ struct TopKCandidatesFP32Params {
   const float* __restrict__ thr;
   const int32_t* __restrict__ out_offsets;  // nullable: added to every emitted index
   int32_t* __restrict__ out;
+  int32_t* __restrict__ reject;  // in/out rejection status for the guarded kernel
   int64_t scores_stride;
   int64_t indices_stride;
   int64_t out_stride;
@@ -71,7 +72,7 @@ struct TopKCandidatesFP32Params {
 // The fp32 candidate top-k of one row: one CTA of 256 threads per row, `run` is the kernel
 // body.
 // kTopK_ Selected elements per row (512 / 1024 / 2048).
-template <uint32_t kTopK_>
+template <uint32_t kTopK_, bool kGuarded>
 struct TopKCandidatesFP32Impl {
   static constexpr uint32_t kTopK = kTopK_;
   static constexpr uint32_t kBlockSize = 256;
@@ -104,6 +105,7 @@ struct TopKCandidatesFP32Impl {
     uint32_t pivot_bin;
     uint32_t count_above;
     uint32_t emit_counter;  // packed (ties << 16 | above-pivot)
+    uint32_t cutoff_key;
     float row_min;
     alignas(8) uint64_t full_bar[kNumStages];
     union alignas(128) {
@@ -127,6 +129,7 @@ struct TopKCandidatesFP32Impl {
   uint32_t n;             // candidates, at most kMaxCands
   float thr;              // T; the row minimum on T = -inf rows
   uint32_t hi_x2, lo_x2;  // pass 2: fp16 codes of the pivot bin's upper and lower edges, twice
+  bool invalid_score = false;
 
   // ---- per-element helpers -----------------------------------------------------------------
 
@@ -181,7 +184,12 @@ struct TopKCandidatesFP32Impl {
       const uint32_t nv = valid_in_group(n_s, pos);
 #pragma unroll
       for (uint32_t i = 0; i < 4; ++i) {
-        if (i < nv) atomicAdd(smem.hist + (bin[i] >> 1), (bin[i] & 1u) ? 0x10000u : 1u);
+        if (i < nv) {
+          if constexpr (kGuarded) {
+            invalid_score |= !isfinite(v[i] - thr) || v[i] < thr;
+          }
+          atomicAdd(smem.hist + (bin[i] >> 1), (bin[i] & 1u) ? 0x10000u : 1u);
+        }
       }
     }
   }
@@ -216,7 +224,9 @@ struct TopKCandidatesFP32Impl {
 #pragma unroll
     for (uint32_t e = 0; e < kElemsPerThread; ++e) {
       const bool hit = (gt_mask >> e) & 1u;
-      if (hit) smem.sel.ids[gt_slot] = s * kStageElems + 4 * ((e / 4) * kBlockSize + tx) + e % 4;
+      if (hit && (!kGuarded || gt_slot < kTopK)) {
+        smem.sel.ids[gt_slot] = s * kStageElems + 4 * ((e / 4) * kBlockSize + tx) + e % 4;
+      }
       gt_slot += hit ? 1u : 0u;
     }
     // the pivot bin (sparse)
@@ -224,11 +234,28 @@ struct TopKCandidatesFP32Impl {
       const uint32_t e = __ffs(eq_mask) - 1;
       const uint32_t i = 4 * ((e / 4) * kBlockSize + tx) + e % 4;
       const uint32_t id = s * kStageElems + i;
-      // order-preserving key of the fp32 score: negatives below positives, -0 below +0
-      const uint32_t bits = __float_as_uint(data[i]);
-      const uint32_t key = bits ^ (static_cast<uint32_t>(static_cast<int32_t>(bits) >> 31) | 0x80000000u);
+      const uint32_t key = score_key(data[i]);
       if (eq_slot < kTieCap) smem.sel.tie_key[eq_slot] = uint64_t{key} << 32 | ~id;
     }
+  }
+
+  // Order-preserving key of the fp32 score: negatives below positives, -0 below +0.
+  SGL_DEVICE static uint32_t score_key(float score) {
+    const uint32_t bits = __float_as_uint(score);
+    return bits ^ (static_cast<uint32_t>(static_cast<int32_t>(bits) >> 31) | 0x80000000u);
+  }
+
+  // All non-pivot bins are wholly selected or rejected. The smallest selected
+  // score in the pivot bin must have no unselected equal there.
+  SGL_DEVICE bool ambiguous_cutoff(const int32_t* tie_ids, uint32_t num_ties, uint32_t taken) {
+    const uint32_t key = tx < num_ties ? static_cast<uint32_t>(smem.sel.tie_key[tx] >> 32) : 0;
+    if (__syncthreads_or(key == 0x7fffffffu || key == 0x80000000u)) return true;
+    if (num_ties == taken) return false;
+    if (tx == 0) smem.cutoff_key = 0xffffffffu;
+    __syncthreads();
+    if (tx < taken) atomicMin(&smem.cutoff_key, score_key(row[tie_ids[tx]]));
+    __syncthreads();
+    return __syncthreads_count(tx < num_ties && key >= smem.cutoff_key) > taken;
   }
 
   // ---- selection ---------------------------------------------------------------------------
@@ -405,13 +432,24 @@ struct TopKCandidatesFP32Impl {
     }
     // every thread loads the per-row scalars itself; the loads overlap the barrier below
     PDLWaitPrimary<true>();
-    n = min(static_cast<uint32_t>(params.count[bx]), params.cap);
+    const uint32_t count = static_cast<uint32_t>(params.count[bx]);
+    n = min(count, params.cap);
     thr = params.thr[bx];
     const int32_t off = params.out_offsets != nullptr ? params.out_offsets[bx] : 0;
     __syncthreads();
 
     const auto indices_row = params.indices + bx * params.indices_stride;
     const auto out = params.out + bx * params.out_stride;
+    if constexpr (kGuarded) {
+      if (params.reject[bx] != 0 || count <= kTopK || count > params.cap || !isfinite(thr)) {
+        __syncthreads();  // finish all reads of the in/out rejection status
+        if (tx == 0) {
+          params.reject[bx] = 1;
+          ptx::mbar_wait_parity(&smem.full_bar[0], 0);
+        }
+        return PDLTriggerSecondary<true>();
+      }
+    }
     if (n <= kTopK) {  // every candidate is selected, -1 past the row
       static_loop<kTopK, kBlockSize>(tx, [&](uint32_t t) {
         out[t] = t < n ? indices_row[t] + off : -1;  //
@@ -478,7 +516,14 @@ struct TopKCandidatesFP32Impl {
         hist_stage(0, 2);
       }
     }
-    __syncthreads();
+    if constexpr (kGuarded) {
+      if (__syncthreads_or(invalid_score)) {
+        if (tx == 0) params.reject[bx] = 1;
+        return PDLTriggerSecondary<true>();
+      }
+    } else {
+      __syncthreads();
+    }
 
     find_pivot();
     const uint32_t pivot = smem.pivot_bin;
@@ -513,10 +558,17 @@ struct TopKCandidatesFP32Impl {
 
     // ---- rank the tie buffer by exact score ----
     // the pivot bin's population, clamped to the tie buffer (a wider bin keeps its first kTieCap)
-    const uint32_t num_ties = min(smem.emit_counter >> 16, kTieCap);
+    const uint32_t pivot_count = smem.emit_counter >> 16;
+    const uint32_t num_ties = min(pivot_count, kTieCap);
     const uint32_t taken = min(quota, num_ties);
     // == kTopK unless the pivot bin overflowed: the slots past it gather a placeholder and store -1
     const uint32_t first_hole = count_above + taken;
+    if constexpr (kGuarded) {
+      if (pivot_count > kTieCap || first_hole != kTopK || (smem.emit_counter & 0xffffu) != count_above) {
+        if (tx == 0) params.reject[bx] = 1;
+        return;
+      }
+    }
     int32_t* const tie_ids = smem.sel.ids + count_above;
     for (uint32_t i = taken + tx; i < quota; i += kBlockSize) {
       tie_ids[i] = 0;
@@ -531,6 +583,13 @@ struct TopKCandidatesFP32Impl {
       radix_ties(tie_ids, num_ties, taken);
     }
     __syncthreads();
+
+    if constexpr (kGuarded) {
+      if (ambiguous_cutoff(tie_ids, num_ties, taken)) {
+        if (tx == 0) params.reject[bx] = 1;
+        return;
+      }
+    }
 
     // ---- gather: quads of selected positions -> key indices (+ offset) -> out ----
     constexpr uint32_t kQuads = kTopK / 4;
@@ -583,9 +642,9 @@ __global__ __launch_bounds__(Impl::kBlockSize, Impl::kOccupancy)  //
   impl.run(params);
 }
 
-template <uint32_t kTopK>
+template <uint32_t kTopK, bool kGuarded = false>
 struct TopKCandidatesFP32Kernel {
-  using C = TopKCandidatesFP32Impl<kTopK>;
+  using C = TopKCandidatesFP32Impl<kTopK, kGuarded>;
   static constexpr auto kernel = topk_candidates_fp32_kernel<C>;
 
   static void
@@ -595,6 +654,29 @@ struct TopKCandidatesFP32Kernel {
       const tvm::ffi::TensorView thr,
       const tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets,
       const tvm::ffi::TensorView out) {
+    launch(scores, indices, count, thr, out_offsets, out, {});
+  }
+
+  static void run_guarded(
+      tvm::ffi::TensorView scores,
+      tvm::ffi::TensorView indices,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView thr,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView reject) {
+    static_assert(kGuarded);
+    launch(scores, indices, count, thr, {}, out, reject);
+  }
+
+ private:
+  static void launch(
+      tvm::ffi::TensorView scores,
+      tvm::ffi::TensorView indices,
+      tvm::ffi::TensorView count,
+      tvm::ffi::TensorView thr,
+      tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets,
+      tvm::ffi::TensorView out,
+      tvm::ffi::Optional<tvm::ffi::TensorView> reject) {
     using namespace host;
     auto R = SymbolicSize{"rows"};
     auto L = SymbolicSize{"cap"};
@@ -636,6 +718,7 @@ struct TopKCandidatesFP32Kernel {
         .thr = static_cast<const float*>(thr.data_ptr()),
         .out_offsets = nullptr,
         .out = static_cast<int32_t*>(out.data_ptr()),
+        .reject = nullptr,
         .scores_stride = S.unwrap(),
         .indices_stride = SI.unwrap(),
         .out_stride = O.unwrap(),
@@ -647,6 +730,12 @@ struct TopKCandidatesFP32Kernel {
           .with_device(device_)
           .verify(out_offsets.value());
       params.out_offsets = static_cast<const int32_t*>(out_offsets.value().data_ptr());
+    }
+    if constexpr (kGuarded) {
+      CHECK_HOST(L.unwrap() == C::kStageElems && reject.has_value())
+          << "guarded fp32 top-k requires a 4096-column slab and rejection status";
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(reject.value());
+      params.reject = static_cast<int32_t*>(reject.value().data_ptr());
     }
     const auto device = device_.unwrap();
     runtime::set_max_dynamic_smem_per_device<kernel>(device, C::kSmemBytes);
