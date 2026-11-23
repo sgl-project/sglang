@@ -16,7 +16,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 # Shapes from a 0.6B decode step: (n, k) of qkv / o / gate_up / down.
 DECODE_SHAPES = [(4096, 1024), (1024, 2048), (6144, 1024), (1024, 3072)]
