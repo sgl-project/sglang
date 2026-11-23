@@ -2940,6 +2940,17 @@ class KVCacheConfigurator:
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
+            if _is_npu and get_dsa_index_kpool(self.model_config.hf_config) > 1:
+                from sglang.srt.mem_cache.kv_cache_dtype import (
+                    resolve_indexer_quant_mode,
+                )
+
+                full_pool_class = partial(
+                    full_pool_class,
+                    indexer_quant_mode=resolve_indexer_quant_mode(
+                        self.server_args.indexer_kv_cache_dtype, self.kv_cache_dtype
+                    ),
+                )
         else:
             pool_class = QSATokenToKVPool
             extra_args.update(
