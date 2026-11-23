@@ -40,7 +40,12 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device
@@ -352,6 +357,27 @@ def sp_fused_matmul_eligible(linear) -> bool:
     return _HAS_TORCH_SYMM_MEM_FUSED
 
 
+_symm_mem_reserved: dict[str, int] = {}
+
+
+def _reserve_symm_mem_workspace(group_name: str, nbytes: int) -> None:
+    """Reserve the Torch workspace once, sized for the largest SP pass."""
+    if _symm_mem_reserved.get(group_name, 0) >= nbytes:
+        return
+    import torch.distributed._symmetric_memory as symm_mem
+
+    symm_mem.get_symm_mem_workspace(group_name, min_size=nbytes)
+    _symm_mem_reserved[group_name] = nbytes
+
+
+def _max_sp_rows(tp_size: int) -> int:
+    schedule = get_schedule()
+    tokens = schedule.chunked_prefill_size
+    if tokens is None or tokens <= 0:
+        tokens = schedule.max_prefill_tokens
+    return ceil_align(int(tokens), tp_size)
+
+
 def column_parallel_g_matmul(
     linear, input_parallel: torch.Tensor, bias
 ) -> torch.Tensor:
@@ -363,6 +389,7 @@ def column_parallel_g_matmul(
     tile-gated all-gather; other models retain their existing implementation.
     """
     num_tokens = sp_num_tokens()
+    tp_size = linear.tp_group.world_size
     if sp_fused_matmul_eligible(linear):
         if is_npu():
             # CANN MC2: allgather(input shard) @ weight.t(), then narrow.
@@ -392,8 +419,15 @@ def column_parallel_g_matmul(
                 get_parallel().tp_group.device_group,
                 workspace=sp_collective_gemm_workspace,
             )[:num_tokens]
-        else:
+        elif input_parallel.shape[0] * tp_size <= _max_sp_rows(tp_size):
             group_name = get_parallel().tp_group.device_group.group_name
+            max_rows = _max_sp_rows(tp_size)
+            # Torch gathers the whole input into the workspace for up to 2048 rows.
+            rows = max(max_rows // tp_size, min(max_rows, 2048))
+            _reserve_symm_mem_workspace(
+                group_name,
+                rows * input_parallel.shape[-1] * input_parallel.element_size(),
+            )
             _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
                 input_parallel.contiguous(),
                 [linear.weight.t()],
@@ -450,8 +484,16 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
                 get_parallel().tp_group.device_group,
                 workspace=sp_collective_gemm_workspace,
             )
-        else:
+        elif padded <= _max_sp_rows(tp_size):
             group_name = get_parallel().tp_group.device_group.group_name
+            # The pipelined reduce-scatter double-buffers this rank's output rows.
+            _reserve_symm_mem_workspace(
+                group_name,
+                2
+                * (_max_sp_rows(tp_size) // tp_size)
+                * linear.weight.shape[0]
+                * x.element_size(),
+            )
             return torch.ops.symm_mem.fused_matmul_reduce_scatter(
                 x,
                 linear.weight.t(),
