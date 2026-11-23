@@ -145,7 +145,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
     def plan_verify(
         self, batch: ScheduleBatch, *, watermark_full_mask: bool
     ) -> VerifyStep:
-        """Bind a target verify's sampling state: its route and its watermark.
+        """Plan a target verify's sampling: derive its route and bind its watermark.
         Call it before the target forward launches, so the route can pick the
         forward's own fast paths.
 
