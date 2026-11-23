@@ -107,6 +107,9 @@ def test_native_compact_kernels_and_replay():
                 outputs, (correct, bonus, raw_correct - correct)
             ):
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            small = torch.empty_like(dense_ids)
+            kernel.ragged_candidates(ids=ids, indptr=ptr, lens=lens, out=small)
+            torch.testing.assert_close(small, padded_candidates, rtol=0, atol=0)
 
             commits = correct + 1
             mapping = torch.arange(table.numel(), device=device, dtype=torch.int64) + 17
@@ -180,6 +183,7 @@ def test_native_compact_kernels_and_replay():
                 bonus=outputs[1],
                 trim=outputs[2],
             )
+            kernel.ragged_candidates(ids=ids, indptr=ptr, lens=lens, out=small)
             kernel.compact_commit_layout(
                 indptr=ptr,
                 lens=lens,
@@ -234,6 +238,7 @@ def test_native_compact_kernels_and_replay():
                 outputs, (correct, bonus, raw_correct - correct)
             ):
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            torch.testing.assert_close(small, padded_candidates, rtol=0, atol=0)
             committed = (
                 mask
                 & (torch.arange(6, device=device)[None, :] < (correct + 1)[:, None])

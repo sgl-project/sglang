@@ -32,6 +32,7 @@ from sglang.kernels.ops.speculative.dspark.native_compact import (
     accept_ragged,
     compact_commit_layout,
     pack_verify_inputs,
+    ragged_candidates,
 )
 from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
     accept_sampling_sharded,
@@ -745,6 +746,13 @@ class DsparkVerifyEpilogue:
             and simulated_correct_len is None
             and commit_ctx is not None
         )
+        self.native_folds_engram = False
+        self.native_post_fold = (
+            self.native_compact and envs.SGLANG_DSPARK_COMPACT_POST_FOLD.get()
+        )
+        self._compact_candidates = torch.empty(
+            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
 
@@ -766,6 +774,7 @@ class DsparkVerifyEpilogue:
         # The draft KV pool is created after this epilogue's constructor.
         if self.native_compact and not self.folds_commit:
             self.native_compact = False
+            self.native_post_fold = False
         if self.native_compact:
             self._native_epilogue(out, forward_batch)
             return
@@ -830,6 +839,21 @@ class DsparkVerifyEpilogue:
             positions=positions,
             pool=pool,
         )
+        if self.native_post_fold:
+            candidates = self._compact_candidates[:bs]
+            ragged_candidates(
+                ids=forward_batch.input_ids, indptr=indptr, lens=lens, out=candidates
+            )
+            committed = self._commit_engram_history(
+                candidates,
+                forward_batch.req_pool_indices,
+                accept.commit_lens,
+                lens,
+                self.inject_gate_buf,
+            )
+            if committed:
+                self.native_folds_engram = True
+            self._scatter_future_relay(forward_batch.req_pool_indices, bs)
 
     def begin_step(self, verify_lens, armed: bool) -> None:
         self._static_step_state = None

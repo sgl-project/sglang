@@ -486,7 +486,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                                 self.model_runner.ngram_embedding_manager.engram_hasher
                             )
                         )
-                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                        if (
+                            envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                            or (
+                                self._verify_planner.mode_value == "compact"
+                                and envs.SGLANG_DSPARK_COMPACT_NATIVE_ACCEPT.get()
+                                and envs.SGLANG_DSPARK_COMPACT_POST_FOLD.get()
+                            )
+                        )
                         else None
                     ),
                 ),
@@ -1313,9 +1320,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)
         engram_in_graph = (
-            folded_accept and not run_compact and epilogue.folds_engram_commit
-        ) or (
-            region_accept is not None and self._sampling_accept_graph.committed_engram
+            (folded_accept and not run_compact and epilogue.folds_engram_commit)
+            or (
+                folded_accept
+                and target_verify.native_compact
+                and epilogue.native_folds_engram
+            )
+            or (
+                region_accept is not None
+                and self._sampling_accept_graph.committed_engram
+            )
         )
         # The static verify graph committed the engram history when it folded the accept.
         if not engram_in_graph:
@@ -1452,10 +1466,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):
-        """The FutureMap relay this step's static graph already scattered into
-        (SGLANG_OPT_DSV41_DSPARK_POST_FOLD), or None for the host scatter."""
+        """The FutureMap relay already written by this step's verify graph,
+        or None when the host must publish its accept result."""
         epilogue = self._verify_executor.verify_epilogue
-        if epilogue is None or run_compact or not folded_accept:
+        if epilogue is None or not folded_accept:
+            return None
+        if run_compact and not epilogue.native_post_fold:
+            return None
+        if not run_compact and not epilogue._post_fold:
             return None
         relay = epilogue.future_relay
         if relay is None or not relay.adopted:
