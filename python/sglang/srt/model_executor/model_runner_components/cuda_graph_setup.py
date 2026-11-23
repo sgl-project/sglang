@@ -417,6 +417,30 @@ def capture_cuda_graphs(
 
     """
 
+    if (
+        model_runner.device == "npu"
+        and not model_runner.is_draft_worker
+        and not defer_distributed_setup
+        and get_disagg().disaggregation_mode == "null"
+        and get_exec().moe.moe_a2a_backend == "deepep"
+        and get_exec().moe.deepep_mode == "auto"
+        and getattr(model_runner.model_config.hf_config, "model_type", None)
+        in ("deepseek_v41", "deepseek_v41_text")
+        and (
+            check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+            or (
+                capture_decode_cuda_graph
+                and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+            )
+        )
+        and torch.npu.get_device_name().replace(" ", "").startswith("Ascend910B")
+    ):
+        from sglang.srt.hardware_backend.npu.graph_runner.hccl_warmup import (
+            prepare_hccl_before_metadata,
+        )
+
+        prepare_hccl_before_metadata(model_runner.model, get_parallel())
+
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )
