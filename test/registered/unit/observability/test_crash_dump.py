@@ -1,6 +1,7 @@
 """The `--crash-dump-folder` pickle: the Python TokenizerManager and the Rust
 server's scheduler write the same file, which the dump readers load."""
 
+import asyncio
 import dataclasses
 import functools
 import glob
@@ -26,7 +27,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.entrypoints import engine as engine_module  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers import scheduler as scheduler_module  # noqa: E402
-from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    ConfigureLoggingReq,
+    GenerateReqInput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 from sglang.srt.observability import request_dump as crash_dump_module  # noqa: E402
 from sglang.srt.observability.request_dump import (  # noqa: E402
@@ -357,6 +361,126 @@ def _normalized(body: dict, index=None) -> GenerateReqInput:
     obj = GenerateReqInput(**body)
     obj.normalize_batch_and_arguments()
     return obj if index is None else obj[index]
+
+
+def _configure_logging_manager():
+    """A bare TokenizerManager stand-in for `configure_logging`, which only
+    touches the request logger and the dump settings."""
+    tm = SimpleNamespace(
+        request_logger=MagicMock(),
+        dump_requests_folder="",
+        dump_requests_threshold=1,
+        dump_requests_exclude_meta_keys=[],
+        dump_request_list=[],
+        crash_dump_folder=None,
+        _server_args_for_dump=lambda: None,
+        _dump_config_snapshot=lambda: None,
+    )
+    # Bind the real writer so dump_requests exercises the true write path.
+    tm._dump_data_to_file = lambda *a, **k: TokenizerManager._dump_data_to_file(
+        tm, *a, **k
+    )
+    return tm
+
+
+class TestConfigureLoggingDumpFolderValidation(CustomTestCase):
+    """`/configure_logging` (sgl-project/sglang#51832): the dump folders
+    must be validated before the server writes pickle files to them."""
+
+    def test_rejects_nonexistent_dump_folder(self):
+        tm = _configure_logging_manager()
+        with tempfile.TemporaryDirectory() as parent:
+            missing = os.path.join(parent, "does-not-exist")
+            with self.assertRaisesRegex(ValueError, "existing directory"):
+                TokenizerManager.configure_logging(
+                    tm, ConfigureLoggingReq(dump_requests_folder=missing)
+                )
+            # Nothing was applied, and the writer never created the path.
+            self.assertEqual(tm.dump_requests_folder, "")
+            self.assertFalse(os.path.exists(missing))
+
+    def test_rejects_nonexistent_crash_dump_folder(self):
+        tm = _configure_logging_manager()
+        with tempfile.TemporaryDirectory() as parent:
+            missing = os.path.join(parent, "does-not-exist")
+            with self.assertRaisesRegex(ValueError, "existing directory"):
+                TokenizerManager.configure_logging(
+                    tm, ConfigureLoggingReq(crash_dump_folder=missing)
+                )
+            self.assertIsNone(tm.crash_dump_folder)
+            self.assertFalse(os.path.exists(missing))
+
+    def test_rejects_relative_and_file_paths(self):
+        tm = _configure_logging_manager()
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            TokenizerManager.configure_logging(
+                tm, ConfigureLoggingReq(dump_requests_folder="relative/dumps")
+            )
+        with tempfile.NamedTemporaryFile() as f:
+            with self.assertRaisesRegex(ValueError, "existing directory"):
+                TokenizerManager.configure_logging(
+                    tm, ConfigureLoggingReq(crash_dump_folder=f.name)
+                )
+        self.assertEqual(tm.dump_requests_folder, "")
+        self.assertIsNone(tm.crash_dump_folder)
+
+    def test_rejects_invalid_folder_atomically(self):
+        """A request with one good and one bad folder applies neither."""
+        tm = _configure_logging_manager()
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(ValueError, "existing directory"):
+                TokenizerManager.configure_logging(
+                    tm,
+                    ConfigureLoggingReq(
+                        dump_requests_folder=folder,
+                        crash_dump_folder=os.path.join(folder, "missing"),
+                    ),
+                )
+            self.assertEqual(tm.dump_requests_folder, "")
+            self.assertIsNone(tm.crash_dump_folder)
+
+    def test_accepts_existing_directory_and_dumps_into_it(self):
+        tm = _configure_logging_manager()
+        with tempfile.TemporaryDirectory() as parent:
+            # `..` and the trailing slash resolve to the same directory.
+            folder = os.path.join(parent, "dumps", "..", "dumps") + os.sep
+            os.mkdir(os.path.join(parent, "dumps"))
+            TokenizerManager.configure_logging(
+                tm, ConfigureLoggingReq(dump_requests_folder=folder)
+            )
+            self.assertEqual(tm.dump_requests_folder, os.path.join(parent, "dumps"))
+
+            async def _dump_one():
+                state = SimpleNamespace(
+                    obj=_request("r1"),
+                    time_stats=SimpleNamespace(created_time=100.0, finished_time=101.5),
+                )
+                TokenizerManager.dump_requests(tm, state, _out("r1"))
+                await asyncio.sleep(1.0)  # the writer runs via asyncio.to_thread
+
+            asyncio.run(_dump_one())
+            written = glob.glob(os.path.join(parent, "dumps", "*.pkl"))
+            self.assertEqual(len(written), 1)
+            self.assertRegex(
+                os.path.basename(written[0]),
+                r"^\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.pkl$",
+            )
+
+    def test_empty_string_disables_and_none_keeps(self):
+        tm = _configure_logging_manager()
+        with tempfile.TemporaryDirectory() as folder:
+            TokenizerManager.configure_logging(
+                tm, ConfigureLoggingReq(dump_requests_folder=folder)
+            )
+            self.assertEqual(tm.dump_requests_folder, folder)
+            # "" is the pre-existing "do not dump" value.
+            TokenizerManager.configure_logging(
+                tm, ConfigureLoggingReq(dump_requests_folder="")
+            )
+            self.assertEqual(tm.dump_requests_folder, "")
+            # A field left out of the request keeps its current value.
+            TokenizerManager.configure_logging(tm, ConfigureLoggingReq())
+            self.assertEqual(tm.dump_requests_folder, "")
 
 
 class TestRustServerCrashDump(CustomTestCase):
