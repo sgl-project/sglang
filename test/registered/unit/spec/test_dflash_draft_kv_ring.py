@@ -540,7 +540,7 @@ class TestSpeculatorsDSparkConfig(CustomTestCase):
         self.assertEqual(cfg.dflash_config["target_layer_ids"], [75, 79, 83, 87, 91])
         self.assertEqual(get_dflash_aux_hidden_stream(cfg), "prefix")
 
-    def _load(self, layer_config):
+    def _load(self, layer_config, **top):
         from sglang.srt.configs.speculators_dspark import (
             try_load_speculators_dspark_config,
         )
@@ -550,10 +550,74 @@ class TestSpeculatorsDSparkConfig(CustomTestCase):
             "aux_hidden_state_layer_ids": [2, 4],
             "mask_token_id": 7,
             "transformer_layer_config": layer_config,
+            **top,
         }
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "config.json").write_text(json.dumps(raw))
             return try_load_speculators_dspark_config(tmp, revision=None)
+
+    def test_speculators_dspark_causality_follows_the_layer_types(self):
+        """One is_causal must describe every draft layer; disagreeing layer types
+        are refused instead of being forced causal."""
+        llama = {
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+        }
+        full = {**llama, "layer_types": ["full_attention"] * 2}
+        mixed = {**llama, "layer_types": ["sliding_attention", "full_attention"]}
+        self.assertFalse(self._load(full).is_causal)
+        self.assertTrue(self._load(full, full_attention_causal=True).is_causal)
+        self.assertTrue(self._load(mixed, full_attention_causal=True).is_causal)
+        with self.assertRaisesRegex(ValueError, "mixes causal and non-causal"):
+            self._load(mixed)
+
+    def test_speculators_dspark_embedding_tap_is_rejected(self):
+        """aux_hidden_state_layer_ids count from 1; 0 (the embeddings) has no layer."""
+        llama = {"model_type": "llama", "hidden_size": 64, "num_attention_heads": 4}
+        with self.assertRaisesRegex(ValueError, "count layers from 1"):
+            self._load(llama, aux_hidden_state_layer_ids=[0, 4])
+
+    def test_parser_hands_the_prefix_stream_to_the_kimi_capture(self):
+        """A speculators DSpark checkpoint parsed by SGLang must make Kimi-K3 capture
+        the prefix stream, end to end from the config parser to the capture setter."""
+        from sglang.srt.hf_transformers.config import HfModelConfigParser
+        from sglang.srt.models import kimi_k3
+
+        raw = {
+            "speculators_model_type": "dspark",
+            "aux_hidden_state_layer_ids": [2, 4],
+            "mask_token_id": 7,
+            "transformer_layer_config": {
+                "model_type": "llama",
+                "hidden_size": 64,
+                "num_attention_heads": 4,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps(raw))
+            cfg = HfModelConfigParser().parse(tmp, trust_remote_code=False)
+            self.assertEqual(cfg.dflash_config["aux_hidden_stream"], "prefix")
+            causal_lm = SimpleNamespace(
+                model=SimpleNamespace(carries_bank_slices=False)
+            )
+            spec = SimpleNamespace(
+                speculative_draft_model_path=tmp, speculative_draft_model_revision=None
+            )
+            with (
+                patch.object(kimi_k3, "get_spec", return_value=spec),
+                patch.object(
+                    kimi_k3,
+                    "get_model",
+                    return_value=SimpleNamespace(trust_remote_code=False),
+                ),
+            ):
+                kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(
+                    causal_lm, [1, 3]
+                )
+        self.assertEqual(causal_lm.model.dspark_aux_hidden_stream, "prefix")
+        self.assertEqual(causal_lm.model.dspark_layers_to_capture, [1, 3])
 
     def test_speculators_dspark_config_follows_the_layer_backbone(self):
         """The flattened config is the backbone's HF config class, not a fixed one."""

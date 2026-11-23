@@ -45,13 +45,13 @@ def try_load_speculators_dspark_config(
             "speculators DSpark config needs transformer_layer_config.model_type"
         )
 
-    layer_types = set(layer_config.get("layer_types") or ())
-    if layer_types == {"sliding_attention"}:
-        is_causal = not bool(config_dict.get("sliding_window_non_causal", False))
-    elif layer_types == {"full_attention"}:
-        is_causal = bool(config_dict.get("full_attention_causal", False))
-    else:
-        is_causal = True
+    is_causal = _speculators_is_causal(config_dict, layer_config)
+    layer_ids = [int(idx) for idx in config_dict.get("aux_hidden_state_layer_ids", [])]
+    if any(idx < 1 for idx in layer_ids):
+        raise ValueError(
+            "aux_hidden_state_layer_ids count layers from 1 (0 is the embeddings), "
+            f"got {layer_ids}"
+        )
 
     flat = dict(layer_config)
     flat.pop("model_type", None)
@@ -63,9 +63,7 @@ def try_load_speculators_dspark_config(
         flat["use_sliding_window"] = True
     flat["dflash_config"] = {
         "mask_token_id": int(config_dict["mask_token_id"]),
-        "target_layer_ids": [
-            int(idx) - 1 for idx in config_dict.get("aux_hidden_state_layer_ids", [])
-        ],
+        "target_layer_ids": [idx - 1 for idx in layer_ids],
         "aux_hidden_stream": "prefix",
     }
     for key in _COPIED_DSPARK_KEYS:
@@ -73,3 +71,24 @@ def try_load_speculators_dspark_config(
             flat[key] = config_dict[key]
 
     return AutoConfig.for_model(layer_model_type, **flat)
+
+
+def _speculators_is_causal(config_dict: dict, layer_config: dict) -> bool:
+    """One is_causal for the draft: sliding layers are causal unless
+    sliding_window_non_causal, full layers only with full_attention_causal, other
+    layer types always. Raises when the layer types disagree."""
+    causal_by_type = {
+        "sliding_attention": not bool(
+            config_dict.get("sliding_window_non_causal", False)
+        ),
+        "full_attention": bool(config_dict.get("full_attention_causal", False)),
+    }
+    layer_types = set(layer_config.get("layer_types") or ())
+    # Other or missing layer types are causal, as before.
+    causality = {causal_by_type.get(t, True) for t in layer_types} or {True}
+    if len(causality) > 1:
+        raise ValueError(
+            "speculators DSpark config mixes causal and non-causal layer types "
+            f"{sorted(layer_types)}, which one is_causal cannot express"
+        )
+    return causality.pop()

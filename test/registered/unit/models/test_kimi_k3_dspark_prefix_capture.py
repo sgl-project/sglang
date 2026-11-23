@@ -28,8 +28,9 @@ class _EqualSizeGroup:
 
     world_size = WORLD
 
-    def __init__(self, full: torch.Tensor):
+    def __init__(self, full: torch.Tensor, rank: int):
         self.full = full
+        self.rank = rank
 
     def _rank_rows(self, rank: int, width: int) -> torch.Tensor:
         rows = self.full[rank * width : (rank + 1) * width]
@@ -38,6 +39,9 @@ class _EqualSizeGroup:
     def all_gather_into_tensor(self, out: torch.Tensor, inp: torch.Tensor) -> None:
         if out.shape[0] != inp.shape[0] * WORLD:
             raise RuntimeError("all-gather needs equal sizes on every rank")
+        # This rank must send its own rows, padded; the others' come from `full`.
+        if not torch.equal(inp, self._rank_rows(self.rank, inp.shape[0])):
+            raise RuntimeError("this rank sent rows other than its own shard")
         out.copy_(torch.cat([self._rank_rows(r, inp.shape[0]) for r in range(WORLD)]))
 
     def all_gather(self, inp: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -52,7 +56,9 @@ class TestDSparkPrefixCaptureRowShards(CustomTestCase):
         full = torch.arange(TOTAL * HIDDEN, dtype=torch.float32).view(TOTAL, HIDDEN)
         start, valid = attn_bank_hip.row_shard(TOTAL, WORLD, rank)
         parallel = SimpleNamespace(
-            attn_tp_size=WORLD, attn_tp_rank=rank, attn_tp_group=_EqualSizeGroup(full)
+            attn_tp_size=WORLD,
+            attn_tp_rank=rank,
+            attn_tp_group=_EqualSizeGroup(full, rank),
         )
         bank = SimpleNamespace(block_residual=torch.zeros(TOTAL, 1, HIDDEN))
         model = SimpleNamespace(
