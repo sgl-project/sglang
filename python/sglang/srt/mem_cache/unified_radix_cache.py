@@ -1683,7 +1683,9 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
-            priority=(req.priority or 0) * self.priority_sign,
+            priority=min(
+                (req.priority or 0) * self.priority_sign, torch.iinfo(torch.int64).max
+            ),
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
@@ -1875,7 +1877,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.checkpoint(req, up_to=branch_end)
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            priority=(req.priority or 0) * self.priority_sign,
+            priority=min(
+                (req.priority or 0) * self.priority_sign, torch.iinfo(torch.int64).max
+            ),
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)

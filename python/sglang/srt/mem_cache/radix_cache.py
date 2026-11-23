@@ -483,8 +483,11 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool; the priority enters the
         # tree as an eviction sort key (larger = evicted later), flipped when
-        # lower values mean higher priority.
-        priority = (req.priority or 0) * self.priority_sign
+        # lower values mean higher priority. Clamped to int64 max because the
+        # flip can otherwise push INT64_MIN one past the upper bound.
+        priority = min(
+            (req.priority or 0) * self.priority_sign, torch.iinfo(torch.int64).max
+        )
         result = self.insert(
             InsertParams(
                 key=radix_key,

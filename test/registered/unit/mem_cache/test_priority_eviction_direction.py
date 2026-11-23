@@ -121,6 +121,27 @@ class TestPriorityEvictionDirection(CustomTestCase):
                     low_first=low_first, high_prio=other, low_prio=sentinel
                 )
 
+    def test_int64_extremes_stay_in_sort_key_range(self):
+        """The sign flip can push INT64_MIN one past the int64 upper bound;
+        the entry points must clamp the sort key back into int64 range."""
+        int64_min, int64_max = -(1 << 63), (1 << 63) - 1
+
+        # low_first: INT64_MIN is the highest priority; the flip yields +2^63,
+        # which must clamp to int64 max instead of leaving the int64 range.
+        cache = self._make_cache(low_first=True)
+        self._insert_req(cache, self.HIGH_TOKENS, priority=int64_min)
+        node = cache.root_node.children[1]
+        self.assertEqual(node.priority, int64_max)
+
+        # Default direction: INT64_MIN stays the smallest in-range sort key
+        # (no clamping needed) and must be evicted before priority 0.
+        cache = self._make_cache(low_first=False)
+        self._insert_req(cache, self.HIGH_TOKENS, priority=int64_min)
+        self._insert_req(cache, self.LOW_TOKENS, priority=0)
+        cache.evict(EvictParams(num_tokens=len(self.HIGH_TOKENS)))
+        self.assertFalse(self._present(cache, self.HIGH_TOKENS))
+        self.assertTrue(self._present(cache, self.LOW_TOKENS))
+
 
 if __name__ == "__main__":
     unittest.main()
