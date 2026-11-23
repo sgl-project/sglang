@@ -20,9 +20,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 PAD_SLOT_ID = -1
-requires_sm90 = unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
-    "requires SM90 (Hopper)",
+requires_sm80_or_sm90 = unittest.skipUnless(
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability() in ((8, 0), (9, 0)),
+    "requires SM80 (Ampere) or SM90 (Hopper)",
 )
 
 
@@ -84,7 +85,7 @@ def _reference_decode(b, c, x, weight, state, cache_indices):
     return c * conv
 
 
-@requires_sm90
+@requires_sm80_or_sm90
 class TestLFMShortConv(CustomTestCase):
     def test_prefill_matches_reference_for_variable_sequences(self):
         seq_lens = [1, 2, 33, 65]
