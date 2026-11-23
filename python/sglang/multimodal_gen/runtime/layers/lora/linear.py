@@ -957,8 +957,11 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         snapshot_base: bool = True,
+        defer_snapshot: bool = False,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
+        super().__init__(
+            base_layer, lora_rank, lora_alpha, snapshot_base, defer_snapshot
+        )
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
