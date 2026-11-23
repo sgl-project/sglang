@@ -60,12 +60,47 @@ jobs:
             --run-id "$RUN_ID" \
             ${{ github.event_name == 'workflow_dispatch' && '--any-event' || '' }}
 
-  runner-health:
+  # The cache is not trusted: any workflow run whose cache scope is the
+  # default branch can save a `lark-runner-health-*` entry, and restoring an
+  # archive can write files anywhere in the job. So the restore happens in a
+  # job that holds no secret, and only the parsed JSON crosses to the job
+  # that does.
+  restore-runner-health-state:
     if: >-
       github.repository == 'sgl-project/sglang' && (
         (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
         (github.event_name == 'workflow_dispatch' && inputs.task == 'runner-health')
       )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      state: ${{ steps.read.outputs.state }}
+    steps:
+      # Key never matches (run_id is unique) so restore-keys picks the most
+      # recent state and the save step writes a fresh entry every run.
+      - name: Restore runner-health state
+        uses: actions/cache/restore@v4
+        with:
+          path: runner-health-state.json
+          key: lark-runner-health-${{ github.run_id }}
+          restore-keys: lark-runner-health-
+      - name: Read state as compact JSON
+        id: read
+        shell: python3 {0}
+        run: |
+          import json, os
+          state = ""
+          if os.path.exists("runner-health-state.json"):
+              with open("runner-health-state.json") as f:
+                  parsed = json.load(f)
+              if not isinstance(parsed, dict):
+                  raise SystemExit("runner-health state is not a JSON object")
+              state = json.dumps(parsed, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"state={state}\n")
+
+  runner-health:
+    needs: restore-runner-health-state
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Serialize so the state file is never written by two runs at once.
@@ -79,14 +114,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # Key never matches (run_id is unique) so restore-keys picks the most
-      # recent state and the save step writes a fresh entry every run.
-      - name: Restore runner-health state
-        uses: actions/cache/restore@v4
-        with:
-          path: runner-health-state.json
-          key: lark-runner-health-${{ github.run_id }}
-          restore-keys: lark-runner-health-
+      - name: Write runner-health state
+        env:
+          STATE: ${{ needs.restore-runner-health-state.outputs.state }}
+        run: |
+          if [ -n "$STATE" ]; then printf '%s' "$STATE" > runner-health-state.json; fi
       - name: Check runner pools
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_RUNNER_ADMIN }}
