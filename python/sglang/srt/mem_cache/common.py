@@ -171,10 +171,18 @@ def storage_prefetch_end(
     return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
 
 
+def waiting_token_ids(req: Req) -> array:
+    """``origin_input_ids + output_ids`` of a request that is not in a batch,
+    read from the sequence the request keeps instead of copied on every call."""
+    if req.is_dllm():
+        # DLLM fill ids end in a mask block that is not committed.
+        return req.origin_input_ids + req.output_ids
+    req.refresh_fill_ids()
+    return req.full_untruncated_fill_ids
+
+
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
-    tree_cache.touch_prefix(
-        _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
-    )
+    tree_cache.touch_prefix(_req_radix_key(tree_cache, req, waiting_token_ids(req)))
 
 
 def match_kv_cache(
