@@ -24,7 +24,7 @@ from sglang.srt.speculative.eagle_worker_common import accept_draft_tree
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
+    HostVerifyTree,
     needs_verify_tree,
     verify_row_prefixes,
 )
@@ -77,7 +77,7 @@ def _tree():
 
 
 def _host_tree(layout, bs):
-    return GrammarTree.from_host(
+    return HostVerifyTree.from_host(
         torch.tensor([layout["next_token"]] * bs),
         torch.tensor([layout["next_sibling"]] * bs),
         torch.tensor([layout["tokens"]] * bs),
@@ -130,7 +130,7 @@ def _bound_verify(batch, layout):
         watermark=None,
         watermark_full_mask=True,
     )
-    verify.bind_tree(_host_tree(layout, 2), logits_output=None, barrier=None)
+    verify.bind_target(None, tree=_host_tree(layout, 2), barrier=None)
     return verify
 
 
@@ -139,7 +139,7 @@ class TestRowPrefixes(CustomTestCase):
         """DFlash and DSpark verify a chain whose column 0 is the committed token."""
         chain = torch.tensor([[ROOT, 2, 3, 4], [ROOT, 7, 8, 9]])
         self.assertEqual(
-            verify_row_prefixes(*GrammarTree.from_linear_chain(chain).resolve()),
+            verify_row_prefixes(*HostVerifyTree.from_linear_chain(chain).resolve()),
             [[], [2], [2, 3], [2, 3, 4], [], [7], [7, 8], [7, 8, 9]],
         )
 

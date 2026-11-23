@@ -145,7 +145,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
-    GrammarTree,
+    HostVerifyTree,
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
@@ -3538,8 +3538,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
-        verify_tree = (
-            GrammarTree.from_linear_chain(draft_tokens)
+        host_tree = (
+            HostVerifyTree.from_linear_chain(draft_tokens)
             if needs_verify_tree(batch)
             else None
         )
@@ -3655,9 +3655,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        verify.bind_tree(
-            verify_tree, logits_output=logits_output, barrier=grammar_barrier
-        )
+        verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
         if sampling_info is not None and target_predict is None:
             # In place: DFlash refuses the watermark, the one stage that returns
             # new logits.

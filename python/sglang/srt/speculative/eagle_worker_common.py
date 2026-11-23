@@ -38,7 +38,7 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
+    HostVerifyTree,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
     needs_verify_tree,
@@ -838,8 +838,8 @@ def run_eagle_verify(
         )
 
     # Must stay ahead of the target verify launch below.
-    verify_tree = (
-        GrammarTree.from_device(
+    host_tree = (
+        HostVerifyTree.from_device(
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
@@ -872,7 +872,7 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
-    verify.bind_tree(verify_tree, logits_output=logits_output, barrier=grammar_barrier)
+    verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
     # SGLang's post-verify graphs when they are on, for a batch they can replay;
