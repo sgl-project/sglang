@@ -1,5 +1,5 @@
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -47,9 +47,15 @@ class TestDsaEagerMetadataNoHostSync(unittest.TestCase):
             _cal_indexer_k_start_end=lambda *args: (None, None),
             _transform_table_1_to_real=lambda table: table,
             _build_topk_v2_plan=lambda _: None,
+            _dcp_topk_length_buffer=lambda *args: None,
             init_kernel_metadata=lambda _: None,
             _init_kpool_metadata=lambda metadata, *args, **kwargs: metadata,
+            # A static pool: no id translation, so the gather reads the table.
+            runner_ids=None,
         )
+        for name in ("_read_v2p", "_gather_token_table"):
+            method = getattr(module.DeepseekSparseAttnBackend, name)
+            setattr(backend, name, MethodType(method, backend))
 
         def cumulative(lengths):
             return torch.cat(
