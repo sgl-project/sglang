@@ -2,9 +2,11 @@ import argparse
 from types import SimpleNamespace
 
 import torch
-import torch_npu  # noqa: F401
 
 from sglang.srt.hardware_backend.npu.moe import fuseep
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW4A8Int8MoEMethod,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -36,11 +38,15 @@ def test_fuseep_mode_three_routes_to_mega_moe(monkeypatch):
     )
 
     hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+    activation = fuseep._mega_moe_activation(
+        SimpleNamespace(activation="situ", gemm1_alpha=4.0, gemm1_clamp_limit=25.0)
+    )
     layer = SimpleNamespace(
-        moe_runner_config=SimpleNamespace(
-            gemm1_alpha=None,
-            gemm1_clamp_limit=None,
-        ),
+        moe_ep_size=2,
+        moe_tp_size=1,
+        _mega_moe_weights_processed=True,
+        _mega_moe_quant_mode=1,
+        _mega_moe_activation_params=activation,
         w13_weight=[torch.empty(16, 6, dtype=torch.int32)],
         w13_weight_scale=[torch.empty(48, dtype=torch.uint64)],
         w2_weight=[torch.empty(12, 2, dtype=torch.int32)],
@@ -57,7 +63,8 @@ def test_fuseep_mode_three_routes_to_mega_moe(monkeypatch):
     output = fuseep.forward_fuseep(layer, hidden_states, topk_output)
 
     assert output is hidden_states
-    assert received["backend"] == "mega_moe"
+    assert received["fuse_mode"] == 3
+    assert received["quant_mode"] == 1
     assert received["activation"] == "situ"
     assert received["beta"] == 4.0
     assert received["linear_beta"] == 25.0
@@ -67,8 +74,23 @@ def test_fuseep_mode_three_routes_to_mega_moe(monkeypatch):
 
 def test_mega_moe_w4a8_weights_use_gemm_layout(monkeypatch):
     monkeypatch.setattr(fuseep, "npu_format_cast", lambda tensor: tensor)
-    experts, hidden, intermediate = 2, 16, 12
+    monkeypatch.setattr(fuseep, "_check_mega_moe_support", lambda: None)
+    monkeypatch.setattr(fuseep, "_mega_moe_capacity", lambda: 1024)
+    experts, hidden, intermediate = 2, 1024, 1024
+    kernel = object.__new__(NPUW4A8Int8MoEMethod)
+    kernel.is_per_channel_weight = True
+    kernel.activation_use_clip = False
     layer = SimpleNamespace(
+        w13_kernel=kernel,
+        w2_kernel=kernel,
+        moe_ep_size=2,
+        moe_tp_size=1,
+        num_experts=4,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
+        num_fused_shared_experts=0,
+        moe_runner_config=SimpleNamespace(activation="situ", top_k=1),
         w13_weight=torch.nn.Parameter(
             torch.empty(experts, intermediate, hidden, dtype=torch.int8),
             requires_grad=False,
@@ -78,15 +100,15 @@ def test_mega_moe_w4a8_weights_use_gemm_layout(monkeypatch):
             requires_grad=False,
         ),
         w13_weight_scale=torch.nn.Parameter(
-            torch.empty(experts, 2 * intermediate, 1),
+            torch.ones(experts, 2 * intermediate, 1),
             requires_grad=False,
         ),
         w2_weight_scale=torch.nn.Parameter(
-            torch.empty(experts, hidden, 1),
+            torch.ones(experts, hidden, 1),
             requires_grad=False,
         ),
         w13_scale_bias=torch.nn.Parameter(
-            torch.empty(experts, 2 * intermediate, 1),
+            torch.ones(experts, 2 * intermediate, 1),
             requires_grad=False,
         ),
         w2_scale_bias=torch.nn.Parameter(
