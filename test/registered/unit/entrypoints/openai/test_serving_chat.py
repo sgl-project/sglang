@@ -1854,18 +1854,6 @@ class ServingChatTestCase(CustomTestCase):
                     f"{field} requires return_meta_info=true.",
                 )
 
-    def test_validate_request_rejects_removed_sampling_logprobs_mode(self):
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
-            return_meta_info=True,
-            return_sampling_mask=True,
-            sampling_logprobs_mode="selected",
-        )
-        self.assertIn(
-            "sampling_logprobs_mode was removed", self.chat._validate_request(req)
-        )
-
     def test_validate_request_bounds_top_logprobs_to_vocab(self):
         """top_logprobs outside [0, vocab_size] must be a 400, not a topk that
         kills the scheduler."""

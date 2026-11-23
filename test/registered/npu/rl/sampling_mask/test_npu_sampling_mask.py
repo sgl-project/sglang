@@ -177,7 +177,6 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
                 )
 
     def test_mixed_batch_flags(self):
-        """Check each flag, opt-in and request/token association independently."""
         bodies = self._generate(
             {"top_k": 10},
             text=[

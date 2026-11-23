@@ -30,7 +30,6 @@ _NUM_TOKENS = sum(len(rows) for rows in _ROWS)
 
 
 def _chunk(rows) -> SamplingMaskChunk:
-    """Float32-exact logprobs: one per row for the sampled token, one per token id."""
     token_ids = [t for row in rows for t in row]
     return SamplingMaskChunk(
         selected_logprobs=-np.arange(1, len(rows) + 1, dtype=np.float32) / 4,
@@ -100,8 +99,6 @@ class TestFlatRawSamplingMaskValidation(CustomTestCase):
 
 class TestSamplingOutputMetaInfo(CustomTestCase):
     def test_flat_matches_nested_rows(self):
-        """A nested row is its (logprob, token_id) pairs, the values the flat arrays
-        carry, and no token text."""
         chunks = [_chunk(rows) for rows in _ROWS]
         nested = _meta_info(_make_state(), chunks, finished=True)
         nested_rows = nested["output_sampling_mask_logprobs"]

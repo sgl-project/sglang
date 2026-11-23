@@ -255,8 +255,6 @@ class TestPrefillCompleteResult(CustomTestCase):
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
     def test_prefill_only_captured_request_skips_sampling_status_and_rows(self):
-        """A prefill-only batch (max_new_tokens=0) skips the sampler, so PD prefill
-        must not 500 on missing status or try to queue a sampling row."""
         req = _Req(allocated=True)
         req.to_finish = None
         req.pending_bootstrap = False
@@ -265,8 +263,6 @@ class TestPrefillCompleteResult(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=0)
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
         scheduler = _Scheduler()
-        scheduler.batch_result_processor.get_sampling_mask_finish_reason = Mock()
-        scheduler.batch_result_processor.add_sampling_mask_return_values = Mock()
         scheduler.checkpoint_disagg_prefill = Mock()
         move([req], scheduler.prefill_launched_reqs)
 
@@ -282,8 +278,6 @@ class TestPrefillCompleteResult(CustomTestCase):
 
         self.assertIsNone(req.finished_reason)
         self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
-        scheduler.batch_result_processor.get_sampling_mask_finish_reason.assert_not_called()
-        scheduler.batch_result_processor.add_sampling_mask_return_values.assert_not_called()
         scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
 
 

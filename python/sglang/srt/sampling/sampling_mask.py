@@ -46,7 +46,6 @@ class SamplingMaskChunk(
         )
 
     def support_rows(self) -> Tuple[List[List[int]], List[List[float]]]:
-        """Each row's support token IDs and their logprobs."""
         token_ids: List[List[int]] = []
         logprobs: List[List[float]] = []
         start = 0
@@ -124,7 +123,6 @@ class SamplingMaskRows(msgspec.Struct):
         token_ids: np.ndarray,
         support_logprobs: np.ndarray,
     ) -> None:
-        """Queue one token's sampled logprob, int32 support, and float32 support logprobs."""
         self._selected_logprobs.append(selected_logprob)
         self._lengths.append(len(token_ids))
         self._token_ids.extend(token_ids)

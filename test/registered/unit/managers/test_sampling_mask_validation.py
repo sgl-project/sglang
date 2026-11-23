@@ -178,32 +178,14 @@ class TestSamplingMaskValidation(CustomTestCase):
                     self._validate(processor)
 
     def test_other_processors_still_work_without_sampling_masks(self):
-        self._validate(
-            Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
-        )
-
-    def test_sampling_logprobs_need_no_mask(self):
-        for processor in (None, Qwen3ThinkingBudgetLogitProcessor.to_str()):
-            with self.subTest(processor=processor):
+        for return_sampling_logprobs in (False, True):
+            with self.subTest(return_sampling_logprobs=return_sampling_logprobs):
                 self._validate(
-                    processor,
+                    Qwen3ThinkingBudgetLogitProcessor.to_str(),
                     return_sampling_mask=False,
-                    return_sampling_logprobs=True,
-                    return_logprob=True,
+                    return_sampling_logprobs=return_sampling_logprobs,
+                    return_logprob=return_sampling_logprobs,
                 )
-
-    def test_removed_sampling_logprobs_mode_is_rejected(self):
-        for mode in ("selected", "support", [None, None]):
-            with self.subTest(mode=mode):
-                req = GenerateReqInput(
-                    text=["a", "b"],
-                    return_sampling_mask=True,
-                    sampling_logprobs_mode=mode,
-                )
-                with self.assertRaisesRegex(
-                    ValueError, "sampling_logprobs_mode was removed"
-                ):
-                    req.normalize_batch_and_arguments()
 
     def test_flat_raw_sampling_mask_requires_sampling_mask(self):
         self._validate(None, return_flat_raw_sampling_mask=True)

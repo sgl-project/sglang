@@ -369,7 +369,6 @@ class SamplingMaskTestMixin:
         kill_process_tree(cls.process.pid)
 
     def _post_sampling_logprobs(self, sampling_params):
-        """Sampling logprobs without the mask."""
         payload = {
             "text": "The capital of France is",
             "sampling_params": {
@@ -417,8 +416,6 @@ class SamplingMaskTestMixin:
         )
 
     def _assert_sampling_masks(self, output_ids, meta_info):
-        """Check one mask row and one sampling logprob per output token; returns
-        each row's token ids."""
         mask_rows = meta_info["output_sampling_mask_logprobs"]
         sampling_logprobs = meta_info["output_token_sampling_logprobs"]
         self.assertEqual(len(mask_rows), len(output_ids))
@@ -774,7 +771,6 @@ class TestSamplingMaskPacking(CustomTestCase):
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
         # produce more positive weights than the fixed transport can hold.
-        # Row 1 returns no mask, so it has no support to overflow.
         capture = _SamplingMaskCapture(
             batch_rows=torch.tensor([0, 1]),
             weights=torch.full((2, 5), 0.2),

@@ -489,6 +489,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
             ("return_logprob", {"return_logprob": True}),
             ("top_logprobs_num", {"top_logprobs_num": 2}),
             ("token_ids_logprob", {"token_ids_logprob": [3]}),
+            ("return_sampling_logprobs", {"return_sampling_logprobs": True}),
             ("return_sampling_mask", {"return_sampling_mask": True}),
             (
                 "return_flat_raw_top_logprobs",
@@ -510,14 +511,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
         for field in ("frequency_penalty", "presence_penalty", "return_logprob"):
             self.assertIn(field, error)
         self.assertIn("sampling is governed by the renoise schedule", error)
-
-    def test_every_algorithm_rejects_sampling_outputs(self):
-        """A diffusion step never runs the sampler, so no algorithm can return
-        sampling logprobs or masks; accepting them would return empty fields."""
-        for flag in ("return_sampling_logprobs", "return_sampling_mask"):
-            with self.subTest(flag=flag):
-                error = self._validate(algorithm="LowConfidence", **{flag: True})
-                self.assertIn(flag, error)
 
     def test_validation_is_gemma4_renoise_specific(self):
         self.assertIsNone(

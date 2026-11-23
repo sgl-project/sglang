@@ -337,7 +337,6 @@ def pre_alloc_fill_len(req: Req) -> int:
 
 
 def has_sampling_handoff_row(req: Req) -> bool:
-    """Whether PD prefill and decode hand off a first-token sampling row."""
     return req.captures_sampling and req.sampling_params.max_new_tokens > 0
 
 

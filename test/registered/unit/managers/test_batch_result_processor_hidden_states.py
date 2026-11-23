@@ -138,8 +138,6 @@ class TestPrefillEmbeddingResults(CustomTestCase):
 
 class TestSamplingMaskMaterialization(CustomTestCase):
     def test_logprob_only_and_support_rows_share_one_batch(self):
-        """A row that captures no support keeps its sampled logprob and gets an
-        empty support, whatever the batch packed for the rows that do."""
         output = LogitsProcessorOutput(
             next_token_logits=None,
             sampling_mask_output=SamplingMaskOutput(

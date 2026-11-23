@@ -488,7 +488,6 @@ def _build_flat_top_logprobs_fields_from_arrays(
 def _build_flat_sampling_mask_fields(
     chunks: List[SamplingMaskChunk], return_b64: bool
 ) -> Dict[str, Any]:
-    """A finished request's sampling mask rows as flat arrays; base64 if ``return_b64``."""
     fields: Dict[str, Any] = {}
     for name, attr, dtype in (
         ("output_sampling_mask_logprobs_val_flat", "support_logprobs", np.float32),

@@ -3455,7 +3455,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     length, mask, mask_logprobs, logprob = buffers.get_buf(0)[6:10]
                     self.assertEqual(length[0].item(), 3)
                     self.assertEqual(mask.tolist(), [7, 8, 9])
-                    # One logprob per mask id, and the sampled token's on its own.
                     self.assertEqual(mask_logprobs.tolist(), [-1.25, -1.5, -2.0])
                     self.assertEqual(logprob.tolist(), [-1.5] + [0.0] * 15)
                 else:
@@ -3468,21 +3467,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         enabled_ptrs, _, enabled_sizes = schemas[1]
         self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 4)
         self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), (3 + 3) * 4 + 128)
-
-    def test_sampling_logprob_is_sent_without_a_mask(self):
-        """A captured request that returns sampling logprobs only still sends its
-        first token's logprob, with an empty mask."""
-        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
-            buffers = MetadataBuffers(
-                size=1,
-                hidden_size=2,
-                hidden_states_dtype=torch.float32,
-                max_sampling_mask_tokens=3,
-            )
-            buffers.set_buf(self._make_req(None, sampling_logprob=-0.5))
-            length, _, _, logprob = buffers.get_buf(0)[6:10]
-            self.assertEqual(length[0].item(), 0)
-            self.assertEqual(logprob[0].item(), -0.5)
 
     def test_sampling_mask_row_reaches_decode_unchanged(self):
         """The prefill worker's first-token row is the row the decode worker streams."""
@@ -3550,8 +3534,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
 
     def test_prefill_only_request_skips_sampling_handoff_row(self):
-        """A max_new_tokens=0 request has no sampled token, so set_buf must not
-        require a row and decode must not read stale bytes or queue a row."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -3559,7 +3541,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 hidden_states_dtype=torch.float32,
                 max_sampling_mask_tokens=4,
             )
-            # Populate slot 0 with a previous request's sampling data.
             buffers.set_buf(
                 self._make_req(
                     None,

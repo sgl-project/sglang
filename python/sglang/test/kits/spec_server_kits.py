@@ -705,10 +705,6 @@ class SpecGrammarKit:
 
 
 class SpecSamplingMaskKit:
-    """Sampling logprobs and masks on a mixed greedy/sampling batch: one logprob
-    and one mask row per output token, each output token inside its row with that
-    logprob, and greedy rows as singletons."""
-
     def test_sampling_mask(self):
         response = requests.post(
             self.base_url + "/generate",
