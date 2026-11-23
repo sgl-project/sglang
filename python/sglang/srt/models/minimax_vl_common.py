@@ -36,6 +36,73 @@ from sglang.srt.utils import envs, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
 
+DEFERRED_IMAGE_KEY = "minimax_deferred_image"
+
+
+@dataclass(frozen=True)
+class MiniMaxDeferredImage:
+    image_mean: List[float]
+    image_std: List[float]
+    rescale_factor: float
+    patch_size: int
+    merge_size: int
+    temporal_patch_size: int
+    feature_dtype: str
+
+
+def patchify_images(
+    images: torch.Tensor, *, patch_size: int, merge_size: int, temporal_patch_size: int
+) -> torch.Tensor:
+    batch, channel, height, width = images.shape
+    grid_h, grid_w = height // patch_size, width // patch_size
+    patches = images.reshape(
+        batch,
+        channel,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    ).permute(0, 2, 5, 3, 6, 1, 4, 7)
+    return (
+        patches.unsqueeze(6)
+        .expand(-1, -1, -1, -1, -1, -1, temporal_patch_size, -1, -1)
+        .reshape(
+            batch,
+            grid_h * grid_w,
+            channel * temporal_patch_size * patch_size * patch_size,
+        )
+    )
+
+
+def finish_deferred_image(
+    image_hwc: torch.Tensor, deferred: MiniMaxDeferredImage, device: torch.device
+) -> torch.Tensor:
+    # Folds the rescale into mean/std like the HF fast processor: bit-exact pixels.
+    mean = torch.tensor(deferred.image_mean, dtype=torch.float32) * (
+        1.0 / deferred.rescale_factor
+    )
+    std = torch.tensor(deferred.image_std, dtype=torch.float32) * (
+        1.0 / deferred.rescale_factor
+    )
+    pixels = (
+        image_hwc.to(device, non_blocking=True)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(torch.float32)
+    )
+    pixels = pixels.sub_(mean.to(device).view(-1, 1, 1)).div_(
+        std.to(device).view(-1, 1, 1)
+    )
+    patches = patchify_images(
+        pixels,
+        patch_size=deferred.patch_size,
+        merge_size=deferred.merge_size,
+        temporal_patch_size=deferred.temporal_patch_size,
+    )
+    return patches[0].to(getattr(torch, deferred.feature_dtype))
+
 
 @dataclass
 class CLIPVisionConfig:
@@ -842,13 +909,20 @@ def _run_vision_tower(
     return vision_tower(pixel_values, grid_thw=grid_thw)
 
 
+def _item_pixel_values(item: MultimodalDataItem, device: torch.device):
+    deferred = item.model_specific_data.get(DEFERRED_IMAGE_KEY)
+    if deferred is None:
+        return item.feature
+    return finish_deferred_image(item.feature, deferred, device)
+
+
 def _stack_pixel_values(
     vision_tower: MiniMaxVLVisionModel, items: List[MultimodalDataItem]
 ) -> torch.Tensor:
     weight = vision_tower.vision_model.embeddings.patch_embedding.weight
-    return torch.cat([item.feature for item in items], dim=0).to(
-        device=weight.device, dtype=vision_tower.dtype
-    )
+    return torch.cat(
+        [_item_pixel_values(item, weight.device) for item in items], dim=0
+    ).to(device=weight.device, dtype=vision_tower.dtype)
 
 
 def get_image_feature(

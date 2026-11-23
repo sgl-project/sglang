@@ -1,7 +1,11 @@
 """M3.1 media resize, per-request limits, and token expansion."""
 
 import asyncio
+import base64
+import io
+import re
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -14,7 +18,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentVideoURL,
 )
-from sglang.srt.models.minimax_vl_common import _stack_pixel_values
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.models.minimax_vl_common import (
+    DEFERRED_IMAGE_KEY,
+    MiniMaxDeferredImage,
+    _stack_pixel_values,
+    finish_deferred_image,
+)
+from sglang.srt.multimodal.cache import snapshot_media
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -23,7 +34,11 @@ from sglang.srt.multimodal.processors.minimax_m3_vl import (
     MiniMaxM3VLProcessor,
     _compute_aligned_size,
     _compute_sampled_frame_indices,
+    _expand_media_tokens_scan,
+    _LoadedImage,
+    expand_media_tokens,
     preprocess_for_encoder,
+    resize_images_for_request,
     video_frame_timestamps,
 )
 from sglang.srt.multimodal.processors.minimax_m31_media import (
@@ -141,6 +156,9 @@ class _ProcessorCase(CustomTestCase):
         processor.process_and_combine_mm_data_async = AsyncMock(
             return_value=([], [1, 2, 3], {})
         )
+        processor.io_executor = ThreadPoolExecutor(2)
+        self.addCleanup(processor.io_executor.shutdown)
+        processor.deferred_image = None
         self.processor = processor
 
     def run_processor(self, images=(), image_data=None, videos=(), video_data=None):
@@ -229,6 +247,168 @@ class TestImageLimits(_ProcessorCase):
         image = object()
         output, _ = self.run_processor([image], [ImageData(url="x")])
         self.assertIs(output.images[0], image)
+
+    def test_concurrent_resize_matches_encoder_path(self):
+        image_processor = MiniMaxM3VLImageProcessor(
+            **{**M3_VL_PREPROCESSOR, "size": None}
+        )
+        self.processor._processor.image_processor = image_processor
+        self.processor.image_config = {"max_pixels": 200704}
+        images = [_image(1920, 1080, seed=1), _image(1500, 1000, seed=2)] * 2
+        image_data = [
+            ImageData(url="a"),
+            ImageData(url="b", max_long_side_pixel=252),
+            ImageData(url="c", max_long_side_pixel=1008),
+            ImageData(url="d"),
+        ]
+        output, _ = self.run_processor(images, image_data)
+        expected = resize_images_for_request(
+            images, image_data, image_processor=image_processor, max_pixels=200704
+        )
+        self.assertEqual(
+            [image.size for image in output.images],
+            [(588, 336), (252, 168), (1008, 560), (532, 364)],
+        )
+        for actual, reference in zip(output.images, expected):
+            self.assertTrue(np.array_equal(actual, reference))
+
+
+def _png_bytes(width, height, color=(40, 80, 120), mode="RGB"):
+    buffer = io.BytesIO()
+    Image.new(mode, (width, height), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class TestImageIdentity(_ProcessorCase):
+    def setUp(self):
+        super().setUp()
+        self.processor.processor_fingerprint = "sha256:" + "ab" * 32
+
+        async def combine(*, base_output, **kwargs):
+            items = []
+            for image in base_output.images:
+                width, height = image.size
+                items.append(
+                    MultimodalDataItem(
+                        modality=Modality.IMAGE,
+                        feature=torch.zeros(1),
+                        model_specific_data={
+                            "image_grid_thw": torch.tensor(
+                                [[1, height // 14, width // 14]]
+                            )
+                        },
+                    )
+                )
+            return items, torch.tensor([1]), {}
+
+        self.processor.process_and_combine_mm_data_async = combine
+
+    def identities(self, images, limits=None):
+        loaded = [
+            MiniMaxM3VLProcessor._load_single_item(image, Modality.IMAGE)
+            for image in images
+        ]
+        self.processor.load_mm_data = AsyncMock(
+            return_value=SimpleNamespace(images=loaded, videos=[])
+        )
+        output = asyncio.run(
+            self.processor.process_mm_data_async(
+                image_data=[
+                    ImageData(url="x", max_long_side_pixel=limit)
+                    for limit in limits or [None] * len(images)
+                ],
+                audio_data=None,
+                input_text=[1],
+                request_obj=SimpleNamespace(video_data=None),
+            )
+        )
+        return [item.identity for item in output.mm_items]
+
+    def test_loader_hashes_the_bytes_it_decodes(self):
+        payload = _png_bytes(64, 48)
+        url = "data:image/png;base64," + base64.b64encode(payload).decode()
+        for data in (payload, url, ImageData(url=url, max_long_side_pixel=504)):
+            with self.subTest(data=type(data).__name__):
+                loaded = MiniMaxM3VLProcessor._load_single_item(data, Modality.IMAGE)
+                self.assertIsInstance(loaded, _LoadedImage)
+                self.assertEqual(
+                    loaded.content_digest, snapshot_media(payload).content_digest
+                )
+                self.assertTrue(
+                    np.array_equal(loaded.image, Image.open(io.BytesIO(payload)))
+                )
+
+    def test_identity_covers_bytes_options_and_config(self):
+        first, second = _png_bytes(3000, 2000), _png_bytes(3000, 2000, (0, 0, 0))
+        small = _png_bytes(640, 480)
+        [plain] = self.identities([first])
+        self.assertEqual(len(plain), 32)
+        self.assertEqual(self.identities([first]), [plain])
+        self.assertEqual(self.identities([first], [2016]), [plain])
+        self.assertNotEqual(self.identities([second]), [plain])
+        self.assertNotEqual(self.identities([first], [1008]), [plain])
+        self.assertEqual(
+            self.identities([first, small]), self.identities([small, first])[::-1]
+        )
+        self.processor.processor_fingerprint = "sha256:" + "cd" * 32
+        self.assertNotEqual(self.identities([first]), [plain])
+
+    def test_inputs_without_digests_keep_feature_hash(self):
+        self.processor.load_mm_data = AsyncMock(
+            return_value=SimpleNamespace(images=[_image(64, 64)], videos=[])
+        )
+        output = asyncio.run(
+            self.processor.process_mm_data_async(
+                image_data=[ImageData(url="x")],
+                audio_data=None,
+                input_text=[1],
+                request_obj=SimpleNamespace(video_data=None),
+            )
+        )
+        self.assertIsNone(output.mm_items[0].identity)
+        bundled = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            model_specific_data={"image_grid_thw": torch.tensor([[1, 4, 4]] * 2)},
+        )
+        self.processor._set_image_identities(
+            [bundled],
+            content_digests=[snapshot_media(_png_bytes(8, 8)).content_digest] * 2,
+            resize_specs=[("max_long_side_pixel", 2016)] * 2,
+        )
+        self.assertIsNone(bundled.identity)
+
+    def test_malformed_image_fails_its_own_load(self):
+        payload = b"\x89PNG\r\n\x1a\nnot an image"
+        with self.assertRaises(ValueError):
+            MiniMaxM3VLProcessor._load_single_item(payload, Modality.IMAGE)
+
+
+class TestPreprocessThreads(CustomTestCase):
+    def test_preprocessing_threads_are_scoped_to_the_call(self):
+        processor = object.__new__(MiniMaxM3VLProcessor)
+        processor._tokenizer = None
+        processor.IM_TOKEN_ID = 10
+        processor.VIDEO_TOKEN_ID = 11
+        processor.IM_START_TOKEN_ID = 12
+        processor.image_config = {}
+        processor.preprocess_num_threads = 4
+        seen = []
+
+        def image_processor(**kwargs):
+            seen.append(torch.get_num_threads())
+            return {"image_grid_thw": [[1, 2, 4]]}
+
+        processor._processor = SimpleNamespace(
+            image_processor=image_processor,
+            tokenizer=Mock(encode=Mock(return_value=[12, 10, 10, 13])),
+        )
+        processor._image_placeholder_text = lambda grid: "image"
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        for worker_threads in (1, 16):
+            torch.set_num_threads(worker_threads)
+            processor.process_mm_data(None, images=[object()], input_ids=[10])
+            self.assertEqual(torch.get_num_threads(), worker_threads)
+        self.assertEqual(seen, [4, 16])
 
 
 class TestVideoLimits(_ProcessorCase):
@@ -428,7 +608,7 @@ class TestMiniMaxM31FeatureTransportDtype(CustomTestCase):
         pixel_values = torch.randn(
             256, 1176, generator=torch.Generator().manual_seed(0)
         )
-        item = SimpleNamespace(feature=pixel_values.clone())
+        item = SimpleNamespace(feature=pixel_values.clone(), model_specific_data={})
         processor._postprocess_mm_items_before_transport([item], images=None)
 
         self.assertEqual(item.feature.dtype, torch.bfloat16)
@@ -445,7 +625,8 @@ class TestMiniMaxM31FeatureTransportDtype(CustomTestCase):
             torch.equal(
                 _stack_pixel_values(vision_tower, [item]),
                 _stack_pixel_values(
-                    vision_tower, [SimpleNamespace(feature=pixel_values)]
+                    vision_tower,
+                    [SimpleNamespace(feature=pixel_values, model_specific_data={})],
                 ),
             )
         )
@@ -516,9 +697,23 @@ class TestMiniMaxM31Placeholders(CustomTestCase):
 
         def fake_base_init(self, *args, **kwargs):
             self.video_config = {}
+            self.mm_processor_worker_num = 1
 
         tokenizer = Mock(convert_tokens_to_ids=Mock(return_value=1))
-        with patch.object(BaseMultimodalProcessor, "__init__", fake_base_init):
+        disagg = SimpleNamespace(
+            disaggregation_mode="null", disaggregation_decode_enable_radix_cache=False
+        )
+        with (
+            patch.object(BaseMultimodalProcessor, "__init__", fake_base_init),
+            patch(
+                "sglang.srt.multimodal.processors.minimax_m3_vl.get_disagg",
+                return_value=disagg,
+            ),
+            patch(
+                "sglang.srt.multimodal.processors.minimax_m3_vl.get_serving",
+                return_value=SimpleNamespace(tokenizer_worker_num=1),
+            ),
+        ):
             processor = MiniMaxM3VLProcessor(
                 None, None, SimpleNamespace(tokenizer=tokenizer)
             )
@@ -529,6 +724,290 @@ class TestMiniMaxM31Placeholders(CustomTestCase):
             processor.mm_tokens.get_combined_regex().findall(prompt),
             ["]<]image[>[", "]<]video[>["],
         )
+
+
+_FAKE_SPECIALS = {
+    MiniMaxM3VLProcessor.IMAGE_START_TOKEN: 12,
+    MiniMaxM3VLProcessor.IMAGE_TOKEN: 10,
+    MiniMaxM3VLProcessor.IMAGE_END_TOKEN: 13,
+    MiniMaxM3VLProcessor.VIDEO_TOKEN: 11,
+}
+
+
+def _fake_encode(text, **kwargs):
+    pattern = "|".join(re.escape(token) for token in _FAKE_SPECIALS) + "|."
+    return [
+        _FAKE_SPECIALS[piece] if piece in _FAKE_SPECIALS else ord(piece) + 1000
+        for piece in re.findall(pattern, text, flags=re.S)
+    ]
+
+
+def _png_data_url(width, height, mode="RGB", color=(40, 80, 120)):
+    return (
+        "data:image/png;base64,"
+        + base64.b64encode(_png_bytes(width, height, color, mode)).decode()
+    )
+
+
+def _fake_processor(image_processor):
+    processor = object.__new__(MiniMaxM3VLProcessor)
+    processor.IM_TOKEN_ID = 10
+    processor.VIDEO_TOKEN_ID = 11
+    processor.IM_START_TOKEN_ID = 12
+    processor.IM_END_TOKEN_ID = 13
+    processor.image_config = {}
+    processor.video_config = {}
+    processor.io_executor = ThreadPoolExecutor(2)
+    tokenizer = Mock(bos_token=None)
+    tokenizer.encode.side_effect = _fake_encode
+    processor._tokenizer = tokenizer
+    processor._tokenizer_auto_adds_specials = False
+    processor._processor = SimpleNamespace(
+        tokenizer=tokenizer, image_processor=image_processor
+    )
+    return processor
+
+
+class TestDeferredImagePreprocessing(CustomTestCase):
+    def setUp(self):
+        processor = _fake_processor(
+            MiniMaxM3VLImageProcessor(**{**M3_VL_PREPROCESSOR, "size": None})
+        )
+        self.addCleanup(processor.io_executor.shutdown)
+        processor._feature_transport = SimpleNamespace(mm_feature_transport="cpu")
+        processor.feature_dtype = torch.float32
+        self.processor = processor
+
+    def enable(self):
+        with patch(
+            "sglang.srt.multimodal.processors.minimax_m3_vl.is_cuda",
+            return_value=True,
+        ):
+            self.assertIsInstance(self.processor.deferred_image, MiniMaxDeferredImage)
+
+    def finish(self, mm_items, device):
+        return torch.cat(
+            [
+                finish_deferred_image(
+                    item.feature,
+                    item.model_specific_data[DEFERRED_IMAGE_KEY],
+                    torch.device(device),
+                ).cpu()
+                for item in mm_items
+            ]
+        )
+
+    def test_deferred_images_match_processor_output(self):
+        self.enable()
+        images = [
+            _image(588, 336, seed=1),
+            _image(252, 168, seed=2),
+            _image(28, 5600, seed=3),
+            _image(1008, 756, seed=4),
+        ]
+        ids = [101, 10, 102, 10, 103, 10, 10, 104]
+        expected = self.processor.process_mm_data(
+            None, images=images, input_ids=list(ids), images_resized=True
+        )
+        mm_items, input_ids = asyncio.run(
+            self.processor._defer_image_preprocessing(images, ids)
+        )
+        self.assertEqual(input_ids, expected["input_ids"][0].tolist())
+        self.assertEqual(
+            [item.offsets[0] for item in mm_items],
+            BaseMultimodalProcessor.get_mm_items_offset(expected["input_ids"][0], 10),
+        )
+        self.assertTrue(
+            torch.equal(
+                torch.cat([item.image_grid_thw for item in mm_items]),
+                expected["image_grid_thw"],
+            )
+        )
+        self.assertEqual(mm_items[0].feature.dtype, torch.uint8)
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                self.assertTrue(
+                    torch.equal(
+                        self.finish(mm_items, device),
+                        expected["pixel_values"],
+                    )
+                )
+
+    def test_request_path_matches_processor_path(self):
+        self.enable()
+        sources = [
+            _png_data_url(3000, 2000),
+            _png_data_url(333, 517, mode="RGBA", color=(10, 200, 30, 90)),
+            _png_data_url(1000, 50, mode="L", color=77),
+            _png_data_url(640, 480, mode="P", color=5),
+        ]
+        image_data = [ImageData(url=url) for url in sources]
+        prompt = "a]<]image[>[b]<]image[>[c]<]image[>[d]<]image[>[e"
+
+        def run(deferred, input_text):
+            self.processor.__dict__["deferred_image"] = deferred
+            return asyncio.run(
+                self.processor.process_mm_data_async(
+                    image_data=image_data,
+                    audio_data=None,
+                    input_text=input_text,
+                    request_obj=SimpleNamespace(video_data=None),
+                )
+            )
+
+        async def combine(*, base_output, images_resized, input_ids, **kwargs):
+            result = self.processor.process_mm_data(
+                None,
+                images=base_output.images,
+                input_ids=input_ids,
+                images_resized=images_resized,
+            )
+            items = [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=feature,
+                    offsets=[offset],
+                    model_specific_data={"image_grid_thw": grid[None]},
+                )
+                for feature, grid, offset in zip(
+                    result["pixel_values"].split(
+                        result["image_grid_thw"].prod(-1).tolist()
+                    ),
+                    result["image_grid_thw"],
+                    BaseMultimodalProcessor.get_mm_items_offset(
+                        result["input_ids"][0], 10
+                    ),
+                )
+            ]
+            return items, result["input_ids"][0], result
+
+        async def load(*, image_data, **kwargs):
+            return SimpleNamespace(
+                images=[
+                    MiniMaxM3VLProcessor._load_single_item(item, Modality.IMAGE)
+                    for item in image_data
+                ],
+                videos=[],
+            )
+
+        self.processor.process_and_combine_mm_data_async = combine
+        self.processor.load_mm_data = load
+        self.processor.processor_fingerprint = "sha256:" + "ab" * 32
+        deferred = self.processor.deferred_image
+        ids = _fake_encode(prompt)
+        expected = run(None, ids)
+        for input_text in (ids, prompt):
+            with self.subTest(input_text=type(input_text).__name__):
+                actual = run(deferred, input_text)
+                self.assertEqual(actual.input_ids, expected.input_ids)
+                self.assertEqual(
+                    [item.offsets for item in actual.mm_items],
+                    [item.offsets for item in expected.mm_items],
+                )
+                self.assertEqual(
+                    [item.identity for item in actual.mm_items],
+                    [item.identity for item in expected.mm_items],
+                )
+                self.assertTrue(
+                    all(
+                        DEFERRED_IMAGE_KEY in item.model_specific_data
+                        for item in actual.mm_items
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        self.finish(actual.mm_items, "cpu"),
+                        torch.cat([item.feature for item in expected.mm_items]),
+                    )
+                )
+
+    def test_unsupported_image_options_keep_processor_path(self):
+        with patch(
+            "sglang.srt.multimodal.processors.minimax_m3_vl.is_cuda",
+            return_value=True,
+        ):
+            for image_config, supported in (
+                ({"max_pixels": 200704}, True),
+                ({"image_mean": [0.5, 0.5, 0.5]}, False),
+            ):
+                with self.subTest(image_config=image_config):
+                    self.processor.__dict__.pop("deferred_image", None)
+                    self.processor.image_config = image_config
+                    self.assertEqual(
+                        self.processor.deferred_image is not None, supported
+                    )
+
+
+class TestDecodeImageSizes(CustomTestCase):
+    def setUp(self):
+        self.processor = _fake_processor(MiniMaxM31ImageProcessor(max_size=(672, 672)))
+        self.addCleanup(self.processor.io_executor.shutdown)
+
+    def test_header_sizes_match_pixel_path(self):
+        sizes = [(3000, 2000), (50, 1000), (640, 480), (100, 100), (1500, 1000)]
+        image_data = [
+            ImageData(url=_png_data_url(*size), max_long_side_pixel=limit)
+            for size, limit in zip(sizes, [None, None, 252, None, 1008])
+        ]
+        ids = [101]
+        for _ in sizes:
+            ids += [10, 102]
+        for max_pixels in (None, 451584):
+            with self.subTest(max_pixels=max_pixels):
+                self.processor.image_config = (
+                    {} if max_pixels is None else {"max_pixels": max_pixels}
+                )
+                output = asyncio.run(
+                    self.processor._process_image_sizes(image_data, list(ids))
+                )
+                resized = resize_images_for_request(
+                    [Image.new("RGB", size) for size in sizes],
+                    image_data,
+                    image_processor=self.processor._processor.image_processor,
+                    max_pixels=max_pixels,
+                )
+                expected = self.processor.process_mm_data(
+                    None, images=resized, input_ids=list(ids), images_resized=True
+                )
+                expected_ids = expected["input_ids"][0]
+                self.assertEqual(output.input_ids, expected_ids.tolist())
+                self.assertEqual(
+                    [item.image_grid_thw[0].tolist() for item in output.mm_items],
+                    expected["image_grid_thw"].tolist(),
+                )
+                self.assertEqual(
+                    [item.offsets[0] for item in output.mm_items],
+                    BaseMultimodalProcessor.get_mm_items_offset(expected_ids, 10),
+                )
+
+    def test_decode_rejects_malformed_image(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(
+                self.processor._process_image_sizes(
+                    [ImageData(url="data:image/png;base64,bm90IGFuIGltYWdl")], [10]
+                )
+            )
+
+    def test_vectorized_expansion_matches_scan(self):
+        rng = np.random.default_rng(0)
+        image = [12, 10, 10, 13]
+        video = [20, 12, 11, 13, 12, 11, 13]
+        for trial in range(200):
+            ids = rng.integers(100, 110, rng.integers(0, 40)).tolist()
+            for token in rng.choice([10, 11], rng.integers(0, 5)).tolist():
+                ids.insert(int(rng.integers(0, len(ids) + 1)), token)
+            replacements = {
+                10: [image] * int(rng.integers(0, 4)),
+                11: [video] * int(rng.integers(0, 3)),
+            }
+            results = []
+            for expand in (expand_media_tokens, _expand_media_tokens_scan):
+                try:
+                    results.append(expand(ids, replacements, im_start_id=12))
+                except ValueError as error:
+                    results.append(str(error))
+            self.assertEqual(results[0], results[1], msg=f"trial {trial}: {ids}")
 
 
 class TestVisionTokenBlocks(CustomTestCase):
