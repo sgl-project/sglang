@@ -463,6 +463,24 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
                 "model.layers.0.self_attn.qkv_proj", ignore=GLM_IGNORE[:2]
             )
 
+    def test_fused_regex_matching_some_shards_raises(self):
+        """`re:.*v_proj$` also matches qkv_proj, but q/k stay quantized, so it raises."""
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj",
+                ignore=["re:.*v_proj$"],
+                fused_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+            )
+
+    def test_literal_fused_name_wins_over_a_partial_regex(self):
+        """A real fused tensor named literally stays ignored even if a regex hits one shard."""
+        self.assertTrue(
+            should_ignore_layer(
+                "visual.blocks.0.attn.qkv_proj",
+                ignore=["visual.blocks.0.attn.qkv_proj", "re:.*v_proj$"],
+            )
+        )
+
     @staticmethod
     def _lfm2_scheme(ignore):
         """Scheme lookup with LFM2-MoE's class mapping and mapper, as the loader applies them."""

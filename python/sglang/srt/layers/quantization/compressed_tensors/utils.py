@@ -37,10 +37,15 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
-    # An entry naming the fused layer itself wins, with or without a model
-    # mapping, since some checkpoints store a real qkv_proj / gate_up_proj.
-    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+    # Some checkpoints store a real qkv_proj / gate_up_proj, so an entry that
+    # names the fused layer itself wins; a regex on it must agree with shards.
+    if check_equal_or_regex_match(
+        layer_name=layer_name, targets=[t for t in ignore if not t.startswith("re:")]
+    ):
         return True
+    fused_name_ignored = check_equal_or_regex_match(
+        layer_name=layer_name, targets=ignore
+    )
 
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
@@ -50,43 +55,31 @@ def should_ignore_layer(
     if shard_proj_names is None:
         shard_proj_names = _FALLBACK_FUSED_SHARDS.get(proj_name)
 
-    if shard_proj_names is not None:
-        # Convert fused_name --> [shard_names]
-        shard_names = [
-            layer_name.replace(proj_name, shard_proj_name)
-            for shard_proj_name in shard_proj_names
-        ]
-
-        # Layer should be ignored if shards are ignored.
-        should_ignore_layer = None
-        for shard_name in shard_names:
-            should_ignore_shard = check_equal_or_regex_match(
-                layer_name=shard_name, targets=ignore
-            )
-            if not should_ignore_shard:
-                should_ignore_shard = check_equal_or_regex_match(
-                    layer_name=f"{shard_name}.linear", targets=ignore
-                )
-
-            # If shard_idx=0, set layer ignore to match shard.
-            if should_ignore_layer is None:
-                should_ignore_layer = should_ignore_shard
-
-            # If shard_idx=1+ confirm scheme matches prior shards.
-            elif should_ignore_shard != should_ignore_layer:
-                raise ValueError(
-                    f"Found different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. SGLang "
-                    "requires all to use the same scheme."
-                )
-
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
-    else:
-        should_ignore_layer = False
+    if shard_proj_names is None:
+        return fused_name_ignored
 
-    assert should_ignore_layer is not None
-    return should_ignore_layer
+    # Convert fused_name --> [shard_names]
+    shard_names = [
+        layer_name.replace(proj_name, shard_proj_name)
+        for shard_proj_name in shard_proj_names
+    ]
+    shards_ignored = {
+        check_equal_or_regex_match(layer_name=shard_name, targets=ignore)
+        or check_equal_or_regex_match(layer_name=f"{shard_name}.linear", targets=ignore)
+        for shard_name in shard_names
+    }
+
+    # Reject a list that covers only some shards even if an entry also matches
+    # the fused name: `re:.*v_proj$` matches qkv_proj too, but q/k may be packed.
+    if len(shards_ignored) > 1:
+        raise ValueError(
+            f"Found different quantization schemes for "
+            f"{shard_proj_names} in {layer_name}. SGLang "
+            "requires all to use the same scheme."
+        )
+    return fused_name_ignored or shards_ignored.pop()
 
 
 def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
