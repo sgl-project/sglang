@@ -12,10 +12,12 @@ from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
 register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
 
 MODEL_PATH = "Qwen/Qwen3-1.7B-FP8"
+BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 
 BASE_ARGS = CPU_BASE_ARGS
 
@@ -37,17 +39,21 @@ class TestQwen3_1B7FP8Xeon(unittest.TestCase):
             test_name="Qwen3-1.7B-FP8 (Xeon)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.67,
+                baseline_accuracy=BASELINE.min_accuracy,
                 api="completion",
                 num_threads=64,
+                num_shots=5,
+                max_tokens=2048,
+                temperature=0,
+                top_p=1,
                 return_latency=True,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                baseline_ftl_s=1.2,
-                baseline_itl_ms=35.0,
+                baseline_ftl_s=BASELINE.max_ftl_s,
+                baseline_itl_ms=BASELINE.max_itl_ms,
                 include_latency_breakdown=True,
             ),
             share_server=True,

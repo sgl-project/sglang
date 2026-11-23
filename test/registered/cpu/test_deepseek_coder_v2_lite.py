@@ -1,7 +1,6 @@
 """Nightly accuracy + performance test for DeepSeek-Coder-V2-Lite-Instruct on CPU.
 
 16B MoE coder model (2.4B active params), TP=6 on Xeon.
-GSM8K baseline: 0.80 (86.4% reported - 5% buffer; CPU measured 0.809).
 
 Registry: nightly-xeon-models suite
 """
@@ -14,10 +13,12 @@ from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
 register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
 
 MODEL_PATH = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 
 BASE_ARGS = CPU_BASE_ARGS
 
@@ -39,17 +40,21 @@ class TestDeepSeekCoderV2LiteXeon(unittest.TestCase):
             test_name="DeepSeek-Coder-V2-Lite-Instruct (Xeon)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.80,
+                baseline_accuracy=BASELINE.min_accuracy,
                 api="completion",
                 num_threads=64,
+                num_shots=5,
+                max_tokens=2048,
+                temperature=0,
+                top_p=1,
                 return_latency=True,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                baseline_ftl_s=2.0,
-                baseline_itl_ms=100.0,
+                baseline_ftl_s=BASELINE.max_ftl_s,
+                baseline_itl_ms=BASELINE.max_itl_ms,
                 include_latency_breakdown=True,
             ),
             share_server=True,

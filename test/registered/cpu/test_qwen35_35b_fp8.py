@@ -1,7 +1,6 @@
 """Nightly accuracy + performance test for Qwen3.5-35B-A3B-FP8 on CPU.
 
 35B MoE with 3B active params, FP8 weight quantization, TP=6 on Xeon.
-GSM8K baseline: 0.83.
 
 Registry: nightly-xeon-models suite"""
 
@@ -13,12 +12,14 @@ from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
 register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
 
 # export SGLANG_DEEPSEEK_FP8A8=1
 # build sgl-kernel using SGLANG_CPU_FP8_BRGEMM=1 on DMR
 MODEL_PATH = "Qwen/Qwen3.5-35B-A3B-FP8"
+BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 
 BASE_ARGS = CPU_BASE_ARGS
 
@@ -40,17 +41,21 @@ class TestQwen35_35BFPS8Xeon(unittest.TestCase):
             test_name="Qwen3.5-35B-A3B-FP8 (Xeon)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.83,
+                baseline_accuracy=BASELINE.min_accuracy,
                 api="completion",
                 num_threads=64,
+                num_shots=5,
+                max_tokens=2048,
+                temperature=0,
+                top_p=1,
                 return_latency=True,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                baseline_ftl_s=3.2,
-                baseline_itl_ms=155.0,
+                baseline_ftl_s=BASELINE.max_ftl_s,
+                baseline_itl_ms=BASELINE.max_itl_ms,
                 include_latency_breakdown=True,
             ),
             share_server=True,

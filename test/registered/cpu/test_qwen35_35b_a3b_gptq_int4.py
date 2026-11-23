@@ -13,12 +13,14 @@ from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
 # The full GSM8K evaluation exceeded the previous 90-minute file timeout.
 # With --timeout-from-est-time, this estimate gives the file a 3-hour budget.
 register_cpu_ci(est_time=7200, suite="nightly-xeon-models")
 
 MODEL_PATH = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 
 BASE_ARGS = CPU_BASE_ARGS
 
@@ -40,17 +42,21 @@ class TestQwen35_35BXeon(unittest.TestCase):
             test_name="Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 (Xeon)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.80,
+                baseline_accuracy=BASELINE.min_accuracy,
                 api="completion",
                 num_threads=64,
+                num_shots=5,
+                max_tokens=2048,
+                temperature=0,
+                top_p=1,
                 return_latency=True,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                baseline_ftl_s=4.5,
-                baseline_itl_ms=45.0,
+                baseline_ftl_s=BASELINE.max_ftl_s,
+                baseline_itl_ms=BASELINE.max_itl_ms,
                 include_latency_breakdown=True,
             ),
             share_server=True,
