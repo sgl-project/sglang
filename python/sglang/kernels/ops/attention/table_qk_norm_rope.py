@@ -20,6 +20,7 @@ def _table_qk_norm_rope_kernel(
     q_size,
     k_out_ptr,
     v_out_ptr,
+    q_out_ptr,
     NHQ: tl.constexpr,
     NH: tl.constexpr,
     D: tl.constexpr,
@@ -29,6 +30,7 @@ def _table_qk_norm_rope_kernel(
     MROPE: tl.constexpr,
     HEADS_PER_PROGRAM: tl.constexpr,
     KV_OUT: tl.constexpr,
+    Q_OUT: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     heads = tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM)
@@ -98,6 +100,9 @@ def _table_qk_norm_rope_kernel(
     if KV_OUT:
         k_row = (k_out_ptr + (t * (NH - NHQ) + heads - NHQ) * D)[:, None]
         row = tl.where(is_q, row, k_row)
+    if Q_OUT:
+        q_row = (q_out_ptr + (t * NHQ + heads) * D)[:, None]
+        row = tl.where(is_q, q_row, row)
     tl.store(row + half_ar, o1.to(tl.bfloat16), mask=mask)
     tl.store(row + HALF + half_ar, o2.to(tl.bfloat16), mask=mask)
 
@@ -116,6 +121,7 @@ def table_qk_norm_rope_(
     match_cuda: bool = False,
     axis_map: Optional[torch.Tensor] = None,
     kv_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    q_out: Optional[torch.Tensor] = None,
 ) -> None:
     """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
 
@@ -132,6 +138,9 @@ def table_qk_norm_rope_(
     MRoPE passes [3, T] positions and ``MRotaryEmbedding.axis_map``, the axis
     each rotary lane reads its position from. A BF16 table rotates in BF16 to
     match ``triton_mrope_fused``.
+
+    With ``q_out``, Q is read from the packed input and written into a separate
+    contiguous output. K is normalized and rotated in place. V is untouched.
 
     With ``kv_out`` = (k, v), contiguous ``[T, num_k_heads * head_dim]`` each, the normed / roped K and a copy
     of V are written there instead of into ``qkv`` (not with ``match_cuda``).
@@ -158,6 +167,10 @@ def table_qk_norm_rope_(
             for t in (positions, q_weight, k_weight, cos_sin_cache, axis_map)
             if t is not None
         )
+    if q_out is not None:
+        assert match_cuda and kv_out is None and q_out.is_contiguous()
+        assert q_out.dtype == qkv.dtype and q_out.device == qkv.device
+        assert q_out.shape == (qkv.shape[0], num_q_heads * head_dim)
     T = qkv.shape[0]
     if T == 0:
         return
@@ -188,6 +201,7 @@ def table_qk_norm_rope_(
         num_q_heads * head_dim,
         k_out,
         v_out,
+        q_out,
         NHQ=num_q_heads,
         NH=num_heads,
         D=head_dim,
@@ -197,5 +211,6 @@ def table_qk_norm_rope_(
         MROPE=axis_map is not None,
         HEADS_PER_PROGRAM=heads_per_program,
         KV_OUT=kv_out is not None,
+        Q_OUT=q_out is not None,
         num_warps=num_warps,
     )

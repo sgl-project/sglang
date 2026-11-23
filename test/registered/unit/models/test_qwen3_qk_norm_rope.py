@@ -38,11 +38,18 @@ def runtime():
         yield defaults
 
 
-def make_layer(d=128, dtype=torch.bfloat16, enable_prefill_qk_norm_rope=True, **kwargs):
+def make_layer(
+    d=128,
+    dtype=torch.bfloat16,
+    enable_prefill_qk_norm_rope=True,
+    num_heads=8,
+    num_kv_heads=2,
+    **kwargs,
+):
     layer = qwen3.Qwen3Attention(
-        hidden_size=8 * d,
-        num_heads=8,
-        num_kv_heads=2,
+        hidden_size=num_heads * d,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=d,
         rms_norm_eps=1e-6,
         max_position_embeddings=4096,
@@ -246,6 +253,39 @@ def test_changing_input_graph_replay(rope_scaling, mode, dtype, batch_size):
         )
         graph.replay()
         assert_same_qkv(actual, separate(layer, positions, x, batch))
+
+
+@pytest.mark.parametrize(
+    "mode,tokens,should_fuse",
+    [
+        (ForwardMode.EXTEND, 1024, True),
+        (ForwardMode.MIXED, 1024, True),
+        (ForwardMode.EXTEND, 1023, False),
+        (ForwardMode.TARGET_VERIFY, 1024, False),
+    ],
+)
+def test_hopper_vl_prefill_dispatch(mode, tokens, should_fuse):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("This prefill path targets Hopper")
+    layer = make_layer(
+        num_heads=32,
+        num_kv_heads=8,
+        rope_scaling=MROPE,
+        enable_prefill_qk_norm_mrope=True,
+    )
+    x = torch.randn(tokens, layer.hidden_size, device="cuda", dtype=torch.bfloat16)
+    pos = decode_positions(layer, torch.arange(tokens, device="cuda"))
+    batch = SimpleNamespace(forward_mode=mode)
+    expected = separate(layer, pos, x, batch)
+    with patch.object(
+        qwen3, "table_qk_norm_rope_", wraps=qwen3.table_qk_norm_rope_
+    ) as fused:
+        actual = layer.forward_prepare_native(pos, x, batch)
+    assert fused.call_count == int(should_fuse)
+    assert_same_qkv(actual, expected)
+    if should_fuse:
+        assert actual[0].is_contiguous()
+        assert fused.call_args.kwargs["q_out"] is actual[0]
 
 
 if __name__ == "__main__":

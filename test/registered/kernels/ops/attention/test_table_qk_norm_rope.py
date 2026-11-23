@@ -199,5 +199,52 @@ def test_hybrid_ownership_and_native_parity(d, dtype, batch):
     assert_same_bits(storage[:, -8:], before[:, -8:])
 
 
+@pytest.mark.parametrize("spatial", [False, True])
+def test_mrope_prefill_writes_separate_contiguous_q(spatial):
+    tokens, hq, hk, d = 1025, 32, 8, 128
+    _, packed, p, qw, kw, cache = inputs(d, tokens, hq, hk, 29, padded=True)
+    cache = cache.bfloat16()
+    positions = (
+        torch.stack([p, (p + 7) % len(cache), (p * 3) % len(cache)])
+        if spatial
+        else p.expand(3, -1)
+    )
+    section = [24, 20, 20]
+    axis_map = MRotaryEmbedding._build_axis_map(
+        SimpleNamespace(
+            mrope_section=section,
+            rotary_dim=d,
+            mrope_interleaved=True,
+            mrope_interleaved_glm=False,
+            cos_sin_cache=cache,
+        )
+    )
+    expected = packed.clone()
+    q, k, _ = expected.split([hq * d, hk * d, hk * d], dim=-1)
+    fused_inplace_qknorm(q.view(tokens, hq, d), k.view(tokens, hk, d), qw, kw, 1e-6)
+    triton_mrope_fused(q, k, cache, positions, section, d, d, True, False, True, None)
+
+    q_before = packed[:, : hq * d].clone()
+    out = torch.empty_like(q_before)
+    table_qk_norm_rope_(
+        packed,
+        positions,
+        qw,
+        kw,
+        cache,
+        hq,
+        hk,
+        d,
+        1e-6,
+        match_cuda=True,
+        axis_map=axis_map,
+        q_out=out,
+    )
+    assert out.is_contiguous()
+    assert_same_bits(out, q)
+    assert_same_bits(packed[:, : hq * d], q_before)
+    assert_same_bits(packed[:, hq * d :], expected[:, hq * d :])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

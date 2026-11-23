@@ -209,6 +209,7 @@ class Qwen3Attention(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         enable_prefill_qk_norm_rope: bool = False,
+        enable_prefill_qk_norm_mrope: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -337,6 +338,22 @@ class Qwen3Attention(nn.Module):
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
 
+        # FA3 otherwise materializes the packed Q slice once per layer.
+        self.use_prefill_qk_norm_mrope = (
+            enable_prefill_qk_norm_mrope
+            and self.use_table_qk_norm_rope
+            and type(self.rotary_emb) is MRotaryEmbedding
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim == 128
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and (self.num_heads, self.num_kv_heads) == (32, 8)
+            and quant_config is None
+            and attn_tp_size == 1
+            and torch.cuda.get_device_capability()[0] == 9
+            and attention_backends()[0] == "fa3"
+            and get_spec().speculative_algorithm is None
+        )
+
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -374,9 +391,18 @@ class Qwen3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        mrope_prefill = (
+            self.use_prefill_qk_norm_mrope
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and not torch.compiler.is_compiling()
+            and qkv.shape[0] >= 1024
+            and positions.shape == (3, qkv.shape[0])
+            and positions.stride(-1) == 1
+            and positions.dtype in (torch.int32, torch.int64)
+        )
         if (
             self.use_table_qk_norm_rope
-            and forward_batch.forward_mode.is_decode()
+            and (forward_batch.forward_mode.is_decode() or mrope_prefill)
             and qkv.dtype == torch.bfloat16
             and self.q_norm.weight.dtype == torch.bfloat16
             and self.k_norm.weight.dtype == torch.bfloat16
@@ -386,6 +412,8 @@ class Qwen3Attention(nn.Module):
             if positions.ndim == 2:
                 axis_map = self.rotary_emb.axis_map
                 self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            if mrope_prefill:
+                q = torch.empty_like(q, memory_format=torch.contiguous_format)
             table_qk_norm_rope_(
                 qkv,
                 positions,
@@ -398,6 +426,7 @@ class Qwen3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
                 match_cuda=True,
                 axis_map=axis_map,
+                q_out=q if mrope_prefill else None,
             )
         elif (
             self.use_prefill_qk_norm_rope
@@ -577,6 +606,9 @@ class Qwen3DecoderLayer(nn.Module):
             alt_stream=alt_stream,
             enable_prefill_qk_norm_rope=(
                 type(self) is Qwen3DecoderLayer and config.model_type == "qwen3"
+            ),
+            enable_prefill_qk_norm_mrope=(
+                type(self) is Qwen3DecoderLayer and config.model_type == "qwen3_vl"
             ),
         )
         self.mlp = Qwen3MLP(
