@@ -55,6 +55,10 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
+    def supports_dynamic_batching(self) -> bool:
+        # Text requests can batch; the scheduler guards image-conditioned requests.
+        return True
+
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
 
