@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -243,6 +243,21 @@ class MambaComponent(TreeComponent):
             return result
         req = params.req
         assert req is not None
+        prefix_len = result.device_prefix_len
+        grid = self.mamba_checkpoint_grid if self.cache.enable_mamba_extra_buffer else 0
+        if (
+            grid
+            and result.host_hit_length == 0
+            and grid == self.mamba_cache_chunk_size
+            and prefix_len % self.tree_core.page_size == 0
+            and prefix_len % grid != 0
+            and result.full_kv_hit_length >= prefix_len + grid
+            and not get_parallel().dcp_enabled
+        ):
+            # Both tree cores propose an absolute depth. With an off-grid
+            # device prefix, the extend can track only prefix-relative blocks.
+            blocks = (result.full_kv_hit_length - prefix_len) // grid
+            result = result._replace(mamba_branching_seqlen=prefix_len + blocks * grid)
         # A deferred slot is bound with the row (`StateStorage.acquire`); the
         # staged copy still runs, as it does into a slot taken here.
         if not req.kv.holds_mamba and not params.defer_cow_slot:
