@@ -159,12 +159,15 @@ def apply_dense_packed_q(
     the fp8 OPUS kernel's query pair by the native route's GEMM (mxfp8_native_packed_q).
     None off that route or at sizes its packed tile does not cover; the caller then
     takes apply_dense's bf16 output."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
     if not (
-        getattr(method, "block_fp8_as_mxfp8", False)
+        isinstance(method, Fp8LinearMethod)
+        and method.block_fp8_as_mxfp8
         and method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and layer.block_fp8_mxfp8_ready
         and layer.mxfp8_native_ready
-        and getattr(layer, "bias", None) is None
+        and layer.bias is None
     ):
         return None
     input_scale = None
@@ -175,7 +178,10 @@ def apply_dense_packed_q(
     elif isinstance(x, tuple):
         x, input_scale = x
     return mxfp8_native_packed_q(
-        x, layer.weight.view(torch.uint8), layer.weight_scale_mx_e8m0, input_scale
+        input=x,
+        weight_shuffled=layer.weight.view(torch.uint8),
+        weight_scale_ue8m0=layer.weight_scale_mx_e8m0,
+        input_scale=input_scale,
     )
 
 

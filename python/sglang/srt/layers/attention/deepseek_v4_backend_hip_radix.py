@@ -3265,12 +3265,12 @@ class DeepseekV4HipRadixBackend(
             else None
         )
         self._gather_opus_rows(
-            pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            cache.swa_page_size,
-            swa_rows,
-            pool.get_swa_key_layout(),
-            fp8,
+            k_cache=pool.get_swa_key_buffer_radix(layer_id),
+            token_ids=cache.swa_token_ids,
+            page_size=cache.swa_page_size,
+            out=swa_rows,
+            layout=pool.get_swa_key_layout(),
+            fp8=fp8,
             rope_out=swa_rope,
         )
         swa_kv = swa_rows.view(num_swa_rows, -1)
@@ -3394,12 +3394,12 @@ class DeepseekV4HipRadixBackend(
                 else None
             )
             self._gather_opus_rows(
-                c_cache,
-                gather.flat_token_ids,
-                c_page_size,
-                rows,
-                pool.get_extra_key_layout(layer_id),
-                fp8,
+                k_cache=c_cache,
+                token_ids=gather.flat_token_ids,
+                page_size=c_page_size,
+                out=rows,
+                layout=pool.get_extra_key_layout(layer_id),
+                fp8=fp8,
                 rope_out=rope,
             )
             entry = (c_cache.data_ptr(), rows.view(num_rows, -1), rope)

@@ -8,10 +8,10 @@ layout (512 e4m3 per row at unit scale, RoPE in the last 64) through
 ``pa_sparse_prefill_fp8_opus``, with the rows' bf16 RoPE alongside for QK^T.
 """
 
-import dataclasses
 import functools
 from typing import Optional, Tuple
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -27,11 +27,10 @@ _D_ROPE = 64
 _Q_BLK = 32
 
 
-@dataclasses.dataclass(frozen=True)
-class OpusPackedQ:
+class OpusPackedQ(msgspec.Struct, frozen=True):
     """A query handed to attention already as the fp8 OPUS kernel's pair, written by its
     projection: q_nope [T, H, 512] fp8 (what quantize_q_opus_fp8 writes) and q_rope
-    [T, H, 64] bf16 with its RoPE applied. A dataclass, not a tuple: tuples already
+    [T, H, 64] bf16 with its RoPE applied. A struct, not a tuple: tuples already
     mean (fp8, scale) operands to the linear layers."""
 
     q_nope: torch.Tensor

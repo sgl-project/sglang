@@ -124,26 +124,29 @@ def wq_b_unroped(attn, q) -> torch.Tensor:
 def wq_b_packed_for_opus(attn, q, forward_batch, attn_backend) -> Optional[OpusPackedQ]:
     """wq_b_unroped as the fp8 OPUS prefill kernel's query pair, written by wq_b's GEMM
     itself, where this layer's attention runs that kernel; None elsewhere."""
-    takes = getattr(attn_backend, "opus_fp8_takes_packed_q", None)
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
+
     rows = q.x if isinstance(q, Fp8GridActivation) else q
     rows = rows.q if isinstance(rows, Mxfp8Activation) else rows
     rows = rows[0] if isinstance(rows, tuple) else rows
     if (
-        takes is None
+        not isinstance(attn_backend, DeepseekV4HipRadixBackend)
         or attn.use_mega_attention
         or is_in_breakable_cuda_graph()
-        or not takes(
-            rows.shape[0],
-            attn.n_local_heads,
-            attn.layer_id,
-            forward_batch,
-            attn.compress_ratio,
+        or not attn_backend.opus_fp8_takes_packed_q(
+            num_tokens=rows.shape[0],
+            num_heads=attn.n_local_heads,
+            layer_id=attn.layer_id,
+            forward_batch=forward_batch,
+            compress_ratio=attn.compress_ratio,
         )
     ):
         return None
     from sglang.srt.layers.quantization.fp8_hip import apply_dense_packed_q
 
-    packed = apply_dense_packed_q(attn.wq_b.quant_method, attn.wq_b, q)
+    packed = apply_dense_packed_q(method=attn.wq_b.quant_method, layer=attn.wq_b, x=q)
     return None if packed is None else OpusPackedQ(*packed)
 
 
@@ -168,7 +171,12 @@ def compute_q_b(
     if fuse_q_rope:
         q = None
         if forward_batch is not None:
-            q = wq_b_packed_for_opus(attn, q_for_wqb, forward_batch, attn_backend)
+            q = wq_b_packed_for_opus(
+                attn=attn,
+                q=q_for_wqb,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
         if q is None:
             q = wq_b_unroped(attn, q_for_wqb)
     else:
