@@ -1015,12 +1015,7 @@ class SchedulerMetricsReporter:
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
-            msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-                msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
-            msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            msg += self._decode_queue_log_suffix()
 
         if (
             get_disagg().language_only
@@ -1453,6 +1448,17 @@ class SchedulerMetricsReporter:
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                 lists[ListKind.PD_SENDING], priority_enabled
             )
+
+    def _decode_queue_log_suffix(self) -> str:
+        """Transport-specific queue details; embedders can report their own PD state."""
+        prealloc = self.scheduler.disagg_decode_prealloc_queue
+        transfer = self.scheduler.disagg_decode_transfer_queue
+        msg = f"pre-allocated usage: {prealloc.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
+        msg += f"#prealloc-req: {len(prealloc.queue)}, "
+        msg += f"#transfer-req: {len(transfer.queue)}, "
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
+        return msg + f"#retracted-req: {len(prealloc.retracted_queue)}, "
 
     def _update_decode_queue_stats(self, priority_enabled: bool) -> None:
         transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
