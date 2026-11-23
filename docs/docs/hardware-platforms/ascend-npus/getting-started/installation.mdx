@@ -46,11 +46,6 @@ Each CANN version requires its own matched set of component versions — do not 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>memcache</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memcache-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.6.0+dev20261105160244</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[triton_ascend-3.6.0+dev20261105160244](https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/triton-ascend/20261105160244/triton_ascend-3.6.0%2Bdev20261105160244-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_34_aarch64.whl)<br/>(x86_64 host: replace aarch64 with x86_64)</td>
@@ -59,11 +54,6 @@ Each CANN version requires its own matched set of component versions — do not 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.11.0.post12</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.11.0.post12">sgl-kernel-npu releases</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.1.3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-zbal==1.1.3`</td>
     </tr>
   </tbody>
 </table>
@@ -88,7 +78,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.2.0</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Contact Huawei commercial support</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2Cbcc87fc38cd74df28cf5c415cf2aea75%2C31%2CAArch64%2Coffline_run_file">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -104,11 +94,6 @@ Each CANN version requires its own matched set of component versions — do not 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>memcache</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5.0.dev20261119</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memcache-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
@@ -231,22 +216,6 @@ If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid.
 ```bash Command
 # The index serves both aarch64 and x86_64 wheels
 pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/
-
-# Install the device-specific MemFabric kernels:
-# --soc-version is A5 on the 950PR/DT Series, A3 on the A3 Series
-mfcli kernel install --soc-version A5
-```
-
-#### MemFabric-zbal
-
-MemFabric-zbal is a Zero Buffer Acceleration Library of high-performance operators for LLM inference and training on Ascend,
-accelerating computation by eliminating intermediate memory buffers; it is required only on **aarch64** clusters and is
-installed in addition to MemFabric-Hybrid.
-
-```bash Command
-# Only needed on aarch64 (arm64) hosts
-# A3 Series:
-pip install memfabric-zbal==1.1.3
 ```
 
 #### PyTorch and PyTorch Framework Adapter on Ascend
