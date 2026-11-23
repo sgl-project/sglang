@@ -237,10 +237,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        use_npu_ple_lookup: bool = False,
     ):
         super().__init__()
         self.quant_config = quant_config
         self.output_dtype = output_dtype
+        self.use_npu_ple_lookup = use_npu_ple_lookup
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -444,7 +446,20 @@ class VocabParallelEmbedding(torch.nn.Module):
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
         if _is_npu:
-            return False
+            return (
+                self.use_npu_ple_lookup
+                and self.tp_size > 1
+                and isinstance(self.quant_method, UnquantizedEmbeddingMethod)
+                and self.num_added_embeddings == 0
+                and input_.device.type == "npu"
+                and input_.device == self.weight.device
+                and input_.dtype in (torch.int32, torch.int64)
+                and input_.ndim == 2 and input_.shape[1] == 16
+                and input_.is_contiguous()
+                and self.weight.dtype == torch.bfloat16
+                and self.weight.ndim == 2 and self.weight.shape[1] == 160
+                and self.weight.is_contiguous()
+            )
         if self.tp_size == 1:
             return False
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):

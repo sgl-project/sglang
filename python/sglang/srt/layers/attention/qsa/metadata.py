@@ -94,8 +94,19 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     defer_block_expansion: bool = False
+    # The NPU GBSA prefill consumer accepts complete group IDs and adds the
+    # incomplete causal tail itself. Other consumers expand at their boundary.
+    defer_prefill_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
+    # Separate stable request view for LI; other consumers retain row metadata.
+    npu_lightning_inputs: Optional[object] = None
+    # Paged GBSA uses one sequence per query row; the fixed offsets are shared
+    # across layers and never rebuilt inside the captured attention graph.
+    npu_gbsa_cu_q: Optional[torch.Tensor] = None
+    # The device metadata builder assigns padded rows to unallocated request0.
+    # With <=4 rows per real request, every live pending-ring slot is unique.
+    npu_unique_live_ring_writes: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)

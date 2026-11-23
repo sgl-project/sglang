@@ -1,4 +1,4 @@
-"""NPUCudaGraphBackend — Ascend NPU full-graph capture (torch.npu.NPUGraph).
+"""NPUCudaGraphBackend — NPU full-graph capture (torch.npu.NPUGraph).
 
 Mirrors FullCudaGraphBackend with two differences:
   - Captures via torch.npu.graph(...) into torch.npu.NPUGraph.
@@ -450,12 +450,32 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             graph,
             pool=self._pool,
             stream=self._capture_stream,
-            auto_dispatch_capture=True,
+            auto_dispatch_capture=self._auto_dispatch_capture(),
         ):
             out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        if (
+            os.getenv("SGLANG_NPU_PREWARM_FIXED_GRAPHS", "0") == "1"
+            and not self._auto_dispatch_capture()
+        ):
+            # Allocate the runtime's SQ/CQ resources while startup still has
+            # free huge pages, rather than on a bucket's first live replay.
+            # Fixed-input graphs have no external host-update event to wait on.
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            graph.replay()
+            self._device_module.synchronize()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
+            logger.info("Prewarmed fixed NPU graph %s", shape_key)
+
+    def _auto_dispatch_capture(self) -> bool:
+        attn_backend = getattr(self._decode_runner, "attn_backend", None)
+        full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+        # Fixed-shape attention needs no host update or external-event wait.
+        return getattr(full_attn_backend, "npu_graph_auto_dispatch_capture", True)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -471,7 +491,7 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         **kwargs,
     ) -> Any:
         runner = self._decode_runner
-        if runner is not None:
+        if runner is not None and self._auto_dispatch_capture():
             from sglang.srt.speculative import (
                 multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
             )

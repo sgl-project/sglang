@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -78,6 +79,33 @@ def test_qwen38_packed_prefill_selection():
     _check_selected(actual, scores, starts.cpu(), ends.cpu(), positions, row_lengths)
 
 
+def test_qsa_prefill_request_mapping():
+    table = torch.tensor(
+        [[13, 2, 17, 5, 19, 7], [0] * 6, [23, 11, 29, 3, 31, 37]],
+        dtype=torch.int32,
+        device="npu",
+    )[::2]
+    # Rows 0 and 2 belong to request 1; invalid columns must stay -1.
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        token_slot_table=table,
+        token_to_batch_idx=torch.tensor([1, 0, 1], device="npu"),
+        sequence_lengths=torch.tensor([3, 5], device="npu"),
+    )
+    indices = torch.tensor(
+        [[4, 1, 5, -1, 8], [2, 3, -1, 0, 5], [0, 2, 4, 5, 6]],
+        dtype=torch.int32,
+        device="npu",
+    )
+    expected = torch.tensor(
+        [[31, 11, -1, -1, -1], [17, -1, -1, 13, -1], [23, 29, 31, -1, -1]],
+        dtype=torch.int32,
+        device="cpu",
+    )
+    actual = QwenSparseAttnBackend._logical_to_physical(indices, metadata)
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "mode,batch_size,heads",
     [
@@ -104,7 +132,8 @@ def test_qsa_graph_request_updates(mode, batch_size, heads, runtime_context):
     v = torch.randn_like(k)
     q = torch.randn(rows, heads, 256, device="npu", dtype=k.dtype)
     index_q = torch.ones(rows, 4, 128, device="npu", dtype=k.dtype)
-    pool = SimpleNamespace(
+    pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+    pool.__dict__.update(
         qsa_compress_ratio=4,
         qsa_block_topk=512,
         qsa_index_kv_heads=1,

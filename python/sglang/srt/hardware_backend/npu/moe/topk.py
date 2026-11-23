@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -28,6 +29,7 @@ def fused_topk_npu(
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+    weights_padding_applied = False
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. norm_type=2 fuses softplus/sqrt/topk/gather/norm/cast.
@@ -52,19 +54,48 @@ def fused_topk_npu(
 
     # Fast path: simple top-k without grouped routing and bias
     elif not use_grouped_topk and correction_bias is None:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
-            router_logits,
-            k=topk_config.top_k,
-        )
-
+        if (
+            os.getenv("SGLANG_NPU_MOE_VA_TOPK", "0") == "1"
+            and router_logits.dtype == torch.bfloat16
+            and router_logits.shape[-1] == 512
+            and 0 < router_logits.shape[0] <= 16
+            and topk_config.top_k == 10
+            and renormalize
+            and topk_config.scoring_func == "softmax"
+            and topk_config.num_shared_topk_slots == 0
+            and not topk_config.apply_routed_scaling_factor_on_output
+        ):
+            # Preserve the BF16 selected softmax weights before SG's FP32 L1.
+            topk_weights, topk_ids, _ = moe_gating_top_k(
+                x=router_logits, k=topk_config.top_k, group_select_mode=1,
+                renorm=0, norm_type=0,
+            )
+        else:
+            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+                router_logits, k=topk_config.top_k,
+            )
         if renormalize:
             from sgl_kernel_npu.operators.norm import l1_norm
 
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_shared_topk_slots == 0
-                else topk_weights[:, :-1]
-            )
+            if (
+                os.getenv("SGLANG_NPU_MOE_PADDED_L1", "0") == "1"
+                and num_token_non_padded is not None
+                and num_token_non_padded.numel() == 1
+                and num_token_non_padded.device == topk_weights.device
+                and topk_config.num_shared_topk_slots == 0
+                and topk_weights.is_contiguous()
+                and topk_weights.shape[1] == 10
+                and 0 < topk_weights.shape[0] <= 512
+                and topk_weights.dtype == torch.bfloat16
+            ):
+                topk_weights = l1_norm(topk_weights, valid_rows=num_token_non_padded)
+                weights_padding_applied = True
+            else:
+                topk_weights = l1_norm(
+                    topk_weights
+                    if topk_config.num_shared_topk_slots == 0
+                    else topk_weights[:, :-1]
+                )
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
@@ -119,6 +150,7 @@ def fused_topk_npu(
         num_token_non_padded=num_token_non_padded,
         expert_location_dispatch_info=expert_location_dispatch_info,
         layer_id=layer_id,
+        weights_padding_applied=weights_padding_applied,
     )
 
 
@@ -131,6 +163,7 @@ def _finalize_topk_npu(
     num_token_non_padded,
     expert_location_dispatch_info,
     layer_id,
+    weights_padding_applied=False,
 ):
     num_shared = topk_config.num_shared_topk_slots
     routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
@@ -143,12 +176,17 @@ def _finalize_topk_npu(
     )
     # NPU dispatch retains valid IDs; duplicating a padded row's routes onto
     # expert zero can exceed per-expert capacity in fused dispatch backends.
-    _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+    if not weights_padding_applied:
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+    recorder = get_global_expert_distribution_recorder()
     recorder_ids = routed_ids
-    if num_token_non_padded is not None:
+    if num_token_non_padded is not None and (
+        os.getenv("SGLANG_NPU_MOE_SKIP_NOOP_IDS", "0") != "1"
+        or getattr(recorder, "needs_padded_expert_ids", True)
+    ):
         rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
         recorder_ids = routed_ids.masked_fill(
             (rows >= num_token_non_padded)[:, None], -1
         )
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=recorder_ids)
+    recorder.on_select_experts(topk_ids=recorder_ids)
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

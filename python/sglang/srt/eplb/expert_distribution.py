@@ -211,7 +211,7 @@ class ExpertDistributionRecorder(ABC):
 
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
-    pass
+    needs_padded_expert_ids = False
 
 
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):

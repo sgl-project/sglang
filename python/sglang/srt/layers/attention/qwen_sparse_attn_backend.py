@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -93,9 +94,29 @@ def _npu_sparse_attention(
         qsa_sparse_attention as sparse_attention,
     )
 
+    import os
+
+    if os.getenv("SGLANG_NPU_QSA_DECODE_GBSA", "0") == "1":
+        from sglang.kernels.ops.attention.qsa_prefill_attention import (
+            qsa_decode_attention as sparse_attention,
+        )
+
     k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
     v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
     return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
+
+
+def _npu_sparse_prefill_attention(q, k_cache, v_cache, token_slots, softmax_scale=None):
+    from sglang.kernels.ops.attention.qsa_prefill_attention import qsa_prefill_attention
+
+    # Prefill TopK blocks and the incomplete tail select distinct tokens.
+    return qsa_prefill_attention(
+        q,
+        _flatten_qsa_kv_cache(k_cache, "k_cache"),
+        _flatten_qsa_kv_cache(v_cache, "v_cache"),
+        token_slots,
+        softmax_scale,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -198,6 +219,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # token_slot_table translated to rows of the KV-shard scratch, during a
     # KV-sharded extend.
     kv_shard_slot_table: Optional[torch.Tensor] = None
+    npu_prefill_inputs: Optional[object] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -289,6 +311,8 @@ class QwenSparseAttnBackend(AttentionBackend):
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+    # Gathered KV lengths are fixed; live padding is carried by the tensor mask.
+    npu_graph_auto_dispatch_capture: bool = False
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -849,6 +873,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            defer_prefill_block_expansion=self._can_defer_prefill_block_expansion(
+                forward_batch.forward_mode
+            ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
@@ -857,6 +884,35 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            npu_prefill_inputs=self._make_npu_prefill_inputs(
+                forward_batch, sequence_lengths, token_slot_table,
+                token_to_batch_idx.numel(),
+            ),
+        )
+
+    def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
+        if not (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_VA_PREFILL_DISPATCH", "0") == "1"
+            and batch.forward_mode == ForwardMode.EXTEND
+            and self._can_defer_prefill_block_expansion(batch.forward_mode)
+            and getattr(batch, "attn_cp_metadata", None) is None
+            and batch.seq_lens_cpu is not None
+            and batch.extend_seq_lens_cpu is not None
+            and rows >= 128
+        ):
+            return None
+        from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
+            prepare_sg_prefill_inputs,
+        )
+
+        positions = batch.positions
+        positions = positions[0] if positions.ndim == 2 else positions
+        return prepare_sg_prefill_inputs(
+            batch.seq_lens_cpu[: lengths.numel()],
+            batch.extend_seq_lens_cpu[: lengths.numel()],
+            lengths, batch.extend_seq_lens, token_table,
+            positions.flatten()[:rows],
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1069,6 +1125,25 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=self._graph_state_slots[:metadata_rows],
             graph_ring_group_locs=self._graph_ring_group_locs[:metadata_rows],
             defer_block_expansion=self._can_defer_block_expansion(forward_mode),
+            npu_lightning_inputs=self._make_npu_verify_lightning_inputs(
+                forward_mode, spec_info, metadata_rows,
+                self._graph_compressed_page_table.shape[1],
+            ),
+            npu_gbsa_cu_q=(
+                self._graph_cu_seqlens_q[:metadata_rows + 1].to(torch.int64)
+                if _is_npu and os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+                else None
+            ),
+            npu_unique_live_ring_writes=(
+                self._npu_device_metadata_enabled(pool)
+                and pool.qsa_compress_ratio == 4
+                and (
+                    forward_mode.is_decode()
+                    or 1 <= int(get_spec().speculative_num_draft_tokens or 0) <= 4
+                )
+                and (not forward_mode.is_target_verify()
+                     or 1 <= int(spec_info.draft_token_num) <= 4)
+            ),
         )
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
@@ -1084,6 +1159,57 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         self._cuda_graph_metadata[(forward_mode, bs)] = metadata
         self.forward_metadata = metadata
+        if self._npu_device_metadata_enabled(pool):
+            # Warmup/capture must use the same reserved-slot padding contract
+            # as replay, before any captured raw writer observes these buffers.
+            self._replay_cuda_graph_metadata_gpu(
+                metadata, bs=bs, req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens, forward_mode=forward_mode,
+                spec_info=spec_info, seq_lens_cpu=None, num_padding=bs,
+            )
+        else:
+            self._refresh_npu_lightning_inputs(indexer_metadata)
+
+    def _npu_device_metadata_enabled(self, pool):
+        if not (_is_npu and os.getenv("SGLANG_NPU_QSA_DEVICE_METADATA", "0") == "1"):
+            return False
+        from sglang.srt.layers.attention.qsa.graph_metadata import supports_graph_metadata_kernels
+
+        return supports_graph_metadata_kernels(pool, self.device)
+
+    def _make_npu_verify_lightning_inputs(self, forward_mode, spec_info, rows, pages):
+        profile = self.qsa_profile
+        pool = self.token_to_kv_pool
+        if not (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_REQUEST_LI", "0") == "1"
+            and os.getenv("SGLANG_NPU_QSA_LIGHTNING_INDEXER", "0") == "1"
+            and forward_mode.is_target_verify()
+            and profile is not None
+            and profile.head_dim == 128
+            and profile.n_heads == 4
+            and profile.kv_heads == 1
+            and profile.compress_ratio == 4
+            and profile.block_topk == 512
+            and getattr(pool, "qsa_compressed_dtype", None) == torch.bfloat16
+        ):
+            return None
+        width = int(getattr(spec_info, "draft_token_num", 0) or 0)
+        if width not in (1, 2, 3, 4) or rows <= 0 or rows % width:
+            return None
+        from sglang.kernels.ops.attention.qsa_lightning_inputs import TargetVerifyLightningInputs
+
+        return TargetVerifyLightningInputs(rows, width, pages, profile.n_heads, self.device)
+
+    @staticmethod
+    def _refresh_npu_lightning_inputs(indexer_metadata):
+        inputs = getattr(indexer_metadata, "npu_lightning_inputs", None)
+        if inputs is not None:
+            inputs.refresh(
+                indexer_metadata.sequence_lengths,
+                indexer_metadata.graph_compressed_lengths,
+                indexer_metadata.graph_compressed_page_table,
+            )
 
     def _replay_cuda_graph_metadata(
         self,
@@ -1113,8 +1239,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.forward_metadata = metadata
             return
         if seq_lens_cpu is None:
-            # Host-fallback staging only (non-CUDA pools): an explicit
-            # slow-path readback, never the serving path.
+            # Fallback pools stage request lengths on the host.
             seq_lens_cpu = seq_lens[:bs].cpu()
         if self._is_speculative_paged_mode(forward_mode):
             row_lengths, row_req_pool_indices, row_prefix_lengths = (
@@ -1145,8 +1270,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
-        # Guard NPU before the import, which precedes the is_cuda check below.
-        if _is_npu:
+        if _is_npu and not self._npu_device_metadata_enabled(metadata.indexer_metadata.token_to_kv_pool):
             return False
         if self.req_to_token is None:
             return False
@@ -1154,7 +1278,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             supports_graph_metadata_kernels,
         )
 
-        return seq_lens.is_cuda and supports_graph_metadata_kernels(
+        return supports_graph_metadata_kernels(
             metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
         )
 
@@ -1231,6 +1355,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool=pool,
             seq_offset=seq_offset,
         )
+        self._refresh_npu_lightning_inputs(indexer)
 
     def _update_qsa_cuda_graph_metadata(
         self, metadata: QSAIndexerMetadata, req_pool_indices: torch.Tensor
@@ -1289,6 +1414,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             // full_page
         ).clamp_min(0)
         page_table[:, :num_pages].copy_(table.to(torch.int32))
+        QwenSparseAttnBackend._refresh_npu_lightning_inputs(metadata)
 
     def get_indexer_metadata(self, layer_id: int, forward_batch):
         if self.forward_metadata is None:
@@ -1466,15 +1592,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             request_ids = metadata.row_req_pool_indices.long().index_select(
                 0, sequence_ids
             )
-            safe = logical_indices.clamp(
-                min=0, max=metadata.req_to_token.shape[1] - 1
-            ).long()
-            slots = metadata.req_to_token[request_ids[:, None], safe]
+            table = metadata.req_to_token
         else:
-            safe = logical_indices.clamp(
-                min=0, max=metadata.token_slot_table.shape[1] - 1
-            ).long()
-            slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+            table = metadata.token_slot_table
+            request_ids = sequence_ids
+        safe = logical_indices.clamp(min=0, max=table.shape[1] - 1).long()
+        if _is_npu:
+            # Flatten the row/column indices to use the device gather path.
+            offsets = request_ids[:, None] * table.shape[1] + safe
+            slots = table.reshape(-1).index_select(0, offsets.reshape(-1))
+            slots = slots.view(logical_indices.shape)
+        else:
+            slots = table[request_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     @staticmethod
@@ -1493,7 +1622,11 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _can_defer_block_expansion(self, forward_mode):
         return (
-            self._fused_kv_pool_eligible
+            (
+                self._mtp_shared_sparse_indices is None
+                if _is_npu
+                else self._fused_kv_pool_eligible
+            )
             and self.qsa_profile is not None
             and self.compress_ratio == 4
             and self.qsa_profile.block_topk == 512
@@ -1506,14 +1639,73 @@ class QwenSparseAttnBackend(AttentionBackend):
             and indices.shape[1] == self.qsa_profile.block_topk
         )
 
-    def _expand_block_indices(self, indices, metadata):
+    def _npu_indices_to_physical(self, indices, metadata, query_positions=None):
+        indexer = metadata.indexer_metadata
+        pages = (
+            indexer.graph_compressed_page_table
+            if metadata.is_cuda_graph
+            else indexer.decode_page_table
+        )
+        tensors = [indices, metadata.token_to_batch_idx, metadata.sequence_lengths]
+        if pages is not None:
+            tensors.append(pages)
+        if query_positions is not None:
+            tensors.append(query_positions)
+        if (
+            pages is None
+            or indices.shape[0] > 128
+            or indices.shape[1] > 2055
+            or pages.shape[1] > 512
+            or any(t.dtype != torch.int32 or not t.is_contiguous() for t in tensors)
+        ):
+            # Ordinary prefills have no paged LI view. Large eager batches
+            # retain the original mapper: the fused kernel is tuned for the
+            # <=128-row int32 decode/verify shapes and <=64K context. Strided
+            # int64 metadata also needs the original path to fit the NPU unified buffer.
+            indices = self._expand_block_indices(indices, metadata, query_positions)
+            return self._logical_to_physical(indices, metadata)
+        from sglang.kernels.ops.attention.qsa_index_slots import qsa_paged_indices_to_slots
+
+        return qsa_paged_indices_to_slots(
+            indices,
+            metadata.token_to_batch_idx,
+            metadata.sequence_lengths,
+            pages,
+            query_positions,
+            self.token_to_kv_pool.qsa_compressed_page_size * self.compress_ratio,
+        )
+
+    def _can_defer_prefill_block_expansion(self, forward_mode):
+        return (
+            _is_npu
+            and os.getenv("SGLANG_NPU_QSA_PREFILL_GBSA", "0") == "1"
+            and forward_mode.is_extend_or_draft_extend_or_mixed()
+            # The draft's plain post-prefill EXTEND seeds token IDs for MTP
+            # reuse, just like DRAFT_EXTEND_V2. Keep that producer unchanged.
+            and self._mtp_shared_sparse_indices is None
+            and self.compress_ratio == 4
+            and self.token_to_kv_pool.qsa_block_topk == 512
+            and self.token_to_kv_pool.qsa_compressed_page_size == 32
+        )
+
+    def _expand_block_indices(self, indices, metadata, query_positions=None):
         if not self._uses_block_indices(indices):
             return indices
         indexer = metadata.indexer_metadata
+        positions = (
+            indexer.decode_logical_positions
+            if query_positions is None
+            else query_positions
+        )
+        lengths = (
+            indexer.get_seqlens_int32()
+            if query_positions is None
+            else indexer.get_seqlens_expanded()
+        )
         return expand_qsa_block_indices(
             indices,
-            indexer.decode_logical_positions,
-            indexer.get_seqlens_int32(),
+            positions,
+            lengths,
             self.compress_ratio,
             self.qsa_profile.budget,
         )
@@ -1631,10 +1823,87 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
-            slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
+            if (
+                _is_npu and 2 <= q.shape[0] < 128
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and not metadata.is_cuda_graph
+                and os.getenv("SGLANG_NPU_QSA_SHORT_CUBE", "0") == "1"
+                and self._mtp_shared_sparse_indices is None
+                and self.compress_ratio == 4
+                and pool.qsa_compressed_page_size == 32
+            ):
+                from sglang.kernels.ops.attention.qsa_cube_prefill import try_short_cube
+
+                cache = pool.layer_router.read(layer.layer_id)
+                output = try_short_cube(
+                    q, _flatten_qsa_kv_cache(cache.key(), "key"),
+                    _flatten_qsa_kv_cache(cache.value(), "value"), topk_indices,
+                    metadata.token_slot_table, metadata.token_to_batch_idx,
+                    forward_batch.positions, metadata.sequence_lengths, layer.scaling,
+                )
+                if output is not None:
+                    return self._pad_extend_output(output, num_output_rows)
+            if (
+                _is_npu
+                and os.getenv("SGLANG_NPU_QSA_PREFILL_GBSA", "0") == "1"
+                and q.shape[0] >= 128
+                and q.shape[1:] == (3, 256)
+                and q.dtype == torch.bfloat16
+                and (
+                    topk_indices.shape[1] == 2051
+                    or self._uses_block_indices(topk_indices)
+                )
+                and pool.qsa_compressed_page_size * self.compress_ratio == 128
+                and not metadata.is_cuda_graph
+            ):
+                from sglang.kernels.ops.attention.qsa_gbsa_prefill import qsa_gbsa_prefill
+
+                if metadata.npu_prefill_inputs is not None and self._uses_block_indices(topk_indices):
+                    from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
+                        dispatch_sg_prefill,
+                    )
+
+                    output = dispatch_sg_prefill(
+                        q, k, v,
+                        _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
+                        _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
+                        topk_indices, metadata.npu_prefill_inputs, layer.scaling,
+                    )
+                    return self._pad_extend_output(output, num_output_rows)
+                # Keep original sequence boundaries: GBSA computes all selected
+                # complete groups plus the causal incomplete tail (mode 1).
+                output = qsa_gbsa_prefill(
+                    q,
+                    _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
+                    _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
+                    topk_indices,
+                    metadata.token_slot_table,
+                    metadata.sequence_lengths,
+                    forward_batch.extend_seq_lens,
+                    q.shape[0],
+                    layer.scaling,
+                    indices_are_blocks=self._uses_block_indices(topk_indices),
+                )
+                return self._pad_extend_output(output, num_output_rows)
+            # The token consumer can fuse compact expansion with slot mapping.
+            positions = None
+            if self._uses_block_indices(topk_indices):
+                positions = forward_batch.positions
+                positions = positions[0] if positions.ndim == 2 else positions
+                positions = positions.flatten()[:num_valid_rows]
+                if not _is_npu:
+                    topk_indices = self._expand_block_indices(
+                        topk_indices, metadata, positions
+                    )
+                    positions = None
+            slots = (
+                self._npu_indices_to_physical(topk_indices, metadata, positions)
+                if _is_npu
+                else self._logical_to_physical(topk_indices, metadata)
+            )
             if _is_npu:
-                attention = _npu_sparse_attention
+                attention = _npu_sparse_prefill_attention
             else:
                 attention = qsa_sparse_attention
             output = attention(
@@ -2075,14 +2344,28 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.layer_router.read(layer.layer_id).key()
         v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
+        if _is_npu:
+            compact = self._uses_block_indices(topk_indices)
+            positions = (
+                metadata.indexer_metadata.decode_logical_positions
+                if compact
+                else None
+            )
+            if compact and positions is None:
+                raise RuntimeError("Compact QSA paged indices require logical positions")
+            if compact:
+                output = self._try_npu_paged_gbsa(
+                    q, k_buffer, v_buffer, metadata, topk_indices, layer.scaling
+                )
+                if output is not None:
+                    return output.reshape(q.shape[0], -1)
+            slots = self._npu_indices_to_physical(topk_indices, metadata, positions)
+            output = _npu_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            return output.reshape(q.shape[0], -1)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
-        if _is_npu or not q.is_cuda:
+        if not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)
-            if _is_npu:
-                attention = _npu_sparse_attention
-            else:
-                attention = qsa_sparse_attention
-            output = attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
@@ -2181,11 +2464,48 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _try_npu_paged_gbsa(self, q, k, v, metadata, groups, scale):
+        if not (
+            os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+            and q.shape[0] > 0
+            and q.shape[1:] == (3, 256)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and groups.shape == (q.shape[0], 512)
+            and self.compress_ratio == 4
+            and self.token_to_kv_pool.qsa_compressed_page_size == 32
+        ):
+            return None
+        indexer = metadata.indexer_metadata
+        pages = indexer.graph_compressed_page_table if metadata.is_cuda_graph else indexer.decode_page_table
+        if pages is None:
+            return None
+        if metadata.is_cuda_graph:
+            # Captured paged metadata is already expanded to query rows.
+            if pages.shape[0] != q.shape[0] or metadata.sequence_lengths.shape != (q.shape[0],):
+                return None
+            lengths = metadata.sequence_lengths
+        else:
+            rows = metadata.token_to_batch_idx.long()
+            pages = pages.index_select(0, rows)
+            lengths = metadata.sequence_lengths.index_select(0, rows)
+        cu_q = indexer.npu_gbsa_cu_q
+        if cu_q is None:
+            cu_q = torch.arange(q.shape[0] + 1, dtype=torch.int64, device=q.device)
+        from sglang.kernels.ops.attention.qsa_gbsa_prefill import qsa_gbsa_prefill
+
+        return qsa_gbsa_prefill(
+            q, _flatten_qsa_kv_cache(k, "key"), _flatten_qsa_kv_cache(v, "value"),
+            groups, None, lengths, None, 1, scale,
+            indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
+        )
+
 
 class QwenSparseMultiStepDraftBackend:
     """Per-step QSA metadata for consecutive Qwen4-Exp MTP draft decoding."""
 
     needs_cpu_seq_lens: bool = False
+    # Gathered KV lengths are fixed; live padding is carried by the tensor mask.
+    npu_graph_auto_dispatch_capture: bool = False
 
     def __init__(self, model_runner, topk: int, speculative_num_steps: int):
         if topk != 1:
@@ -2302,7 +2622,12 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
-        if forward_batch.seq_lens.is_cuda and self.attn_backends:
+        use_fused_draft_metadata = (
+            forward_batch.seq_lens.device.type == "npu"
+            and _is_npu
+            and os.getenv("SGLANG_NPU_QSA_MULTISTEP_METADATA", "0") == "1"
+        ) or (not _is_npu and forward_batch.seq_lens.is_cuda)
+        if use_fused_draft_metadata and self.attn_backends:
             from sglang.srt.layers.attention.qsa.graph_metadata import (
                 launch_draft_graph_metadata,
                 prepare_draft_graph_metadata,
@@ -2350,7 +2675,7 @@ class QwenSparseMultiStepDraftBackend:
                 backend._cuda_graph_metadata[
                     (ForwardMode.DECODE, forward_batch.batch_size)
                 ]
-                if forward_batch.seq_lens.is_cuda
+                if forward_batch.seq_lens.device.type in ("cuda", "npu")
                 else None
             )
             if metadata is not None and backend._can_replay_with_gpu_kernels(
