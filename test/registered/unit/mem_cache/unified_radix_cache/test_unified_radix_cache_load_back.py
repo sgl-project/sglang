@@ -629,10 +629,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(new_node, match.last_device_node)
         self.assertIsNone(node_device_value(cache, leaf, ComponentType.FULL))
         self.assertIsNone(node_device_value(cache, leaf, ComponentType.MAMBA))
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), avail_before
-        )
+        self._assert_extends_from_anchor_state(req, cache, new_node, avail_before)
 
     @requires_full_mamba_ps1
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_load_failure(self):
@@ -655,7 +652,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            loaded_len, _ = cache.init_load_back(
+            loaded_len, new_node = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -665,10 +662,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             )
 
         self.assertEqual(loaded_len, 0)
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), avail_before
-        )
+        self._assert_extends_from_anchor_state(req, cache, new_node, avail_before)
 
     @requires_full_mamba_ps1
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_capacity_failure(self):
@@ -700,7 +694,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
                 cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
             ),
         ):
-            loaded_len, _ = cache.init_load_back(
+            loaded_len, new_node = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -710,9 +704,19 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             )
 
         self.assertEqual(loaded_len, 0)
-        self.assertIsNone(req.kv.mamba_pool_idx)
+        self._assert_extends_from_anchor_state(req, cache, new_node, avail_before)
+
+    def _assert_extends_from_anchor_state(self, req, cache, anchor, avail_before):
+        # A refused load-back leaves the request at its device anchor, a node with a
+        # device state here: it keeps prepare's slot and copies that state into it.
+        anchor_state = node_device_value(cache, anchor, ComponentType.MAMBA)
+        self.assertIsNotNone(anchor_state)
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
+        self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, anchor_state))
+        self.assertFalse(req.kv.mamba_needs_clear)
         self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), avail_before
+            cache.req_to_token_pool.mamba_allocator.available_size(),
+            avail_before - 1,
         )
 
     @requires_full_mamba_ps1
