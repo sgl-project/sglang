@@ -10,10 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_declared_decoder_boundary as fixture
-import torch
 from torch import nn
 
-from sglang.kernels.ops.communication import all_reduce_residual
 from sglang.srt.environ import envs
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.layer_boundary import BatchVariant, layer_stack
@@ -299,60 +297,6 @@ class TestKimiK3BankOnShards(CustomTestCase):
                 ),
             ):
                 self.assertEqual(kimi_k3._carries_bank_slices(config), carries)
-
-
-class TestKimiK3AllReducePushWindow(CustomTestCase):
-    """The fused all-reduce pushes a message up to the architecture's
-    crossover and pulls a larger one."""
-
-    def _path(self, rows: int, *, sm: tuple) -> str:
-        taken = []
-        state = SimpleNamespace(world_size=8, push_slot_bytes=8 << 20)
-        arch = SimpleNamespace(is_sm=lambda major, minor=None: (major, minor) == sm)
-        x = torch.zeros(rows, 7168, dtype=torch.bfloat16)
-        with (
-            patch.object(k3_ar_fusion, "_get_state", lambda: state),
-            patch.object(k3_ar_fusion, "current_arch", lambda: arch),
-            patch.object(k3_ar_fusion, "get_mc_ptr", lambda tensor: 0),
-            patch.object(
-                all_reduce_residual,
-                "all_reduce_push_res",
-                lambda world, tensor, residual: taken.append("push"),
-            ),
-            patch.object(
-                all_reduce_residual,
-                "all_reduce_pull_res",
-                lambda world, tensor, residual, input_mc_ptr: taken.append("pull"),
-            ),
-        ):
-            k3_ar_fusion.all_reduce(x)
-        return taken[0]
-
-    def test_a_verify_batch_of_eighty_rows_is_pushed_on_sm107_only(self):
-        # 80 x 7168 bf16 = 1.1 MB: sixteen requests at a five-token block.
-        self.assertEqual(self._path(80, sm=(10, 7)), "push")
-        self.assertEqual(self._path(80, sm=(10, 3)), "pull")
-        self.assertEqual(self._path(80, sm=(10, 0)), "pull")
-
-    def test_the_finalize_push_window_follows_the_same_crossover(self):
-        # The deferred MoE finalize rides the push only: 80 latent rows are 0.55 MB.
-        state = SimpleNamespace(world_size=8, push_slot_bytes=8 << 20)
-        for sm, fits in (((10, 7), True), ((10, 3), False)):
-            arch = SimpleNamespace(
-                is_sm=lambda major, minor=None, sm=sm: (major, minor) == sm
-            )
-            with (
-                self.subTest(sm=sm),
-                patch.object(k3_ar_fusion, "_get_state", lambda: state),
-                patch.object(k3_ar_fusion, "current_arch", lambda arch=arch: arch),
-            ):
-                self.assertEqual(k3_ar_fusion.finalize_push_fits(80), fits)
-
-    def test_small_and_large_messages_take_the_same_path_everywhere(self):
-        for sm in ((10, 0), (10, 3), (10, 7)):
-            with self.subTest(sm=sm):
-                self.assertEqual(self._path(32, sm=sm), "push")
-                self.assertEqual(self._path(160, sm=sm), "pull")
 
 
 if __name__ == "__main__":

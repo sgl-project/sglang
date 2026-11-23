@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 # push wins below ~0.5 MB on B200x8/GB300 (bs<=32 @ H=7168); NVLS 2shot wins
 # above (measured: push 8.5us vs pull 11.0us at 448KB, 15.5 vs 11.0 at 896KB)
 _PUSH_MAX_BYTES = 512 * 1024
-# SM107 crossover, measured at TP8 on two 4-GPU VR200 trays.
 _PUSH_MAX_BYTES_SM107 = 2 * 1024 * 1024
 
 
