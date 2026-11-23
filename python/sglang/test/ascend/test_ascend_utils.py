@@ -938,9 +938,7 @@ def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
     return path
 
 
-# Default ports for the Ascend MemCache meta service components. They avoid the
-# ports the test framework already uses: --dist-init-addr (5000) and the PD
-# separation worker HTTP server (8000).
+# Default ports for the Ascend MemCache meta service components.
 MEMCACHE_META_SERVICE_PORT = 5007
 MEMCACHE_CONFIG_STORE_PORT = 6007
 MEMCACHE_METRICS_PORT = 8007

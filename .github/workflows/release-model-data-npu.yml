@@ -8,9 +8,6 @@
 name: Release Model Data (NPU)
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/release-model-data-npu.yml"
   workflow_dispatch:
     inputs:
       image:

@@ -367,10 +367,6 @@ jobs:
           eval "${CMD}"
 
       - name: Collect node logs
-        # Must contain a status-check function: GitHub implicitly prepends
-        # success() to `if` expressions that use none, so a bare
-        # `steps.run_test.outcome == ...` check would be skipped exactly when
-        # the run failed or was cancelled.
         if: ${{ always() && steps.run_test.outcome != 'success' }}
         continue-on-error: true
         run: |
@@ -403,11 +399,6 @@ jobs:
           fi
 
       - name: Upload metrics artifact
-        # Do not depend on steps.run_test.outputs.name: when the runner fails the
-        # container step itself ("Executing the custom container implementation
-        # failed"), the step outputs are empty, so that condition skipped the
-        # upload on exactly the failed runs whose logs we need. A job runs a
-        # single case, so the run-scoped case directory is unambiguous.
         if: always()
         uses: actions/upload-artifact@v4
         with:
