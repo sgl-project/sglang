@@ -1383,6 +1383,17 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _fetch_server_info(base_url: str) -> Optional[Dict[str, Any]]:
+    try:
+        response = requests.get(
+            base_url + "/server_info", headers=get_auth_headers(), timeout=5
+        )
+    except requests.exceptions.RequestException as exc:
+        print(f"Warning: could not fetch /server_info: {exc}", file=sys.stderr)
+        return None
+    return response.json() if response.status_code == 200 else None
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1652,27 +1663,15 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
-    else:
-        accept_length = None
+    accept_length = None
+    server_info_json = _fetch_server_info(base_url) if "sglang" in backend else None
+    if server_info_json is not None:
+        if "decode" in server_info_json:
+            server_info_json = server_info_json["decode"][0]
+        if server_info_json.get("internal_states"):
+            accept_length = server_info_json["internal_states"][0].get(
+                "avg_spec_accept_length"
+            )
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -1857,8 +1856,7 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    server_info = _fetch_server_info(base_url)
 
     if (
         metrics.median_ttft_ms is not None
