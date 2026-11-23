@@ -79,35 +79,14 @@ def rocm_home() -> str:
 
 @cache_once
 def musa_home() -> str:
-    configured = os.environ.get("MUSA_HOME") or os.environ.get("MUSA_PATH")
-    if configured is not None:
-        return configured
-    configured_mcc = os.environ.get("SGLANG_MUSA_MCC")
-    if configured_mcc is not None:
-        return os.path.dirname(os.path.dirname(configured_mcc))
-    try:
-        from torch_musa.utils.musa_extension import MUSA_HOME
+    from torch_musa.utils.musa_extension import MUSA_HOME
 
-        if MUSA_HOME:
-            return MUSA_HOME
-    except ImportError:
-        pass
-    mcc_path = shutil.which("mcc")
-    if mcc_path is not None:
-        return os.path.dirname(os.path.dirname(mcc_path))
-    return "/usr/local/musa"
+    return MUSA_HOME
 
 
 @cache_once
 def torchada_cuda_compat_include_dir() -> str:
     """Torchada's CUDA-named headers for direct JIT compiler consumers."""
-    import torchada
-
-    version = tuple(int(part) for part in torchada.__version__.split(".")[:3])
-    if version < (0, 1, 113):
-        raise RuntimeError(
-            "SGLang MUSA JIT requires torchada>=0.1.113 for cuda_compat headers"
-        )
     from torchada.cuda_compat import cuda_compat_include_dir
 
     return cuda_compat_include_dir()
@@ -125,9 +104,7 @@ def device_compiler_path() -> str:
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
     if is_musa_runtime():
-        return os.environ.get("SGLANG_MUSA_MCC") or os.path.join(
-            musa_home(), "bin", "mcc"
-        )
+        return os.path.join(musa_home(), "bin", "mcc")
     return os.path.join(cuda_home(), "bin", "nvcc")
 
 
@@ -245,9 +222,7 @@ def target_flags(arch: CompileArch | None = None) -> List[str]:
                 f"{', '.join(_SAIL_GPU_ARCHS)}"
             )
         return [f"--gpu-architecture={sail_arch}"]
-    if is_hip_runtime():
-        return [f"--offload-arch={gpu_arch_name()}"]
-    if is_musa_runtime():
+    if is_hip_runtime() or is_musa_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
     arch = arch or get_compile_arch()
     target = f"{arch.major}{arch.minor}{arch.suffix}"

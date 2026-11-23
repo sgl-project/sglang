@@ -12,31 +12,41 @@ def test_musa_arch_flags(monkeypatch):
     assert arch.get_default_target_flags() == ["-DUSE_MUSA", "-std=c++20", "-O3"]
 
 
-def test_musa_home_uses_compiler_override(monkeypatch):
-    monkeypatch.delenv("MUSA_HOME", raising=False)
-    monkeypatch.delenv("MUSA_PATH", raising=False)
-    monkeypatch.setenv("SGLANG_MUSA_MCC", "/opt/musa/bin/mcc")
-    assert toolchain.musa_home.__wrapped__() == "/opt/musa"
-
-
 def test_musa_runtime_alias_owner_is_torchada():
-    utils = (
+    include_dir = (
         Path(__file__).resolve().parents[4]
-        / "python/sglang/kernels/jit/include/sgl_kernel/utils.cuh"
-    ).read_text()
-    musa_block = utils.split("#if defined(__MUSACC__)", 1)[1].split(
-        "#elif !defined(USE_ROCM)", 1
-    )[0]
-    assert "#include <cuda.h>" not in musa_block
+        / "python/sglang/kernels/jit/include/sgl_kernel"
+    )
+    headers = {
+        path.name: path.read_text()
+        for path in (
+            include_dir / "runtime.cuh",
+            include_dir / "tensor.h",
+            include_dir / "utils.cuh",
+            include_dir / "utils.h",
+        )
+    }
+    assert (
+        "#if defined(__MUSACC__)\n#include <cuda_runtime.h>"
+        not in headers["runtime.cuh"]
+    )
+    assert "__MUSACC__" not in headers["runtime.cuh"]
+    assert "__MUSACC__" in headers["tensor.h"]
+    assert "__MUSACC__" in headers["utils.h"]
+    assert "USE_MUSA" not in headers["tensor.h"]
+    assert "USE_MUSA" not in headers["utils.h"]
     for header in ("cuda_bf16.h", "cuda_fp16.h", "cuda_fp8.h", "cuda_runtime.h"):
-        assert f"#include <{header}>" in musa_block
-    for symbol in (
-        "cudaFuncAttributeMaxDynamicSharedMemorySize",
-        "cudaLaunchKernelEx",
-        "cudaRuntimeGetVersion",
-        "cuGetErrorString",
-    ):
-        assert f"#define {symbol}" not in musa_block
+        assert f"#include <{header}>" in headers["utils.cuh"]
+    for source in headers.values():
+        for symbol in (
+            "musaDeviceGetAttribute",
+            "musaLaunchKernelEx",
+            "musaFuncSetAttribute",
+            "musaRuntimeGetVersion",
+            "__mt_bfloat16",
+            "__mt_fp8",
+        ):
+            assert symbol not in source
 
 
 def test_musa_toolchain_paths_and_flags(monkeypatch):

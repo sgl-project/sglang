@@ -40,9 +40,7 @@
 
 #include <concepts>
 #include <cstddef>
-#if defined(__MUSACC__)
-#include <iterator>
-#else
+#if !defined(__MUSACC__)
 #include <ranges>
 #endif
 #include <ostream>
