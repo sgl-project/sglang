@@ -15,12 +15,13 @@ import requests
 from github import Auth, Github
 
 # Import scripts/ci/ modules (sibling-up dir): runner_configs, npu_suites,
-# amd_suites, and the rerun partitioner.
+# amd_suites, xpu_suites, and the rerun partitioner.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import amd_suites as _amd_suites  # noqa: E402
 import npu_suites as _npu_suites  # noqa: E402
 import partition_rerun_tests as _partition  # noqa: E402
 import runner_configs as _runner_configs  # noqa: E402
+import xpu_suites as _xpu_suites  # noqa: E402
 
 # ci_register.py imports nothing from sglang, so it loads without the package.
 sys.path.insert(
@@ -1101,11 +1102,11 @@ class RerunEntry:
 
     mode: str
     runs_on: str
-    # The registered CI stage, the NPU or AMD suite, or None; shown next to
+    # The registered CI stage, the NPU, AMD, or XPU suite, or None; shown next to
     # the command in the reply.
     stage: Optional[str]
     # The suite the npu stage workflow runs, or whose container setup the amd
-    # job reproduces; cuda/cpu jobs need none.
+    # or xpu job reproduces; cuda/cpu jobs need none.
     suite: str = ""
     install_script: str = ""
     install_timeout: str = ""
@@ -1127,6 +1128,7 @@ _RERUN_BACKENDS = (
     _ci_register.HWBackend.CPU,
     _ci_register.HWBackend.NPU,
     _ci_register.HWBackend.AMD,
+    _ci_register.HWBackend.XPU,
 )
 
 
@@ -1150,8 +1152,9 @@ def detect_suite(file_path_from_test, hw=None):
     by scripts/ci/runner_configs.py, the same single source of truth that drives
     the main PR test pipeline; the legacy single-string `suite=` carries no
     runner_config and is reported as non-dispatchable. A CPU file yields one
-    entry, an NPU or AMD file one per `register_npu_ci(...)` or
-    `register_amd_ci(...)` call, less the NPU nightly ones _detect_npu skips.
+    entry, an NPU, AMD, or XPU file one per `register_npu_ci(...)`,
+    `register_amd_ci(...)`, or `register_xpu_ci(...)` call, less the NPU
+    nightly ones _detect_npu skips.
     """
     full_path = f"test/{file_path_from_test}"
     try:
@@ -1234,7 +1237,7 @@ def _detect_cuda_or_cpu(full_path, registrations):
             f"single-string `suite=`, which carries no runner_config and so "
             f"is not dispatchable via /rerun-test. Re-register it with "
             f"`stage=`/`runner_config=` (CUDA), or dispatch its own "
-            f"workflow (npu/amd)."
+            f"workflow (npu/amd/xpu)."
         ]
 
     return []
@@ -1250,14 +1253,15 @@ def _no_rerun_backend_error(full_path, registrations):
         where = f" (suite `{suites[0]}`)" if suites else ""
         return (
             f"`{full_path}` is registered for {backends}{where}, not for "
-            f"CUDA, CPU, NPU, or AMD; rerun-test.yml has no {backends} job. Rerun "
+            f"CUDA, CPU, NPU, AMD, or XPU; rerun-test.yml has no {backends} job. Rerun "
             f"it with /rerun-failed-ci, or dispatch the {backends} workflow "
             f"manually."
         )
 
     return (
         f"No `register_cuda_ci(runner_config=...)`, `register_cpu_ci()`, "
-        f"`register_npu_ci()`, or `register_amd_ci()` found in `{full_path}`. "
+        f"`register_npu_ci()`, `register_amd_ci()`, or `register_xpu_ci()` "
+        f"found in `{full_path}`. "
         f"This file may not be a registered CI test."
     )
 
@@ -1330,12 +1334,44 @@ def _detect_amd(full_path, registrations):
     return out
 
 
+def _detect_xpu(full_path, registrations):
+    xpu = _of_backend(registrations, _ci_register.HWBackend.XPU)
+    if not xpu:
+        return []
+    try:
+        suites = _xpu_suites.load_suites()
+    except ValueError as e:
+        return [f"Cannot resolve XPU registrations: {e}"]
+    out = []
+    for r in xpu:
+        suite = r.effective_suite
+        if r.nightly or suite not in suites:
+            out.append(
+                f"XPU suite `{suite}` of `{full_path}` has no job in "
+                f"{' or '.join(_xpu_suites.WORKFLOWS)}, the only XPU jobs "
+                f"/rerun-test reproduces (nightly suites are not supported)."
+            )
+        elif r.disabled is not None:
+            out.append(
+                f"`{full_path}` is disabled in XPU suite `{suite}` "
+                f"({r.disabled}), so run_suite.py would skip it."
+            )
+        else:
+            out.append(
+                RerunEntry(
+                    mode="xpu", runs_on=suites[suite].runs_on, stage=suite, suite=suite
+                )
+            )
+    return out
+
+
 # /rerun-test backends -> (label, detector). Without `--hw`, a file runs on the
 # first one it registers.
 RERUN_HW = {
     "cuda": ("CUDA/CPU", _detect_cuda_or_cpu),
     "npu": ("NPU", _detect_npu),
     "amd": ("AMD", _detect_amd),
+    "xpu": ("XPU", _detect_xpu),
 }
 
 
@@ -1466,7 +1502,7 @@ def _dispatch_batch(
             "reply_marker": reply_marker,
             "refresh_precision_baseline": str(refresh_precision_baseline).lower(),
         }
-        # Only npu and amd dispatches send `suite`, so cuda/cpu ones still match
+        # Only npu, amd, and xpu dispatches send `suite`, so cuda/cpu ones still match
         # the inputs of a PR branch's older rerun-test.yml.
         if first.suite:
             inputs["suite"] = first.suite
@@ -1732,8 +1768,9 @@ def handle_rerun_test(
             f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
             "every test file this PR adds or modifies)\n"
             f"- `/rerun-test {HW_FLAG} npu test_foo.py` (backends to run on: "
-            f"`cuda`, `npu`, `amd`, a list such as `cuda,amd`, or `all`; without "
-            "it a file runs on the first of CUDA/CPU, NPU, and AMD it registers)"
+            f"`cuda`, `npu`, `amd`, `xpu`, a list such as `cuda,amd`, or `all`; "
+            "without it a file runs on the first of CUDA/CPU, NPU, AMD, and XPU "
+            "it registers)"
         )
         return False
 

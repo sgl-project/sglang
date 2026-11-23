@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | amd"
+        description: "Dispatch mode: cuda | multimodal_gen | cpu | npu | amd | xpu"
         required: true
         type: choice
         options:
@@ -14,6 +14,7 @@ on:
           - cpu
           - npu
           - amd
+          - xpu
       test_command:
         description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
         required: true
@@ -39,7 +40,7 @@ on:
         type: string
         default: ""
       suite:
-        description: "Registered suite the files belong to (npu and amd only)"
+        description: "Registered suite the files belong to (npu, amd, and xpu only)"
         required: false
         type: string
         default: ""
@@ -114,6 +115,8 @@ jobs:
       # env of the suite's job in pr-test-amd.yml or pr-test-amd-extra.yml.
       rocm_version: ${{ steps.partition.outputs.rocm_version }}
       exec_env: ${{ steps.partition.outputs.exec_env }}
+      # xpu only: the install arguments of the suite's job in pr-test-xpu.yml.
+      install_args: ${{ steps.partition.outputs.install_args }}
     steps:
       - name: Checkout partition script
         uses: actions/checkout@v4
@@ -138,10 +141,10 @@ jobs:
           SUITE: ${{ inputs.suite }}
         run: |
           python3 scripts/ci/partition_rerun_tests.py
-          # Fails for a suite no stage or setup-amd-ci job runs, so only those
+          # Fails for a suite no stage, setup-amd-ci, or XPU job runs, so only those
           # names reach the later shell steps. This checkout is github.sha, so
           # the derived values come from the base branch's workflows.
-          if [[ "$MODE" == "npu" || "$MODE" == "amd" ]]; then
+          if [[ "$MODE" == "npu" || "$MODE" == "amd" || "$MODE" == "xpu" ]]; then
             python3 -c 'import yaml' 2>/dev/null ||
               python3 -m pip install --disable-pip-version-check pyyaml
             python3 "scripts/ci/${MODE}_suites.py" "$SUITE" >> "$GITHUB_OUTPUT"
@@ -493,8 +496,91 @@ jobs:
           EXEC_ENV: ${{ needs.prepare-partitions.outputs.exec_env }}
         run: bash trusted-ci/scripts/ci/run_rerun_tests.sh amd "${{ matrix.partition }}"
 
+  # Runs each file directly in the XPU CI container, installed as the suite's
+  # job in pr-test-xpu.yml installs it (scripts/ci/xpu_suites.py).
+  rerun-test-xpu:
+    name: rerun-test-xpu (partition ${{ matrix.partition }})
+    needs: prepare-partitions
+    if: inputs.mode == 'xpu'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
+    runs-on: ${{ inputs.runs_on }}
+    # The 60-minute Run test step plus the image pull and install.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # Fork code runs on this runner, so a fork PR's rerun pulls anonymously.
+      DOCKERHUB_INTEL_USERNAME: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_INTEL_USERNAME || '' }}
+      DOCKERHUB_INTEL_TOKEN: ${{ inputs.pr_head_sha == '' && secrets.DOCKERHUB_INTEL_TOKEN || '' }}
+      # Per-job name so a rerun never removes another job's ci_sglang_xpu container.
+      CONTAINER_NAME: ci_sglang_xpu_rerun_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.partition }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          # The CI container leaves root-owned files in the bind-mounted workspace.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          # Tags let setuptools_scm resolve a real version in the install step.
+          fetch-depth: 0
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
+
+      - name: Checkout trusted CI files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-ci
+          sparse-checkout: |
+            .github/actions
+            scripts/ci
+          persist-credentials: false
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 trusted-ci/scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./trusted-ci/.github/actions/check-maintenance
+
+      - name: Start CI container
+        run: bash trusted-ci/scripts/ci/xpu/xpu_ci_start_container.sh
+
+      - name: Install dependencies
+        timeout-minutes: 60
+        env:
+          INSTALL_ARGS: ${{ needs.prepare-partitions.outputs.install_args }}
+        run: |
+          read -ra install_args <<< "$INSTALL_ARGS"
+          bash trusted-ci/scripts/ci/xpu/xpu_ci_install_dependency.sh "${install_args[@]}"
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
+        run: bash trusted-ci/scripts/ci/run_rerun_tests.sh xpu "${{ matrix.partition }}"
+
+      - name: Cleanup container
+        if: always()
+        run: bash trusted-ci/scripts/ci/xpu/xpu_ci_cleanup.sh
+
   write-back-result:
-    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu, rerun-test-amd]
+    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu, rerun-test-npu, rerun-test-amd, rerun-test-xpu]
     if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
     runs-on: ubuntu-latest
     permissions:
@@ -520,7 +606,8 @@ jobs:
              || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
              || "${{ needs.rerun-test-cpu.result }}" == "success" \
              || "${{ needs.rerun-test-npu.result }}" == "success" \
-             || "${{ needs.rerun-test-amd.result }}" == "success" ]]; then
+             || "${{ needs.rerun-test-amd.result }}" == "success" \
+             || "${{ needs.rerun-test-xpu.result }}" == "success" ]]; then
             STATUS=success
           else
             STATUS=failure

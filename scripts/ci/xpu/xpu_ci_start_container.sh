@@ -7,7 +7,8 @@ set -euo pipefail
 # Pulls the :latest tag and starts a long-running container that subsequent
 # steps `docker exec` into.
 
-CONTAINER_NAME="ci_sglang_xpu"
+# rerun-test.yml sets a per-job name; other workflows use the default.
+CONTAINER_NAME="${CONTAINER_NAME:-ci_sglang_xpu}"
 IMAGE_REPO="intel/sglang-dev"
 IMAGE_TAG="latest"
 CUSTOM_IMAGE=""

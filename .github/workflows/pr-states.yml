@@ -14,7 +14,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)"]
+    workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)", "PR Test (XPU)"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -112,6 +112,7 @@ jobs:
             const labels = pr.labels.map(l => l.name);
             const hasCI = labels.includes('run-ci');
             const hasNvExtra = labels.includes('run-ci-nv-extra');
+            const hasXpuExtra = labels.includes('run-ci-xpu-extra');
 
             // Pre-sleep below only matters when a label was just removed;
             // other no-label fires don't race against fresh indexing.
@@ -125,7 +126,7 @@ jobs:
                 workflow_id: workflowFile,
                 head_sha: sha,
                 // Every row reports the PR gate, so exclude other events for
-                // this SHA: all three workflows also accept workflow_dispatch,
+                // this SHA: all four workflows also accept workflow_dispatch,
                 // and for AMD that is a single stage rather than the full gate.
                 event: 'pull_request',
                 per_page: 10,
@@ -151,13 +152,13 @@ jobs:
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
 
-            // The three lookups are independent, so the added one costs no
+            // The four lookups are independent, so the added ones cost no
             // wall-clock time. The AMD lookup never spends the retry budget:
             // that workflow has an on.pull_request.paths filter, so a missing
             // run is usually legitimate rather than an indexing race, and the
             // race resolves itself -- `requested` is in the workflow_run
             // subscription above, so a real dispatch refreshes this block.
-            const [ptRun, peRun, amdRun] = await Promise.all([
+            const [ptRun, peRun, amdRun, xpuRun] = await Promise.all([
               findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
               // pr-test-extra gates on BOTH labels (see call-gate there).
               findRun(
@@ -165,6 +166,11 @@ jobs:
                 (hasCI && hasNvExtra) ? labelOnOpts : labelOffOpts,
               ),
               findRun('pr-test-amd.yml', labelOffOpts),
+              // pr-test-xpu gates on BOTH labels, like pr-test-extra.
+              findRun(
+                'pr-test-xpu.yml',
+                (hasCI && hasXpuExtra) ? labelOnOpts : labelOffOpts,
+              ),
             ]);
 
             // Skipped run = "no real run" -- happens when a label is added
@@ -188,8 +194,23 @@ jobs:
               return jobs.some((job) => (job.steps || []).some(
                 (step) => step.name === 'Skip tests' && step.conclusion === 'success'));
             }
-            const [ptSkipped, peSkipped, amdSkipped] = await Promise.all(
-              [ptRun, peRun, amdRun].map(skippedAtGate));
+            const [ptSkipped, peSkipped, amdSkipped, xpuSkipped] = await Promise.all(
+              [ptRun, peRun, amdRun, xpuRun].map(skippedAtGate));
+            // pr-test-xpu filters paths in its check-changes job, so a PR that
+            // touches no XPU path still gets a green run with every test job skipped.
+            async function noXpuChanges(run) {
+              if (!isReal(run) || run.status !== 'completed') return false;
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                filter: 'latest',
+                per_page: 100,
+              });
+              const tests = jobs.filter((job) => /^(extra|multimodal-gen)-test-/.test(job.name));
+              return tests.length > 0 && tests.every((job) => job.conclusion === 'skipped');
+            }
+            const xpuNoChanges = !xpuSkipped && await noXpuChanges(xpuRun);
             const tested = (run, skipped) => isReal(run) && !skipped;
 
             // GitHub's "skipped" mark, for every row whose tests the gate skipped.
@@ -231,6 +252,10 @@ jobs:
             const peText = rowText(peRun, peSkipped, 'run-ci-nv-extra', stalePushText);
             // No AMD run usually means its paths filter excluded the PR, not a label.
             const amdText = amdRun ? rowText(amdRun, amdSkipped, null, amdNotTriggeredText) : amdNotTriggeredText;
+            const xpuNoChangesText = `${skipMark} -- no XPU-relevant changes.`;
+            const xpuText = xpuNoChanges
+              ? xpuNoChangesText
+              : rowText(xpuRun, xpuSkipped, 'run-ci-xpu-extra', stalePushText);
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
@@ -240,6 +265,8 @@ jobs:
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
             const amdStart   = '<!-- slot:pr-test-amd:start -->';
             const amdEnd     = '<!-- slot:pr-test-amd:end -->';
+            const xpuStart   = '<!-- slot:pr-test-xpu:start -->';
+            const xpuEnd     = '<!-- slot:pr-test-xpu:end -->';
 
             const newBlock = [
               outerStart,
@@ -249,6 +276,7 @@ jobs:
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
               `Latest PR Test (AMD ROCm 10): ${amdStart}${amdText}${amdEnd}`,
+              `Latest PR Test (XPU): ${xpuStart}${xpuText}${xpuEnd}`,
               '',
               '> [!TIP]',
               '> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:',

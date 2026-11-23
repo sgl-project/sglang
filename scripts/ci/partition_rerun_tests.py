@@ -27,6 +27,7 @@ _BACKENDS = {
     "cpu": ci_register.HWBackend.CPU,
     "npu": ci_register.HWBackend.NPU,
     "amd": ci_register.HWBackend.AMD,
+    "xpu": ci_register.HWBackend.XPU,
 }
 
 
@@ -117,7 +118,7 @@ def estimate_seconds(command, root, mode, runs_on="", suite=""):
     elif mode == "cpu":
         matching = [r.est_time for r in found if r.effective_suite in UBUNTU_CPU_SUITES]
     else:
-        # An npu or amd dispatch names the suite it runs.
+        # An npu, amd, or xpu dispatch names the suite it runs.
         matching = [r.est_time for r in found if r.effective_suite == suite]
     # A file may register on multiple pools; without a match, stay conservative.
     return max(matching or [r.est_time for r in found])
