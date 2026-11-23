@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.quantization.awq.awq import uses_awq_fused_shard_matcher
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -878,7 +879,9 @@ def _declare_k_eq_v_qkv_shards(
     layers_prefix: str,
 ) -> None:
     # K=V layers ship only q_proj and k_proj; load_weights copies K into V.
-    if quant_config is None or not getattr(config, "attention_k_eq_v", False):
+    if not config.attention_k_eq_v:
+        return
+    if not uses_awq_fused_shard_matcher(quant_config):
         return
     mapping = dict(quant_config.packed_modules_mapping)
     for i, layer_type in enumerate(config.layer_types):

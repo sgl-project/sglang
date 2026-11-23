@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 from sglang.srt.layers.quantization.awq.awq import AWQConfig, is_layer_skipped_awq
@@ -201,6 +202,7 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
 
         from sglang.srt.models.gemma4_causal import _declare_k_eq_v_qkv_shards
 
+        mapping_before = copy.deepcopy(QWEN3_5_MAPPING)
         text_config = SimpleNamespace(
             attention_k_eq_v=True,
             layer_types=["sliding_attention", "full_attention"],
@@ -229,10 +231,7 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "same precision"):
                     skipped(f"{layers_prefix}.0.self_attn.qkv_proj")
         # The model class mapping itself is left untouched.
-        self.assertEqual(
-            set(QWEN3_5_MAPPING),
-            {"qkv_proj", "gate_up_proj", "in_proj_qkvz", "in_proj_ba"},
-        )
+        self.assertEqual(QWEN3_5_MAPPING, mapping_before)
 
     def test_router_entry_does_not_split_gate_up_proj(self):
         """ "mlp.gate" names the MoE router, not the gate_proj shard of a dense MLP."""
@@ -271,6 +270,85 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
         self.assertTrue(
             _skipped("model.layers.0.self_attn.qkv_proj", not_convert, mapping)
         )
+
+    def test_chatglm_prefix_entry_covers_both_dense_layers(self):
+        """AutoAWQ matches by substring, so "mlp.dense_" skips dense_h_to_4h and dense_4h_to_h."""
+        from sglang.srt.models.chatglm import ChatGLMForCausalLM
+
+        mapping = ChatGLMForCausalLM.packed_modules_mapping
+        for name in ("dense_h_to_4h", "dense_4h_to_h"):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    _skipped(
+                        f"transformer.encoder.layers.0.mlp.{name}",
+                        ["mlp.dense_"],
+                        mapping,
+                    )
+                )
+
+    def test_bailing_linear_attention_qkv_is_one_tensor(self):
+        """Bailing's linear-attention qkv_proj loads one query_key_value tensor."""
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearForCausalLM
+
+        mapping = BailingMoELinearForCausalLM.packed_modules_mapping
+        prefix = "model.layers.0.attention.qkv_proj"
+        # An MLA-layer entry neither splits nor raises on the linear layer.
+        self.assertFalse(_skipped(prefix, ["attention.q_proj"], mapping))
+        self.assertTrue(_skipped(prefix, ["attention.query_key_value"], mapping))
+
+    def test_gemma4_k_eq_v_skips_configs_without_the_awq_matcher(self):
+        """w8a8_fp8 has no packed_modules_mapping and is left untouched."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+        from sglang.srt.models.gemma4_causal import _declare_k_eq_v_qkv_shards
+
+        text_config = SimpleNamespace(
+            attention_k_eq_v=True, layer_types=["full_attention"]
+        )
+        quant_config = W8A8Fp8Config()
+        state_before = copy.deepcopy(vars(quant_config))
+        _declare_k_eq_v_qkv_shards(text_config, quant_config, "model.layers")
+        self.assertEqual(vars(quant_config), state_before)
+
+    def test_moe_wna16_awq_linear_keeps_the_k_eq_v_shards(self):
+        """moe_wna16 rebuilds AWQ per linear layer and must keep the model's update."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.models.gemma4_causal import _declare_k_eq_v_qkv_shards
+
+        not_convert = [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+        ]
+        full_config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "modules_to_not_convert": not_convert,
+            "packed_modules_mapping": QWEN3_5_MAPPING,
+        }
+        # The CPU runner has no device capability; AWQ itself needs none here.
+        with mock.patch(
+            "sglang.srt.layers.quantization.moe_wna16.get_device_capability",
+            return_value=(8, 0),
+        ):
+            quant_config = MoeWNA16Config.from_config(full_config)
+        _declare_k_eq_v_qkv_shards(
+            SimpleNamespace(attention_k_eq_v=True, layer_types=["full_attention"]),
+            quant_config,
+            "model.layers",
+        )
+        layer = mock.MagicMock(spec=LinearBase)
+        method = quant_config.get_quant_method(
+            layer, "model.layers.0.self_attn.qkv_proj"
+        )
+        self.assertIsInstance(method, UnquantizedLinearMethod)
 
     def test_partially_listed_fused_layer_raises(self):
         with self.assertRaisesRegex(ValueError, "same precision"):

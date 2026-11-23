@@ -106,6 +106,14 @@ def _fused_layer_shard_paths(
     return [parent + shard for shard in shards]
 
 
+def uses_awq_fused_shard_matcher(quant_config: Optional[QuantizationConfig]) -> bool:
+    from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if isinstance(quant_config, MoeWNA16Config):
+        return quant_config.linear_quant_method == "awq"
+    return isinstance(quant_config, (AWQConfig, AWQMarlinConfig))
+
+
 def is_layer_skipped_awq(
     prefix: str,
     *,
@@ -113,7 +121,9 @@ def is_layer_skipped_awq(
     quant_config: QuantizationConfig,
 ) -> bool:
     shard_paths = _fused_layer_shard_paths(quant_config, prefix)
-    if not shard_paths:
+    # A mapping back to the layer itself (ChatGLM's dense_h_to_4h) is one
+    # tensor: keep AutoAWQ's plain substring match, so "mlp.dense_" covers it.
+    if not shard_paths or shard_paths == [prefix]:
         return any(module_name in prefix for module_name in modules_to_not_convert)
 
     # The list names checkpoint shards (self_attn.q_proj), not SGLang's fused
