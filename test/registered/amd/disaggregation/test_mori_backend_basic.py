@@ -8,6 +8,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
+from sglang.srt.disaggregation.mori.buffers import BufferKeys
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +141,38 @@ class TestMoriDCP(unittest.TestCase):
         manager._add_remote_peer(info)
         self.assertTrue(info.requires_dcp_relayout)
         self.assertEqual(info.dcp_token_item_lens, [64])
+
+
+class TestMoriLocalRegistration(CustomTestCase):
+    @staticmethod
+    def _register(*, kv_len=64, aux_len=8, state_len=32):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.kv_args = SimpleNamespace(
+            gpu_id=0,
+            kv_data_ptrs=[0x1000],
+            kv_data_lens=[kv_len],
+            aux_data_ptrs=[0x2000],
+            aux_data_lens=[aux_len],
+            state_data_ptrs=[[0x3000]],
+            state_data_lens=[[state_len]],
+        )
+        manager._local_keys = BufferKeys.for_buffers([0x1000], [0x2000], [[0x3000]])
+        manager.transport = Mock()
+        manager._register_local_buffers()
+        return manager.transport.register
+
+    def test_only_a_state_buffer_may_be_zero_length(self):
+        """Peers accept a None slot only in the state list of the registration
+        message, so a zero-length KV or aux buffer must fail at startup instead
+        of reaching a peer as None."""
+        for field in ("kv_len", "aux_len"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "zero-length"):
+                    self._register(**{field: 0})
+
+        register = self._register(state_len=0)
+        self.assertEqual(register.call_count, 3)
+        self.assertEqual(register.call_args.kwargs["length"], 0)
 
 
 class TestMoriDsaStateElision(unittest.TestCase):

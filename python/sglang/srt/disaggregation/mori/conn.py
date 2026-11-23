@@ -475,6 +475,10 @@ class MoriKVManager(CommonKVManager):
             )
         )
         for key, ptr in keyed_ptrs:
+            if lens[key] == 0 and key.kind != BufferKind.STATE:
+                # Only a state buffer may be empty: peers accept a None slot only in
+                # the state list of the registration message.
+                raise ValueError(f"MoRI cannot register a zero-length buffer {key!r}")
             self.transport.register(
                 key=key,
                 ptr=ptr,
