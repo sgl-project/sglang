@@ -225,6 +225,12 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
+            from sglang.srt.configs.speculators_dspark import (
+                try_load_speculators_dspark_config,
+            )
+
+            config = try_load_speculators_dspark_config(model, revision, **kwargs)
+        if config is None:
             config = AutoConfig.from_pretrained(
                 model,
                 trust_remote_code=trust_remote_code,

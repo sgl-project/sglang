@@ -3462,6 +3462,7 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        self.dspark_aux_hidden_stream: str = "attn_res"
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -3728,6 +3729,14 @@ class KimiK3LinearModel(nn.Module):
         output side for the last layer). The standard path captures at the
         next input instead."""
         hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
+        if self.dspark_aux_hidden_stream == "prefix":
+            if (
+                _is_gfx95
+                and hidden_states.shape[0]
+                != self.attn_bank.require().block_residual.shape[0]
+            ):
+                return get_parallel().attn_tp_group.all_gather(hidden_states, dim=0)
+            return hidden_states
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3856,6 +3865,22 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.dspark_aux_hidden_stream = "attn_res"
+        spec_cfg = get_spec()
+        if spec_cfg.speculative_draft_model_path is not None:
+            from sglang.srt.hf_transformers import get_config
+            from sglang.srt.speculative.dflash_utils import (
+                get_dflash_aux_hidden_stream,
+            )
+
+            draft_cfg = get_config(
+                spec_cfg.speculative_draft_model_path,
+                trust_remote_code=True,
+                revision=spec_cfg.speculative_draft_model_revision,
+            )
+            self.model.dspark_aux_hidden_stream = get_dflash_aux_hidden_stream(
+                draft_cfg
+            )
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         # DFLASH target_layer_ids name layer outputs, which is what the DSPARK

@@ -396,6 +396,11 @@ def _get_dflash_config(config: Any) -> dict:
         return {}
 
 
+def get_dflash_aux_hidden_stream(config: Any) -> str:
+    stream = _get_dflash_config(config).get("aux_hidden_stream")
+    return str(stream) if stream is not None else "attn_res"
+
+
 def is_nemotron_35_draft_config(config: Any) -> bool:
     """Identify the published Nemotron 3.5 DFlash/DSpark draft layout.
 

@@ -1,5 +1,8 @@
 import contextlib
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -493,6 +496,49 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
                 rel = keys - floor
                 read = table[0, rel // page].to(torch.int64) * page + rel % page
                 self.assertTrue(torch.equal(dst_pool[read], keys))
+
+
+class TestSpeculatorsDSparkConfig(unittest.TestCase):
+    def test_speculators_dspark_config_flattens_layer_ids_and_aux_stream(self):
+        from sglang.srt.configs.speculators_dspark import (
+            try_load_speculators_dspark_config,
+        )
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_aux_hidden_stream,
+        )
+
+        raw = {
+            "architectures": ["DSparkDraftModel"],
+            "speculators_model_type": "dspark",
+            "aux_hidden_state_layer_ids": [76, 80, 84, 88, 92],
+            "block_size": 7,
+            "markov_rank": 512,
+            "markov_head_type": "vanilla",
+            "mask_token_id": 163839,
+            "sample_from_anchor": True,
+            "sliding_window_non_causal": False,
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 7168,
+                "intermediate_size": 14336,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 96,
+                "num_key_value_heads": 16,
+                "head_dim": 64,
+                "layer_types": ["sliding_attention"] * 5,
+                "sliding_window": 2048,
+                "vocab_size": 163840,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps(raw))
+            cfg = try_load_speculators_dspark_config(tmp, revision=None)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.architectures, ["DSparkDraftModel"])
+        self.assertEqual(cfg.sliding_window, 2048)
+        self.assertTrue(cfg.is_causal)
+        self.assertEqual(cfg.dflash_config["target_layer_ids"], [75, 79, 83, 87, 91])
+        self.assertEqual(get_dflash_aux_hidden_stream(cfg), "prefix")
 
 
 if __name__ == "__main__":
