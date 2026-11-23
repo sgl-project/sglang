@@ -1,11 +1,12 @@
 """gfx942 group32 ue8m0 block-FP8 linears served from the cached BF16 weight expansion."""
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.layers.quantization import fp8, fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.utils import is_gfx942_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -98,16 +99,37 @@ class TestGfx942Block32Bf16Linear(CustomTestCase):
                 layer, _ = _build_layer(n, k, weight.clone(), scale)
                 has_cache = getattr(layer, "_block_fp8_bf16_weight", None) is not None
                 self.assertEqual(has_cache, cached)
-                # The rejection must not depend on this shard's scales, or TP
-                # ranks would disagree on whether an online update is allowed.
-                self.assertIn(
-                    "gfx942", getattr(layer, "_derived_weight_cache_error", None) or ""
-                )
+                # An all-FP8 layer keeps online updates.
+                rejects = getattr(layer, "_derived_weight_cache_error", None)
+                self.assertEqual(rejects is not None, cached)
 
     def test_cache_rejects_online_updates(self):
         layer, _ = _build_layer(64, 128)
         self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
         self.assertIn("gfx942", layer._derived_weight_cache_error)
+
+    def test_cache_follows_every_tp_rank(self):
+        # A peer whose shard fails the scale check keeps this rank on FP8 too, so the
+        # online-update rejection agrees across ranks.
+        tp_group = SimpleNamespace(world_size=2, cpu_group=object())
+
+        def peer_fails(flags, op=None, group=None):
+            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+            self.assertIs(group, tp_group.cpu_group)
+            flags.zero_()
+
+        with (
+            mock.patch.object(
+                fp8, "get_parallel", lambda: SimpleNamespace(tp_group=tp_group)
+            ),
+            mock.patch.object(
+                torch.distributed, "all_reduce", side_effect=peer_fails
+            ) as all_reduce,
+        ):
+            layer, _ = _build_layer(64, 128)
+        self.assertEqual(all_reduce.call_count, 1)
+        self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
+        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
 
     def test_explicit_triton_backend_keeps_fp8_path(self):
         n, k, m = 64, 128, 6
