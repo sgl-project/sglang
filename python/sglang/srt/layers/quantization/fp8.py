@@ -19,6 +19,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -515,9 +516,13 @@ def _loading_presharded() -> bool:
     those loads keep the plain layout and existing caches stay valid.
     """
     try:
-        return get_model().load_format == "presharded"
+        load_format = get_model().load_format
     except ValueError:  # runtime config not published (standalone use)
         return False
+    # Normalized as LoadConfig does, so "PRESHARDED" also counts.
+    return str(getattr(load_format, "value", load_format)).lower() == (
+        LoadFormat.PRESHARDED.value
+    )
 
 
 class Fp8LinearMethod(LinearMethodBase):
