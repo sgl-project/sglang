@@ -3561,7 +3561,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
-        verify = self.target_worker.model_runner.sampling_pipeline.bind_verify(
+        verify = self.target_worker.model_runner.sampling_pipeline.plan_verify(
             batch, watermark_full_mask=False
         )
 
@@ -3638,7 +3638,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         # Before the deferred-shard block, which may drop the logits: the NaN
         # probe reads the vocab shard.
-        verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
+        verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
         target_lp = self._target_logits_processor

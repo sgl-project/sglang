@@ -454,7 +454,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         if batch.forward_mode.is_target_verify():
             # NGRAM watermark contexts use the full-mask layout.
-            verify = self.model_runner.sampling_pipeline.bind_verify(
+            verify = self.model_runner.sampling_pipeline.plan_verify(
                 batch, watermark_full_mask=True
             )
             batch_result = self.target_worker.forward_batch_generation(
@@ -480,7 +480,7 @@ class NGRAMWorker(BaseSpecWorker):
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            verify.bind_target(
+            verify.build_row_inputs(
                 logits_output,
                 tree=host_tree,
                 # Host corpus lookup, so NGRAM stays synchronous: nothing pending.

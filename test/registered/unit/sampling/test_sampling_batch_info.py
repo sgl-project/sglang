@@ -323,7 +323,7 @@ class TestNanLogits(CustomTestCase):
                 detect_nan_logits(self._logits(), "verify")
             with self.assertRaises(RuntimeError):
                 self._verify(self._logits())
-            # Every verify worker probes through bind_target, also without a host
+            # Every verify worker probes through build_row_inputs, also without a host
             # tree: before its early return.
             verify = VerifyStep(
                 batch=None,
@@ -332,7 +332,7 @@ class TestNanLogits(CustomTestCase):
                 watermark_full_mask=True,
             )
             with self.assertRaises(RuntimeError):
-                verify.bind_target(
+                verify.build_row_inputs(
                     SimpleNamespace(next_token_logits=self._logits()),
                     tree=None,
                     barrier=None,
