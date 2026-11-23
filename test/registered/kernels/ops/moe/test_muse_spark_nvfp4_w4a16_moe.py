@@ -1,6 +1,7 @@
 """Fused NVFP4 W4A16 MoE vs fp64 torch and Marlin; dynamic guests; CUDA graph replay."""
 
 import functools
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -194,3 +195,7 @@ def test_cuda_graph_replay(M):
             t.copy_(u)
         graph.replay()
         assert torch.equal(out, run())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
