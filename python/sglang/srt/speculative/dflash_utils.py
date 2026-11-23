@@ -368,10 +368,8 @@ def dflash_draft_kv_fits_swa(
         or get_disagg().disaggregation_mode != "null"
     ):
         return False
-    layer_types, window = (
-        get_dflash_layer_types(draft_hf_config),
-        get_dflash_attention_sliding_window_size(draft_hf_config),
-    )
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    window = get_dflash_attention_sliding_window_size(draft_hf_config)
     return (
         bool(layer_types)
         and all(t == "sliding_attention" for t in layer_types)

@@ -2721,14 +2721,12 @@ class KVCacheConfigurator:
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         if not self.is_hybrid_swa and self._draft_kv_in_target_swa():
             # Every draft layer in the SWA sub-pool, one row per target SWA slot.
-            swa_attention_layer_ids, full_attention_layer_ids = (
-                list(range(self.layer_info.start_layer, self.layer_info.end_layer)),
-                [],
+            swa_attention_layer_ids = list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
             )
-            kwargs["v_head_dim"], swa_pool_class = (
-                self.model_config.v_head_dim,
-                mha_pool_class,
-            )
+            full_attention_layer_ids = []
+            kwargs["v_head_dim"] = self.model_config.v_head_dim
+            swa_pool_class = mha_pool_class
         # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
