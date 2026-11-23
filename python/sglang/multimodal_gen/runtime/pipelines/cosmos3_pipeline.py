@@ -38,6 +38,7 @@ class Cosmos3Pipeline(LoRAPipeline, ComposedPipelineBase):
     # Older checkpoints declare ``Cosmos3OmniDiffusersPipeline`` (see the
     # back-compat alias below).
     pipeline_name = "Cosmos3OmniPipeline"
+    neg_cond_without_cfg_supported = True
     is_video_pipeline = True
 
     _required_config_modules = [
