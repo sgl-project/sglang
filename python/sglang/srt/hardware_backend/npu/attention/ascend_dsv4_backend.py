@@ -2653,7 +2653,7 @@ class DeepseekV4AscendAttnBackend(
             model_runner.spec_aux_config.draft_model_config.hf_config
         ):
             return False
-        # The target's verify event also covers the draft inject's precomputed addresses.
+        # The target event also covers the draft inject's precomputed addresses.
         # Deferred KV stores carry reads into the next round and keep the old barrier.
         return not (
             model_runner.req_to_token_pool.holds_state_slots
@@ -2661,7 +2661,9 @@ class DeepseekV4AscendAttnBackend(
         )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
-        if self._is_dspark_algorithm and not fm.is_target_verify():
+        if self._is_dspark_algorithm and not (
+            fm == ForwardMode.EXTEND or fm.is_target_verify()
+        ):
             return SharedReadEnds.UNKNOWN
         end = super().shared_read_ends(fm)
         if (
@@ -4183,6 +4185,7 @@ class DeepseekV4AscendAttnBackend(
 
         if self.shared_read_enabled and (
             not self._is_dspark_algorithm
+            or forward_batch.forward_mode == ForwardMode.EXTEND
             or forward_batch.forward_mode.is_target_verify()
         ):
             # Snapshot addresses before read-done; compressor and KV stores must
