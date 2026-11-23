@@ -369,6 +369,7 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
         self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
         self.assertEqual(quant_info.swiglu_limit, 0.0)
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "interleave"})
+        self.assertTrue(quant_info.w13_weight.gate_up_interleave)
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
 
 
