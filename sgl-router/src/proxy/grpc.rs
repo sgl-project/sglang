@@ -14,8 +14,11 @@ use crate::server::metrics::MediaCounts;
 use crate::workers::Worker;
 use axum::http::{HeaderMap, StatusCode};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
-use sglang_api_types::api::v1 as proto;
 use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
+use sglang_api_types::api::v1::{
+    self as proto, finish_reason, generate_stream_item, media_input, optional_int64_or_list,
+    optional_string_or_list, sampling_params_or_list, string_or_list, token_ids_or_list,
+};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -39,13 +42,13 @@ impl PumpItem for proto::GenerateStreamItem {
 
 /// An item error or a scheduler abort carrying an HTTP error status.
 fn response_status(reply: &proto::GenerateStreamItem) -> Option<StatusCode> {
-    use proto::generate_stream_item::Item;
+    use generate_stream_item::Item;
     let code = match reply.item.as_ref()? {
         Item::Error(error) => error.error.as_ref().map(|error| error.code),
         Item::Frame(frame) => {
             let reason = frame.meta_info.as_ref()?.finish_reason.as_ref()?;
             match reason.kind.as_ref()? {
-                proto::finish_reason::Kind::Abort(abort) => Some(abort.status_code?),
+                finish_reason::Kind::Abort(abort) => Some(abort.status_code?),
                 _ => return None,
             }
         }
@@ -78,9 +81,9 @@ fn media_count(input: Option<&proto::MediaInput>) -> u32 {
             .count()
     };
     let count = match input.and_then(|input| input.value.as_ref()) {
-        Some(proto::media_input::Value::Item(_)) => 1,
-        Some(proto::media_input::Value::Many(many)) => items(many),
-        Some(proto::media_input::Value::Nested(nested)) => nested
+        Some(media_input::Value::Item(_)) => 1,
+        Some(media_input::Value::Many(many)) => items(many),
+        Some(media_input::Value::Nested(nested)) => nested
             .items
             .iter()
             .filter_map(|entry| entry.items.as_ref())
@@ -101,8 +104,8 @@ impl<'a> TryFrom<&'a proto::GenerateRequest> for RoutingView<'a> {
             ))
         };
         let text = match request.text.as_ref().and_then(|text| text.value.as_ref()) {
-            Some(proto::string_or_list::Value::One(text)) => Some(text.as_str()),
-            Some(proto::string_or_list::Value::Many(_)) => return Err(batch("text")),
+            Some(string_or_list::Value::One(text)) => Some(text.as_str()),
+            Some(string_or_list::Value::Many(_)) => return Err(batch("text")),
             None => None,
         };
         let input_ids = match request
@@ -110,8 +113,8 @@ impl<'a> TryFrom<&'a proto::GenerateRequest> for RoutingView<'a> {
             .as_ref()
             .and_then(|ids| ids.value.as_ref())
         {
-            Some(proto::token_ids_or_list::Value::One(ids)) => Some(ids.ids.as_slice()),
-            Some(proto::token_ids_or_list::Value::Many(_)) => return Err(batch("input_ids")),
+            Some(token_ids_or_list::Value::One(ids)) => Some(ids.ids.as_slice()),
+            Some(token_ids_or_list::Value::Many(_)) => return Err(batch("input_ids")),
             None => None,
         };
         if text.is_some() == input_ids.is_some() {
@@ -120,8 +123,8 @@ impl<'a> TryFrom<&'a proto::GenerateRequest> for RoutingView<'a> {
             ));
         }
         let rid = match request.rid.as_ref().and_then(|rid| rid.value.as_ref()) {
-            Some(proto::string_or_list::Value::One(rid)) => Some(rid.as_str()),
-            Some(proto::string_or_list::Value::Many(_)) => return Err(batch("rid")),
+            Some(string_or_list::Value::One(rid)) => Some(rid.as_str()),
+            Some(string_or_list::Value::Many(_)) => return Err(batch("rid")),
             None => None,
         };
         let sampling_params = match request
@@ -129,10 +132,8 @@ impl<'a> TryFrom<&'a proto::GenerateRequest> for RoutingView<'a> {
             .as_ref()
             .and_then(|params| params.value.as_ref())
         {
-            Some(proto::sampling_params_or_list::Value::One(params)) => Some(params),
-            Some(proto::sampling_params_or_list::Value::Many(_)) => {
-                return Err(batch("sampling_params"))
-            }
+            Some(sampling_params_or_list::Value::One(params)) => Some(params),
+            Some(sampling_params_or_list::Value::Many(_)) => return Err(batch("sampling_params")),
             None => None,
         };
         Ok(Self {
@@ -205,7 +206,7 @@ fn apply_generation(request: &mut proto::GenerateRequest, additions: &Additions)
         .is_none()
     {
         request.rid = additions.rid.as_ref().map(|rid| proto::StringOrList {
-            value: Some(proto::string_or_list::Value::One(rid.clone())),
+            value: Some(string_or_list::Value::One(rid.clone())),
         });
     }
     if let Some(rank) = additions.routed_dp_rank {
@@ -214,17 +215,15 @@ fn apply_generation(request: &mut proto::GenerateRequest, additions: &Additions)
     }
     if let Some(bootstrap) = &additions.bootstrap {
         request.bootstrap_host = Some(proto::OptionalStringOrList {
-            value: Some(proto::optional_string_or_list::Value::One(
-                proto::OptionalString {
-                    value: Some(bootstrap.host.clone()),
-                },
-            )),
+            value: Some(optional_string_or_list::Value::One(proto::OptionalString {
+                value: Some(bootstrap.host.clone()),
+            })),
         });
         let one = |value| {
             Some(proto::OptionalInt64OrList {
-                value: Some(proto::optional_int64_or_list::Value::One(
-                    proto::OptionalInt64 { value },
-                )),
+                value: Some(optional_int64_or_list::Value::One(proto::OptionalInt64 {
+                    value,
+                })),
             })
         };
         request.bootstrap_port = one(bootstrap.port.map(i64::from));
@@ -235,8 +234,8 @@ fn apply_generation(request: &mut proto::GenerateRequest, additions: &Additions)
         let params = request.sampling_params.get_or_insert_with(Default::default);
         let params = params
             .value
-            .get_or_insert_with(|| proto::sampling_params_or_list::Value::One(Default::default()));
-        if let proto::sampling_params_or_list::Value::One(params) = params {
+            .get_or_insert_with(|| sampling_params_or_list::Value::One(Default::default()));
+        if let sampling_params_or_list::Value::One(params) = params {
             for &(field, value) in &additions.sampling_defaults {
                 set_sampling_default(params, field, value);
             }
@@ -498,18 +497,16 @@ mod tests {
     fn apply_adds_router_fields_without_overriding_the_caller() {
         for caller_params in [false, true] {
             let rid = proto::StringOrList {
-                value: Some(proto::string_or_list::Value::One("caller".into())),
+                value: Some(string_or_list::Value::One("caller".into())),
             };
             let mut request = proto::GenerateRequest {
                 rid: Some(rid.clone()),
                 routed_dp_rank: Some(3),
                 sampling_params: caller_params.then(|| proto::SamplingParamsOrList {
-                    value: Some(proto::sampling_params_or_list::Value::One(
-                        proto::SamplingParams {
-                            temperature: Some(0.70000000001),
-                            ..Default::default()
-                        },
-                    )),
+                    value: Some(sampling_params_or_list::Value::One(proto::SamplingParams {
+                        temperature: Some(0.70000000001),
+                        ..Default::default()
+                    })),
                 }),
                 ..Default::default()
             };
@@ -530,7 +527,7 @@ mod tests {
                 request.routed_dp_rank, None,
                 "the router's unpinned rank wins"
             );
-            let proto::sampling_params_or_list::Value::One(params) =
+            let sampling_params_or_list::Value::One(params) =
                 request.sampling_params.unwrap().value.unwrap()
             else {
                 panic!("expected scalar sampling params");

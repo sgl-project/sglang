@@ -32,7 +32,7 @@ use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
     COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
-use sglang_api_types::api::v1 as proto;
+use sglang_api_types::api::v1::{token_ids_or_list, GenerateRequest, TokenIds, TokenIdsOrList};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
@@ -195,7 +195,7 @@ async fn serve_http(
 /// Route one native Generate request without converting it through JSON.
 pub async fn route_generate(
     ctx: &AppContext,
-    mut request: proto::GenerateRequest,
+    mut request: GenerateRequest,
     headers: HeaderMap,
 ) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
     let start = Instant::now();
@@ -212,8 +212,8 @@ pub async fn route_generate(
             && request.audio_data.is_none()
         {
             if let Some(tokens) = &prepared.tokens {
-                request.input_ids = Some(proto::TokenIdsOrList {
-                    value: Some(proto::token_ids_or_list::Value::One(proto::TokenIds {
+                request.input_ids = Some(TokenIdsOrList {
+                    value: Some(token_ids_or_list::Value::One(TokenIds {
                         ids: tokens.ids.iter().copied().map(i64::from).collect(),
                     })),
                 });

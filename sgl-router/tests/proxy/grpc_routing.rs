@@ -18,8 +18,10 @@ use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{DecodeGate, EngineProfile, WireProtocol, WorkerRegistry};
-use sglang_api_types::api::v1 as proto;
 use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
+use sglang_api_types::api::v1::{
+    self as proto, generate_stream_item, sampling_params_or_list, string_or_list, token_ids_or_list,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -176,22 +178,20 @@ impl<T: Clone> Seen<T> {
 
 fn frame(text: &str, finished: bool) -> proto::GenerateStreamItem {
     proto::GenerateStreamItem {
-        item: Some(proto::generate_stream_item::Item::Frame(
-            proto::GenerateResponse {
-                text: text.into(),
-                meta_info: Some(proto::GenerateMetaInfo {
-                    finish_reason: finished.then(|| proto::FinishReason::stop(None)),
-                    ..Default::default()
-                }),
+        item: Some(generate_stream_item::Item::Frame(proto::GenerateResponse {
+            text: text.into(),
+            meta_info: Some(proto::GenerateMetaInfo {
+                finish_reason: finished.then(|| proto::FinishReason::stop(None)),
                 ..Default::default()
-            },
-        )),
+            }),
+            ..Default::default()
+        })),
     }
 }
 
 fn error(code: u32) -> proto::GenerateStreamItem {
     proto::GenerateStreamItem {
-        item: Some(proto::generate_stream_item::Item::Error(
+        item: Some(generate_stream_item::Item::Error(
             proto::GenerateStreamError {
                 error: Some(proto::ErrorBody {
                     message: "engine failed".into(),
@@ -207,7 +207,7 @@ fn error(code: u32) -> proto::GenerateStreamItem {
 fn generate(stream: bool) -> proto::GenerateRequest {
     proto::GenerateRequest {
         input_ids: Some(proto::TokenIdsOrList {
-            value: Some(proto::token_ids_or_list::Value::One(proto::TokenIds {
+            value: Some(token_ids_or_list::Value::One(proto::TokenIds {
                 ids: vec![1, 2, 3],
             })),
         }),
@@ -350,13 +350,11 @@ async fn generate_preserves_fields_metadata_and_typed_replies() {
     for streaming in [false, true] {
         let mut body = generate(streaming);
         body.sampling_params = Some(proto::SamplingParamsOrList {
-            value: Some(proto::sampling_params_or_list::Value::One(
-                proto::SamplingParams {
-                    temperature: Some(0.70000000001),
-                    max_new_tokens: Some(10),
-                    ..Default::default()
-                },
-            )),
+            value: Some(sampling_params_or_list::Value::One(proto::SamplingParams {
+                temperature: Some(0.70000000001),
+                max_new_tokens: Some(10),
+                ..Default::default()
+            })),
         });
         let mut request = tonic::Request::new(body.clone());
         let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -374,7 +372,7 @@ async fn generate_preserves_fields_metadata_and_typed_replies() {
         assert_eq!(metadata.get("traceparent").unwrap(), traceparent);
         assert!(metadata.get("authorization").is_none());
         assert!(
-            matches!(sent.rid.as_ref().and_then(|r| r.value.as_ref()), Some(proto::string_or_list::Value::One(rid)) if !rid.is_empty())
+            matches!(sent.rid.as_ref().and_then(|r| r.value.as_ref()), Some(string_or_list::Value::One(rid)) if !rid.is_empty())
         );
         body.rid = sent.rid.clone();
         assert_eq!(
@@ -566,7 +564,7 @@ async fn text_generation_keeps_forwarding_guards() {
             assert_eq!(
                 sent.input_ids,
                 Some(proto::TokenIdsOrList {
-                    value: Some(proto::token_ids_or_list::Value::One(proto::TokenIds {
+                    value: Some(token_ids_or_list::Value::One(proto::TokenIds {
                         ids: expected_ids.into_iter().map(i64::from).collect(),
                     })),
                 })
@@ -631,10 +629,7 @@ async fn client_cancel_aborts_the_engine_request() {
         .await
         .expect("the engine call outlived the client");
     let rid = generates.last().await.rid.unwrap().value.unwrap();
-    assert_eq!(
-        rid,
-        proto::string_or_list::Value::One(aborts.last().await.rid)
-    );
+    assert_eq!(rid, string_or_list::Value::One(aborts.last().await.rid));
 }
 
 #[tokio::test]
