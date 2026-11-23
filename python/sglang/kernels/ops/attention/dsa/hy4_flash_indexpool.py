@@ -399,6 +399,170 @@ def indexpool_decode_update(
     )
 
 
+@triton.jit
+def _verify_update_kernel(
+    key_ptr,  # [R, >=128] bf16 raw key projection (before its RMSNorm)
+    key_stride,
+    key_norm_ptr,  # [128] bf16 RMSNorm weight of the raw key
+    key_eps,
+    out_loc_ptr,  # [R] KV slot of each verify row
+    start_ptr,  # [B] position of each request's first verify row
+    pages_ptr,  # [R, NP] int32 64-token page table (row b * WIDTH is request b)
+    pages_stride,
+    num_pages,
+    raw_ptr,  # [slots, 128] bf16 raw keys
+    raw_slots,
+    wv_ptr,
+    wg_ptr,
+    ape_ptr,
+    norm_ptr,
+    inv_freq_ptr,
+    buf_ptr,
+    buf_page_stride,
+    xyz_ptr,  # [slots, 3] int32 MRoPE positions per KV slot (MROPE only)
+    eps,
+    WIDTH: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    RATIO: tl.constexpr,
+    PAGE: tl.constexpr,
+    MROPE: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+):
+    """Target verify: program (b, i) normalizes and stores the raw keys of
+    request b's verify rows in its i-th touched group, then pools that group if
+    the block completes it."""
+    b = tl.program_id(0)
+    i = tl.program_id(1)
+    base_row = b * WIDTH
+    if tl.load(out_loc_ptr + base_row) == 0:
+        return
+    start = tl.load(start_ptr + b).to(tl.int64)
+    group = start // RATIO + i
+    j = tl.arange(0, BLOCK_W)
+    mine = (j < WIDTH) & ((start + j) // RATIO == group)
+    d = tl.arange(0, 128)
+    x = tl.load(
+        key_ptr + (base_row + j)[:, None] * key_stride + d[None, :],
+        mask=mine[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    w = tl.load(key_norm_ptr + d).to(tl.float32)
+    key = x * tl.rsqrt(tl.sum(x * x, axis=1) / 128 + key_eps)[:, None] * w[None, :]
+    slot = tl.load(out_loc_ptr + base_row + j, mask=mine, other=0).to(tl.int64)
+    slot = tl.minimum(tl.maximum(slot, 0), raw_slots - 1)
+    tl.store(
+        raw_ptr + slot[:, None] * 128 + d[None, :],
+        key.to(tl.bfloat16),
+        mask=mine[:, None],
+    )
+    if (group + 1) * RATIO <= start + WIDTH:
+        # The pooling threads re-read the keys stored above from global memory.
+        tl.debug_barrier()
+        rows = tl.arange(0, 16)
+        live = rows < RATIO
+        first = group * RATIO
+        tok = first + tl.where(live, rows, 0)
+        page = tl.load(
+            pages_ptr + base_row * pages_stride + tl.minimum(tok // 64, num_pages - 1),
+            mask=live,
+            other=0,
+        ).to(tl.int64)
+        slots = tl.minimum(tl.maximum(page * 64 + tok % 64, 0), raw_slots - 1)
+        dst = tl.sum(tl.where(rows == 0, slots, 0), axis=0)
+        if MROPE:
+            rope_pos = _mrope_positions(
+                tl.load(xyz_ptr + dst * 3),
+                tl.load(xyz_ptr + dst * 3 + 1),
+                tl.load(xyz_ptr + dst * 3 + 2),
+                S1,
+                S2,
+            )
+        else:
+            rope_pos = first
+        _pool_group(
+            raw_ptr,
+            slots,
+            live,
+            rope_pos,
+            dst,
+            wv_ptr,
+            wg_ptr,
+            ape_ptr,
+            norm_ptr,
+            inv_freq_ptr,
+            buf_ptr,
+            buf_page_stride,
+            eps,
+            PAGE,
+        )
+
+
+def indexpool_verify_update(
+    raw_key_proj,
+    key_norm_weight,
+    key_eps,
+    out_loc,
+    block_starts,
+    pages,
+    raw_keys,
+    wv_t,
+    wg_t,
+    ape,
+    key_norm,
+    eps,
+    inv_freq,
+    index_buf,
+    page_size,
+    rope_xyz=None,
+    mrope_section=None,
+):
+    """Target-verify step of the IndexPool cache: RMSNorm + store of every verify
+    row's raw key, and the pooled FP8 key of every group the block completes.
+
+    raw_key_proj: [B * W, 128] bf16 (row stride free), W rows per request;
+    out_loc: [B * W] KV slots, request b skipped when out_loc[b * W] == 0
+    (CUDA-graph padding); block_starts: [B] position of each request's first
+    row; pages: [B * W, NP] int32 64-token page table. With MRoPE, rope_xyz
+    [slots, 3] int32 holds each KV slot's (t, h, w) position."""
+    bs = block_starts.shape[0]
+    if bs == 0:
+        return
+    width = raw_key_proj.shape[0] // bs
+    assert raw_key_proj.stride(1) == 1 and width * bs == raw_key_proj.shape[0]
+    mrope = mrope_section is not None
+    _verify_update_kernel[(bs, (width + 2) // 4 + 1)](
+        raw_key_proj,
+        raw_key_proj.stride(0),
+        key_norm_weight,
+        key_eps,
+        out_loc,
+        block_starts,
+        pages,
+        pages.stride(0),
+        pages.shape[1],
+        raw_keys,
+        raw_keys.shape[0],
+        wv_t,
+        wg_t,
+        ape,
+        key_norm,
+        inv_freq,
+        index_buf,
+        index_buf.stride(0),
+        rope_xyz if mrope else raw_keys,
+        eps,
+        WIDTH=width,
+        BLOCK_W=triton.next_power_of_2(width),
+        RATIO=4,
+        PAGE=page_size,
+        MROPE=mrope,
+        S1=mrope_section[1] if mrope else 0,
+        S2=mrope_section[2] if mrope else 0,
+        num_warps=4,
+    )
+
+
 def indexpool_pool_write(
     raw_keys,
     member_slots,

@@ -441,9 +441,6 @@ class FlashIndexPool(nn.Module):
         raw_buf[layout_clamp(out_loc, raw_buf.shape[0])] = keys
         ratio = self.ratio
         device = keys.device
-        if forward_batch.forward_mode.is_target_verify():
-            self._verify_pool_groups(forward_batch, layout, keys.shape[0])
-            return
         ends = forward_batch.seq_lens.to(torch.int64)
         starts = ends - forward_batch.extend_seq_lens.to(torch.int64)
         first_group = starts // ratio
@@ -472,26 +469,30 @@ class FlashIndexPool(nn.Module):
             first_positions = self.rope_store.buffer[member_slots[:, 0]]
         self._pool_groups(member_slots, first_positions, member_slots[:, 0])
 
-    def _verify_pool_groups(self, forward_batch, layout: "_RowLayout", rows: int):
-        ratio = self.ratio
-        bs = forward_batch.batch_size
-        width = rows // bs
-        device = layout.positions.device
-        starts = forward_batch.seq_lens[:bs].to(torch.int64)
-        groups = starts[:, None] // ratio + torch.arange(
-            width // ratio + 1, device=device
+    def _verify_update_cache(self, raw_key_proj, forward_batch, layout: "_RowLayout"):
+        """Target verify: one kernel normalizes and stores the block's raw keys
+        and pools the groups the block completes."""
+        raw_buf = self._raw_key_buffer(raw_key_proj.device)
+        buf, page_size = self._index_buffer()
+        rows = raw_key_proj.shape[0]
+        indexpool_kernels.indexpool_verify_update(
+            raw_key_proj,
+            self.token_key_norm.weight,
+            self.token_key_norm.eps,
+            forward_batch.out_cache_loc[:rows],
+            forward_batch.seq_lens[: forward_batch.batch_size],
+            layout.metadata.get_page_table_64(),
+            raw_buf,
+            *self._transposed_weights(),
+            self.intra_group_ape,
+            self.key_norm,
+            self.eps,
+            self.inv_freq,
+            buf,
+            page_size,
+            rope_xyz=self.rope_store.buffer if self.rope_store is not None else None,
+            mrope_section=self.mrope_section,
         )
-        live = (groups + 1) * ratio <= starts[:, None] + width
-        members = groups[..., None] * ratio + torch.arange(ratio, device=device)
-        first_rows = torch.arange(bs, device=device) * width
-        live &= (forward_batch.out_cache_loc[first_rows] != 0)[:, None]
-        member_slots = layout.slots(members, first_rows[:, None]).view(-1, ratio)
-        # Slot 0 is the pool's padding slot: no request reads it.
-        write_slots = torch.where(live.view(-1), member_slots[:, 0], 0)
-        first_positions = members[..., 0].reshape(-1)
-        if self.rope_store is not None:
-            first_positions = self.rope_store.buffer[member_slots[:, 0]]
-        self._pool_groups(member_slots, first_positions, write_slots)
 
     def _capture_dfly_topk(self, indices, forward_batch):
         mode = forward_batch.forward_mode
@@ -579,6 +580,8 @@ class FlashIndexPool(nn.Module):
         raw_key_proj, head_weights = self._project_key_and_head_weights(x)
         if forward_batch.forward_mode.is_decode():
             self._decode_update_cache(raw_key_proj, forward_batch, layout)
+        elif forward_batch.forward_mode.is_target_verify():
+            self._verify_update_cache(raw_key_proj, forward_batch, layout)
         else:
             keys = self.token_key_norm(raw_key_proj)
             self._update_cache(keys, forward_batch, layout)
