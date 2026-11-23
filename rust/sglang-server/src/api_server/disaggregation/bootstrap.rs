@@ -29,6 +29,8 @@ const ROOM_SHARD_COUNT: usize = 64;
 struct PrefillRankInfo {
     rank_ip: String,
     rank_port: i64,
+    #[serde(skip)]
+    manager_id: Option<String>,
 }
 
 /// Python's (`PrefillServerInfo`).
@@ -114,6 +116,7 @@ impl RoomShards {
 /// The registration topology.
 #[derive(Clone, Default)]
 struct Topology {
+    bootstrap_epoch: Option<axum::http::HeaderValue>,
     attn_tp_size: Option<i64>,
     attn_cp_size: Option<i64>,
     dp_size: Option<i64>,
@@ -200,6 +203,8 @@ fn truthy(value: &serde_json::Value) -> bool {
 /// PUT /route payload (`CommonKVManager.register_to_bootstrap`).
 #[derive(Deserialize)]
 struct Route {
+    #[serde(default)]
+    manager_id: Option<String>,
     attn_tp_size: i64,
     attn_tp_rank: i64,
     attn_cp_size: i64,
@@ -299,14 +304,20 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
         topo.stores_to_linker
             .get_or_insert(body.stores_to_linker.unwrap_or(false));
-        topo.prefill_ranks.insert(
+        let previous = topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
                 rank_ip: body.rank_ip.clone(),
                 rank_port: body.rank_port,
+                manager_id: body.manager_id.clone(),
             },
         );
-        topo.registered_count += 1;
+        if previous.is_none() {
+            topo.registered_count += 1;
+        }
+        if previous.as_ref().and_then(|row| row.manager_id.as_ref()) != body.manager_id.as_ref() {
+            topo.bootstrap_epoch = Some(uuid::Uuid::new_v4().simple().to_string().parse().unwrap());
+        }
         topo
     });
 
@@ -376,7 +387,7 @@ async fn route_get(
 
     if (dp, cp, tp, pp) == (-1, -1, -1, -1) {
         // Aggregate-topology sentinel.
-        return Json(PrefillServerInfo {
+        let mut response = Json(PrefillServerInfo {
             attn_tp_size: topo.attn_tp_size.unwrap(),
             attn_cp_size: topo.attn_cp_size.unwrap(),
             dp_size: topo.dp_size.unwrap(),
@@ -396,6 +407,12 @@ async fn route_get(
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
+        if let Some(epoch) = &topo.bootstrap_epoch {
+            response
+                .headers_mut()
+                .insert("x-sglang-bootstrap-epoch", epoch.clone());
+        }
+        return response;
     }
 
     match topo.prefill_ranks.get(&(dp, cp, tp, pp)) {
