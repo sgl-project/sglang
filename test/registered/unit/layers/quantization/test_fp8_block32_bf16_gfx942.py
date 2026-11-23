@@ -98,11 +98,47 @@ class TestGfx942Block32Bf16Linear(CustomTestCase):
                 layer, _ = _build_layer(n, k, weight.clone(), scale)
                 has_cache = getattr(layer, "_block_fp8_bf16_weight", None) is not None
                 self.assertEqual(has_cache, cached)
+                # The rejection must not depend on this shard's scales, or TP
+                # ranks would disagree on whether an online update is allowed.
+                self.assertIn(
+                    "gfx942", getattr(layer, "_derived_weight_cache_error", None) or ""
+                )
 
     def test_cache_rejects_online_updates(self):
         layer, _ = _build_layer(64, 128)
         self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
         self.assertIn("gfx942", layer._derived_weight_cache_error)
+
+    def test_explicit_triton_backend_keeps_fp8_path(self):
+        n, k, m = 64, 128, 6
+
+        def fake_group_quant(x, group_size, **kwargs):
+            q = torch.zeros_like(x, dtype=torch.float8_e4m3fnuz)
+            return q, torch.ones(x.shape[0], k // group_size, device=x.device)
+
+        fake_matmul = mock.Mock(
+            return_value=torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+        )
+        # Only the dispatch is checked: the ROCm group32 ue8m0 activation quant
+        # fails on its own, independently of this cache.
+        with (
+            mock.patch.object(
+                fp8_utils,
+                "FP8_GEMM_RUNNER_BACKEND",
+                fp8_utils.Fp8GemmRunnerBackend.TRITON,
+            ),
+            mock.patch.object(
+                fp8_utils, "sglang_per_token_group_quant_fp8", fake_group_quant
+            ),
+            mock.patch.object(fp8_utils, "per_token_group_quant_fp8", fake_group_quant),
+            mock.patch.object(fp8_utils, "w8a8_block_fp8_matmul_triton", fake_matmul),
+        ):
+            layer, _ = _build_layer(n, k)
+            x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            layer.quant_method.apply(layer, x)
+        self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
+        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
+        self.assertTrue(fake_matmul.called)
 
 
 if __name__ == "__main__":

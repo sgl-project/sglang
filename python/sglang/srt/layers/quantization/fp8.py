@@ -69,6 +69,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -914,7 +915,9 @@ class Fp8LinearMethod(LinearMethodBase):
             and weight.dtype == torch.float8_e4m3fn
         )
         gfx942_bf16_cache = (
-            _is_gfx942_supported and weight.dtype == torch.float8_e4m3fnuz
+            _is_gfx942_supported
+            and get_fp8_gemm_runner_backend().is_auto()
+            and weight.dtype == torch.float8_e4m3fnuz
         )
         if (
             (hopper_bf16_cache or gfx942_bf16_cache)
@@ -928,32 +931,38 @@ class Fp8LinearMethod(LinearMethodBase):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
             from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
-            # Keep every finite E4M3 value (down to 2^-9, or 2^-10 for FNUZ) a normal
-            # BF16 after scaling, and reject mislabeled non-power-of-two scales.
-            min_exact_scale = 2.0**-116 if gfx942_bf16_cache else 2.0**-117
-            exact_bf16_scales = (
-                (weight_scale >= min_exact_scale)
-                & (weight_scale <= 2.0**119)
-                & (torch.frexp(weight_scale)[0] == 0.5)
-            ).all()
-            if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
-                # Group32 FP8 GEMMs on Hopper and gfx942 are K-loop bound; reuse a BF16
-                # expansion, keeping the original FP8 weights for fallbacks and reloads.
-                layer.register_buffer(
-                    "_block_fp8_bf16_weight",
-                    block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
-                    persistent=False,
-                )
+            if not is_batch_invariant_mode_enabled():
+                # Set from startup-determined checks only, so every TP rank rejects
+                # online updates together even where this shard's scales keep FP8.
                 layer._derived_weight_cache_error = (
                     "Online weight updates are not supported for group32 FP8 "
-                    "weights on gfx942: captured CUDA graphs retain their BF16 "
-                    "expansions."
+                    "weights on gfx942: captured CUDA graphs may retain their BF16 "
+                    "expansions. Restart with --fp8-gemm-backend triton to allow "
+                    "online updates."
                     if gfx942_bf16_cache
-                    else "Online weight updates are not supported while Hopper FP8 "
-                    "BF16 weight caches are active: captured CUDA graphs retain "
-                    "these derived weights. Restart with "
-                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                    else "Online weight updates are not supported for Hopper group32 "
+                    "FP8 weights: captured CUDA graphs may retain their BF16 "
+                    "expansions. Restart with SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to "
+                    "allow online updates."
                 )
+                # Keep every finite E4M3 value (down to 2^-9, or 2^-10 for FNUZ) a
+                # normal BF16 after scaling; reject mislabeled non-power-of-two scales.
+                min_exact_scale = 2.0**-116 if gfx942_bf16_cache else 2.0**-117
+                exact_bf16_scales = (
+                    (weight_scale >= min_exact_scale)
+                    & (weight_scale <= 2.0**119)
+                    & (torch.frexp(weight_scale)[0] == 0.5)
+                ).all()
+                if exact_bf16_scales.item():
+                    # Group32 FP8 GEMMs on Hopper and gfx942 are K-loop bound; reuse
+                    # a BF16 expansion, keeping the FP8 weights for fallbacks.
+                    layer.register_buffer(
+                        "_block_fp8_bf16_weight",
+                        block_quant_dequant(
+                            weight, weight_scale, [32, 32], torch.bfloat16
+                        ),
+                        persistent=False,
+                    )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
 
