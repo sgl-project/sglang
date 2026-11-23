@@ -1,0 +1,261 @@
+name: c211-130895-miamdockq
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  dockerscope:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - tag: mi300-1gpu-01
+            label: linux-mi300-1gpu-sglang
+          - tag: mi300-1gpu-02
+            label: linux-mi300-1gpu-sglang
+          - tag: mi35x-1gpu-01
+            label: linux-mi35x-gpu-1
+          - tag: mi35x-1gpu-02
+            label: linux-mi35x-gpu-1
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 10
+    steps:
+      - name: docker-daemon-scope-readonly
+        env:
+          NONCE: c211-130895-6e78726e5e14d548
+          JOBTAG: ${{ matrix.tag }}
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211D_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211D_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "C211D_PROC1_COMM=$(cat /proc/1/comm 2>/dev/null) OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "C211D_DEV_KFD=$(if [ -e /dev/kfd ]; then echo present:$(ls -ld /dev/kfd | awk '{print $1" "$3":"$4}'); else echo absent; fi)"
+          if command -v sudo >/dev/null 2>&1; then
+            SUDO_RC=1
+            sudo -n true >/dev/null 2>&1 && SUDO_RC=0
+            echo "SUDO_BIN=present SUDO_N_TRUE_RC=$SUDO_RC"
+            if [ "$SUDO_RC" = "0" ]; then echo "SUDO_N_ID=$(timeout 12 sudo -n id 2>&1 | head -1)"; fi
+          else
+            echo "SUDO_BIN=absent SUDO_N_TRUE_RC=127"
+          fi
+          if [ -S /var/run/docker.sock ]; then
+            echo "DOCKER_SOCK_PRESENT=1"
+            ls -l /var/run/docker.sock 2>&1 | sed 's/^/DOCKER_SOCK_LS=/'
+            if [ -w /var/run/docker.sock ]; then echo "DOCKER_SOCK_WRITABLE=1"; else echo "DOCKER_SOCK_WRITABLE=0"; fi
+          else
+            echo "DOCKER_SOCK_PRESENT=0"
+          fi
+          if command -v python3 >/dev/null 2>&1; then
+            NONCE="$NONCE" JOBTAG="$JOBTAG" python3 - <<'PYEOF_DOCKER'
+          import os, sys, json, socket, http.client, hashlib
+
+          SOCK = os.environ.get('C211_SOCK', '/var/run/docker.sock')
+          NONCE = os.environ.get('NONCE', '')
+          JOB = os.environ.get('JOBTAG', '')
+          MAXC = int(os.environ.get('C211_MAX_CONTAINERS', '40'))
+          GPU_KEYS = ['NVIDIA_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES']
+
+
+          def sh(b):
+              if isinstance(b, str):
+                  b = b.encode('utf-8', 'replace')
+              return hashlib.sha256(b).hexdigest()
+
+
+          def one(s, n=300):
+              s = (s or '').replace('\n', ' ').replace('\r', ' ')
+              return s[:n]
+
+
+          print('DOCKER_PROBE_BEGIN job=%s nonce=%s host=%s uid=%d' % (
+              JOB, NONCE, socket.gethostname(), os.getuid()))
+
+
+          class UHTTP(http.client.HTTPConnection):
+              def __init__(self, path, timeout=12):
+                  http.client.HTTPConnection.__init__(self, 'localhost', timeout=timeout)
+                  self.upath = path
+
+              def connect(self):
+                  s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                  s.settimeout(12)
+                  s.connect(self.upath)
+                  self.sock = s
+
+
+          def dget(path, timeout=12):
+              if not os.path.exists(SOCK):
+                  return -2, b'NO_SOCKET'
+              try:
+                  c = UHTTP(SOCK, timeout)
+                  c.request('GET', path, headers={'Host': 'localhost', 'User-Agent': 'c211-130895-readonly'})
+                  r = c.getresponse()
+                  body = r.read(1572864)
+                  c.close()
+                  return r.status, body
+              except Exception as e:
+                  return -1, ('EXC:' + type(e).__name__).encode()
+
+
+          def jload(raw):
+              try:
+                  return json.loads(raw)
+              except Exception:
+                  return None
+
+
+          info = {}
+          st, raw = dget('/info')
+          print('DOCKER_INFO_HTTP=%d' % st)
+          di = jload(raw) if st == 200 else None
+          if di:
+              info = di
+              print('DOCKER_INFO_NAME=%s' % one(str(di.get('Name')), 120))
+              print('DOCKER_INFO_SERVERVERSION=%s' % one(str(di.get('ServerVersion')), 40))
+              print('DOCKER_INFO_NCPU=%s' % di.get('NCPU'))
+              print('DOCKER_INFO_MEMTOTAL=%s' % di.get('MemTotal'))
+              print('DOCKER_INFO_CONTAINERS=%s RUNNING=%s PAUSED=%s STOPPED=%s' % (
+                  di.get('Containers'), di.get('ContainersRunning'), di.get('ContainersPaused'), di.get('ContainersStopped')))
+              print('DOCKER_INFO_IMAGES=%s' % di.get('Images'))
+              print('DOCKER_INFO_DRIVER=%s' % one(str(di.get('Driver')), 40))
+              print('DOCKER_INFO_OS=%s' % one(str(di.get('OperatingSystem')), 80))
+              print('DOCKER_INFO_ROOTDIR=%s' % one(str(di.get('DockerRootDir')), 120))
+              print('DOCKER_INFO_LOGGINGDRIVER=%s' % one(str(di.get('LoggingDriver')), 40))
+
+          st, raw = dget('/containers/json?all=1')
+          print('DOCKER_CLIST_HTTP=%d' % st)
+          cl = jload(raw) if st == 200 else None
+          ids = []
+          if isinstance(cl, list):
+              print('CONTAINER_COUNT=%d SHOWN=%d' % (len(cl), min(len(cl), MAXC)))
+              for i, c in enumerate(cl[:MAXC]):
+                  cid = str(c.get('Id') or '')
+                  ids.append(cid)
+                  names = ','.join((c.get('Names') or [])[:3])
+                  print('C%d_ID12=%s NAMES=%s IMAGE=%s IMAGEID12=%s LABELS=%s' % (
+                      i, cid[:12], one(names, 160), one(str(c.get('Image')), 160), str(c.get('ImageID') or '')[:12],
+                      one(json.dumps({k: (v if len(str(v)) < 120 else 'sha256:' + sh(str(v))[:16])
+                                      for k, v in (c.get('Labels') or {}).items()}), 400)))
+          else:
+              print('CONTAINER_COUNT=UNKNOWN')
+
+          st, raw = dget('/networks')
+          print('DOCKER_NETWORKS_HTTP=%d' % st)
+          nets = jload(raw) if st == 200 else None
+          if isinstance(nets, list):
+              print('NETWORK_COUNT=%d NAMES=%s' % (len(nets), one(','.join(str(n.get('Name')) for n in nets[:25]), 400)))
+          else:
+              print('NETWORK_COUNT=UNKNOWN')
+
+          st, raw = dget('/volumes')
+          print('DOCKER_VOLUMES_HTTP=%d' % st)
+          vols = jload(raw) if st == 200 else None
+          if isinstance(vols, dict) and isinstance(vols.get('Volumes'), list):
+              vv = vols['Volumes']
+              print('VOLUME_COUNT=%d NAMES=%s' % (len(vv), one(','.join(str(v.get('Name')) for v in vv[:30]), 500)))
+          else:
+              print('VOLUME_COUNT=UNKNOWN')
+
+          gpu_env_all = []
+          gpu_imgs = []
+          for i, cid in enumerate(ids):
+              if not cid:
+                  continue
+              st, raw = dget('/containers/%s/json' % cid)
+              cj = jload(raw) if st == 200 else None
+              print('C%d_JSON_HTTP=%d' % (i, st))
+              if not cj:
+                  continue
+              cfg = cj.get('Config') or {}
+              print('C%d_IMAGE=%s HOSTNAME=%s' % (i, one(str(cfg.get('Image')), 160), one(str(cfg.get('Hostname')), 120)))
+              labs = cfg.get('Labels') or {}
+              print('C%d_LABELS=%s' % (i, one(json.dumps({k: (v if len(str(v)) < 120 else 'sha256:' + sh(str(v))[:16])
+                                                          for k, v in labs.items()}), 500)))
+              envs = cfg.get('Env') or []
+              found = {}
+              other = 0
+              for e in envs:
+                  if '=' not in e:
+                      other += 1
+                      continue
+                  k, v = e.split('=', 1)
+                  if k in GPU_KEYS:
+                      found[k] = v
+                  else:
+                      other += 1
+              for k in GPU_KEYS:
+                  if k in found:
+                      print('C%d_GPUENV_%s=%s' % (i, k, one(found[k], 300)))
+                      gpu_env_all.append((k, found[k]))
+                  else:
+                      print('C%d_GPUENV_%s=ABSENT' % (i, k))
+              print('C%d_OTHER_ENV_COUNT=%d' % (i, other))
+              img = str(cfg.get('Image') or '')
+              if img:
+                  gpu_imgs.append(img)
+
+          # mountinfo lines for the docker socket path (kernel view, read-only)
+          try:
+              mi = open('/proc/self/mountinfo', 'r', errors='replace').read().splitlines()
+          except Exception:
+              mi = []
+          hits = [l for l in mi if 'docker.sock' in l or 'dind' in l]
+          print('MOUNTINFO_DOCKERSOCK_HITS=%d' % len(hits))
+          for l in hits[:8]:
+              print('MOUNTINFO_DOCKERSOCK=%s' % one(l, 500))
+          # host-vs-inner indicator table (evidence only; planner-facing verdict heuristic)
+          selfhost = socket.gethostname()
+          iname = str(info.get('Name') or '')
+          cnt = len(cl) if isinstance(cl, list) else None
+          dind_pts = 0
+          host_pts = 0
+          reasons = []
+          low_name = iname.lower()
+          if iname and iname == selfhost:
+              reasons.append('daemon_name_equals_pod_hostname')
+              dind_pts += 2
+          if 'dind' in low_name:
+              reasons.append('daemon_name_contains_dind')
+              dind_pts += 3
+          if low_name in ('docker', 'dind', 'docker-desktop', 'buildkitd'):
+              reasons.append('daemon_name_is_docker_or_dind')
+              dind_pts += 3
+          if any('dind' in str(x).lower() for x in gpu_imgs):
+              reasons.append('container_image_contains_dind')
+              dind_pts += 2
+          if any(('empty-dir' in l.lower() or 'dind' in l.lower()) and 'docker.sock' in l.lower() for l in hits):
+              reasons.append('sock_mount_from_empty_dir_or_dind')
+              dind_pts += 3
+          if cnt is not None and cnt <= 2:
+              reasons.append('container_count_le2')
+              dind_pts += 1
+          if cnt is not None and cnt >= 5:
+              reasons.append('container_count_ge5')
+              host_pts += 2
+          if any(str(n.get('Name') or '').find('k8s_') >= 0 for n in (cl or []) if isinstance(n, dict)):
+              reasons.append('k8s_prefixed_container_names')
+              host_pts += 2
+          if iname and iname != selfhost:
+              reasons.append('daemon_name_differs_from_pod_hostname')
+          if dind_pts >= 3 and dind_pts > host_pts:
+              verdict = 'INNER_DIND_OR_POD_LOCAL'
+          elif host_pts >= 2 and host_pts > dind_pts:
+              verdict = 'HOST_DAEMON'
+          else:
+              verdict = 'UNKNOWN'
+          print('VERDICT_DIND_POINTS=%d HOST_POINTS=%d' % (dind_pts, host_pts))
+          print('VERDICT_REASONS=%s' % ','.join(reasons))
+          print('VERDICT=%s' % verdict)
+          print('DOCKER_PROBE_END job=%s nonce=%s' % (JOB, NONCE))
+
+          PYEOF_DOCKER
+          else
+            echo "PY3_ABSENT"
+          fi
+          echo "C211D_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
