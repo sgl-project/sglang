@@ -1,3 +1,4 @@
+import argparse
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -94,11 +95,14 @@ class TestA3MegaMoE(CustomTestCase):
     def test_w4a8_layout_scale_bits_and_compensation(self):
         layer = make_layer()
         expected = layer.w13_weight[0].transpose(-2, -1).contiguous().view(torch.int32)
+        bias = layer.w2_scale_bias.data
+        bias.copy_(torch.arange(bias.numel(), dtype=torch.float32).reshape_as(bias))
+        expected_w2_bias = bias[0].sum(dim=-1)
         self.prepare(layer)
         torch.testing.assert_close(layer.w13_weight[0], expected)
         self.assertEqual(layer.w2_weight[0].shape, (1024, 128))
         self.assertEqual(layer.w13_weight_scale[0].tolist(), [0x40000000] * 2048)
-        torch.testing.assert_close(layer.w2_scale_bias[0], torch.full((1024,), 2.0))
+        torch.testing.assert_close(layer.w2_scale_bias[0], expected_w2_bias)
         first = layer.w13_weight
         self.prepare(layer)
         self.assertIs(layer.w13_weight, first)
@@ -476,7 +480,9 @@ class TestA3MegaMoE(CustomTestCase):
             result.__dict__.update(attributes)
             return result
 
-        loader = Mock(return_value=(lambda: None, compatible))
+        def loader():
+            return lambda: None, compatible
+
         strategy = module(
             "fused_strategy", MegaMoeStrategy=SimpleNamespace(_load_mega_moe_ops=loader)
         )
@@ -507,10 +513,15 @@ class TestA3MegaMoE(CustomTestCase):
         ):
             _, operator = fuseep._check_mega_moe_support()
         self.assertIs(operator, compatible)
-        loader.assert_called_once_with()
 
-    def test_cli_rejects_unsupported_mode_three_combinations(self):
+    def test_mode_three_cli_and_unsupported_combinations(self):
         from sglang.srt.arg_groups.overrides import _a2a_fusion_adjustments
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(["--model-path", "dummy", "--fuseep-mode", "3"])
+        self.assertEqual(args.fuseep_mode, 3)
 
         valid = dict(
             fuseep_mode=3,
