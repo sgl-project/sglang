@@ -69,6 +69,20 @@ Use `perf_dump_path` for a lightweight timing report instead of a profiler trace
 Run latency benchmarks separately with profiling disabled, since collecting a
 trace adds overhead.
 
+### Disk weight updates
+
+On a running diffusion server, call `POST /start_profile`, submit
+`POST /update_weights_from_disk`, and call `POST /stop_profile` after the update
+returns. Open the worker's `*-rank-<rank>.trace.json.gz` and search for
+`WEIGHT UPDATE`. The worker trace breaks down conditioning-cache invalidation,
+checkpoint resolution and validation, weight loading for each selected module,
+and cleanup. If applying weights fails and the worker restores the previous
+weights, a separate rollback span captures that work.
+
+Use CPU profiling activities to see the named host spans. Include CUDA
+activities on supported deployments to see device work alongside those spans.
+Use a local checkpoint when measuring disk updates without download time.
+
 ### Output Location
 
 By default, trace files are saved in the ./logs/ directory.

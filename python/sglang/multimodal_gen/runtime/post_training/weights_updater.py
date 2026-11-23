@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -365,6 +366,7 @@ class WeightsUpdater:
             self._module_weight_dirs = {}
             pipeline._weights_updater_module_weight_dirs = self._module_weight_dirs
 
+    @maybe_record_function("WEIGHT UPDATE disk")
     def update_weights_from_disk(
         self,
         model_path: str,
@@ -372,7 +374,8 @@ class WeightsUpdater:
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Update model weights from disk without restarting the server."""
-        invalidate_conditioning_caches()
+        with maybe_record_function("WEIGHT UPDATE invalidate conditioning caches"):
+            invalidate_conditioning_caches()
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
@@ -391,30 +394,32 @@ class WeightsUpdater:
             return False, error_msg
 
         try:
-            local_model_path = maybe_download_model(model_path)
+            with maybe_record_function("WEIGHT UPDATE resolve checkpoint"):
+                local_model_path = maybe_download_model(model_path)
         except Exception as e:
             return False, f"Failed to download model: {e}"
 
-        weights_map, missing = _validate_weight_files(
-            local_model_path, modules_to_update
-        )
-        if missing:
-            error_msg = (
-                f"Cannot update weights: missing weight files for modules: {missing}. "
-                f"No partial updates allowed."
+        with maybe_record_function("WEIGHT UPDATE validate checkpoint"):
+            weights_map, missing = _validate_weight_files(
+                local_model_path, modules_to_update
             )
-            logger.error(error_msg)
-            return False, error_msg
+            if missing:
+                error_msg = (
+                    f"Cannot update weights: missing weight files for modules: {missing}. "
+                    f"No partial updates allowed."
+                )
+                logger.error(error_msg)
+                return False, error_msg
 
-        try:
-            for module_name, module in modules_to_update:
-                if isinstance(module, BaseDiT):
-                    module.validate_weight_update_source(
-                        weights_path=weights_map[module_name]
-                    )
-        except ValueError as e:
-            logger.error(str(e))
-            return False, str(e)
+            try:
+                for module_name, module in modules_to_update:
+                    if isinstance(module, BaseDiT):
+                        module.validate_weight_update_source(
+                            weights_path=weights_map[module_name]
+                        )
+            except ValueError as e:
+                logger.error(str(e))
+                return False, str(e)
 
         logger.info(
             f"Updating {len(weights_map)} modules: "
@@ -423,27 +428,28 @@ class WeightsUpdater:
 
         success, message = self._apply_weights(modules_to_update, weights_map)
 
-        if success:
-            for module_name, _ in modules_to_update:
-                self._module_weight_dirs[module_name] = weights_map[module_name]
-            if target_modules is None:
-                self.pipeline.model_path = local_model_path
-            for module_name, module in modules_to_update:
-                if isinstance(module, BaseDiT):
-                    # Weight-derived caches must not survive a weight swap
-                    # (regardless of flush_cache, which only governs
-                    # optimization caches like TeaCache).
-                    module.refresh_weight_derived_caches(
-                        weights_path=weights_map[module_name]
-                    )
+        with maybe_record_function("WEIGHT UPDATE cleanup"):
+            if success:
+                for module_name, _ in modules_to_update:
+                    self._module_weight_dirs[module_name] = weights_map[module_name]
+                if target_modules is None:
+                    self.pipeline.model_path = local_model_path
+                for module_name, module in modules_to_update:
+                    if isinstance(module, BaseDiT):
+                        # Weight-derived caches must not survive a weight swap
+                        # (regardless of flush_cache, which only governs
+                        # optimization caches like TeaCache).
+                        module.refresh_weight_derived_caches(
+                            weights_path=weights_map[module_name]
+                        )
 
-        gc.collect()
-        torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        if success and flush_cache:
-            for _, module in modules_to_update:
-                if isinstance(module, TeaCacheMixin):
-                    module.reset_teacache_state()
+            if success and flush_cache:
+                for _, module in modules_to_update:
+                    if isinstance(module, TeaCacheMixin):
+                        module.reset_teacache_state()
 
         logger.info(message)
         return success, message
@@ -481,8 +487,9 @@ class WeightsUpdater:
 
         for module_name, module in modules_to_update:
             try:
-                weights_iter = _get_weights_iter(weights_map[module_name])
-                _load_weights_into_module(module, weights_iter)
+                with maybe_record_function(f"WEIGHT UPDATE load {module_name}"):
+                    weights_iter = _get_weights_iter(weights_map[module_name])
+                    _load_weights_into_module(module, weights_iter)
                 updated_modules.append(module_name)
             except Exception as e:
                 rollback_list = updated_modules + [module_name]
@@ -493,7 +500,8 @@ class WeightsUpdater:
                     f"{rollback_list}.",
                     exc_info=True,
                 )
-                self._rollback(rollback_list)
+                with maybe_record_function("WEIGHT UPDATE rollback"):
+                    self._rollback(rollback_list)
                 return False, (
                     f"Failed to update module '{module_name}': {e}. "
                     f"All modules rolled back to original weights."
