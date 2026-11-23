@@ -383,11 +383,7 @@ def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
 
 
 @pytest.mark.skipif(is_xpu(), reason="MiniMax MHA block swap-in has no XPU kernel.")
-# 960 is the production swap_in_block_size.
-@pytest.mark.parametrize("block_size", [256, 960])
-def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block(
-    block_size: int,
-) -> None:
+def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block() -> None:
     """A partial newest block must not consume slots for its invalid tail."""
     sparse_block_size = 4
     hot_buffer_size = 8
@@ -444,7 +440,6 @@ def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block(
         item_size_bytes=ITEM_SIZE_BYTES,
         hot_buffer_size=hot_buffer_size,
         sparse_block_size=sparse_block_size,
-        block_size=block_size,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
     get_device_module().synchronize()
@@ -496,7 +491,7 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
 
 @pytest.mark.skipif(
     not is_hip(),
-    reason="CUDA transfer_rows_warp assumes 16B-aligned items with no sub-8B remainder.",
+    reason="CUDA transfer_item_warp assumes 16B-aligned items with no sub-8B remainder.",
 )
 @pytest.mark.parametrize(
     "kv_dim,miss_token",
@@ -759,15 +754,15 @@ def test_late_bound_host_binding_honours_a_wider_row_stride() -> None:
 
 
 @_requires_shared_sources
-# 656 B (GLM-5.2 FP8 MLA) at 960 threads; 1152 B, two 1 KiB chunks at 256 threads;
+# 656 B (GLM-5.2 FP8 MLA) at 960 threads; 1152 B spans two 1 KiB chunks at 256 threads;
 # 24 B, one 16 B pair plus the 8 B remainder.
 @pytest.mark.parametrize("kv_dim,block_size", [(164, 960), (288, 256), (6, 256)])
 def test_many_misses_copy_byte_exact_through_a_strided_host(
     kv_dim: int, block_size: int
 ) -> None:
-    """Each miss must land byte-exactly, and nowhere else, when a warp copies several.
+    """Each miss must land byte-exactly, and nowhere else.
 
-    40 misses leave warps more than one miss and a partial last batch;
+    40 misses give some warps more than one;
     rows come through a page_first host stride and permuted host and device maps.
     """
     # Four layers keep host rows 16 B aligned (CUDA needs it); so do even device rows.
