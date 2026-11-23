@@ -128,12 +128,15 @@ def test_fused_kv_materialize_workspace_rounds_256_invalidates_before_release_an
 
     helper = _make_minimal_fused_kv_helper(on_workspace_reset=_on_reset)
 
-    # First allocation does not invoke on_workspace_reset.
+    fresh_helper = _make_minimal_fused_kv_helper(on_workspace_reset=_on_reset)
+    fresh_helper._ensure_workspace(512, torch.float16)
+    assert fresh_helper._workspace_capacity == 512
+    assert events == []
+
     helper._ensure_workspace(64, torch.float16)
     assert helper._workspace_capacity == 256
     assert events == []
 
-    # Growing to 512 rounds to 512 (not 8192) and invalidates before freeing.
     orig_empty = torch.empty
 
     def _spy_empty(*args, **kwargs):
@@ -153,7 +156,7 @@ def test_fused_kv_materialize_workspace_rounds_256_invalidates_before_release_an
         "sglang.kernels.ops.speculative.fused_kv_materialize.torch.empty",
         side_effect=_spy_empty,
     ):
-        helper._ensure_workspace(512, torch.float16)
+        helper._ensure_workspace(272, torch.float16)
 
     assert events == [
         ("reset", 256, True, True, True),
@@ -161,21 +164,29 @@ def test_fused_kv_materialize_workspace_rounds_256_invalidates_before_release_an
     ]
     assert helper._workspace_capacity == 512
 
-    # Growing to 8015 rounds to 8192; subsequent 8192 reuses without doubling to 16030.
+    helper._ensure_workspace(528, torch.float16)
+    assert helper._workspace_capacity == 1024
+    assert len(events) == 3
+
+    proj_1024 = helper._proj_workspace
+    helper._ensure_workspace(784, torch.float16)
+    assert helper._workspace_capacity == 1024
+    assert helper._proj_workspace is proj_1024
+    assert len(events) == 3
+
     helper._ensure_workspace(8015, torch.float16)
     assert helper._workspace_capacity == 8192
-    assert len(events) == 3
+    assert len(events) == 4
 
     old_proj = helper._proj_workspace
     helper._ensure_workspace(8192, torch.float16)
     assert helper._workspace_capacity == 8192
     assert helper._proj_workspace is old_proj
-    assert len(events) == 3
+    assert len(events) == 4
 
-    # Above 8192 rounds up to the next 256-token multiple rather than doubling.
     helper._ensure_workspace(8193, torch.float16)
     assert helper._workspace_capacity == 8448
-    assert len(events) == 4
+    assert len(events) == 5
 
 
 def test_fused_kv_materialize_workspace_oom_leaves_clean_state():

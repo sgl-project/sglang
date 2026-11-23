@@ -379,9 +379,6 @@ class FusedKVMaterializeHelper:
         ):
             return
 
-        # Invalidate any cached CUDA graphs referencing the previous workspace
-        # buffers before freeing them, then release before allocating larger
-        # buffers to avoid 2x transient memory spikes.
         had_workspace = (
             self._workspace_capacity > 0
             or self._proj_workspace is not None
@@ -392,16 +389,21 @@ class FusedKVMaterializeHelper:
         if had_workspace and on_workspace_reset is not None:
             on_workspace_reset()
 
+        prev_capacity = (
+            self._workspace_capacity if self._workspace_dtype == dtype else 0
+        )
+
         self._proj_workspace = None
         self._k_workspace = None
         self._v_workspace = None
         self._workspace_capacity = 0
         self._workspace_dtype = None
 
-        # Round up to the next 256-row multiple instead of doubling or jumping
-        # straight to 8192 so small prefills stay lightweight while 8015 -> 8192
-        # still avoids doubling to 16030.
-        new_capacity = ((max(1, total_ctx) + 255) // 256) * 256
+        aligned_ctx = ((max(1, total_ctx) + 255) // 256) * 256
+        if prev_capacity > 0 and aligned_ctx <= 8192:
+            new_capacity = min(8192, max(aligned_ctx, prev_capacity * 2))
+        else:
+            new_capacity = aligned_ctx
 
         proj_workspace = torch.empty(
             (new_capacity, self.n_layers * self.layer_out_dim),
