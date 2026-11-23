@@ -47,6 +47,23 @@ class PriorityStrategy(EvictionStrategy):
         return (node.priority, node.last_access_time)
 
 
+def to_eviction_priority_key(priority: int, low_priority_values_first: bool) -> int:
+    """Convert a request priority into the eviction sort key stored on a tree node.
+
+    The eviction heap always pops the smallest key first and shared-prefix
+    nodes propagate the ``max()`` of their children's keys, so the stored key
+    must rank the *least* urgent prefix smallest. By default larger values
+    are more urgent, so the raw value already is that key. With
+    ``--schedule-low-priority-values-first`` smaller values are more urgent,
+    so the key is the negated value: the most urgent request (smallest value)
+    gets the largest key and is evicted last, and ``max()`` propagation keeps
+    a shared prefix alive as long as any urgent request uses it. The root
+    sentinel (``-sys.maxsize``) stays below every real key in both directions,
+    so no propagation or sentinel change is needed.
+    """
+    return -priority if low_priority_values_first else priority
+
+
 class TLRUStrategy(EvictionStrategy):
     """Tail-Optimized LRU (Zhang et al., arXiv:2510.15152).
 

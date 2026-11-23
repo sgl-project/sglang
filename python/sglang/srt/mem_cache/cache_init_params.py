@@ -33,6 +33,11 @@ class CacheInitParams:
     # Keyword arguments for the eviction policy's constructor; see the strategy
     # classes in evict_policy.py for what each policy accepts.
     eviction_policy_config: Optional[dict[str, Any]] = None
+    # True when --schedule-low-priority-values-first is set: lower request
+    # priority values are more urgent. Trees that evict by priority store the
+    # eviction sort key (see to_eviction_priority_key in evict_policy.py)
+    # in node.priority, so eviction follows the same direction as scheduling.
+    schedule_low_priority_values_first: bool = False
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False

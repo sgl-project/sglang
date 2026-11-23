@@ -1224,5 +1224,102 @@ class TestRadixCache(CustomTestCase):
         self.assertLess(torch_allocated, cache_size_bytes * 2)
 
 
+class TestRadixCachePriorityEvictionDirection(CustomTestCase):
+    """Regression tests for sgl-project/sglang#52423.
+
+    ``--radix-eviction-policy priority`` must evict the least urgent prefix
+    first in both priority directions: by default larger values are more
+    urgent, while ``--schedule-low-priority-values-first`` makes smaller
+    values more urgent.
+    """
+
+    def setUp(self):
+        TreeNode.counter = 0
+
+    def _make_cache(self, low_priority_values_first):
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+        return RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=mock_allocator,
+                page_size=1,
+                eviction_policy="priority",
+                schedule_low_priority_values_first=low_priority_values_first,
+            )
+        )
+
+    def _insert(self, cache, tokens, priority):
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=torch.tensor([t * 10 for t in tokens], dtype=torch.int64),
+                priority=priority,
+            )
+        )
+
+    def _match_len(self, cache, tokens):
+        return cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).device_prefix_len
+
+    def test_default_direction_evicts_smallest_priority_first(self):
+        # Default: larger value = higher priority, so the priority-0 prefix
+        # is the least urgent and is evicted first (pre-existing behavior).
+        cache = self._make_cache(low_priority_values_first=False)
+        self._insert(cache, [1, 2, 3], priority=0)
+        self._insert(cache, [4, 5, 6], priority=100)
+
+        result = cache.evict(EvictParams(num_tokens=3))
+
+        self.assertEqual(result.num_tokens_evicted, 3)
+        self.assertEqual(self._match_len(cache, [1, 2, 3]), 0)
+        self.assertEqual(self._match_len(cache, [4, 5, 6]), 3)
+
+    def test_low_values_first_evicts_largest_priority_first(self):
+        # With --schedule-low-priority-values-first, 0 is the most urgent
+        # and 100 the least urgent, so the priority-100 prefix is evicted
+        # first instead of the priority-0 one.
+        cache = self._make_cache(low_priority_values_first=True)
+        self._insert(cache, [1, 2, 3], priority=0)
+        self._insert(cache, [4, 5, 6], priority=100)
+
+        result = cache.evict(EvictParams(num_tokens=3))
+
+        self.assertEqual(result.num_tokens_evicted, 3)
+        self.assertEqual(self._match_len(cache, [1, 2, 3]), 3)
+        self.assertEqual(self._match_len(cache, [4, 5, 6]), 0)
+
+    def test_low_values_first_shared_prefix_kept_for_urgent_request(self):
+        # Shared prefix [1, 2, 3] used by an urgent request (priority 0) and
+        # a low-priority one (100): the shared node must carry the urgent
+        # request's eviction key, so the low-priority leaf evicts first.
+        cache = self._make_cache(low_priority_values_first=True)
+        self._insert(cache, [1, 2, 3, 4], priority=0)
+        self._insert(cache, [1, 2, 3, 5], priority=100)
+
+        (shared_node,) = cache.root_node.children.values()
+        self.assertEqual(len(shared_node.key), 3)
+        self.assertEqual(shared_node.priority, 0)
+
+        result = cache.evict(EvictParams(num_tokens=1))
+
+        self.assertEqual(result.num_tokens_evicted, 1)
+        self.assertEqual(self._match_len(cache, [1, 2, 3, 4]), 4)
+        self.assertEqual(self._match_len(cache, [1, 2, 3, 5]), 3)
+
+    def test_default_direction_shared_prefix_key(self):
+        # Same shared prefix, default direction: the shared node carries
+        # max(0, 100) = 100, the most urgent request's eviction key.
+        cache = self._make_cache(low_priority_values_first=False)
+        self._insert(cache, [1, 2, 3, 4], priority=0)
+        self._insert(cache, [1, 2, 3, 5], priority=100)
+
+        (shared_node,) = cache.root_node.children.values()
+        self.assertEqual(len(shared_node.key), 3)
+        self.assertEqual(shared_node.priority, 100)
+
+
 if __name__ == "__main__":
     unittest.main()

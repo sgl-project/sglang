@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
+from sglang.srt.mem_cache.evict_policy import to_eviction_priority_key
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -265,7 +266,9 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
-        # priority for priority-aware eviction
+        # priority for priority-aware eviction: the eviction sort key (the
+        # request priority, negated when --schedule-low-priority-values-first
+        # is set; see to_eviction_priority_key in evict_policy.py).
         self.priority = priority
 
         self.id = TreeNode.counter if id is None else id
@@ -316,6 +319,14 @@ class RadixCache(BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(
             "lru" if self.disable else self.eviction_policy,
             None if self.disable else params.eviction_policy_config,
+        )
+        # With --schedule-low-priority-values-first, lower request priority
+        # values are more urgent; _insert_helper stores the negated value as
+        # the node's eviction key so the smallest-first heap evicts the least
+        # urgent prefix first. Only the priority policy reads node.priority.
+        self._negate_priority_on_insert = (
+            self.eviction_policy == "priority"
+            and params.schedule_low_priority_values_first
         )
 
         self.evictable_leaves = set()
@@ -720,6 +731,11 @@ class RadixCache(BasePrefixCache):
         # Convert None priority to 0
         if priority is None:
             priority = 0
+        # Store the eviction sort key, not the raw request priority: with
+        # --schedule-low-priority-values-first the key is the negated value,
+        # so the existing max() propagation and root sentinel stay correct
+        # in both directions (see to_eviction_priority_key).
+        priority = to_eviction_priority_key(priority, self._negate_priority_on_insert)
         access_time = time.monotonic()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
