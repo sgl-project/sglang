@@ -1307,7 +1307,7 @@ class LowRatioCompressAscendBackendMixin:
     Mirrors ``DeepseekV4AttnBackend.forward_low_ratio_sources`` but keeps its own
     orchestration: ``deepseek_v4_backend`` imports Triton kernels at module scope,
     and the two generations differ in kernels and cache row formats. The
-    context-parallel and prefill-graph branches are CUDA-only.
+    prefill-graph branch is CUDA-only.
 
     Unlike CUDA, the compress step hands its pre-RoPE ``latent`` to the index
     step, because ``indexer_prologue_k`` projects the index K from that latent.
@@ -1332,22 +1332,36 @@ class LowRatioCompressAscendBackendMixin:
     def _prepare_dsv41_cp_read_metadata(self, forward_batch: ForwardBatch) -> None:
         strategy = get_cp_strategy()
         cp = forward_batch.attn_cp_metadata
-        assert isinstance(cp, ZigzagContextParallelMetadata) and strategy is not None
+        assert strategy is not None
         fm = self.forward_metadata
         positions = forward_batch.positions
         local_rows = strategy.local_q_indices(cp.total_seq_lens, forward_batch)
+        local_positions = positions.index_select(0, local_rows)
         cp.moe_local_token_count = positions.new_tensor(
             local_rows.numel(), dtype=torch.int32
         )
-        # Each virtual request is a contiguous Q segment. Its KV length ends
-        # at that segment's last absolute position for right-aligned masking.
-        request_rows = positions.new_tensor(
-            [segment // (2 * strategy.cp_size) for segment in cp.zigzag_index],
-            dtype=torch.long,
-        )
-        seq_lens = cp.kv_len_combined_tensor
+        if isinstance(cp, ZigzagContextParallelMetadata):
+            # Right-align each contiguous segment to its last absolute position.
+            request_rows = positions.new_tensor(
+                [segment // (2 * strategy.cp_size) for segment in cp.zigzag_index],
+                dtype=torch.long,
+            )
+            seq_lens = cp.kv_len_combined_tensor
+            cu_seqlens_q = cp.cu_seqlens_q_combined_tensor
+        else:
+            # As in V4, a strided query gets its own virtual request so causal
+            # masking applies to its absolute position, including before top-k.
+            extend_lens = forward_batch.extend_seq_lens
+            request_ids = torch.arange(extend_lens.numel(), device=positions.device)
+            request_rows = request_ids.repeat_interleave(
+                extend_lens, output_size=cp.total_seq_lens
+            ).index_select(0, local_rows)
+            seq_lens = local_positions.to(torch.int32) + 1
+            cu_seqlens_q = torch.arange(
+                local_rows.numel() + 1, dtype=torch.int32, device=positions.device
+            )
         read = ForwardMetadata(
-            actual_seq_lengths_q_pa=cp.cu_seqlens_q_combined_tensor,
+            actual_seq_lengths_q_pa=cu_seqlens_q,
             actual_seq_lengths_kv=seq_lens,
         )
         read.kernel_metadata = {}
@@ -1357,7 +1371,7 @@ class LowRatioCompressAscendBackendMixin:
                 setattr(read, field, getattr(fm, field).index_select(0, request_rows))
         fm.dsv41_cp_read = _DSV41CPReadView(
             metadata=read,
-            positions=positions.index_select(0, local_rows),
+            positions=local_positions,
             seq_lens=seq_lens,
             out_cache_loc=forward_batch.out_cache_loc.index_select(0, local_rows),
             forward_mode=forward_batch.forward_mode,

@@ -118,8 +118,12 @@ For DSA models, such as the GLM-5 series and DeepSeek V3.2, use `interleave`; `z
 
 ### DeepSeek-V4.1 on Ascend
 
-On a single A3 or A5 node, use the `dsv4` backend with
-`--enable-prefill-cp --cp-strategy zigzag --cuda-graph-backend-prefill disabled`.
+To evaluate Interleave on a single A3 or A5 node, use the `dsv4` backend with
+`--enable-prefill-cp --cp-strategy interleave --cuda-graph-backend-prefill disabled`
+to use the same token layout as the DeepSeek V4 Ascend accuracy recipes.
+`--cp-strategy zigzag` selects contiguous query segments. Interleave uses
+one logical read request per query row and should be validated for the target
+chunk size and context length on each platform.
 The prefill path uses eager execution and replicated KV caches. Decode can
 continue to use its existing graph configuration. Use a compatible CANN and
 sgl-kernel-npu build for the checkpoint on your platform.

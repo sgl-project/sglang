@@ -230,10 +230,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
     is_dsv41 = model_config_of(server_args).hf_config.model_type == "deepseek_v41"
     if is_npu() and is_dsv41:
-        if cfg.cp_strategy != "zigzag":
-            raise ValueError(
-                "DeepSeek-V4.1 prefill CP on NPU requires --cp-strategy zigzag."
-            )
         if attention_backends_of(resolved_view(server_args)) != ("dsv4", "dsv4"):
             raise ValueError(
                 "DeepSeek-V4.1 prefill CP on NPU requires the dsv4 attention backend."

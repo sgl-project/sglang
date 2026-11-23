@@ -82,6 +82,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV41NPUSingleKVPool,
 )
 from sglang.srt.layers import dp_attention
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.engram import EngramEmbedding
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1207,7 +1208,7 @@ class TestDSV41PrefillCP(CustomTestCase):
             EngramEmbedding.forward(embed, idle_indices, idle_batch)
             lookup.assert_called_once_with(idle_indices, idle_batch, None)
 
-    def _init_cp_batch(self):
+    def _init_cp_batch(self, strategy_cls=ZigzagCPStrategy):
         backend = _low_ratio_backend(window=4)
         backend._dsv4_has_c4 = backend._dsv4_has_c128 = False
         backend._is_dspark_draft_worker = False
@@ -1232,7 +1233,7 @@ class TestDSV41PrefillCP(CustomTestCase):
         batch.req_pool_indices = torch.tensor([1, 3])
         batch.encoder_swa_replay = False
         batch.spec_algorithm = None
-        strategy = ZigzagCPStrategy(cp_size=2)
+        strategy = strategy_cls(cp_size=2)
         with (
             get_context().override_server_args(device="cpu", tp_size=2, attn_cp_size=2),
             get_parallel().override(attn_cp_rank=1),
@@ -1242,6 +1243,53 @@ class TestDSV41PrefillCP(CustomTestCase):
             batch.attn_cp_metadata = strategy.build_metadata(14, [14, 133], [9, 5])
             backend.init_forward_metadata(batch)
         return backend, batch
+
+    def test_interleave_reads_each_query_at_its_absolute_position(self):
+        a3 = SimpleNamespace(
+            metadata=MagicMock(return_value=torch.zeros(48, dtype=torch.int32))
+        )
+        for arch35 in (False, True):
+            with (
+                self.subTest(arch35=arch35),
+                patch.object(dsv4_backend, "is_npu_arch35", return_value=arch35),
+                patch.object(dsv4_backend, "_dsv41_a3_ops", return_value=a3),
+                patch.object(
+                    DS41,
+                    "quant_lightning_indexer_metadata_dsl",
+                    wraps=DS41.quant_lightning_indexer_metadata_dsl,
+                ) as qli_metadata,
+            ):
+                backend, batch = self._init_cp_batch(InterleaveCPStrategy)
+                fm = backend.forward_metadata
+                read = fm.dsv41_cp_read
+                self.assertEqual(read.positions.tolist(), [6, 8, 10, 12, 128, 130, 132])
+                self.assertEqual(read.seq_lens.tolist(), [7, 9, 11, 13, 129, 131, 133])
+                self.assertEqual(
+                    read.out_cache_loc.tolist(), [134, 136, 138, 140, 768, 770, 772]
+                )
+                self.assertEqual(
+                    read.metadata.actual_seq_lengths_q_pa.tolist(), list(range(8))
+                )
+                self.assertEqual(batch.attn_cp_metadata.moe_local_token_count.item(), 7)
+                for field in ("swa_page_table", "c2_page_table", "c2_index_page_table"):
+                    table = getattr(fm, field)
+                    self.assertTrue(
+                        torch.equal(
+                            getattr(read.metadata, field), table[[0] * 4 + [1] * 3]
+                        )
+                    )
+                self.assertEqual(fm.actual_seq_lengths_q_pa.tolist(), [0, 9, 14])
+                self.assertEqual(fm.start_pos.tolist(), [5, 128])
+                if arch35:
+                    self.assertEqual(
+                        read.metadata.dsv41_cmp_topk_length_c2.flatten().tolist(),
+                        [3, 4, 5, 6, 64, 65, 66],
+                    )
+                    index = qli_metadata.call_args.kwargs
+                else:
+                    index = backend._dsv41_a3_index_kwargs(batch, 2)
+                self.assertEqual(index["seqused_k"].tolist(), [3, 4, 5, 6, 64, 65, 66])
+                self.assertEqual(index["cmp_residual_k"].tolist(), [1] * 7)
 
     def test_causal_metadata_and_attention_follow_local_zigzag_segments(self):
         def a5_attention(q, *, out, **kwargs):
