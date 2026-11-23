@@ -401,6 +401,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -5622,11 +5623,14 @@ class Scheduler(
                             eagle_prepare_for_verify,
                         )
 
-                        # PP speculative decoding refuses the watermark.
-                        verify = (
-                            self.tp_worker.model_runner.sampling_pipeline.plan_verify(
-                                batch, watermark_full_mask=False
-                            )
+                        # PP speculative decoding refuses the watermark, so
+                        # only the route is needed, not a bound verify step.
+                        sampling_info = batch.sampling_info
+                        verify_route = VerifyRoute.derive(
+                            sampling_info,
+                            has_grammar=batch.has_grammar,
+                            has_watermark=sampling_info is not None
+                            and sampling_info.watermark is not None,
                         )
                         # Isolation is load-bearing: eagle_prepare_for_verify
                         # mutates SB fields (forward_mode -> TARGET_VERIFY,
@@ -5640,7 +5644,7 @@ class Scheduler(
                                     self.req_to_token_pool,
                                     batch,
                                     self.tp_worker,
-                                    route=verify.route,
+                                    route=verify_route,
                                 )
                             )
                             batch_result = self.tp_worker.forward_batch_generation(
