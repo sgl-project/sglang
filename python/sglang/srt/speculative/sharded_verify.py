@@ -17,7 +17,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.plugin_kernels.nvidia.spec import VocabShardView
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +47,7 @@ def sampling_allows_vocab_shards(
     policy. Anything that reads or edits full logits needs the gathered logits.
     """
     return (
-        # A provider may decline after seeing its local shard.  Sanitizing that
-        # low-precision shard before the decline is not stock-equivalent: stock
-        # gathers to FP32 first, then sanitizes.  This diagnostic mode is rare,
-        # so keep its exact mutation order by entering the gathered path before
-        # invoking any optional local-key policy.
-        not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
-        and not return_logprob
+        not return_logprob
         and not adjusts_logits
         and (info.is_all_greedy or (has_local_keys and not need_truncated_sampling))
     )

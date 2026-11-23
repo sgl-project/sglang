@@ -12,6 +12,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
@@ -22,6 +23,8 @@ from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
+    VerifyRoute,
+    _adjust_after_watermark,
     _adjust_before_watermark,
     adjust_verify_logits,
 )
@@ -151,8 +154,8 @@ class TestSamplingPipelineOrder(CustomTestCase):
         )
 
     def test_verify_runs_the_watermark_before_the_custom_processor(self):
-        """Verify runs sampling's order; the custom processor also processes the
-        unwatermarked logits the watermark keeps for the logprobs."""
+        """Verify runs sampling's order; the custom processor and sanitize also
+        process the unwatermarked logits the watermark keeps for the logprobs."""
         events = []
         logits = torch.zeros(2, 4)
         watermarked = torch.zeros(2, 4)
@@ -173,6 +176,12 @@ class TestSamplingPipelineOrder(CustomTestCase):
                     "custom " + ("logits" if t is logits else "watermarked")
                 ),
             ),
+            patch(
+                f"{module}.sanitize_nan_logits",
+                side_effect=lambda t, msg: events.append(
+                    "sanitize " + ("logits" if t is logits else "watermarked")
+                ),
+            ),
         ):
             verify_logits, _ = adjust_verify_logits(
                 logits,
@@ -184,7 +193,15 @@ class TestSamplingPipelineOrder(CustomTestCase):
 
         self.assertIs(verify_logits, watermarked)
         self.assertEqual(
-            events, ["logit_bias", "watermark", "custom watermarked", "custom logits"]
+            events,
+            [
+                "logit_bias",
+                "watermark",
+                "custom watermarked",
+                "custom logits",
+                "sanitize watermarked",
+                "sanitize logits",
+            ],
         )
 
     def test_observer_sees_production_constraint_boundary(self):
@@ -244,6 +261,59 @@ class TestSamplingPipelineOrder(CustomTestCase):
 
 
 # build_grammar_mask
+class TestNanLogits(CustomTestCase):
+    @staticmethod
+    def _logits():
+        """NaN at column 0 and +inf at column 1; the grammar masks column 2."""
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 0] = float("nan")
+        logits[0, 1] = float("inf")
+        return logits
+
+    @staticmethod
+    def _mask(logits, vocab_mask=None):
+        logits[:, 2] = float("-inf")
+
+    def _decode(self, logits):
+        info = _make_info()
+        info.grammars = [_grammar(torch.zeros(1, VOCAB_SIZE), self._mask)]
+        _adjust_before_watermark(logits, info)
+        _adjust_after_watermark(logits, info)
+        return logits
+
+    def _verify(self, logits):
+        verify_logits, _ = adjust_verify_logits(
+            logits,
+            sampling_info=_make_info(),
+            grammar_mask=SimpleNamespace(apply=self._mask),
+            draft_tokens=torch.zeros(1, 1, dtype=torch.long),
+        )
+        return verify_logits
+
+    def test_sanitize_mode_heals_verify_logits_as_decode(self):
+        """A masked token's logprob is -1e30 on both, not -inf on verify."""
+        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
+            decode = self._decode(self._logits())
+            verify = self._verify(self._logits())
+        self.assertTrue(torch.equal(verify, decode))
+        self.assertTrue(torch.equal(verify[0, :3], torch.tensor([-1e30, 1e30, -1e30])))
+        self.assertTrue(torch.isfinite(torch.log_softmax(verify, dim=-1)).all())
+
+    def test_default_env_leaves_verify_logits_unhealed(self):
+        verify = self._verify(self._logits())
+        self.assertTrue(verify[0, 0].isnan())
+        self.assertEqual(verify[0, 1:3].tolist(), [float("inf"), float("-inf")])
+
+    def test_sanitize_mode_routes_every_verify_through_the_stages(self):
+        info = _make_info()
+        route = partial(
+            VerifyRoute.derive, info, has_grammar=False, has_watermark=False
+        )
+        self.assertFalse(route().adjusts_logits)
+        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
+            self.assertTrue(route().adjusts_logits)
+
+
 class TestBuildGrammarMask(CustomTestCase):
     def test_no_grammars_builds_no_mask(self):
         for grammars in (None, []):

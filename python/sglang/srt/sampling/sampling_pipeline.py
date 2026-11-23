@@ -2,7 +2,7 @@
 speculative target verify:
 
     penalty -> grammar mask -> logit_bias -> watermark -> custom logit processor
-    -> sanitize (decode only) -> sampler or accept core -> commit
+    -> sanitize -> sampler or accept core -> commit
 
 Two entries run it:
 
@@ -21,6 +21,10 @@ chain, and a grammar mask built over the draft tree. Penalty and watermark keep
 per-request state, so each commits the sampled tokens or the verify's
 `VerifyAccept`. A `SamplingObserver` sees the decode logits between the penalty
 and the grammar mask.
+
+The sanitize, which heals NaN and inf only under SGLANG_SANITIZE_NAN_LOGITS,
+ends the stages on every path; a verify's route turns
+off the fast paths that skip the stages in that mode.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
 from sglang.srt.sampling.grammar_mask import apply_grammar_mask
@@ -232,9 +237,7 @@ def _adjust_after_watermark(
     """Decode's stages after the watermark, in place: the custom logit
     processor, then non-finite sanitizing."""
     _custom_logit_processor_stage(logits, sampling_info, logprob_logits=logprob_logits)
-    sanitize_nan_logits(logits, "sampler: next_token_logits")
-    if logprob_logits is not None:
-        sanitize_nan_logits(logprob_logits, "sampler: next_token_logits")
+    _sanitize_stage(logits, logprob_logits=logprob_logits)
     return logits
 
 
@@ -257,10 +260,35 @@ def _custom_logit_processor_stage(
         )
 
 
+def _sanitize_stage(
+    logits: torch.Tensor, *, logprob_logits: Optional[torch.Tensor]
+) -> None:
+    """The last stage, in place, on the logits the sampler or accept core reads
+    and on `logprob_logits`: `sanitize_nan_logits`, which probes for NaN and
+    heals only under SGLANG_SANITIZE_NAN_LOGITS."""
+    sanitize_nan_logits(logits, "sampling: logits after the stages")
+    if logprob_logits is not None:
+        sanitize_nan_logits(logprob_logits, "sampling: logprob logits after the stages")
+
+
+def edits_verify_logits(
+    info: SamplingBatchInfo, *, has_grammar: bool, has_watermark: bool
+) -> bool:
+    """Whether some stage before the sanitize edits a verify's logits."""
+    return (
+        has_grammar
+        or has_watermark
+        or info.step_penalties is not None
+        or info.logit_bias is not None
+        or info.has_custom_logit_processor
+    )
+
+
 class VerifyRoute(msgspec.Struct, frozen=True):
     """The sampling facts that pick a target verify's fast paths."""
 
-    # Some stage edits the logits before the accept reads them.
+    # Some stage edits the logits before the accept reads them; under
+    # SGLANG_SANITIZE_NAN_LOGITS always, as the sanitize ends the stages.
     adjusts_logits: bool
     # Some row truncates its distribution with top-k, top-p, or min-p.
     need_truncated_sampling: bool
@@ -281,11 +309,10 @@ class VerifyRoute(msgspec.Struct, frozen=True):
             return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
         return cls(
             adjusts_logits=(
-                has_grammar
-                or has_watermark
-                or info.step_penalties is not None
-                or info.logit_bias is not None
-                or info.has_custom_logit_processor
+                edits_verify_logits(
+                    info, has_grammar=has_grammar, has_watermark=has_watermark
+                )
+                or envs.SGLANG_SANITIZE_NAN_LOGITS.get()
             ),
             need_truncated_sampling=need_truncated_sampling(info),
         )
@@ -432,4 +459,7 @@ def adjust_verify_logits(
             logprob_logits=None if verify_logits is logits else logits,
             rows_per_request=draft_tokens.shape[1],
         )
+    _sanitize_stage(
+        verify_logits, logprob_logits=None if verify_logits is logits else logits
+    )
     return verify_logits, sampling_info
