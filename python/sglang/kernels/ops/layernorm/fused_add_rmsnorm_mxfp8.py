@@ -285,8 +285,11 @@ def _reference_runs_cute_norm() -> bool:
 def supports_fused_add_rmsnorm_mxfp8(hidden_size: int) -> bool:
     if hidden_size % 128 != 0 or not _reference_runs_cute_norm():
         return False
+    sm = get_sm_version()
+    if sm < 100:
+        return False
     try:
-        _FusedAddRMSNormMxfp8Kernel(hidden_size, 1.0, get_sm_version())
+        _FusedAddRMSNormMxfp8Kernel(hidden_size, 1.0, sm)
     except AssertionError:
         return False
     return True
@@ -308,6 +311,8 @@ def gemma_fused_add_rmsnorm_mxfp8(
     quantized = torch.empty(m, h, dtype=torch.float8_e4m3fn, device=input.device)
     padded = (m + 127) // 128 * 128
     scales = torch.empty(padded * (h // 32), dtype=torch.uint8, device=input.device)
+    if m == 0:
+        return quantized, scales
     if padded != m:
         scales[(padded - 128) * (h // 32) :].zero_()
     from flashinfer.utils import device_support_pdl

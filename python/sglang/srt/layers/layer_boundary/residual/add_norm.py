@@ -207,8 +207,12 @@ def _update_and_read_residual_mxfp8_swizzled(
         residual is None
         or post_residual_addition is not None
         or type(norm) is not GemmaRMSNorm
+        or hidden_states.ndim != 2
+        or hidden_states.numel() == 0
         or not (hidden_states.is_contiguous() and residual.is_contiguous())
         or hidden_states.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+        or norm.weight.dtype != torch.bfloat16
         or hidden_states.numel() >= 2**31
     ):
         return _update_and_read_residual_plain(
