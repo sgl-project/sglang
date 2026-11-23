@@ -1597,6 +1597,7 @@ class TestDatasetSpecificResultArgs(unittest.TestCase):
         from sglang.benchmark.serving import _dataset_specific_args
 
         for dataset_name in (
+            "agentic-trace",
             "sharegpt",
             "custom",
             "autobench",
@@ -1605,6 +1606,20 @@ class TestDatasetSpecificResultArgs(unittest.TestCase):
         ):
             result = _dataset_specific_args(self._args(dataset_name))
             self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
+
+    def test_agentic_trace_reports_sharegpt_output_len_override(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        args = self._args("agentic-trace")
+        args.sharegpt_output_len = 64
+        self.assertEqual(_dataset_specific_args(args), {"sharegpt_output_len": 64})
+
+    def test_every_registered_dataset_is_classified(self):
+        """A new dataset must get result keys or join the deliberate exceptions."""
+        from sglang.benchmark.datasets import DATASET_MAPPING, DATASET_RESULT_ARG_KEYS
+
+        unlisted = set(DATASET_MAPPING) - set(DATASET_RESULT_ARG_KEYS)
+        self.assertEqual(unlisted, {"mooncake", "speed-bench"})
 
     def test_other_dataset_returns_empty(self):
         from sglang.benchmark.serving import _dataset_specific_args
@@ -1655,6 +1670,7 @@ class TestDatasetSpecificResultArgs(unittest.TestCase):
         from sglang.benchmark.serving import _dataset_specific_args
 
         for dataset_name in (
+            "agentic-trace",
             "sharegpt",
             "custom",
             "autobench",

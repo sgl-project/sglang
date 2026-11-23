@@ -33,6 +33,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
 }
 
 DATASET_RESULT_ARG_KEYS: Dict[str, Tuple[str, ...]] = {
+    "agentic-trace": ("sharegpt_output_len",),
     "autobench": ("sharegpt_output_len",),
     "sharegpt": ("sharegpt_output_len",),
     "custom": ("sharegpt_output_len",),
