@@ -180,6 +180,26 @@ class ResponsesSamplingParamsTestCase(CustomTestCase):
         params = request.to_sampling_params(default_max_tokens=128)
         self.assertEqual(params["max_new_tokens"], 128)
 
+    def test_omitted_fields_take_preferred_sampling_params(self):
+        """--preferred-sampling-params fills the sampling fields a request omits or
+        sends as null, ahead of the model's generation_config, never one it sets."""
+        preferred = {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 1.5}
+        generation_config = {"temperature": 0.6, "top_p": 0.8}
+        null = {"temperature": None, "top_p": None}
+        sent = {"temperature": 0.7, "top_p": 1.0, "presence_penalty": 0.0}
+        for request_fields, expected in [
+            ({}, preferred),
+            (null, preferred),
+            (sent, sent),
+        ]:
+            params = ResponsesRequest(
+                model="x", input="hi", store=False, **request_fields
+            ).to_sampling_params(
+                default_params=generation_config,
+                preferred_sampling_params=preferred,
+            )
+            self.assertEqual({k: params[k] for k in expected}, expected)
+
     def test_text_format_maps_to_json_schema_constraint(self):
         schema = {"type": "object", "properties": {"age": {"type": "integer"}}}
         for fmt, expected in [

@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
+    PREFERRED_SAMPLING_FIELDS,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -173,6 +174,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "sampling_seed": request.seed,
             "watermark": request.watermark,
         }
+        for key, value in (get_serving().preferred_sampling_params or {}).items():
+            if key in PREFERRED_SAMPLING_FIELDS and key not in request.model_fields_set:
+                sampling_params[key] = value
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
