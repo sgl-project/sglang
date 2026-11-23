@@ -39,6 +39,7 @@ _DEVICE_ROUTING_FIELDS = (
     "logical_to_all_physical_map_num_valid",
     "logical_to_rank_dispatch_physical_map",
 )
+_MAX_PACKED_FIELD_BYTES = 16 * 1024
 
 
 class EplbControl:
@@ -250,6 +251,42 @@ def _broadcast_placement(placement, error, rank, group, physical_shape, num_logi
     )
 
 
+@dataclass(frozen=True)
+class _PackedExpertFields:
+    """Send narrow fields together and expose their original views for writeback."""
+
+    small: tuple[int, ...]
+    direct: tuple[int, ...]
+    send: torch.Tensor
+    receive: list[torch.Tensor]
+
+    @classmethod
+    def create(cls, staging: list[torch.Tensor]) -> _PackedExpertFields | None:
+        # The weight adapter exposes contiguous [expert, bytes] tensors.
+        small = tuple(
+            i
+            for i, field in enumerate(staging)
+            if 0 < field.size(1) <= _MAX_PACKED_FIELD_BYTES
+        )
+        if len(small) < 2:
+            return None
+        direct = tuple(i for i in range(len(staging)) if i not in small)
+        widths = [staging[i].size(1) for i in small]
+        packed = staging[0].new_empty((staging[0].size(0), sum(widths)))
+        for i, view in zip(small, packed.split(widths, dim=1), strict=True):
+            staging[i] = view
+        return cls(
+            small,
+            direct,
+            torch.empty_like(packed),
+            [staging[i] for i in direct] + [packed],
+        )
+
+    def pack(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        torch.cat([weights[i] for i in self.small], dim=1, out=self.send)
+        return [weights[i] for i in self.direct] + [self.send]
+
+
 class NpuEplbRuntime:
     def __init__(
         self,
@@ -286,6 +323,11 @@ class NpuEplbRuntime:
         }
         self.staging = tuple(
             adapter.create_temp_buffers() for _ in range(layers_per_chunk)
+        )
+        self._packed_fields = (
+            _PackedExpertFields.create(self.staging[0])
+            if order_submissions and world_size == ranks_per_node
+            else None
         )
         # Reserve the layer slots before KV sizing. One owner event fences reuse
         # after all writes from the preceding chunk have been enqueued.
@@ -445,9 +487,14 @@ class NpuEplbRuntime:
             self._p2p_stream.wait_event(self._owner_ready)
             for name, row in self._routing_rows[slot].items():
                 row.copy_(self._planned_rows[name][layer], non_blocking=True)
+            weights, staging = self.weights[layer], self.staging[slot]
+            sends, receives = weights, staging
+            if self._packed_fields is not None:
+                sends = self._packed_fields.pack(weights)
+                receives = self._packed_fields.receive
             update_expert_weights_single_layer(
-                routed_experts_weights=self.weights[layer],
-                temp_buffers=self.staging[slot],
+                routed_experts_weights=sends,
+                temp_buffers=receives,
                 old_physical_to_logical_map=old_layout,
                 new_physical_to_logical_map=new_layout,
                 num_local_physical_experts=self.spec.local_experts,
@@ -460,9 +507,7 @@ class NpuEplbRuntime:
                 submit_p2p_batch=submit_p2p_batch,
                 p2p_expert_order=p2p_expert_order,
             )
-            writeback = _make_weight_writeback(
-                self.weights[layer], self.staging[slot], staged_rows
-            )
+            writeback = _make_weight_writeback(weights, staging, staged_rows)
             if self._submitted is not None:
                 self._submitted.set_result(None)
             self._p2p_stream.synchronize()
@@ -576,14 +621,19 @@ def create_npu_async_eplb(model_config, weights, metadata):
             "Async EPLB ranks disagree on layout, weight geometry or batching"
         )
     prewarm_eplb_communication(p2p_group)
+    weight_staging_bytes = sum(t.nbytes for slot in runtime.staging for t in slot)
+    packed_fields = runtime._packed_fields
+    if packed_fields is not None:
+        weight_staging_bytes += packed_fields.send.nbytes
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d reuse_world_group=%s layers_per_chunk=%d",
-        sum(t.nbytes for slot in runtime.staging for t in slot),
+        "hccl_buffer_mib=%d reuse_world_group=%s layers_per_chunk=%d packed_fields=%d",
+        weight_staging_bytes,
         sum(row.nbytes for slot in runtime._routing_buffers for row in slot.values()),
         p2p_buffer_mib,
         borrow_world_group,
         layers_per_chunk,
+        len(packed_fields.small) if packed_fields is not None else 0,
     )
     return AsyncEplbCoordinator(
         EplbControl(control_group), runtime, layers_per_chunk=layers_per_chunk
