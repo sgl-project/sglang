@@ -312,6 +312,8 @@ class DSANPUIndexerMixin:
         layer_id: int,
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
+        *,
+        allow_pcp_query_shard: bool = False,
     ) -> torch.Tensor:
         # DSA prefill CP metadata is Ascend-local and is first consumed by this
         # indexer (before the attention backend's forward_extend), so prepare it
@@ -680,7 +682,7 @@ class DSANPUIndexerMixin:
             query = q.view(-1, self.n_heads, self.head_dim)
             pcp_shard = None
             if (
-                getattr(forward_batch, "npu_dsa_pcp_query_shard_allowed", False)
+                allow_pcp_query_shard
                 and getattr(forward_batch, "dsa_cp_metadata_prepared", False)
                 and block_table is not None
                 and weights.shape[0] == query.shape[0]
