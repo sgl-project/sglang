@@ -233,6 +233,9 @@ pub struct SamplingParams {
     pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
     #[serde(default)]
     pub watermark: Option<WatermarkRequestConfig>,
+    /// Force decode to replay this token sequence while preserving model scores.
+    #[serde(default)]
+    pub trace_decode_token_ids: Option<Vec<i64>>,
 
     // Normalized internal fields.
     //
@@ -298,6 +301,7 @@ impl Default for SamplingParams {
             stream_interval: None,
             logit_bias: None,
             sampling_seed: None,
+            trace_decode_token_ids: None,
             stop_strs: Vec::new(),
             stop_regex_strs: Vec::new(),
             stop_str_max_len: 0,
@@ -415,6 +419,21 @@ impl SamplingParams {
             stop_regex_max_len = stop_regex_max_len.max(pattern.max_len());
         }
         self.stop_regex_max_len = stop_regex_max_len;
+
+        if let Some(trace_len) = self.trace_decode_token_ids.as_ref().map(Vec::len) {
+            let trace_len = i64::try_from(trace_len).unwrap_or(i64::MAX);
+            self.max_new_tokens = Some(
+                self.max_new_tokens
+                    .map_or(trace_len, |max_new_tokens| max_new_tokens.min(trace_len)),
+            );
+            self.min_new_tokens = 0;
+            self.ignore_eos = true;
+            self.stop_token_ids = None;
+            self.stop_strs.clear();
+            self.stop_regex_strs.clear();
+            self.stop_str_max_len = 0;
+            self.stop_regex_max_len = 0;
+        }
 
         // Python `raise_if_tokenizer_required`: these need `tokenizer.decode` /
         // `eos_token_id`, which `skip_tokenizer_init` does not have.
@@ -564,6 +583,33 @@ impl SamplingParams {
                 }
             }
         }
+        if let Some(trace_decode_token_ids) = &self.trace_decode_token_ids {
+            if trace_decode_token_ids.is_empty() {
+                return Err(bad("trace_decode_token_ids must not be empty".into()));
+            }
+            if trace_decode_token_ids
+                .iter()
+                .any(|&token_id| token_id < 0 || token_id as u64 >= vocab_size)
+            {
+                return Err(bad(format!(
+                    "trace_decode_token_ids must contain token ids in [0, {vocab_size})"
+                )));
+            }
+            if self.custom_params.as_ref().is_some_and(|params| {
+                params.contains_key("thinking_budget")
+                    || params.contains_key(REQUEST_REASONING_END_TOKEN_IDS_KEY)
+            }) {
+                return Err(bad(
+                    "trace_decode_token_ids cannot be combined with thinking or reasoning controls"
+                        .into(),
+                ));
+            }
+            if self.watermark.is_some() {
+                return Err(bad(
+                    "trace_decode_token_ids cannot be combined with watermark".into(),
+                ));
+            }
+        }
         // Grammars are mutually exclusive.
         let grammars = [
             &self.json_schema,
@@ -577,6 +623,11 @@ impl SamplingParams {
         if grammars > 1 {
             return Err(bad(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set".into(),
+            ));
+        }
+        if self.trace_decode_token_ids.is_some() && grammars > 0 {
+            return Err(bad(
+                "trace_decode_token_ids cannot be combined with structured outputs".into(),
             ));
         }
         // Not a Python restriction: the rust from_scheduler maps one rid to one response,
@@ -743,7 +794,7 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The 31 wire slots, in Python's declaration order.
+    /// The wire slots, in Python's declaration order.
     ///
     /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
     /// the header carries an ARRAY and every field is identified by POSITION. Two
@@ -782,6 +833,7 @@ mod tests {
         "sampling_seed",
         "custom_params",
         "watermark",
+        "trace_decode_token_ids",
         "stop_strs",
         "stop_regex_strs",
         "stop_str_max_len",
@@ -822,6 +874,7 @@ mod tests {
             no_stop_trim: true,
             stream_interval: Some(30),
             sampling_seed: Some(31),
+            trace_decode_token_ids: Some(vec![32, 33]),
             ..Default::default()
         };
         let buf = rmp_serde::to_vec(&sp).expect("serializes");
@@ -857,6 +910,15 @@ mod tests {
         assert_eq!(arr[at("no_stop_trim")].as_bool(), Some(true));
         assert_eq!(arr[at("stream_interval")].as_i64(), Some(30));
         assert_eq!(arr[at("sampling_seed")].as_i64(), Some(31));
+        assert_eq!(
+            arr[at("trace_decode_token_ids")]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_i64())
+                .collect::<Vec<_>>(),
+            vec![32, 33]
+        );
         // Unset optionals ride as nil rather than being skipped.
         assert!(arr[at("stop")].is_nil());
         assert!(arr[at("logit_bias")].is_nil());

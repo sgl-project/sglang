@@ -183,7 +183,60 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.argmax(logits, dim=-1)
 
 
-__all__ = ["argmax", "cake_softmax", "softmax"]
+def trace_replay(table, slots, lengths, steps, sampled, *, inplace=False):
+    """Replace sampled tokens with each request's next trace token.
+
+    Row zero is reserved. Steps have shape [batch].
+    """
+    import torch
+
+    if (
+        table.device.type in ("cuda", "npu")
+        and getattr(torch.version, "musa", None) is None
+        and table.stride(1) == 1
+        and slots.is_contiguous()
+        and lengths.is_contiguous()
+        and steps.is_contiguous()
+        and sampled.is_contiguous()
+    ):
+        return get_kernel("sampling.trace_replay", KernelBackend.TRITON)(
+            table, slots, lengths, steps, sampled, inplace=inplace
+        )
+
+    valid = (
+        (slots > 0)
+        & (slots < table.shape[0])
+        & (steps >= 0)
+        & (steps < lengths)
+        & (steps < table.shape[1])
+    )
+    tokens = table[torch.where(valid, slots, 0), torch.where(valid, steps, 0)]
+    result = torch.where(
+        valid, tokens.to(sampled.dtype), sampled.reshape(steps.shape)
+    ).reshape(sampled.shape)
+    if inplace:
+        sampled.copy_(result)
+        return sampled
+    return result
+
+
+__all__ = ["argmax", "cake_softmax", "softmax", "trace_replay"]
+
+
+register_kernel(
+    KernelSpec(
+        op="sampling.trace_replay",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.trace_replay_triton:trace_replay_triton",
+        capabilities=frozenset(
+            {
+                CapabilityRequirement.CUDA,
+                CapabilityRequirement.HIP,
+                CapabilityRequirement.NPU,
+            }
+        ),
+    )
+)
 
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).

@@ -2294,7 +2294,10 @@ class ModelRunner:
             observer=self.sampling_observer,
             graph_token_ids=(
                 self.uocr_greedy_graph.recorded_ids(logits_output, forward_batch)
-                if self.uocr_greedy_graph is not None
+                if (
+                    self.uocr_greedy_graph is not None
+                    and forward_batch.sampling_info.trace_replay is None
+                )
                 else None
             ),
         )

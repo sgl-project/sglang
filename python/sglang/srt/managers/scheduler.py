@@ -3627,6 +3627,43 @@ class Scheduler(
             )
             return
 
+        if (
+            req.sampling_params.trace_decode_token_ids is not None
+            and not get_exec().features.enable_trace_replay
+        ):
+            error_msg = (
+                "The server is not configured to enable trace replay. "
+                "Please set `--enable-trace-replay` to enable this feature."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.sampling_params.trace_decode_token_ids is not None
+            and self.spec_algorithm.is_speculative()
+        ):
+            error_msg = (
+                "trace_decode_token_ids is only supported without speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.sampling_params.trace_decode_token_ids is not None
+            and req.return_sampling_mask
+        ):
+            error_msg = (
+                "trace_decode_token_ids is not supported with return_sampling_mask."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(
                 req,

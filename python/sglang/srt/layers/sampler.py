@@ -86,6 +86,19 @@ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPRO
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 
 
+def apply_trace_decode_tokens(
+    sampled_token_ids: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    *,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """Replace sampled IDs with the next IDs from each request's trace."""
+    trace = sampling_info.trace_replay
+    if trace is None:
+        return sampled_token_ids
+    return trace.apply(sampled_token_ids, inplace=inplace)
+
+
 def _trace_e2e_sampler(stage: str, **fields) -> None:
     if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
         return
@@ -302,6 +315,14 @@ class Sampler(nn.Module):
                         else torch.log(probs)
                     )
                 del probs
+
+        # Keep the natural logits/logprobs intact and only override the selected
+        # IDs. This makes returned logprobs describe the model distribution for
+        # the forced trace token.
+        if sampling_info.trace_replay is not None:
+            batch_next_token_ids = apply_trace_decode_tokens(
+                batch_next_token_ids, sampling_info, inplace=True
+            )
 
         if return_logprob:
             if target_logprobs is not None:

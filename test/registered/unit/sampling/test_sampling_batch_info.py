@@ -12,6 +12,7 @@ from unittest.mock import ANY, MagicMock, patch
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_trace_decode_tokens
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     DisallowedTokensLogitsProcessor,
@@ -22,6 +23,7 @@ from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
     _adjust_before_watermark,
 )
+from sglang.srt.sampling.trace_replay import TraceReplayBatch
 from sglang.srt.sampling.watermarking.interface import SampleStep
 from sglang.test.test_utils import CustomTestCase
 
@@ -490,6 +492,102 @@ class TestStepBuilds(CustomTestCase):
         self.assertEqual(entry.indices.dtype, torch.long)
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+
+class TestTraceReplayBatch(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self._trace_req_pool = SimpleNamespace(
+            device=DEVICE,
+            max_context_len=VOCAB_SIZE,
+            req_generation=torch.zeros(16, dtype=torch.long),
+        )
+        self._next_trace_slot = 1
+
+    def _make_req(self, trace=None):
+        req = MagicMock()
+        req.sampling_params.trace_decode_token_ids = trace
+        req.sampling_params.max_new_tokens = None
+        if trace is not None:
+            req.kv.req_pool_idx = self._next_trace_slot
+            self._next_trace_slot += 1
+        req.output_ids = []
+        return req
+
+    def _make_trace_info(self, reqs):
+        return SamplingBatchInfo(
+            vocab_size=VOCAB_SIZE,
+            device=DEVICE,
+            trace_replay=TraceReplayBatch.from_requests(reqs, self._trace_req_pool),
+        )
+
+    def test_trace_batch_changes_reuse_resident_request_slots(self):
+        long_req = self._make_req(trace=[7, 8, 9, 10])
+        long_req.sampling_params.max_new_tokens = 2
+        short_req = self._make_req(trace=[13])
+        info = self._make_trace_info([long_req])
+        right = self._make_trace_info([short_req, self._make_req()])
+        self.assertIsNone(info.trace_replay.pool.tokens)
+
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30]), info).tolist(), [7]
+        )
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30, 31]), right).tolist(), [13, 31]
+        )
+        snapshot = info.copy_for_forward().trace_replay
+        table = snapshot.pool.tokens
+        revision = snapshot.pool.revision
+
+        info.advance_trace_decode_steps()
+        info.trace_replay = TraceReplayBatch.merge(
+            info.trace_replay, right.trace_replay, 1, 2
+        )
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30, 31, 32]), info).tolist(),
+            [8, 13, 32],
+        )
+        info.trace_replay = info.trace_replay.filter([0, 2], torch.tensor([0, 2]))
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30, 31]), info).tolist(), [8, 31]
+        )
+        self.assertIs(info.trace_replay.pool.tokens, table)
+        self.assertEqual(info.trace_replay.pool.revision, revision)
+        self.assertEqual(snapshot.steps.tolist(), [0])
+        self.assertEqual(snapshot.lengths.tolist(), [2])
+
+        info.advance_trace_decode_steps()
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30, 31]), info).tolist(), [30, 31]
+        )
+        info.trace_replay = info.trace_replay.filter([1], torch.tensor([1]))
+        self.assertIsNone(info.trace_replay)
+
+    def test_trace_slot_reuse_preserves_delayed_forward_generation(self):
+        old_req = self._make_req(trace=[7, 8])
+        slot = old_req.kv.req_pool_idx
+        old = self._make_trace_info([old_req])
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30]), old).tolist(), [7]
+        )
+
+        self._trace_req_pool.req_generation[slot] += 1
+        ordinary = self._make_req()
+        ordinary.kv.req_pool_idx = slot
+        self.assertIsNone(self._make_trace_info([ordinary]).trace_replay)
+
+        self._trace_req_pool.req_generation[slot] += 1
+        new_req = self._make_req(trace=[12, 13, 14, 15, 16])
+        new_req.kv.req_pool_idx = slot
+        new_req.output_ids = [12, 13, 14, 15]
+        new = self._make_trace_info([new_req])
+
+        # A deferred sampling call from the old generation must use its own
+        # tokens even if the replacement used the same slot first.
+        sampled = torch.tensor([30])
+        self.assertEqual(apply_trace_decode_tokens(sampled, new).tolist(), [16])
+        self.assertEqual(apply_trace_decode_tokens(sampled, old).tolist(), [7])
+        self.assertEqual(apply_trace_decode_tokens(sampled, new).tolist(), [16])
 
 
 if __name__ == "__main__":

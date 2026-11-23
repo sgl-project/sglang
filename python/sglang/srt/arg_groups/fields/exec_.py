@@ -88,6 +88,11 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
     ] = False
+    enable_trace_replay: A[
+        bool,
+        "Enable trace replay via sampling_params.trace_decode_token_ids "
+        "(disabled by default to avoid unexpected trace-table device memory allocation).",
+    ] = False
     enable_watermark: A[
         bool,
         "Enable text watermarking with the algorithm --watermark-algorithm selects.",

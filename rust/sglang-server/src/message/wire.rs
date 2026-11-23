@@ -191,6 +191,7 @@ impl TryFrom<api::SamplingParams> for SamplingParams {
             logit_bias: (!p.logit_bias.is_empty()).then(|| p.logit_bias.into_iter().collect()),
             sampling_seed: p.sampling_seed,
             custom_params,
+            trace_decode_token_ids: p.trace_decode_token_ids.map(|trace| trace.items),
             watermark: p.watermark.map(|watermark| WatermarkRequestConfig {
                 enabled: watermark.enabled,
                 key: watermark.key,
@@ -487,6 +488,20 @@ mod tests {
             Some(1.5)
         );
         assert_eq!(p.temperature, 1.0, "schema default applied by the decoder");
+    }
+
+    #[test]
+    fn trace_replay_crosses_generated_schema_without_losing_presence() {
+        for (json, expected) in [
+            (r#"{}"#, None),
+            (r#"{"trace_decode_token_ids":null}"#, None),
+            (r#"{"trace_decode_token_ids":[]}"#, Some(vec![])),
+            (r#"{"trace_decode_token_ids":[1,2,3]}"#, Some(vec![1, 2, 3])),
+        ] {
+            let p: api::SamplingParams = serde_json::from_str(json).unwrap();
+            let p = SamplingParams::try_from(p).unwrap();
+            assert_eq!(p.trace_decode_token_ids, expected, "{json}");
+        }
     }
 
     #[test]
