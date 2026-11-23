@@ -2207,8 +2207,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 padded_inter = (
                     (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
                 )
-                # Compute the zero-padded region; declaring it leaves AITER scratch
-                # unwritten while some stage-2 kernels still read those columns.
+                # Workaround for ROCm/aiter#6598: a declared pad leaves stage-1 scratch
+                # unwritten for stage 2 to read; declare it once that PR is required.
                 layer.intermediate_pad = 0
                 layer.hidden_pad = 0
                 if padded_inter != inter_per_part:
