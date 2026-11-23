@@ -71,8 +71,11 @@ class Downsample3D(nn.Module):
 
     def forward(self, x):
         if self.space_stride == 2:
-            pad = (0, 1, 0, 1, 0, 0)
-            x = F.pad(x, pad, mode=self.pad_mode)
+            if x.device.type == "npu" and x.ndim == 5 and x.shape[2] == 1:
+                x = F.pad(x.squeeze(2), (0, 1, 0, 1), mode=self.pad_mode).unsqueeze(2)
+            else:
+                pad = (0, 1, 0, 1, 0, 0)
+                x = F.pad(x, pad, mode=self.pad_mode)
         return self.conv(x)
 
 

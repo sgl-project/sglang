@@ -1376,7 +1376,23 @@ class AutoencoderKLLegacy(AutoencoderKL):
     @torch.no_grad()
     @cached_vae_encode
     def encode(self, x):
-        return self.quant_conv(self.encoder(x))
+        h = self.encoder(x)
+        if (
+            x.device.type == "npu"
+            and h.ndim == 5
+            and h.shape[2] == 1
+            and isinstance(self.quant_conv, nn.Conv3d)
+            and self.quant_conv.kernel_size == (1, 1, 1)
+            and self.quant_conv.stride == (1, 1, 1)
+            and self.quant_conv.padding == (0, 0, 0)
+        ):
+            return nn.functional.conv2d(
+                h.squeeze(2),
+                self.quant_conv.weight.squeeze(2),
+                self.quant_conv.bias,
+                groups=self.quant_conv.groups,
+            ).unsqueeze(2)
+        return self.quant_conv(h)
 
     @torch.no_grad()
     def decode(self, z):

@@ -110,34 +110,42 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
         self, tiles, tile_indices, forward_fn, cls_agg=None, *, tile_batch: int = 1
     ):
         # Reuse native overlapping-tile assembly and batched ViT attention.
-        # Bound activation memory as the image canvas grows. Encoding and exact
-        # requests retain their original scheduling and numerical path.
-        if (
-            self.decode_fast_path_gate.enabled
-            and not self.training
-            and tile_indices
-            and tiles[0].is_cuda
-            and forward_fn == self.decode
-        ):
-            tile_rank, tile_world_size = get_tile_parallel_state()
-            parallel_decode = (
-                self.use_parallel_decode
-                and self.sglang_config.use_parallel_tiling
-                and not self.parallel_tiling
-                and 1 < tile_world_size <= len(tiles)
-                and tile_indices == list(range(len(tiles)))
-            )
-            if parallel_decode:
-                owners = tile_owners(len(tiles), tile_world_size)
-                tile_indices = self._local_tile_indices(owners, tile_rank)
-            # Stack up to 128 samples of tiles per decoder forward.
-            chunk_size = max(1, 128 // tiles[0].shape[0])
-            outputs = super()._run_tile_tasks(
-                tiles, tile_indices, forward_fn, cls_agg, tile_batch=chunk_size
-            )
-            if parallel_decode:
-                return self._all_gather_tiled_results(outputs, owners)
-            return outputs
+        # Bound activation memory as the image canvas grows. Exact requests and
+        # non-NPU encoding retain their original scheduling and numerical path.
+        if self._sgl_gate.enabled and not self.training and tile_indices:
+            device_type = tiles[0].device.type
+            if forward_fn == self.decode and device_type in ("cuda", "npu"):
+                tile_rank, tile_world_size = get_tile_parallel_state()
+                parallel_decode = (
+                    self.use_parallel_decode
+                    and self.sglang_config.use_parallel_tiling
+                    and not self.parallel_tiling
+                    and 1 < tile_world_size <= len(tiles)
+                    and tile_indices == list(range(len(tiles)))
+                )
+                if parallel_decode:
+                    owners = tile_owners(len(tiles), tile_world_size)
+                    tile_indices = self._local_tile_indices(owners, tile_rank)
+                # Stack up to 128 samples of tiles per decoder forward.
+                chunk_size = max(1, 128 // tiles[0].shape[0])
+                outputs = super()._run_tile_tasks(
+                    tiles, tile_indices, forward_fn, cls_agg, tile_batch=chunk_size
+                )
+                if parallel_decode:
+                    return self._all_gather_tiled_results(outputs, owners)
+                return outputs
+            if forward_fn == self.encode and device_type == "npu":
+                # VisualEncodingStage runs on the owner rank only, so never issue
+                # collectives here; batch up to 16 encoder tiles per NPU forward to
+                # amortize Conv2d/GroupNorm launch and cache-hash overhead.
+                encode_tile_batch = max(1, 16 // tiles[0].shape[0])
+                return super()._run_tile_tasks(
+                    tiles,
+                    tile_indices,
+                    forward_fn,
+                    cls_agg,
+                    tile_batch=encode_tile_batch,
+                )
         return super()._run_tile_tasks(
             tiles, tile_indices, forward_fn, cls_agg, tile_batch=tile_batch
         )

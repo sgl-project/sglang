@@ -405,3 +405,62 @@ def test_vit_decoder_disables_autocast_on_npu(tiny_image, monkeypatch):
 
     assert "npu" in get_dtype_calls
     assert rotary_dtypes == [torch.bfloat16]
+
+
+def test_npu_image_vae_conv2d_equiv_and_tile_tasks(tiny_image, monkeypatch):
+    has_npu = hasattr(torch, "npu") and torch.npu.is_available()
+    if has_npu:
+        device = torch.device("npu")
+        vae = tiny_image.to(device).eval()
+        x = torch.randn(2, 3, 1, 32, 32, device=device, dtype=torch.float32)
+        with torch.inference_mode():
+            y_fast = vae.encode(x)
+        with torch.enable_grad():
+            y_ref = vae.quant_conv(vae.encoder(x)).detach()
+        torch.testing.assert_close(y_fast, y_ref, rtol=1e-4, atol=1e-4)
+
+        decode_calls = []
+        encode_calls = []
+
+        def fake_decode(tiles):
+            decode_calls.append(tiles.shape[0])
+            return tiles * 2
+
+        def fake_encode(tiles):
+            encode_calls.append(tiles.shape[0])
+            return tiles + 1
+
+        monkeypatch.setattr(vae, "decode", fake_decode)
+        monkeypatch.setattr(vae, "encode", fake_encode)
+
+        tiles = [torch.full((2, 1, 1, 1), i, device=device) for i in range(40)]
+        indices = list(range(40))
+        with use_vae_fast_path(vae, True):
+            out_dec = vae._run_tile_tasks(tiles, indices, fake_decode)
+            out_enc = vae._run_tile_tasks(tiles, indices, fake_encode)
+        assert decode_calls == [80]
+        assert encode_calls == [16, 16, 16, 16, 16]
+        for actual, tile in zip(out_dec, tiles, strict=True):
+            torch.testing.assert_close(actual, tile * 2, rtol=0, atol=0)
+        for actual, tile in zip(out_enc, tiles, strict=True):
+            torch.testing.assert_close(actual, tile + 1, rtol=0, atol=0)
+
+        encode_calls.clear()
+        vae._run_tile_tasks(tiles, indices, fake_encode)
+        assert encode_calls == [2] * 40
+    else:
+        # CPU check for TemporalIsolatedGroupNorm depth=1 fast path parity.
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.norm import (
+            TemporalIsolatedGroupNorm,
+            _merge_time_to_batch,
+            _split_time_from_batch,
+        )
+
+        gn = TemporalIsolatedGroupNorm(num_groups=8, num_channels=32, eps=1e-6).eval()
+        x = torch.randn(2, 32, 1, 8, 8)
+        with torch.inference_mode():
+            y_fast = gn(x)
+            y_ref = _split_time_from_batch(
+                torch.nn.GroupNorm.forward(gn, _merge_time_to_batch(x)), x.shape[0]
+            )
+        torch.testing.assert_close(y_fast, y_ref, rtol=0, atol=0)
