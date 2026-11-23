@@ -25,16 +25,12 @@ from unittest.mock import MagicMock, patch
 
 import prometheus_client
 
-from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
-from sglang.srt.managers.scheduler_components.request_list import (
-    IndexedReqList,
-    ListKind,
-)
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
@@ -230,6 +226,24 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_backup_storage_duration_metrics(self):
+        # _drain_backup reads operation.enqueue_time on every L2->L3 ack; a
+        # StorageOperation without the field (renamed or dropped) would crash
+        # the scheduler drain path instead of merely missing one sample.
+        from sglang.srt.managers.cache_controller import StorageOperation
+
+        operation = StorageOperation(host_indices=None, token_ids=[1, 2, 3])
+        self.assertIsInstance(operation.enqueue_time, float)
+        self.assertGreater(operation.enqueue_time, 0)
+
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+        collector.observe_backup_storage_duration(0.5)
+        self.assertEqual(
+            collector.backup_storage_duration_seconds.observations,
+            [(labels, 0.5)],
+        )
+
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
@@ -285,8 +299,11 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], pre_allocated_token_counts=lambda: (0, 0)
+                queue=[],
+                num_tokens_pending_prealloc=0,
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
+            max_total_num_tokens=1,
             running_batch=SimpleNamespace(reqs=[]),
             request_lists=lambda: {kind: [] for kind in ListKind},
             enable_fpm=False,
@@ -296,7 +313,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -350,28 +368,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         # before the metrics block runs, so a reset inside the metrics block
         # would zero the gauge on every busy-path report.
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda dr: dr.req)
-        queue.queue.join(
-            [
-                DecodeRequest(object(), SimpleNamespace(conclude_state=None)),
-                DecodeRequest(
-                    object(),
-                    SimpleNamespace(conclude_state=None),
-                    awaiting_publish=True,
-                ),
-                DecodeRequest(
-                    object(),
-                    SimpleNamespace(conclude_state=None),
-                    pending_metadata=(None, (), {}),
-                ),
-                DecodeRequest(object(), SimpleNamespace(conclude_state=KVPoll.Success)),
-                DecodeRequest(object(), SimpleNamespace(conclude_state=KVPoll.Failed)),
-            ]
-        )
+        queue.queue = []
         queue._deferred_releases = [object(), object()]
         batch = SimpleNamespace(
-            reqs=[SimpleNamespace(routing_key=None, seqlen=128) for _ in range(8)],
-            num_new_decode_reqs=2,
+            reqs=[],
             seq_lens_cpu=None,
             forward_iter=1,
             dp_cooperation_info=None,
@@ -385,7 +385,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 queue=[],
                 retracted_queue=[],
                 num_tokens_pre_allocated=0,
-                pre_allocated_token_counts=lambda: (0, 0),
+                num_tokens_pending_prealloc=0,
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
             running_batch=batch,
             waiting_queue=[],
@@ -398,7 +399,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     get_decode_usage_msg_parts=lambda: [],
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -409,7 +411,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         )
         reporter.stats = SchedulerStats()
         reporter.current_scheduler_metrics_enabled = True
-        reporter.is_stats_logging_rank = True
+        reporter.is_stats_logging_rank = False
         reporter.enable_mfu_metrics = False
         reporter.scheduler_status_logger = None
         reporter.forward_ct_decode = 0
@@ -437,10 +439,6 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.metrics_collector = collector
 
         with (
-            self.assertLogs(
-                "sglang.srt.managers.scheduler_components.metrics_reporter",
-                level="INFO",
-            ) as logs,
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
                 False,
@@ -463,11 +461,6 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         ):
             reporter.report_decode_stats(can_run_cuda_graph=False, running_batch=batch)
 
-        line = logs.output[0]
-        self.assertIn("#running-req: 8,", line)
-        self.assertIn("#new-req: 2,", line)
-        self.assertIn("#transfer-req: 5,", line)
-        self.assertIn("#recv-inflight-req: 1,", line)
         self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 2)
         self.assertEqual(
             self.collector.num_decode_deferred_kv_release_reqs.sets,

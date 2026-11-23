@@ -138,6 +138,7 @@ def test_prefill_attention_and_short_residency():
                     actual_seq_lengths_q=None,
                     actual_seq_lengths_kv=None,
                     sparse_kv_fused_prefill_plan=None,
+                    sparse_kv_offload_rows=None,
                 ),
             )
             query = torch.randn(4, heads, 512, device="npu", dtype=torch.bfloat16)
@@ -314,7 +315,10 @@ def test_short_sparse_graph_lifecycle(
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
                 sparse_kv_manager=manager,
-                forward_metadata=SimpleNamespace(sparse_kv_lim_plan=None),
+                forward_metadata=SimpleNamespace(
+                    sparse_kv_lim_plan=None,
+                    sparse_kv_offload_rows=None,
+                ),
             )
             lengths = [max(129, width + 1), capacity + 257, 0]
             max_abs = 0.0

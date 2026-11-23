@@ -72,14 +72,14 @@ def _prepare_sparse_kv_offload_kernel(
     tl.store(valid + t, live, in_bounds)
 
 
-def prepare_sparse_kv_rows(
+def prepare_sparse_kv_offload_rows(
+    tokens,
+    device,
     request_ids,
     seq_lens,
     positions,
     out_cache_loc,
     *,
-    tokens,
-    device,
     request_rows,
     context_len,
     host_capacity,
@@ -88,7 +88,7 @@ def prepare_sparse_kv_rows(
     extend_prefix_lens=None,
     compact_prefill=False,
 ):
-    """Prepare row addressing for split and packed offloaded KV."""
+    """Prepare row metadata for a single sparse KV offload forward."""
     batch = request_ids.numel()
     prefill = extend_seq_lens is not None
     source = torch.empty(tokens, dtype=torch.int64, device=device)
@@ -130,9 +130,39 @@ def prepare_sparse_kv_rows(
     return source, destination, token_positions, valid
 
 
-def prepare_sparse_kv_offload(k, k_rope, *args, **kwargs):
-    """Prepare split KV rows and the current decode/verify payload."""
-    rows = prepare_sparse_kv_rows(*args, tokens=k.shape[0], device=k.device, **kwargs)
-    prefill = kwargs.get("extend_seq_lens") is not None
-    current = (k, k_rope) if prefill else torch.cat((k, k_rope), dim=-1)
+def prepare_sparse_kv_offload(
+    k,
+    k_rope,
+    request_ids,
+    seq_lens,
+    positions,
+    out_cache_loc,
+    *,
+    request_rows,
+    context_len,
+    host_capacity,
+    query_width=1,
+    extend_seq_lens=None,
+    extend_prefix_lens=None,
+    compact_prefill=False,
+):
+    """Prepare offload rows and, for target decode/verify, concatenate KV."""
+    rows = prepare_sparse_kv_offload_rows(
+        k.shape[0],
+        k.device,
+        request_ids,
+        seq_lens,
+        positions,
+        out_cache_loc,
+        request_rows=request_rows,
+        context_len=context_len,
+        host_capacity=host_capacity,
+        query_width=query_width,
+        extend_seq_lens=extend_seq_lens,
+        extend_prefix_lens=extend_prefix_lens,
+        compact_prefill=compact_prefill,
+    )
+    current = (
+        (k, k_rope) if extend_seq_lens is not None else torch.cat((k, k_rope), dim=-1)
+    )
     return (*rows, current)

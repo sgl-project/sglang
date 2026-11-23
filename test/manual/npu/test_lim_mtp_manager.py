@@ -43,11 +43,11 @@ def _single_rank_attention_group():
 class _IndexPool(MLATokenToKVPool):
     """Isolate index-cache allocation while retaining the real manager path."""
 
-    def __init__(self, key):
+    def __init__(self, key, num_layers):
         self.key = key
         self.kv_lora_rank, self.qk_rope_head_dim = 512, 64
         self.store_dtype = torch.bfloat16
-        self.start_layer, self.layer_num = 0, 2
+        self.start_layer, self.layer_num = 0, num_layers
         self.page_size = 128
         self.size = key.shape[0] * 128 - self.page_size
 
@@ -80,7 +80,14 @@ def test_real_manager_mtp_compact_pd_lifecycle(graph):
     _run_manager_lifecycle(graph, 4, 2, 4096, compact_pd=True)
 
 
-def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False):
+@pytest.mark.parametrize("graph", [False, True])
+def test_real_manager_mtp_multiple_owners(graph):
+    _run_manager_lifecycle(graph, 4, 4, 12288, num_layers=4)
+
+
+def _run_manager_lifecycle(
+    graph, heads, query_width, capacity, compact_pd=False, num_layers=2
+):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
@@ -119,7 +126,7 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
     )
     if compact_pd:
         pool.req_to_token[6, :CONTEXT] = pool.req_to_token[5, :CONTEXT]
-    index_pool = _IndexPool(keys)
+    index_pool = _IndexPool(keys, num_layers)
     budget = resolve_sparse_kv_budget(
         model_config=SimpleNamespace(
             kv_lora_rank=512,
@@ -138,7 +145,7 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
         graph_batch_capacity=3,
         context_len=CONTEXT,
         cache_tokens=C,
-        num_layers=2,
+        num_layers=num_layers,
         top_k=K,
         kv_bytes_per_token=1152,
         copy_sfa_query_heads=heads,
@@ -170,7 +177,7 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
         SimpleNamespace(
             layer_id=i, tp_k_head_num=1, tp_q_head_num=heads, scaling=576**-0.5
         )
-        for i in range(2)
+        for i in range(num_layers)
     ]
     generator = torch.Generator().manual_seed(123)
     q = torch.randn(token_rows, heads, 512, generator=generator).to(
@@ -211,7 +218,7 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
                     2,
                     0,
                 ]
-            for i in range(2):
+            for i in range(num_layers):
                 for component in (manager.host_k_buffer[i], manager.host_v_buffer[i]):
                     component.copy_(
                         torch.randn(component.shape, generator=generator).to(
@@ -224,22 +231,26 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
                 sparse_kv_manager=manager,
-                forward_metadata=SimpleNamespace(sparse_kv_lim_plan=None),
+                forward_metadata=SimpleNamespace(
+                    sparse_kv_lim_plan=None, sparse_kv_offload_rows=None
+                ),
             )
 
             def run():
-                plan = manager.lim_adapter.select(
-                    manager,
-                    query=query,
-                    weights=weights,
-                    key=keys,
-                    block_table=table,
-                    forward_batch=inputs,
-                    layer_id=0,
-                )
-                backend.forward_metadata.sparse_kv_lim_plan = plan
                 outputs = []
-                for i in range(2):
+                for i in range(num_layers):
+                    if i % 2 == 0:
+                        plan = manager.lim_adapter.select(
+                            manager,
+                            query=query,
+                            weights=weights,
+                            key=keys,
+                            block_table=table,
+                            forward_batch=inputs,
+                            layer_id=i,
+                            reuse_metadata=i > 0,
+                        )
+                        backend.forward_metadata.sparse_kv_lim_plan = plan
                     outputs.append(
                         forward_fused_sparse_kv_offload(
                             backend,
@@ -255,7 +266,24 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
                     )
                 return plan, outputs
 
-            plan, outputs = run()
+            adapter = manager.lim_adapter
+            with (
+                patch.object(
+                    adapter, "_prepare_forward", wraps=adapter._prepare_forward
+                ) as prepare_lim,
+                patch.object(
+                    manager,
+                    "prepare_copy_sfa_plan",
+                    wraps=manager.prepare_copy_sfa_plan,
+                ) as prepare_copy,
+                patch.object(
+                    manager, "prepare_offload_rows", wraps=manager.prepare_offload_rows
+                ) as prepare_offload,
+            ):
+                plan, outputs = run()
+                assert prepare_lim.call_count == 1
+                assert prepare_copy.call_count == num_layers // 2
+                assert prepare_offload.call_count == 1
             torch.npu.synchronize()
             assert plan.miss_counts.cpu().tolist() == [C, C, 0]
             if compact_pd:
@@ -299,7 +327,7 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
             torch.npu.synchronize()
             assert plan.miss_counts.cpu().tolist() == [C, Q, 0]
             ids = plan.source_ids.cpu()
-            for i in range(2):
+            for i in range(num_layers):
                 host = torch.cat(
                     (manager.host_k_buffer[i], manager.host_v_buffer[i]), dim=-1
                 )
@@ -364,7 +392,7 @@ def _run_manager_lifecycle(graph, heads, query_width, capacity, compact_pd=False
             torch.npu.synchronize()
             assert plan.miss_counts.cpu().tolist() == [C, C, 0]
             ids = plan.source_ids.cpu()
-            for i in range(2):
+            for i in range(num_layers):
                 host = torch.cat(
                     (manager.host_k_buffer[i], manager.host_v_buffer[i]), dim=-1
                 )

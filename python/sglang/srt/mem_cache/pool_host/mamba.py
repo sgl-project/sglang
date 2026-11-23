@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
-    host_memory_budget_bytes,
+    host_memory_preflight,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -28,8 +28,8 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 # XPU ops only when no CUDA/ROCm backend is present, matching the imports below.
 _use_xpu_mamba_ops = _is_xpu and not (_is_cuda or _is_hip)
-transfer_state_per_layer_direct_pf_lf = None
-transfer_state_all_layer_direct_lf_pf = None
+transfer_kv_per_layer_direct_pf_lf = None
+transfer_kv_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
@@ -49,16 +49,16 @@ elif _is_xpu:
         transfer_kv_per_layer_direct_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection
+    from sgl_kernel_npu.operators.data_move import TransferDirection
 
     try:
-        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+        from sgl_kernel_npu.operators.data_move import transfer_mamba_state
     except ImportError:
         transfer_mamba_state = None
     try:
-        from sgl_kernel_npu.kvcacheio import (
-            transfer_state_all_layer_direct_lf_pf,
-            transfer_state_per_layer_direct_pf_lf,
+        from sgl_kernel_npu.operators.data_move import (
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_per_layer_direct_pf_lf,
         )
     except ImportError:
         pass
@@ -204,18 +204,27 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(),
+            self.allocator,
+            self._buffer_device,
+        )
+        from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_mamba_pool
+
+        # gfx950 shrinks a ratio-sized pool to fit the pinnable budget; no-op elsewhere
+        allocation_bytes, available_bytes = clamp_mamba_pool(
+            self, host_size, allocation_bytes, available_bytes
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (%d state slots, layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             self.size,
             self.layout,
         )
@@ -247,8 +256,8 @@ class MambaPoolHost(HostKVCache):
             return
 
         required_ops = (
-            transfer_state_per_layer_direct_pf_lf,
-            transfer_state_all_layer_direct_lf_pf,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_all_layer_direct_lf_pf,
         )
         required_torch_ops = (
             "transfer_state_per_layer_direct_pf_lf",
@@ -445,6 +454,22 @@ class MambaPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def get_mapping_lengths(self) -> list[int]:
+        token_layer_bytes = self.size * self.num_mamba_layers
+        return [
+            token_layer_bytes
+            * self.temporal_state_elem_size
+            * self.temporal_dtype.itemsize,
+            *(
+                token_layer_bytes * elem_size * self.conv_dtype.itemsize
+                for elem_size in self.conv_state_elem_sizes
+            ),
+            *(
+                self.size * state[0].numel() * state.element_size()
+                for state in self.slot_state_device_tensors
+            ),
+        ]
+
     @staticmethod
     def _item_size_per_index(tensor: torch.Tensor) -> int:
         if tensor.shape[0] == 0:
@@ -517,7 +542,7 @@ class MambaPoolHost(HostKVCache):
             )
         elif io_backend == "kernel_ascend":
             if _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_per_layer_direct_pf_lf(
+                transfer_kv_per_layer_direct_pf_lf(
                     src=src,
                     dst=dst,
                     src_indices=src_indices,
@@ -660,7 +685,7 @@ class MambaPoolHost(HostKVCache):
                     values = src.index_select(0, device_indices).to(device=dst.device)
                     dst[:, layer_id, 0].index_copy_(0, host_indices, values)
             elif _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_all_layer_direct_lf_pf(
+                transfer_kv_all_layer_direct_lf_pf(
                     device_states=[src_layers],
                     host_states=[dst],
                     device_indices=src_indices,

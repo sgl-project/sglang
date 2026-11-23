@@ -48,16 +48,18 @@ def _load_fused_attention():
 
 def test_publication_rows_are_built_once_per_target_forward():
     module = _load_fused_attention()
-    publication_rows = tuple(object() for _ in range(4))
+    publication_rows = tuple(torch.empty(2) for _ in range(4))
     plan = SimpleNamespace(query_width=1)
     metadata = SimpleNamespace(
         sparse_kv_lim_plan=plan,
-        sparse_kv_publication_rows=None,
+        sparse_kv_offload_rows=None,
     )
     manager = SimpleNamespace(
         packed_c8=True,
         start_layer=0,
-        prepare_publication_rows=Mock(return_value=publication_rows),
+        layer_num=2,
+        lim_adapter=Mock(),
+        prepare_offload_rows=Mock(return_value=publication_rows),
         offload_v2=Mock(
             return_value=(
                 torch.empty(2, 656, dtype=torch.int8),
@@ -95,21 +97,24 @@ def test_publication_rows_are_built_once_per_target_forward():
             **tensors,
         )
 
-    manager.prepare_publication_rows.assert_called_once()
-    assert metadata.sparse_kv_publication_rows is publication_rows
+    manager.prepare_offload_rows.assert_called_once_with(2, forward_batch)
+    manager.lim_adapter.commit_forward.assert_called_once_with(2)
+    assert metadata.sparse_kv_offload_rows is None
+    assert metadata.sparse_kv_lim_plan is None
     assert manager.offload_v2.call_count == 2
     for call in manager.offload_v2.call_args_list:
-        assert call.kwargs["publication_rows"] is publication_rows
+        assert call.kwargs["offload_rows"] is publication_rows
 
-    # Capture warmup may execute again with the same graph ForwardMetadata.
-    # Its first layer must still record a fresh producer in that invocation.
+    # A new invocation with the same ForwardMetadata rebuilds the row tensors.
+    metadata.sparse_kv_lim_plan = plan
     module.forward_fused_sparse_kv_offload(
         backend,
         layer=SimpleNamespace(layer_id=0, tp_k_head_num=1),
         forward_batch=forward_batch,
         **tensors,
     )
-    assert manager.prepare_publication_rows.call_count == 2
+    assert manager.prepare_offload_rows.call_count == 2
+    manager.lim_adapter.commit_forward.assert_called_once()
 
 
 if __name__ == "__main__":

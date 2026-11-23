@@ -3,22 +3,17 @@
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
-from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_rows
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     C8_ROW_BYTES,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
     LIMDecodeAdapter,
-    sparse_query_width,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
     FusedSparseKVCacheManager,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-    MemFabricKVPool,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-    prepare_copy_sfa_metadata,
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+    HostKVPool,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -38,7 +33,7 @@ def _copy_packed(source, destination, src, dst, valid):
     )
 
 
-class PackedMemFabricKVPool(MemFabricKVPool):
+class PackedMemFabricKVPool(HostKVPool):
     def copy_rows(self, sources, destinations, source_rows, destination_rows, valid):
         (source,), (destination,) = sources, destinations
         if source_rows.numel():
@@ -55,21 +50,19 @@ class C8DecodeAdapter(LIMDecodeAdapter):
             raise RuntimeError("A5 C8 requires the paired fully visible LIM wheel.")
         return operator
 
-    def select(
+    def _run_operator(
         self,
         manager,
+        layer_index,
+        batch,
+        width,
         *,
         query,
         weights,
         key,
-        block_table,
-        forward_batch,
-        layer_id,
         query_scale,
         key_scale,
     ):
-        layer = layer_id - manager.start_layer
-        batch, width = self.prepare(manager, block_table, forward_batch, layer)
         rows = batch * width
         self.operator(
             query=query[:rows].contiguous(),
@@ -83,7 +76,7 @@ class C8DecodeAdapter(LIMDecodeAdapter):
             cache_tokens=self._pre_cache_sizes[:batch],
             request_state=self._pre_states[:batch],
             pool_entries=self.resident_safe_slots[:batch],
-            slot_pool=manager.device_slot_map[layer],
+            slot_pool=manager.device_slot_map[layer_index],
             topk_sources=self.source_ids[:rows],
             topk_slots=self.device_slots[:rows],
             topk_miss_counts=self.topk_misses[:rows],
@@ -91,20 +84,6 @@ class C8DecodeAdapter(LIMDecodeAdapter):
             miss_slots=self.miss_slots[:batch],
             miss_counts=self.miss_counts[:batch],
         )
-        # This metadata belongs to the shared LIM plan.  Prepare it once on the
-        # owner layer so IndexShare consumers can submit CopySFA directly.
-        prepare_copy_sfa_metadata(
-            source_ids=self.source_ids[:rows],
-            valid_rows=self._pre_valid[:batch],
-            sparse_rows=self._pre_sparse[:batch],
-            request_slots=self.resident_safe_slots[:batch],
-            actual_seq_lengths_kv=self._pre_lengths[:batch],
-            hbm_block_table=manager.planner_hbm_block_table[:batch],
-            capacity=self.capacity,
-            query_width=width,
-            hbm_row_offset=1,
-        )
-        return self.finish(layer, batch, width)
 
 
 class C8SparseKVCacheManager(FusedSparseKVCacheManager):
@@ -148,44 +127,20 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         if resident_id:
             self.reset_requests([request_id], [resident_id])
 
-    def prepare_publication_rows(self, forward_batch, tokens, device):
-        """Build layer-independent row addresses for this target forward."""
-        prefill = forward_batch.forward_mode.is_extend_without_speculative()
-        return prepare_sparse_kv_rows(
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            None if prefill else forward_batch.positions,
-            forward_batch.out_cache_loc,
-            tokens=tokens,
-            device=device,
-            request_rows=self.size,
-            context_len=self.logical_max_context_len,
-            host_capacity=self.host_token_capacity,
-            query_width=1 if prefill else sparse_query_width(forward_batch),
-            extend_seq_lens=forward_batch.extend_seq_lens if prefill else None,
-            extend_prefix_lens=forward_batch.extend_prefix_lens if prefill else None,
-            compact_prefill=prefill
-            and sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
-            == tokens,
-        )
-
-    def offload_v2(self, k, k_rope, layer, forward_batch, publication_rows=None):
+    def offload_v2(self, k, k_rope, layer, forward_batch, *, offload_rows=None):
         layer_index = layer.layer_id - self.start_layer
         current = self.paged_kv_cache._pack_dsa_fp8_kv_cache(k, k_rope).view(torch.int8)
-        prefill = forward_batch.forward_mode.is_extend_without_speculative()
-        if publication_rows is None:
-            publication_rows = self.prepare_publication_rows(
-                forward_batch, current.shape[0], current.device
-            )
-        src, dst, positions, valid = publication_rows
+        if offload_rows is None:
+            offload_rows = self.prepare_offload_rows(k.shape[0], forward_batch)
+        src, dst, positions, valid = offload_rows
         if self.host_pool.rank == 0:
             _copy_packed(current, self.host_kv_buffer[layer_index], src, dst, valid)
         self.host_pool.publish()
-        if prefill:
+        if forward_batch.forward_mode.is_extend_without_speculative():
             requests = forward_batch.req_pool_indices.long()
             self.resident_end[layer_index].index_fill_(0, requests, -1)
-            if self.request_to_resident is None:
-                self.lim_adapter.last_prefix[layer_index].index_fill_(0, requests, -1)
+            if self.request_to_resident is None and layer_index == self.layer_num - 1:
+                self.lim_adapter.reset_requests(requests)
         return current, positions, valid
 
     def copy_sfa_attention(self, layer, query_nope, query_rope, plan, current_inputs):
@@ -193,7 +148,7 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         batch, width = plan.valid_rows.numel(), plan.query_width
         rows, heads = batch * width, query_nope.shape[1]
         padded_heads = self.budget.copy_sfa_query_heads
-        lengths = self.lim_adapter._pre_lengths[:batch]
+        lengths = self.lim_adapter._copy_lengths[:batch]
         current, positions, valid = current_inputs
         hbm_table = self.planner_hbm_block_table[:batch]
         if heads < padded_heads:
@@ -204,9 +159,7 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         self._copy_sfa_operator(
             query_nope.contiguous(),
             query_rope.contiguous(),
-            self.device_kv_buffer[layer_index].view(
-                -1, self.page_size, 1, C8_ROW_BYTES
-            ),
+            self.device_k_buffer[layer_index].view(-1, self.page_size, 1, C8_ROW_BYTES),
             self.host_kv_buffer[layer_index],
             self.dev_ptr_list[layer_index],
             hbm_table,

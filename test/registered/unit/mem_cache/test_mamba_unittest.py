@@ -27,8 +27,8 @@ from sglang.test.ci.ci_register import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_amd_ci(est_time=9, suite="base-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 
 class TestMamba(unittest.TestCase):
@@ -171,6 +171,49 @@ class TestMamba(unittest.TestCase):
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
+
+    def test_mamba_pool_without_intermediate_ssm(self):
+        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=4096,
+            n_groups=16,
+            num_heads=32,
+            head_dim=128,
+            state_size=128,
+            conv_kernel=4,
+        )
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            cache_params = Mamba2CacheParams(shape=shape, layers=[0, 1])
+        common = dict(
+            size=4,
+            max_context_len=128,
+            device=get_device(),
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=[0, 1],
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        for allocate in (True, False):
+            for pool in (
+                HybridReqToTokenPool(
+                    mamba_size=8,
+                    mamba_spec_state_size=4,
+                    allocate_intermediate_ssm=allocate,
+                    **common,
+                ),
+                HybridMambaDecodeReqToTokenPool(
+                    pre_alloc_size=0,
+                    enable_overlap_schedule=False,
+                    allocate_intermediate_ssm=allocate,
+                    **common,
+                ),
+            ):
+                cache = pool.mamba_pool.mamba_cache
+                assert (cache.intermediate_ssm is not None) == allocate
+                assert cache.intermediate_conv_window[0].shape[2] == 3
 
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):

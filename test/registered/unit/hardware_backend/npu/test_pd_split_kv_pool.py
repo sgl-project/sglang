@@ -36,6 +36,108 @@ def _make_pool():
 
 
 class TestPDSplitKVPool(CustomTestCase):
+    def test_nonarch35_mla_builder_compacts_eligible_target_only(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        owner_ids = (0, 1, 2, *range(6, 78, 4))
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+            indexer_types=[
+                "full" if layer_id in owner_ids else "shared" for layer_id in range(78)
+            ],
+        )
+
+        def build_pool(*, start_layer, end_layer, num_layers, is_draft, eligible):
+            configurator = object.__new__(KVCacheConfigurator)
+            configurator.is_draft_worker = is_draft
+            configurator.layer_info = SimpleNamespace(
+                start_layer=start_layer,
+                end_layer=end_layer,
+                num_effective_layers=num_layers,
+            )
+            configurator.model_config = SimpleNamespace(
+                hf_config=hf_config,
+                index_head_dim=128,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
+            configurator.kv_cache_dtype = torch.bfloat16
+            configurator.device = "cpu"
+            configurator.server_args = SimpleNamespace(indexer_kv_cache_dtype="auto")
+            configurator.spec_algorithm = SimpleNamespace(is_dspark=lambda: False)
+            configurator.modelslim_cache_layout = None
+            with (
+                patch(
+                    "sglang.srt.layers.cp.utils.get_glm_dsa_cp_layer_shard_info",
+                    return_value=(None, 1),
+                ),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_size=1),
+                ),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.get_schedule",
+                    return_value=SimpleNamespace(page_size=64),
+                ),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.get_exec",
+                    return_value=SimpleNamespace(
+                        features=SimpleNamespace(enable_memory_saver=False)
+                    ),
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                    return_value=eligible,
+                ),
+            ):
+                return configurator._build_ascend_mla_kv_pool(
+                    max_total_num_tokens=128, max_running_requests=1, is_dsa_model=True
+                )
+
+        target = build_pool(
+            start_layer=0,
+            end_layer=78,
+            num_layers=78,
+            is_draft=False,
+            eligible=True,
+        )
+        self.assertEqual(target.index_k_buffer.shape[0], 21)
+        self.assertEqual(target.index_k_buffer.dtype, torch.bfloat16)
+        self.assertEqual(target.index_k_buffer.nbytes, 21 * 3 * 64 * 128 * 2)
+        self.assertEqual(target.get_index_k_buffer(74).shape[-1], 128)
+        with self.assertRaises(KeyError):
+            target.get_index_k_buffer(3)
+
+        full_target = build_pool(
+            start_layer=0,
+            end_layer=78,
+            num_layers=78,
+            is_draft=False,
+            eligible=False,
+        )
+        self.assertEqual(full_target.index_k_buffer.shape[0], 78)
+
+        draft = build_pool(
+            start_layer=78,
+            end_layer=79,
+            num_layers=1,
+            is_draft=True,
+            eligible=False,
+        )
+        self.assertEqual(draft.index_k_buffer.shape[0], 1)
+        self.assertEqual(draft.index_k_buffer.nbytes, 1 * 3 * 64 * 128 * 2)
+        self.assertEqual(draft.get_index_k_buffer(78).shape[-1], 128)
+
     def test_pool_allocation_follows_fused_role(self):
         from sglang.srt.environ import envs
 
@@ -99,7 +201,7 @@ class TestPDSplitKVPool(CustomTestCase):
         self.assertEqual(page_bytes, [131072] * 2 + [16384] * 2 + [512] * 2)
 
     def test_host_group_partitions_by_shared_memory(self):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
             _host_group,
         )
 
@@ -236,8 +338,8 @@ class TestPDSplitKVPool(CustomTestCase):
             self.assertTrue(torch.all(tensor[1] == 3))
 
     def test_shared_host_allocation_and_copy(self):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-            MemFabricKVPool,
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+            HostKVPool,
         )
 
         messages = []
@@ -303,7 +405,7 @@ class TestPDSplitKVPool(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool._host_group",
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool._host_group",
                 side_effect=lambda group: group,
             ),
             patch.dict(
@@ -330,8 +432,8 @@ class TestPDSplitKVPool(CustomTestCase):
                     dtype=dtype,
                     device="cpu",
                 )
-                owner = MemFabricKVPool(group=Group(0), **kwargs)
-                peer = MemFabricKVPool(group=Group(1), **kwargs)
+                owner = HostKVPool(group=Group(0), **kwargs)
+                peer = HostKVPool(group=Group(1), **kwargs)
                 self.assertEqual(len(allocations), len(widths))
                 self.assertEqual(
                     [c[0].data_ptr() for c in owner.buffers],

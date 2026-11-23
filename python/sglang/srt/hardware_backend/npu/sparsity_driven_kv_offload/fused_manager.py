@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -24,17 +23,16 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-        MemFabricKVPool,
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+        HostKVPool,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
 
-logger = logging.getLogger(__name__)
-
 
 class FusedSparseKVCacheManager:
-    host_pool: MemFabricKVPool
+    host_pool: HostKVPool
+    packed_c8 = False
 
     def __init__(
         self,
@@ -64,20 +62,6 @@ class FusedSparseKVCacheManager:
         self.max_query_width = self.budget.max_query_width
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
-        logger.info(
-            "Sparse KV: K=%d C=%d, managed HBM/rank=%.2f MiB, shared host payload=%.2f MiB, host_layout=%s",
-            self.sparse_topk,
-            self.device_cache_size,
-            self.budget.managed_hbm_bytes / 1024**2,
-            self.budget.host_kv_bytes / 1024**2,
-            "packed_c8" if self.budget.packed_c8 else "paged_split",
-        )
-        logger.info(
-            "Sparse KV prefill workspace: enabled=%s capacity_tokens=%d persistent_bytes=%d",
-            bool(self.budget.prefill_workspace_tokens),
-            self.budget.prefill_workspace_tokens,
-            self.budget.prefill_workspace_bytes,
-        )
         self.cache_capacity = self.device_cache_size
         self._copy_sfa_operator = self._load_copy_sfa_operator()
 
@@ -86,22 +70,13 @@ class FusedSparseKVCacheManager:
         try:
             for name, spec in self.budget.manager_buffers.items():
                 fill_value = None
-                if name in (
-                    "device_slot_map",
-                    "resident_begin",
-                    "resident_end",
-                ):
+                if name in ("device_slot_map", "resident_begin", "resident_end"):
                     fill_value = -1
                 elif name == "request_to_resident":
                     fill_value = 0
                 value = (
                     [spec.allocate(self.device, fill_value) for _ in range(spec.count)]
-                    if name
-                    in (
-                        "device_kv_buffer",
-                        "device_rope_buffer",
-                        "device_slot_map",
-                    )
+                    if name in ("device_k_buffer", "device_v_buffer", "device_slot_map")
                     else spec.allocate(self.device, fill_value)
                 )
                 setattr(self, name, value)
@@ -115,6 +90,9 @@ class FusedSparseKVCacheManager:
             self._install_req_alloc_hook(req_to_token_pool)
         else:
             self._clear_resident_rows()
+            req_to_token_pool.available_sparse_resident_rows = (
+                self._available_resident_rows
+            )
             req_to_token_pool.admit_sparse_resident_rows = self._admit_resident_rows
             req_to_token_pool.release_sparse_resident_row = self._release_resident_row
             req_to_token_pool.clear_sparse_resident_rows = self._clear_resident_rows
@@ -129,11 +107,11 @@ class FusedSparseKVCacheManager:
 
         # Radix prefixes use native physical token IDs. Keep host payloads in that
         # same address space; request slots own only bounded HBM residency maps.
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-            MemFabricKVPool,
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+            HostKVPool,
         )
 
-        self.host_pool = MemFabricKVPool(
+        self.host_pool = HostKVPool(
             tokens=self.host_token_capacity,
             layers=self.layer_num,
             page_size=self.page_size,
@@ -147,58 +125,6 @@ class FusedSparseKVCacheManager:
             [x.data_ptr() for x in component] for component in self.host_pool.buffers
         )
         self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
-        logger.info(
-            "Sparse KV host buffers: layout=split, CKV=%s, KPE=%s, pool=%s",
-            tuple(self.host_k_buffer[0].shape),
-            tuple(self.host_v_buffer[0].shape),
-            type(self.host_pool).__name__,
-        )
-        # Log allocation metadata once, before any graph capture or forward.
-        logger.info(
-            "Sparse split C allocation: capacity=%d resident_rows=%d request_rows=%d "
-            "layers=%d bytes=%d ckv_spec=%s rope_spec=%s",
-            self.device_cache_size,
-            self.budget.resident_rows,
-            self.size,
-            self.layer_num,
-            self.budget.device_kv_bytes,
-            self.budget.manager_buffers["device_kv_buffer"],
-            self.budget.manager_buffers["device_rope_buffer"],
-        )
-        for layer_idx in range(self.layer_num):
-            ckv = self.device_kv_buffer[layer_idx]
-            rope = self.device_rope_buffer[layer_idx]
-            host_ckv = self.host_k_buffer[layer_idx]
-            host_rope = self.host_v_buffer[layer_idx]
-            logger.debug(
-                "Sparse split layout layer=%d host_ckv_shape=%s host_ckv_stride=%s "
-                "host_ckv_registered_ptr=%#x host_rope_shape=%s host_rope_stride=%s "
-                "host_rope_registered_ptr=%#x hbm_ckv_shape=%s hbm_ckv_stride=%s "
-                "hbm_ckv_storage_ptr=%#x hbm_rope_shape=%s hbm_rope_stride=%s "
-                "hbm_rope_storage_ptr=%#x hbm_bytes=%d",
-                layer_idx,
-                tuple(host_ckv.shape),
-                tuple(host_ckv.stride()),
-                self.dev_ptr_list[layer_idx],
-                tuple(host_rope.shape),
-                tuple(host_rope.stride()),
-                self.rope_dev_ptr_list[layer_idx],
-                tuple(ckv.shape),
-                tuple(ckv.stride()),
-                ckv.untyped_storage().data_ptr(),
-                tuple(rope.shape),
-                tuple(rope.stride()),
-                rope.untyped_storage().data_ptr(),
-                ckv.nbytes + rope.nbytes,
-            )
-        logger.info(
-            "Sparse split HBM layout: start_layer=%d layers=%d C=%d CKV=%d RoPE=%d",
-            self.start_layer,
-            self.layer_num,
-            self.device_cache_size,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-        )
 
     def _make_decode_adapter(self):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
@@ -255,6 +181,9 @@ class FusedSparseKVCacheManager:
         self._resident_rows_by_request = [0] * self.size
         self._free_resident_rows = list(range(self.budget.resident_rows - 1, 0, -1))
 
+    def _available_resident_rows(self) -> int:
+        return len(self._free_resident_rows)
+
     def _release_resident_row(self, req_id: int) -> None:
         resident_id = self._resident_rows_by_request[req_id]
         if resident_id:
@@ -281,6 +210,27 @@ class FusedSparseKVCacheManager:
         mapping = torch.tensor(self._resident_rows_by_request, dtype=torch.int32)
         self.request_to_resident.copy_(mapping, non_blocking=True)
 
+    def prepare_copy_sfa_plan(self, plan) -> None:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
+            prepare_copy_sfa_metadata,
+        )
+
+        batch = plan.request_safe_slots.numel()
+        adapter = self.lim_adapter
+        prepare_copy_sfa_metadata(
+            source_ids=plan.source_ids,
+            valid_rows=plan.valid_rows,
+            sparse_rows=plan.sparse_rows,
+            request_slots=plan.resident_safe_slots,
+            # The next LIM owner still needs the real sequence lengths.
+            seq_lens=adapter._pre_lengths[:batch],
+            actual_seq_lengths_kv=adapter._copy_lengths[:batch],
+            hbm_block_table=self.planner_hbm_block_table[:batch],
+            capacity=adapter.capacity,
+            query_width=plan.query_width,
+            hbm_row_offset=int(self.packed_c8),
+        )
+
     def copy_sfa_attention(
         self,
         layer,
@@ -289,25 +239,9 @@ class FusedSparseKVCacheManager:
         plan,
         current_inputs,
     ):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-            prepare_copy_sfa_metadata,
-        )
-
         batch = plan.request_safe_slots.numel()
         rows = batch * plan.query_width
         adapter = self.lim_adapter
-        # LIM has consumed these lengths on this stream; reuse the scratch for CopySFA.
-        actual_seq_lengths_kv = adapter._pre_lengths[:batch]
-        prepare_copy_sfa_metadata(
-            source_ids=plan.source_ids,
-            valid_rows=plan.valid_rows,
-            sparse_rows=plan.sparse_rows,
-            request_slots=plan.resident_safe_slots,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            hbm_block_table=self.planner_hbm_block_table[:batch],
-            capacity=adapter.capacity,
-            query_width=plan.query_width,
-        )
         query_heads = query_nope.shape[1]
         current, positions, valid = current_inputs
         padded_heads = self.budget.copy_sfa_query_heads
@@ -321,10 +255,10 @@ class FusedSparseKVCacheManager:
             device=query_nope.device,
         )
         layer_idx = layer.layer_id - self.start_layer
-        cache = self.device_kv_buffer[layer_idx].view(
+        cache = self.device_k_buffer[layer_idx].view(
             -1, self.page_size, self.head_num, self.kv_lora_rank
         )
-        rope_cache = self.device_rope_buffer[layer_idx].view(
+        rope_cache = self.device_v_buffer[layer_idx].view(
             -1, self.page_size, self.head_num, self.qk_rope_head_dim
         )
         fused_scatter_copy_sparse_flash_attention(
@@ -333,8 +267,8 @@ class FusedSparseKVCacheManager:
             hbm_ckv=cache,
             hbm_rope=rope_cache,
             actual_seq_lengths_query=adapter.query_ends[plan.query_width - 1, :batch],
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            num_cache_tokens=self.lim_adapter._pre_cache_sizes[:batch],
+            actual_seq_lengths_kv=adapter._copy_lengths[:batch],
+            num_cache_tokens=adapter._pre_cache_sizes[:batch],
             topk_src_ids=plan.source_ids,
             topk_dst_slots=plan.device_slots,
             topk_miss_counts=plan.topk_misses,
@@ -380,35 +314,32 @@ class FusedSparseKVCacheManager:
 
         setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
 
-    def offload_v2(
-        self,
-        k: torch.Tensor,
-        k_rope: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-    ):
-        """Publish KV to paged host storage and return decode rows for CopySFA."""
-        from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_offload
+    def prepare_offload_rows(
+        self, tokens: int, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sglang.kernels.ops.kvcache.npu_sparse_kv import (
+            prepare_sparse_kv_offload_rows,
+        )
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             sparse_query_width,
         )
 
-        layer_idx = layer.layer_id - self.start_layer
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
         compact_prefill = is_prefill and (
-            sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
-            == k.shape[0]
+            sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size]) == tokens
         )
-        src, dst, positions, valid, current = prepare_sparse_kv_offload(
-            k,
-            k_rope,
+        return prepare_sparse_kv_offload_rows(
+            tokens,
+            self.device,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             None if is_prefill else forward_batch.positions,
             forward_batch.out_cache_loc,
             request_rows=self.size,
             context_len=(
-                self.max_context_len if is_prefill else self.logical_max_context_len
+                self.max_context_len
+                if is_prefill and not self.packed_c8
+                else self.logical_max_context_len
             ),
             host_capacity=self.host_token_capacity,
             query_width=1 if is_prefill else sparse_query_width(forward_batch),
@@ -416,6 +347,25 @@ class FusedSparseKVCacheManager:
             extend_prefix_lens=forward_batch.extend_prefix_lens if is_prefill else None,
             compact_prefill=compact_prefill,
         )
+
+    def offload_v2(
+        self,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        *,
+        offload_rows: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None,
+    ):
+        """Publish this layer's KV and return its current rows for attention."""
+        layer_idx = layer.layer_id - self.start_layer
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        if offload_rows is None:
+            offload_rows = self.prepare_offload_rows(k.shape[0], forward_batch)
+        src, dst, positions, valid = offload_rows
+        current = (k, k_rope) if is_prefill else torch.cat((k, k_rope), dim=-1)
         if self.host_pool.rank == 0:
             self.host_pool.copy_rows(
                 (k, k_rope),

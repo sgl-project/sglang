@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
+    is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
     uses_compressed_kv_attention,
@@ -118,6 +119,9 @@ class MemoryPoolConfig:
     # instead of re-summing token counts; None when a user token cap is the budget.
     unified_total_bytes: Optional[int] = None
 
+    # The target priced a compact DFLASH draft pool per sliding-window token: the
+    # draft pool holds swa_max_total_num_tokens rows indexed by the target's SWA ids.
+    dflash_draft_follows_swa: bool = False
     # Live owner-token ceiling (user or PP), distinct from the arena's share.
     # None allows token KV to borrow unused state/window capacity.
     unified_full_cap_tokens: Optional[int] = None
@@ -131,19 +135,70 @@ class MemoryPoolConfig:
 
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+        BudgetPlan,
+    )
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
 
 
+def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
+    """A DFLASH draft KV ring is charged as a fixed pool instead
+    (KVCacheConfigurator._dflash_draft_kv_ring_bytes)."""
+    return (
+        not kvc.is_draft_worker
+        and kvc.spec_algorithm.is_dflash_family()
+        # DFLASH and DSPARK only build the draft on the final PP stage.
+        and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
+        and not get_spec().speculative_dflash_draft_kv_ring
+    )
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds per target row, 0 if none."""
-    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+    if not _charges_dflash_draft_kv_per_token(kvc):
         return 0
     cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
+
+
+def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
+    """Whether the target sizes its compact-window DFLASH draft pool per
+    sliding-window token (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV). The draft's whole
+    read window must stay inside what the target's SWA eviction retains. ROCm only."""
+    if not _is_hip or not envs.SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV.get():
+        return False
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return False
+    draft_window = get_spec().speculative_draft_window_size
+    # The target's sliding_window_size counts the tokens before the current one
+    # (Muse: config window 2048 -> 2047); its SWA eviction keeps window + 1.
+    target_window = kvc.sliding_window_size
+    reasons = []
+    if draft_window is None:
+        reasons.append("no --speculative-draft-window-size (non-compact draft)")
+    elif target_window is None or int(draft_window) > int(target_window) + 1:
+        reasons.append(
+            f"draft window {draft_window} exceeds the target's retained window "
+            f"{None if target_window is None else int(target_window) + 1}"
+        )
+    if not kvc.is_hybrid_swa or not kvc.layer_info.full_attention_layer_ids:
+        reasons.append("the target is not a hybrid full/SWA model")
+    if is_deepseek_v4(kvc.model_config.hf_config):
+        reasons.append("DeepSeek-V4 pools are not supported")
+    if get_memory().enable_unified_memory:
+        reasons.append("--enable-unified-memory is set")
+    if get_parallel().attn_dcp_size > 1:
+        reasons.append("DCP widens the draft id space")
+    if reasons:
+        logger.warning(
+            "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
+        )
+        return False
+    return True
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -254,6 +309,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self._sparse_budget = None
+        self._pd_sparse_decode = False
         self._kvc = kvc
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         dcp_size = get_parallel().attn_dcp_size
@@ -296,6 +352,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 get_sparsity_driven_kv_offload_sparse_context_len,
                 is_sparsity_driven_kv_offload_enabled,
             )
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+                C8_ROW_BYTES,
+            )
             from sglang.srt.mem_cache.allocation_sizing import (
                 get_req_to_token_extra_context_len,
             )
@@ -308,8 +367,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 # The variable-sized native pool contains only indexer KV. The
                 # separate sparse manager is allocated later by AscendAttnBackend
                 # and must be charged before that indexer pool fills HBM.
-                if kvc.sparse_kv_budget_plan is None:
-                    disagg = get_disagg()
+                disagg = get_disagg()
+                self._pd_sparse_decode = (
+                    disagg.disaggregation_mode == "decode"
+                    and not disagg.enable_pd_role_switch
+                )
+                if kvc.sparse_kv_budget_plan is None or (
+                    self._pd_sparse_decode and not kvc.sparse_kv_budget_finalized
+                ):
                     extra_rows = (
                         disagg.disaggregation_decode_extra_slots or 0
                         if disagg.disaggregation_mode == "decode"
@@ -324,9 +389,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         request_rows=max_running_requests_per_worker + extra_rows + 1,
                         resident_rows=(
                             max_running_requests_per_worker + 1
-                            if disagg.disaggregation_mode == "decode"
-                            and not disagg.enable_pd_role_switch
-                            and extra_rows > 0
+                            if self._pd_sparse_decode
                             else max_running_requests_per_worker + extra_rows + 1
                         ),
                         context_len=kvc.model_config.context_len
@@ -335,7 +398,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             model_config=kvc.model_config
                         ),
                         kv_bytes_per_token=(
-                            656
+                            C8_ROW_BYTES
                             if kvc.kv_cache_dtype == torch.float8_e4m3fn
                             else (
                                 kvc.model_config.kv_lora_rank
@@ -343,12 +406,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             )
                             * torch._utils._element_size(kvc.kv_cache_dtype)
                         ),
-                    )
-                    kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
                         num_layers=num_layers,
                         kv_dtype=kvc.kv_cache_dtype,
-                        **budget_options,
                     )
+                    if self._pd_sparse_decode:
+                        # The ceiling is a candidate, so enforce the HBM limit
+                        # when fitting the final row count.
+                        budget_options["hbm_budget_bytes"] = 0
+                        self._pd_sparse_budget_options = budget_options
+                    if kvc.sparse_kv_budget_plan is None:
+                        kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
+                            **budget_options
+                        )
                 budget = kvc.sparse_kv_budget_plan
                 self._sparse_budget = budget
                 self._sparse_min_tokens = get_schedule().max_total_tokens or max(
@@ -360,10 +429,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         len(kvc.get_dsa_indexer_layer_ids()) * torch.float32.itemsize
                     )
                     self._cell_size += scale_bytes
-                    self._fixed_overhead_bytes += (
-                        scale_bytes * get_schedule().page_size
-                        + 128 * 128 * torch.bfloat16.itemsize
-                    )
+                    self._fixed_overhead_bytes += 128 * 128 * torch.bfloat16.itemsize
+                    # PD's native padding page already includes the scale bytes.
+                    if not self._pd_sparse_decode:
+                        self._fixed_overhead_bytes += (
+                            scale_bytes * get_schedule().page_size
+                        )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -447,7 +518,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if _charges_dflash_draft_kv_per_token(kvc):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -498,7 +569,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if dcp_size is None:
             dcp_size = get_parallel().attn_dcp_size
 
-        if kvc.use_mla_backend:
+        if kvc.modelslim_cache_layout is not None:
+            cell_size = (
+                kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
+            )
+        elif kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
                 # NPU sparse KV offload uses an index-only device pool.
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
@@ -526,16 +601,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            if kvc.modelslim_cache_layout is not None:
-                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
-            else:
-                per_layer_bytes = (
-                    calculate_mla_kv_cache_dim(
-                        model_config=model_config,
-                        kv_cache_dtype=kv_cache_dtype,
-                    )
-                    * kv_size
+            per_layer_bytes = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
+                * kv_size
+            )
             cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -700,12 +772,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 ) // scale_block_size
 
         cell_size += self._compute_qsa_cell_size(
-            hf_config=model_config.hf_config, num_layers=num_layers
+            hf_config=model_config.hf_config,
+            num_layers=num_layers,
+            kv_shard_size=kvc.kv_shard_size,
         )
         return cell_size
 
     @staticmethod
-    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+    def _compute_qsa_cell_size(
+        *, hf_config, num_layers: int, kv_shard_size: int
+    ) -> int:
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -719,7 +795,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
-        return QSATokenToKVPool.qsa_bytes_per_token(
+        # Under KV sharding the compressed keys stay replicated over the
+        # N-times widened logical slot space (see QSATokenToKVPool).
+        return kv_shard_size * QSATokenToKVPool.qsa_bytes_per_token(
             kv_heads=qsa_profile.kv_heads,
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
@@ -737,7 +815,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
-                index_head_dim, get_exec().kernel.enable_fp4_indexer
+                index_head_dim,
+                get_exec().kernel.enable_fp4_indexer
+                or get_exec().kernel.enable_dsa_fp4_indexer,
             ),
             get_dsa_index_kpool(kvc.model_config.hf_config),
         )
@@ -745,11 +825,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
+            from sglang.srt.mem_cache.kv_cache_dtype import (
+                QUANT_MODE_TOKEN_INT8,
+                resolve_indexer_quant_mode,
+            )
+
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
-                indexer_size_per_token = index_head_dim
-                element_size = torch._utils._element_size(dtype)
+                indexer_quant_mode = resolve_indexer_quant_mode(
+                    kvc.server_args.indexer_kv_cache_dtype, dtype
+                )
+                if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+                    if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
+                        raise ValueError(
+                            "INT8 indexer KV cache is not supported with NPU KPool."
+                        )
+                    indexer_size_per_token = (
+                        index_head_dim + torch._utils._element_size(torch.float16)
+                    )
+                    element_size = 1
+                else:
+                    indexer_size_per_token = ceil_div(
+                        index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
+                    )
+                    element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -806,29 +906,105 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
         )
 
+    def _pd_sparse_extra_hbm_bytes(self, budget: BudgetPlan, page_size: int) -> int:
+        # The request table and the native pools' padding pages are outside
+        # the manager's buffer plan. The table is bounded by the aligned context.
+        return (
+            budget.request_rows * budget.context_len * torch.int32.itemsize
+            + page_size * self._cell_size
+        )
+
+    def _fit_pd_sparse_budget(
+        self, requested: BudgetPlan, available_bytes: int, page_size: int
+    ) -> BudgetPlan:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            get_sparse_kv_budget,
+        )
+
+        requested_rows = requested.resident_rows - 1
+        extra_rows = requested.request_rows - requested.resident_rows
+        hbm_limit = envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
+        token_limit = get_schedule().max_total_tokens
+        # Preallocation needs at least one prompt page plus the per-request
+        # decode reservation, even when the native token pool is empty.
+        min_tokens = ceil_align(
+            max(2, page_size + get_disagg().num_reserved_decode_tokens), page_size
+        )
+
+        def plan_for(rows: int) -> BudgetPlan:
+            if rows == requested_rows:
+                return requested
+            return get_sparse_kv_budget(
+                **(
+                    self._pd_sparse_budget_options
+                    | {
+                        "request_rows": rows + extra_rows + 1,
+                        "resident_rows": rows + 1,
+                    }
+                )
+            )
+
+        def required_bytes(plan: BudgetPlan, native_tokens: int) -> int:
+            return (
+                plan.managed_hbm_bytes
+                + self._pd_sparse_extra_hbm_bytes(plan, page_size)
+                + native_tokens * self._cell_size
+            )
+
+        def exceeds_budget(rows: int) -> bool:
+            # Match the native request limit (token capacity // 2). The
+            # configured token limit caps capacity; it is not a reservation.
+            native_tokens = max(min_tokens, ceil_align(2 * rows, page_size))
+            if token_limit is not None and native_tokens > token_limit:
+                return True
+            plan = plan_for(rows)
+            return (
+                hbm_limit != 0 and plan.managed_hbm_bytes > hbm_limit
+            ) or required_bytes(plan, native_tokens) > available_bytes
+
+        # Buffer sizes are nondecreasing in the row count, including the graph
+        # and eager scratch rounded to their batch alignment.
+        fitting_rows = bisect_right(
+            range(1, requested_rows + 1), False, key=exceeds_budget
+        )
+        if fitting_rows:
+            return plan_for(fitting_rows)
+
+        one_row = plan_for(1)
+        raise RuntimeError(
+            "Not enough memory for one sparse KV resident row and a native "
+            f"token pool: need {required_bytes(one_row, min_tokens)} bytes "
+            f"for {min_tokens} native tokens, have {available_bytes} bytes "
+            f"(manager needs {one_row.managed_hbm_bytes} bytes, "
+            f"manager HBM limit={hbm_limit or 'unset'}, "
+            f"max_total_tokens={token_limit})."
+        )
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         budget = self._sparse_budget
         if budget is not None and not self._kvc.sparse_kv_budget_finalized:
-            min_tokens = (
-                (self._sparse_min_tokens + page_size - 1) // page_size * page_size
-            )
-            required = self._fixed_overhead_bytes + min_tokens * self._cell_size
-            if budget.prefill_workspace_tokens and required > available_bytes:
-                logger.warning(
-                    "Disabling sparse prefill workspace (%d tokens): "
-                    "fixed allocations and %d native tokens require %d bytes, "
-                    "but only %d bytes are available.",
-                    budget.prefill_workspace_tokens,
-                    min_tokens,
-                    required,
-                    available_bytes,
+            if self._pd_sparse_decode:
+                fixed_without_manager = (
+                    self._fixed_overhead_bytes - budget.managed_hbm_bytes
                 )
-                self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
-                self._sparse_budget = budget.without_prefill_workspace()
-                self._kvc.sparse_kv_budget_plan = self._sparse_budget
+                budget = self._fit_pd_sparse_budget(
+                    budget, available_bytes - fixed_without_manager, page_size
+                )
+                self._fixed_overhead_bytes = (
+                    fixed_without_manager + budget.managed_hbm_bytes
+                )
+            elif budget.prefill_workspace_tokens:
+                min_tokens = ceil_align(self._sparse_min_tokens, page_size)
+                required = self._fixed_overhead_bytes + min_tokens * self._cell_size
+                if required > available_bytes:
+                    self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
+                    budget = budget.without_prefill_workspace()
+            self._sparse_budget = self._kvc.sparse_kv_budget_plan = budget
             self._kvc.sparse_kv_budget_finalized = True
+        if budget is not None and self._pd_sparse_decode:
+            available_bytes -= self._pd_sparse_extra_hbm_bytes(budget, page_size)
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
@@ -962,6 +1138,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._draft_swa_layers_num = 0
             self._draft_swa_full_layers_num = 0
             self._draft_cell_size = 0
+        # A DFLASH draft pool that follows the target's SWA ids costs its bytes
+        # per SWA token, not per full token.
+        self._draft_follows_swa = (
+            self._draft_cell_size > 0 and dflash_draft_kv_follows_target_swa(kvc)
+        )
+        self._draft_swa_cell_size = 0
+        if self._draft_follows_swa:
+            self._draft_swa_cell_size = self._draft_cell_size
+            self._draft_cell_size = 0
 
         self._recompute_cell_size()
 
@@ -977,7 +1162,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def _swa_cell_bytes(self) -> int:
         if self._fused_swa_entry is not None:
             return self._fused_swa_entry
-        return self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+        return (
+            self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+            + self._draft_swa_cell_size
+        )
 
     def _recompute_cell_size(self) -> None:
         # Bytes per token of max_total_num_tokens: full_tokens when hybrid, else
@@ -1098,6 +1286,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 if self._enable_unified_memory
                 else None
             ),
+            dflash_draft_follows_swa=self._draft_follows_swa,
         )
 
     def calculate_pool_sizes(

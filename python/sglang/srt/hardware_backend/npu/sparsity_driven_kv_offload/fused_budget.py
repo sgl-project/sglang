@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from copy import copy
 from dataclasses import dataclass
 from math import prod
@@ -16,8 +15,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 # Fixed native LIM ABI dimensions, independent of model geometry.
-logger = logging.getLogger(__name__)
-
 MISS_CAPACITY = 32768
 MAX_QUERY_WIDTH = 14
 C8_ROW_BYTES = 656
@@ -85,12 +82,12 @@ class BudgetPlan:
         self.prefill_workspace_tokens = prefill_workspace_tokens
         metadata_dtype = torch.int32
         self.manager_buffers = {
-            "device_kv_buffer": BufferSpec(
+            "device_k_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, kv_lora_rank),
                 kv_dtype,
                 num_layers,
             ),
-            "device_rope_buffer": BufferSpec(
+            "device_v_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, qk_rope_head_dim),
                 kv_dtype,
                 num_layers,
@@ -107,12 +104,14 @@ class BudgetPlan:
         if packed_c8:
             if resident_rows <= 1:
                 raise ValueError("A5 C8 requires at least one live resident row.")
-            self.manager_buffers["device_kv_buffer"] = BufferSpec(
+            # Valid row IDs start at 1. CopySFA subtracts 1 when addressing
+            # packed payload pages so the dummy row has no HBM allocation.
+            self.manager_buffers["device_k_buffer"] = BufferSpec(
                 (resident_rows - 1, cache_tokens, 1, C8_ROW_BYTES),
                 torch.int8,
                 num_layers,
             )
-            del self.manager_buffers["device_rope_buffer"]
+            del self.manager_buffers["device_v_buffer"]
         if resident_rows < request_rows:
             self.manager_buffers["request_to_resident"] = BufferSpec(
                 (request_rows,), metadata_dtype
@@ -143,9 +142,8 @@ class BudgetPlan:
             "block_table": BufferSpec(
                 (batch_capacity, context_len // page_size), metadata_dtype
             ),
-            "last_prefix": BufferSpec((num_layers, resident_rows + 1), metadata_dtype),
+            "last_prefix": BufferSpec((resident_rows + 1,), metadata_dtype),
         }
-        # Per batch row: six int32 metadata arrays and two boolean masks.
         for name in (
             "request_safe_slots",
             "resident_safe_slots",
@@ -153,6 +151,7 @@ class BudgetPlan:
             "_pre_states",
             "_pre_next_prefix",
             "_pre_cache_sizes",
+            "_copy_lengths",
         ):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):
@@ -160,7 +159,7 @@ class BudgetPlan:
         self.device_kv_bytes = sum(
             spec.nbytes
             for name, spec in self.manager_buffers.items()
-            if name in ("device_kv_buffer", "device_rope_buffer")
+            if name in ("device_k_buffer", "device_v_buffer")
         )
         self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
         # Reserve one maximal forward output without allocating it persistently.
@@ -171,7 +170,7 @@ class BudgetPlan:
         self.copy_sfa_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
-            if n not in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
+            if n not in ("device_k_buffer", "device_v_buffer", "device_slot_map")
             and not n.startswith("prefill_")
         )
         self.prefill_workspace_bytes = sum(
@@ -324,13 +323,6 @@ def resolve_sparse_kv_budget(
         and hbm_budget_bytes
         and planned_bytes > hbm_budget_bytes
     ):
-        logger.warning(
-            "Disabling sparse prefill workspace (%d tokens): planned HBM %d bytes "
-            "exceeds budget %d bytes.",
-            prefill_workspace_tokens,
-            planned_bytes,
-            hbm_budget_bytes,
-        )
         prefill_workspace_tokens = 0
     result = (
         BudgetPlan(**plan_options, prefill_workspace_tokens=prefill_workspace_tokens)
