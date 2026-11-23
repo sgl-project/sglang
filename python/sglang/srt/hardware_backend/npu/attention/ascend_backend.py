@@ -395,14 +395,6 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla = self.use_mla and not self.use_dsa
         self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
-        self.use_verify_indexer_request_shard = (
-            envs.SGLANG_NPU_DSA_VERIFY_REQUEST_SHARD.get()
-            and self.use_dsa
-            and not self.is_draft_worker
-            and model_runner.spec_algorithm.is_dflash()
-            and parallel.attn_tp_size > 1
-            and parallel.attn_cp_size == 1
-        )
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
             if (
