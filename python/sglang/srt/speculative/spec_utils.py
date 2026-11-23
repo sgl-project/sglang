@@ -874,8 +874,7 @@ def generate_token_bitmask(
 
 
 class GrammarTree:
-    """The verify tree on the host, for the grammar bitmask and the custom logit
-    processors' row prefixes.
+    """The verify tree the grammar bitmask is built over, on the host.
 
     ``from_device`` starts an async copy, so build it before the target verify
     launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
@@ -932,34 +931,6 @@ class GrammarTree:
         return self._host
 
 
-def verify_row_prefixes(
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    draft_tokens: torch.Tensor,
-) -> List[List[int]]:
-    """Per verify row, the draft tokens on the path from the root to the row's
-    node, the root excluded: it is the request's last committed token. A chain's
-    row j gets drafts 1..j. The arguments are the (bs, num_draft_tokens) host tree.
-    """
-    row_prefixes = []
-    for next_token, next_sibling, tokens in zip(
-        retrieve_next_token.tolist(),
-        retrieve_next_sibling.tolist(),
-        draft_tokens.tolist(),
-    ):
-        prefixes = [[] for _ in tokens]
-        stack = [0]
-        while stack:
-            node = stack.pop()
-            child = next_token[node]
-            while child != -1:
-                prefixes[child] = [*prefixes[node], tokens[child]]
-                stack.append(child)
-                child = next_sibling[child]
-        row_prefixes.extend(prefixes)
-    return row_prefixes
-
-
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
@@ -987,8 +958,6 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 

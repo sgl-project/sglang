@@ -1,11 +1,10 @@
-import ast
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.eagle_worker_common import post_verify_hook_applies
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.speculative import eagle_worker_common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -14,37 +13,37 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestNativeEagerVerify(CustomTestCase):
     def test_master_selects_native_sampling_or_runtime_hooks(self):
-        root = Path(__file__).resolve().parents[4] / "python/sglang/srt/speculative"
-        for module in ("eagle_worker_common", "ngram_worker"):
-            tree = ast.parse((root / (module + ".py")).read_text())
-            gate = next(
-                n
-                for n in ast.walk(tree)
-                if isinstance(n, ast.If)
-                and ast.unparse(n.test)
-                == "post_verify_hook_applies(batch.sampling_info)"
-                and any(
-                    isinstance(c, ast.Call)
-                    and isinstance(c.func, ast.Name)
-                    and c.func.id == "eagle_sample"
-                    for branch in n.orelse
-                    for c in ast.walk(branch)
-                )
-            )
-            for enabled in (False, True):
-                with self.subTest(module=module, enabled=enabled):
+        # EAGLE passes its sparse and simulated-acceptance options; NGRAM the defaults.
+        eagle_options = dict(
+            uno_target_max_top_k=17,
+            simulated_acc_len_rng=object(),
+            sparse_bonus_argmax=True,
+        )
+        for label, options in (("eagle", eagle_options), ("defaults", {})):
+            # A custom processor matters only with the switch on.
+            for enabled, custom in ((False, False), (True, False), (True, True)):
+                with self.subTest(options=label, enabled=enabled, custom=custom):
                     batch = SimpleNamespace(
-                        sampling_info=SimpleNamespace(has_custom_logit_processor=False),
+                        sampling_info=SimpleNamespace(
+                            has_custom_logit_processor=custom
+                        ),
                         seq_lens=object(),
                         req_pool_indices=object(),
                         device="cpu",
                         return_logprob=False,
                         forward_mode=SimpleNamespace(is_idle=lambda: False),
                     )
-                    runner = SimpleNamespace(
-                        attn_backend=SimpleNamespace(verify_mask=None),
+                    verify = VerifyStep(
+                        batch=batch,
+                        route=VerifyRoute(
+                            adjusts_logits=True, need_truncated_sampling=False
+                        ),
+                        watermark=object(),
+                        watermark_full_mask=True,
+                        grammar_mask=object(),
                     )
-                    target = SimpleNamespace(model_runner=runner)
+                    verify_input = object()
+                    logits_output = SimpleNamespace(next_token_logits=None)
                     outputs = (object(), object(), object())
                     hooks = SimpleNamespace(
                         post_verify=Mock(
@@ -59,61 +58,43 @@ class TestNativeEagerVerify(CustomTestCase):
                         Mock(return_value=outputs),
                         Mock(return_value=object()),
                     )
-                    scope = dict(
-                        post_verify_hook_applies=post_verify_hook_applies,
-                        batch=batch,
-                        verify_input=object(),
-                        logits_output=object(),
-                        grammar_mask=object(),
-                        watermark=object(),
-                        watermark_full_mask=True,
-                        target_worker=target,
-                        self=SimpleNamespace(
-                            model_runner=runner, _speculative_runtime_hooks=hooks
+                    with (
+                        patch.object(eagle_worker_common, "eagle_sample", sample),
+                        patch.object(
+                            eagle_worker_common, "make_post_verify_io", make_io
                         ),
-                        speculative_runtime_hooks=hooks,
-                        make_post_verify_io=make_io,
-                        eagle_sample=sample,
-                        post_verify_graphs=None,
-                        uno_target_max_top_k=17,
-                        simulated_acc_len_rng=object(),
-                        sparse_bonus_argmax=True,
-                    )
-                    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
-                        enabled
+                        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
+                            enabled
+                        ),
                     ):
-                        exec(
-                            compile(
-                                ast.Module(body=[gate], type_ignores=[]),
-                                "<verify-gate>",
-                                "exec",
-                            ),
-                            scope,
+                        accept = eagle_worker_common.accept_draft_tree(
+                            batch,
+                            verify=verify,
+                            verify_input=verify_input,
+                            logits_output=logits_output,
+                            speculative_runtime_hooks=hooks,
+                            **options,
                         )
                     self.assertEqual(
-                        (scope["predict"], scope["accept_lens"], scope["accept_index"]),
+                        (accept.tokens, accept.accept_lens, accept.accept_index),
                         outputs,
                     )
-                    if enabled:
+                    if enabled and not custom:
                         sample.assert_not_called()
                         make_io.assert_called_once()
                         hooks.post_verify.assert_called_once_with(make_io.return_value)
                     else:
                         make_io.assert_not_called()
                         hooks.post_verify.assert_not_called()
-                        kwargs = dict(watermark=scope["watermark"], row_prefixes=None)
-                        if module == "eagle_worker_common":
-                            kwargs.update(
-                                uno_target_max_top_k=17,
-                                simulated_acc_len_rng=scope["simulated_acc_len_rng"],
-                                sparse_bonus_argmax=True,
-                            )
                         sample.assert_called_once_with(
-                            scope["verify_input"],
-                            batch,
-                            scope["logits_output"],
-                            scope["grammar_mask"],
-                            **kwargs,
+                            verify_input,
+                            verify,
+                            logits_output,
+                            uno_target_max_top_k=options.get("uno_target_max_top_k"),
+                            simulated_acc_len_rng=options.get("simulated_acc_len_rng"),
+                            sparse_bonus_argmax=options.get(
+                                "sparse_bonus_argmax", False
+                            ),
                         )
 
 

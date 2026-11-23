@@ -10,7 +10,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -24,25 +23,20 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    accept_draft_tree,
     bind_eagle_runtime_hooks,
-    make_post_verify_io,
-    post_verify_hook_applies,
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
-    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
-    verify_row_prefixes,
 )
 from sglang.srt.utils import is_cpu
-from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
 
@@ -50,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+# Tail of each request's context inserted into the trie once its prefill ends.
+NGRAM_EXTEND_PROMPT_WINDOW = 1024
 
 
 def _derive_tree_links(
@@ -117,7 +113,7 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
-        self.draft_tree_host: Optional[tuple] = None
+        self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
@@ -156,6 +152,8 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
+        # Drain queued inserts first, or they land after the reset.
+        self.ngram_corpus.synchronize()
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
@@ -346,13 +344,8 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        # Staged for the grammar bitmask and the custom logit processors' row
-        # prefixes, derived after the verify launch below.
-        self.draft_tree_host = (
-            (mask, req_drafts)
-            if batch.has_grammar or batch.sampling_info.has_custom_logit_processor
-            else None
-        )
+        # Staged for the grammar bitmask, derived after the verify launch below.
+        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask_func(
@@ -409,15 +402,28 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
         )
 
+    def _insert_extend_prompt_tails(self, batch: ScheduleBatch) -> None:
+        """Seed the trie with each request's context once its prefill finishes."""
+        batch_tokens = []
+        for req in batch.reqs:
+            # A middle chunk would re-insert the same tail on every chunk.
+            if req is batch.chunked_req:
+                continue
+            # Unpadded: multimodal pad values are cache identities, not tokens.
+            tail = list(req.output_ids[-NGRAM_EXTEND_PROMPT_WINDOW:])
+            need = NGRAM_EXTEND_PROMPT_WINDOW - len(tail)
+            if need > 0:
+                tail = list(req.origin_input_ids_unpadded[-need:]) + tail
+            if tail:
+                batch_tokens.append(tail)
+        if batch_tokens:
+            self.ngram_corpus.batch_put(batch_tokens)
+
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        # Prompt context is inserted at extend by _insert_extend_prompt_tails.
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         for req in batch.reqs:
-            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
-            # there is not much difference, so we will not insert it for now.
-            # if batch.forward_mode.is_extend():
-            #     put_ids = req.origin_input_ids + req.output_ids
-            # else:
             prev_tokens = self.prev_token_ids[
                 i * stride : i * stride + self.prev_accept_lens[i]
             ]
@@ -445,6 +451,10 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
+            # NGRAM watermark contexts use the full-mask layout.
+            verify = self.model_runner.sampling_pipeline.bind_verify(
+                batch, watermark_full_mask=True
+            )
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
@@ -455,82 +465,38 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            verify_tree_host = None
-            if self.draft_tree_host is not None:
+            grammar_tree = None
+            if batch.has_grammar:
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
-                mask, req_drafts = self.draft_tree_host
+                mask, req_drafts = self.grammar_tree_host
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
-                verify_tree_host = GrammarTree.from_host(
+                grammar_tree = GrammarTree.from_host(
                     retrieve_next_token_cpu,
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            grammar_mask = None
-            if batch.has_grammar:
-                grammar_mask = build_grammar_vocab_mask(
-                    reqs=batch.reqs,
-                    tree=verify_tree_host,
-                    sampling_info=batch.sampling_info,
-                    device=verify_input.retrieve_next_token.device,
-                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
-                    barrier=None,
-                )
-
-            # Sample
-            maybe_detect_nan(
-                logits_output.next_token_logits, "verify: target model logits"
+            verify.build_grammar_mask(
+                grammar_tree,
+                logits_output=logits_output,
+                # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
+                barrier=None,
             )
-            maybe_detect_inf(
-                logits_output.next_token_logits, "verify: target model logits"
+            accept = accept_draft_tree(
+                batch,
+                verify=verify,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                speculative_runtime_hooks=self._speculative_runtime_hooks,
             )
-            # NGRAM watermark contexts use the full-mask layout.
-            watermark = (
-                self.model_runner.watermark.bind_verify(
-                    batch.sampling_info.watermark, full_mask=True
-                )
-                if self.model_runner.watermark is not None
-                else None
+            verify.commit(accept, logits_output=logits_output)
+            predict, accept_lens, accept_index = (
+                accept.tokens,
+                accept.accept_lens,
+                accept.accept_index,
             )
-            if post_verify_hook_applies(batch.sampling_info):
-                post_verify_output = self._speculative_runtime_hooks.post_verify(
-                    make_post_verify_io(
-                        verify_input=verify_input,
-                        sampling_info=batch.sampling_info,
-                        sequence_lengths=batch.seq_lens,
-                        request_pool_indices=batch.req_pool_indices,
-                        device=batch.device,
-                        logits_output=logits_output,
-                        grammar_mask=grammar_mask,
-                        watermark=watermark,
-                        watermark_full_mask=True,
-                        return_logprob=batch.return_logprob,
-                        is_idle=batch.forward_mode.is_idle(),
-                    )
-                )
-                predict = post_verify_output.token_ids
-                accept_lens = post_verify_output.accepted_lengths
-                accept_index = post_verify_output.accepted_indices
-            else:
-                row_prefixes = (
-                    verify_row_prefixes(*verify_tree_host.resolve())
-                    if batch.sampling_info.has_custom_logit_processor
-                    else None
-                )
-                (
-                    predict,
-                    accept_lens,
-                    accept_index,
-                ) = eagle_sample(
-                    verify_input,
-                    batch,
-                    logits_output,
-                    grammar_mask,
-                    watermark=watermark,
-                    row_prefixes=row_prefixes,
-                )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -539,15 +505,7 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index]
-            if watermark is not None:
-                self.model_runner.watermark.append_accept_tokens(
-                    batch.sampling_info.watermark,
-                    batch.req_pool_indices,
-                    accept_tokens,
-                    accept_lens,
-                )
-            accept_tokens = accept_tokens.flatten()
+            accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's
@@ -559,14 +517,6 @@ class NGRAMWorker(BaseSpecWorker):
                 num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
             )
-            if batch.return_logprob:
-                compute_spec_logprobs(
-                    batch,
-                    logits_output,
-                    predict,
-                    accept_index=accept_index,
-                )
-
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
@@ -586,6 +536,8 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            if batch.forward_mode.is_extend():
+                self._insert_extend_prompt_tails(batch)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

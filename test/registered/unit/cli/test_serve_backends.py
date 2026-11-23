@@ -860,7 +860,7 @@ class TestCliGuide(CustomTestCase):
             ("NVIDIA GB10", ("dgx-spark",)),
             (
                 "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-                ("rtx6000", "rtx-pro-6000"),
+                ("rtx6000", "rtx-pro-6000", "rtxpro6000"),
             ),
             ("NVIDIA GeForce RTX 5090", ("rtx5090",)),
             ("NVIDIA H20-3e", ("h20-3e",)),

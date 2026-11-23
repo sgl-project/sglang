@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -238,6 +239,18 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def input_candidate_selectors(batch: ScheduleBatch) -> Optional[List[Optional[Any]]]:
+    """The requests' input candidate selectors, or None when an extend batch
+    has none: only prefill reads them."""
+    if (
+        not batch.return_logprob
+        or not batch.forward_mode.is_extend_without_speculative()
+    ):
+        return None
+    selectors = [req.logprob.input_candidate_selector for req in batch.reqs]
+    return selectors if any(s is not None for s in selectors) else None
 
 
 def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
@@ -541,6 +554,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
+    input_candidate_selectors: Optional[List[Optional[Any]]] = None
     token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For multimodal
@@ -568,6 +582,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Per-request target-verify geometry.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # The target verify's sampling route (VerifyStep.route). Set only by
+    # eagle_prepare_for_verify: EAGLE is the one verify whose logits may stay
+    # vocab-sharded, and LogitsProcessor.verify_uses_vocab_shards reads it.
+    verify_route: Optional[VerifyRoute] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.
@@ -929,6 +947,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
         ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
+        verify_route: Optional[VerifyRoute] = None,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
         pp_loras: Optional[set[Optional[str]]] = None,
@@ -963,14 +982,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_seq_lens = batch.extend_lens
             extend_prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
-
-        # Mirror the grammars-population behavior previously done in
-        # ScheduleBatch.get_model_worker_batch.
-        if batch.sampling_info is not None:
-            if batch.has_grammar:
-                batch.sampling_info.grammars = [req.grammar for req in batch.reqs]
-            else:
-                batch.sampling_info.grammars = None
 
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
@@ -1076,6 +1087,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
+            input_candidate_selectors=input_candidate_selectors(batch),
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
@@ -1092,6 +1104,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
             ragged_verify_layout=ragged_verify_layout,
+            verify_route=verify_route,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
