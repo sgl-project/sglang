@@ -769,9 +769,7 @@ class DSANPUIndexerMixin:
                 kv_lens = actual_seq_lengths_kv.to(device=k.device, dtype=torch.int32)
                 valid_requests = None
                 if shard is not None and shard.request_rows is not None:
-                    valid_requests = (kv_lens > 0) & verify_valid_requests[
-                        shard.request_rows
-                    ]
+                    valid_requests = verify_valid_requests[shard.request_rows]
                     # An all-empty shard may leave indexer output unwritten.
                     # Run padded rows against the reserved page zero, then
                     # discard their output before the fixed-size all-gather.
