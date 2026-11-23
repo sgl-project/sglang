@@ -1242,7 +1242,7 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 sampling_mask_finish_reason = None
-                if req.return_sampling_mask:
+                if req.captures_sampling:
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
@@ -1317,7 +1317,7 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if req.return_sampling_mask:
+                if req.captures_sampling:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
@@ -2122,7 +2122,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.logprob.output_top_logprobs_idx.clear()
                 req.logprob.output_token_ids_logprobs_val.clear()
                 req.logprob.output_token_ids_logprobs_idx.clear()
-            if req.return_sampling_mask:
+            if req.captures_sampling:
                 req.sampling_mask_rows.take()
         req.reset_for_retract()
         req.output_ids = array("q")

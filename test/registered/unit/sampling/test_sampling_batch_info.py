@@ -327,7 +327,8 @@ class TestStepBuilds(CustomTestCase):
         seed=None,
         stop_ids=None,
         eos_id=2,
-        mask_mode=None,
+        sampling_logprobs=False,
+        sampling_mask=False,
         filler_seed=0,
     ):
         req = MagicMock()
@@ -342,8 +343,9 @@ class TestStepBuilds(CustomTestCase):
         req.custom_logit_processor = None
         req.grammar = None
         req.filler_seed = filler_seed
-        req.return_sampling_mask = mask_mode is not None
-        req.sampling_logprobs_mode = mask_mode
+        req.return_sampling_logprobs = sampling_logprobs
+        req.return_sampling_mask = sampling_mask
+        req.captures_sampling = sampling_logprobs or sampling_mask
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
@@ -393,12 +395,13 @@ class TestStepBuilds(CustomTestCase):
         self.assertIsNone(info.sampling_seed)
 
     def test_mask_rows(self):
-        """Mask rows index the batch; support rows index the mask rows."""
+        """Mask rows index the captured requests; support rows index, among
+        them, the ones that return the mask."""
         reqs = [
             self._make_req(top_k=5),
-            self._make_req(top_k=7, mask_mode="full"),
-            self._make_req(top_k=50, mask_mode="support", seed=9),
-            self._make_req(top_k=3, mask_mode="support"),
+            self._make_req(top_k=7, sampling_logprobs=True),
+            self._make_req(top_k=50, sampling_mask=True, seed=9),
+            self._make_req(top_k=3, sampling_logprobs=True, sampling_mask=True),
         ]
         info = _make_info()
         info.set_seeds_and_mask_rows(reqs)
@@ -406,7 +409,7 @@ class TestStepBuilds(CustomTestCase):
         self.assertEqual(
             info.sampling_support_logprobs_capture_indices.tolist(), [1, 2]
         )
-        self.assertEqual(info.sampling_mask_top_ks, [1, 7, 50, 3])
+        self.assertEqual(info.sampling_mask_top_ks, [1, 1, 50, 3])
         self.assertEqual(info.sampling_seed[2].item(), 9)
 
         info.set_seeds_and_mask_rows(reqs[:2])

@@ -92,11 +92,11 @@ class SamplingBatchInfo:
     # Set by the scheduler at each launch (set_seeds_and_mask_rows).
     # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
-    # Rows of the requests that return sampling masks, and each support-mode row's
-    # index among them; None when no row has one. They limit capture to those rows.
+    # Rows of the requests whose sampling is captured, and each mask-returning
+    # row's index among them; None when no row has one. They limit capture to those rows.
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
-    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    # Per-row top_k of support captures (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
     # Per-row watermark policy, None unless some row is a watermark candidate;
@@ -164,11 +164,9 @@ class SamplingBatchInfo:
                     # A deterministic run defaults to 42; otherwise the row stays random.
                     seed = 42 if enable_deterministic else r.filler_seed
                 seeds.append(seed)
-        mask_rows = [i for i, r in enumerate(reqs) if r.return_sampling_mask]
+        mask_rows = [i for i, r in enumerate(reqs) if r.captures_sampling]
         capture_rows = [
-            j
-            for j, i in enumerate(mask_rows)
-            if reqs[i].sampling_logprobs_mode == "support"
+            j for j, i in enumerate(mask_rows) if reqs[i].return_sampling_mask
         ]
 
         rows = seeds + mask_rows + capture_rows
@@ -188,7 +186,12 @@ class SamplingBatchInfo:
             device_rows[num_seeds + num_masks :] if capture_rows else None
         )
         self.sampling_mask_top_ks = (
-            [r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs]
+            [
+                r.sampling_params.top_k
+                if r.captures_sampling and r.return_sampling_mask
+                else 1
+                for r in reqs
+            ]
             if mask_rows
             else None
         )

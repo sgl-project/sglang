@@ -3418,6 +3418,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_top_logprobs_idx,
             output_token_sampling_mask_len,
             output_token_sampling_mask_idx,
+            output_sampling_mask_logprobs,
             output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
@@ -3505,20 +3506,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 logprob = output_token_logprobs_val[0].item()
                 top_logprobs_val = output_top_logprobs_val[:top_logprobs_num].tolist()
                 top_logprobs_idx = output_top_logprobs_idx[:top_logprobs_num].tolist()
-            sampling_mask_idx = sampling_mask_logprobs = None
-            if req.return_sampling_mask:
+            sampling_logprob = sampling_mask_idx = sampling_mask_logprobs = None
+            if req.captures_sampling:
                 assert output_token_sampling_mask_idx is not None, (
                     "sampling mask buffer disabled on decode side"
                 )
                 sampling_mask_len = int(output_token_sampling_mask_len[0].item())
-                num_logprobs = (
-                    sampling_mask_len if req.sampling_logprobs_mode == "support" else 1
-                )
+                sampling_logprob = output_token_sampling_logprobs[0].item()
                 sampling_mask_idx = (
                     output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy()
                 )
                 sampling_mask_logprobs = (
-                    output_token_sampling_logprobs[:num_logprobs].cpu().numpy()
+                    output_sampling_mask_logprobs[:sampling_mask_len].cpu().numpy()
                 )
             self.scheduler.batch_result_processor.commit_handoff_token(
                 req,
@@ -3527,6 +3526,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 logprob=logprob,
                 top_logprobs_val=top_logprobs_val,
                 top_logprobs_idx=top_logprobs_idx,
+                sampling_logprob=sampling_logprob,
                 sampling_mask_idx=sampling_mask_idx,
                 sampling_mask_logprobs=sampling_mask_logprobs,
             )

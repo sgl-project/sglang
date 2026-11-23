@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
-SamplingLogprobsMode = Literal["selected", "support"]
 
 
 def get_return_hidden_states_mode(

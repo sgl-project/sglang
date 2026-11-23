@@ -362,7 +362,8 @@ class TestAllocationIntegration(CustomTestCase):
             output_ids=[42],
             grammar=None,
             return_logprob=False,
-            return_sampling_mask=False,
+            captures_sampling=True,
+            sampling_mask_rows=Mock(),
             skip_radix_cache_insert=False,
             kv=SimpleNamespace(cache_protected_len=16),
             full_untruncated_fill_ids=list(range(32)),
@@ -399,6 +400,7 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertEqual(list(scheduler.disagg_prefill_bootstrap_queue.queue), [])
             self.assertEqual(req.prefill_attempt_count, 2)
             self.assertEqual(list(req.output_ids), [])
+            req.sampling_mask_rows.take.assert_called_once()
             self.assertTrue(req.pending_bootstrap)
             self.assertEqual(req.storage_prefetch_retry_attempts, 0)
             self.assertEqual(req.storage_prefetch_last_match_len, 16)
@@ -446,7 +448,7 @@ class TestAllocationIntegration(CustomTestCase):
         req.output_ids = [42]
         req.grammar = None
         req.return_logprob = False
-        req.return_sampling_mask = False
+        req.captures_sampling = False
         req.skip_radix_cache_insert = False
         req.kv = SimpleNamespace(cache_protected_len=16)
         req.full_untruncated_fill_ids = list(range(32))

@@ -75,7 +75,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
                 abort, add_to_queue, make_req = _handle_pd_request(
-                    mode, MagicMock(return_sampling_mask=True, return_logprob=False)
+                    mode, MagicMock(captures_sampling=True, return_logprob=False)
                 )
                 self.assertEqual(make_req.call_args.kwargs["vocab_size"], 120)
                 abort.assert_called_once()
@@ -96,7 +96,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         disaggregation_max_top_logprobs_num=capacity
                     ),
                 ):
-                    req = MagicMock(return_sampling_mask=True, return_logprob=True)
+                    req = MagicMock(captures_sampling=True, return_logprob=True)
                     req.logprob.top_logprobs_num = top_logprobs_num
                     abort, add_to_queue, _ = _handle_pd_request(mode, req)
                     abort.assert_called_once()

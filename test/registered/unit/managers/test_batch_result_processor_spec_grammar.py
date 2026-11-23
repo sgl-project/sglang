@@ -152,6 +152,7 @@ def _commit_disagg_handoff(
             None,
             None,
             None,
+            None,
             torch.tensor([1], dtype=torch.long),
         ),
         get_customized_info=lambda _: None,

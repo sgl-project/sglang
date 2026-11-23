@@ -994,13 +994,13 @@ class ServingChatTestCase(CustomTestCase):
             )
 
             self.basic_req.return_sampling_mask = True
-            self.basic_req.sampling_logprobs_mode = "support"
+            self.basic_req.return_sampling_logprobs = True
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
-            self.assertEqual(adapted.sampling_logprobs_mode, "support")
+            self.assertTrue(adapted.return_sampling_logprobs)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -1841,16 +1841,29 @@ class ServingChatTestCase(CustomTestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
 
-    def test_validate_request_rejects_sampling_mask_without_meta_info(self):
+    def test_validate_request_rejects_sampling_outputs_without_meta_info(self):
+        for field in ("return_sampling_mask", "return_sampling_logprobs"):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                **{field: True},
+            )
+            with self.subTest(field=field):
+                self.assertEqual(
+                    self.chat._validate_request(req),
+                    f"{field} requires return_meta_info=true.",
+                )
+
+    def test_validate_request_rejects_removed_sampling_logprobs_mode(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
+            return_meta_info=True,
             return_sampling_mask=True,
+            sampling_logprobs_mode="selected",
         )
-
-        self.assertEqual(
-            self.chat._validate_request(req),
-            "return_sampling_mask requires return_meta_info=true.",
+        self.assertIn(
+            "sampling_logprobs_mode was removed", self.chat._validate_request(req)
         )
 
     def test_validate_request_bounds_top_logprobs_to_vocab(self):

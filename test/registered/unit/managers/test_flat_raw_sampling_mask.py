@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import (
     ReqState,
-    _add_sampling_mask_to_meta_info,
+    _add_sampling_output_to_meta_info,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
@@ -20,27 +20,34 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _FLAT_KEYS = (
-    "output_token_sampling_mask_flat",
-    "output_token_sampling_mask_row_lengths",
-    "output_token_sampling_logprobs_flat",
+    "output_sampling_mask_logprobs_val_flat",
+    "output_sampling_mask_logprobs_idx_flat",
+    "output_sampling_mask_logprobs_row_lengths",
 )
 # The output sampling masks of three batches, one row of token ids per output token.
 _ROWS = [[[5, 7, 9], [2]], [[4, 1], [8, 6, 3, 0]], [[11]]]
+_NUM_TOKENS = sum(len(rows) for rows in _ROWS)
 
 
-def _chunk(rows, support_logprobs: bool) -> SamplingMaskChunk:
-    """Float32-exact logprobs: one per token id in support mode, one per row in selected mode."""
+def _chunk(rows) -> SamplingMaskChunk:
+    """Float32-exact logprobs: one per row for the sampled token, one per token id."""
     token_ids = [t for row in rows for t in row]
-    count = len(token_ids) if support_logprobs else len(rows)
     return SamplingMaskChunk(
+        selected_logprobs=-np.arange(1, len(rows) + 1, dtype=np.float32) / 4,
         lengths=np.asarray([len(row) for row in rows], dtype=np.int32),
         token_ids=np.asarray(token_ids, dtype=np.int32),
-        logprobs=-np.arange(1, count + 1, dtype=np.float32) / 8,
+        support_logprobs=-np.arange(1, len(token_ids) + 1, dtype=np.float32) / 8,
     )
 
 
 def _make_state(**obj_kwargs) -> ReqState:
-    obj = GenerateReqInput(text="hello", return_sampling_mask=True, **obj_kwargs)
+    obj = GenerateReqInput(
+        text="hello",
+        return_logprob=True,
+        return_sampling_logprobs=True,
+        return_sampling_mask=True,
+        **obj_kwargs,
+    )
     obj.normalize_batch_and_arguments()
     return ReqState(
         out_list=[],
@@ -54,7 +61,7 @@ def _make_state(**obj_kwargs) -> ReqState:
 def _meta_info(state: ReqState, chunks, finished: bool) -> dict:
     meta_info = {}
     for i, chunk in enumerate(chunks):
-        _add_sampling_mask_to_meta_info(
+        _add_sampling_output_to_meta_info(
             meta_info, state, chunk, finished=finished and i == len(chunks) - 1
         )
     return meta_info
@@ -91,51 +98,54 @@ class TestFlatRawSamplingMaskValidation(CustomTestCase):
             self.assertTrue(req[i].return_flat_raw_sampling_mask_b64)
 
 
-class TestFlatRawSamplingMask(CustomTestCase):
+class TestSamplingOutputMetaInfo(CustomTestCase):
     def test_flat_matches_nested_rows(self):
-        for mode in ("selected", "support"):
-            chunks = [_chunk(rows, mode == "support") for rows in _ROWS]
-            nested = _meta_info(
-                _make_state(sampling_logprobs_mode=mode), chunks, finished=True
-            )
-            for b64 in (False, True):
-                with self.subTest(mode=mode, b64=b64):
-                    state = _make_state(
-                        sampling_logprobs_mode=mode,
-                        return_flat_raw_sampling_mask=True,
-                        return_flat_raw_sampling_mask_b64=b64,
-                    )
-                    unfinished = _meta_info(state, chunks[:-1], finished=False)
-                    fields = _meta_info(state, chunks[-1:], finished=True)
-                    ids, lengths, logprobs = (
-                        _flat_values(fields, key) for key in _FLAT_KEYS
-                    )
+        """A nested row is its (logprob, token_id) pairs, the values the flat arrays
+        carry, and no token text."""
+        chunks = [_chunk(rows) for rows in _ROWS]
+        nested = _meta_info(_make_state(), chunks, finished=True)
+        nested_rows = nested["output_sampling_mask_logprobs"]
+        self.assertEqual(
+            [[token_id for _, token_id in row] for row in nested_rows],
+            [row for rows in _ROWS for row in rows],
+        )
+        self.assertEqual(len(nested["output_token_sampling_logprobs"]), _NUM_TOKENS)
+        for b64 in (False, True):
+            with self.subTest(b64=b64):
+                state = _make_state(
+                    return_flat_raw_sampling_mask=True,
+                    return_flat_raw_sampling_mask_b64=b64,
+                )
+                unfinished = _meta_info(state, chunks[:-1], finished=False)
+                fields = _meta_info(state, chunks[-1:], finished=True)
+                logprobs, ids, lengths = (
+                    _flat_values(fields, key) for key in _FLAT_KEYS
+                )
 
-                    self.assertEqual(unfinished, {})
-                    self.assertEqual(state.output_token_sampling_mask, [])
-                    self.assertNotIn("output_token_sampling_mask", fields)
-                    self.assertEqual(
-                        [
-                            row.tolist()
-                            for row in np.split(ids, np.cumsum(lengths)[:-1])
-                        ],
-                        nested["output_token_sampling_mask"],
-                    )
-                    self.assertEqual(
-                        fields["output_token_sampling_mask_length"],
-                        nested["output_token_sampling_mask_length"],
-                    )
-                    expected = nested["output_token_sampling_logprobs"]
-                    if mode == "support":
-                        expected = [v for row in expected for v in row]
-                    self.assertEqual(logprobs.tolist(), expected)
+                self.assertNotIn("output_sampling_mask_logprobs", unfinished)
+                self.assertNotIn("output_sampling_mask_logprobs", fields)
+                self.assertEqual(state.output_sampling_mask_logprobs, [])
+                self.assertEqual(
+                    fields["output_token_sampling_logprobs"],
+                    nested["output_token_sampling_logprobs"],
+                )
+                ends = np.cumsum(lengths)[:-1]
+                self.assertEqual(
+                    [
+                        list(zip(row_logprobs.tolist(), row_ids.tolist()))
+                        for row_logprobs, row_ids in zip(
+                            np.split(logprobs, ends), np.split(ids, ends)
+                        )
+                    ],
+                    nested_rows,
+                )
 
     def test_a_request_finished_without_rows_gets_empty_arrays(self):
         state = _make_state(return_flat_raw_sampling_mask=True)
 
         fields = _meta_info(state, [None], finished=True)
 
-        self.assertEqual(fields["output_token_sampling_mask_length"], 0)
+        self.assertEqual(fields["output_token_sampling_logprobs"], [])
         for key in _FLAT_KEYS:
             self.assertEqual(fields[key], [])
 

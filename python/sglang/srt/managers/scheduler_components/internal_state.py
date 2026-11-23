@@ -199,13 +199,13 @@ class SchedulerInternalStateController:
 
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the
-        # target policy, which is what a captured sampling mask describes.
+        # target policy, which is what the returned sampling logprobs describe.
         if not self.scheduler.spec_algorithm.is_dflash() or float(value) == 1.0:
             return
-        if self._has_active_sampling_mask_request():
+        if self._has_active_sampling_output_request():
             raise UpdateRejected(
-                f"Updating {key} is rejected while DFlash sampling-mask "
-                "requests are active."
+                f"Updating {key} is rejected while return_sampling_logprobs or "
+                "return_sampling_mask requests are active."
             )
 
     def _apply_accept_threshold(self, key: str, value: Any) -> Dict[str, Any]:
@@ -265,10 +265,11 @@ class SchedulerInternalStateController:
             / metrics_reporter.spec_total_num_forward_ct
         )
 
-    def _has_active_sampling_mask_request(self) -> bool:
-        """Whether any unfinished live request holds a sampling mask."""
+    def _has_active_sampling_output_request(self) -> bool:
+        """Whether any unfinished live request returns sampling logprobs or masks."""
         return any(
-            req.return_sampling_mask and not req.finished()
+            (req.return_sampling_logprobs or req.return_sampling_mask)
+            and not req.finished()
             for reqs in self.scheduler.request_lists().values()
             for req in reqs
         )
