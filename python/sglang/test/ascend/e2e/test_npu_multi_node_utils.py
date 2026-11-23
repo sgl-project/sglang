@@ -5,7 +5,6 @@ import re
 import signal
 import socket
 import subprocess
-import sys
 import threading
 import time
 from functools import wraps
@@ -746,80 +745,31 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
     return decorator
 
 
-HF_MODULES_CACHE_DIR = "/tmp/hf_modules"
-PREWARM_MAX_ATTEMPTS = 3
+def prewarm_hf_dynamic_modules(model_config):
+    """Warm the pod-local HF_MODULES_CACHE before the schedulers fork.
 
-PREWARM_HF_MODULES_CODE = """
-import sys
-
-from transformers import AutoProcessor, AutoTokenizer
-
-path = sys.argv[1]
-try:
-    AutoProcessor.from_pretrained(path, trust_remote_code=True)
-except Exception as processor_error:
-    print(f"AutoProcessor prewarm failed: {processor_error}", file=sys.stderr)
-    AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-print("hf dynamic modules prewarmed")
-"""
-
-
-def _resolve_tokenizer_path(model_config):
-    """Return the tokenizer path the server will load remote code from."""
+    Every pod starts one scheduler process per device and each of them loads
+    the tokenizer itself. The cold /tmp/hf_modules cache is filled by
+    transformers with a non-atomic copy, so concurrent readers can import a
+    truncated tokenization_kimi.py and fail with
+    AttributeError: ... has no attribute 'TikTokenTokenizer'.
+    """
+    tokenizer_path = model_config["model_path"]
     other_args = model_config.get("other_args") or []
     for index, arg in enumerate(other_args):
         if arg == "--tokenizer-path" and index + 1 < len(other_args):
-            return other_args[index + 1]
-        if arg.startswith("--tokenizer-path="):
-            return arg.split("=", 1)[1]
-    return model_config["model_path"]
+            tokenizer_path = other_args[index + 1]
+            break
+    try:
+        from transformers import AutoProcessor, AutoTokenizer
 
-
-def prewarm_hf_dynamic_modules(model_config):
-    """Populate HF_MODULES_CACHE once per pod before the server is launched.
-
-    run_npu_testcase.sh already points HF_MODULES_CACHE at the pod-local
-    /tmp/hf_modules (the shared /root/.cache/huggingface is read-only), so the
-    nodes do not interfere with each other. The race is intra-pod: with
-    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS every node spawns one scheduler
-    process per device, and all of them call get_processor()/init_tokenizer()
-    at the same time against the cold /tmp cache. transformers fills that cache
-    with a non-atomic shutil.copyfile, so a reader can import a half-written
-    tokenization_kimi.py and fail with:
-    AttributeError: module 'transformers_modules...tokenization_kimi' has no
-    attribute 'TikTokenTokenizer'.
-    Warming the cache here, before popen_launch_server() forks the schedulers,
-    leaves every process a complete copy to reuse.
-    """
-    cache_dir = os.environ.setdefault("HF_MODULES_CACHE", HF_MODULES_CACHE_DIR)
-    os.makedirs(cache_dir, exist_ok=True)
-    tokenizer_path = _resolve_tokenizer_path(model_config)
-
-    env = os.environ.copy()
-    env["HF_MODULES_CACHE"] = cache_dir
-    for attempt in range(1, PREWARM_MAX_ATTEMPTS + 1):
-        logger.info(
-            f"Prewarming HF_MODULES_CACHE={cache_dir} from {tokenizer_path} "
-            f"(attempt {attempt}/{PREWARM_MAX_ATTEMPTS})"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", PREWARM_HF_MODULES_CODE, tokenizer_path],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            logger.info(f"HF_MODULES_CACHE prewarmed: {cache_dir}")
-            return
-        logger.warning(
-            f"Prewarm attempt {attempt} failed (rc={result.returncode}): "
-            f"{result.stderr.strip()[-2000:]}"
-        )
-
-    logger.warning(
-        f"Failed to prewarm HF_MODULES_CACHE={cache_dir}; "
-        "server processes will populate it themselves."
-    )
+        try:
+            AutoProcessor.from_pretrained(tokenizer_path, trust_remote_code=True)
+        except Exception:
+            AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        logger.info(f"HF_MODULES_CACHE prewarmed from {tokenizer_path}")
+    except Exception as e:
+        logger.warning(f"HF_MODULES_CACHE prewarm from {tokenizer_path} failed: {e}")
 
 
 # Launch master/worker node
