@@ -933,7 +933,7 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         gfx942_bf16_cache = (
             _is_gfx942_supported
-            and get_fp8_gemm_runner_backend().is_auto()
+            and not get_fp8_gemm_runner_backend().is_triton()
             and weight.dtype == torch.float8_e4m3fnuz
         )
         if (
