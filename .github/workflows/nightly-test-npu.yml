@@ -156,6 +156,7 @@ jobs:
           fi
           echo "accuracy_date_parity=${ACCURACY_DATE_PARITY}" | tee -a $GITHUB_OUTPUT
 
+
   nightly-acc-test-4-npu-a5-mix:
      name: nightly-acc-test-4-npu-a5-mix
      if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-4-npu-a5,')) }}
