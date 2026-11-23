@@ -3245,13 +3245,10 @@ def get_moe_tensor_parallel_rank():
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     from sglang.srt.distributed.bootstrap import reset_parallel_initialised
+    from sglang.srt.platforms import current_platform
 
-    if _is_npu:
-        from sglang.srt.hardware_backend.npu.moe.mega_moe import (
-            destroy_mega_moe_buffers,
-        )
-
-        destroy_mega_moe_buffers()
+    # Release platform buffers tied to the process groups before they die.
+    current_platform.on_destroy_model_parallel()
     reset_parallel_initialised()
     get_parallel().clear_stamp()
     dwdp_mgr = get_global_dwdp_manager()
