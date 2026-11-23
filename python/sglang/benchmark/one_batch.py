@@ -76,6 +76,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -98,6 +99,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -106,8 +108,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     maybe_reindex_device_id,
-    require_mlp_sync,
-    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
@@ -510,6 +510,16 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
+    sampler_params_pool = SamplerParamsPool(
+        num_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
+        device=model_runner.req_to_token_pool.device,
+    )
+    sampler_params_pool.write(reqs)
+    batch.sampling_info.set_sampler_params(
+        sampler_params_pool.gather(batch.req_pool_indices, batch.req_pool_indices_cpu)
+    )
+    batch.sampling_info.set_plugin_state(reqs)
+    batch.sampling_info.set_seeds_and_mask_rows(reqs)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     if (
         batch.input_ids is None

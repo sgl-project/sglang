@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.communication.engram_gather_peer import engram_gather_peer
+from sglang.kernels.ops.embeddings import engram_gather as engram_gather_module
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather, unpack_mxfp4_rows
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -82,6 +83,48 @@ def test_engram_gather_peer_decodes_packed_mxfp4() -> None:
             mxfp4=mxfp4,
         )
         _assert_bits_equal(out, expected)
+
+
+@pytest.mark.parametrize("rows_per_program", [2, 8, 16])
+@pytest.mark.parametrize("mxfp4", [False, True])
+@pytest.mark.parametrize("sort_ids", [False, True])
+def test_engram_gather_rows_per_program_bit_exact(
+    monkeypatch: pytest.MonkeyPatch, rows_per_program: int, mxfp4: bool, sort_ids: bool
+) -> None:
+    """Several rows per program give the one-row kernel's bits, ids outside the
+    shard and a ragged last program included."""
+    packed, exps = _packed_table(rows=1024)
+    table = packed if mxfp4 else unpack_mxfp4_rows(packed)
+    row_lo, row_hi = 3000, 3000 + table.shape[0]
+    gen = torch.Generator(device="cuda").manual_seed(1)
+
+    def gather(rows: int, ids: torch.Tensor) -> torch.Tensor:
+        monkeypatch.setattr(
+            engram_gather_module, "_gather_rows_per_program", lambda: rows
+        )
+        out = torch.full(
+            (ids.numel(), _DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        engram_gather(
+            weight_ptr=table.data_ptr(),
+            scale_ptr=exps.data_ptr(),
+            ids=ids,
+            out=out,
+            dim=_DIM,
+            block_size=_BLOCK,
+            row_lo=row_lo,
+            row_hi=row_hi,
+            sort_ids=sort_ids,
+            mxfp4=mxfp4,
+        )
+        return out
+
+    for n in (1, 7, 8, 9, 1000, 4099):
+        # About a quarter of the ids fall in this shard, as under 4-way DP.
+        ids = torch.randint(
+            0, 4 * table.shape[0], (n,), device="cuda", generator=gen
+        ) + (row_lo - table.shape[0])
+        _assert_bits_equal(gather(rows_per_program, ids), gather(1, ids))
 
 
 if __name__ == "__main__":

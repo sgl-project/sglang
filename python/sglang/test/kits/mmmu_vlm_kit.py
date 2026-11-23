@@ -349,11 +349,6 @@ class MMMUMultiModelTestBase(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
-            # CUDA IPC multimodal-feature transport is NVIDIA-only; enabling it
-            # on ROCm/HIP makes ServerArgs raise "requires NVIDIA CUDA" and the
-            # server exits. Only opt in on CUDA so AMD exercises CPU transport.
-            if is_cuda():
-                process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -369,6 +364,10 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 timeout=self.time_out,
                 api_key=self.api_key,
                 other_args=[
+                    # CUDA IPC multimodal-feature transport is NVIDIA-only; on
+                    # ROCm/HIP it makes ServerArgs raise "requires NVIDIA CUDA".
+                    # Only opt in on CUDA so AMD exercises CPU transport.
+                    *(["--mm-feature-transport", "cuda_ipc"] if is_cuda() else []),
                     "--trust-remote-code",
                     "--cuda-graph-max-bs-decode",
                     "64",

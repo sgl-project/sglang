@@ -3,13 +3,14 @@
 import asyncio
 import base64
 import copy
+import logging
 import math
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import List, Literal, Optional, Union
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -23,6 +24,14 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
+from sglang.srt.multimodal.media_io import (
+    ImageData,
+    VideoData,
+    check_local_media_file,
+    download_remote_media,
+    media_url_timeout,
+    read_local_media_file,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -35,9 +44,8 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.runtime_context import get_device
-from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import download_remote_media
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -468,7 +476,7 @@ class MiMoProcessor:
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):
@@ -482,6 +490,10 @@ class MiMoProcessor:
         else:
             source = path_or_data  # local path or file://
         try:
+            if isinstance(source, str):
+                if source.startswith("file://"):
+                    source = unquote(urlparse(source).path)
+                source = check_local_media_file(source)
             AudioDecoder(source)
             return True
         except Exception:
@@ -490,7 +502,7 @@ class MiMoProcessor:
     def _load_video_for_encoder(self, video_data):
         # Normalise once to bytes-or-path; reused by frame decode, audio
         # detection, and audio preprocessing without re-downloading.
-        from sglang.srt.utils.common import VideoData, _normalize_video_input
+        from sglang.srt.multimodal.media_io import VideoData, _normalize_video_input
         from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
         if isinstance(video_data, VideoData):
@@ -879,11 +891,6 @@ class MiMoProcessor:
     def _process_video_content(self, content_idx, video_results, verbose):
         visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
         grid_t, grid_h, grid_w = thw_grid
-        num_media_tokens = (
-            (grid_t * grid_h * grid_w)
-            // (self.merge_size**2)
-            // self.temporal_compression_ratio
-        )
 
         assert len(timestamps) == grid_t * self.temporal_patch_size, (
             f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
@@ -1424,10 +1431,13 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                timeout = media_url_timeout(3)
+                with BytesIO(download_remote_media(image, timeout=timeout)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+                image_obj = Image.open(
+                    BytesIO(read_local_media_file(unquote(urlparse(image).path)))
+                )
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
@@ -1435,7 +1445,7 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                image_obj = Image.open(image)
+                image_obj = Image.open(BytesIO(read_local_media_file(image)))
         else:
             image_obj = Image.open(BytesIO(image))
         if image_obj is None:

@@ -28,15 +28,18 @@
 //     experiment on chunan/kda (same mbarrier staging, same 3/4-stage
 //     dispatch by grid size);
 //   * PDL (kUsePDL, plumbed like kda_packed_decode): griddepcontrol wait at
-//     kernel entry, launch_dependents at every exit.
+//     kernel entry, launch_dependents at every exit;
+//   * 8/16 local heads (GLM-5.3-Flash TP8/TP4), with L2 evict-first state
+//     loads and streaming state stores on SM90 (kStreamState).
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
-#include <sgl_kernel/math.cuh>
-#include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel
-#include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum
+#include <sgl_kernel/activation.cuh>
+#include <sgl_kernel/runtime.cuh>  // For host::runtime::get_cc_major
+#include <sgl_kernel/type.cuh>     // For bf16_t, fp32_t
+#include <sgl_kernel/utils.cuh>    // For LaunchKernel
+#include <sgl_kernel/warp.cuh>     // For device::warp::reduce_sum
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -90,6 +93,20 @@ static SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_sr
   asm volatile(
       "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
       " [%0], [%1], %2, [%3];" ::"r"(to_shared(smem_dst)),
+      "l"(gmem_src),
+      "r"(bytes),
+      "r"(to_shared(bar))
+      : "memory");
+}
+
+// Same load with an L2 evict-first policy, for data read once per kernel.
+static SGL_DEVICE void
+cp_async_bulk_1d_load_evict_first(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
+  asm volatile(
+      "{\n\t.reg .b64 policy;\n\t"
+      "createpolicy.fractional.L2::evict_first.b64 policy, 1.0;\n\t"
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1], %2, [%3], policy;\n\t}\n" ::"r"(to_shared(smem_dst)),
       "l"(gmem_src),
       "r"(bytes),
       "r"(to_shared(bar))
@@ -153,9 +170,11 @@ SGL_DEVICE __nv_bfloat16 bf16_store(float value) {
   return __float2bfloat16(value);
 }
 
-template <bool kUseCacheGlobalStore>
+template <bool kUseCacheGlobalStore, bool kStreamingStore = false>
 SGL_DEVICE void store_state_float4(float* ptr, float4 value) {
-  if constexpr (kUseCacheGlobalStore) {
+  if constexpr (kStreamingStore) {
+    __stcs(reinterpret_cast<float4*>(ptr), value);
+  } else if constexpr (kUseCacheGlobalStore) {
     __stcg(reinterpret_cast<float4*>(ptr), value);
   } else {
     *reinterpret_cast<float4*>(ptr) = value;
@@ -194,7 +213,7 @@ cp_async_state_chunk(float* s_state, const float* state, int slot, int i_hv, int
 
 // 1D TMA bulk copy gmem -> smem; the issuing thread arrives with expect-tx on
 // the mbarrier, completion is observed via ptx::mbar_wait_parity.
-template <int kStageChunkV>
+template <int kStageChunkV, bool kEvictFirst = false>
 SGL_DEVICE void tma_state_chunk_stage(
     float* s_state,
     const float* state,
@@ -214,7 +233,11 @@ SGL_DEVICE void tma_state_chunk_stage(
 #if KDA_FUSED_DECODE_HAS_TMA
   ptx::fence_async_smem();
   ptx::mbar_arrive_expect_tx(bar, kBytes);
-  ptx::cp_async_bulk_1d_load(dst, src, kBytes, bar);
+  if constexpr (kEvictFirst) {
+    ptx::cp_async_bulk_1d_load_evict_first(dst, src, kBytes, bar);
+  } else {
+    ptx::cp_async_bulk_1d_load(dst, src, kBytes, bar);
+  }
 #else
   __trap();
 #endif
@@ -386,7 +409,8 @@ template <
     bool kApplyBetaSigmoid = true,
     bool kUseTmaLoad = false,
     int kTmaStages = kNumChunks,
-    bool kUsePDL = false>
+    bool kUsePDL = false,
+    bool kStreamState = false>
 // Shapes below use K3's per-TP-rank sizing (linear_attn_config: num_heads=96 over
 // TP={8,16,32} -> H=HV={12,6,3} local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128;
 // short_conv_kernel_size=4 -> kKernelWidth=4, kConvStateWidth=3). B is the live
@@ -512,9 +536,10 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       for (int c = 0; c < kTmaStages; ++c) {
         ptx::mbar_init(&s_tma_bar[c], 1);
       }
-      tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, state_slot_stride, 0, 0, &s_tma_bar[0]);
+      tma_state_chunk_stage<kChunkV, kStreamState>(s_state, state, slot, i_hv, state_slot_stride, 0, 0, &s_tma_bar[0]);
       if (kTmaStages > 1 && kNumChunks > 1) {
-        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, state_slot_stride, 1, 1, &s_tma_bar[1]);
+        tma_state_chunk_stage<kChunkV, kStreamState>(
+            s_state, state, slot, i_hv, state_slot_stride, 1, 1, &s_tma_bar[1]);
       }
     }
   } else {
@@ -561,14 +586,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_k[cs_base + cs_w_stride] = k_shift1;
       cs_k[cs_base + 2 * cs_w_stride] = k_new;
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = device::activation::silu(q_acc);
+      s_k[k] = device::activation::silu(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
-        s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
+        s_decay[k] = __expf(lower_bound * device::activation::sigmoid(exp_a * g_raw));
       } else {
-        s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
+        s_decay[k] = __expf(-exp_a * device::activation::softplus(g_raw));
       }
     }
   } else {
@@ -588,14 +613,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       q_acc += bf16_load(x_q, bos * x_row_stride + hk) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
       k_acc += bf16_load(x_k, bos * x_row_stride + hk) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = device::activation::silu(q_acc);
+      s_k[k] = device::activation::silu(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
-        s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
+        s_decay[k] = __expf(lower_bound * device::activation::sigmoid(exp_a * g_raw));
       } else {
-        s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
+        s_decay[k] = __expf(-exp_a * device::activation::softplus(g_raw));
       }
     }
   }
@@ -625,11 +650,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = device::activation::silu(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
-        pre_onorm_gate = device::math::sigmoid_fast(bf16_load(onorm_g, onorm_idx));
+        pre_onorm_gate = device::activation::sigmoid(bf16_load(onorm_g, onorm_idx));
         pre_onorm_weight = onorm_weight[v];
       }
     }
@@ -645,11 +670,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         v_acc += bf16_load(cs_v, cs_idx) * fp32_at(w_v_t, w * hvv_dim + hvv);
       }
       v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = device::activation::silu(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
-        pre_onorm_gate = device::math::sigmoid_fast(bf16_load(onorm_g, onorm_idx));
+        pre_onorm_gate = device::activation::sigmoid(bf16_load(onorm_g, onorm_idx));
         pre_onorm_weight = onorm_weight[v];
       }
     }
@@ -658,7 +683,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   if (tid == 0) {
     const float beta_raw = bf16_load(beta, bos * beta_row_stride + i_hv);
     if constexpr (kApplyBetaSigmoid) {
-      s_beta = device::math::sigmoid_fast(beta_raw);
+      s_beta = device::activation::sigmoid(beta_raw);
     } else {
       s_beta = beta_raw;
     }
@@ -696,7 +721,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   for (int chunk = 0; chunk < kNumChunks; ++chunk) {
     if constexpr (kUseTmaLoad) {
       if (tid == 0 && chunk + 2 < kNumChunks && chunk + 2 < kTmaStages) {
-        tma_state_chunk_stage<kChunkV>(
+        tma_state_chunk_stage<kChunkV, kStreamState>(
             s_state, state, slot, i_hv, state_slot_stride, chunk + 2, chunk + 2, &s_tma_bar[chunk + 2]);
       }
       ptx::mbar_wait_parity(&s_tma_bar[chunk % kTmaStages], (chunk / kTmaStages) & 1);
@@ -767,11 +792,15 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       if constexpr (kComputeOutputBeforeStore) {
         dot_hq_a = h_a_0 * r_q[0] + h_a_1 * r_q[1] + h_a_2 * r_q[2] + h_a_3 * r_q[3];
         dot_hq_b = h_b_0 * r_q[0] + h_b_1 * r_q[1] + h_b_2 * r_q[2] + h_b_3 * r_q[3];
-        store_state_float4<kUseCacheGlobalStore>(state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
-        store_state_float4<kUseCacheGlobalStore>(state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
+        store_state_float4<kUseCacheGlobalStore, kStreamState>(
+            state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
+        store_state_float4<kUseCacheGlobalStore, kStreamState>(
+            state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
       } else {
-        store_state_float4<kUseCacheGlobalStore>(state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
-        store_state_float4<kUseCacheGlobalStore>(state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
+        store_state_float4<kUseCacheGlobalStore, kStreamState>(
+            state + state_idx_a, make_float4(h_a_0, h_a_1, h_a_2, h_a_3));
+        store_state_float4<kUseCacheGlobalStore, kStreamState>(
+            state + state_idx_b, make_float4(h_b_0, h_b_1, h_b_2, h_b_3));
         dot_hq_a = h_a_0 * r_q[0] + h_a_1 * r_q[1] + h_a_2 * r_q[2] + h_a_3 * r_q[3];
         dot_hq_b = h_b_0 * r_q[0] + h_b_1 * r_q[1] + h_b_2 * r_q[2] + h_b_3 * r_q[3];
       }
@@ -792,7 +821,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       if (chunk + kTmaStages < kNumChunks) {
         __syncthreads();
         if (tid == 0) {
-          tma_state_chunk_stage<kChunkV>(
+          tma_state_chunk_stage<kChunkV, kStreamState>(
               s_state,
               state,
               slot,
@@ -840,7 +869,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = device::math::sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = device::activation::sigmoid(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
@@ -865,7 +894,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = device::math::sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = device::activation::sigmoid(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
@@ -881,13 +910,21 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 }
 
 // K3 decode configuration of the many-heads kernel: onorm fused, static
-// H = HV in {3, 6, 12} layout with a (B, HV) grid, onorm params preloaded, next state
+// H = HV in {3, 6, 8, 12, 16} layout with a (B, HV) grid, onorm params preloaded, next state
 // chunk prefetched, active onorm reduction, conv cache updated in place,
 // beta sigmoid in-kernel. Both forget-gate variants are compiled (softplus
 // and lower-bounded sigmoid) and selected at launch from the model config.
 // kUseTmaLoad/kTmaStages select the 1D-TMA state-staging path in place of the
 // cp.async fallback used for a misaligned recurrent-state slot stride.
-template <int kFixedHeads, bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
+// kStreamState loads the recurrent state with an L2 evict-first policy and
+// stores it with streaming (.cs) stores.
+template <
+    int kFixedHeads,
+    bool kUseLowerBound,
+    bool kUsePDL,
+    bool kUseTmaLoad = false,
+    int kTmaStages = kNumChunks,
+    bool kStreamState = false>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true,
     /*kUseStaticDecodeLayout=*/true,
@@ -907,20 +944,21 @@ constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyBetaSigmoid=*/true,
     kUseTmaLoad,
     kTmaStages,
-    kUsePDL>;
+    kUsePDL,
+    kStreamState>;
 
-template <int kFixedHeads, bool kUsePDL>
+template <int kFixedHeads, bool kUsePDL, bool kStreamState = false>
 auto select_kda_fused_decode_k3_kernel(bool use_lower_bound, int tma_stages) {
   if (tma_stages == 3) {
-    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3>
-                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3>;
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3, kStreamState>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3, kStreamState>;
   }
   if (tma_stages == 4) {
-    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4>
-                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4>;
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4, kStreamState>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4, kStreamState>;
   }
-  return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL>
-                         : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL>;
+  return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, false, kNumChunks, kStreamState>
+                         : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, false, kNumChunks, kStreamState>;
 }
 
 template <bool kUsePDL>
@@ -948,7 +986,10 @@ struct KdaFusedDecodeKernel {
     using namespace host;
 
     const int64_t kH = A_log.shape()[0];
-    RuntimeCheck(kH == 3 || kH == 6 || kH == 12, "KDA fused decode supports local head counts 3, 6, or 12, got ", kH);
+    RuntimeCheck(
+        kH == 3 || kH == 6 || kH == 8 || kH == 12 || kH == 16,
+        "KDA fused decode supports local head counts 3, 6, 8, 12, or 16, got ",
+        kH);
     const int64_t kSeg = kH * 128;  // q, k and v segment width
 
     auto B_ = SymbolicSize{"batch"};
@@ -1012,9 +1053,25 @@ struct KdaFusedDecodeKernel {
       // fastest.
       tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
     }
-    auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
-                          : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
-                                     : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
+    auto kernel = select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages);
+    if (kH == 3) {
+      kernel = select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages);
+    } else if (kH == 6) {
+      kernel = select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages);
+    } else if (kH == 8 || kH == 16) {
+      // Measured on H200 at 8/16 heads: evict-first state traffic is 1-9%
+      // faster up to 1024 (token, head) blocks and 1-2% slower from 1600;
+      // Blackwell was not measured with it, so it keeps the default policy.
+      const bool stream_state =
+          B * static_cast<int>(kH) <= 1024 && host::runtime::get_cc_major(device.unwrap().device_id) == 9;
+      if (kH == 8) {
+        kernel = stream_state ? select_kda_fused_decode_k3_kernel<8, kUsePDL, true>(use_lower_bound, tma_stages)
+                              : select_kda_fused_decode_k3_kernel<8, kUsePDL>(use_lower_bound, tma_stages);
+      } else {
+        kernel = stream_state ? select_kda_fused_decode_k3_kernel<16, kUsePDL, true>(use_lower_bound, tma_stages)
+                              : select_kda_fused_decode_k3_kernel<16, kUsePDL>(use_lower_bound, tma_stages);
+      }
+    }
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(

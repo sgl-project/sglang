@@ -17,6 +17,9 @@ if TYPE_CHECKING:
 
 
 class TboAttnBackend(AttentionBackend):
+    def window_capacity_children(self) -> list:
+        return [self.primary, *self.children]
+
     def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
         super().__init__()
         self.primary = primary

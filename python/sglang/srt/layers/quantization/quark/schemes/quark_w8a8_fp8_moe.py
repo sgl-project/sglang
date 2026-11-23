@@ -13,7 +13,8 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
-from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
