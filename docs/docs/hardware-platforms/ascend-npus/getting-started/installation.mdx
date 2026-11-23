@@ -300,14 +300,14 @@ pip install -e python[all_npu]
 #### Install Ascend Docker Runtime
 
 The container commands in this documentation rely on
-[Ascend Docker Runtime](https://www.hiascend.com/document/detail/en/mindcluster/latest/) on the host.
+[Ascend Docker Runtime](https://www.hiascend.com/document/detail/en/mindcluster/latest/clustersched/schedulingug/docs/en/scheduling/01_introduction/01_component_description.md#ascend-docker-runtime) on the host.
 It is a container runtime plugin (an OCI prestart hook) that reads the `ASCEND_VISIBLE_DEVICES` environment variable
 passed to `docker run`: it binds the selected NPU device nodes (including `/dev/davinci_manager` and `/dev/hisi_hdc`)
 into the container and mounts the host driver dependencies the NPU stack needs. Without the runtime,
 `ASCEND_VISIBLE_DEVICES` is ignored and none of this is mounted automatically.
 
 Install it once per host as `root` (skip this step if the host already has it). Download the `.run` package
-from the [MindCluster documentation](https://www.hiascend.com/document/detail/en/mindcluster/latest/), then:
+from the [MindCluster releases page](https://gitcode.com/Ascend/mind-cluster/releases), then:
 
 ```bash Command
 # ============================================================
@@ -343,14 +343,6 @@ or set `"default-runtime": "ascend"` in `/etc/docker/daemon.json` and restart Do
 
 `ASCEND_VISIBLE_DEVICES` accepts a single id (`0`), a comma-separated list (`0,1`), an inclusive range (`0-15`),
 a mixed form (`0-3,7`), and `void` for a container without any NPU.
-
-<Note>
-The runtime can mount extra host paths into every container through `ASCEND_RUNTIME_MOUNTS`. Its value **replaces**
-the default `base` list, so a custom value must list `base` explicitly, for example
-`-e ASCEND_RUNTIME_MOUNTS=base,hostextra` with one host path per line in the corresponding `.list` file under
-`/etc/ascend-docker-runtime.d/`. The value is limited to 128 characters and each list file to 128 entries. Do not
-edit `base.list` by hand.
-</Note>
 
 If the runtime cannot be installed on the host (for example, no `root` access), containers can still be started
 with explicit `--device` and `--volume` flags — see
