@@ -34,21 +34,18 @@ register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 # sparse path and never reach the kernel under test.
 _IS_GFX95_GPU = torch.cuda.is_available() and is_hip() and is_gfx95_supported()
 
-# The shared cases are built at `DSA_PAGE_SIZE` (64), but the HIP DSA pool only
-# accepts a paged layout on the aiter preshuffle path; the legacy path asserts
-# `page_size == 1`. Preshuffle needs triton >= 3.5.0 or
-# AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1; on the MI35x runner its absence
-# must fail the test, not skip it.
-
 
 @unittest.skipUnless(_IS_GFX95_GPU, "requires an AMD gfx95x (MI350/MI355) GPU")
 class TestDSADenseMHAFallbackGfx950(CustomTestCase):
     CASES = make_dsa_dense_fallback_cases("dsa")
 
     def test_mha_one_shot_dense_fallback_cases(self):
+        # The HIP DSA pool takes the cases' paged layout (page size 64) only on the
+        # preshuffle path; fail rather than skip, so the MI35x job cannot pass empty.
         self.assertTrue(
             aiter_can_use_preshuffle_paged_mqa(),
-            "aiter preshuffle paged-MQA path is unavailable on this image",
+            "aiter preshuffle paged-MQA path is unavailable; it needs triton >= 3.5.0"
+            " or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1",
         )
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
