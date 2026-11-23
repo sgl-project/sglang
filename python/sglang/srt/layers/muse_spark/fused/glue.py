@@ -169,15 +169,29 @@ def run_attention(
     if is_cp_active(forward_batch):
         return None
     if not forward_batch.forward_mode.is_target_verify():
-        return run_prefill_attention(
+        out = run_prefill_attention(
             module, qkv, positions, forward_batch, push, last_only
         )
+        if out is None and forward_batch.mixed_verify_tree is not None:
+            _tree_uncovered()
+        return out
     from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
     spec = forward_batch.spec_info
     if not isinstance(spec, DFlashVerifyInput) or spec.ragged_verify_layout is not None:
         return None
-    return _run_verify_attention(module, qkv, forward_batch, (None, None))
+    tree = (spec.tree_anc, spec.tree_depth)
+    out = _run_verify_attention(module, qkv, forward_batch, tree)
+    if out is None and tree[0] is not None:
+        _tree_uncovered()
+    return out
+
+
+def _tree_uncovered():
+    # stock attention has no tree mask; trees only reach batches tree_verify_max_batch() admits
+    raise RuntimeError(
+        "fused tree verify: this layer / batch is not covered by attn_srv"
+    )
 
 
 def _fa3_metadata(module):
@@ -303,9 +317,11 @@ def _run_mixed_verify(
     module, qkv, positions, out, a, forward_batch, push=None, last_only=False
 ) -> bool:
     page_table, cache_loc, k_cache, v_cache, cache_seqlens, cu_seqlens_q, ext, seq = a
-    tails = forward_batch.mixed_verify_rows or 0
+    tails, tree = forward_batch.mixed_verify_rows or 0, forward_batch.mixed_verify_tree
     rows = len(ext) - tails
     if rows < 0 or tails > attn_srv.MAX_BATCH or any(e != 8 for e in ext[rows:]):
+        if tree is not None:
+            _tree_uncovered()
         return False
     n, t = sum(ext[:rows]), 8 * tails
     o = rows if last_only else n
@@ -338,7 +354,7 @@ def _run_mixed_verify(
         v_cache,
         page_table[rows:],
         module._fused_cfg,
-        (None, None),
+        tree or (None, None),
         out[o : o + t].view(tails, 8, -1),
         push and push[:4] + (n,),
     )

@@ -2300,6 +2300,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 ragged_verify_layout=ragged_verify_layout,
             )
+            if not self.model_runner.is_draft_worker:
+                from sglang.srt.speculative.dflash_tree import (
+                    tree_buffers,
+                    tree_max_batch,
+                )
+
+                # captured tree attention reads the static tree arrays
+                if num_tokens <= self.captured_req_width * tree_max_batch(
+                    self.model_runner
+                ):
+                    tree = tree_buffers(self.model_runner.device)
+                    spec_info.tree_anc, spec_info.tree_depth = tree.anc, tree.depth
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

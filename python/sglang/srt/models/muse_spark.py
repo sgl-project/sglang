@@ -1855,6 +1855,18 @@ class MuseSparkTextForCausalLM(nn.Module):
         )
         self.capture_aux_hidden_states = False
 
+    def supports_tree_verify(self) -> bool:
+        """Token-tree verify needs the fused Hopper attention (tree masks)."""
+        return self.model.language_model.hopper_kernels
+
+    def tree_verify_max_batch(self, backends) -> int:
+        """Largest target-verify batch with token-tree attention masks in every layer."""
+        return min(
+            glue.verify_max_batch(layer.self_attn, b)
+            for layer in self.get_layers()
+            for b in backends
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,

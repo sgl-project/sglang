@@ -5,7 +5,7 @@ metatags:
 ---
 
 On SM90 GPUs, Muse Spark NVFP4 with DFlash serves with Hopper kernels: fused W4A16 experts, fused
-FP8-KV attention, sequence-parallel prefill and small-M GEMVs. They keep the stock
+FP8-KV attention, token-tree verify, sequence-parallel prefill and small-M GEMVs. They keep the stock
 precision (only fp32 accumulation order may differ) and need compute capability 9.0; other GPUs and
 models keep the stock code.
 
