@@ -4,9 +4,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-)
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
@@ -110,7 +108,6 @@ class NGRAMWorker(BaseSpecWorker):
         # alloc_memory_pool(), after the target pools are allocated.
         self.device = get_device().device
 
-        self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
@@ -233,14 +230,6 @@ class NGRAMWorker(BaseSpecWorker):
             self.tree_mask_batch.append(
                 self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
             )
-
-    def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
-    ) -> None:
-        # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
-        # result processor calls it with batch_size as a keyword argument.
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
