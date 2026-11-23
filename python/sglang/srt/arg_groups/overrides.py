@@ -435,6 +435,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Lfm3VlForConditionalGeneration",
         "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
+        "Lfm2MoeForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
@@ -456,8 +457,12 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
 
     if get_platform().is_xpu:
         return False
-    if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
-        # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
+    if (
+        hf_config.architectures[0] in ("Lfm3ForCausalLM", "Lfm2MoeForCausalLM")
+        and get_platform().is_hip
+    ):
+        # HIP has no extra-buffer hand-off for LFM conv-state checkpointing;
+        # LFM2-MoE shares the same ShortConv (kernel_size-1)-token cache.
         return False
     if get_platform().is_xpu:
         return False
