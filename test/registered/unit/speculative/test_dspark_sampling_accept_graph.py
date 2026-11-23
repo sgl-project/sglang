@@ -9,6 +9,7 @@ import msgspec
 import pytest
 import torch
 
+from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
     dspark_verify,
@@ -70,7 +71,9 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, None)
     assert not _eligible(worker, _sampling_info(is_any_greedy=True))
     assert not _eligible(worker, _sampling_info(need_top_k_sampling=True))
-    assert not _eligible(worker, _sampling_info(need_top_p_sampling=True))
+    assert _eligible(worker, _sampling_info(need_top_p_sampling=True))
+    top_p = _sampling_info(need_top_p_sampling=True)
+    assert not _eligible(worker, top_p, sim_bonus=top_p)
     assert not _eligible(worker, _sampling_info(need_min_p_sampling=True))
     assert not _eligible(worker, _sampling_info(watermark=object()))
     assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
@@ -108,7 +111,9 @@ def _gpu_case(*, bs, graph_bs, vocab, seed):
         greedy_draft=False,
         step_logits=step_logits,
         params=SimpleNamespace(
-            temperatures=temps, greedy_mask=torch.zeros(8, dtype=torch.bool, device=dev)
+            temperatures=temps,
+            greedy_mask=torch.zeros(8, dtype=torch.bool, device=dev),
+            top_ps=torch.ones(8, device=dev),
         ),
     )
     epi = dspark_verify.DsparkVerifyEpilogue(
@@ -119,7 +124,7 @@ def _gpu_case(*, bs, graph_bs, vocab, seed):
     return io, sampler, epi
 
 
-def _eager_reference(io, sampler, bs, rejection_noise=None):
+def _eager_reference(io, sampler, bs, rejection_noise=None, top_ps=None):
     """The worker's eager sampling accept on the live rows only."""
     cand = io.candidates[:bs]
     params = sampler.params
@@ -130,7 +135,11 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
         temperatures=params.temperatures[:bs],
         greedy_draft=False,
     )
-    info = sag.GraphSamplingInfo(temperatures=params.temperatures[:bs].view(bs, 1))
+    info = sag.GraphSamplingInfo(
+        temperatures=params.temperatures[:bs].view(bs, 1),
+        need_top_p_sampling=top_ps is not None,
+        top_ps=None if top_ps is None else top_ps[:bs],
+    )
     correct_len, bonus, trim = dspark_verify.accept_draft_tokens(
         candidates=cand,
         target_logits=io.logits[: bs * STRIDE],
@@ -224,6 +233,36 @@ def test_injects_the_hidden_of_the_replayed_verify_graph(monkeypatch):
         torch.cuda.synchronize()
         assert torch.equal(seen, replayed.hidden), step
     assert region.num_replays == 4
+
+
+@pytest.fixture
+def server_args():
+    reset_context()
+    yield get_context().override_server_args
+    reset_context()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("bs,tp_size", [(1, 1), (3, 4)])
+def test_top_p_replay_equals_eager(monkeypatch, server_args, bs, tp_size):
+    """A top-p batch, on one rank and under TP 4 (deterministic renorm)."""
+    with server_args(tp_size=tp_size):
+        io, sampler, epi = _gpu_case(bs=bs, graph_bs=bs, vocab=2048, seed=200 + bs)
+        graph = _graph(epi, sampler, monkeypatch)
+        top_ps = torch.linspace(0.5, 0.9, bs, device="cuda")
+        sampler.params.top_ps[:bs].copy_(top_ps)
+        for step in range(4):  # eager warm-up, capture + replay, then replays
+            torch.cuda.manual_seed(1234 + step)
+            ref = _eager_reference(io, sampler, bs, top_ps=top_ps)
+            torch.cuda.manual_seed(1234 + step)
+            out = graph.run(
+                bs=bs, target_logits=io.logits, target_hidden=io.hidden, top_p=True
+            )
+            torch.cuda.synchronize()
+            got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
+            for name in _FIELDS:
+                assert torch.equal(got[name], want[name]), (step, name)
+        assert graph.num_replays == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

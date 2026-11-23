@@ -1280,6 +1280,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs,
                 target_logits=target_logits,
                 target_hidden=logits_output.hidden_states,
+                top_p=sampling_info.need_top_p_sampling,
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
@@ -1439,14 +1440,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.mode_value == "static"
             and sampling_info is not None
             and not sampling_info.is_any_greedy
-            and not need_truncated_sampling(sampling_info)
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
             and verify_logits_adjustments_are_noop(
                 sampling_info, has_grammar=batch.has_grammar
             )
-            # A simulated bonus is drawn in the region from this batch's temperatures.
+            # A simulated bonus is drawn in the region from this batch's temperatures
+            # alone, without top-p.
             and (
                 simulate_bonus_sampling_info is None
-                or simulate_bonus_sampling_info is sampling_info
+                or (
+                    simulate_bonus_sampling_info is sampling_info
+                    and not sampling_info.need_top_p_sampling
+                )
             )
         )
 

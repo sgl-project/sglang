@@ -107,6 +107,7 @@ class DsparkDraftSampler:
             step_temperatures=torch.zeros(
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
+            top_ps=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
         )
         # [max_bs, gamma, vocab] step logits for sampling accept. The stock path
         # sizes it on first use; a bound specialized path may allocate it now.
