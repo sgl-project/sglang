@@ -8,6 +8,7 @@ import unittest
 import torch
 
 from sglang.srt.managers import overlap_utils
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -50,6 +51,7 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
             need_top_p_sampling=False,
             need_min_p_sampling=False,
         ),
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=None,
         prefix_lens=torch.zeros(bs, dtype=torch.int64, device=DEVICE),
         bs=bs,

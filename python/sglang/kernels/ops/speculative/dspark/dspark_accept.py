@@ -14,7 +14,6 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.environ import envs
-from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -63,6 +62,7 @@ class AcceptSampling:
         target_logits: torch.Tensor,
         draft_probs: torch.Tensor,
         sampling_info,
+        need_truncated_sampling: bool,
         draft_input: DFlashDraftInputV2,
         gamma: int,
         verify_num_draft_tokens: int,
@@ -74,6 +74,7 @@ class AcceptSampling:
             target_logits=target_logits,
             draft_probs=draft_probs,
             sampling_info=sampling_info,
+            need_truncated_sampling=need_truncated_sampling,
             draft_input=draft_input,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
@@ -89,6 +90,7 @@ class AcceptSampling:
         target_logits: torch.Tensor,
         draft_probs: torch.Tensor,
         sampling_info,
+        need_truncated_sampling: bool,
         draft_input: DFlashDraftInputV2,
         gamma: int,
         verify_num_draft_tokens: int,
@@ -100,6 +102,7 @@ class AcceptSampling:
             target_logits=target_logits,
             draft_probs=draft_probs,
             sampling_info=sampling_info,
+            need_truncated_sampling=need_truncated_sampling,
             draft_input=draft_input,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
@@ -114,6 +117,7 @@ def _accept_sampling_core(
     target_logits: torch.Tensor,
     draft_probs: torch.Tensor,
     sampling_info,
+    need_truncated_sampling: bool,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
@@ -122,7 +126,7 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    plain = not need_truncated_sampling(sampling_info)
+    plain = not need_truncated_sampling
     if (
         _SPLIT_ACCEPT
         and plain
@@ -236,6 +240,7 @@ def accept_sampling(
     target_logits: torch.Tensor,
     draft_probs: torch.Tensor,
     sampling_info,
+    need_truncated_sampling: bool,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
@@ -249,6 +254,7 @@ def accept_sampling(
         target_logits=target_logits,
         draft_probs=draft_probs,
         sampling_info=sampling_info,
+        need_truncated_sampling=need_truncated_sampling,
         draft_input=draft_input,
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
@@ -306,6 +312,7 @@ def accept_sampling_triton(
     target_logits: torch.Tensor,
     draft_probs: torch.Tensor,
     sampling_info,
+    need_truncated_sampling: bool,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
@@ -317,6 +324,7 @@ def accept_sampling_triton(
         target_logits=target_logits,
         draft_probs=draft_probs,
         sampling_info=sampling_info,
+        need_truncated_sampling=need_truncated_sampling,
         draft_input=draft_input,
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
