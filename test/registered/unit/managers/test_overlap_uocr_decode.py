@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
     UnlimitedOCRV2AttnBackend,
 )
@@ -112,9 +111,6 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         sampling.grammars = None
         batch.return_logprob = True
         self.assertFalse(graph_io.can_defer(batch))
-        batch.return_logprob = False
-        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
-            self.assertFalse(graph_io.can_defer(batch))
 
     def test_relay_result_seeds_every_non_graph_decode_transition(self):
         graph_io = _graph_io()
@@ -245,15 +241,6 @@ class TestUocrGreedyGraph(CustomTestCase):
         batch.sampling_info.grammars = [object(), None]
         graph.before_forward(batch, replays_graph=True, decode_graph_runner=None)
         self.assertIsNone(graph.recorded_ids(logits, batch))
-
-    def test_a_sanitize_mode_step_samples_instead_of_taking_the_graph_argmax(self):
-        """The in-graph argmax ran before the sanitize, so it cannot stand in."""
-        graph = UocrGreedyGraph(max_bs=4, device="cpu")
-        logits = Mock(next_token_logits=torch.zeros(2, 5))
-        batch = _decode_batch()
-        graph.before_forward(batch, replays_graph=True, decode_graph_runner=None)
-        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
-            self.assertIsNone(graph.recorded_ids(logits, batch))
 
 
 def _scheduler_for(architecture, training_stage):

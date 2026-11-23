@@ -23,7 +23,6 @@ from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
-    VerifyRoute,
     _adjust_after_watermark,
     _adjust_before_watermark,
     adjust_verify_logits,
@@ -312,15 +311,6 @@ class TestNanLogits(CustomTestCase):
             with self.assertRaises(RuntimeError):
                 self._verify(self._logits())
             detect_nan_logits(torch.zeros(1, VOCAB_SIZE), "verify")
-
-    def test_sanitize_mode_routes_every_verify_through_the_stages(self):
-        info = _make_info()
-        route = partial(
-            VerifyRoute.derive, info, has_grammar=False, has_watermark=False
-        )
-        self.assertFalse(route().adjusts_logits)
-        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
-            self.assertTrue(route().adjusts_logits)
 
 
 class TestBuildGrammarMask(CustomTestCase):

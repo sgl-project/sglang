@@ -80,7 +80,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
         logits; they replace the stages after the watermark.
         """
         sampling_info = forward_batch.sampling_info
-        detect_nan_logits(logits_output.next_token_logits, "decode")
+        detect_nan_logits(logits_output.next_token_logits, "sampler")
         if observer is not None and not observer.is_active(sampling_info):
             observer = None
         observer_state = _adjust_before_watermark(
