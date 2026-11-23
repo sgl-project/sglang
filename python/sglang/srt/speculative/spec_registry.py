@@ -107,8 +107,10 @@ class CustomSpecAlgo:
         return False
 
     def supports_grammar_overlap(self) -> bool:
-        # Whether the worker advances the grammar FSM inside verify() (via the
-        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        # Whether the worker calls the scheduler's grammar barrier inside verify(),
+        # for the grammar FSM advance and the custom logit processors' pending
+        # tokens, so spec decode with a grammar or custom logit processors keeps
+        # overlap.
         return False
 
     def has_draft_kv(self) -> bool:

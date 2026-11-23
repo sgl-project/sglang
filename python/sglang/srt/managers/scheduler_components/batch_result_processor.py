@@ -8,6 +8,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -1135,6 +1136,51 @@ class SchedulerBatchResultProcessor:
             retained[i] = self._accept_grammar_tokens(req, accept_tokens)
         result.grammar_retained_tokens = retained
         result.grammar_advanced = True
+
+    def pending_output_tokens(
+        self, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> Dict[Req, List[int]]:
+        """The tokens processing ``result`` will append to req.output_ids, for
+        each request with a custom logit processor: the verify barrier hands
+        them to a verify that runs before the result is processed. Call it after
+        ``advance_grammar_fsm``: a grammar request's tokens are its
+        ``grammar_retained_tokens``.
+        Keep it in step with what ``process_batch_result_prefill`` and
+        ``_resolve_spec_v2_tokens`` commit.
+
+        A request this result finishes is listed too: the next batch's verify
+        still runs it, and discards its output.
+        """
+        rows = [
+            i
+            for i, req in enumerate(batch.reqs)
+            if req.custom_logit_processor is not None and self.still_in_batch(req)
+        ]
+        is_decode = batch.forward_mode.is_decode()
+        if not rows or not (is_decode or batch.forward_mode.is_extend()):
+            return {}
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        next_token_ids = result.next_token_ids.tolist()
+
+        if not is_decode:
+            # Extend: the single token each completed prefill emits.
+            return {
+                batch.reqs[i]: [next_token_ids[i]]
+                for i in rows
+                if batch.reqs[i] is not batch.chunked_req
+            }
+
+        accept_lens = result.accept_lens.tolist()
+        stride = _get_speculative_output_stride(result)
+        pending = {}
+        for i in rows:
+            req = batch.reqs[i]
+            if req.grammar is not None:
+                pending[req] = result.grammar_retained_tokens[i]
+            else:
+                pending[req] = next_token_ids[i * stride : i * stride + accept_lens[i]]
+        return pending
 
     def process_batch_result_idle(
         self,

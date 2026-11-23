@@ -4,11 +4,16 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.sampling.custom_logit_processor import (
+    ROW_PREFIX_KEY,
+    CustomLogitProcessor,
+)
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
+from sglang.srt.speculative.spec_utils import verify_row_prefixes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -127,15 +132,18 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         expected.masked_fill_(banned, float("-inf"))
         expected.view(bs, width, VOCAB_SIZE).add_(info.logit_bias[:, None, :])
 
-        def processor(logits, custom_params):
-            seen.append((logits.clone(), custom_params))
-            raise _Stop
+        class _Record(CustomLogitProcessor):
+            supports_row_prefix = True
+
+            def __call__(self, logits, custom_params):
+                seen.append((logits.clone(), custom_params))
+                raise _Stop
 
         seen = []
         info.has_custom_logit_processor = True
         info.custom_params = [{"req": 0}, {"req": 1}]
         info.custom_logit_processor = {
-            0: ProcessorEntry(processor=processor, rows=[1], indices=torch.tensor([1]))
+            0: ProcessorEntry(processor=_Record(), rows=[1], indices=torch.tensor([1]))
         }
         verify_input = SimpleNamespace(
             draft_token_num=width,
@@ -152,13 +160,18 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         logits_output = SimpleNamespace(
             next_token_logits=logits, next_token_logits_vocab_shard=None
         )
+        verify = _verify(batch, grammar_mask)
+        verify.row_prefixes = verify_row_prefixes(
+            next_child, next_sibling, verify_tokens, pending_tokens=[[]] * bs
+        )
         with self.assertRaises(_Stop):
-            eagle_utils.eagle_sample(
-                verify_input, _verify(batch, grammar_mask), logits_output
-            )
+            eagle_utils.eagle_sample(verify_input, verify, logits_output)
         self.assertEqual(len(seen), 1)
         self.assertTrue(torch.equal(seen[0][0], expected[width:]))
-        self.assertEqual(seen[0][1], [{"req": 1}] * width)
+        self.assertEqual(
+            seen[0][1],
+            [{"req": 1, ROW_PREFIX_KEY: prefix} for prefix in ([], [6], [6, 5])],
+        )
 
 
 if __name__ == "__main__":

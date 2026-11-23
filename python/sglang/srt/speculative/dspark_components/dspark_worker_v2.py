@@ -96,9 +96,10 @@ from sglang.srt.speculative.spec_sampling_mask import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
+    HostVerifyTree,
     draft_pp_context,
     draft_tp_context,
+    needs_verify_tree,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -1137,8 +1138,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logger.info("Verify ids read from the draft graph output (first step).")
 
         # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        host_tree = (
+            HostVerifyTree.from_linear_chain(verify_ids_2d)
+            if needs_verify_tree(batch)
+            else None
         )
 
         fold_eligible = (
@@ -1197,9 +1200,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_verify.logits_output
         detect_nan_logits(logits_output.next_token_logits, "verify")
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        verify.build_grammar_mask(
-            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
-        )
+        verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
         target_logits = logits_output.next_token_logits
         # Without sampling info (a simulated greedy accept drops it), nothing
         # adjusts the logits: the drop requires a route that adjusts nothing.
@@ -1253,6 +1254,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+            # The graph accepts never run with a custom logit processor: it
+            # adjusts the logits. correct_len stays the accept core's for the
+            # acceptance estimators, so on a capped row it no longer matches
+            # bonus and commit_lens.
+            accept.commit_lens, accept.bonus, accept.new_seq_lens = (
+                verify.cap_chain_accept(
+                    out_tokens=accept.out_tokens,
+                    commit_lens=accept.commit_lens,
+                    bonus=accept.bonus,
+                    prefix_lens=prefix_lens,
+                    new_seq_lens=accept.new_seq_lens,
+                )
             )
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),

@@ -21,6 +21,7 @@ from sglang.srt.parser.inkling_tokenizer import (
 )
 from sglang.srt.sampling.custom_logit_processor import (
     NGRAM_OUTPUT_ONLY_KEY,
+    ROW_PREFIX_KEY,
     CustomLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DeepSeekR1ThinkingBudgetLogitProcessor,
@@ -89,6 +90,54 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             [[1.0] * 4, [1.0] * 4, [0.0] * 4, [0.0] * 4, [3.0] * 4, [3.0] * 4]
         )
         self.assertTrue(torch.equal(logits, expected))
+
+    def test_row_prefixes_reach_supporting_processors_only(self):
+        """At verify, a processor that supports row prefixes gets each row's; any
+        other runs on each request's first row only."""
+        params = [{"value": 1.0}, {"value": 2.0}, {"value": 3.0}]
+        row_prefixes = [[], [7], [], [8], [], [9]]
+
+        class _Fill(CustomLogitProcessor):
+            def __call__(self, logits, custom_param_list):
+                for row, param in zip(logits, custom_param_list, strict=True):
+                    row.fill_(param["value"] + 10 * len(param.get(ROW_PREFIX_KEY, ())))
+                return logits
+
+        class _FillWithRowPrefix(_Fill):
+            supports_row_prefix = True
+
+        for processor, want in [
+            (_FillWithRowPrefix(), [1, 11, 0, 0, 3, 13]),
+            (_Fill(), [1, 0, 0, 0, 3, 0]),
+        ]:
+            with self.subTest(processor=type(processor).__name__):
+                sampling_info = SamplingBatchInfo(
+                    temperatures=torch.ones(3, 1),
+                    top_ps=torch.ones(3),
+                    top_ks=torch.zeros(3, dtype=torch.int32),
+                    min_ps=torch.zeros(3),
+                    is_all_greedy=False,
+                    is_any_greedy=False,
+                    need_top_p_sampling=False,
+                    need_top_k_sampling=False,
+                    need_min_p_sampling=False,
+                    vocab_size=4,
+                    has_custom_logit_processor=True,
+                    custom_params=params,
+                    custom_logit_processor={
+                        0: ProcessorEntry(
+                            processor=processor,
+                            rows=[0, 2],
+                            indices=torch.tensor([0, 2]),
+                        )
+                    },
+                    device="cpu",
+                )
+                logits = torch.zeros(6, 4)
+                apply_custom_logit_processor(
+                    logits, sampling_info, rows_per_request=2, row_prefixes=row_prefixes
+                )
+                self.assertEqual(logits[:, 0].tolist(), want)
 
 
 class _WriteRowId(CustomLogitProcessor):
@@ -868,6 +917,109 @@ class TestNGramProcessorBatchEdits(CustomTestCase):
         finally:
             torch.cuda.set_sync_debug_mode(previous)
         self.assertTrue(torch.equal(result.cpu(), self._expected()))
+
+
+class TestRowPrefixReadsAsOutput(CustomTestCase):
+    """At speculative verify a row's history is the committed output followed by
+    its draft prefix: each history reader must give the row what it gives a
+    request whose output holds both."""
+
+    def _check(self, processor, params, prompt, output, prefixes, vocab):
+        rows = []
+        for prefix in prefixes:
+            with self.subTest(processor=type(processor).__name__, prefix=prefix):
+                as_prefix = processor(
+                    torch.zeros(1, vocab),
+                    [
+                        {
+                            **params,
+                            "__req__": _make_req(prompt, output),
+                            ROW_PREFIX_KEY: prefix,
+                        }
+                    ],
+                )
+                as_output = processor(
+                    torch.zeros(1, vocab),
+                    [{**params, "__req__": _make_req(prompt, output + prefix)}],
+                )
+                self.assertTrue(torch.equal(as_prefix, as_output))
+                rows.append(as_output)
+        # Every prefix leads to a different edit, so the cases cover the reads.
+        self.assertEqual(
+            len(
+                {tuple(torch.isfinite(r[0]).nonzero().flatten().tolist()) for r in rows}
+            ),
+            len(prefixes),
+        )
+
+    def test_thinking_budget(self):
+        p = Qwen3ThinkingBudgetLogitProcessor
+        # Under the budget, at it without a newline, at it after one.
+        self._check(
+            p(),
+            {"thinking_budget": 4},
+            [p.THINKING_START_TOKEN_ID],
+            [100, 101, 102],
+            [[], [103], [103, p.NEW_LINE_TOKEN_ID]],
+            vocab=200000,
+        )
+
+    def test_ngram_ban(self):
+        self._check(
+            DeepseekOCRNoRepeatNGramLogitProcessor(),
+            {"ngram_size": 2, "window_size": 100},
+            [],
+            [1, 2, 3],
+            [[], [1], [1, 2]],
+            vocab=100,
+        )
+
+    def test_repeat_stop(self):
+        params = {
+            "rep_min_pattern_size": 2,
+            "rep_max_pattern_size": 2,
+            "rep_min_count": 3,
+            "eos_token_id": 1,
+        }
+        self._check(
+            DeepseekOCRNoRepeatNGramLogitProcessor(),
+            params,
+            [],
+            [5, 6, 5, 6],
+            [[], [5, 6]],
+            vocab=100,
+        )
+
+    def test_page_guard(self):
+        page, eos, img = 7, 1, 50
+        params = {"max_page_tokens": 3, "page_token_id": page, "eos_token_id": eos}
+        # One page open of two, then the page's cap, then the last page open.
+        self._check(
+            DeepseekOCRNoRepeatNGramLogitProcessor(),
+            params,
+            [page, img, page, img],
+            [page, 10],
+            [[], [11, 12], [page]],
+            vocab=100,
+        )
+
+    def test_page_guard_state_counts_committed_output_only(self):
+        page = 7
+        req = _make_req([page, 50, page, 50], [page, 10])
+        DeepseekOCRNoRepeatNGramLogitProcessor()(
+            torch.zeros(1, 100),
+            [
+                {
+                    "__req__": req,
+                    "max_page_tokens": 3,
+                    "page_token_id": page,
+                    "eos_token_id": 1,
+                    ROW_PREFIX_KEY: [page, 11],
+                }
+            ],
+        )
+        st = req.page_guard_state
+        self.assertEqual((st.seen, st.marks, st.last), (2, 1, 0))
 
 
 if __name__ == "__main__":

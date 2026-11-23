@@ -78,7 +78,10 @@ class DFlashRuntime(Protocol):
         grammar_barrier: Optional[Callable[[], Any]],
     ) -> Optional[GenerationBatchResult]:
         """The decode branch of ``forward_batch_generation``. None, decided alike on
-        every TP rank before any launch, runs SGLang's round."""
+        every TP rank before any launch, runs SGLang's round. A round that applies
+        the grammar mask or custom logit processors passes ``grammar_barrier`` to
+        ``VerifyStep.bind_target``; under overlap the barrier advances the grammar FSM
+        and returns the previous step's tokens, which req.output_ids lacks yet."""
 
 
 # ---- Binding: the worker state a runtime may read.

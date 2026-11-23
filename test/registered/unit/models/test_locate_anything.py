@@ -23,6 +23,7 @@ from sglang.srt.models.locate_anything import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.custom_logit_processor import ROW_PREFIX_KEY
 from sglang.srt.utils.device import is_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -159,6 +160,21 @@ class TestBoxGrammarLogitProcessor(CustomTestCase):
             self._params([self.BOX_START] + [self.COORD_START] * 4 + [self.BOX_END]),
         )
         self.assertTrue(torch.equal(out, original))
+
+    def test_row_prefix_reads_as_output(self):
+        """A speculative verify row's history is the committed output followed
+        by its draft prefix."""
+        proc = LocateAnythingBoxGrammarLogitProcessor()
+        output = [42, self.BOX_START]
+        for prefix in ([], [self.COORD_START], [self.NONE]):
+            with self.subTest(prefix=prefix):
+                params = self._params(output)
+                params[0][ROW_PREFIX_KEY] = prefix
+                as_prefix = proc(torch.zeros(1, self.VOCAB), params)
+                as_output = proc(
+                    torch.zeros(1, self.VOCAB), self._params(output + prefix)
+                )
+                self.assertTrue(torch.equal(as_prefix, as_output))
 
     def test_empty_param_list_is_noop(self):
         proc = LocateAnythingBoxGrammarLogitProcessor()

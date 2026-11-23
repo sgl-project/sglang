@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
+from sglang.srt.speculative.spec_utils import HostVerifyTree, traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -42,7 +42,7 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
 
     def _chain(self, verify_ids_2d):
         """Row 0 of the links chain-verify algorithms actually feed traverse_tree."""
-        links = GrammarTree.from_linear_chain(verify_ids_2d).resolve()
+        links = HostVerifyTree.from_linear_chain(verify_ids_2d).resolve()
         return tuple(t[0] for t in links)
 
     def test_branching_tree_passes_ints(self):
