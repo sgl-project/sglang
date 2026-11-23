@@ -443,6 +443,9 @@ def _try_set_kv_buffer_fp8(
         FP8_MAX=torch.finfo(k_cache.dtype).max,
         K_SCALE_IS_PTR=k_scale_arg[1],
         V_SCALE_IS_PTR=v_scale_arg[1],
+        # Specialize absent scales without inspecting graph-replay device values.
+        HAS_K_SCALE=k_scale is not None,
+        HAS_V_SCALE=v_scale is not None,
         num_warps=num_warps,
         # Keeps the slot bound check that store_cache always asserts; it also turns on
         # Triton's int32 overflow checks, and the measured timings include both.

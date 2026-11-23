@@ -216,7 +216,11 @@ class TestSetKvBufferFp8Kernel(CustomTestCase):
             # Not exact in BF16 or FP16, so the divisor rounding is exercised.
             "host": (0.1, 1.3),
             "device": (_scale(0.1), _scale(1.3)),
-            "mixed": (None, _scale(1.3)),
+            "unit_host": (1.0, 1.0),
+            "k_only_host": (0.1, None),
+            "v_only_host": (None, 1.3),
+            "k_only_device": (_scale(0.1), None),
+            "v_only_device": (None, _scale(1.3)),
         }
         for dtype in SOURCE_DTYPES:
             for row_dim, strided in ((63, True), (256, False), (1030, False)):
@@ -292,24 +296,37 @@ class TestSetKvBufferFp8Kernel(CustomTestCase):
                         )
 
     def test_graph_replay_reads_current_scales_and_locations(self):
-        """Captured writes must read live device scales, locations and source rows."""
+        """Absent K/V scales are independent; a device scale initially equal to
+        one must still be read when it changes during graph replay."""
         k = torch.randn((4, 1, 128), dtype=torch.bfloat16, device=DEVICE)
         v = torch.randn_like(k)
-        k_cache, v_cache = make_kv_cache(16, 128)
         loc = torch.tensor([1, 4, 0, 0], device=DEVICE)
-        k_scale, v_scale = _scale(0.1), _scale(1.3)
-        _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
-        for destinations, ks, vs in (([7, 0, 2, 9], 0.3, 0.7), ([0] * 4, 1.3, 0.1)):
-            loc.copy_(torch.tensor(destinations, device=DEVICE))
-            k_scale.fill_(ks)
-            v_scale.fill_(vs)
-            k.normal_()
-            v.normal_()
-            with _assert_store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
-                graph.replay()
+        for k_scale, v_scale in (
+            (None, None),
+            (None, _scale(1.0)),
+            (_scale(1.0), None),
+            (_scale(1.0), _scale(1.0)),
+        ):
+            with self.subTest(k_scale=k_scale, v_scale=v_scale):
+                k_cache, v_cache = make_kv_cache(16, 128)
+                loc.copy_(torch.tensor([1, 4, 0, 0], device=DEVICE))
+                _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    _store(k, v, k_cache, v_cache, loc, k_scale, v_scale)
+                for destinations, ks, vs in (
+                    ([7, 0, 2, 9], 0.3, 0.7),
+                    ([0] * 4, 1.3, 0.1),
+                ):
+                    loc.copy_(torch.tensor(destinations, device=DEVICE))
+                    if k_scale is not None:
+                        k_scale.fill_(ks)
+                    if v_scale is not None:
+                        v_scale.fill_(vs)
+                    k.normal_()
+                    v.normal_()
+                    with _assert_store(k, v, k_cache, v_cache, loc, k_scale, v_scale):
+                        graph.replay()
 
     def test_empty_write_preserves_cache(self):
         k = torch.empty((0, 1, 128), dtype=torch.bfloat16, device=DEVICE)

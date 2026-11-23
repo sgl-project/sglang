@@ -84,15 +84,17 @@ def _quantize_kv_fp8(
     SRC_DTYPE: tl.constexpr,
     DST_DTYPE: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    HAS_SCALE: tl.constexpr = True,
 ):
-    val = val.to(tl.float32)
-    if SCALE_IS_TENSOR:
-        # Tensor division rounds the divisor first and uses correctly rounded division.
-        val = tl.div_rn(val, scale.to(SRC_DTYPE).to(tl.float32))
-    else:
-        # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
-        val = val * tl.div_rn(1.0, scale)
-    val = val.to(SRC_DTYPE)
+    if HAS_SCALE:
+        val = val.to(tl.float32)
+        if SCALE_IS_TENSOR:
+            # Tensor division rounds the divisor first and uses correctly rounded division.
+            val = tl.div_rn(val, scale.to(SRC_DTYPE).to(tl.float32))
+        else:
+            # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
+            val = val * tl.div_rn(1.0, scale)
+        val = val.to(SRC_DTYPE)
     return _saturate_to_fp8_range(val, FP8_MAX, SRC_DTYPE).to(DST_DTYPE)
 
 
@@ -176,6 +178,8 @@ def set_kv_buffer_tiled_fp8(
     FP8_MAX: tl.constexpr,
     K_SCALE_IS_PTR: tl.constexpr = False,
     V_SCALE_IS_PTR: tl.constexpr = False,
+    HAS_K_SCALE: tl.constexpr = True,
+    HAS_V_SCALE: tl.constexpr = True,
 ):
     row = tl.program_id(0).to(tl.int64)
     loc = tl.load(loc_ptr + row).to(tl.int64)
@@ -189,9 +193,9 @@ def set_kv_buffer_tiled_fp8(
     mask_elem = elem_off < ROW_ELEMS
 
     # A device scale is read here, so a captured CUDA graph needs no host copy.
-    if K_SCALE_IS_PTR:
+    if HAS_K_SCALE and K_SCALE_IS_PTR:
         k_scale = tl.load(k_scale)
-    if V_SCALE_IS_PTR:
+    if HAS_V_SCALE and V_SCALE_IS_PTR:
         v_scale = tl.load(v_scale)
 
     k_val = _quantize_kv_fp8(
@@ -201,6 +205,7 @@ def set_kv_buffer_tiled_fp8(
         src_k_ptr.dtype.element_ty,
         dst_k_ptr.dtype.element_ty,
         FP8_MAX,
+        HAS_SCALE=HAS_K_SCALE,
     )
     v_val = _quantize_kv_fp8(
         tl.load(src_v_ptr + row * src_v_row_stride + elem_off, mask=mask_elem, other=0),
@@ -209,6 +214,7 @@ def set_kv_buffer_tiled_fp8(
         src_v_ptr.dtype.element_ty,
         dst_v_ptr.dtype.element_ty,
         FP8_MAX,
+        HAS_SCALE=HAS_V_SCALE,
     )
 
     tl.store(dst_k_ptr + loc * dst_k_row_stride + elem_off, k_val, mask=mask_elem)
