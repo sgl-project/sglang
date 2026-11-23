@@ -23,6 +23,12 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_HIT_LOGGER = logging.getLogger("mega_moe")
 
+# Require only the entry points for the selected precision.
+_PPU_MEGA_MOE_DEEP_GEMM_APIS = (
+    "get_symm_buffer_for_mega_moe",
+    "mega_moe_pre_dispatch",
+)
+
 
 # One-shot feature marker, owned by the runtime context rather than the model.
 def _mega_moe_hit_state():
@@ -242,3 +248,36 @@ def run_mega_routed_experts(
             **mega_kwargs,
         )
     return y[:num_tokens]
+
+
+def _require_ppu_mega_moe_deep_gemm_apis() -> None:
+    try:
+        import deep_gemm
+    except ImportError as exc:
+        raise ValueError(
+            "--moe-a2a-backend megamoe on PPU requires the PPU DeepGEMM build"
+        ) from exc
+
+    from sglang.srt.hardware_backend.sail.quantization.mxfp4 import mega_moe_precision
+
+    precision_apis = {
+        "mxf4xmxf4": ("fp4_fp4_mega_moe", "transform_weights_for_mega_moe"),
+        "fp8xmxfp4": ("fp8_fp4_mega_moe", "transform_weights_for_w4a8_mega_moe"),
+        "bf16xmxfp4": ("bf16_fp4_mega_moe", "transform_weights_for_w4a16_mega_moe"),
+    }[mega_moe_precision()]
+    missing = [
+        name
+        for name in (*_PPU_MEGA_MOE_DEEP_GEMM_APIS, *precision_apis)
+        if not callable(getattr(deep_gemm, name, None))
+    ]
+    if missing:
+        raise ValueError(
+            "--moe-a2a-backend megamoe on PPU requires a DeepGEMM build with the "
+            "PPU MegaMoE entry points; missing: " + ", ".join(missing)
+        )
+
+
+def validate_mega_moe(device_sm: int) -> None:
+    if device_sm < 89:
+        raise ValueError("--moe-a2a-backend megamoe on PPU requires SM89 or newer.")
+    _require_ppu_mega_moe_deep_gemm_apis()

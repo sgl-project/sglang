@@ -6,11 +6,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import contextlib
+import sys
 import unittest
 from contextlib import ExitStack
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.mega_moe_hook import check_mega_moe_compat
 from sglang.srt.arg_groups.model_override_base import ResolvedView, resolved_view
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
@@ -94,22 +96,17 @@ class TestMxfp8MoeRunnerBackend(CustomTestCase):
 
 
 class TestSailMoeA2aBackend(CustomTestCase):
-    """An emulated CUDA capability must not let SAIL pick a MegaMoE it cannot run.
-
-    The refusal lives in ``handle_sail_backends``, not in the platform-agnostic
-    ``_a2a_backend_overrides`` pass, so the cases below drive the hook the same
-    way the resolution pipeline does: run the A2A pass, then the hook.
-    """
+    """Preserve MegaMoE in the platform hook; validate SAIL SM and precision APIs."""
 
     def setUp(self):
         super().setUp()
         stack = ExitStack()
         self.addCleanup(stack.close)
-        # The hook switches both DeepGEMM toggles on and gates its MXFP4 W4A16
-        # checks off these vars; keep all four out of the process-global env.
+        # Isolate switches modified by the hook and MegaMoE precision opt-ins.
         for var in (
             envs.SGLANG_SAIL_DEEPGEMM_DENSE,
             envs.SGLANG_SAIL_DEEPGEMM_MOE,
+            envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8,
             envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16,
             envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA,
         ):
@@ -134,16 +131,50 @@ class TestSailMoeA2aBackend(CustomTestCase):
             handle_sail_backends(args)
         return args
 
-    def test_sail_rejects_megamoe_with_or_without_waterfill(self):
-        # Waterfill keeps megamoe in _a2a_backend_overrides, so only this hook
-        # can stop it reaching a communicator SAIL cannot drive.
+    def test_sail_preserves_megamoe_with_or_without_waterfill(self):
         with override_platform(is_sail=True):
             for waterfill in (False, True):
+                with self.subTest(waterfill=waterfill):
+                    args = self._run_hook("megamoe", waterfill)
+                    self.assertEqual(resolved_view(args).moe_a2a_backend, "megamoe")
+
+    def test_sail_megamoe_requires_only_selected_precision_apis(self):
+        """Require selected precision APIs without depending on unselected ones."""
+        args = SimpleNamespace(
+            moe_a2a_backend="megamoe",
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+        )
+        common = ("get_symm_buffer_for_mega_moe", "mega_moe_pre_dispatch")
+        for precision, compute, transform in (
+            ("w4a4", "fp4_fp4_mega_moe", "transform_weights_for_mega_moe"),
+            ("w4a8", "fp8_fp4_mega_moe", "transform_weights_for_w4a8_mega_moe"),
+            ("w4a16", "bf16_fp4_mega_moe", "transform_weights_for_w4a16_mega_moe"),
+        ):
+            vendor = ModuleType("deep_gemm")
+            for name in (*common, compute, transform):
+                setattr(vendor, name, lambda *a, **kw: None)
+            with (
+                self.subTest(precision=precision),
+                override_platform(is_sail=True, device_sm=89),
+                patch.dict(sys.modules, {"deep_gemm": vendor}),
+                envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.override(precision == "w4a8"),
+                envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(precision == "w4a16"),
+            ):
+                check_mega_moe_compat(args)
+                for name in (*common, compute, transform):
+                    with (
+                        self.subTest(missing=name),
+                        patch.object(vendor, name, None),
+                        self.assertRaisesRegex(ValueError, name),
+                    ):
+                        check_mega_moe_compat(args)
                 with (
-                    self.subTest(waterfill=waterfill),
-                    self.assertRaisesRegex(ValueError, "SAIL.*MegaMoE"),
+                    envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.override(True),
+                    envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(True),
+                    self.assertRaisesRegex(ValueError, "mutually exclusive"),
                 ):
-                    self._run_hook("megamoe", waterfill)
+                    check_mega_moe_compat(args)
 
     def test_sail_preserves_supported_backends_and_waterfill_resolution(self):
         cases = (

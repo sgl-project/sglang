@@ -237,10 +237,7 @@ def handle_sail_backends(server_args: Any):
         envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
 
     cfg = resolving_view(server_args)
-    if cfg.moe_a2a_backend == "megamoe":
-        raise ValueError(
-            "SAIL does not support MegaMoE; please use --moe-a2a-backend none."
-        )
+    # mega_moe_hook validates MegaMoE device and vendor API requirements.
     valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
     mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
     # The flags are not published yet, so hand the guard the values being
