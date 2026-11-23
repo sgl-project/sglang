@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
@@ -15,6 +16,17 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 VOCAB_SIZE = 16
+
+
+def _build_step(reqs, pool):
+    """The step's penalties from each request's index, as the scheduler's
+    `SamplingParamsPool` gather gives them."""
+    host = np.array(
+        [-1 if r.penalty_index is None else r.penalty_index for r in reqs],
+        dtype=np.int64,
+    )
+    indices = torch.tensor(host, dtype=torch.int32, device=pool.device)
+    return StepPenalties.build(pool, indices, host)
 
 
 class _Stop(Exception):
@@ -33,7 +45,7 @@ def _step(num_reqs):
     pool = PenaltyStatusPool(VOCAB_SIZE, "cpu")
     pool.alloc(reqs)
     pool.reset_history(reqs)
-    return StepPenalties.build(reqs, pool)
+    return _build_step(reqs, pool)
 
 
 def _sampling_info(bs):

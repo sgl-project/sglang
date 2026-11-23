@@ -17,38 +17,17 @@ from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
 )
 from sglang.srt.sampling.logit_bias import build_logit_bias
-from sglang.srt.sampling.penalties import StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.watermarking.interface import WatermarkRows
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.utils.device import async_h2d
-from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.sampling.sampler_params import SamplerParams
+    from sglang.srt.sampling.sampling_params_pool import SamplingRows
 
 
 logger = logging.getLogger(__name__)
-
-
-def _any_row_with_seed(reqs: List[Req]) -> bool:
-    """Whether some row samples with its request's own seed, when deterministic
-    mode is off (it seeds every row).
-
-    False under speculative decoding, whose draft graphs have seed buffers only in
-    deterministic mode. A greedy row never draws, so its seed does not count.
-    """
-    if not any(
-        r.sampling_params.sampling_seed is not None and r.sampling_params.top_k > 1
-        for r in reqs
-    ):
-        return False
-    if get_spec().speculative_algorithm is not None:
-        print_warning_once(
-            "sampling_seed is ignored with speculative decoding unless "
-            "--enable-deterministic-inference is set."
-        )
-        return False
-    return True
 
 
 @dataclasses.dataclass
@@ -64,7 +43,7 @@ class ProcessorEntry:
 class SamplingBatchInfo:
     vocab_size: int
 
-    # The SamplerParams fields, set by the scheduler at each launch.
+    # The SamplerParams fields, set by the scheduler at each launch (set_rows).
     temperatures: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -81,7 +60,7 @@ class SamplingBatchInfo:
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
-    # Set by the scheduler at each launch.
+    # Set by the scheduler at each launch (set_rows).
     step_penalties: Optional[StepPenalties] = None
 
     # Set by the scheduler at each launch (set_step_state).
@@ -89,9 +68,11 @@ class SamplingBatchInfo:
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
-    # Set by the scheduler at each launch (set_step_state).
+    # Set by the scheduler at each launch (set_rows).
     # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
+
+    # Set by the scheduler at each launch (set_step_state).
     # Rows of the requests that return sampling masks, and each support-mode row's
     # index among them; None when no row has one. They limit capture to those rows.
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
@@ -100,7 +81,7 @@ class SamplingBatchInfo:
     sampling_mask_top_ks: Optional[List[int]] = None
 
     # Per-row watermark policy, None unless some row is a watermark candidate;
-    # set by the scheduler at each launch.
+    # set by the scheduler at each launch (set_rows).
     watermark: Optional[WatermarkRows] = None
 
     # Device
@@ -111,14 +92,29 @@ class SamplingBatchInfo:
     # The step's grammar objects, None when no request has one (see grammar_mask.py).
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
-    def set_sampler_params(self, params: SamplerParams) -> None:
+    def set_rows(
+        self, rows: SamplingRows, penalty_status_pool: Optional[PenaltyStatusPool]
+    ) -> None:
+        """Set the step's state read from its rows of `SamplingParamsPool`: the
+        sampler params, the per-row seeds, the penalties, and the watermark rows."""
+        params = rows.sampler_params
         for name, value in zip(params._fields, params):
             setattr(self, name, value)
+        self.sampling_seed = rows.seeds
+        self.step_penalties = (
+            StepPenalties.build(
+                penalty_status_pool, rows.penalty_indices, rows.penalty_indices_host
+            )
+            if penalty_status_pool is not None
+            else None
+        )
+        self.watermark = build_watermark_rows(
+            rows.watermark_values, rows.watermark_candidates_host
+        )
 
     def set_step_state(self, reqs: List[Req]) -> None:
         """Build the stages' step state from the step's requests: logit_bias, the
-        grammars, the custom logit processors, the per-row seeds, and the
-        sampling-mask rows."""
+        grammars, the custom logit processors, and the sampling-mask rows."""
         self.logit_bias = build_logit_bias(
             reqs, vocab_size=self.vocab_size, device=self.device
         )
@@ -153,39 +149,24 @@ class SamplingBatchInfo:
             self.custom_params = None
             self.custom_logit_processor = None
 
-        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
-        seeded = enable_deterministic or _any_row_with_seed(reqs)
-        seeds = []
-        if seeded:
-            for r in reqs:
-                seed = r.sampling_params.sampling_seed
-                if seed is None:
-                    # A deterministic run defaults to 42; otherwise the row stays random.
-                    seed = 42 if enable_deterministic else r.filler_seed
-                seeds.append(seed)
         mask_rows = [i for i, r in enumerate(reqs) if r.return_sampling_mask]
         capture_rows = [
             j
             for j, i in enumerate(mask_rows)
             if reqs[i].sampling_logprobs_mode == "support"
         ]
-
-        rows = seeds + mask_rows + capture_rows
-        device_rows = None
-        if rows:
-            # One copy for the three int64 lists.
-            device_rows = async_h2d(rows, dtype=torch.int64, device=self.device)
-        elif seeded:
-            # A deterministic idle batch still seeds, with no rows.
-            device_rows = torch.empty(0, dtype=torch.int64, device=self.device)
-        num_seeds, num_masks = len(seeds), len(mask_rows)
-        self.sampling_seed = device_rows[:num_seeds] if seeded else None
-        self.sampling_mask_batch_indices = (
-            device_rows[num_seeds : num_seeds + num_masks] if mask_rows else None
-        )
-        self.sampling_support_logprobs_capture_indices = (
-            device_rows[num_seeds + num_masks :] if capture_rows else None
-        )
+        if mask_rows:
+            # One copy for both int64 lists.
+            device_rows = async_h2d(
+                mask_rows + capture_rows, dtype=torch.int64, device=self.device
+            )
+            self.sampling_mask_batch_indices = device_rows[: len(mask_rows)]
+            self.sampling_support_logprobs_capture_indices = (
+                device_rows[len(mask_rows) :] if capture_rows else None
+            )
+        else:
+            self.sampling_mask_batch_indices = None
+            self.sampling_support_logprobs_capture_indices = None
         self.sampling_mask_top_ks = (
             [r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs]
             if mask_rows

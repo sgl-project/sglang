@@ -1,12 +1,13 @@
 """Sampling-penalty state: per-token output counts and lengths plus the
-request's penalty parameters, one table row per penalized request, addressed by
+request's penalty parameters, one table entry per penalized request, addressed by
 its penalty index.
 
-- Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only queue
-  writes; the tables are written, grown, and read on the sampling stream.
+- Host calls (`alloc`, `reset_history`, `free`) only queue writes; the tables are
+  written, grown, and read on the sampling stream.
 - A request takes an index at its first extend admission; every extend admission
-  resets its history and replays `output_ids`. A retraction keeps the index;
-  `RequestRetirer` frees it at exit.
+  resets its history and replays `output_ids`, and `SamplingParamsPool` records
+  the index, which a step reads from there. A retraction keeps the index;
+  `RequestRetirer` frees it at exit, with the request's slot.
 - A step reads and commits the indices it was built with. No request is admitted
   between a step's build and its sampling, so none of them is reused before then.
 - Freeing the last live index drops the tables at once; their memory is from the
@@ -31,6 +32,7 @@ from sglang.srt.utils.device import (
     get_device_sm,
     is_cuda,
     is_npu,
+    rows_where,
 )
 
 if TYPE_CHECKING:
@@ -360,20 +362,24 @@ class StepPenalties:
     ] = dataclasses.field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
-    def build(cls, reqs: Sequence, pool: PenaltyStatusPool) -> Optional[StepPenalties]:
-        batch_indices = [i for i, r in enumerate(reqs) if r.penalty_index is not None]
-        if not batch_indices:
+    def build(
+        cls,
+        pool: PenaltyStatusPool,
+        penalty_indices: torch.Tensor,
+        penalty_indices_host: np.ndarray,
+    ) -> Optional[StepPenalties]:
+        """From each batch row's penalty index ([bs] on the device and its host
+        copy, -1 for a row without one), without a copy or a sync."""
+        penalized = penalty_indices_host[penalty_indices_host >= 0]
+        if penalized.size == 0:
             return None
-        penalty_indices = [reqs[i].penalty_index for i in batch_indices]
-        kinds = functools.reduce(operator.or_, (pool.kinds[i] for i in penalty_indices))
-        indices = async_h2d(
-            [batch_indices, penalty_indices], dtype=torch.int64, device=pool.device
-        )
+        kinds = functools.reduce(operator.or_, (pool.kinds[i] for i in penalized))
+        batch_indices = rows_where(penalty_indices >= 0, penalized.size)
         return cls(
             pool=pool,
-            batch_size=len(reqs),
-            batch_indices=indices[0],
-            penalty_indices=indices[1],
+            batch_size=penalty_indices_host.size,
+            batch_indices=batch_indices,
+            penalty_indices=penalty_indices[batch_indices].long(),
             kinds=kinds,
         )
 

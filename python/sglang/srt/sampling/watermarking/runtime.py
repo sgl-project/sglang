@@ -7,8 +7,9 @@ The only place that decides which algorithm runs: each entry point dispatches on
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.runtime_context import get_exec
@@ -51,14 +52,29 @@ def make_watermark_engine(
     )
 
 
-def build_watermark_rows(
-    reqs: list[Req], device: torch.device | str
-) -> Optional[WatermarkRows]:
+def num_watermark_fields() -> int:
+    """How many `SamplingParamsPool` fields the algorithm keeps per request; 0 when
+    watermarking is off."""
     features = get_exec().features
     if not features.enable_watermark:
+        return 0
+    return _ADAPTERS[features.watermark_algorithm].NUM_POOL_FIELDS
+
+
+def watermark_pool_values(req: Req) -> tuple[bool, Sequence[int]]:
+    """Whether the request is a candidate, and its int32 values for the pool."""
+    features = get_exec().features
+    return _ADAPTERS[features.watermark_algorithm].pool_values(req, features=features)
+
+
+def build_watermark_rows(
+    values: Optional[torch.Tensor], candidates_host: Optional[np.ndarray]
+) -> Optional[WatermarkRows]:
+    """The step's rows from its gathered pool values, or None without a candidate."""
+    if values is None or not candidates_host.any():
         return None
-    return _ADAPTERS[features.watermark_algorithm].build_rows(
-        reqs, features=features, device=device
+    return _ADAPTERS[get_exec().features.watermark_algorithm].build_rows(
+        values, candidates_host.tolist()
     )
 
 

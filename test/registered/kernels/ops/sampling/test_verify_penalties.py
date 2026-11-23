@@ -2,6 +2,7 @@ import random
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -13,6 +14,17 @@ from sglang.srt.sampling.sampling_pipeline import _adjust_before_watermark
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+
+
+def _build_step(reqs, pool):
+    """The step's penalties from each request's index, as the scheduler's
+    `SamplingParamsPool` gather gives them."""
+    host = np.array(
+        [-1 if r.penalty_index is None else r.penalty_index for r in reqs],
+        dtype=np.int64,
+    )
+    indices = torch.tensor(host, dtype=torch.int32, device=pool.device)
+    return StepPenalties.build(pool, indices, host)
 
 
 def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -110,7 +122,7 @@ def _decode_one_token_at_a_time(logits_row, req, path, device):
     pool.alloc([decoded])
     pool.reset_history([decoded])
     for token in req.output_ids + path:
-        step = StepPenalties.build([decoded], pool)
+        step = _build_step([decoded], pool)
         if step is not None:
             step.commit(torch.tensor([token], device=device))
     info = SamplingBatchInfo(
@@ -126,7 +138,7 @@ def _decode_one_token_at_a_time(logits_row, req, path, device):
         vocab_size=VOCAB_SIZE,
         device=device,
     )
-    info.step_penalties = StepPenalties.build([decoded], pool)
+    info.step_penalties = _build_step([decoded], pool)
     row = logits_row.to(device).clone()[None]
     _adjust_before_watermark(row, info, observer=None)
     return row[0]
@@ -155,7 +167,7 @@ def _setup(device, dtype, width, tree, seed, reqs=None):
     pool = PenaltyStatusPool(VOCAB_SIZE, device)
     pool.alloc(reqs)
     pool.reset_history(reqs)
-    step = StepPenalties.build(reqs, pool)
+    step = _build_step(reqs, pool)
     bs = len(reqs)
     parents = [
         _random_parents(width, rng) if tree else list(range(-1, width - 1))
@@ -253,7 +265,7 @@ def test_commit_kernel_matches_torch_fallback(token_dtype) -> None:
             torch.rand(bs, k, generator=torch.Generator().manual_seed(k)) < 0.7
         )
         for device, (pool, reqs) in pools.items():
-            step = StepPenalties.build(reqs, pool)
+            step = _build_step(reqs, pool)
             step.commit(
                 tokens.to(device)[:, ::2], accept_mask.to(device) if k > 1 else None
             )
