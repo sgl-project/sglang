@@ -221,6 +221,77 @@ sglang serve \
   --port 30000
 ```
 
+### MI325X deployment measured with the SemiAnalysis InferenceX harness
+
+FP8 checkpoint with EAGLE MTP on eight MI325X GPUs (TP8·EP1), measured with the [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) AgentX harness on one 8×MI325X node for the InferenceX recipe in [InferenceX #5190](https://github.com/SemiAnalysisAI/InferenceX/pull/5190): GPU-resident KV at concurrency 1–3, and HiCache at concurrency 4–8. With the AITER fix below applied, GSM8K accuracy is 0.946 (1,319 questions, temperature 0, mean of six runs), and needle-in-a-haystack retrieval passed 80 of 80 prompts at 32K, 128K, 256K and 450K tokens (measured on the GPU-KV command with the batch limits raised to 16; the HiCache command was measured for throughput only).
+
+Image: `lmsysorg/sglang:v0.5.23-rocm720-mi30x` (`sha256:a3a6eb293187b20012a5abc8f00423e6ab51d0169113a6e58a91da5614200170`). The commands have not been run on MI300X, whose 192 GB of HBM per GPU leaves less room for KV at the same `--mem-fraction-static`.
+
+- **DSA backends.** `--dsa-prefill-backend triton --dsa-decode-backend triton` is the ROCm default, set explicitly because the MI300X/MI325X Deploy cells select TileLang; against TileLang it raised throughput per GPU by 5–8% at concurrency 1 and 4.
+- **KV cache.** `--kv-cache-dtype bfloat16` is the gfx942 default, set explicitly because SGLang warns when DSA backends are chosen without a KV dtype.
+- **Chunked prefill.** `--chunked-prefill-size 16384` instead of the 131072 in the AMD tip and the low-latency Deploy cell: on an SGLang nightly ROCm image with the KV pool uncapped, a 131072-token chunk at roughly 400K tokens of context under concurrency-6 load ran the GPU out of memory (`HSA_STATUS_ERROR_OUT_OF_RESOURCES`, TileLang DSA kernels); 16384-token chunks also leave more HBM headroom (a single 450K-token prefill peaked at 92% HBM instead of 97%).
+- **Memory fraction.** `--mem-fraction-static 0.85`; at 0.92 the server failed its first long prefills with `hipErrorLaunchOutOfResources` (tested on an SGLang nightly ROCm image).
+- **MTP.** `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` drafts with the checkpoint's nextn layer.
+- **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency; the commands below use concurrency 2 and 4.
+- **HiCache.** `--enable-hierarchical-cache --hicache-host-memory-fraction 0.85 --hicache-io-backend direct --hicache-mem-layout page_first_direct`, with `--hicache-size` and `--hicache-ratio` unset, keeps the host pools of all ranks within 85% of the available host memory (bounded by the container's cgroup limit, after a 10 GiB reserve); on a node with about 975 GiB available to the container that is about 103 GiB per rank (host pools of 97.4 GiB). The concurrency 4–8 sweep used `--hicache-size 110` with the default `kernel` I/O backend and `page_first` layout; this form was measured at concurrency 4 only, within 0.4% of that throughput.
+- **Defaults.** The commands leave `--dsa-topk-backend sgl-kernel`, fused top-k (`SGLANG_DSA_FUSE_TOPK`), `SGLANG_OPT_USE_TOPK_V2=false` (SGLang's default for DSA models on ROCm) and the checkpoint's 1,048,576-token context length at their defaults.
+
+<Warning>
+  **AITER MoE config in this image.** The image's `aiter/configs/model_configs/a8w8_blockscale_tuned_fmoe_glm5_1.csv` selects, on gfx942, a fused-MoE kernel that returns wrong output for GLM-5.2-FP8 at TP8 when a MoE call carries 9–16 tokens. Whether a workload hits it likely depends on its batch shapes: on a repeated pass against the same server, few-shot GSM8K at 16 concurrent requests fell from about 0.95 to 0.876 (−7.5 points), for these commands and for the TileLang configuration alike; the first pass was unaffected. Until an image includes [ROCm/aiter#7750](https://github.com/ROCm/aiter/pull/7750), set `AITER_CONFIG_FMOE` to the image's default list — `aiter/configs/tuned_fmoe.csv` plus every `aiter/configs/model_configs/*tuned_fmoe*.csv`, `:`-separated — with `a8w8_blockscale_tuned_fmoe_glm5_1.csv` replaced by a copy that carries the #7750 row (setting the variable replaces aiter's merged default; the accuracy measurements here did this).
+</Warning>
+
+```bash TP8·EP1 GPU KV (concurrency 1–3)
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+sglang serve \
+  --model-path zai-org/GLM-5.2-FP8 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --kv-cache-dtype bfloat16 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 16384 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs-decode 4 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash TP8·EP1 HiCache (concurrency 4–8)
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+sglang serve \
+  --model-path zai-org/GLM-5.2-FP8 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --kv-cache-dtype bfloat16 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 16384 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-hierarchical-cache \
+  --hicache-host-memory-fraction 0.85 \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ## 1. Model Introduction
 
 **GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench. For AMD MI355X (gfx950), AMD publishes an **MXFP4** build (`amd/GLM-5.2-MXFP4`, Quark-quantized) — see the AMD GPUs configuration tip below. The exact AgentX recipes in this page are benchmarked on GLM-5.2; the general-purpose Deploy panel cells remain marked unverified when their batch shapes differ from those measured recipes.
@@ -271,14 +342,14 @@ sglang serve \
 - **PD Disaggregation (prefill/decode).** GLM-5.2 is a DSA model and runs under prefill/decode disaggregation — toggle the **PD Disagg** card in the [Playground above](#playground) (pick a Prefill/Decode role + transfer backend, then front the roles with the `sgl-router` command the card prints). The Mooncake backend **auto-detects the InfiniBand HCA**, so no device flag is needed by default; only add `--disaggregation-ib-device mlx5_0` (your NIC) if auto-detection picks the wrong device or KV transfer fails to connect. On H200 Docker, expose the IB HCAs to the container (`--privileged --ulimit memlock=-1`, or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) — without IB exposure Mooncake silently falls back to TCP.
 - **Chunked-prefill size is regime-dependent.** At long input (8K+) the default `--chunked-prefill-size 2048` is too small and leaves the balanced point prefill-bound (queueing dominates TTFT). Raising it to `--chunked-prefill-size 32768` on the balanced recipe gave roughly **+34–78% output throughput and −39–59% TTFT** on 8×H200 and 8×B200 (8K-in / 1K-out) in our testing. It is **neutral for high-throughput** (decode-bound there) — keep the default. `--max-running-requests` tracks KV capacity, not a tuning free-for-all: ~60–90 concurrent 8K+1K FP8 requests fit on a single 8-GPU node, so pin balanced near `--max-running-requests 80` and let high-throughput run wider.
 
-- **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.2-FP8`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.2`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there (or a multi-node BF16 layout once validated). Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). FP8 uses about half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). GLM-5.2 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
+- **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.2-FP8`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.2`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there (or a multi-node BF16 layout once validated). Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). The [MI325X AgentX commands](#mi325x-deployment-measured-with-the-semianalysis-inferencex-harness) use the Triton DSA backends and `--chunked-prefill-size 16384` instead, because 131072-token chunks with an uncapped KV pool exhausted HBM in long-context prefill there. FP8 uses about half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). GLM-5.2 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
 - **MI355X MXFP4 (gfx950-only).** AMD publishes a Quark-quantized **`amd/GLM-5.2-MXFP4`** build for MI355X. It needs `--trust-remote-code` (Quark's custom quant config) with `--kv-cache-dtype fp8_e4m3` and the DSA triton backends (`--dsa-prefill-backend triton --dsa-decode-backend triton`, also SGLang's ROCm default). The measured AgentX deployment uses TP8/EP1 with the Gluon target MoE backend at concurrency 1–2, TP4/EP4 with HiCache at concurrency 4–16, and TP4/EP4 with DCP4 at concurrency 16–48. The general-purpose Deploy panel cells use different batch shapes and remain marked unverified.
 
 <Note>
 **gfx950 block-FP8 accuracy: fixed as of the pinned MI355X image (`v0.5.13.post1-rocm720-mi35x-20260618`).** Earlier SGLang ROCm images miscompiled AMD aiter's `gemm_a8w8_blockscale_bpreshuffle` GEMM on gfx950 (ROCm 7.2): the error was small per layer but compounded across all 78 layers and silently corrupted output — in-context reasoning broke (GSM8K ≈ 0) while short factual prompts still looked fine. The root cause was a gfx950/ROCm-7.2 miscompile of the CK kernel (a packed illegal-type FMA that relied on an LLVM coercion pass removed in ROCm 7.2; non-deterministic wrong rows near tile boundaries). This is resolved in the pinned image and newer: GLM-5.2-FP8 on MI350X/MI355X (gfx950) was re-validated at TP4 and TP8 — **GSM8K ≈ 0.96 (0% invalid)** and **15/15 needle-in-haystack retrieval to ~118K tokens**. **MI300X / MI325X (gfx942) were never affected.** If you must run an older image, treat gfx950 FP8 output as unverified. Background: [sgl-project/sglang#28685](https://github.com/sgl-project/sglang/issues/28685) (analysis) and the upstream CK fix [ROCm/rocm-libraries#8639](https://github.com/ROCm/rocm-libraries/pull/8639) (scalar FMA + accumulator anchor; restores correctness and determinism at -O3).
 </Note>
 
-- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113`. Choose the TP8/EP1 Gluon recipe for concurrency 1–2, TP4/EP4 with HiCache for concurrency 4–16, or TP4/EP4 with DCP4 (`--dcp-size 4`) for concurrency 16–48. The DCP4 arm runs without HiCache, which SGLang rejects with DCP and EAGLE. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113`. Choose the TP8/EP1 Gluon recipe for concurrency 1–2, TP4/EP4 with HiCache for concurrency 4–16, or TP4/EP4 with DCP4 (`--dcp-size 4`) for concurrency 16–48. The DCP4 arm runs without HiCache, which SGLang rejects with DCP and EAGLE. On MI325X, three-step MTP is validated for `zai-org/GLM-5.2-FP8` with `lmsysorg/sglang:v0.5.23-rocm720-mi30x` only in the [MI325X AgentX commands](#mi325x-deployment-measured-with-the-semianalysis-inferencex-harness), with the AITER MoE config override from the warning there. MTP remains unvalidated for GLM-5.2 on MI300X, in the MI325X Deploy cells and Playground presets, and for the other MI355X checkpoint precisions.
 
 - **Ascend NPU (A3 Series) topology.** One A3 node is 8 cards x 2 dies = **16 devices**, so every A3 recipe runs `--tp-size 16` per node. **Single Node** is PD mixed on one node; the **Prefill role** / **Decode role** on the PD Disagg card are one node each, so a 1P1D pair spans two nodes and is fronted by the router command the panel emits below the recipe. Send client traffic to the router, not to either role.
 - **Ascend weights and the MTP head.** The msModelSlim W8A8 build is ~774 GB and fits one node's 16 x 64 GB; the BF16 checkpoint (~1.5 TB) needs two. Quantization covers the main model only: in the shard that holds layer 78 the tensors are BF16 and F32 with no INT8, while ordinary layers in the same shard are INT8 plus F32 scales. That is why every A3 recipe passes `--speculative-draft-model-quantization unquant` -- the nextn head is served unquantized.
