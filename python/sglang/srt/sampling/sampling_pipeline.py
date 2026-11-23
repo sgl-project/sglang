@@ -26,7 +26,7 @@ and the grammar mask.
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.sampler import Sampler
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_observer import SamplingObserver
@@ -311,8 +311,9 @@ class VerifyStep(msgspec.Struct):
     watermark: Optional[VerifyWatermark]
     watermark_full_mask: bool
     grammar_mask: Optional[GrammarMask] = None
-    # Per verify row, the draft tokens between the request's committed output
-    # and that row; set for a batch with custom logit processors.
+    # Per verify row, the tokens between req.output_ids and that row: the
+    # committed ones result processing has not appended yet, then the row's
+    # drafts; set for a batch with custom logit processors.
     row_prefixes: Optional[List[List[int]]] = None
     # The requests whose custom logit processor ran on their first row only
     # (it does not support row prefixes): each commits one token.
@@ -323,12 +324,14 @@ class VerifyStep(msgspec.Struct):
         tree: Optional[GrammarTree],
         *,
         logits_output: LogitsProcessorOutput,
-        barrier: Optional[Callable[[], None]],
+        barrier: Optional[Callable[[], Dict[Req, List[int]]]],
     ) -> None:
         """Build the grammar mask and the custom logit processors' row prefixes
         over the verify tree, which the worker builds when `needs_verify_tree`.
         Call it after the target verify launches, so the host work overlaps the
-        forward."""
+        forward. Under overlap the previous step's result is still queued;
+        `barrier` advances the grammar FSM over its tokens and returns them per
+        request, as result processing will append them to req.output_ids."""
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.
@@ -337,6 +340,7 @@ class VerifyStep(msgspec.Struct):
             verify_row_prefixes,
         )
 
+        pending = barrier() if barrier is not None else {}
         batch = self.batch
         if batch.has_grammar:
             self.grammar_mask = build_grammar_vocab_mask(
@@ -344,11 +348,13 @@ class VerifyStep(msgspec.Struct):
                 tree=tree,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
-                barrier=barrier,
             )
         info = batch.sampling_info
         if info is not None and info.has_custom_logit_processor:
-            self.row_prefixes = verify_row_prefixes(*tree.resolve())
+            self.row_prefixes = verify_row_prefixes(
+                *tree.resolve(),
+                pending_tokens=[pending.get(req, []) for req in batch.reqs],
+            )
             self.first_row_only_reqs = first_row_only_requests(info)
 
     def adjust(

@@ -162,7 +162,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         )
         verify = _verify(batch, grammar_mask)
         verify.row_prefixes = verify_row_prefixes(
-            next_child, next_sibling, verify_tokens
+            next_child, next_sibling, verify_tokens, pending_tokens=[[]] * bs
         )
         with self.assertRaises(_Stop):
             eagle_utils.eagle_sample(verify_input, verify, logits_output)

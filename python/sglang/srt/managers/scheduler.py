@@ -2354,21 +2354,31 @@ class Scheduler(
                 return True
 
         # The next batch's grammar bitmask needs this result's FSM advance, and its
-        # custom logit processors at verify need its tokens in req.output_ids.
+        # custom logit processors at verify need its tokens, when the worker's
+        # verify cannot take them from the barrier.
         return (
             last_batch.grammar_needs_sync()
             or last_batch.custom_logit_processor_needs_sync()
         )
 
-    def _advance_pending_grammar(self):
-        """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
-        -processed decode result still in the queue, so a following verify()'s
-        bitmask sees the previous batch's committed tokens. Invoked mid-worker
-        (before generate_token_bitmask) so the CPU advance overlaps the target
-        verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+    def _resolve_pending_results(self) -> Dict[Req, List[int]]:
+        """Grammar barrier (spec-v2 overlap): over the not-yet-processed results
+        still in the queue, advance the grammar FSM, so a following verify()'s
+        bitmask sees the previous batch's committed tokens, and return the tokens
+        each custom logit processor request will append to req.output_ids, for
+        the verify's row prefixes. Invoked mid-worker, after the target verify
+        launches, so the CPU work overlaps that forward. Idempotent; empty when
+        the queue is.
         """
+        pending: Dict[Req, List[int]] = {}
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+            tokens = self.batch_result_processor.pending_output_tokens(
+                prev_result, prev_batch
+            )
+            for req, req_tokens in tokens.items():
+                pending.setdefault(req, []).extend(req_tokens)
+        return pending
 
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
@@ -5540,13 +5550,13 @@ class Scheduler(
                             fwd_kwargs["on_publish"] = partial(
                                 self.future_map.publish, future_indices
                             )
-                            # Grammar-overlap-capable workers advance the grammar FSM
-                            # inside verify() before building the bitmask; hand them the
-                            # barrier that resolves the previous batch's committed
-                            # tokens (overlapping the target forward).
+                            # Grammar-overlap-capable workers call the barrier inside
+                            # verify(), after the target forward launches, for the
+                            # previous batch's committed tokens: the grammar bitmask
+                            # and the custom logit processors' row prefixes read them.
                             if batch.spec_algorithm.supports_grammar_overlap():
                                 fwd_kwargs["grammar_barrier"] = (
-                                    self._advance_pending_grammar
+                                    self._resolve_pending_results
                                 )
 
                         if input_ids_from_graph:
