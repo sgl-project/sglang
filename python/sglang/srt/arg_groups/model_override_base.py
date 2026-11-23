@@ -301,13 +301,67 @@ def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
     return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
 
 
+# Head dims (qk == vo) that trtllm-gen ships paged-KV kernels for on SM100/SM103,
+# in both phases. Context also has 80; decode does not. flashinfer-ai/flashinfer#9900.
+_TRTLLM_GEN_MHA_HEAD_DIMS = (64, 128, 256, 512)
+
+
+def _attn_head_dim_pairs(model_config) -> tuple:
+    return (
+        (model_config.head_dim, model_config.v_head_dim),
+        (model_config.swa_head_dim, model_config.swa_v_head_dim),
+    )
+
+
+def trtllm_gen_mha_serves_head_dims(model_config) -> bool:
+    """Whether trtllm-gen has SM100 paged MHA kernels for the model's head dims.
+
+    A missing kernel only surfaces at CUDA-graph capture or the first request
+    ("Missing TRTLLM-GEN kernel"), and FlashInfer exposes no query for it.
+    """
+    return all(
+        qk == vo and qk in _TRTLLM_GEN_MHA_HEAD_DIMS
+        for qk, vo in _attn_head_dim_pairs(model_config)
+    )
+
+
+def fa4_sm100_serves_head_dims(model_config) -> bool:
+    """Mirrors the SM100 rule in flash_attn/cute/interface.py:_validate_head_dims
+    for 16-bit K/V: 8..128 in steps of 8, or the (192, 128) and (256, 256) kernels.
+    """
+    return all(
+        (8 <= qk <= 128 and 8 <= vo <= 128 and qk % 8 == 0 and vo % 8 == 0)
+        or (qk, vo) in ((192, 128), (256, 256))
+        for qk, vo in _attn_head_dim_pairs(model_config)
+    )
+
+
+def _sm100_mha_backend(model_config) -> str:
+    # trtllm_mha requires equal K/V row widths; fa4 carries v_head_dim through.
+    if model_config.has_asymmetric_kv:
+        return "fa4"
+    if trtllm_gen_mha_serves_head_dims(model_config):
+        return "trtllm_mha"
+    backend = "fa4" if fa4_sm100_serves_head_dims(model_config) else "triton"
+    logger.info(
+        "trtllm-gen has no SM100 MHA kernels for head_dim=%s (v_head_dim=%s); "
+        "using %s.",
+        model_config.head_dim,
+        model_config.v_head_dim,
+        backend,
+    )
+    return backend
+
+
 def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
     """
     Auto select the fastest attention backend.
 
     1. Models with MHA Architecture (e.g: Llama, QWen)
         1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-        1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+        1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1,
+           when trtllm-gen ships kernels for the model's head dims. Otherwise use fa4 if it
+           supports them (and for asymmetric K/V), else triton.
            Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
         1.3 In other cases, we will use flashinfer if available, otherwise use triton.
     2. Models with MLA Architecture and using FA3
@@ -345,11 +399,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
                 or _forces_eagle_topk_one(cfg.speculative_algorithm)
             )
         ):
-            # trtllm_mha requires equal K/V row widths; fa4 carries
-            # v_head_dim through.
-            if model_config.has_asymmetric_kv:
-                return "fa4"
-            return "trtllm_mha"
+            return _sm100_mha_backend(model_config)
         elif get_platform().is_hip:
             return "aiter"
         elif is_mps():
