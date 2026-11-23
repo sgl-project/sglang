@@ -44,7 +44,7 @@ aggregate within the bounded skew.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
@@ -362,6 +362,17 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             else:
                 self.class_free_pages[r] = torch.cat((freed, self.class_free_pages[r]))
 
+        if self.debug_mode:
+            self.debug_check_classes()
+
+    def free_classed(self, pages_by_class: Sequence[torch.Tensor]) -> None:
+        """`free` of whole pages already split by owner class, each class
+        distinct and ascending: the lists end up as `free` leaves them."""
+        assert self.free_group is None and len(pages_by_class) == self.shard_size
+        lists = self.class_release_pages if self.need_sort else self.class_free_pages
+        for r, freed in enumerate(pages_by_class):
+            if freed.numel():
+                lists[r] = torch.cat((freed, lists[r]))
         if self.debug_mode:
             self.debug_check_classes()
 
