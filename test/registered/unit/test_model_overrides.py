@@ -22,6 +22,7 @@ from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_override_base import register_model_override
+from sglang.srt.arg_groups.model_overrides import beam as beam_module
 from sglang.srt.arg_groups.model_overrides import gemma4 as gemma4_module
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
@@ -4856,6 +4857,47 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestBeamMoeRunnerDefaults(CustomTestCase):
+    @staticmethod
+    def _overrides(*, moe_runner_backend="auto", moe_a2a_backend="none", **platform):
+        args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            quantization=None,
+            moe_runner_backend=moe_runner_backend,
+            moe_a2a_backend=moe_a2a_backend,
+        )
+        hf_config = SimpleNamespace(
+            quantization_config={"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        )
+        facts = {"is_sm90": False, "is_sm100": False, "is_sm120": False}
+        facts.update(platform)
+        with override_platform(**facts):
+            return beam_module._beam_overrides(args, hf_config)
+
+    def test_nvfp4_runner_follows_the_architecture(self):
+        for platform, runner in (
+            ({"is_sm100": True}, "flashinfer_trtllm"),
+            ({"is_sm120": True}, "flashinfer_cutlass"),
+        ):
+            with self.subTest(platform=platform):
+                overrides = self._overrides(**platform)
+                self.assertEqual(overrides["moe_runner_backend"], runner)
+                self.assertEqual(overrides["attention_backend"], "trtllm_mha")
+
+    def test_nvfp4_runner_is_left_alone_elsewhere_or_when_explicit(self):
+        self.assertNotIn("moe_runner_backend", self._overrides(is_sm90=True))
+        self.assertNotIn(
+            "moe_runner_backend",
+            self._overrides(is_sm120=True, moe_runner_backend="triton"),
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            self._overrides(is_sm100=True, moe_a2a_backend="flashinfer_megamoe"),
+        )
 
 
 class TestLfm3SpeculativeDecoding(CustomTestCase):
