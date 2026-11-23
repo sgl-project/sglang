@@ -35,6 +35,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
     request_allows_lossless,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+    host_copies_would_not_fit,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     write_dense_weight,
 )
@@ -1126,16 +1130,41 @@ class LinearWithLoRA(BaseLayerWithLoRA):
         return self._add_lora_output_offset(out)
 
 
+def _snapshot_pin_budget() -> HostPinBudget | None:
+    """The worker's pinned-host allowance, or None when --pin-cpu-memory is off
+    or no worker owns a budget yet."""
+    from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+        peek_global_component_residency_manager,
+    )
+
+    manager = peek_global_component_residency_manager()
+    if manager is None or not manager.server_args.pin_cpu_memory:
+        return None
+    return manager.host_pin_budget
+
+
 def _host_snapshot(weight: torch.Tensor) -> torch.Tensor:
-    """Copy a device weight to host memory, pinned when possible so restoring
-    it on unmerge is a fast host-to-device copy."""
+    """Copy a device weight to host memory. The copy is pinned, so restoring it
+    on unmerge is a fast host-to-device copy, only while the worker's pin budget
+    covers it; otherwise it stays pageable."""
     if weight.device.type == "cuda" and not isinstance(weight, DTensor):
-        try:
-            host = torch.empty_like(weight, device="cpu", pin_memory=True)
-            host.copy_(weight)
-            return host
-        except RuntimeError:
-            pass
+        budget = _snapshot_pin_budget()
+        size = weight.numel() * weight.element_size()
+        if (
+            budget is not None
+            and size <= budget.spendable_bytes
+            and not host_copies_would_not_fit(size)
+            and budget.request(component_name="lora_snapshot", weight_bytes=size)
+        ):
+            try:
+                host = torch.empty_like(weight, device="cpu", pin_memory=True)
+            except RuntimeError:
+                budget.release(size)
+            else:
+                # the allowance returns when the snapshot's storage is freed
+                budget.track_storage(host.untyped_storage())
+                host.copy_(weight)
+                return host
     return weight.to("cpu").clone()
 
 
