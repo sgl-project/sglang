@@ -784,7 +784,7 @@ def run_eagle_verify(
     bs = len(batch.seq_lens)
 
     attn_verify_mask = target_worker.model_runner.attn_backend.verify_mask
-    verify = target_worker.model_runner.sampling_pipeline.bind_verify(
+    verify = target_worker.model_runner.sampling_pipeline.plan_verify(
         batch,
         watermark_full_mask=(
             attn_verify_mask is None or attn_verify_mask.mode == TreeMaskMode.FULL_MASK

@@ -8,7 +8,7 @@ Two entries run it:
 
 - decode: `SamplingPipeline.sample`, which binds, applies, samples, and commits
   in one call;
-- verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
+- verify: `SamplingPipeline.plan_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
   launch the verify worker calls `bind_target`, the stages (`VerifyStep.adjust`,
   inside `eagle_sample` for a tree), its accept core, and `commit`.
@@ -141,7 +141,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             sampling_info.step_penalties.commit(next_token_ids)
         return next_token_ids
 
-    def bind_verify(
+    def plan_verify(
         self, batch: ScheduleBatch, *, watermark_full_mask: bool
     ) -> VerifyStep:
         """Bind a target verify's sampling state: its route and its watermark.
@@ -302,7 +302,7 @@ class VerifyRoute(msgspec.Struct, frozen=True):
 
 
 class VerifyStep(msgspec.Struct):
-    """One target verify's sampling state, from `SamplingPipeline.bind_verify`:
+    """One target verify's sampling state, from `SamplingPipeline.plan_verify`:
     the route its fast paths read, the bound watermark, and what the stages read
     from the draft tree, bound after the target forward launches."""
 
