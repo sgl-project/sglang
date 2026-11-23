@@ -134,10 +134,17 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
+    fixed_tile: bool = False,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    # The shrunken tile for short calls changes output bytes with the call's total
+    # length, i.e. with the batch; fixed_tile keeps every call on the chunk tile.
+    BT = (
+        chunk_size
+        if fixed_tile
+        else min(chunk_size, max(16, triton.next_power_of_2(T)))
+    )
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )

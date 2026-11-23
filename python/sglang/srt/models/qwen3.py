@@ -189,12 +189,10 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(
             self.head_dim,
             eps=rms_norm_eps,
-            true_on_policy_weight_dtype=torch.float32,
         )
         self.k_norm = RMSNorm(
             self.head_dim,
             eps=rms_norm_eps,
-            true_on_policy_weight_dtype=torch.float32,
         )
 
         self.qkv_proj = QKVParallelLinear(
@@ -424,16 +422,10 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            true_on_policy_weight_dtype=torch.float32,
-            true_on_policy_override_orig_dtype=torch.float32,
-            true_on_policy_fp32_residual=True,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            true_on_policy_weight_dtype=torch.float32,
-            true_on_policy_override_orig_dtype=torch.float32,
-            true_on_policy_fp32_residual=True,
         )
 
         attn, ffn = self.stage_facts(config, layer_id)

@@ -1,6 +1,11 @@
 import unittest
+from types import SimpleNamespace
+
+import torch
+from torch import nn
 
 from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -94,6 +99,73 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
         )
 
         self.assertFalse(ignored)
+
+
+class _RowRecordingNorm(nn.Module):
+    """Stands in for GemmaRMSNorm, whose CUDA kernel rejects a zero-row launch."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+
+    def forward(self, x):
+        if x.shape[0] == 0:
+            raise RuntimeError("CUDA launch failed: cudaErrorInvalidValue")
+        self.rows.append(x.shape[0])
+        return x
+
+
+class _EmbedThenIdentity(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, hidden_size)
+
+    def forward(self, input_ids, positions, forward_batch, hidden_states):
+        return hidden_states
+
+
+class TestQwen3_5MTPForwardRows(CustomTestCase):
+    _HIDDEN = 4
+
+    def _forward(self, num_rows):
+        mtp = SimpleNamespace(
+            quant_config=None,
+            model=_EmbedThenIdentity(self._HIDDEN),
+            pre_fc_norm_embedding=_RowRecordingNorm(),
+            pre_fc_norm_hidden=_RowRecordingNorm(),
+            fc=nn.Linear(2 * self._HIDDEN, self._HIDDEN, bias=False),
+            lm_head=None,
+            logits_processor=lambda input_ids, hidden_states, lm_head, fb: (
+                hidden_states
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            mm_input_embeds=None,
+            contains_mm_inputs=lambda: False,
+            spec_info=SimpleNamespace(
+                hidden_states=torch.zeros(num_rows, self._HIDDEN)
+            ),
+        )
+        out = Qwen3_5ForCausalLMMTP.forward(
+            mtp,
+            input_ids=torch.zeros(num_rows, dtype=torch.long),
+            positions=torch.zeros(num_rows, dtype=torch.long),
+            forward_batch=forward_batch,
+        )
+        return out, mtp
+
+    def test_zero_row_extend_skips_the_pre_fc_norms(self):
+        """An idle attention-DP rank in a prefill round reaches the draft as a
+        zero-row EXTEND (A2A MoE keeps local token counts); its forward must not
+        launch the norms, while a rank with rows still normalizes them."""
+        out, mtp = self._forward(num_rows=0)
+        self.assertEqual(tuple(out.shape), (0, self._HIDDEN))
+        self.assertEqual(mtp.pre_fc_norm_embedding.rows, [])
+
+        _, mtp = self._forward(num_rows=3)
+        self.assertEqual(mtp.pre_fc_norm_embedding.rows, [3])
+        self.assertEqual(mtp.pre_fc_norm_hidden.rows, [3])
 
 
 if __name__ == "__main__":

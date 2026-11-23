@@ -385,7 +385,6 @@ class Qwen2Model(nn.Module):
                 quant_config=quant_config,
                 use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
-                params_dtype=(torch.float32 if is_true_on_policy_enabled() else None),
             )
         else:
             self.embed_tokens = PPMissingLayer()

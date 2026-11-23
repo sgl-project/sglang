@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla import kda_top
 from sglang.kernels.ops.attention.fla.chunk_intra_token_parallel import (
     chunk_kda_fwd_intra_token_parallel,
 )
@@ -35,11 +36,13 @@ else:
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
+    configs=kda_top.intra_configs(
+        [
+            triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
+            for BK in [32, 64]
+            for num_warps in [1, 2, 4]
+        ]
+    ),
     key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
     **autotune_cache_kwargs,
 )

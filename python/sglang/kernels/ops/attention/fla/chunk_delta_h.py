@@ -26,6 +26,19 @@ GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
+def _top_chunked_fma_close() -> bool:
+    """TOP chunked GDN closes a chunk's state as one explicit FMA, h = fma(h, exp(g_last), (k^T v)^T), the expression
+    the decode row engine evaluates (chunk_rows._out_kernel). Written as `h *= exp(g_last); h += (k^T v)^T`, the
+    rounding is the compiler's choice: one FMA on SM90, not on SM10x, where the decay product is rounded before the
+    tcgen05 accumulate (1-ulp FP32 state differences, test_gdn_chunked_rows)."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_TOP_GDN_MODE.get() == "chunked"
+
+
+TOP_CHUNKED_FMA_CLOSE = _top_chunked_fma_close()
+
+
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into
     # initial_state in-place; with multiple configs, triton's autotune benchmark
@@ -82,6 +95,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRACK_STATE: tl.constexpr,
+    FMA_CLOSE: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -249,13 +263,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_g = tl.load(p_g, boundary_check=(0,))
             b_v = b_v * safe_exp(b_g_last - b_g)[:, None]
             b_g_last = exp(b_g_last)
-            b_h1 = b_h1 * b_g_last
-            if K > 64:
-                b_h2 = b_h2 * b_g_last
-            if K > 128:
-                b_h3 = b_h3 * b_g_last
-            if K > 192:
-                b_h4 = b_h4 * b_g_last
+            if not FMA_CLOSE:
+                b_h1 = b_h1 * b_g_last
+                if K > 64:
+                    b_h2 = b_h2 * b_g_last
+                if K > 128:
+                    b_h3 = b_h3 * b_g_last
+                if K > 192:
+                    b_h4 = b_h4 * b_g_last
 
         if USE_GK:
             o_k1 = tl.arange(0, 64)
@@ -307,25 +322,37 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.trans(tl.dot(b_k, b_v))
+        if FMA_CLOSE:
+            b_h1 = tl.fma(b_h1, b_g_last, tl.trans(tl.dot(b_k, b_v)))
+        else:
+            b_h1 += tl.trans(tl.dot(b_k, b_v))
         if K > 64:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h2 += tl.trans(tl.dot(b_k, b_v))
+            if FMA_CLOSE:
+                b_h2 = tl.fma(b_h2, b_g_last, tl.trans(tl.dot(b_k, b_v)))
+            else:
+                b_h2 += tl.trans(tl.dot(b_k, b_v))
         if K > 128:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h3 += tl.trans(tl.dot(b_k, b_v))
+            if FMA_CLOSE:
+                b_h3 = tl.fma(b_h3, b_g_last, tl.trans(tl.dot(b_k, b_v)))
+            else:
+                b_h3 += tl.trans(tl.dot(b_k, b_v))
         if K > 192:
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h4 += tl.trans(tl.dot(b_k, b_v))
+            if FMA_CLOSE:
+                b_h4 = tl.fma(b_h4, b_g_last, tl.trans(tl.dot(b_k, b_v)))
+            else:
+                b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
     if INPLACE_UPDATE and valid_state:
@@ -433,6 +460,7 @@ def chunk_gated_delta_rule_fwd_h(
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
+        FMA_CLOSE=TOP_CHUNKED_FMA_CLOSE and g is not None and gk is None,
         TRACK_STATE=track_state is not None,
     )
     return h, v_new

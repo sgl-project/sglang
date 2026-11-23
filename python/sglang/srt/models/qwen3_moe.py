@@ -23,7 +23,6 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -74,6 +73,7 @@ from sglang.srt.true_on_policy import (
     is_true_on_policy_enabled,
     should_disable_fused_qk_norm_mrope,
 )
+from sglang.srt.true_on_policy.qwen_moe import TopQwenMoe
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -249,6 +249,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
+        self._top = TopQwenMoe.build(
+            config=config, quant_config=quant_config, ep_size=self.ep_size
+        )
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -320,6 +323,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
 
+        # The stock MoE runner picks its Triton tile config by token count (try_get_optimal_moe_config);
+        # TopQwenMoe runs the DeepGEMM expert program at every row count.
+        if self._top is not None:
+            top_output = self._top.forward(
+                hidden_states, gate_weight=self.gate.weight, experts=self.experts
+            )
+            if top_output is not None:
+                return top_output
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)
         if (
@@ -351,12 +362,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if is_true_on_policy_enabled():
-                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-                routing_weights, selected_experts = torch.topk(
-                    routing_weights, self.top_k, dim=-1
+                from sglang.srt.true_on_policy.qwen_route import route_qwen_logits
+
+                routing_weights, selected_experts = route_qwen_logits(
+                    router_logits, self.topk.topk_config.top_k, hidden_states.dtype
                 )
-                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-                routing_weights = routing_weights.to(hidden_states.dtype)
                 topk_output = StandardTopKOutput(
                     topk_weights=routing_weights,
                     topk_ids=selected_experts,
@@ -372,7 +382,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        if hidden_states.shape[0] > 0:
+        if self._top is not None and hidden_states.shape[0] > 0:
+            topk_output = self._top.deepep_topk(
+                hidden_states, gate_weight=self.gate.weight
+            )
+        elif hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(
@@ -494,6 +508,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
+def _top_fused_rope(rope) -> bool:
+    """Under TOP only a RoPE that dispatches to the stock fused kernel takes the KV store; the store
+    kernel shares its per-head rotation and writes the rotated K and the raw V as set_kv_buffer does."""
+    return rope._forward_method == rope.forward_cuda
+
+
 class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
@@ -570,9 +590,10 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        ) and not is_true_on_policy_enabled()
+        # Under TOP the KV store fuses only into the stock fused RoPE (_top_fused_rope); forward_native takes none.
+        self.compatible_with_fused_kv_buffer = not isinstance(
+            self.rotary_emb, MRotaryEmbedding
+        ) and (not is_true_on_policy_enabled() or _top_fused_rope(self.rotary_emb))
         self.compatible_with_fused_qk_norm_rope = not isinstance(
             self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
@@ -592,6 +613,7 @@ class Qwen3MoeAttention(nn.Module):
                     )
                 )
             )
+            # The trainer runs the Q/K norm (true_on_policy.qk_norm) and RoPE as separate kernels.
             and not should_disable_fused_qk_norm_mrope()
         )
         self.use_fused_qk_norm_rope_cpu = (

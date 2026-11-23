@@ -1547,6 +1547,40 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
+        # A linear backend whose verify keeps no per-draft states commits on its own (TOP chunked GDN).
+        commit_after_verify = getattr(
+            self.linear_attn_backend, "commit_after_verify", None
+        )
+        if commit_after_verify is not None:
+            assert src_indices_raw is None and req_pool_indices is not None
+            commit_after_verify(
+                state_indices=state_indices_tensor,
+                req_pool_indices=req_pool_indices[:request_number],
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                mamba_caches=mamba_caches,
+            )
+            # The PLE side states (Qwen4-Exp) keep their per-draft scratch under TOP too; no-op without them.
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            # QSA's pending key ring takes the accepted rows only (qsa_indexer.top_commit_verify).
+            from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+            for module in model.modules():
+                if isinstance(module, QSAIndexer):
+                    module.top_commit_verify(
+                        self.full_attn_backend.token_to_kv_pool,
+                        req_pool_indices[:request_number],
+                        last_correct_step_indices,
+                    )
+            return
+
         # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
         # during verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.

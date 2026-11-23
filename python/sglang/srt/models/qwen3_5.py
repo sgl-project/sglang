@@ -137,6 +137,7 @@ from sglang.srt.runtime_context import (
     get_stream,
     linear_attn_parallel_group,
 )
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 
 # Utils
 from sglang.srt.utils import (
@@ -727,8 +728,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return
         fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
+        self._fused_in_proj_ba_width = ba.weight.shape[0]
+        if is_true_on_policy_enabled():
+            # Zero rows to the BI GEMM's 16-wide N granularity, so it never pads per call.
+            fused = torch.nn.functional.pad(fused, (0, 0, 0, -fused.shape[0] % 16))
         qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
-        ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
+        ba.weight.data = fused[
+            self._fused_in_proj_qkvz_width : self._fused_in_proj_qkvz_width
+            + self._fused_in_proj_ba_width
+        ]
         self._fused_in_proj_weight = fused
 
     def _finalize_fused_fp8_in_proj(self) -> bool:
@@ -868,9 +876,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             fused_out = bf16_gemm_dispatch(
                 hidden_states, self._fused_in_proj_weight, None
             )
+            split = self._fused_in_proj_qkvz_width
             return (
-                fused_out[:, : self._fused_in_proj_qkvz_width],
-                fused_out[:, self._fused_in_proj_qkvz_width :],
+                fused_out[:, :split],
+                fused_out[:, split : split + self._fused_in_proj_ba_width],
             )
 
         if (
@@ -1009,6 +1018,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
             packed_verify = getattr(backend, "supports_packed_verify", False)
+        # TOP decode runs it too: its Conv1D update has the products, order, SiLU and
+        # state shift of split + causal_conv1d_update, so the decode bytes are those.
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
             and (forward_batch.forward_mode.is_decode() or packed_verify)
@@ -1326,6 +1337,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
+        self.top_enabled = is_true_on_policy_enabled()
+        if (
+            self.top_enabled
+            and _is_cuda
+            and self.attn_output_gate
+            and self.rotary_emb.cos_sin_cache.dtype != torch.float32
+        ):
+            # The trainer's forward calls the fused Q/K norm + RoPE + gate kernel on its FP32 CPU-derived table.
+            raise ValueError(
+                "[top] the fused Q/K norm + RoPE + gate needs the FP32 cos/sin table"
+            )
 
         # Q stays sharded across attention TP ranks; K/V are replicated within
         # each DCP group.
@@ -1429,10 +1451,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply Q/K normalization with optional alt_stream overlap."""
+        # TOP norms are not safe to run concurrently on two streams; graph capture
+        # must keep eager's sequential order (overlap changes k's bits).
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
             and _qknorm_use_alt_stream
+            and not self.top_enabled
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)

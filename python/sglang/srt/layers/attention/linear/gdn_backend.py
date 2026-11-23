@@ -1140,7 +1140,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # same flag that makes `use_replayssm_spec` true above), so
                 # this branch is unreachable with a None buffer by
                 # construction -- keep it loud rather than silently frozen.
-                assert intermediate_state_cache is not None, (
+                assert intermediate_state_cache is not None or not getattr(
+                    self.kernel_dispatcher.verify_kernel,
+                    "verify_needs_intermediate_states",
+                    True,
+                ), (
                     "recurrent target_verify fallback requires intermediate_ssm, "
                     "which is not allocated under --enable-linear-replayssm-spec"
                 )

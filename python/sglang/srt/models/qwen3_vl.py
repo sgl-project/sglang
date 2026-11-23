@@ -89,6 +89,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import vision as top_vision
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -177,6 +178,10 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
+        if is_true_on_policy_enabled():
+            fc1, fc2 = self.linear_fc1, self.linear_fc2
+            x_fc1 = top_vision.linear(x, fc1.weight, fc1.bias)
+            return top_vision.linear(self.act(x_fc1), fc2.weight, fc2.bias)
         x_fc1, _ = self.linear_fc1(x)
         mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
@@ -202,6 +207,14 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
+        if is_true_on_policy_enabled():
+            # One patch is one kernel window, so the convolution is a projection of the flattened patch.
+            weight = self.proj.weight
+            return top_vision.linear(
+                hidden_states.to(dtype=target_dtype).reshape(-1, weight[0].numel()),
+                weight.reshape(self.embed_dim, -1),
+                self.proj.bias,
+            )
         hidden_states = hidden_states.view(
             -1,
             self.in_channels,
@@ -358,6 +371,10 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
 
+        if not self.disable_merger_proj and is_true_on_policy_enabled():
+            fc1, fc2 = self.linear_fc1, self.linear_fc2
+            x = top_vision.linear(x, fc1.weight, fc1.bias)
+            return top_vision.linear(self.act_fn(x), fc2.weight, fc2.bias)
         if not self.disable_merger_proj:
             x_parallel, _ = self.linear_fc1(x)
             x_parallel = self.act_fn(x_parallel)
@@ -488,6 +505,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.graph_runners = graph_runners_dict[self.device.type](self)
+        # Set once the first TOP encode has passed true_on_policy.vision's serving refusals.
+        self.top_admitted = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -669,6 +688,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return (
             envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
             and num_images >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
+            # TOP pins the per-image loop: an image's rows must not depend on how many images share its batch.
+            and not is_true_on_policy_enabled()
         )
 
     def fast_pos_embed_interpolate_vectorized(self, grid_thw):
@@ -885,7 +906,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        if is_true_on_policy_enabled() and not self.top_admitted:
+            top_vision.refuse_unqualified_serving(
+                deepstack=bool(self.deepstack_visual_indexes)
+            )
+            self.top_admitted = True
+        # TOP runs one tower program: the graph path interpolates positions with other arithmetic, so it is not taken.
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and not is_true_on_policy_enabled():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)

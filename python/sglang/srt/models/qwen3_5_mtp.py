@@ -227,7 +227,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = forward_batch.spec_info.hidden_states
 
-            if not forward_batch.forward_mode.is_idle():
+            # An idle attention-DP rank can arrive as a zero-row EXTEND (A2A MoE keeps local
+            # token counts); the norm kernel rejects an empty launch, so skip it as the target does.
+            if not forward_batch.forward_mode.is_idle() and input_embeds.shape[0] > 0:
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             # Captured prefill gives padded embeddings but real-height target states;
