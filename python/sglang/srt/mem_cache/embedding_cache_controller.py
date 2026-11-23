@@ -19,6 +19,12 @@ except ImportError:
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.device import (
+    create_device_event,
+    create_device_stream,
+    current_device_stream,
+    device_stream_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -789,8 +795,8 @@ class EmbeddingCacheController:
         try:
             device = dst_tensor.device
             copy_stream = self._get_copy_stream(device)
-            event = torch.cuda.Event()
-            with torch.cuda.stream(copy_stream):
+            event = create_device_event(device)
+            with device_stream_context(copy_stream):
                 self._copy_embedding_page_runs(
                     src=pool.tensor,
                     dst=dst_tensor,
@@ -855,11 +861,11 @@ class EmbeddingCacheController:
                 if entry is not None:
                     self._unpin_read(entry)
 
-    def _get_copy_stream(self, device: torch.device) -> "torch.cuda.Stream":
+    def _get_copy_stream(self, device: torch.device):
         key = str(device)
         stream = self._copy_streams.get(key)
         if stream is None:
-            stream = torch.cuda.Stream(device=device)
+            stream = create_device_stream(device)
             self._copy_streams[key] = stream
         return stream
 
@@ -872,15 +878,15 @@ class EmbeddingCacheController:
         src_is_pool: bool,
         dst_token_offset: int = 0,
     ) -> None:
-        """Copy one embedding entry between its host pool and a CUDA tensor."""
+        """Copy one embedding entry between its host pool and a device tensor."""
         src_starts, dst_starts, lengths = _build_host_device_transfer_plan(
             entry, pool, src_is_pool, dst_token_offset
         )
         if not lengths:
             return
 
-        has_cuda_side = src.device.type == "cuda" or dst.device.type == "cuda"
-        if has_cuda_side and transfer_embedding_ranges_direct is not None:
+        has_device_side = src.device.type != "cpu" or dst.device.type != "cpu"
+        if has_device_side and transfer_embedding_ranges_direct is not None:
             transfer_embedding_ranges_direct(
                 src,
                 dst,
@@ -919,10 +925,10 @@ class EmbeddingCacheController:
         Returns: pending D2H handles; pass to wait_store_to_pool().
         """
         for tensor in tensors:
-            if tensor.device.type != "cuda":
+            if tensor.device.type == "cpu":
                 raise ValueError(
-                    f"store_to_pool_async expects CUDA tensors, "
-                    f"got device={tensor.device}"
+                    f"store_to_pool_async expects device tensors to stage to the "
+                    f"host pool, got device={tensor.device}"
                 )
 
         pool = self._get_pool(modality)
@@ -1010,7 +1016,7 @@ class EmbeddingCacheController:
     def _copy_tensor_to_pool(
         self, tensor: torch.Tensor, entry: EmbeddingCacheEntry, pool: EmbeddingPool
     ) -> AsyncCopyHandle:
-        """Async D2H copy of a CUDA tensor into pool pages."""
+        """Async D2H copy of a device tensor into pool pages."""
         src = tensor.detach()
         if src.ndim != 2:
             src = src.reshape(-1, src.shape[-1])
@@ -1018,12 +1024,12 @@ class EmbeddingCacheController:
             src = src.contiguous()
 
         device = src.device
-        producer_stream = torch.cuda.current_stream(device)
+        producer_stream = current_device_stream(device)
         copy_stream = self._get_copy_stream(device)
         copy_stream.wait_stream(producer_stream)
         src.record_stream(copy_stream)
-        event = torch.cuda.Event()
-        with torch.cuda.stream(copy_stream):
+        event = create_device_event(device)
+        with device_stream_context(copy_stream):
             self._copy_embedding_page_runs(
                 src=src,
                 dst=pool.tensor,
