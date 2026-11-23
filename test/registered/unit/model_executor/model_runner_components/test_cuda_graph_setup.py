@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -263,6 +264,7 @@ def test_vpp_startup_keeps_workspaces_without_whole_model_warmup(monkeypatch):
     prepared = []
     mr = SimpleNamespace(
         device="cpu",
+        dtype=torch.bfloat16,
         is_draft_worker=False,
         canary_manager=None,
         model=SimpleNamespace(
@@ -281,12 +283,14 @@ def test_vpp_startup_keeps_workspaces_without_whole_model_warmup(monkeypatch):
     )
     disabled = SimpleNamespace(backend="disabled")
     execution = SimpleNamespace(
+        moe=SimpleNamespace(is_ep_scale_joiner=False),
         graph=SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=disabled, decode=disabled)
-        )
+        ),
     )
     monkeypatch.setattr(cuda_graph_setup, "get_exec", lambda: execution)
     monkeypatch.setattr(graph_shared_output, "get_exec", lambda: execution)
+    monkeypatch.setattr(base_runner, "get_exec", lambda: execution)
     monkeypatch.setattr(base_runner, "get_parallel", lambda: parallel)
     monkeypatch.setattr(
         base_runner,
