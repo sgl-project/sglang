@@ -24,7 +24,7 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             _tag_keys=lambda keys: keys,
         )
         self.linker.pools = {
-            name: Mock(get_prepared_layer_range_meta=Mock(return_value=None))
+            name: Mock(get_prepared_layers_range_meta=Mock(return_value=None))
             for name in ("kv", "index")
         }
         self.linker.num_layers = 1
@@ -56,7 +56,7 @@ class TestLayerWiseLoadSessions(CustomTestCase):
         self.store.batch_get_into_multi_buffer_ranges.return_value = [3, 3]
         for pool in self.linker.pools.values():
             pool.prepare_locations.side_effect = locations
-            pool.get_prepared_layer_range_meta.side_effect = lambda rows, layer: (
+            pool.get_prepared_layers_range_meta.side_effect = lambda rows, layers: (
                 [[100 + int(row) * 3] for row in rows],
                 [[3], [3]],
                 [[0], [0]],
