@@ -63,7 +63,7 @@ class TestKimiK31PrefillCP(CustomTestCase):
         """Legacy NPU kernels reject 96 heads; arch35 must receive them natively.
 
         Both paths must preserve every real head's output and the caller's
-        inputs, including when extra kernel heads have to be removed.
+        inputs. Extra kernel heads must be zero-filled and removed from output.
         """
         for cp_enabled in (False, True):
             for arch35 in (False, True):
@@ -104,6 +104,13 @@ class TestKimiK31PrefillCP(CustomTestCase):
             if arch35 or heads == 128:
                 self.assertIs(kwargs["query"], query)
                 self.assertIs(kwargs["query_rope"], query_rope)
+            else:
+                self.assertEqual(
+                    torch.count_nonzero(kwargs["query"][:, heads:]).item(), 0
+                )
+                self.assertEqual(
+                    torch.count_nonzero(kwargs["query_rope"][:, heads:]).item(), 0
+                )
             torch.testing.assert_close(kwargs["query"][:, :heads], original_query)
             torch.testing.assert_close(kwargs["query_rope"][:, :heads], original_rope)
             return (
