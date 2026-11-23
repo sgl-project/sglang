@@ -246,6 +246,9 @@ class NemotronH_Nano_VL_V2(EVS):
         return self.language_model.get_input_embeddings()
 
     def precompile_kernels_after_loading(self) -> None:
+        # Encoder-only workers never run the language model, so they skip it.
+        if getattr(self.config, "encoder_only", False):
+            return
         # The loader only looks for this hook on the top-level model.
         self.language_model.precompile_kernels_after_loading()
 

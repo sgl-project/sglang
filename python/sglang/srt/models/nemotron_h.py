@@ -1239,12 +1239,22 @@ class NemotronHForCausalLM(nn.Module):
     def precompile_kernels_after_loading(self) -> None:
         # NemotronH does not capture prefill CUDA graphs, so without this the
         # Mamba2 prefill kernels compile on the first live requests instead.
+        # With chunked prefill, a prefill batch never holds more tokens than
+        # one chunk, so larger layouts would only cost startup time. PP dynamic
+        # chunking can grow past it, so it keeps the full sweep.
+        schedule = get_schedule()
+        max_tokens = None
+        if (schedule.chunked_prefill_size or 0) > 0 and not (
+            schedule.enable_dynamic_chunking and get_parallel().pp_size > 1
+        ):
+            max_tokens = schedule.chunked_prefill_size
         start = time.perf_counter()
         cases = precompile_mamba2_prefill_kernels(
             self,
             chunk_size=self.config.mamba_chunk_size,
             cache_params=self.config.mamba2_cache_params,
             use_triton_causal_conv=True,
+            max_tokens=max_tokens,
         )
         if cases:
             logger.info(

@@ -64,19 +64,21 @@ def precompile_mamba2_prefill_kernels(
     chunk_size: int,
     cache_params: Mamba2CacheParams,
     use_triton_causal_conv: bool,
+    max_tokens: Optional[int] = None,
 ) -> int:
     """Compile the prefill kernels of every distinct Mamba2 mixer in ``model``.
 
     Mixers with the same sizes and dtypes share their kernels, so each distinct
-    shape is swept once. Returns the number of prefill runs (0 when the model
-    has no Mamba2 mixer on a CUDA device).
+    shape is swept once. ``max_tokens`` is the largest prefill batch the
+    scheduler can build, or None when it has no fixed limit. Returns the number
+    of prefill runs (0 without CUDA or without a Mamba2 mixer).
     """
+    if not torch.cuda.is_available():
+        return 0
     seen = set()
     cases = 0
     for module in model.modules():
         if not isinstance(module, mamba_layer.MambaMixer2):
-            continue
-        if module.A.device.type != "cuda":
             continue
         dims, params = _mixer_prefill_inputs(
             mixer=module, chunk_size=chunk_size, cache_params=cache_params
@@ -93,7 +95,10 @@ def precompile_mamba2_prefill_kernels(
             continue
         seen.add(key)
         cases += sweep_mamba2_prefill(
-            dims=dims, params=params, use_triton_causal_conv=use_triton_causal_conv
+            dims=dims,
+            params=params,
+            use_triton_causal_conv=use_triton_causal_conv,
+            max_tokens=max_tokens,
         )
     return cases
 
@@ -103,10 +108,11 @@ def sweep_mamba2_prefill(
     dims: Mamba2PrefillDims,
     params: Mamba2PrefillParams,
     use_triton_causal_conv: bool,
+    max_tokens: Optional[int] = None,
 ) -> int:
     """Run every swept layout with and without initial states and tracking."""
     cases = 0
-    for seq_lens in prefill_layouts(dims.chunk_size):
+    for seq_lens in prefill_layouts(dims.chunk_size, max_tokens=max_tokens):
         for with_initial_states in (False, True):
             for with_track in (False, True):
                 cases += run_mamba2_prefill(
@@ -217,7 +223,9 @@ def run_mamba2_prefill(
     return True
 
 
-def prefill_layouts(chunk_size: int) -> list[tuple[int, ...]]:
+def prefill_layouts(
+    chunk_size: int, max_tokens: Optional[int] = None
+) -> list[tuple[int, ...]]:
     """Per-request token counts of the swept prefill batches.
 
     Crosses request counts with batch token counts so that the request count,
@@ -230,10 +238,22 @@ def prefill_layouts(chunk_size: int) -> list[tuple[int, ...]]:
     the chunk count plus one for every request boundary that falls inside a
     chunk. The last group of layouts moves that number through its classes for
     each token count by putting 1-token requests in front.
+
+    ``max_tokens`` caps the batch size at the largest prefill the scheduler
+    can build. Under the cap, the two largest token counts of each class
+    replace the ones that no longer fit.
     """
     c = chunk_size
     request_counts = (1, 2, 3, 16, 17)
     token_counts = (1, 7, 16, c + 44, 2 * c, 16 * c - 1, 16 * c)
+    if max_tokens is not None and max_tokens < 16 * c:
+        largest = (max_tokens // 16 * 16, max_tokens - (max_tokens % 16 == 0))
+        token_counts = tuple(
+            dict.fromkeys(
+                [t for t in token_counts if t <= max_tokens]
+                + [t for t in largest if t > 0]
+            )
+        )
     layouts = []
     for num_tokens in token_counts:
         for num_seqs in request_counts:
@@ -253,6 +273,8 @@ def prefill_layouts(chunk_size: int) -> list[tuple[int, ...]]:
             num_short = num_logical - num_chunks
             if 0 <= num_short < num_tokens:
                 layouts.append((1,) * num_short + (num_tokens - num_short,))
+    if max_tokens is not None:
+        layouts = [layout for layout in layouts if sum(layout) <= max_tokens]
     return list(dict.fromkeys(layouts))
 
 
@@ -351,9 +373,14 @@ def _mixer_prefill_inputs(
     chunk_size: int,
     cache_params: Mamba2CacheParams,
 ) -> tuple[Mamba2PrefillDims, Mamba2PrefillParams]:
-    """Read one mixer's per-TP-rank sizes, dtypes and weights."""
+    """Read one mixer's per-TP-rank sizes, dtypes and weights.
+
+    The weights are copied to the current CUDA device when they live elsewhere,
+    as with CPU offload, since serving runs the kernels on the GPU.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
     tp_size = mixer.tp_size
-    conv_weight = mixer.conv1d.weight
+    conv_weight = mixer.conv1d.weight.to(device)
     dims = Mamba2PrefillDims(
         num_heads=mixer.num_heads // tp_size,
         head_dim=mixer.head_dim,
@@ -367,12 +394,13 @@ def _mixer_prefill_inputs(
         conv_state_dtype=cache_params.dtype.conv,
         ssm_state_dtype=cache_params.dtype.temporal,
     )
+    conv_bias = mixer.conv1d.bias
     params = Mamba2PrefillParams(
-        A=mixer.A,
-        D=mixer.D,
-        dt_bias=mixer.dt_bias,
+        A=mixer.A.to(device),
+        D=mixer.D.to(device),
+        dt_bias=mixer.dt_bias.to(device),
         conv_weight=conv_weight.view(conv_weight.size(0), conv_weight.size(2)),
-        conv_bias=mixer.conv1d.bias,
+        conv_bias=None if conv_bias is None else conv_bias.to(device),
         activation=mixer.activation,
     )
     return dims, params
