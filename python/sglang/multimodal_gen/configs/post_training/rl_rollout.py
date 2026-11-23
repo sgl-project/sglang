@@ -87,11 +87,6 @@ class RLRolloutArgs:
 
     def _validate_extra_stream_sde_args(self) -> None:
         overrides = self.rollout_extra_stream_sde_args
-        if not isinstance(overrides, dict):
-            raise ValueError(
-                "rollout_extra_stream_sde_args must map stream names to "
-                f"SDE kernel overrides, got {overrides!r}"
-            )
         for stream, override in overrides.items():
             if stream not in self.rollout_extra_streams:
                 raise ValueError(
@@ -100,6 +95,7 @@ class RLRolloutArgs:
                     f"{list(self.rollout_extra_streams)}; the top-level fields are "
                     "the primary stream's"
                 )
+            # A string override would be read as its characters by the field check below.
             if not isinstance(override, dict):
                 raise ValueError(
                     f"The override of stream {stream!r} must be a dict, got {override!r}"
