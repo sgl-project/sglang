@@ -88,6 +88,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _top_logprobs_to_lists(val, idx):
+    # Top logprobs arrive as a per-row tensor list, or as one [rows, k] tensor
+    # when every row asks for the same k.
+    if torch.is_tensor(val):
+        return val.tolist(), idx.tolist()
+    if val:
+        return _rows_to_lists(val), _rows_to_lists(idx)
+    return val, idx
+
+
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
     stride = result.speculative_output_stride
@@ -130,6 +140,25 @@ def _record_token_values(
     values.extend(row if num_visible == len(row) else row[:num_visible])
 
 
+def _rows_to_lists(rows: List[torch.Tensor]) -> List[list]:
+    # Without overlap scheduling the rows are still on the device, where every
+    # `.tolist()` is a blocking device-to-host copy; read them back together.
+    if (
+        len(rows) < 2
+        or rows[0].device.type == "cpu"
+        or any(row.dim() != 1 for row in rows)
+        or len({row.dtype for row in rows}) > 1
+    ):
+        return [row.tolist() for row in rows]
+    flat = torch.cat(rows).tolist()
+    lists = []
+    start = 0
+    for row in rows:
+        lists.append(flat[start : start + row.numel()])
+        start += row.numel()
+    return lists
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -170,8 +199,11 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 self.request_retirer.release(req, checkpoint=True)
 
+        # Running requests send the prefill token with their first decode output.
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.output_streamer.stream_output(
+            [req for req in batch.reqs if req.finished()], batch.return_logprob
+        )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
@@ -364,6 +396,7 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
         # Each generation row's KV work, queued in row order for _flush_prefill.
         kv_ops: List[Callable[[], None]] = []
+        checkpoint_reqs: List[Req] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -513,6 +546,7 @@ class SchedulerBatchResultProcessor:
                         kv_ops.append(
                             partial(checkpoint_kv_cache, req, self.tree_cache)
                         )
+                        checkpoint_reqs.append(req)
                         if get_memory().enable_hisparse:
                             kv_ops.append(
                                 partial(
@@ -626,12 +660,14 @@ class SchedulerBatchResultProcessor:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self._flush_prefill(
-            batch,
-            self._reqs_still_in_batch(batch, still_in_batch_rows),
-            kv_ops,
-            skip_stream_req,
-        )
+        # The state slots the queued checkpoints take, taken in one take.
+        with self.tree_cache.lease_checkpoint_state_slots(checkpoint_reqs):
+            self._flush_prefill(
+                batch,
+                self._reqs_still_in_batch(batch, still_in_batch_rows),
+                kv_ops,
+                skip_stream_req,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
@@ -702,13 +738,13 @@ class SchedulerBatchResultProcessor:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
-            if logits_output.next_token_top_logprobs_val:
-                logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                ]
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = _top_logprobs_to_lists(
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            )
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
@@ -1298,18 +1334,18 @@ class SchedulerBatchResultProcessor:
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
-            if logits_output.next_token_top_logprobs_val:
-                logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                ]
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = _top_logprobs_to_lists(
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            )
 
             if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+                logits_output.next_token_token_ids_logprobs_val = _rows_to_lists(
+                    logits_output.next_token_token_ids_logprobs_val
+                )
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
@@ -1627,6 +1663,7 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu is None
             or req.kv.mamba_ping_pong_track_buffer is not None
             or not self.tree_cache.supports_mamba()
+            or self.tree_cache.request_mamba_only
         ):
             return True
 
@@ -1716,7 +1753,10 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.kv.mamba_ping_pong_track_buffer is None:
+        if (
+            req.kv.mamba_ping_pong_track_buffer is None
+            or not batch.token_to_kv_pool_allocator.state.tracks_decode_state
+        ):
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy

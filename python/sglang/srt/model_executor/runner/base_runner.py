@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import prepare_megakernel
 from sglang.srt.layers import deep_gemm_wrapper
@@ -45,6 +46,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.model_runner_components.capture_state import (
+    prepare_capture_state,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
@@ -238,7 +242,6 @@ class BaseRunner(ABC):
             if model_runner.is_draft_worker
             else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -266,6 +269,7 @@ class BaseRunner(ABC):
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_dcp_push_combine()
         self._pre_initialize_pcie_ipc_workspace()
+        self._prepare_capture_state()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -276,6 +280,13 @@ class BaseRunner(ABC):
             prepare_model_resources(mr)
         prepare_megakernel(mr)
         self._finalize_symm_workspaces()
+
+        if hybrid_gdn_config(mr.model_config) is not None:
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                prewarm_gdn_prefill_kernels,
+            )
+
+            prewarm_gdn_prefill_kernels(attn_backend=mr.attn_backend, model=mr.model)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -389,6 +400,16 @@ class BaseRunner(ABC):
         pcie_ipc_comm.prepare(
             hidden=mr.model_config.hidden_size,
             max_rows=self._widest_decode_rows(),
+        )
+
+    def _prepare_capture_state(self):
+        """With CUDA graph persistence, build the lazy comm state before CG capture."""
+        mr = self.model_runner
+        prepare_capture_state(
+            model=mr.model,
+            dtype=mr.dtype,
+            is_draft_worker=mr.is_draft_worker,
+            is_ep_scale_joiner=get_exec().moe.is_ep_scale_joiner,
         )
 
     def _widest_decode_rows(self) -> Optional[int]:
@@ -529,7 +550,16 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # A speculative target prefills with plain EXTEND forwards, so an EXTEND
+        # dummy keeps its mode; its other dummies take the verify shape.
+        _is_target_extend = (
+            forward_mode_override == ForwardMode.EXTEND and not mr.is_draft_worker
+        )
+        if (
+            mr.spec_algorithm.is_speculative()
+            and not _is_pd_prefill_target
+            and not _is_target_extend
+        ):
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
@@ -537,11 +567,8 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
-            assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
-            ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
+            assert capture_forward_mode == ForwardMode.EXTEND, (
+                "extend_num_tokens_per_req requires an EXTEND dummy"
             )
             num_tokens_per_req = extend_num_tokens_per_req
 
@@ -577,8 +604,8 @@ class BaseRunner(ABC):
                 )
                 get_flags().capture.enable_torch_compile = False
 
-        # NOTE: aux hidden state capture (eagle3/dflash) is already
-        # configured by init_aux_hidden_state_capture() in initialize().
+        # NOTE: aux hidden state capture (eagle3/dflash) is already configured
+        # by configure_aux_hidden_state_capture() in init_attention_backends().
 
         # Token-axis buffer views and counters.
         input_ids = buffers.input_ids[:num_tokens]
