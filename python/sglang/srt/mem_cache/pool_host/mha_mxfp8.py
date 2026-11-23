@@ -302,3 +302,56 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         self, indices: torch.Tensor, split_factor: int
     ):
         raise self._storage_pages_unsupported()
+
+
+class NPUModelSlimMXFP8KDynamicVPerChannelHost(MHATokenToKVPoolHost):
+    """L2 host pool for ModelSlim QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL.
+
+    Pages carry K/V and dynamic K scales. Static V scales come from the weights.
+    """
+
+    def get_size_per_token(self):
+        k_scale_bytes = self.layer_num * self.head_num * (self.head_dim // 32)
+        return super().get_size_per_token() + k_scale_bytes
+
+    def get_mapping_lengths(self) -> list[int]:
+        payload_bytes = self.size * super().get_size_per_token()
+        return [payload_bytes, self.size * self.size_per_token - payload_bytes]
+
+    def init_kv_buffer(self):
+        if self.layout != "page_first_direct":
+            raise NotImplementedError(
+                "ModelSlim MXFP8 HiCache requires page_first_direct."
+            )
+        kv_buffer = super().init_kv_buffer()
+        self.k_scale_host = ALLOC_MEMORY_FUNCS[self._transfer_device.type](
+            (*kv_buffer.shape[1:-1], self.head_dim // 32),
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        # The exchange op reads V's head dimension even for K-only transfers.
+        self._empty_host_v = self.k_scale_host.new_empty((0,) * 5)
+        self._empty_device_v = torch.empty_like(
+            self._empty_host_v, device=self._transfer_device
+        )
+        return kv_buffer
+
+    def _npu_transfer_buffers(self):
+        yield from super()._npu_transfer_buffers()
+        layer_start = 0
+        for info in self._buffer_infos:
+            k_scale = info.scales.k.flatten(-2)
+            layer_end = layer_start + k_scale.shape[0]
+            yield (
+                k_scale,
+                self._empty_device_v,
+                self.k_scale_host[:, layer_start:layer_end],
+                self._empty_host_v,
+            )
+            layer_start = layer_end
+
+    def destroy(self):
+        self.k_scale_host = None
+        super().destroy()

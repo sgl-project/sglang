@@ -151,9 +151,9 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
             # Used by the MLX backend, which builds its additive mask rows
             # on the CPU before inserting them into the lazy graph.
@@ -182,6 +182,12 @@ class XGrammarGrammar(BaseGrammarObject):
             grammar_stats,
         )
 
+    def memory_size_bytes(self) -> Optional[int]:
+        # Copies share ``ctx``; the matcher is small next to the token tables
+        # inside the compiled grammar, so the compiled grammar is the charge.
+        size = getattr(self.ctx, "memory_size_bytes", None)
+        return size if isinstance(size, int) else None
+
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
@@ -200,8 +206,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
         max_whitespace_cnt: Optional[int] = None,
+        cache_limit_bytes: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
 
         if hasattr(tokenizer, "init_xgrammar"):
             # For special tokenizer
@@ -226,7 +233,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 )
 
         self._tokenizer_info = tokenizer_info
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        # The compiler keeps its own cache of the same CompiledGrammar objects
+        # and is unbounded by default, so evicting from ``self.cache`` alone
+        # would free nothing. Both caches reference one C++ object, so giving
+        # the compiler the same budget keeps the total near one budget.
+        compiler_limit = self.cache_limit_bytes if self.cache_limit_bytes > 0 else -1
+        self.grammar_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info, cache_limit_bytes=compiler_limit
+        )
         self._framing_compiler = self._new_framing_compiler(tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
@@ -288,9 +302,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

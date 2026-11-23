@@ -30,7 +30,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, is_in_ci
 
-register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=300, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 # PD disaggregation needs two devices: the fixture puts decode on

@@ -9,7 +9,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 
 
 def _info(temps):
@@ -17,6 +17,7 @@ def _info(temps):
         temperatures=torch.tensor(temps, device="cuda"),
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
     )
 
 
