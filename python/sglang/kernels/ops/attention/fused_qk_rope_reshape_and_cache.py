@@ -597,12 +597,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
 
 
 @triton.jit
-def _rope_half(x, x_rot, cos, sin):
-    # fma on the cos product, as the per-(token, head) kernel compiles to: bit-equal output.
-    return tl.fma(x.to(tl.float32), cos, x_rot.to(tl.float32) * sin)
-
-
-@triton.jit
 def _fused_qk_rope_cache_tiled_kernel(
     q_ptr,
     k_ptr,
@@ -681,8 +675,9 @@ def _fused_qk_rope_cache_tiled_kernel(
         )
         q_x1 = tl.load(q_src, mask=q_m3, other=0.0)
         q_x2 = tl.load(q_src + HALF, mask=q_m3, other=0.0)
-        q_o1 = _rope_half(q_x1, -q_x2, cos3, sin3)
-        q_o2 = _rope_half(q_x2, q_x1, cos3, sin3)
+        # fma on the cos product, as the per-(token, head) kernel compiles to: bit-equal output.
+        q_o1 = tl.fma(q_x1.to(tl.float32), cos3, (-q_x2).to(tl.float32) * sin3)
+        q_o2 = tl.fma(q_x2.to(tl.float32), cos3, q_x1.to(tl.float32) * sin3)
         q_dst = (
             q_out_ptr
             + t64[:, None, None] * q_out_stride_t
@@ -710,8 +705,9 @@ def _fused_qk_rope_cache_tiled_kernel(
         )
         x1 = tl.load(src, mask=m3, other=0.0)
         x2 = tl.load(src + HALF, mask=m3, other=0.0)
-        o1 = _rope_half(x1, -x2, cos3, sin3)
-        o2 = _rope_half(x2, x1, cos3, sin3)
+        # fma on the cos product, as the per-(token, head) kernel compiles to: bit-equal output.
+        o1 = tl.fma(x1.to(tl.float32), cos3, (-x2).to(tl.float32) * sin3)
+        o2 = tl.fma(x2.to(tl.float32), cos3, x1.to(tl.float32) * sin3)
         dst = (
             k_out_ptr
             + t64[:, None, None] * k_out_stride_t
