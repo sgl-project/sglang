@@ -66,7 +66,6 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling import sampling_batch_info
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.sampling.verify_accept import VerifyAccept
@@ -1945,7 +1944,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidate_ids: torch.Tensor,
         q_rows: torch.Tensor,
         sampling_info,
-        need_truncated_sampling: bool,
         draft_input,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1969,7 +1967,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
                 sampling_info=sampling_info,
-                need_truncated_sampling=need_truncated_sampling,
                 draft_input=draft_input,
                 gamma=gamma,
                 verify_num_draft_tokens=block,
@@ -2829,14 +2826,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        route: Optional[VerifyRoute] = None,
     ):
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
-        it verified; cap_trim_lens counts the accepted drafts the cutoff cut.
-        `route` is optional because external DFLASH runtimes call this through
-        their `accept_block` binding with the keywords it had before; without
-        it, the truncated-sampling bit is read from `sampling_info`."""
+        it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
         new_seq_lens = None
         cap_trim_lens = None
         # A resolved argmax (vocab-sharded verify) means the accept is greedy.
@@ -2848,11 +2841,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
-                need_truncated_sampling=(
-                    route.need_truncated_sampling
-                    if route is not None
-                    else sampling_batch_info.need_truncated_sampling(sampling_info)
-                ),
                 draft_input=draft_input,
                 cutoff_verify_lens=cutoff_verify_lens,
             )
@@ -3684,7 +3672,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
             sampling_info=sampling_info,
-            route=verify.route,
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,

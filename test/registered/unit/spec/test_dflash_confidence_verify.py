@@ -10,7 +10,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.dflash import CandidateSelector
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 from sglang.srt.speculative.dspark_components import dspark_planner
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,7 +29,6 @@ def _greedy_accept(candidates, target_predict, cutoff_verify_lens):
         candidates=candidates,
         next_token_logits=None,
         sampling_info=None,
-        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=None,
         prefix_lens=torch.tensor([10, 20]),
         bs=candidates.shape[0],

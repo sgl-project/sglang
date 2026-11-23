@@ -340,7 +340,6 @@ def test_dspark_accept_min_p_does_not_depend_on_the_batch():
                 target_logits=logits[: bs * width],
                 draft_probs=torch.zeros((bs, width - 1, vocab), device=device),
                 sampling_info=info,
-                need_truncated_sampling=True,
                 draft_input=SimpleNamespace(max_top_k=None, uniform_top_k_value=None),
                 gamma=width - 1,
                 verify_num_draft_tokens=width,
