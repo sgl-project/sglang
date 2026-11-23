@@ -360,14 +360,14 @@ class VerifyStep(msgspec.Struct):
         tree: Optional[HostVerifyTree],
         barrier: Optional[Callable[[], Dict[Req, List[int]]]],
     ) -> None:
-        """Bind the target forward's output: build the grammar mask and the
+        """Each verify worker's one call after the target verify launches, so
+        the host work overlaps the forward: build the grammar mask and the
         custom logit processors' row prefixes over `tree`, the verify tree's
-        host copy, which the worker builds when `needs_verify_tree`. Each verify
-        worker calls it once, after the target verify launches, so the host work
-        overlaps the forward. Under overlap the previous step's result is still
-        queued; `barrier` advances the grammar FSM over its tokens and returns
-        them per request, as result processing will append them to
-        req.output_ids."""
+        host copy, which the worker builds when `needs_verify_tree`.
+        `logits_output` gives the grammar mask its device. Under overlap the
+        previous step's result is still queued; `barrier` advances the grammar
+        FSM over its tokens and returns them per request, as result processing
+        will append them to req.output_ids."""
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.
