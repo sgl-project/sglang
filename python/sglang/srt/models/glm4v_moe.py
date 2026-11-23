@@ -79,7 +79,12 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        rope_config = (
+            getattr(self.config, "rope_scaling", None)
+            or getattr(self.config, "rope_parameters", None)
+            or {}
+        )
+        self.is_mrope_enabled = "mrope_section" in rope_config
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False

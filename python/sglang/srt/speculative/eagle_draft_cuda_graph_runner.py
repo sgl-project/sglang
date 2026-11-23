@@ -679,6 +679,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         num_tokens = bs * self.captured_req_width
 
+        vocab_size = self.model_runner.model_config.vocab_size
+        # Invalid draft probabilities/indices would otherwise reach the captured
+        # graph and the async OOB probe. Clamp before both.
+        if forward_batch.spec_info.topk_p is not None:
+            forward_batch.spec_info.topk_p.clamp_(0.0, 1.0)
+        if forward_batch.spec_info.topk_index is not None:
+            forward_batch.spec_info.topk_index.clamp_(0, vocab_size - 1)
+
         maybe_detect_nan(
             forward_batch.spec_info.topk_p,
             "EagleDraftCudaGraphRunner.replay: topk_p",
@@ -686,9 +694,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         maybe_detect_oob(
             forward_batch.spec_info.topk_index,
             0,
-            self.model_runner.model_config.vocab_size,
+            vocab_size,
             "EagleDraftCudaGraphRunner.replay: topk_index vs vocab_size="
-            f"{self.model_runner.model_config.vocab_size}",
+            f"{vocab_size}",
         )
 
         # Common inputs — batch the small per-field device copies into a grouped
