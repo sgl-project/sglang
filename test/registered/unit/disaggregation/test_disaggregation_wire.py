@@ -3705,6 +3705,106 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             self.assertEqual(chunk.selected_logprobs.tolist(), [])
             self.assertEqual(chunk.lengths.tolist(), [])
 
+    def test_pd_sampling_capture_mismatch_aborts_without_leaking_stale_slot(self):
+        """If prefill and decode disagree on whether a request filters sampling
+        (e.g. different --preferred-sampling-params), decode must abort instead
+        of reading the previous slot occupant's sampling data or ignoring a
+        filtered first token."""
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4,
+            )
+            # Request X leaves sampling data in slot 0.
+            buffers.set_buf(
+                self._make_req(
+                    None,
+                    sampling_logprob=-0.123,
+                    sampling_mask=[42],
+                    sampling_mask_logprobs=[-0.123],
+                )
+            )
+            buffers.clear_slot(0)
+            self.assertEqual(
+                buffers.output_token_sampling_mask_len[0].tolist(), [0] * 16
+            )
+            self.assertEqual(
+                buffers.output_token_sampling_logprobs[0].tolist(), [0.0] * 16
+            )
+
+            fields = dict.fromkeys(
+                f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+            )
+            fields["model_config"] = SimpleNamespace(self_opened_think_start_ids=None)
+            queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            queue.scheduler = SimpleNamespace(
+                kv_checksum_computer=None,
+                batch_result_processor=SchedulerBatchResultProcessor(**fields),
+            )
+            queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+            queue.metadata_buffers = buffers
+
+            for name, prefill_captured, decode_captured in (
+                ("prefill unfiltered, decode filtered", False, True),
+                ("prefill filtered, decode unfiltered", True, False),
+            ):
+                with self.subTest(name=name):
+                    if prefill_captured:
+                        prefill_req = self._make_req(
+                            None,
+                            sampling_logprob=-0.5,
+                            sampling_mask=[7],
+                            sampling_mask_logprobs=[-0.5],
+                        )
+                    else:
+                        # Leave stale values from a prior owner before set_buf.
+                        buffers.set_buf(
+                            self._make_req(
+                                None,
+                                sampling_logprob=-0.123,
+                                sampling_mask=[42],
+                                sampling_mask_logprobs=[-0.123],
+                            )
+                        )
+                        prefill_req = self._make_req(None, sampling_logprob=None)
+                    buffers.set_buf(prefill_req)
+
+                    aborted = []
+                    decode_req = SimpleNamespace(
+                        rid="r0",
+                        bootstrap_host="127.0.0.1",
+                        bootstrap_room=9,
+                        output_ids=[],
+                        require_reasoning=False,
+                        return_logprob=False,
+                        captures_sampling=decode_captured,
+                        sampling_params=SimpleNamespace(max_new_tokens=8),
+                        sampling_mask_rows=SamplingMaskRows(),
+                        time_stats=SimpleNamespace(
+                            set_wait_queue_entry_time=lambda: None
+                        ),
+                        finish_outside_step=lambda reason: aborted.append(reason),
+                    )
+                    receiver = Mock()
+                    dreq = DecodeRequest(
+                        req=decode_req,
+                        kv_receiver=receiver,
+                        metadata_buffer_index=0,
+                    )
+                    queue._commit_transfer_to_req(dreq)
+
+                    self.assertEqual(len(aborted), 1)
+                    self.assertIn("sampling capture mismatch", aborted[0].message)
+                    self.assertEqual(decode_req.output_ids, [])
+                    self.assertEqual(
+                        decode_req.sampling_mask_rows.take().selected_logprobs.tolist(),
+                        [],
+                    )
+                    receiver.clear.assert_called_once()
+                    self.assertIsNone(dreq.kv_receiver)
+
     def test_rebootstrap_commit_keeps_emitted_output(self):
         """A PD rebootstrap with output keeps its output ids and their sampling-mask
         rows; the prefill worker's fresh token and row are dropped."""

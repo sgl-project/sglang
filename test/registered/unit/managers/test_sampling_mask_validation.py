@@ -192,6 +192,66 @@ class TestSamplingMaskValidation(CustomTestCase):
                     return_logprob=True,
                 )
 
+    def test_unfiltered_sampling_logprobs_requires_return_logprob(self):
+        """An unfiltered return_sampling_logprobs request omits sampling fields
+        and falls back to output_token_logprobs, so it needs return_logprob=true."""
+        self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.tokenizer = None
+        self.manager.fake_bootstrap_room_counter = 0
+        for name, preferred, params, flags, accepted in (
+            (
+                "unfiltered logprobs without return_logprob",
+                None,
+                {"temperature": 0.8},
+                {"return_sampling_logprobs": True, "return_logprob": False},
+                False,
+            ),
+            (
+                "unfiltered logprobs with return_logprob",
+                None,
+                {"temperature": 0.8},
+                {"return_sampling_logprobs": True, "return_logprob": True},
+                True,
+            ),
+            (
+                "filtered logprobs without return_logprob",
+                None,
+                {"top_k": 10},
+                {"return_sampling_logprobs": True, "return_logprob": False},
+                True,
+            ),
+            (
+                "preferred-params filtered logprobs without return_logprob",
+                {"top_k": 10},
+                {"temperature": 0.8},
+                {"return_sampling_logprobs": True, "return_logprob": False},
+                True,
+            ),
+            (
+                "unfiltered mask-only without return_logprob",
+                None,
+                {"temperature": 0.8},
+                {"return_sampling_mask": True, "return_logprob": False},
+                True,
+            ),
+        ):
+            with self.subTest(name=name):
+                self.manager.preferred_sampling_params = preferred
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3], sampling_params=params, **flags
+                )
+                req.normalize_batch_and_arguments()
+                self.manager.rid_to_state = {
+                    req.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+                }
+                if accepted:
+                    self.manager._create_tokenized_object(req, "", req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "requires return_logprob"):
+                        self.manager._create_tokenized_object(req, "", req.input_ids)
+
     def test_removed_sampling_logprobs_mode_is_rejected(self):
         for mode in ("selected", "support", [None, None]):
             with self.subTest(mode=mode):

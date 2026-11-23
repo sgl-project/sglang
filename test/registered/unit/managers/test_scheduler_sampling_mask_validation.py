@@ -121,14 +121,20 @@ class TestSamplingCapture(CustomTestCase):
                     self.assertEqual(req.captures_sampling, captured)
                     self.assertEqual(req.sampling_mask_rows is not None, captured)
 
-    def test_speculative_decoding_validates_captured_requests_only(self):
-        """EAGLE cannot capture sampling: a request that filters sampling is
-        refused, and an unfiltered one, which returns no sampling fields, is not."""
-        for sampling_params, refused in (({"top_k": 20}, True), ({}, False)):
-            with self.subTest(params=sampling_params):
+    def test_speculative_decoding_validates_all_sampling_output_requests(self):
+        """EAGLE cannot guarantee exact sampling logprobs, so both filtered and
+        unfiltered requests that set either flag are refused; requests with
+        neither flag still pass."""
+        for sampling_params, flags, refused in (
+            ({"top_k": 20}, {"logprobs": True, "mask": True}, True),
+            ({}, {"logprobs": True}, True),
+            ({}, {"mask": True}, True),
+            ({}, {"logprobs": False, "mask": False}, False),
+        ):
+            with self.subTest(params=sampling_params, flags=flags):
                 abort, _, passed, _ = _handle_request(
                     DisaggregationMode.NULL,
-                    _sampling_req(sampling_params, logprobs=True, mask=True),
+                    _sampling_req(sampling_params, **flags),
                     spec_algorithm=SpeculativeAlgorithm.EAGLE,
                 )
                 self.assertEqual(passed, not refused)
@@ -137,12 +143,17 @@ class TestSamplingCapture(CustomTestCase):
                 else:
                     abort.assert_not_called()
 
-    def test_threshold_update_counts_captured_requests_only(self):
-        """Under DFlash a relaxed acceptance threshold is refused while a captured
-        request runs; an unfiltered request returns no sampling fields and does not
-        block it."""
-        for sampling_params, refused in (({"top_k": 20}, True), ({}, False)):
-            running = _sampling_req(sampling_params, logprobs=True, mask=True)
+    def test_threshold_update_counts_all_sampling_output_requests(self):
+        """Under DFlash a relaxed acceptance threshold is refused while any
+        sampling-output request runs, filtered or unfiltered, because the
+        unfiltered fallback depends on exact sampling too."""
+        for sampling_params, flags, refused in (
+            ({"top_k": 20}, {"logprobs": True, "mask": True}, True),
+            ({}, {"logprobs": True}, True),
+            ({}, {"mask": True}, True),
+            ({}, {"logprobs": False, "mask": False}, False),
+        ):
+            running = _sampling_req(sampling_params, **flags)
             controller = SchedulerInternalStateController(
                 SimpleNamespace(
                     spec_algorithm=SpeculativeAlgorithm.DFLASH,
@@ -150,7 +161,7 @@ class TestSamplingCapture(CustomTestCase):
                 ),
                 record_step_time=False,
             )
-            with self.subTest(params=sampling_params):
+            with self.subTest(params=sampling_params, flags=flags):
                 if refused:
                     with self.assertRaises(UpdateRejected):
                         controller._validate_accept_threshold(

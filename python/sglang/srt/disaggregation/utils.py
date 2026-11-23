@@ -793,6 +793,9 @@ class MetadataBuffers:
         self.bootstrap_room[idx] = 0
         if self.kv_checksum is not None:
             self.kv_checksum[idx] = 0
+        if self.enable_sampling_mask:
+            self.output_token_sampling_mask_len[idx] = 0
+            self.output_token_sampling_logprobs[idx] = 0
 
     def get_buf_infos(self):
         bufs = [
@@ -974,22 +977,33 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        if has_sampling_handoff_row(req):
-            # Prefill streams a request only once its KV transfer ends or it aborts,
-            # so the first token's row is the only one queued here.
-            chunk = req.sampling_mask_rows.view()
-            mask_len = len(chunk.token_ids)
-            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = mask_len
-            self.output_token_sampling_mask_idx[
-                req.metadata_buffer_index, :mask_len
-            ].copy_(torch.from_numpy(chunk.token_ids))
-            self.output_sampling_mask_logprobs[
-                req.metadata_buffer_index, :mask_len
-            ].copy_(torch.from_numpy(chunk.support_logprobs))
-            (sampling_logprob,) = chunk.selected_logprobs.tolist()
-            self.output_token_sampling_logprobs[req.metadata_buffer_index][0] = (
-                sampling_logprob
+        if self.enable_sampling_mask:
+            has_row = has_sampling_handoff_row(req)
+            # Slot 0 holds mask length; slot 1 records whether prefill captured
+            # this request so decode rejects a sampling-defaults mismatch.
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][1] = int(
+                has_row
             )
+            if has_row:
+                # Prefill streams a request only once its KV transfer ends or it aborts,
+                # so the first token's row is the only one queued here.
+                chunk = req.sampling_mask_rows.view()
+                mask_len = len(chunk.token_ids)
+                self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = (
+                    mask_len
+                )
+                self.output_token_sampling_mask_idx[
+                    req.metadata_buffer_index, :mask_len
+                ].copy_(torch.from_numpy(chunk.token_ids))
+                self.output_sampling_mask_logprobs[
+                    req.metadata_buffer_index, :mask_len
+                ].copy_(torch.from_numpy(chunk.support_logprobs))
+                (sampling_logprob,) = chunk.selected_logprobs.tolist()
+                self.output_token_sampling_logprobs[req.metadata_buffer_index][0] = (
+                    sampling_logprob
+                )
+            else:
+                self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = 0
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

@@ -1866,6 +1866,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            if (
+                obj.return_sampling_logprobs
+                and not sampling_params.filters_sampling()
+                and not obj.return_logprob
+            ):
+                raise ValueError(
+                    "return_sampling_logprobs without top-k/top-p/min-p sampling "
+                    "requires return_logprob=true, because unfiltered requests omit "
+                    "output_token_sampling_logprobs and fall back to "
+                    "output_token_logprobs."
+                )
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )

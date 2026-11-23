@@ -3476,6 +3476,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver = None
             return
 
+        if (
+            not _is_fake_transfer(decode_req.req)
+            and not decode_req.is_rebootstrap
+            and output_token_sampling_mask_len is not None
+        ):
+            prefill_captured = bool(output_token_sampling_mask_len[1].item())
+            decode_expects = has_sampling_handoff_row(decode_req.req)
+            if prefill_captured != decode_expects:
+                error_msg = (
+                    "Disaggregation sampling capture mismatch: "
+                    f"prefill captured={prefill_captured}, "
+                    f"decode expects={decode_expects}. "
+                    "Configure --preferred-sampling-params and --sampling-defaults "
+                    "identically on prefill and decode."
+                )
+                logger.error(error_msg)
+                prepare_abort(
+                    decode_req.req,
+                    error_msg,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
+
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer

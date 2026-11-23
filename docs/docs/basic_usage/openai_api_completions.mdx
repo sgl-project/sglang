@@ -421,17 +421,16 @@ idx = np.frombuffer(
 - `return_sampling_logprobs: true` adds `output_token_sampling_logprobs` to `meta_info`: one float per output token.
 - `return_sampling_mask: true` adds `output_sampling_mask_logprobs`: one row per output token, each entry `[logprob, token_id]` for a token the sampler could have drawn. Unlike a `top_logprobs` entry it carries no text, whatever `return_text_in_logprobs` is.
 
-The fields are returned only for a request that filters sampling with top-k, top-p or min-p; greedy sampling counts as `top_k: 1`. Without a filter each token is sampled from `softmax(logits / temperature)` and the fields are omitted. A caller that needs each token's sampling logprob sets `return_sampling_logprobs` with `logprobs: true`, and reads `output_token_sampling_logprobs` when present and the output token logprob otherwise.
+The fields are returned only for a request that filters sampling with top-k, top-p or min-p; greedy sampling counts as `top_k: 1`. Without a filter each token is sampled from `softmax(logits / temperature)` and the fields are omitted. An unfiltered `return_sampling_logprobs: true` request requires `logprobs: true` (`return_logprob: true` on `/generate`), and the caller reads `output_token_sampling_logprobs` when present and the output token logprob otherwise.
 
 That fallback is not the logprob of the draw when the server reports something other than what it samples from. Cases include:
 
 - `SGLANG_RETURN_ORIGINAL_LOGPROB=1` reports the logprob before temperature.
 - Watermarking reports the logprob before the watermark.
-- Speculative decoding may accept draft tokens without exact sampling: argmax verification, a relaxed acceptance threshold, or simulated acceptance.
 - `--rl-on-policy-target` reports a BF16 log-softmax, and a batch that holds a filtered request is not drawn from it.
 - With tensor parallelism, synchronizing token ids across ranks (grammar-constrained requests, or `SGLANG_SYNC_TOKEN_IDS_ACROSS_TP`) can replace the token after its logprob was computed.
 
-With a filter, `return_sampling_mask` needs greedy sampling or a finite `top_k` within `--sampling-mask-max-tokens`; `return_sampling_logprobs` alone has no such limit. A request with a custom logit processor other than `DisallowedTokensLogitsProcessor` is refused when it sets either flag, with or without a filter. In PD disaggregation the prefill and decode servers must agree on whether a request filters, so give both the same `--preferred-sampling-params`.
+With a filter, `return_sampling_mask` needs greedy sampling or a finite `top_k` within `--sampling-mask-max-tokens`; `return_sampling_logprobs` alone has no such limit. Speculative decoding exactness checks apply to any request that sets either flag, filtered or not. For `return_sampling_mask`, a custom logit processor other than `DisallowedTokensLogitsProcessor` is refused; `return_sampling_logprobs` alone accepts other custom logit processors. In PD disaggregation the prefill and decode servers must agree on whether a request filters (use the same `--preferred-sampling-params` and `--sampling-defaults`), or decode aborts the request on handoff.
 
 The native `/generate` API takes the same two flags.
 
