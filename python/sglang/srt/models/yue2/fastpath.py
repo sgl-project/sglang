@@ -50,21 +50,17 @@ def _load_topk_backend():
 def deepselect_runnable() -> bool:
     """True when the loaded top-k backend can run on the current device.
 
-    Importability says nothing about runnability: the in-tree DeepSelect JIT
-    builds only for SM 9.0/10.0/10.3, and ``torch.cuda.is_available()`` is
-    also true on ROCm, where calling the kernel raises at decode time. The
-    in-tree wrapper therefore exposes ``is_deepselect_supported()``; backends
-    without the probe (pip ``deep_select``) keep the original availability
-    check. Capability-detection errors fail safe to the reference path.
+    DeepSelect JIT builds only for SM 9.0/10.0/10.3. Add ROCm safty check.
     """
     backend = _load_topk_backend()
     if not backend:
         return False
-    probe = getattr(backend, "is_deepselect_supported", None)
+    
+    is_deepselect_supported = getattr(backend, "is_deepselect_supported", None)
     try:
-        if probe is None:
-            return torch.cuda.is_available()
-        return bool(probe())
+        if is_deepselect_supported is None:
+            return torch.version.hip is None and torch.cuda.is_available()
+        return bool(is_deepselect_supported())
     except Exception:
         return False
 

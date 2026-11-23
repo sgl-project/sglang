@@ -38,9 +38,6 @@ default_batched_pool = GraphSessionPool(max_sessions_per_key=int(
 def batched_ar_enabled() -> bool:
     if os.environ.get("SGLANG_YUE2_BATCHED_AR", "1") != "1":
         return False
-    # BatchedGraphSampler captures the CUDA-only DeepSelect kernel inside the
-    # pooled decode graphs; gate on the same capability probe so unsupported
-    # devices never construct those sessions and stay on the per-request path.
     return deepselect_runnable()
 
 
@@ -281,7 +278,7 @@ def _abc_per_request(model, tokenizer, requests, configs, batches):
         prefix = list(batch.extra["yue2_prefix"])
         abc_ids, _timing, abc_truncated = generate_tokens(
             model, prefix, config.abc, request.seed, phase="abc",
-            cfg_scale=1.0, use_cuda_graph=True, use_fast_sampler=True)
+            cfg_scale=1.0, use_cuda_graph=True, use_fast_sampler=None)
         abc_ids_list.append(list(abc_ids))
         abc_truncated_list.append(bool(abc_truncated))
     return abc_ids_list, abc_truncated_list

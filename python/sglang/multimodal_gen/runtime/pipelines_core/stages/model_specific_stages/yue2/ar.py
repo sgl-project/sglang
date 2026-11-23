@@ -110,7 +110,7 @@ class Yue2ARStage(PipelineStage):
             cfg_scale=cfg_scale,
             use_cuda_graph=True,
             legacy_off=legacy_semantic,
-            use_fast_sampler=not legacy_semantic,
+            use_fast_sampler=None if not legacy_semantic else False,
         )
 
         batch.extra.update(
