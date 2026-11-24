@@ -86,7 +86,10 @@ def test_fused_hc_mix_gate_rejects_prefill_rows():
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 32])
 def test_hc_mix_splitk_matches_reference_and_repeats_bitwise(num_tokens):
-    """The split-K epilogue's cluster hand-off: reference values, the same bits per run."""
+    """End-to-end values and run-to-run bits of ``hc_mix_splitk``.
+
+    Not a race regression test: it repeats one input and reuses the scratch, so a stale partial would repeat too.
+    """
     from sglang.kernels.ops.gemm.hc_mix_splitk import hc_mix, permute_pad_up_weight
 
     x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
