@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEn
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.utils.common import temp_set_env
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -467,6 +469,20 @@ class MooncakeBaseStore:
             self.clear_request_context()
 
 
+def _pd_forces_mnnvl(protocol: str) -> bool:
+    """Whether MC_FORCE_MNNVL belongs to this PD worker's KV transfer engine;
+    Mooncake reads it process-wide, so it would also move an "rdma" store."""
+    if protocol != "rdma" or "MC_FORCE_MNNVL" not in os.environ:
+        return False
+    if not get_context().is_config_namespace_published("disagg"):
+        return False
+    disagg = get_disagg()
+    return (
+        disagg.disaggregation_mode != "null"
+        and disagg.disaggregation_transfer_backend == "mooncake"
+    )
+
+
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
@@ -633,6 +649,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self._shared_mooncake_transfer_engine = None
                     logger.debug("Failed to reuse initialized mooncake transfer engine")
 
+                pd_forces_mnnvl = _pd_forces_mnnvl(self.config.protocol)
+                if pd_forces_mnnvl:
+                    logger.info(
+                        "MC_FORCE_MNNVL is set for the PD transfer engine; "
+                        "the Mooncake store starts its own RDMA engine without it."
+                    )
+
                 # Only reuse the shared MooncakeTransferEngine when its
                 # configuration matches the one used by MooncakeStore.
                 # PD may already have created an NVLink engine even when
@@ -640,6 +663,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # A TENT engine has no classic engine object for the store to drive.
                 if (
                     envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+                    and not pd_forces_mnnvl
                     and isinstance(
                         self._shared_mooncake_transfer_engine, MooncakeTransferEngine
                     )
@@ -682,19 +706,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
 
+                # The store's own engine starts without the PD engine's MNNVL force.
+                setup_env = {"MC_FORCE_MNNVL": None} if pd_forces_mnnvl else {}
                 while True:
                     try:
-                        ret_code = self.store.setup(
-                            client_hostname,
-                            self.config.metadata_server,
-                            per_rank_global_segment_size,
-                            self.config.local_buffer_size,
-                            self.config.protocol,
-                            device_name,
-                            self.config.master_server_address,
-                            transfer_engine,
-                            **setup_kwargs,
-                        )
+                        with temp_set_env(**setup_env):
+                            ret_code = self.store.setup(
+                                client_hostname,
+                                self.config.metadata_server,
+                                per_rank_global_segment_size,
+                                self.config.local_buffer_size,
+                                self.config.protocol,
+                                device_name,
+                                self.config.master_server_address,
+                                transfer_engine,
+                                **setup_kwargs,
+                            )
                         break
                     except TypeError as e:
                         unsupported_kwargs = [
