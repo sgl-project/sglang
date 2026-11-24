@@ -437,7 +437,6 @@ async def lifespan(fast_api_app: FastAPI):
             get_disagg().disaggregation_mode,
             get_serving().warmups.split(","),
             _global_state.tokenizer_manager,
-            app_state=fast_api_app.state,
         )
         logger.info("Warmup ended")
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
 import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -21,10 +20,6 @@ _warmup_registry = {}
 # Warmups that only send generate requests, which Rust-server mode runs through
 # its listener (`rust_server.warmups`); the others need the TokenizerManager.
 _rust_server_warmups = set()
-_current_app_state: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
-    "_current_app_state", default=None
-)
-_DEFAULT_MAX_PREFILL_SIZE = 32768
 
 
 def warmup(name: str, *, rust_server: bool = False):
@@ -43,28 +38,29 @@ async def execute_warmups(
     disaggregation_mode: str,
     warmup_names: List[str],
     tokenizer_manager: TokenizerManager,
-    app_state: Optional[Any] = None,
 ):
-    token = _current_app_state.set(app_state)
-    try:
-        for raw in warmup_names:
-            warmup_name = raw.strip() if raw else ""
-            if not warmup_name:
-                continue
-            if warmup_name not in _warmup_registry:
-                logger.warning(f"Could not find custom warmup {warmup_name}")
-                continue
-            logger.info(f"Running warmup {warmup_name}")
-            await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
-    finally:
-        _current_app_state.reset(token)
+    for warmup_name in warmup_names:
+        if warmup_name not in _warmup_registry:
+            logger.warning(f"Could not find custom warmup {warmup_name}")
+            continue
+        logger.info(f"Running warmup {warmup_name}")
+        await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
 
 
 @warmup("whisper_autodetect")
 async def whisper_autodetect(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
-    """Pre-compile the xgrammar FSM for both Whisper auto-detect regexes."""
+    """Pre-compile the xgrammar FSM for both Whisper auto-detect regexes.
+
+    The first request that uses each structured-generation regex incurs a
+    ~15-20s compilation cost. xgrammar caches compiled grammars by the
+    exact regex string, so we warm both the notimestamps and timestamps
+    variants here — otherwise the first ``language=None +
+    timestamp_granularities`` request would still pay the full spike.
+    """
+    # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono) —
+    # soundfile produces the WAV header + PCM data from a list of floats.
     import base64
     import io
 
@@ -80,9 +76,8 @@ async def whisper_autodetect(
     n = int(sr * dur)
     buf = io.BytesIO()
     sf.write(buf, [0.0] * n, sr, format="WAV")
-    audio_data_uri = (
-        f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode()}"
-    )
+    audio_b64 = base64.b64encode(buf.getvalue()).decode()
+    audio_data_uri = f"data:audio/wav;base64,{audio_b64}"
 
     for variant_name, regex in (
         ("notimestamps", WHISPER_AUTODETECT_REGEX),
@@ -105,9 +100,15 @@ async def whisper_autodetect(
             },
             modalities=["audio"],
         )
+        # PD prefill servers assert req.bootstrap_room is not None in the
+        # default follow_bootstrap_room scheduler; the fake values match
+        # what the voice_chat warmup uses for the same reason.
         if disaggregation_mode != "null":
             req.bootstrap_room = 0
             req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        # Drain the generator so the FSM is fully installed and any
+        # downstream exception surfaces instead of being swallowed after
+        # the first yield.
         async for _ in tokenizer_manager.generate_request(req, None):
             pass
     logger.info("Whisper auto-detect regex FSMs compiled.")
@@ -115,6 +116,8 @@ async def whisper_autodetect(
 
 @warmup("voice_chat", rust_server=True)
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    # this warms up the fused_moe triton kernels and caches them
+    # if we don't do this we break real time inference for voice chat
     for i in tqdm.trange(1, 512):
         size = i * 4
         generate_req_input = GenerateReqInput(
@@ -129,7 +132,18 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         if disaggregation_mode != "null":
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+_DEFAULT_MAX_PREFILL_SIZE = 32768
+# Short fixed prompt length used for sampling, logprob, and grammar warmup requests.
+_WARMUP_PROMPT_LEN = 32
+# Shared prefix length and suffix lengths used to trigger radix-cache extend paths.
+_PREFIX_LEN = 64
+_PREFIX_EXTEND_SUFFIX_LENS = (16, 64)
+# Extra small prefill lengths below the 64-token page size used by prefill_shapes.
+_SHORT_PREFILL_SIZES = (16, 32)
 
 
 def _positive_int(value: Any) -> Optional[int]:
@@ -139,7 +153,7 @@ def _positive_int(value: Any) -> Optional[int]:
 
 
 def _max_warmup_input_len(tm: Any, max_new_tokens: int = 1) -> Optional[int]:
-    """Compute the largest safe input token length for a warmup request."""
+    """Return the largest input token length accepted by tokenizer and scheduler."""
     server_args = getattr(tm, "server_args", None)
     model_config = getattr(tm, "model_config", None)
     reserved_tokens = max(0, int(getattr(tm, "num_reserved_tokens", 0) or 0))
@@ -155,16 +169,10 @@ def _max_warmup_input_len(tm: Any, max_new_tokens: int = 1) -> Optional[int]:
         if ctx_len is not None:
             limits.append(ctx_len - reserved_tokens - output_tokens)
 
-    # Scheduler sets `max_req_input_len = min(context_len - 1, kv_capacity - 1) - 5`
-    # and requires `len(input_ids) < max_req_input_len`.
+    # Scheduler rejects requests with `len(input_ids) >= max_req_input_len`.
     max_req_input_len = _positive_int(getattr(tm, "max_req_input_len", None))
     if max_req_input_len is not None:
-        limits.append(
-            min(
-                max_req_input_len - 1,
-                max_req_input_len + 5 - reserved_tokens - output_tokens,
-            )
-        )
+        limits.append(max_req_input_len - 1)
 
     chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
     max_prefill_tokens = _positive_int(getattr(server_args, "max_prefill_tokens", None))
@@ -180,10 +188,12 @@ def _max_warmup_input_len(tm: Any, max_new_tokens: int = 1) -> Optional[int]:
 
 
 def _prefill_shape_sizes(max_size: int = _DEFAULT_MAX_PREFILL_SIZE) -> List[int]:
-    sizes, base = set(), 64
+    page_size = 64
+    sizes = set()
+    base = page_size
     while base <= max_size:
         sizes.add(base)
-        mid = (base * 3 // 2 + 63) // 64 * 64
+        mid = (base * 3 // 2 + page_size - 1) // page_size * page_size
         if mid <= max_size:
             sizes.add(mid)
         base *= 2
@@ -192,24 +202,32 @@ def _prefill_shape_sizes(max_size: int = _DEFAULT_MAX_PREFILL_SIZE) -> List[int]
 
 @warmup("prefill_shapes", rust_server=True)
 async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
+
+    Uses power-of-2 sizes plus intermediate points to cover the shape space
+    that fused_moe, attention extend, and other Triton kernels may encounter.
+    """
     input_limit = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
     max_size = (
         min(_DEFAULT_MAX_PREFILL_SIZE, input_limit)
         if input_limit is not None
         else _DEFAULT_MAX_PREFILL_SIZE
     )
-    for size in tqdm.tqdm(
-        _prefill_shape_sizes(max_size),
-        desc=f"Warmup prefill shapes (up to {max_size})",
-    ):
-        req = GenerateReqInput(
+    sizes = _prefill_shape_sizes(max_size)
+
+    for size in tqdm.tqdm(sizes, desc=f"Warmup prefill shapes (up to {max_size})"):
+        generate_req_input = GenerateReqInput(
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
-            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+            sampling_params={
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            },
         )
         if disaggregation_mode != "null":
-            req.bootstrap_room = 0
-            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
-        await tokenizer_manager.generate_request(req, None).__anext__()
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
 def _resolve_max_prefill_size(max_input_len: Optional[int]) -> int:
@@ -226,9 +244,7 @@ def _resolve_max_prefill_size(max_input_len: Optional[int]) -> int:
                 _DEFAULT_MAX_PREFILL_SIZE,
             )
     if max_input_len is not None:
-        # Leave a small margin below `max_input_len` when context is not tiny.
-        safe_cap = max_input_len - 15 if max_input_len > 80 else max_input_len
-        max_size = min(max_size, safe_cap)
+        max_size = min(max_size, max_input_len)
     return max(0, max_size)
 
 
@@ -240,20 +256,17 @@ async def _send_warmup_request(
     bootstrap_room: int = 0,
     **kwargs: Any,
 ) -> None:
+    """Send one warmup request, clamping length to stay within model context bounds."""
     params = dict(sampling_params)
-    base_limit = _max_warmup_input_len(tm, max_new_tokens=1)
-    if base_limit is not None:
-        if base_limit < 1:
+    max_new_tokens = max(1, int(params.get("max_new_tokens", 1) or 1))
+    max_input = _max_warmup_input_len(tm, max_new_tokens)
+    if max_input is not None and max_input < 1:
+        params["max_new_tokens"] = 1
+        max_input = _max_warmup_input_len(tm, max_new_tokens=1)
+    if max_input is not None:
+        if max_input < 1:
             return
-        max_new_tokens = max(1, int(params.get("max_new_tokens", 1) or 1))
-        input_limit = _max_warmup_input_len(tm, max_new_tokens) or 0
-        if input_limit < 4 and max_new_tokens > 1:
-            max_new_tokens = max(1, min(max_new_tokens, (base_limit + 1) // 2))
-            params["max_new_tokens"] = max_new_tokens
-            input_limit = _max_warmup_input_len(tm, max_new_tokens) or 0
-        if input_limit < 1:
-            return
-        input_ids = input_ids[:input_limit]
+        input_ids = input_ids[:max_input]
 
     if not input_ids:
         return
@@ -268,154 +281,8 @@ async def _send_warmup_request(
         pass
 
 
-async def _warm_gpu_paths(disaggregation_mode: str, tm: TokenizerManager) -> None:
-    if not getattr(tm, "is_generation", True):
-        logger.info("Skipping GPU generation warmup for non-generation model.")
-        return
-
-    vocab_size = _positive_int(
-        getattr(getattr(tm, "model_config", None), "vocab_size", None)
-    )
-    if vocab_size is None:
-        token_low, token_high = 16, 1024
-    elif vocab_size > 32:
-        token_low, token_high = 16, min(vocab_size - 16, 2**15)
-    else:
-        token_low, token_high = 0, vocab_size
-
-    rng = np.random.default_rng(42)
-
-    def rand_ids(length: int) -> List[int]:
-        return [int(x) for x in rng.integers(token_low, token_high, size=length)]
-
-    def send(
-        input_ids: List[int],
-        sampling_params: Dict[str, Any],
-        bootstrap_room: int = 0,
-        **kwargs: Any,
-    ):
-        return _send_warmup_request(
-            disaggregation_mode,
-            tm,
-            input_ids,
-            sampling_params,
-            bootstrap_room,
-            **kwargs,
-        )
-
-    greedy = {"max_new_tokens": 4, "temperature": 0.0, "ignore_eos": True}
-    sampled = {
-        "max_new_tokens": 4,
-        "temperature": 0.6,
-        "top_k": 20,
-        "top_p": 0.95,
-        "ignore_eos": True,
-    }
-    penalty = {
-        **sampled,
-        "repetition_penalty": 1.05,
-        "frequency_penalty": 0.1,
-        "presence_penalty": 0.1,
-    }
-    max_input_len = _max_warmup_input_len(tm, max_new_tokens=1)
-
-    # 1. Sampling, decode batching, and penalty paths.
-    for length, params in (
-        (16, greedy),
-        (21, {**sampled, "max_new_tokens": 16}),
-        (
-            19,
-            {"max_new_tokens": 4, "temperature": 0.8, "top_p": 0.9, "ignore_eos": True},
-        ),
-        (24, {**sampled, "temperature": 0.7, "top_k": 50, "min_p": 0.05}),
-        (21, penalty),
-    ):
-        await send(rand_ids(length), params)
-
-    if max_input_len is None or max_input_len >= 64:
-        await asyncio.gather(
-            send(rand_ids(17), greedy, bootstrap_room=0),
-            send(rand_ids(23), sampled, bootstrap_room=1),
-        )
-        await asyncio.gather(
-            send(rand_ids(19), penalty, bootstrap_room=0),
-            send(rand_ids(27), penalty, bootstrap_room=1),
-        )
-
-    # 2. Output and prompt logprob paths.
-    top_logprobs = min(5, vocab_size) if vocab_size is not None else 5
-    logprob_kwargs = {
-        "return_logprob": True,
-        "top_logprobs_num": top_logprobs,
-        "return_text_in_logprobs": True,
-        "log_metrics": False,
-    }
-    await send(rand_ids(16), greedy, **logprob_kwargs)
-    await send(rand_ids(21), sampled, **logprob_kwargs)
-    if disaggregation_mode != "decode":
-        await send(
-            rand_ids(25),
-            {"max_new_tokens": 1, "temperature": 0.0},
-            logprob_start_len=0,
-            **logprob_kwargs,
-        )
-
-    # 3. Constrained decoding (JSON schema & regex FSMs).
-    grammar_backend = getattr(getattr(tm, "server_args", None), "grammar_backend", None)
-    if not getattr(tm, "skip_tokenizer_init", False) and grammar_backend != "none":
-        schema = '{"type":"object","properties":{"safe":{"type":"boolean"}},"required":["safe"]}'
-        await send(
-            rand_ids(16),
-            {"max_new_tokens": 8, "temperature": 0.0, "json_schema": schema},
-        )
-        await send(
-            rand_ids(16),
-            {"max_new_tokens": 4, "temperature": 0.0, "regex": r"(safe|unsafe)"},
-        )
-
-    # 4. Radix prefix-cache extend and prefill shapes.
-    max_prefill_size = _resolve_max_prefill_size(max_input_len)
-    extend_cap = _max_warmup_input_len(tm, max_new_tokens=2)
-    extend_max = (
-        min(max_prefill_size, extend_cap)
-        if extend_cap is not None
-        else max_prefill_size
-    )
-    prefix_len = min(64, max(0, extend_max - 2))
-    prefix = rand_ids(prefix_len) if prefix_len >= 4 else []
-    for tail_len in (7, 2, 7, 21, 96) if prefix else ():
-        if prefix_len + tail_len <= extend_max:
-            await send(prefix + rand_ids(tail_len), {**sampled, "max_new_tokens": 2})
-
-    prefill_seqs = [
-        rand_ids(size) for size in (3, 7, 21, 48) if size <= max_prefill_size
-    ]
-    prefill_seqs += [
-        list(prefix) if (size == prefix_len and prefix) else rand_ids(size)
-        for size in _prefill_shape_sizes(max_prefill_size)
-    ]
-    if prefill_seqs:
-        for input_ids in tqdm.tqdm(
-            prefill_seqs, desc=f"Warmup prefill shapes (up to {max_prefill_size})"
-        ):
-            await send(
-                input_ids,
-                {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True},
-            )
-
-    # 5. Flush synthetic warmup entries from the radix KV cache.
-    flush_fn = getattr(tm, "flush_cache", None)
-    if disaggregation_mode == "null" and callable(flush_fn):
-        try:
-            res = flush_fn()
-            if asyncio.iscoroutine(res):
-                await res
-        except Exception:
-            logger.debug("Post-warmup flush_cache skipped", exc_info=True)
-
-
-async def _warm_local_worker(tm: Any, app_state: Optional[Any]) -> None:
-    """Warm tokenizer, byte-level BPE cache, and chat template state."""
+async def _warm_tokenizer(tm: Any) -> None:
+    """Warm tokenizer encoding, byte-level BPE table, and Jinja chat template."""
     if getattr(tm, "skip_tokenizer_init", False):
         return
 
@@ -429,34 +296,24 @@ async def _warm_local_worker(tm: Any, app_state: Optional[Any]) -> None:
     except Exception:
         logger.debug("Tokenizer warmup skipped", exc_info=True)
 
-    if tokenizer is not None:
+    if tokenizer is None:
+        return
+
+    try:
+        from sglang.srt.entrypoints.openai.utils import token_id_to_bytes
+
+        await asyncio.to_thread(token_id_to_bytes, tokenizer, 0)
+    except Exception:
+        logger.debug("Byte-level BPE cache warmup skipped", exc_info=True)
+
+    if getattr(tokenizer, "chat_template", None) and hasattr(
+        tokenizer, "apply_chat_template"
+    ):
         try:
-            from sglang.srt.entrypoints.openai.utils import token_id_to_bytes
-
-            await asyncio.to_thread(token_id_to_bytes, tokenizer, 0)
-        except Exception:
-            logger.debug("Byte-level cache warmup skipped", exc_info=True)
-
-    serving_chat = (
-        getattr(app_state, "openai_serving_chat", None) if app_state else None
-    )
-    if serving_chat is not None and getattr(tm, "is_generation", True):
-        try:
-            from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-
-            req = ChatCompletionRequest(
-                messages=[
-                    {"role": "system", "content": "Assistant."},
-                    {"role": "user", "content": "Hi."},
-                ],
-                max_tokens=2,
-                temperature=0.6,
-                top_p=0.95,
-                logprobs=True,
-                top_logprobs=2,
-            )
             await asyncio.to_thread(
-                serving_chat._convert_to_internal_request, req, None
+                tokenizer.apply_chat_template,
+                [{"role": "user", "content": "Warmup."}],
+                tokenize=False,
             )
         except Exception:
             logger.debug("Chat template warmup skipped", exc_info=True)
@@ -464,5 +321,146 @@ async def _warm_local_worker(tm: Any, app_state: Optional[Any]) -> None:
 
 @warmup("all")
 async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    await _warm_gpu_paths(disaggregation_mode, tokenizer_manager)
-    await _warm_local_worker(tokenizer_manager, _current_app_state.get())
+    """End-to-end warmup covering sampling, penalties, logprobs, grammar, radix
+    prefix extend, prefill shapes, and tokenizer initialization.
+    """
+    if getattr(tokenizer_manager, "is_generation", True):
+        vocab_size = _positive_int(
+            getattr(
+                getattr(tokenizer_manager, "model_config", None), "vocab_size", None
+            )
+        )
+        max_token_id = min(vocab_size, 2**15) if vocab_size is not None else 2**15
+        rng = np.random.default_rng(42)
+
+        def rand_ids(length: int) -> List[int]:
+            return [int(x) for x in rng.integers(0, max_token_id, size=length)]
+
+        def send(
+            input_ids: List[int],
+            sampling_params: Dict[str, Any],
+            bootstrap_room: int = 0,
+            **kwargs: Any,
+        ):
+            return _send_warmup_request(
+                disaggregation_mode,
+                tokenizer_manager,
+                input_ids,
+                sampling_params,
+                bootstrap_room,
+                **kwargs,
+            )
+
+        greedy = {"max_new_tokens": 4, "temperature": 0.0, "ignore_eos": True}
+        sampled = {
+            "max_new_tokens": 4,
+            "temperature": 0.6,
+            "top_k": 20,
+            "top_p": 0.95,
+            "ignore_eos": True,
+        }
+        min_p = {
+            **sampled,
+            "temperature": 0.7,
+            "top_k": 50,
+            "min_p": 0.05,
+        }
+        penalty = {
+            **sampled,
+            "repetition_penalty": 1.05,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.1,
+        }
+
+        # 1. Sampling, decode batching (bs=2), and penalty paths.
+        for params in (greedy, sampled, min_p, penalty):
+            await send(rand_ids(_WARMUP_PROMPT_LEN), params)
+
+        max_input_len = _max_warmup_input_len(tokenizer_manager, max_new_tokens=1)
+        if max_input_len is None or max_input_len >= _WARMUP_PROMPT_LEN:
+            await asyncio.gather(
+                send(rand_ids(_WARMUP_PROMPT_LEN), greedy, bootstrap_room=0),
+                send(rand_ids(_WARMUP_PROMPT_LEN), sampled, bootstrap_room=1),
+            )
+            await asyncio.gather(
+                send(rand_ids(_WARMUP_PROMPT_LEN), penalty, bootstrap_room=0),
+                send(rand_ids(_WARMUP_PROMPT_LEN), penalty, bootstrap_room=1),
+            )
+
+        # 2. Output and prompt logprob paths.
+        top_logprobs = min(5, vocab_size) if vocab_size is not None else 5
+        logprob_kwargs = {
+            "return_logprob": True,
+            "top_logprobs_num": top_logprobs,
+            "return_text_in_logprobs": True,
+            "log_metrics": False,
+        }
+        await send(rand_ids(_WARMUP_PROMPT_LEN), greedy, **logprob_kwargs)
+        await send(rand_ids(_WARMUP_PROMPT_LEN), sampled, **logprob_kwargs)
+        if disaggregation_mode != "decode":
+            await send(
+                rand_ids(_WARMUP_PROMPT_LEN),
+                {"max_new_tokens": 1, "temperature": 0.0},
+                logprob_start_len=0,
+                **logprob_kwargs,
+            )
+
+        # 3. Constrained decoding (JSON schema and regex FSMs).
+        grammar_backend = getattr(
+            getattr(tokenizer_manager, "server_args", None), "grammar_backend", None
+        )
+        if (
+            not getattr(tokenizer_manager, "skip_tokenizer_init", False)
+            and grammar_backend != "none"
+        ):
+            schema = '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}'
+            await send(
+                rand_ids(_WARMUP_PROMPT_LEN),
+                {"max_new_tokens": 8, "temperature": 0.0, "json_schema": schema},
+            )
+            await send(
+                rand_ids(_WARMUP_PROMPT_LEN),
+                {"max_new_tokens": 4, "temperature": 0.0, "regex": r"(yes|no)"},
+            )
+
+        # 4. Radix prefix-cache extend and prefill shapes up to context limit.
+        max_prefill_size = _resolve_max_prefill_size(max_input_len)
+        extend_cap = _max_warmup_input_len(tokenizer_manager, max_new_tokens=2)
+        extend_max = (
+            min(max_prefill_size, extend_cap)
+            if extend_cap is not None
+            else max_prefill_size
+        )
+        if extend_max >= _PREFIX_LEN + min(_PREFIX_EXTEND_SUFFIX_LENS):
+            prefix = rand_ids(_PREFIX_LEN)
+            for suffix_len in _PREFIX_EXTEND_SUFFIX_LENS:
+                if _PREFIX_LEN + suffix_len <= extend_max:
+                    await send(
+                        prefix + rand_ids(suffix_len),
+                        {**sampled, "max_new_tokens": 2},
+                    )
+
+        prefill_sizes = [
+            size for size in _SHORT_PREFILL_SIZES if size <= max_prefill_size
+        ] + _prefill_shape_sizes(max_prefill_size)
+        if prefill_sizes:
+            for size in tqdm.tqdm(
+                prefill_sizes,
+                desc=f"Warmup prefill shapes (up to {max_prefill_size})",
+            ):
+                await send(
+                    rand_ids(size),
+                    {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+                )
+
+        # 5. Flush synthetic warmup entries from the radix KV cache.
+        flush_fn = getattr(tokenizer_manager, "flush_cache", None)
+        if disaggregation_mode == "null" and callable(flush_fn):
+            try:
+                res = flush_fn()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                logger.debug("Post-warmup flush_cache skipped", exc_info=True)
+
+    await _warm_tokenizer(tokenizer_manager)

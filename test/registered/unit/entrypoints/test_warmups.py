@@ -42,6 +42,11 @@ class _FakeTokenizerManager:
             chunked_prefill_size=4096,
             max_prefill_tokens=16384,
         )
+        self.tokenizer = SimpleNamespace(
+            encode=MagicMock(return_value=[1, 2]),
+            chat_template="{{ messages }}",
+            apply_chat_template=MagicMock(return_value="Warmup."),
+        )
         self.async_dynamic_batch_tokenizer = SimpleNamespace(
             encode=AsyncMock(return_value=[1, 2])
         )
@@ -74,17 +79,11 @@ class _FakeTokenizerManager:
 
 def test_warmup_all_covers_all_paths_and_flushes_once():
     tm = _FakeTokenizerManager(context_len=65536, max_req_input_len=40960)
-    chat = SimpleNamespace(
-        _convert_to_internal_request=MagicMock(return_value=(None, None))
-    )
-    asyncio.run(
-        warmup_mod.execute_warmups(
-            "null", ["all"], tm, app_state=SimpleNamespace(openai_serving_chat=chat)
-        )
-    )
+    asyncio.run(warmup_mod.execute_warmups("null", ["all"], tm))
 
     lengths = [len(r.input_ids) for r in tm.requests if r.input_ids]
-    assert max(lengths) == 32768 and {3, 21, 85}.issubset(lengths)
+    assert max(lengths) == 32768
+    assert {16, 32, 80, 128}.issubset(lengths)
     assert any(r.return_logprob and r.logprob_start_len == 0 for r in tm.requests)
     assert any(
         (r.sampling_params or {}).get("repetition_penalty") == 1.05 for r in tm.requests
@@ -93,7 +92,7 @@ def test_warmup_all_covers_all_paths_and_flushes_once():
     assert any("json_schema" in (r.sampling_params or {}) for r in tm.requests)
     assert any("regex" in (r.sampling_params or {}) for r in tm.requests)
     tm.async_dynamic_batch_tokenizer.encode.assert_awaited_once()
-    chat._convert_to_internal_request.assert_called_once()
+    tm.tokenizer.apply_chat_template.assert_called_once()
     assert tm.flush_count == 1
 
 
