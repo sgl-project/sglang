@@ -86,7 +86,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
         native_segment_profile_id=options["native_segment_profile_id"],
         native_source_binding=options["source_binding"],
     )
-    monkeypatch.setattr(sdk.PerfDatabase, "open_fidb", lambda *a, **k: database)
+    monkeypatch.setattr(sdk, "PerfDB", lambda *a, **k: database, raising=False)
     monkeypatch.setattr(
         simopus_dspark,
         "_bind_local_model_config",
@@ -136,3 +136,42 @@ def test_native_config_rejects_excluded_warm_and_joint_routes(monkeypatch):
         )
         with pytest.raises(ValueError, match="unknown native SimOpus"):
             ConfigManager.get_inference_time_predictor(None, None, None)
+
+
+@pytest.mark.parametrize("root", ["relative/source", "opaque-native-binding"])
+def test_native_config_delegates_source_binding_to_sdk(monkeypatch, tmp_path, root):
+    from sglang_simulator.simulation.manager.config import ConfigManager
+    from sglang_simulator.simulation.manager.env import Envs
+    from sglang_simulator.time_predictor import simopus_dspark, simopus_sdk
+
+    binding = {"root": root, "profile": {"sha256": "a" * 64}}
+    calls = []
+    resolved = {"root": "SDK-resolved opaque identity"}
+
+    def resolve(value, **kwargs):
+        calls.append((value, kwargs))
+        return resolved
+
+    monkeypatch.setattr(
+        simopus_sdk,
+        "load_sdk",
+        lambda: (None, NS(resolve_native_source_binding=resolve)),
+    )
+    monkeypatch.setattr(Envs, "config_path", lambda: str(tmp_path / "case.json"))
+    monkeypatch.setattr(
+        ConfigManager,
+        "_raw_config",
+        {
+            "predictor": {
+                "name": "simopus",
+                "native_segment_profile_id": "a" * 64,
+                "native_source_binding": binding,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        simopus_dspark, "SimOpusDSparkTimePredictor", lambda *a, **kw: kw
+    )
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result["native_source_binding"] is resolved
+    assert calls == [(binding, {"base_dir": tmp_path})]
