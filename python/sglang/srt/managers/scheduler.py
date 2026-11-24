@@ -2923,7 +2923,6 @@ class Scheduler(
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
-            server_args=self.server_args,
             # The worker already reports logical DCP/page-interleave capacity.
             max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
