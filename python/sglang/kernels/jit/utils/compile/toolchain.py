@@ -21,7 +21,7 @@ from typing import List, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.arch import get_compile_arch
+from sglang.kernels.jit.utils.arch import CompileArch, get_compile_arch
 from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_sail_runtime
 from sglang.srt.environ import envs
 
@@ -175,24 +175,24 @@ def tvm_ffi_paths() -> Tuple[Tuple[str, ...], str, str]:
     return includes, str(lib.parent), lib.stem.removeprefix("lib")
 
 
-def target_flags(kernel_name: str = "") -> List[str]:
-    """The device flags that pin the build to this GPU.
+def target_flags(arch: CompileArch | None = None) -> List[str]:
+    """The device flags that pin the build to ``arch`` (CUDA; default: this GPU).
 
     Emitted from the architecture sglang already detected, rather than left to
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
     if is_sail_runtime():
-        arch = envs.SGLANG_SAIL_GPU_ARCH.get()
-        if arch not in _SAIL_GPU_ARCHS:
+        sail_arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+        if sail_arch not in _SAIL_GPU_ARCHS:
             raise ValueError(
-                f"Invalid SGLANG_SAIL_GPU_ARCH={arch!r}; expected one of "
+                f"Invalid SGLANG_SAIL_GPU_ARCH={sail_arch!r}; expected one of "
                 f"{', '.join(_SAIL_GPU_ARCHS)}"
             )
-        return [f"--gpu-architecture={arch}"]
+        return [f"--gpu-architecture={sail_arch}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
-    arch = get_compile_arch(kernel_name)
+    arch = arch or get_compile_arch()
     target = f"{arch.major}{arch.minor}{arch.suffix}"
     return [f"-gencode=arch=compute_{target},code=sm_{target}"]
 

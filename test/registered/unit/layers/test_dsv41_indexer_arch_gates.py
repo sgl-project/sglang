@@ -14,6 +14,7 @@ v41_indexer / index_logits module namespaces.
 
 import unittest
 from contextlib import ExitStack
+from itertools import product
 from types import SimpleNamespace
 from unittest import mock
 
@@ -67,6 +68,7 @@ def _clear_gate_caches():
     indexer.is_sm100.cache_clear()
     indexer.is_sm100_or_newer.cache_clear()
     indexer._use_deep_gemm_prefill.cache_clear()
+    indexer._use_sm90_prefill_scores.cache_clear()
     indexer.has_dense_fp4_indexer.cache_clear()
     index_logits.index_logits_dtype.cache_clear()
     index_logits.index_weights_dtype.cache_clear()
@@ -86,6 +88,11 @@ class TestV41IndexerArchGates(CustomTestCase):
         )
         stack.enter_context(
             mock.patch.object(index_logits, "current_arch", return_value=arch)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                indexer, "flat_index_logits_widen_to_fp8", return_value=arch.is_sm(9)
+            )
         )
         stack.enter_context(
             mock.patch.object(
@@ -129,18 +136,48 @@ class TestV41IndexerArchGates(CustomTestCase):
             full = indexer.make_full_topk_indexer(
                 token_to_kv_pool=SimpleNamespace(),
                 req_to_token=torch.empty(0),
+                index_heads=64,
+                index_topk=512,
             )
             self.assertTrue(full.use_deep_gemm_prefill)
             self.assertTrue(full.use_deep_gemm_decode)
 
-    def test_full_topk_indexer_keeps_hopper_on_torch(self):
-        with self._route(_FakeCudaArch((9, 0))):
-            full = indexer.make_full_topk_indexer(
-                token_to_kv_pool=SimpleNamespace(),
-                req_to_token=torch.empty(0),
-            )
-            self.assertFalse(full.use_deep_gemm_prefill)
-            self.assertFalse(full.use_deep_gemm_decode)
+    def test_hopper_prefill_consumer_opt_in(self):
+        for deep_gemm_present, enable_consumer in product((False, True), repeat=2):
+            with self.subTest(
+                deep_gemm_present=deep_gemm_present, enable_consumer=enable_consumer
+            ):
+                with (
+                    self._route(
+                        _FakeCudaArch((9, 0)), deep_gemm_present=deep_gemm_present
+                    ),
+                    envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.override(True),
+                    envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.override(
+                        enable_consumer
+                    ),
+                ):
+                    full = indexer.make_full_topk_indexer(
+                        token_to_kv_pool=SimpleNamespace(),
+                        req_to_token=torch.empty(0),
+                        index_heads=64,
+                        index_topk=512,
+                    )
+                    prefill, _ = indexer.make_candidate_indexer(
+                        token_to_kv_pool=SimpleNamespace(),
+                        req_to_token=torch.empty(0),
+                        page_size=64,
+                        candidate_topk_blocks=8,
+                        candidate_block_size=8,
+                    )
+                self.assertEqual(full.use_deep_gemm_prefill, deep_gemm_present)
+                self.assertEqual(prefill.use_deep_gemm_publish, deep_gemm_present)
+                self.assertFalse(full.use_deep_gemm_decode)
+                self.assertFalse(full.use_prefill_lite_topk)
+                self.assertFalse(prefill.use_deep_gemm_consume)
+                self.assertEqual(
+                    prefill.use_sm90_deep_gemm_consume,
+                    deep_gemm_present and enable_consumer,
+                )
 
     def test_deep_gemm_prefill_still_needs_deep_gemm(self):
         with self._route(_FakeCudaArch((12, 1)), deep_gemm_present=False):

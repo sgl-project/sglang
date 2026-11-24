@@ -101,10 +101,9 @@ def _replace_sampling_params_for_prompt(
 
 class DiffGenerator:
     """
-    A unified class for generating images/videos using diffusion models.
+    A unified interface for image, video, audio, and action generation.
 
-    This class provides a simple interface for image/video generation with rich
-    customization options, similar to popular frameworks like HF Diffusers.
+    Use generate for media pipelines and generate_action for action policies.
     """
 
     def __init__(

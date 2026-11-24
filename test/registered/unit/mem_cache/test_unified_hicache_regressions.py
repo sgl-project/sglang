@@ -1,6 +1,7 @@
 """Host reloads must preserve ID domains, allocation ownership, and stream order."""
 
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -59,20 +60,24 @@ class TestHostGateCapacity(unittest.TestCase):
     def test_capacity_read_tracks_holds(self):
         from test_unified_capacity_memo import _build
 
-        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+        from sglang.test.unified_allocator_fixtures import (
+            largest_take,
+            setup_allocator_context,
+        )
 
         setup_allocator_context()
         inst, allocator, kvcache = _build(lazy=True)
         ids = inst._alloc(allocator, kvcache, 8)
         allocator.free_swa(ids[2:6])
-        before = allocator.full_available_size()
+        owner = allocator.full_attn_allocator.sub_pool_name
+        before = largest_take(allocator, owner)
         hold_every_band(allocator)
-        # A held band's holes cannot be compacted away: the read drops.
-        self.assertGreater(before, allocator.full_available_size())
+        # A held band's holes cannot be compacted away: the take shrinks.
+        self.assertGreater(before, largest_take(allocator, owner))
         self.assertTrue(any(band.blocked for band in chain_snapshot(allocator).bands))
         self.assertEqual(allocator.verify_byte_accounting(), [])
         release_every_band(allocator)
-        self.assertEqual(allocator.full_available_size(), before)
+        self.assertEqual(largest_take(allocator, owner), before)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -119,6 +124,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = controller
         cache.ongoing_write_through = {1: None, 2: None}
+        cache._fenced_write_acks = deque()
         cache._finish_write_through_ack = cache.ongoing_write_through.pop
         cache.metrics_collector = None
         # Warm up temporary allocations so cudaMalloc cannot hide a missing fence.

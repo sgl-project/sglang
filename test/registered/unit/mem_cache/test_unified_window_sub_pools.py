@@ -314,32 +314,50 @@ class TestEveryWindowBudget(CustomTestCase):
         storage = _storage((16, 8))
         return storage.allocator
 
-    def _fits(self, allocator, budgets):
+    def _fits(self, allocator, held_back):
+        """A one-page request beside what each window's budget holds back
+        (a pool sharing memory counts its budgets from zero)."""
         page = allocator.page_size
         names = allocator.window_pool_names()
         demand = KVDemand(page, dict.fromkeys(names, page), 0)
         return allocator.prealloc_fits(
             demand,
             evictable={},
-            full_budget_tokens=allocator.full_available_size(),
-            window_budget_tokens=budgets,
+            full_budget_tokens=0,
+            window_budget_tokens={name: -tokens for name, tokens in held_back.items()},
         )
+
+    def _room(self, allocator, window):
+        """The most tokens ``window`` can hold back beside the request."""
+        page = allocator.page_size
+        names = allocator.window_pool_names()
+        low, high = 0, allocator.size_swa // page + 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            windows = dict.fromkeys(names, page)
+            windows[window] += mid * page
+            if allocator.admits(KVDemand(page, windows, 0), evictable={}):
+                low = mid
+            else:
+                high = mid - 1
+        return low * page
 
     def test_a_further_window_holding_back_its_growth_refuses(self):
         allocator = self._allocator()
         target = allocator.target_window_pool()
         (further,) = [n for n in allocator.window_pool_names() if n != target]
         page = allocator.page_size
-        generous = {target: allocator.window_available_size(target)}
-        reachable = allocator.window_available_size(further)
-        # Holding nothing back, the further window admits the request ...
-        self.assertTrue(self._fits(allocator, generous))
-        self.assertTrue(self._fits(allocator, {**generous, further: reachable}))
-        # ... and holding all but this request's page back for running
-        # requests' growth refuses it, though the target's window could serve.
-        self.assertFalse(self._fits(allocator, {**generous, further: page}))
-        # A request beyond its window's budget is refused outright.
-        self.assertFalse(self._fits(allocator, {**generous, further: page - 1}))
+        room = self._room(allocator, further)
+        self.assertGreater(room, 0)
+        # Holding nothing back, or all the room it has, the further window
+        # admits the request ...
+        self.assertTrue(self._fits(allocator, {}))
+        self.assertTrue(self._fits(allocator, {further: room}))
+        # ... and holding back one page more for running requests' growth
+        # refuses it, though the target's window could serve.
+        self.assertFalse(self._fits(allocator, {further: room + page}))
+        # A budget above zero holds nothing back.
+        self.assertTrue(self._fits(allocator, {further: -page}))
 
 
 class TestSharedBytesServeEitherSide(CustomTestCase):
@@ -372,18 +390,16 @@ class TestSharedBytesServeEitherSide(CustomTestCase):
         owner = allocator.full_attn_allocator.sub_pool_name
         # Every row is a cached entry the prefix cache could evict.
         evictable = {owner: held, window: held}
-        budget = allocator.full_available_size() + held
-        demand = KVDemand(budget + held // 2, {window: 4}, 0)
-        self.assertGreater(demand.full_tokens, budget)
+        # More owner tokens than evicting the owner's own entries frees.
+        demand = KVDemand(held + held // 2, {window: 4}, 0)
         self.assertTrue(allocator.admits(demand, evictable=evictable))
+        # Budgets holding nothing back (counted from zero) admit it too.
         self.assertTrue(
             allocator.prealloc_fits(
                 demand,
                 evictable=evictable,
-                full_budget_tokens=budget,
-                window_budget_tokens={
-                    window: allocator.window_available_size(window) + held
-                },
+                full_budget_tokens=0,
+                window_budget_tokens={window: 0},
             )
         )
 
@@ -830,7 +846,8 @@ class TestThreeWindowTree(CustomTestCase):
                 )
                 for ct, name in zip(slots, names):
                     self.assertEqual(
-                        cache.window_available_size(name), a.units_available(name)
+                        cache.window_available_size(name),
+                        a.estimated_units_available(name),
                     )
                 ct, name = slots[victim], names[victim]
                 before = {
@@ -852,7 +869,8 @@ class TestThreeWindowTree(CustomTestCase):
                 cache.unlock(lock)
                 # A demand on this window alone is reclaimed for it alone.
                 held = {b.sub_pool_name: b.allocated_count() for b in a.bands}
-                pages = -(-a.units_available(name) // 4) + 1
+                # More than the estimate, an upper bound: only a reclaim fits it.
+                pages = -(-a.estimated_units_available(name) // 4) + 1
                 cache.evict_for_alloc(KVDemand(window_tokens={name: pages * 4}))
                 self.assertTrue(a.units_fit({name: pages}))
                 after = {b.sub_pool_name: b.allocated_count() for b in a.bands}

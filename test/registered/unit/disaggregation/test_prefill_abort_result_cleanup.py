@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
@@ -220,7 +221,7 @@ class TestPrefillCompleteResult(CustomTestCase):
             )
 
         req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
-        scheduler.prefill_launched_reqs.join([req])
+        move([req], scheduler.prefill_launched_reqs)
         scheduler.process_batch_result_disagg_prefill(batch, result)
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
         self.assertTrue(req.pending_bootstrap)
@@ -246,7 +247,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         req = _Req()
         req.to_finish = None
         retried = []
-        scheduler.optimistic_release_and_requeue = lambda r, src: retried.append(r)
+        scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])

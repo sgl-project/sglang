@@ -2,7 +2,8 @@
 """FP8 flash-attention forward for SM120 in CuTe-DSL: E4M3 QK and PV, FP32 softmax.
 
     Q, K   [H, padded_S, 128]  E4M3, queries padded to 128 rows, keys to 32
-    V^T    [H, 128, padded_S]  E4M3, keys stored in key_order_for_positions() order
+    V^T    [H, 128, padded_S]  E4M3, keys in the PV A-fragment order: inside every
+                               16-key group, position 4t + i holds key 8*(i//2) + 2t + i%2
     scales [3, H]              FP32 per-head descale of Q, K, V
     O      [H, S, 128]         BF16
     LSE    [H, S]              FP32
@@ -548,15 +549,3 @@ def fp8_attention_host(
         block=(num_threads, 1, 1),
         stream=stream,
     )
-
-
-def key_order_for_positions(positions):
-    """Key held at each stored V^T position.
-
-    Inside every 16-key group, position 4t + i holds key 8*(i//2) + 2t + i%2:
-    the k order of the PV A fragment packed straight from the score fragment.
-    """
-    group = positions // 16 * 16
-    quad = (positions % 16) // 4
-    element = positions % 4
-    return group + 8 * (element // 2) + 2 * quad + element % 2
