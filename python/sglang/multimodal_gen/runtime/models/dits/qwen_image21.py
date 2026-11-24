@@ -906,7 +906,8 @@ class QwenImage21Attention(nn.Module):
                 )
             prefix_output = self.to_out[0](cat_outputs(outputs, dim=1).flatten(2))[0]
             if cache is not None:
-                cache.update(key=kp, value=vp)
+                # V can be a view of the packed Q/K/V projection; the cache keeps only V.
+                cache.update(key=kp, value=vp.contiguous())
         if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
             cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp, k_out, v_out)
             if cuda_packed is not None:
