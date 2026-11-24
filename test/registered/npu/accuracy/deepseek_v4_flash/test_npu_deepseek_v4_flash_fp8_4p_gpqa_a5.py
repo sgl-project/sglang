@@ -10,8 +10,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=14400,
-    suite="nightly-acc-test-4-npu-a5-mix",
+    est_time=7200,
+    suite="nightly-acc-test-4-npu-a5",
     nightly=True,
 )
 
