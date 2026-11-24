@@ -190,6 +190,32 @@ class TestRequestEndCheckpoints(CustomTestCase):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_level2_publishes_the_prompt_end(self):
+        """The next turn of a chat diverges where this prompt ends whenever the
+        template does not replay the generated turn."""
+        cache, allocator, pool = _build(2)
+        partial = _running_req(cache, allocator, pool, up_to=8)
+        cache.checkpoint(partial, up_to=8)
+        self.assertEqual(_cached_len(cache, PROMPT), 0)
+
+        req = _running_req(cache, allocator, pool, up_to=len(PROMPT))
+        cache.checkpoint(req, up_to=len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT), len(PROMPT))
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
+    def test_level2_defers_a_decode_checkpoint(self):
+        cache, allocator, pool = _build(2)
+        req = _running_req(cache, allocator, pool, up_to=len(PROMPT))
+        req.output_ids = array("q", range(100, 108))
+        req.refresh_fill_ids()
+        req.kv.mamba_last_track_seqlen = len(PROMPT) + 4
+        cache.checkpoint(req, up_to=len(PROMPT) + 8)
+        self.assertEqual(_cached_len(cache, PROMPT), 0)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, len(PROMPT) + 4)
+        cache.sanity_check()
+
     def test_level2_keeps_every_chunk_with_sliding_window(self):
         cache, allocator, pool = _build(
             2,
@@ -439,7 +465,7 @@ def _spec_request_states(level, strategy, overlap, prompt_len, accept_lens, stop
 
 
 class TestSpecDecodeRequestEndState(CustomTestCase):
-    """Level 2 keeps the prompt's checkpoint in the request through every verify
+    """Level 2 keeps each decode checkpoint in the request through every verify
     until it finishes, and a stop inside a verify's accepted run finishes it
     mid-run. A state the tree keeps under one length but written at another
     resumes the next turn from the wrong state, with no error."""
@@ -466,13 +492,14 @@ class TestSpecDecodeRequestEndState(CustomTestCase):
                 states = _spec_request_states(2, strategy, overlap, 11, (1, 1, 1), 0)
                 self.assertEqual(states, [(8, 8)])
 
-    def test_level2_finish_keeps_the_latest_decode_state(self):
-        # The second verify runs 15 -> 19 past 16; the finish keeps that state
-        # and drops the prompt's at 8 (one state per path).
+    def test_level2_finish_adds_the_latest_decode_state(self):
+        # The prefill published the prompt's state at 8; the second verify runs
+        # 15 -> 19 past 16 and the finish adds that state. The prompt's stays for
+        # a next turn that does not replay the answer.
         for strategy in ("extra_buffer", "extra_buffer_lazy"):
             with self.subTest(strategy=strategy):
                 states = _spec_request_states(2, strategy, True, 11, (4, 4, 1), 0)
-                self.assertEqual(states, [(16, 16)])
+                self.assertEqual(states, [(16, 16), (8, 8)])
 
     def test_level3_finish_adds_the_latest_decode_state(self):
         # The prefill donated the prompt's state at 8; the finish adds the state the
