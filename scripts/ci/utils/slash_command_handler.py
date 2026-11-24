@@ -34,6 +34,7 @@ from run_ci_approval import (  # noqa: E402
     APPROVAL_WORKFLOWS,
     APPROVER_REPO_PERMISSIONS,
     approval_workflows_for,
+    author_may_approve,
     can_approve,
     head_seen_by,
     is_approved,
@@ -356,54 +357,66 @@ def _reply_bad_tier_args(pr, comment, command, unknown, tiers):
     comment.create_reaction("confused")
 
 
-def handle_tag_run_ci(
-    gh_repo, pr, comment, user_perms, react_on_success=True, tier_labels=()
-):
-    """
-    Handles the /tag-run-ci-label command.
+def _approve_head(gh_repo, pr, comment, user_perms):
+    """Check that the commenter may approve the PR's head commit, then record it.
 
-    tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
-    the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
-    their own label, so `run-ci` is always added alongside. The commenter
-    must pass run_ci_approval.can_approve, for every tier.
-
-    Adding `run-ci` here also approves the PR's head commit for the workflows
-    that gate on a per-commit approval (run_ci_approval.APPROVAL_WORKFLOWS), but
-    only a head the commenter could have seen: one pushed before the comment
-    was posted.
-
-    Labels added here start no run (GITHUB_TOKEN label events trigger no
-    workflow); the callers re-run the gated runs.
-
-    Returns True if action was taken, False otherwise.
+    Returns (ok, approved): ok is False after a refusal, answered here; approved
+    is False when the PR's author may approve, so nothing needs recording.
     """
     user_login = comment.user.login
     allowed, reason = can_approve(gh_repo, user_login, user_perms)
     if not allowed:
         print(f"Permission denied: {reason}.")
-        pr.create_issue_comment(
-            f"`run-ci` was not added and no commit was approved for CI: {reason}."
-        )
+        pr.create_issue_comment(f"No commit was approved for CI: {reason}.")
         comment.create_reaction("confused")
-        return False
+        return False, False
 
+    approve_commit = not author_may_approve(gh_repo, pr.user.login)
     head_sha = pr.head.sha
-    if not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
+    if approve_commit and not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
         print(f"Not approving {head_sha}: pushed after the comment, or no run yet.")
         pr.create_issue_comment(
-            f"`run-ci` was not added and no commit was approved for CI: the head "
-            f"{head_sha[:8]} was pushed after this comment, or CI has not started "
-            "for it yet. Review the current head, then post the command again."
+            f"No commit was approved for CI: the head {head_sha[:8]} was pushed "
+            "after this comment, or CI has not started for it yet. Review the "
+            "current head, then post the command again."
         )
         comment.create_reaction("confused")
+        return False, False
+
+    if approve_commit:
+        record_approval(gh_repo, head_sha, user_login)
+    return True, approve_commit
+
+
+def handle_tag_run_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, tier_labels=()
+):
+    """
+    /tag-and-rerun-ci and the /run-* layer commands: approve the head commit,
+    then add `run-ci` and the `run-ci-<tier>` labels of the named tiers.
+
+    Labels added here start no run (GITHUB_TOKEN label events trigger no
+    workflow); the callers re-run the gated runs. Returns True on success.
+    """
+    ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
+    if not ok:
         return False
 
     labels = ["run-ci", *tier_labels]
-    print(f"Permission granted. Adding labels: {labels}.")
+    print(f"Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
-    record_approval(gh_repo, head_sha, user_login)
-    pr.create_issue_comment(f"✅ Approved by {user_login}: CI runs on {head_sha}.")
+
+    user_login = comment.user.login
+    if approved:
+        pr.create_issue_comment(
+            f"✅ Approved by {user_login}: CI runs on {pr.head.sha}."
+        )
+    else:
+        pr.create_issue_comment(
+            f"✅ `run-ci` added by {user_login}: {pr.user.login} may approve, so CI "
+            "runs on every push."
+        )
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -414,9 +427,41 @@ def handle_tag_run_ci(
     return True
 
 
+def handle_approve_ci(gh_repo, pr, comment, user_perms):
+    """
+    /approve-ci: approve a new head commit of a PR that already has `run-ci`.
+
+    Returns True if the head was approved, so its gate-skipped runs can run.
+    """
+    if "run-ci" not in {label.name for label in pr.get_labels()}:
+        pr.create_issue_comment(
+            "No commit was approved for CI: the PR lacks `run-ci`. "
+            "`/tag-and-rerun-ci` adds it and approves the head."
+        )
+        comment.create_reaction("confused")
+        return False
+
+    ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
+    if not ok:
+        return False
+    if not approved:
+        pr.create_issue_comment(
+            f"✅ Nothing to approve: {pr.user.login} may approve, so `run-ci` "
+            "alone runs CI on every push."
+        )
+        comment.create_reaction("+1")
+        return False
+
+    pr.create_issue_comment(
+        f"✅ Approved by {comment.user.login}: CI runs on {pr.head.sha}."
+    )
+    comment.create_reaction("+1")
+    return True
+
+
 def _rerun_gated_runs_after_approval(gh_repo, pr):
     """Re-run the approval workflows' runs whose gate skipped before the approval."""
-    print("Waiting 5 seconds for labels to propagate...")
+    print("Waiting 5 seconds for labels and the approval to propagate...")
     time.sleep(5)
     labels = {label.name for label in pr.get_labels()}
     for _, message in rerun_gated_runs(
@@ -597,6 +642,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     if left_skipped:
         # Left alone, a run whose tests the gate skipped would read as the bot
         # being down; say what the PR still lacks.
+        approve_command = "/approve-ci" if "run-ci" in labels else "/tag-and-rerun-ci"
         missing = [
             step
             for lacking, step in (
@@ -607,7 +653,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 ),
                 (
                     left_unapproved,
-                    "have a maintainer approve this commit (`/tag-and-rerun-ci`)",
+                    f"have a maintainer approve this commit (`{approve_command}`)",
                 ),
             )
             if lacking
@@ -1970,8 +2016,8 @@ OWNED_COMMAND_PREFIXES = ("/tag-", "/rerun-", "/run-")
 # Suggestion targets. Documented spellings only, so a typo is pointed at the
 # canonical name rather than at an undocumented alias.
 KNOWN_COMMANDS = (
-    "/tag-run-ci-label",
     "/tag-and-rerun-ci",
+    "/approve-ci",
     "/rerun-failed-ci",
     "/rerun-group",
     "/rerun-test",
@@ -2063,7 +2109,8 @@ def main():
 
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires run_ci_approval.can_approve.
+    # Note: the labeling commands and /approve-ci still require
+    # run_ci_approval.can_approve.
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -2089,11 +2136,12 @@ def main():
     command = tokens[0] if tokens else ""
     tiers = load_opt_in_tiers()
 
-    is_tag = command.startswith("/tag-run-ci-label")
     is_tag_and_rerun = command.startswith("/tag-and-rerun-ci")
+    # Takes no arguments; like /rerun-failed-ci, it ignores any.
+    is_approve = command.startswith("/approve-ci")
     # Editing an old comment would approve whatever the head is by then.
     if get_env_var("COMMENT_ACTION") == "edited" and (
-        command in LAYER_COMMANDS or is_tag or is_tag_and_rerun
+        command in LAYER_COMMANDS or is_tag_and_rerun or is_approve
     ):
         pr.create_issue_comment(
             f"`{command}` in an edited comment does nothing: only a new comment "
@@ -2101,9 +2149,7 @@ def main():
         )
         comment.create_reaction("confused")
         return
-    if (command in LAYER_COMMANDS or is_tag or is_tag_and_rerun) and "extra" in tokens[
-        1:
-    ]:
+    if (command in LAYER_COMMANDS or is_tag_and_rerun) and "extra" in tokens[1:]:
         choices = ", ".join(f"`{name}`" for name in _hardware_names(tiers))
         pr.create_issue_comment(
             "⛔ The shared `extra` tier and `run-ci-extra` label are retired. "
@@ -2132,15 +2178,15 @@ def main():
 
     # Labeling commands resolve their arguments as /run-ci does.
     tier_names = []
-    if is_tag or is_tag_and_rerun:
+    if is_tag_and_rerun:
         tier_names, unknown = _resolve_tier_args(tokens[1:], tiers, "base")
         if unknown:
             _reply_bad_tier_args(pr, comment, command, unknown, tiers)
             return
     tier_labels = [tiers[name]["label"] for name in tier_names if tiers[name]["label"]]
 
-    if is_tag:
-        if handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels):
+    if is_approve:
+        if handle_approve_ci(repo, pr, comment, user_perms):
             _rerun_gated_runs_after_approval(repo, pr)
             _refresh_pr_states(repo, pr)
 
