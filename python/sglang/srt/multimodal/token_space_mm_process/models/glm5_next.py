@@ -59,18 +59,24 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             # HF Glm5NextProcessor.replace_image_token reads the image processor's.
             "merge_size": image_processor.merge_size,
         }
+        # Fixed at construction and equal on every worker's processor clone, so
+        # merge the HF processor's kwargs once, not on every request.
+        merged = processor._merge_kwargs(
+            processor.valid_processor_kwargs,
+            tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
+            return_tensors="pt",
+            padding=True,
+        )
+        self._image_kwargs = {**merged["images_kwargs"], **self.image_config}
+        self._return_mm_token_type_ids = merged["text_kwargs"].get(
+            "return_mm_token_type_ids", False
+        )
 
     def resolve_media_options(
         self, processor, *, image_device=None, video_device=None
     ) -> dict:
         """Image options as the HF processor call merges them, plus the config."""
-        image_kwargs = processor._merge_kwargs(
-            processor.valid_processor_kwargs,
-            tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
-            return_tensors="pt",
-            padding=True,
-        )["images_kwargs"]
-        image_kwargs.update(self.image_config)
+        image_kwargs = dict(self._image_kwargs)
         if image_device is not None:
             image_kwargs["device"] = image_device
         return {
@@ -99,12 +105,8 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         Glm5NextProcessor returns mm_token_type_ids by default. A single unpadded
         request needs no attention_mask.
         """
-        text_kwargs = processor._merge_kwargs(
-            processor.valid_processor_kwargs,
-            tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
-        )["text_kwargs"]
         output = {"input_ids": torch.tensor([input_ids], dtype=torch.long)}
-        if text_kwargs.get("return_mm_token_type_ids", False):
+        if self._return_mm_token_type_ids:
             output["mm_token_type_ids"] = torch.tensor(
                 processor.create_mm_token_type_ids([input_ids]), dtype=torch.long
             )
@@ -124,7 +126,11 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
 
     # Adapted from the M-RoPE call in sglang.srt.multimodal.processors.glm4v.Glm4vImageProcessor.process_mm_data_async.
     def compute_mrope_positions(self, output):
-        """Legacy's 3-D positions; a model without mrope_section reads 1-D ones."""
+        """Legacy's 3-D positions, kept so the output matches Glm4vImageProcessor.
+
+        GLM-5.3-Flash has no mrope_section, so its model reads 1-D positions and
+        ignores these.
+        """
         input_ids = torch.as_tensor(output["input_ids"], dtype=torch.long).flatten()
         # No attention mask: every caller ID is a real token.
         mrope_positions, mrope_position_delta = get_rope_index_glm4v(
