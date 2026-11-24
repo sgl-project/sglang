@@ -233,6 +233,7 @@ class PenaltyStatusPool:
         params = list(self.pending_params.values())
         histories = list(self.pending_init.values())
         lens_cpu = [len(h) for h in histories]
+        num_replays = sum(lens_cpu)
         values_cpu = np.empty((4, len(params)), dtype=np.int32)
         floats_cpu = values_cpu.view(np.float32)
         floats_cpu[_FREQUENCY_ROW] = [p.frequency for p in params]
@@ -252,7 +253,7 @@ class PenaltyStatusPool:
             history_indices_cpu,
             np.asarray(lens_cpu, dtype=np.int64),
             np.repeat(history_indices_cpu, lens_cpu),
-            np.fromiter((t for h in histories for t in h), np.int64, sum(lens_cpu)),
+            np.fromiter((t for h in histories for t in h), np.int64, num_replays),
         ]
         self.pending_params.clear()
         self.pending_init.clear()
@@ -277,7 +278,7 @@ class PenaltyStatusPool:
         if histories:
             tables.counts.index_fill_(0, history_indices, 0)
             tables.lens.index_copy_(0, history_indices, lens.to(torch.int32))
-        if sum(lens_cpu):
+        if num_replays:
             tables.counts.index_put_(
                 (replay_indices, replay_tokens),
                 torch.ones(len(replay_indices), dtype=torch.int32, device=self.device),
