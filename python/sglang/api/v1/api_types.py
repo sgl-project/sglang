@@ -1394,10 +1394,26 @@ class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
         return encode_FinishStop(self)
 
 
+class IgnoredStop(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.IgnoredStop: JSON object (unknown keys ignored)."""
+
+    position: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "IgnoredStop":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_IgnoredStop(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_IgnoredStop(self)
+
+
 class FinishLength(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.FinishLength: JSON object (unknown keys ignored)."""
 
     length: Optional[int] = None
+    ignored_stop: Optional[IgnoredStop] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "FinishLength":
@@ -6726,18 +6742,36 @@ def encode_FinishStop(v: FinishStop) -> Dict[str, Any]:
     return d
 
 
+def decode_IgnoredStop(value: Any) -> IgnoredStop:
+    m = _expect_map(value, expected="struct IgnoredStop")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "position":
+            kw["position"] = _expect_uint(x, expected="u64")
+    return IgnoredStop(**kw)
+
+
+def encode_IgnoredStop(v: IgnoredStop) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["position"] = v.position
+    return d
+
+
 def decode_FinishLength(value: Any) -> FinishLength:
     m = _expect_map(value, expected="struct FinishLength")
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "length":
             kw["length"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "ignored_stop":
+            kw["ignored_stop"] = None if x is None else decode_IgnoredStop(x)
     return FinishLength(**kw)
 
 
 def encode_FinishLength(v: FinishLength) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["length"] = v.length
+    d["ignored_stop"] = None if v.ignored_stop is None else encode_IgnoredStop(v.ignored_stop)
     return d
 
 
@@ -6776,6 +6810,7 @@ def decode_FinishReason(value: Any) -> FinishReason:
         try:
             return FinishLength(
                 length=None if raw.get("length") is None else _expect_uint(raw.get("length"), expected="u64"),
+                ignored_stop=None if raw.get("ignored_stop") is None else decode_IgnoredStop(raw.get("ignored_stop")),
             )
         except JsonContractError:
             return dict(raw)
@@ -6799,6 +6834,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     if isinstance(v, FinishLength):
         d: Dict[str, Any] = {"type": "length"}
         d["length"] = v.length
+        d["ignored_stop"] = None if v.ignored_stop is None else encode_IgnoredStop(v.ignored_stop)
         return d
     if isinstance(v, FinishAbort):
         d: Dict[str, Any] = {"type": "abort"}
