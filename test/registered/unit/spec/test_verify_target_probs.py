@@ -296,7 +296,9 @@ def test_eagle_dense_verify_applies_min_p():
         patch.object(eagle_utils, "tree_speculative_sampling_target_only", sample),
         pytest.raises(_Stop),
     ):
-        eagle_utils.eagle_sample(verify_input, verify, logits_output)
+        eagle_utils.eagle_sample(
+            verify_input, verify, logits_output, logits_output.next_token_logits, info
+        )
     want = _sampler_min_p(probs, torch.repeat_interleave(info.min_ps, width))
     assert torch.equal(seen[0] > 0, want > 0)
     torch.testing.assert_close(seen[0], want)

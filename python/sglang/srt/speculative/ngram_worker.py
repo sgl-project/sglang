@@ -480,19 +480,21 @@ class NGRAMWorker(BaseSpecWorker):
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            verify.build_row_inputs(
+            accept = verify.run(
                 logits_output,
-                tree=host_tree,
+                tree=verify_input,
+                host_tree=host_tree,
                 # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
                 barrier=None,
+                accept_core=lambda logits, sampling_info: accept_draft_tree(
+                    verify,
+                    logits,
+                    sampling_info,
+                    verify_input=verify_input,
+                    logits_output=logits_output,
+                    speculative_runtime_hooks=self._speculative_runtime_hooks,
+                ),
             )
-            accept = accept_draft_tree(
-                verify,
-                verify_input=verify_input,
-                logits_output=logits_output,
-                speculative_runtime_hooks=self._speculative_runtime_hooks,
-            )
-            verify.commit(accept, logits_output=logits_output)
             predict, accept_lens, accept_index = (
                 accept.tokens,
                 accept.accept_lens,

@@ -19,7 +19,10 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
-from sglang.srt.speculative.eagle_worker_common import STOCK_SPECULATIVE_RUNTIME_HOOKS
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    PostVerifyGraphAccept,
+)
 
 if TYPE_CHECKING:
     from sglang.kernels.plugin_kernels.nvidia.spec import LocalKeysFn
@@ -67,18 +70,18 @@ class EaglePostVerifyGraphs:
         logits_output: Any,
         can_run_cuda_graph: bool,
         max_top_k: Optional[int] = None,
-    ) -> Optional[tuple]:
-        """(predict, accept_lens, accept_index, new_seq_lens, bonus_tokens,
-        draft-extend inputs) from the post-verify graphs, or None when SGLang's
-        sampling and commit run eagerly. max_top_k: the compact top-k branch's
-        support (compact_verify_max_top_k), None for the dense branch."""
+    ) -> Optional[PostVerifyGraphAccept]:
+        """The accept and commit outputs from the post-verify graphs, or None
+        when SGLang's sampling and commit run eagerly. max_top_k: the compact
+        top-k branch's support (compact_verify_max_top_k), None for the dense
+        branch."""
         self.join()
         key = self._key(
             batch, route, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
-        return self._graphs.run(
+        outputs = self._graphs.run(
             key=key,
             inputs=_post_verify_inputs(
                 batch, verify_input, self._verify_state_slots(batch)
@@ -87,6 +90,17 @@ class EaglePostVerifyGraphs:
                 staged, batch, verify_input, logits_output, max_top_k
             ),
             sim_max_len=verify_input.max_tree_depth,
+        )
+        if outputs is None:
+            return None
+        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens, extend = outputs
+        return PostVerifyGraphAccept(
+            tokens=predict,
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            new_seq_lens=new_seq_lens,
+            bonus_tokens=bonus_tokens,
+            prepared_draft_extend_inputs=extend,
         )
 
     def _verify_state_slots(self, batch: ScheduleBatch) -> Optional[ForwardStateSlots]:
@@ -256,6 +270,7 @@ class EaglePostVerifyGraphs:
 def _sample(slot: SimpleNamespace, local_keys: LocalKeysFn) -> tuple:
     """eagle_sample over the slot's staged inputs, with the runtime hooks' local
     keys as on the eager path."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
     from sglang.srt.speculative.eagle_utils import eagle_sample
@@ -303,7 +318,8 @@ def _sample(slot: SimpleNamespace, local_keys: LocalKeysFn) -> tuple:
         req_pool_indices=staged["req_pool_indices"],
         return_logprob=slot.return_logprob,
     )
-    # Post-verify graph eligibility excludes every grammar and watermark round.
+    # Post-verify graph eligibility excludes every round whose stages edit the
+    # logits, so the graphs accept the model's logits as they are.
     verify = VerifyStep(
         batch=batch,
         route=VerifyRoute.derive(sampling_info, has_grammar=False, has_watermark=False),
@@ -313,10 +329,12 @@ def _sample(slot: SimpleNamespace, local_keys: LocalKeysFn) -> tuple:
     return eagle_sample(
         verify_view,
         verify,
-        SimpleNamespace(
+        LogitsProcessorOutput(
             next_token_logits=slot.logits,
             next_token_logits_vocab_shard=slot.vocab_shard,
         ),
+        slot.logits,
+        sampling_info,
         uno_target_max_top_k=slot.max_top_k,
         simulated_acc_len=staged.get("sim_accept_len"),
         sparse_bonus_argmax=slot.max_top_k is not None,

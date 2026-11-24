@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.custom_logit_processor import (
     ROW_PREFIX_KEY,
     CustomLogitProcessor,
@@ -12,7 +13,6 @@ from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
-from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.spec_utils import verify_row_prefixes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,8 +72,15 @@ def _verify(batch, grammar_mask=None):
     )
 
 
+def _run(verify, verify_input, logits_output):
+    """`VerifyStep.run` up to its accept: each test stops inside the stages."""
+    verify.run(
+        logits_output, tree=verify_input, host_tree=None, barrier=None, accept_core=None
+    )
+
+
 class TestVerifyPenaltyPaths(CustomTestCase):
-    def test_eagle_sample_feeds_the_draft_tree(self):
+    def test_run_feeds_the_draft_tree(self):
         # Root 0 has children 1 and 2; node 3 is a child of 1.
         verify_input = SimpleNamespace(
             draft_token_num=4,
@@ -88,9 +95,8 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             sampling_info=SimpleNamespace(step_penalties=step),
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(
-            next_token_logits=torch.zeros(4, VOCAB_SIZE),
-            next_token_logits_vocab_shard=None,
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(4, VOCAB_SIZE)
         )
         apply_verify = step.apply_verify
 
@@ -100,14 +106,14 @@ class TestVerifyPenaltyPaths(CustomTestCase):
 
         with patch.object(step, "apply_verify", side_effect=apply_then_stop):
             with self.assertRaises(_Stop):
-                eagle_utils.eagle_sample(verify_input, _verify(batch), logits_output)
+                _run(_verify(batch), verify_input, logits_output)
 
         self.assertEqual(
             _row_counts(logits_output.next_token_logits, [5, 6, 9]),
             [[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0]],
         )
 
-    def test_eagle_sample_adjusts_in_decoding_order_per_request_tree(self):
+    def test_run_adjusts_in_decoding_order_per_request_tree(self):
         bs, width = 2, 3
         verify_tokens = torch.tensor([[9, 5, 5], [9, 6, 5]])
         next_child = torch.tensor([[1, 2, -1]] * bs)
@@ -157,15 +163,13 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             sampling_info=info,
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(
-            next_token_logits=logits, next_token_logits_vocab_shard=None
-        )
+        logits_output = LogitsProcessorOutput(next_token_logits=logits)
         verify = _verify(batch, grammar_mask)
         verify.row_prefixes = verify_row_prefixes(
             next_child, next_sibling, verify_tokens, pending_tokens=[[]] * bs
         )
         with self.assertRaises(_Stop):
-            eagle_utils.eagle_sample(verify_input, verify, logits_output)
+            _run(verify, verify_input, logits_output)
         self.assertEqual(len(seen), 1)
         self.assertTrue(torch.equal(seen[0][0], expected[width:]))
         self.assertEqual(

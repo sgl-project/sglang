@@ -330,6 +330,19 @@ class LogitsProcessorOutput:
             ready.record()
         self.customized_info = owned
 
+    def gather_vocab_shard(self) -> torch.Tensor:
+        """Replace a vocabulary shard of `next_token_logits` with the full FP32
+        logits, gathered over the TP group; returns `next_token_logits`."""
+        shard = self.next_token_logits_vocab_shard
+        if shard is not None:
+            from sglang.srt.speculative.sharded_verify import gather_full_logits
+
+            self.next_token_logits = gather_full_logits(
+                self.next_token_logits, shard, get_parallel().tp_group
+            )
+            self.next_token_logits_vocab_shard = None
+        return self.next_token_logits
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return

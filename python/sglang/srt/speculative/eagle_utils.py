@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
-    gather_full_logits,
     key_splits,
     reduce_sharded_token_keys,
     sampling_allows_vocab_shards,
@@ -802,6 +801,8 @@ def eagle_sample(
     verify_input: EagleVerifyInput,
     verify: VerifyStep,
     logits_output: LogitsProcessorOutput,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
     *,
     uno_target_max_top_k: Optional[int] = None,
     simulated_acc_len: Optional[torch.Tensor] = None,
@@ -810,17 +811,16 @@ def eagle_sample(
     local_keys: Optional[LocalKeysFn] = None,
 ):
     """
-    Verify and find accepted tokens based on logits output and the verify step:
-    its batch (which contains spec decoding information), the route the shard
-    gate reads, and the stages (`VerifyStep.adjust`). simulated_acc_len: the
+    Verify and find accepted tokens: the tree accept over `logits` and
+    `sampling_info`, as `VerifyStep.run` gives them after the stages. `verify`
+    gives the batch (which contains spec decoding information) and the route
+    the shard gate reads. simulated_acc_len: the
     injected acceptance length already drawn on the host, as a device int64 [1],
     so a CUDA graph can replay the injection. simulated_acc_len_rng: the
     generator to draw it from here otherwise (the global CPU RNG when None).
     sparse_bonus_argmax: an injected acceptance's bonus is the target argmax on
     the compact top-k branch too, as on the dense one.
     """
-    from sglang.srt.runtime_context import get_parallel
-
     batch = verify.batch
     device = batch.device
     if batch.forward_mode.is_idle():
@@ -830,32 +830,23 @@ def eagle_sample(
         return predict, num_correct_drafts, accept_index
 
     bs = len(batch.seq_lens)
-    next_token_logits = logits_output.next_token_logits
     vocab_shard = logits_output.next_token_logits_vocab_shard
     if vocab_shard is not None and not _sharded_sampling_applies(
         verify_input=verify_input,
         verify=verify,
         has_local_keys=local_keys is not None,
     ):
-        next_token_logits = gather_full_logits(
-            next_token_logits, vocab_shard, get_parallel().tp_group
-        )
-        logits_output.next_token_logits = next_token_logits
-        logits_output.next_token_logits_vocab_shard = vocab_shard = None
-
-    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    next_token_logits, sampling_info = verify.adjust(
-        next_token_logits, candidates, tree=verify_input
-    )
+        logits = logits_output.gather_vocab_shard()
+        vocab_shard = None
 
     return _tree_accept(
         verify_input=verify_input,
         batch=batch,
         logits_output=logits_output,
-        next_token_logits=next_token_logits,
+        next_token_logits=logits,
         vocab_shard=vocab_shard,
         sampling_info=sampling_info,
-        candidates=candidates,
+        candidates=verify_input.draft_token.reshape(bs, verify_input.draft_token_num),
         uno_target_max_top_k=uno_target_max_top_k,
         watermark=verify.watermark is not None,
         simulated_acc_len=simulated_acc_len,
@@ -928,11 +919,8 @@ def _tree_accept(
             # A local policy declines before consuming RNG. Rebuild the exact stock
             # logits, publish that mutation, and let the stock sampler consume RNG
             # in its original order.
-            next_token_logits = gather_full_logits(
-                next_token_logits, vocab_shard, get_parallel().tp_group
-            )
-            logits_output.next_token_logits = next_token_logits
-            logits_output.next_token_logits_vocab_shard = vocab_shard = None
+            next_token_logits = logits_output.gather_vocab_shard()
+            vocab_shard = None
     # The generic fused chain acceptance writes every verify output itself.
     chain = _chain_accept_applies(
         verify_input=verify_input,
@@ -1199,13 +1187,7 @@ def _tree_accept(
                         local_keys=local_keys,
                     )
                     if bonus_predict is None:
-                        next_token_logits = gather_full_logits(
-                            next_token_logits,
-                            vocab_shard,
-                            get_parallel().tp_group,
-                        )
-                        logits_output.next_token_logits = next_token_logits
-                        logits_output.next_token_logits_vocab_shard = None
+                        next_token_logits = logits_output.gather_vocab_shard()
                         vocab_shard = None
                 if bonus_predict is None:
                     bonus_predict = sampling_argmax(next_token_logits)

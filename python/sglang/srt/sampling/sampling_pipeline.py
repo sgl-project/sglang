@@ -10,9 +10,10 @@ Two entries run it:
   in one call;
 - verify: `SamplingPipeline.plan_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch the verify worker calls `build_row_inputs`, the stages
-  (`VerifyStep.adjust`, inside `eagle_sample` for a tree), its accept core,
-  and `commit`.
+  launch a tree verify (EAGLE, NGRAM) makes one call, `VerifyStep.run`, which
+  takes its accept core as a function; a chain verify (DFlash, DSpark) calls
+  `build_row_inputs`, the stages (`VerifyStep.adjust`), its accept core, the
+  cap (`cap_chain_accept`), and `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
@@ -25,9 +26,10 @@ and the grammar mask.
 
 Each entry probes the model's logits for NaN before the stages
 (`detect_nan_logits`): decode in `SamplingPipeline.sample`, verify in
-`VerifyStep.build_row_inputs`. The sanitize, which heals NaN and inf only under
-SGLANG_SANITIZE_NAN_LOGITS, ends the stages on every path; a verify's route turns
-off the fast paths that skip the stages in that mode.
+`VerifyStep.build_row_inputs`; `VerifyStep.run` also probes them for inf. The
+sanitize, which heals NaN and inf only under SGLANG_SANITIZE_NAN_LOGITS, ends the
+stages on every path; a verify's route turns off the fast paths that skip the
+stages in that mode.
 """
 
 from __future__ import annotations
@@ -47,7 +49,11 @@ from sglang.srt.sampling.custom_logit_processor import (
 from sglang.srt.sampling.grammar_mask import apply_grammar_mask
 from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
-from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    sanitize_nan_logits,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -353,6 +359,41 @@ class VerifyStep(msgspec.Struct):
     # The requests whose custom logit processor ran on their first row only
     # (it does not support row prefixes): each commits one token.
     first_row_only_reqs: Optional[torch.Tensor] = None
+
+    def run(
+        self,
+        logits_output: LogitsProcessorOutput,
+        *,
+        tree: EagleVerifyInput,
+        host_tree: Optional[HostVerifyTree],
+        barrier: Optional[Callable[[], Dict[Req, List[int]]]],
+        accept_core: Callable[[torch.Tensor, SamplingBatchInfo], VerifyAccept],
+    ) -> VerifyAccept:
+        """A tree verify after its target forward, in one call: probe the
+        model's logits, build the stages' row inputs (`build_row_inputs`, which
+        reads `host_tree` and `barrier`), apply the stages when the route says
+        some stage edits the logits, never on an idle batch (on the full
+        logits, so a vocabulary shard is gathered first), accept, cap each
+        first-row-only request to one token, and commit.
+        `accept_core(logits, sampling_info)` is the worker's accept over the
+        logits and sampling info after the stages; when no stage runs, the
+        model's logits (possibly a vocabulary shard) and the batch's sampling
+        info."""
+        self.build_row_inputs(logits_output, tree=host_tree, barrier=barrier)
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+        batch = self.batch
+        logits, sampling_info = logits_output.next_token_logits, batch.sampling_info
+        if self.route.adjusts_logits and not batch.forward_mode.is_idle():
+            draft_tokens = tree.draft_token.reshape(
+                len(batch.seq_lens), tree.draft_token_num
+            )
+            logits, sampling_info = self.adjust(
+                logits_output.gather_vocab_shard(), draft_tokens, tree=tree
+            )
+        result = accept_core(logits, sampling_info)
+        self.cap_tree_accept(result.accept_lens, result.accept_index)
+        self.commit(result, logits_output=logits_output)
+        return result
 
     def build_row_inputs(
         self,
