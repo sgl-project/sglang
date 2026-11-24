@@ -167,18 +167,26 @@ class _CPUWorkWaiter:
 
 
 class TensorDictRecvHandle:
-    """Full-tensor receive using the existing send_tensor_dict wire format.
+    """Receive tensors using the existing send_tensor_dict wire format.
 
     Only CPU metadata waits run on helper threads. The caller must progress and
     finish the handle on its communication stream: CUDA Work.wait() establishes
     stream dependencies, rather than proving the tensors are ready on the host.
-    No TP all-gather is issued by this interface.
+    Optional TP reconstruction must use a communicator separate from forward.
     """
 
     _MAX_METADATA_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, coordinator: "GroupCoordinator", src: int, tag: int = 0):
+    def __init__(
+        self,
+        coordinator: "GroupCoordinator",
+        src: int,
+        tag: int = 0,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ):
         self._coordinator = coordinator
+        self._all_gather_group = all_gather_group
+        self._gather_shapes = {}
         self._tag = tag
         # src is group-local; torch.distributed P2P requires the global rank.
         self._src_global_rank = coordinator.ranks[src]
@@ -249,8 +257,18 @@ class TensorDictRecvHandle:
                 if isinstance(value, TensorMetadata)
                 else value
             )
-        for value in received_tensor_dict.values():
+        for key, value in received_tensor_dict.items():
             if isinstance(value, torch.Tensor) and value.numel():
+                gather_group = self._all_gather_group
+                if (
+                    gather_group is not None
+                    and value.numel() % gather_group.world_size == 0
+                ):
+                    self._gather_shapes[key] = value.shape
+                    value = value.reshape(gather_group.world_size, -1)[
+                        gather_group.rank_in_group
+                    ]
+                    received_tensor_dict[key] = value
                 payload_comm_group = (
                     self._coordinator.cpu_group
                     if value.is_cpu
@@ -284,6 +302,10 @@ class TensorDictRecvHandle:
             self._progress_metadata(block=True)
             for item in self._payload_recv_works:
                 item.wait()
+            for key, shape in self._gather_shapes.items():
+                self._received_tensor_dict[key] = self._all_gather_group.all_gather(
+                    self._received_tensor_dict[key], dim=0
+                ).reshape(shape)
             self._payload_recv_works.clear()
             self._payload_waits_issued = True
         return self._received_tensor_dict
@@ -492,6 +514,7 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
         self.vpp_reverse_group = None
+        self.vpp_activation_tp_group = None
         # Which FlashInfer fusion workspace this group owns, or None when the
         # group is not eligible for the allreduce-only kAllReduce path. Stamped
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
@@ -1997,11 +2020,14 @@ class GroupCoordinator:
         return p2p_works
 
     def recv_tensor_dict_async(
-        self, src: Optional[int] = None, tag: int = 0
+        self,
+        src: Optional[int] = None,
+        tag: int = 0,
+        all_gather_group: Optional["GroupCoordinator"] = None,
     ) -> TensorDictRecvHandle:
-        """Receive full tensors asynchronously, without send-allgather slicing.
+        """Receive asynchronously, optionally reconstructing TP slices.
 
-        The sender must call send_tensor_dict with all_gather_group=None.
+        The sender and receiver must agree on the TP width and lane.
         Use the same CPU tag on both sides; device payloads follow FIFO order.
         """
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -2010,7 +2036,9 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         if not 0 <= src < self.world_size or src == self.rank_in_group:
             raise ValueError(f"Invalid source rank ({src})")
-        return TensorDictRecvHandle(self, src, tag=tag)
+        return TensorDictRecvHandle(
+            self, src, tag=tag, all_gather_group=all_gather_group
+        )
 
     def recv_tensor_dict(
         self,
@@ -2265,6 +2293,9 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if getattr(self, "vpp_activation_tp_group", None) is not None:
+            self.vpp_activation_tp_group.destroy()
+            self.vpp_activation_tp_group = None
         if getattr(self, "vpp_reverse_group", None) is not None:
             self.vpp_reverse_group.destroy()
             self.vpp_reverse_group = None
@@ -3138,6 +3169,21 @@ def initialize_model_parallel(
             use_pynccl=False,
             use_custom_allreduce=False,
             group_name="vpp_pp_reverse",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+        activation_tp_ranks = [
+            list(range(start, start + attn_tp_size))
+            for start in range(0, world_size, attn_tp_size)
+        ]
+        _PP.vpp_activation_tp_group = init_model_parallel_group(
+            activation_tp_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="vpp_activation_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,

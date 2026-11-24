@@ -1,4 +1,4 @@
-"""Scheduling FIFO and send credits using the full-tensor P2P API."""
+"""Scheduling FIFO and send credits using TP-sliced P2P activations."""
 
 import threading
 from contextlib import nullcontext
@@ -57,10 +57,11 @@ class P2PWorkGroup:
 
 
 class VPPSchedulerActivationReceiver:
-    """Receive the full-tensor FIFO independently on every TP lane."""
+    """Receive a FIFO on each TP lane and reconstruct on a dedicated group."""
 
     def __init__(self, pp_group, tp_group, max_inflight, *, batch_p2p, tag):
         self.pp_group = pp_group
+        self.tp_group = tp_group
         self.tag = tag
         self._handle = None
         self._receive_ready = False
@@ -83,7 +84,9 @@ class VPPSchedulerActivationReceiver:
 
     def _post_metadata(self):
         with self._context():
-            self._handle = self.pp_group.recv_tensor_dict_async(tag=self.tag)
+            self._handle = self.pp_group.recv_tensor_dict_async(
+                tag=self.tag, all_gather_group=self.tp_group
+            )
 
     def progress(self):
         with torch.no_grad(), self._context():

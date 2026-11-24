@@ -244,6 +244,61 @@ class TestPPCommOverlap(CustomTestCase):
 
 
 class TestVPPActivationTransport(CustomTestCase):
+    def test_async_tp_slices_reconstruct_original_shapes(self):
+        for lane in range(4):
+            with self.subTest(lane=lane):
+                mailbox = deque()
+                expected = {
+                    "hidden": torch.arange(24).reshape(3, 8),
+                    "uneven": torch.arange(7),
+                    "empty": torch.empty(0),
+                    "batch": 9,
+                }
+
+                def send(tensor, dst, group=None, tag=0):
+                    mailbox.append(tensor.clone())
+                    return SimpleNamespace(wait=lambda: None)
+
+                def recv(tensor, src, group=None, tag=0):
+                    sent = mailbox.popleft()
+                    self.assertEqual(tensor.shape, sent.shape)
+                    return SimpleNamespace(wait=lambda: tensor.copy_(sent))
+
+                def gather(tensor, dim=0):
+                    torch.testing.assert_close(
+                        tensor, expected["hidden"].reshape(4, -1)[lane]
+                    )
+                    return expected["hidden"].flatten().clone()
+
+                group = object.__new__(GroupCoordinator)
+                group.__dict__.update(
+                    rank_in_group=0,
+                    ranks=[0, 1],
+                    world_size=2,
+                    cpu_group=object(),
+                    device_group=object(),
+                    device=torch.device("cpu"),
+                )
+                tp = SimpleNamespace(
+                    world_size=4, rank_in_group=lane, all_gather=gather
+                )
+                with patch.multiple(
+                    torch.distributed,
+                    is_initialized=lambda: True,
+                    isend=send,
+                    irecv=recv,
+                ):
+                    group.send_tensor_dict(
+                        expected, dst=1, all_gather_group=tp, async_send=True
+                    )
+                    actual = group.recv_tensor_dict_async(
+                        src=1, all_gather_group=tp
+                    ).wait()
+                for key in ("hidden", "uneven", "empty"):
+                    torch.testing.assert_close(actual[key], expected[key])
+                self.assertEqual(actual["batch"], 9)
+                self.assertFalse(mailbox)
+
     def test_async_metadata_progress_does_not_wait_for_payload(self):
         # The actual GroupCoordinator sender and receiver share a CPU mailbox.
         # Work completion is controlled explicitly, without timing-based sleeps.

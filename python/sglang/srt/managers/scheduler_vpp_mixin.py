@@ -117,7 +117,11 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         # Initialize both directed activation communicators before entering the
         # asynchronous control loop; first-use NCCL initialization is collective.
         probe = torch.zeros(1, dtype=torch.int32, device=self.device)
-        for group in (self.pp_group, self.pp_group.vpp_reverse_group):
+        for group in (
+            self.pp_group,
+            self.pp_group.vpp_reverse_group,
+            self.pp_group.vpp_activation_tp_group,
+        ):
             if group is None:
                 raise RuntimeError("Missing native reverse activation group")
             torch.distributed.all_reduce(probe, group=group.device_group)
@@ -513,7 +517,9 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             group = self._pp_vpp_activation_group(action.physical_rank)
             with self.pp_comm_stream_ctx:
                 self.device_module.current_stream().wait_event(event)
-                send_work = group.send_tensor_dict(tensors, async_send=True, tag=1)
+                send_work = group.send_tensor_dict(
+                    tensors, all_gather_group=self.attn_tp_group, async_send=True, tag=1
+                )
         self.launch_event = event
         self.schedule_stream.wait_event(event)
         return result, event, send_work

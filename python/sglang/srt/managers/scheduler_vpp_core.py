@@ -883,7 +883,7 @@ class SchedulingVPPCore:
             source_rank = (self.pp_group.rank_in_group - 1) % self.pp_group.world_size
             self._pp_vpp_activation_receiver = VPPSchedulerActivationReceiver(
                 self._pp_vpp_activation_group(source_rank),
-                None,
+                self.pp_group.vpp_activation_tp_group,
                 max_inflight,
                 batch_p2p=self.pp_group.world_size == 2,
                 tag=_VPP_ACTIVATION_TAG,
