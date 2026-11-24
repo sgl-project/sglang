@@ -16,11 +16,16 @@ CPU-only.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.batch_overlap import two_batch_overlap
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    TboForwardBatchPreparer,
+    compute_split_seq_index,
+)
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_device, get_parallel
@@ -148,6 +153,66 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
         self.assertEqual(
             prepare_raw.call_args.kwargs["tbo_children_num_token_non_padded_cpu"],
             (2, 6),
+        )
+
+
+class TestTboTwoChunkSplit(CustomTestCase):
+    """The children's seq range must follow the token split prepare_raw is given."""
+
+    def _child_a_end(self, *, forward_mode, extend_seq_lens):
+        num_tokens = sum(extend_seq_lens)
+        batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            spec_info=None,
+            extend_seq_lens_cpu=extend_seq_lens,
+            input_ids=torch.zeros(num_tokens, dtype=torch.long),
+            batch_size=len(extend_seq_lens),
+            tbo_children=None,
+        )
+        with (
+            get_context().override_server_args(),
+            patch.object(
+                two_batch_overlap,
+                "get_attn_backend",
+                return_value=Mock(spec=TboAttnBackend),
+            ),
+            patch.object(TboForwardBatchPreparer, "filter_batch") as filter_batch,
+            patch.object(
+                TboForwardBatchPreparer,
+                "derive_fields_related_to_seq_len_for_two_chunk",
+            ),
+        ):
+            batch.tbo_split_seq_index = compute_split_seq_index(
+                forward_mode=forward_mode,
+                num_tokens=num_tokens,
+                extend_lens=extend_seq_lens,
+                token_num_per_seq=None,
+            )
+            TboForwardBatchPreparer.prepare_raw(
+                batch, tbo_children_num_token_non_padded=(None, None)
+            )
+        child_a = filter_batch.call_args_list[0].kwargs
+        return child_a["end_token_index"], child_a["end_seq_index"]
+
+    def test_mixed_cut_inside_a_seq_keeps_that_seq_in_child_a(self):
+        # A prefill chunk plus two decode rows splits 11 / 11 tokens inside seq 0,
+        # so child_a ends with seq 0.
+        self.assertEqual(
+            self._child_a_end(
+                forward_mode=ForwardMode.MIXED, extend_seq_lens=[20, 1, 1]
+            ),
+            (11, 1),
+        )
+
+    def test_cut_on_a_seq_boundary_stays_seq_aligned(self):
+        # 11 // 2 lands exactly after seq 0; child_a must not end on a seq with
+        # zero tokens, so the split moves to the seq boundary after seq 1.
+        self.assertEqual(
+            self._child_a_end(
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=[5, 1, 1, 1, 1, 1, 1],
+            ),
+            (6, 2),
         )
 
 
