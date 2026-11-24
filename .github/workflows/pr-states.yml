@@ -195,7 +195,7 @@ jobs:
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
             const draftText = `${skipMark} -- the PR is a draft; marking it ready starts a new run (AMD: then \`/rerun-failed-ci\`).`;
             const noTestsText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- it predates the labels or the PR leaving draft; \`/rerun-failed-ci\` reruns it.`;
-            const unapprovedText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- its commit has no run-ci approval, or the run predates the labels; a maintainer's \`/tag-and-rerun-ci\` approves this commit and reruns it.`;
+            const unapprovedText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- its commit has no run-ci approval, or the run predates the labels; a maintainer's \`/approve-ci\` approves this commit and reruns it, or \`/rerun-failed-ci\` reruns an approved one.`;
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
             // (for example, for merge conflicts or skip annotations).
