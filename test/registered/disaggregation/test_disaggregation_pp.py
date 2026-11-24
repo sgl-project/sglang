@@ -1,3 +1,4 @@
+import re
 import time
 import unittest
 from types import SimpleNamespace
@@ -230,9 +231,8 @@ class TestDisaggregationStagingPrefillPPDecodeLargerTP(PDDisaggregationServerBas
         # transfer that skipped staging would go through the slice path instead.
         log = self._prefill_stdout_buf.getvalue() + self._prefill_stderr_buf.getvalue()
         for stage in ("PP0", "PP1"):
-            self.assertRegex(
-                log, rf"{stage} PID\d+\] \[Staging\] Sending KV through", stage
-            )
+            pattern = rf"{stage} PID\d+\] \[Staging\] Sending KV through"
+            self.assertTrue(re.search(pattern, log), f"{stage} sent no staged KV")
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 
