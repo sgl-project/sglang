@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+    request_allows,
     request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -85,15 +86,16 @@ def _lora_compute_dtype(x: torch.Tensor, lora_dtype: torch.dtype) -> torch.dtype
     would: cast to fp16, DiT activations beyond 65504 overflow to inf and the
     output turns into NaN (a black image).
 
-    An fp32 adapter on 16-bit activations computes in their dtype when the
-    request allows lossless fast paths, exactly as the same adapter saved in
-    that dtype would (e.g. the fp32 and bf16 files of a Lightning LoRA); in
-    fp32 its matmuls miss the tensor cores and cast every activation. Other
+    An fp32 adapter on 16-bit activations computes in their dtype at
+    quality="high", exactly as the same adapter saved in that dtype would
+    (e.g. the fp32 and bf16 files of a Lightning LoRA); in fp32 its matmuls
+    miss the tensor cores and cast every activation. Rounding the factors to
+    16 bits loses precision, so "exact" and "lossless" keep fp32. Other
     adapters compute in their own dtype, as before.
     """
     if lora_dtype == torch.float16 and x.dtype != torch.float16:
         return _activation_dtype(x)
-    if lora_dtype == torch.float32 and request_allows_lossless():
+    if lora_dtype == torch.float32 and request_allows("high"):
         activation_dtype = _activation_dtype(x)
         if activation_dtype in (torch.bfloat16, torch.float16):
             return activation_dtype
