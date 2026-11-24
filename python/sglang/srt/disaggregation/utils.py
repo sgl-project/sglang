@@ -1253,6 +1253,25 @@ def draft_kv_ring_row_pairs(
     return [a for a, _ in pairs], [b for _, b in pairs]
 
 
+def is_tp_head_owner(
+    *,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    local_tp_rank_in_group: int,
+    dst_tp_rank_in_group: int,
+) -> bool:
+    """Whether ``local_tp_rank_in_group`` owns any contiguous TP head slice for
+    ``dst_tp_rank_in_group`` (Mamba/KDA state or head-sliced draft KV)."""
+    if src_attn_tp_size == dst_attn_tp_size:
+        return local_tp_rank_in_group == dst_tp_rank_in_group
+    if src_attn_tp_size < dst_attn_tp_size:
+        return local_tp_rank_in_group == dst_tp_rank_in_group // (
+            dst_attn_tp_size // src_attn_tp_size
+        )
+    writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+    return local_tp_rank_in_group // writers_per_decode == dst_tp_rank_in_group
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,
@@ -1279,6 +1298,14 @@ def compute_mamba_state_slice_blocks(
     block per sub-block for conv_state; temporal_state and non-GDN states (when
     ``conv_shard_groups`` is None) keep the single contiguous slice.
     """
+    if not is_tp_head_owner(
+        src_attn_tp_size=src_attn_tp_size,
+        dst_attn_tp_size=dst_attn_tp_size,
+        local_tp_rank_in_group=local_tp_rank_in_group,
+        dst_tp_rank_in_group=dst_tp_rank_in_group,
+    ):
+        return []
+
     use_subdims = (
         conv_shard_groups is not None
         and sum(conv_shard_groups) == src_dim * src_attn_tp_size
@@ -1287,8 +1314,6 @@ def compute_mamba_state_slice_blocks(
     if src_attn_tp_size > dst_attn_tp_size:
         # Aggregation: several prefill ranks each write their shard into one decode slot.
         writers_per_decode = src_attn_tp_size // dst_attn_tp_size
-        if local_tp_rank_in_group // writers_per_decode != dst_tp_rank_in_group:
-            return []
         local_writer_idx = local_tp_rank_in_group % writers_per_decode
         if not use_subdims:
             return [(0, local_writer_idx * src_dim, src_dim)]
@@ -1307,16 +1332,7 @@ def compute_mamba_state_slice_blocks(
             dst_off += dst_sub
         return blocks
 
-    # Scatter: 1 prefill rank feeds several decode ranks. Under hybrid-MLA
-    # DCP-M -> DCP-N, a decode rank can also connect to a separate KV-owning
-    # prefill rank; only the TP head owner writes the state slice.
-    if src_attn_tp_size < dst_attn_tp_size:
-        owner_src_tp_rank = dst_tp_rank_in_group // (
-            dst_attn_tp_size // src_attn_tp_size
-        )
-        if local_tp_rank_in_group != owner_src_tp_rank:
-            return []
-
+    # Scatter: 1 prefill rank feeds several decode ranks.
     if not use_subdims:
         src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
         return [(src_dim_start, 0, dst_dim)]
@@ -1367,16 +1383,13 @@ def compute_mamba_state_slice_byte_blocks(
                 "Replicated Mamba state item lengths differ between prefill and "
                 f"decode: {src_item_len} != {dst_item_len}"
             )
-        if src_attn_tp_size < dst_attn_tp_size:
-            owner_src_tp_rank = dst_tp_rank_in_group // (
-                dst_attn_tp_size // src_attn_tp_size
-            )
-            if local_tp_rank_in_group != owner_src_tp_rank:
-                return []
-        elif src_attn_tp_size > dst_attn_tp_size:
-            writers_per_decode = src_attn_tp_size // dst_attn_tp_size
-            if local_tp_rank_in_group // writers_per_decode != dst_tp_rank_in_group:
-                return []
+        if not is_tp_head_owner(
+            src_attn_tp_size=src_attn_tp_size,
+            dst_attn_tp_size=dst_attn_tp_size,
+            local_tp_rank_in_group=local_tp_rank_in_group,
+            dst_tp_rank_in_group=dst_tp_rank_in_group,
+        ):
+            return []
         if not should_send_replicated_state(
             src_attn_tp_size=src_attn_tp_size,
             dst_attn_tp_size=dst_attn_tp_size,

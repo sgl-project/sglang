@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_tp_head_owner,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -1909,17 +1910,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
-                                skip_dup_dcp_kv = (
-                                    self.is_hybrid_mla_backend
-                                    and self.attn_tp_size > decode_tp_size
-                                    and (
-                                        (self.kv_args.engine_rank % self.attn_tp_size)
-                                        % (self.attn_tp_size // decode_tp_size)
-                                    )
-                                    // self.dcp_size
-                                    != 0
-                                )
-                                if not skip_dup_dcp_kv:
+                                if not self._should_skip_duplicate_hybrid_mla_kv(
+                                    decode_tp_size
+                                ):
                                     pack_buffer = (
                                         self._dcp_pack_buffers[worker_index]
                                         if self._dcp_pack_buffers
@@ -3432,6 +3425,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_layer_ids=dst_lids,
                     )
                 else:
+                    if not is_tp_head_owner(
+                        src_attn_tp_size=self.state_tp_size,
+                        dst_attn_tp_size=decode_tp_size,
+                        local_tp_rank_in_group=(
+                            self.kv_args.engine_rank % self.state_tp_size
+                        ),
+                        dst_tp_rank_in_group=decode_tp_rank % decode_tp_size,
+                    ):
+                        continue
                     h = self._send_mamba_state(
                         peer_name,
                         src_indices,

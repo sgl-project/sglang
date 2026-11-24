@@ -72,6 +72,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_tp_head_owner,
     draft_kv_ring_row_pairs,
     filter_kv_indices_for_shard_rank,
     is_elided_entry,
@@ -2165,16 +2166,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
             local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
             dst_tp_in_group = dst_tp_rank % dst_attn_tp_size
-            if (
-                self.attn_tp_size < dst_attn_tp_size
-                and local_tp_rank
-                != dst_tp_in_group // (dst_attn_tp_size // self.attn_tp_size)
-            ):
-                continue
-            if (
-                self.attn_tp_size > dst_attn_tp_size
-                and local_tp_rank // (self.attn_tp_size // dst_attn_tp_size)
-                != dst_tp_in_group
+            if not is_tp_head_owner(
+                src_attn_tp_size=self.attn_tp_size,
+                dst_attn_tp_size=dst_attn_tp_size,
+                local_tp_rank_in_group=local_tp_rank,
+                dst_tp_rank_in_group=dst_tp_in_group,
             ):
                 continue
             src_span = src_width * self.attn_tp_size
@@ -2501,16 +2497,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
 
-        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
-            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
-                self.attn_tp_size // info.dst_attn_tp_size
-            )
-            # Under DCP, each distinct dcp_rank in the aggregation group holds
-            # a unique token shard; only duplicate DCP replicas skip KV.
-            if sub_rank // self.dcp_size != 0:
-                skip_kv = True
-                # Hybrid-MLA KV is replicated across these source ranks, but
-                # TP-sharded state needs every rank for the aggregation path.
+        if info is not None and self._should_skip_duplicate_hybrid_mla_kv(
+            info.dst_attn_tp_size
+        ):
+            skip_kv = True
 
         return skip_kv, skip_state
 
@@ -2665,6 +2655,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         or rc
                     )
                 else:
+                    if (
+                        target_rank_registration_info is not None
+                        and not is_tp_head_owner(
+                            src_attn_tp_size=self.state_tp_size,
+                            dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                            local_tp_rank_in_group=(
+                                self.kv_args.engine_rank % self.state_tp_size
+                            ),
+                            dst_tp_rank_in_group=(
+                                target_rank_registration_info.dst_tp_rank
+                                % target_rank_registration_info.dst_attn_tp_size
+                            ),
+                        )
+                    ):
+                        continue
                     rc = (
                         self._send_mamba_state(
                             req,

@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_tp_head_owner,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
 )
@@ -1821,6 +1822,13 @@ class MoriKVManager(CommonKVManager):
 
         local_tp_rank = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
+        if not is_tp_head_owner(
+            src_attn_tp_size=self.state_tp_size,
+            dst_attn_tp_size=peer_info.decode_tp_size,
+            local_tp_rank_in_group=local_tp_rank,
+            dst_tp_rank_in_group=dst_tp_rank,
+        ):
+            return []
 
         pairs = build_transfer_entry_pairs(
             src_layer_ids,
@@ -2095,16 +2103,19 @@ class MoriKVManager(CommonKVManager):
 
             if not info.is_dummy:
                 if peer_info.requires_dcp_relayout:
-                    result_statuses.extend(
-                        self.send_kvcache_dcp(
-                            peer_info,
-                            kv_indices,
-                            info.dst_kv_indices,
-                            src_page_offset=index_slice.start or 0,
-                            decode_prefix_len=info.decode_prefix_len or 0,
-                            num_kv_tokens=num_kv_tokens,
+                    if not self._should_skip_duplicate_hybrid_mla_kv(
+                        peer_info.decode_tp_size
+                    ):
+                        result_statuses.extend(
+                            self.send_kvcache_dcp(
+                                peer_info,
+                                kv_indices,
+                                info.dst_kv_indices,
+                                src_page_offset=index_slice.start or 0,
+                                decode_prefix_len=info.decode_prefix_len or 0,
+                                num_kv_tokens=num_kv_tokens,
+                            )
                         )
-                    )
                 else:
                     result_statuses.extend(
                         self.send_kvcache(

@@ -730,6 +730,16 @@ class CommonKVManager(BaseKVManager):
             return dst_dcp_rank % self.dcp_size == self.dcp_rank
         return self.dcp_rank == dst_dcp_rank
 
+    def _should_skip_duplicate_hybrid_mla_kv(self, dst_attn_tp_size: int) -> bool:
+        """Under hybrid-MLA aggregation, skip duplicate KV replicas while keeping
+        every distinct prefill DCP shard."""
+        if not self.is_hybrid_mla_backend or self.attn_tp_size <= dst_attn_tp_size:
+            return False
+        sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
+            self.attn_tp_size // dst_attn_tp_size
+        )
+        return sub_rank // self.dcp_size != 0
+
     def prepare_dcp_token_item_lens(
         self,
         dst_page_item_lens: List[Optional[int]],
@@ -745,14 +755,13 @@ class CommonKVManager(BaseKVManager):
                 f"prefill entry: src={num_entries} (draft={num_draft}), "
                 f"dst={len(dst_page_item_lens)}"
             )
-        src_dcp_size = getattr(self, "dcp_size", 1)
         src_draft_collapsed = getattr(self.kv_args, "draft_rows_dcp_collapsed", False)
         src_token_lens = [
             item_len
             // (
                 page_size
                 * (
-                    src_dcp_size
+                    self.dcp_size
                     if i >= num_entries - num_draft and not src_draft_collapsed
                     else 1
                 )
@@ -789,9 +798,8 @@ class CommonKVManager(BaseKVManager):
             return
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
-        src_dcp_size = getattr(self, "dcp_size", 1)
         max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-        max_tokens = ceil_align(max_tokens, self.kv_args.page_size * src_dcp_size)
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size * self.dcp_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
             self._register_staging_memory,
             self.kv_args,
@@ -1744,12 +1752,8 @@ class CommonKVManager(BaseKVManager):
 
         prefill_dcp_size = getattr(info, "dcp_size", 1)
         if self.dcp_size > 1 or prefill_dcp_size > 1:
-            if (self.dcp_size > 1 or prefill_dcp_size != self.dcp_size) and not (
-                self.is_mla_backend or self.is_hybrid_mla_backend
-            ):
-                raise RuntimeError(
-                    "PD DCP relayout requires an MLA or hybrid-MLA KV pool."
-                )
+            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise RuntimeError("PD DCP requires an MLA or hybrid-MLA KV pool.")
             if prefill_dcp_size != self.dcp_size and (
                 self.dcp_size % prefill_dcp_size != 0
                 and prefill_dcp_size % self.dcp_size != 0
@@ -1788,6 +1792,11 @@ class CommonKVManager(BaseKVManager):
         ``dst_dcp`` for fan-in). Hybrid-MLA also pairs each decode rank with the
         contiguous attention-TP owner of its linear-attention state.
         """
+        if max(src_attn_tp, dst_attn_tp) % min(src_attn_tp, dst_attn_tp) != 0:
+            raise RuntimeError(
+                "PD DCP requires divisible prefill/decode attention TP sizes, got "
+                f"prefill={src_attn_tp}, decode={dst_attn_tp}"
+            )
         real_by_dst: Dict[int, List[int]] = {}
         used_src: Set[int] = set()
         for d in range(dst_attn_tp):
@@ -2013,7 +2022,7 @@ class CommonKVManager(BaseKVManager):
             "attn_cp_rank": attn_cp[1],
             "attn_dp_size": self.attn_dp_size,
             "attn_dp_rank": self.attn_dp_rank,
-            "dcp_size": getattr(self, "dcp_size", 1),
+            "dcp_size": self.dcp_size,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
             "system_dp_size": self.system_dp_size,

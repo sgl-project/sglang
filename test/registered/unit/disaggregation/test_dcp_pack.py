@@ -661,6 +661,7 @@ class TestDcpMToNRelayout(CustomTestCase):
             (2, 2, 8, 8),
             (2, 2, 1, 1),
             (4, 4, 2, 1),
+            (4, 4, 4, 2),
         ):
             with self.subTest(
                 src_tp=src_tp, src_dcp=src_dcp, dst_tp=dst_tp, dst_dcp=dst_dcp
@@ -835,6 +836,54 @@ class TestDcpMToNRelayout(CustomTestCase):
         )
         self.assertIsNone(handle)
         nixl.agent.initialize_xfer.assert_not_called()
+
+        # Equal-attn_tp hybrid-MLA (4/4 -> 4/2): KV-only rank p2 connected to d0
+        # must skip equal-TP Mamba state writes on both Mooncake and NIXL.
+        nixl_eq = object.__new__(NixlKVManager)
+        nixl_eq.state_tp_size = 4
+        nixl_eq.attn_tp_size = 4
+        nixl_eq.pp_size = 1
+        nixl_eq.is_mla_backend = False
+        nixl_eq._state_layout_rejections = {}
+        nixl_eq._prepared_state_plans = {}
+        nixl_eq.kv_args = SimpleNamespace(
+            engine_rank=2,
+            gpu_id=0,
+            state_types=[StateType.MAMBA],
+            state_data_ptrs=[[0x1000]],
+            state_item_lens=[[32]],
+            state_dim_per_tensor=[[8]],
+            state_conv_shard_groups=[[]],
+            state_slice_outer_counts=[[]],
+            state_layer_ids=[[]],
+        )
+        nixl_eq._send_mamba_state = Mock()
+        nixl_handles = list(
+            nixl_eq.maybe_send_extra(
+                peer_name="d0",
+                prefill_state_indices=[[0]],
+                dst_state_data_ptrs=[[0x2000]],
+                dst_state_indices=[[0]],
+                dst_gpu_id=0,
+                decode_tp_size=4,
+                decode_tp_rank=0,
+                dst_state_item_lens=[[32]],
+                dst_state_dim_per_tensor=[[8]],
+            )
+        )
+        self.assertEqual(nixl_handles, [])
+        nixl_eq._send_mamba_state.assert_not_called()
+
+        # Non-divisible attn_tp sizes fail cleanly in _resolve_dcp_tp_rank_mapping.
+        with self.assertRaisesRegex(RuntimeError, "divisible"):
+            CommonKVManager._resolve_dcp_tp_rank_mapping(
+                src_attn_tp=2,
+                src_dcp=2,
+                dst_attn_tp=3,
+                dst_dcp=1,
+                dst_tp_rank=0,
+                is_hybrid_mla=False,
+            )
 
 
 if __name__ == "__main__":
