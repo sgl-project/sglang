@@ -1,3 +1,4 @@
+import gc
 import os
 import re
 from collections.abc import Generator
@@ -124,6 +125,57 @@ _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "MT5Model": transformers.MT5EncoderModel,
     "MT5ForConditionalGeneration": transformers.MT5EncoderModel,
 }
+
+
+def _drop_unread_encoder_layers(
+    model: nn.Module, output_layers: tuple[int, ...] | None
+) -> int:
+    """Drop the decoder layers that no read hidden state depends on.
+
+    ``hidden_states[k]`` is the input of layer ``k``. Layer ``max(k)`` is kept
+    too: the encoders append the final-normed output as the last hidden state,
+    so with only ``max(k)`` layers ``hidden_states[max(k)]`` would be normed.
+    Returns the number of layers dropped.
+    """
+    if not output_layers or min(output_layers) < 0:
+        return 0
+    # Same lookup as layerwise offload; skip unless exactly one stack matches.
+    named_modules = dict(model.named_modules())
+    stacks = [
+        named_modules[name]
+        for name in getattr(model, "layer_names", None) or ["layers"]
+        if isinstance(named_modules.get(name), nn.ModuleList)
+        and len(named_modules[name]) > 0
+    ]
+    if len(stacks) != 1:
+        return 0
+    layers = stacks[0]
+    keep = max(output_layers) + 1
+    num_dropped = max(0, len(layers) - keep)
+    del layers[keep:]
+    return num_dropped
+
+
+def _maybe_drop_unread_encoder_layers(
+    model: nn.Module, server_args: ServerArgs, component_name: str
+) -> None:
+    # Only the first text encoder: postprocess_text_funcs[0] reads its outputs.
+    if component_name != "text_encoder":
+        return
+    output_layers = getattr(
+        server_args.pipeline_config, "text_encoder_output_layers", None
+    )
+    num_dropped = _drop_unread_encoder_layers(model, output_layers)
+    if num_dropped:
+        # Each parameter's weight_loader is bound to its layer, so the dropped
+        # layers are reference cycles; free their weights now.
+        gc.collect()
+        logger.info(
+            "Dropped the last %d %s layers; the pipeline reads hidden states %s",
+            num_dropped,
+            component_name,
+            tuple(output_layers),
+        )
 
 
 def _delegate_quantized_checkpoint_to_transformers(
@@ -779,6 +831,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             self.validate_checkpoint_keys(
                 weights_to_load - loaded_weights, [], component_name
             )
+            _maybe_drop_unread_encoder_layers(model, server_args, component_name)
 
             # process_weights_after_loading for unquantized linear
             for _, module in model.named_modules():

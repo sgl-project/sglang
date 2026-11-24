@@ -462,30 +462,30 @@ def _prepare_image_ids(
     return image_latent_ids
 
 
-def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    hidden_states_layers: list[int] = [10, 20, 30]
+# Text encoder hidden states that FLUX.2 reads (hidden_states[k] is the input
+# of decoder layer k). The loader drops the layers after these.
+FLUX2_TEXT_ENCODER_OUTPUT_LAYERS = (10, 20, 30)
+FLUX2_KLEIN_TEXT_ENCODER_OUTPUT_LAYERS = (9, 18, 27)
 
-    out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
+
+def _stack_text_encoder_layers(
+    outputs: BaseEncoderOutput, layers: tuple[int, ...]
+) -> torch.Tensor:
+    out = torch.stack([outputs.hidden_states[k] for k in layers], dim=1)
     batch_size, num_channels, seq_len, hidden_dim = out.shape
-    prompt_embeds = out.permute(0, 2, 1, 3).reshape(
+    return out.permute(0, 2, 1, 3).reshape(
         batch_size, seq_len, num_channels * hidden_dim
     )
 
-    return prompt_embeds
+
+def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    return _stack_text_encoder_layers(outputs, FLUX2_TEXT_ENCODER_OUTPUT_LAYERS)
 
 
 def flux2_klein_postprocess_text(
     outputs: BaseEncoderOutput, _text_inputs
 ) -> torch.Tensor:
-    hidden_states_layers: list[int] = [9, 18, 27]
-
-    out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
-    batch_size, num_channels, seq_len, hidden_dim = out.shape
-    prompt_embeds = out.permute(0, 2, 1, 3).reshape(
-        batch_size, seq_len, num_channels * hidden_dim
-    )
-
-    return prompt_embeds
+    return _stack_text_encoder_layers(outputs, FLUX2_KLEIN_TEXT_ENCODER_OUTPUT_LAYERS)
 
 
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
@@ -516,6 +516,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (flux2_postprocess_text,)
     )
+    # Must match what postprocess_text_funcs reads.
+    text_encoder_output_layers: tuple[int, ...] = FLUX2_TEXT_ENCODER_OUTPUT_LAYERS
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
@@ -838,6 +840,7 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (flux2_klein_postprocess_text,)
     )
+    text_encoder_output_layers: tuple[int, ...] = FLUX2_KLEIN_TEXT_ENCODER_OUTPUT_LAYERS
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         if prompts and isinstance(prompts[0], list):
