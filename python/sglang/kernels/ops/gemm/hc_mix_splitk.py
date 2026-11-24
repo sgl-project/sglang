@@ -178,6 +178,19 @@ _WIDE_TACTICS_SM103 = (
     (448, (64, 32, 2, 9), (64, 64, 64, 8, 2)),
     (512, (128, 32, 2, 5), (128, 32, 64, 8, 3)),
 )
+# SGLANG_HC_MIX_WIDE_SM103_SPLIT2=1: past 224 rows split_k 4 with 32-row token tiles needs 160-180 CTAs, two waves on
+# 152 SMs (down 10.7-11.1 us at 225-288 rows); split_k 2 runs in one (8.5-8.8 us). Not bitwise to split_k 4 (the K
+# sum is split in 2, not 4), the split the table already uses from 289 rows.
+if os.environ.get("SGLANG_HC_MIX_WIDE_SM103_SPLIT2", "0") == "1":
+    _WIDE_TACTICS_SM103 = tuple(
+        e
+        for rows, down, up in _WIDE_TACTICS_SM103
+        for e in (
+            ((224, down, up), (rows, (64, 32, 2, 9), up))
+            if rows == 288
+            else ((rows, down, up),)
+        )
+    )
 WIDE_MAX_ROWS = _WIDE_TACTICS[-1][0]
 _wide_scratch_cache = {}
 _wide_tactic_cache = {}
