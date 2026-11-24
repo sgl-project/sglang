@@ -732,22 +732,52 @@ class TestPromptSegments(_EncodeCase):
         with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
             self._assert_falls_back(self.tokenizer, segments, {})
 
-    def test_the_cache_keeps_to_its_token_budget(self):
+    def _assert_within_byte_budget(self, encoder, budget):
+        self.assertLessEqual(encoder.cached_bytes, budget)
+        self.assertEqual(
+            encoder.cached_bytes,
+            sum(ppe._entry_bytes(*entry) for entry in encoder.cache.items()),
+        )
+
+    def test_the_cache_keeps_to_its_byte_budget(self):
         with (
-            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_TOKENS", 40),
-            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_TOKENS", 20),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", 4096),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_BYTES", 1024),
         ):
             for i in range(30):
                 self._assert_segments_match_encode(
                     self.tokenizer, ["<|user|>", f"turn {i} hello world"], ({},)
                 )
             self._assert_segments_match_encode(
-                self.tokenizer, ["<|user|>", "hello world " * 30], ({},)
+                self.tokenizer, ["<|user|>", "hello world " * 100], ({},)
             )
         encoder = ppe._segment_encoder_for(self.tokenizer)
-        self.assertLessEqual(encoder.cached_tokens, 40)
-        self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
-        self.assertNotIn((None, "hello world " * 30), encoder.cache)
+        self._assert_within_byte_budget(encoder, 4096)
+        self.assertNotIn((None, "hello world " * 100), encoder.cache)
+
+    def test_text_that_encodes_to_no_ids_still_counts_against_the_budget(self):
+        # WhitespaceSplit drops whitespace: each of these texts has no ids, so
+        # a token budget would keep every one of them.
+        tokenizer = _tokenizer(
+            lambda b: setattr(b, "pre_tokenizer", pre_tokenizers.WhitespaceSplit())
+        )
+        with (
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", 8192),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_BYTES", 2048),
+        ):
+            for i in range(100):
+                self.assertEqual(tokenizer.encode(" " * (200 + i)), [])
+                self._assert_segments_match_encode(
+                    tokenizer, ["<|user|>", " " * (200 + i)], ({},)
+                )
+            # A single text over the entry limit is not kept either.
+            self._assert_segments_match_encode(
+                tokenizer, ["<|user|>", " " * 4096], ({},)
+            )
+        encoder = ppe._segment_encoder_for(tokenizer)
+        self._assert_within_byte_budget(encoder, 8192)
+        self.assertLess(len(encoder.cache), 100)
+        self.assertNotIn((None, " " * 4096), encoder.cache)
 
 
 class TestRenderedPrompt(_EncodeCase):

@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import weakref
@@ -57,10 +58,13 @@ logger = logging.getLogger(__name__)
 _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
-# Per tokenizer; a text longer than the entry limit is encoded but not kept.
-# Token ids are kept as uint32 arrays (4 B each): 8M tokens is 32 MB per tokenizer.
-_SEGMENT_CACHE_MAX_TOKENS = 1 << 23
-_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+# Per tokenizer, counting the bytes of each entry's key text and its ids (kept
+# as uint32 arrays): a text can encode to no ids at all, so a token count would
+# not bound the memory. An entry over the entry limit is encoded but not kept.
+_SEGMENT_CACHE_MAX_BYTES = 64 << 20
+_SEGMENT_CACHE_MAX_ENTRY_BYTES = _SEGMENT_CACHE_MAX_BYTES // 8
+# The dict slot, the LRU links and the key tuple of one entry, roughly.
+_SEGMENT_CACHE_ENTRY_OVERHEAD = 256
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -341,7 +345,7 @@ class _SegmentEncoder:
         self.lock = threading.Lock()
         self.encode_lock = threading.Lock()
         self.cache = OrderedDict()
-        self.cached_tokens = 0
+        self.cached_bytes = 0
 
     def cut_id(self, segment):
         token_id = self.raw_ids.get(segment)
@@ -427,15 +431,19 @@ class _SegmentEncoder:
         with self.lock:
             for text, ids in encoded.items():
                 key = (cache_salt, text)
-                if (
-                    key not in self.cache
-                    and len(ids) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS
-                ):
+                size = _entry_bytes(key, ids)
+                if key not in self.cache and size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
                     self.cache[key] = ids
-                    self.cached_tokens += len(ids)
-            while self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS:
-                self.cached_tokens -= len(self.cache.popitem(last=False)[1])
+                    self.cached_bytes += size
+            while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
+                self.cached_bytes -= _entry_bytes(*self.cache.popitem(last=False))
         return encoded
+
+
+def _entry_bytes(key, ids):
+    cache_salt, text = key
+    size = sys.getsizeof(text) + sys.getsizeof(ids) + _SEGMENT_CACHE_ENTRY_OVERHEAD
+    return size if cache_salt is None else size + sys.getsizeof(cache_salt)
 
 
 def _segment_encoder_for(tokenizer):
