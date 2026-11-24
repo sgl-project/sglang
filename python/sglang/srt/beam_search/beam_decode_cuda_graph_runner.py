@@ -97,7 +97,9 @@ class FixedWidthCapacity(msgspec.Struct, frozen=True):
 class FixedWidthAttentionInput:
     """Graph buffers for shared-context attention with one beam width.
 
-    The kernel takes whole beam groups (one per request) and no padding rows:
+    A graph serves several requests at once when each has that beam width: a
+    graph of N rows holds N / beam_width requests. The beams of one request are
+    a group. The kernel takes whole groups and no padding rows:
 
     - Only a graph size that is a multiple of the beam width gets a beam graph.
     - A batch replays only the graph of exactly its own row count.
@@ -237,17 +239,19 @@ class FixedWidthAttentionInput:
     def can_replay(
         self, metadata: Optional[BeamAttentionMetadata], *, graph_size: int
     ) -> bool:
-        # The batch must have:
-        # - exactly the graph's rows, since the kernel takes no padding rows;
-        # - one bucket, which means one beam width, and it is the graphs' width;
-        # - at most max_decode_len generated tokens per beam.
+        # A batch has one bucket per beam width among its requests, so more than
+        # one bucket means requests of different widths.
+        if metadata is None or len(metadata.buckets) != 1:
+            return False
+        batch_bucket = metadata.buckets[0]
+        # [num_groups, beam_width * generated tokens per beam]
+        decode_width = batch_bucket.decode_slots.shape[1]
         return (
-            metadata is not None
+            # Every request has the graphs' beam width.
+            batch_bucket.beam_width == self.capacity.beam_width
+            # The requests fill the graph: the kernel takes no padding rows.
             and metadata.num_rows == graph_size
-            and len(metadata.buckets) == 1
-            and metadata.buckets[0].beam_width == self.capacity.beam_width
-            and metadata.buckets[0].decode_slots.shape[1]
-            <= self.capacity.beam_width * self.capacity.max_decode_len
+            and decode_width <= self.capacity.beam_width * self.capacity.max_decode_len
         )
 
     def load_replay_inputs(self, metadata: BeamAttentionMetadata) -> None:
