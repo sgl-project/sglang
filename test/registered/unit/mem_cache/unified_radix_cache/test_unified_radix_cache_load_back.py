@@ -1,10 +1,16 @@
 import unittest
 from array import array
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCacheTransferMixin,
+    DecodePrefixMatch,
+    HiCacheRestoreResult,
+)
 from sglang.srt.managers.schedule_batch import (
     LOAD_BACK_REFUSAL_LIMIT,
     Req,
@@ -897,6 +903,37 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(req.prefix_len, 0)
         self.assertEqual(req.last_node, cache.root_node_handle())
         self.assertFalse(req.needs_host_load_back())
+
+    @requires_full_mamba_ps1
+    def test_host_only_refusal_fails_decode_restore(self):
+        """A PD decode restore whose load-back is refused with no anchor state to
+        extend from fails the restore; it must not raise in the decode scheduler."""
+        cache, req_to_token_pool, leaf, anchor = self._host_only_anchor_without_state()
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", [1000, 2000, 3000, 4000])
+        host_only, refused_load = self._patch_host_only_refused_loads(cache)
+        with host_only, refused_load:
+            req.init_next_round_input(cache, cow_mamba=False)
+            self.assertEqual((req.last_node, req.best_match_node), (anchor, leaf))
+            decode_req = SimpleNamespace(
+                req=req,
+                prefix_match=DecodePrefixMatch(
+                    prefix_indices=cache.prefix_device_indices(req),
+                    l2_host_hit_length=req.host_hit_length,
+                    l3_storage_hit_length=0,
+                    last_device_node=req.last_node,
+                ),
+                hicache_restore_status=HiCacheRestoreResult.PENDING,
+                hicache_restore_lock=None,
+            )
+            queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+                SimpleNamespace(tree_cache=cache), decode_req
+            )
+
+        self.assertEqual(req.load_back_refusals, 1)
+        self.assertFalse(queued)
+        self.assertEqual(decode_req.hicache_restore_status, HiCacheRestoreResult.FAILED)
+        self.assertIsNone(decode_req.hicache_restore_lock)
 
     @requires(
         lambda cfg: (
