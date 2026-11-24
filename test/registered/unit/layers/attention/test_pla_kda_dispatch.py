@@ -857,5 +857,175 @@ class TestPLAKDADispatch(CustomTestCase):
             self.assertFalse(sail_kda.commit_after_verify(**kwargs))
 
 
+class TestFlashKDAStridedInputs(CustomTestCase):
+    def test_backend_layout_and_state_writeback(self):
+        """PLA keeps input views; external FlashKDA receives contiguous buffers."""
+        num_tokens, num_heads, head_dim = 128, 2, 128
+        generator = torch.Generator().manual_seed(236)
+        qkv = torch.randn(
+            1, num_tokens, 3 * num_heads, head_dim, generator=generator
+        ).to(torch.bfloat16)
+        q, k, v = qkv.split(num_heads, dim=2)
+        gate_beta = torch.rand(
+            1, num_tokens, num_heads * (head_dim + 1), generator=generator
+        ).to(torch.bfloat16)
+        g = gate_beta[..., : num_heads * head_dim].unflatten(-1, (num_heads, head_dim))
+        beta = gate_beta[..., num_heads * head_dim :]
+        packed_inputs = dict(q=q, k=k, v=v, g=g, beta=beta)
+        A_log = torch.arange(2 * num_heads, dtype=torch.float32)[::2].reshape(
+            1, 1, num_heads, 1
+        )
+        dt_bias = torch.arange(2 * num_heads * head_dim, dtype=torch.float32)[::2]
+        initial_pool = torch.arange(5, dtype=torch.float32).view(5, 1, 1, 1)
+        initial_pool = initial_pool.expand(5, num_heads, head_dim, head_dim).clone()
+        initial_pool = initial_pool.transpose(-1, -2)
+        cache_indices = torch.tensor([3, 1], dtype=torch.int32)
+        expected_states = initial_pool.clone()
+        expected_states[cache_indices] += 1
+
+        for layout in ("packed", "dense_transposed"):
+            inputs = packed_inputs
+            if layout == "dense_transposed":
+                inputs = {
+                    name: tensor.transpose(1, 2).contiguous().transpose(1, 2)
+                    for name, tensor in packed_inputs.items()
+                }
+            for tensor in inputs.values():
+                self.assertFalse(tensor.is_contiguous())
+            for use_pla in (True, False):
+                for beta_is_raw in (True, False):
+                    for use_dt_bias in (True, False):
+                        with self.subTest(
+                            layout=layout,
+                            use_pla=use_pla,
+                            beta_is_raw=beta_is_raw,
+                            use_dt_bias=use_dt_bias,
+                        ):
+                            states = initial_pool.clone()
+                            expected_beta = inputs["beta"]
+                            if not beta_is_raw:
+                                expected_beta = torch.logit(
+                                    expected_beta.float().clamp_(1e-7, 1.0 - 1e-7)
+                                ).to(torch.bfloat16)
+                            expected_output = (
+                                inputs["q"]
+                                + inputs["k"]
+                                + inputs["v"]
+                                + inputs["g"]
+                                + expected_beta.unsqueeze(-1)
+                            )
+
+                            def run_kernel(
+                                q,
+                                k,
+                                v,
+                                g,
+                                beta,
+                                scale,
+                                out,
+                                A_log,
+                                dt_bias,
+                                lower_bound,
+                                *,
+                                initial_state,
+                                final_state,
+                                cu_seqlens,
+                            ):
+                                for name, tensor in dict(
+                                    q=q, k=k, v=v, g=g, beta=beta
+                                ).items():
+                                    source = inputs[name]
+                                    expected = (
+                                        expected_beta if name == "beta" else source
+                                    )
+                                    self.assertTrue(
+                                        torch.equal(tensor.reshape_as(source), expected)
+                                    )
+                                    if use_pla and (name != "beta" or beta_is_raw):
+                                        self.assertEqual(
+                                            tensor.data_ptr(), source.data_ptr()
+                                        )
+                                        self.assertEqual(
+                                            tensor.stride(), source.stride()[1:]
+                                        )
+                                    elif not use_pla:
+                                        self.assertTrue(tensor.is_contiguous())
+                                self.assertEqual(beta.dtype, torch.bfloat16)
+                                self.assertEqual(A_log.dtype, torch.float32)
+                                self.assertEqual(A_log.shape, (num_heads,))
+                                if use_pla:
+                                    self.assertEqual(A_log.stride(), (2,))
+                                else:
+                                    self.assertTrue(A_log.is_contiguous())
+                                if use_dt_bias:
+                                    self.assertEqual(dt_bias.dtype, torch.float32)
+                                    self.assertEqual(
+                                        dt_bias.shape, (num_heads, head_dim)
+                                    )
+                                    if use_pla:
+                                        self.assertEqual(
+                                            dt_bias.stride(), (2 * head_dim, 2)
+                                        )
+                                    else:
+                                        self.assertTrue(dt_bias.is_contiguous())
+                                else:
+                                    self.assertIsNone(dt_bias)
+                                self.assertEqual(scale, head_dim**-0.5)
+                                self.assertEqual(lower_bound, -5.0)
+                                self.assertEqual(cu_seqlens.dtype, torch.int64)
+                                self.assertTrue(
+                                    torch.equal(cu_seqlens, torch.tensor([0, 64, 128]))
+                                )
+                                self.assertTrue(out.is_contiguous())
+                                self.assertTrue(final_state.is_contiguous())
+                                if not use_pla:
+                                    self.assertTrue(initial_state.is_contiguous())
+                                self.assertTrue(
+                                    torch.equal(
+                                        initial_state, initial_pool[cache_indices]
+                                    )
+                                )
+                                out.copy_(q + k + v + g + beta.unsqueeze(-1))
+                                final_state.copy_(initial_state + 1)
+
+                            fwd = Mock(side_effect=run_kernel)
+                            kernel = (
+                                sail_flashkda.SailFlashKDAKernel()
+                                if use_pla
+                                else kda_flashkda.FlashKDAKernel()
+                            )
+                            with (
+                                envs.SGLANG_SAIL_PLA.override(True),
+                                patch.object(
+                                    kda_flashkda,
+                                    "_load_flash_kda",
+                                    return_value=SimpleNamespace(fwd=fwd),
+                                ) as loader,
+                                patch.dict(sys.modules, _flashkda_pla_modules(fwd)),
+                            ):
+                                output = kernel.extend(
+                                    **inputs,
+                                    ssm_states=states,
+                                    cache_indices=cache_indices,
+                                    query_start_loc=torch.tensor(
+                                        [0, 64, 128], dtype=torch.int32
+                                    ),
+                                    A_log=A_log,
+                                    dt_bias=dt_bias if use_dt_bias else None,
+                                    lower_bound=-5.0,
+                                    beta_is_raw=beta_is_raw,
+                                    extend_seq_lens_cpu=[64, 64],
+                                )
+                            fwd.assert_called_once()
+                            if use_pla:
+                                loader.assert_not_called()
+                            else:
+                                loader.assert_called_once()
+                            self.assertEqual(output.shape, inputs["v"].shape)
+                            self.assertTrue(output.is_contiguous())
+                            self.assertTrue(torch.equal(output, expected_output))
+                            self.assertTrue(torch.equal(states, expected_states))
+
+
 if __name__ == "__main__":
     unittest.main()

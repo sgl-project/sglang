@@ -231,22 +231,17 @@ class FlashKDAKernel(LinearAttnKernelBase):
         head_dim = q.shape[3]
         scale = head_dim**-0.5
 
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        g = g.contiguous()
-
         # FlashKDA applies sigmoid internally; invert only the already-activated
         # Kimi beta path.
         if not beta_is_raw:
             beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7))
-        beta = beta.to(torch.bfloat16).contiguous()
+        beta = beta.to(torch.bfloat16)
 
         # flash_kda wants A_log [H] fp32 and dt_bias [H, K] fp32. The model
         # stores A_log as [1, 1, H, 1] and dt_bias as 1D [H*K], so reshape both.
-        A_log = A_log.reshape(-1).float().contiguous()
+        A_log = A_log.reshape(-1).float()
         if dt_bias is not None:
-            dt_bias = dt_bias.reshape(num_heads, -1).float().contiguous()
+            dt_bias = dt_bias.reshape(num_heads, -1).float()
 
         # cu_seqlens must be int64 for flash_kda (FLA casts to long).
         cu_seqlens = query_start_loc.to(torch.int64)
@@ -254,10 +249,13 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # flash_kda varlen state is [N, H, V, K] -- the SAME layout as sglang's
         # KDA pool, so no transpose is needed. Advanced indexing copies, so the
         # final state is written back in-place below (matching chunk_kda).
-        initial_state = ssm_states[cache_indices].contiguous()
+        initial_state = ssm_states[cache_indices]
 
-        out_buf = torch.empty_like(v)
-        final_state = torch.empty_like(initial_state)
+        # Keep write buffers contiguous even when inputs are dense strided views.
+        out_buf = torch.empty_like(v, memory_format=torch.contiguous_format)
+        final_state = torch.empty_like(
+            initial_state, memory_format=torch.contiguous_format
+        )
 
         self._launch_fused(
             q,
@@ -297,6 +295,18 @@ class FlashKDAKernel(LinearAttnKernelBase):
         cu_seqlens: torch.Tensor,
     ) -> None:
         """Run the fused extend kernel into ``out_buf``/``final_state``."""
+        # External FlashKDA requires contiguous inputs; platform overrides may
+        # consume the existing views (PLA with t-head/pla#49 supports strides).
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        g = g.contiguous()
+        beta = beta.contiguous()
+        A_log = A_log.contiguous()
+        if dt_bias is not None:
+            dt_bias = dt_bias.contiguous()
+        initial_state = initial_state.contiguous()
+
         flash_kda = _load_flash_kda()
         flash_kda.fwd(
             q,
