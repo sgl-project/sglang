@@ -525,6 +525,75 @@ test("H3-Image AMD recipes use AITER Auto placement and their measured 4K scope"
   assert.equal(resolve(config, { hw: "h200", size: "4736x3552" }).builder.resolvedSettings.attention, undefined);
 });
 
+test("H3-Image Ascend A3 recipes use LaserAttention, resident fold, online AdaLN and measured scope", () => {
+  const config = get("/MiniMax/MiniMax-H3-Image.mdx");
+  const resource = config.commandBuilder.resource;
+  assert.ok(config.supportedHardware.includes("a3"));
+  assert.equal(config.hardware.find((entry) => entry.id === "a3").vendor, "npu");
+  const rec = resource.recommendedRecipe(selection(config, { hw: "a3", gpus_per_node: 4 }));
+  assert.equal(rec.tp_size, 2);
+  assert.equal(rec.ulysses_degree, 2);
+  assert.equal(rec.ring_degree, 1);
+  assert.equal(rec.placement, "resident");
+  assert.equal(rec.encoder, "fold");
+  assert.equal(rec.adaln, "online");
+  assert.equal(rec.unverified, undefined);
+  for (const [tp_size, ulysses_degree] of [[2, 2], [4, 1], [1, 4]]) {
+    const base = {
+      hw: "a3",
+      gpus_per_node: 4,
+      topology_mode: "manual",
+      tp_size,
+      ulysses_degree,
+      ring_degree: 1,
+      placement: "resident",
+      encoder: "fold",
+      adaln: "online",
+    };
+    for (const task of [
+      { size: "2048x2048" },
+      { size: "4736x3552" },
+      { mode: "edit", size: "2048x2048", references: "one" },
+      { mode: "edit", size: "2048x2048", references: "two" },
+    ]) {
+      const result = resolve(config, { ...base, ...task });
+      assert.deepEqual(result.builder.errors, []);
+      assert.equal(result.verified, true, JSON.stringify({ ...base, ...task }));
+      assert.equal(result.builder.resolvedSettings.attention, "LaserAttention");
+      assert.ok(result.flags.includes("--attention-backend laser_attn"));
+    }
+    for (const override of [
+      { size: "6272x2688" },
+      { mode: "edit", size: "4096x4096" },
+      { quality: "exact" },
+      { placement: "auto" },
+      { adaln: "resident" },
+      { warmup: "off" },
+    ]) assert.equal(resolve(config, { ...base, size: "4736x3552", ...override }).verified, false);
+  }
+  const ring = resolve(config, {
+    hw: "a3",
+    gpus_per_node: 4,
+    topology_mode: "manual",
+    tp_size: 2,
+    ulysses_degree: 1,
+    ring_degree: 2,
+    placement: "resident",
+    encoder: "fold",
+    adaln: "online",
+  });
+  assert.match(ring.builder.errors.join(" "), /LaserAttention on Ascend A3 does not support Ring/);
+  const fp8 = resolve(config, {
+    hw: "a3",
+    gpus_per_node: 4,
+    placement: "resident",
+    encoder: "fold",
+    adaln: "online",
+    quantization: "fp8-all",
+  });
+  assert.match(fp8.builder.errors.join(" "), /Native BF16/);
+});
+
 test("Wan preserves standard, multi-GPU, Ascend and LoRA recipes", () => {
   for (const version of ["1", "2"]) {
     const config = get(`/Wan/Wan2.${version}.mdx`);
