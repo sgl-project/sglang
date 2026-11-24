@@ -333,6 +333,16 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
+        # Interleave CP materializes full-order window writes on every rank;
+        # the eager CUDA path can keep the request-owned ring replicated. Keep
+        # other CP modes, graph buckets and PD handoff outside this contract.
+        cp_replay = (
+            get_platform().is_cuda
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+            and cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+            and cfg.disaggregation_mode == "null"
+        )
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -352,7 +362,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
                 and get_platform().is_hip,
             ),
-            ("context parallelism", cfg.attn_cp_size > 1),
+            (
+                "context parallelism outside eager CUDA interleave prefill",
+                (cfg.attn_cp_size > 1 or cfg.enable_prefill_cp) and not cp_replay,
+            ),
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
             ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),

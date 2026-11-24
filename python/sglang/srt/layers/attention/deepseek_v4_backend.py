@@ -1759,6 +1759,7 @@ class DeepseekV4AttnBackend(
         graph_window = (
             use_prefill_cuda_graph and self.token_to_kv_pool.request_window is not None
         )
+        cp_window = cp_active and self.token_to_kv_pool.request_window is not None
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1778,7 +1779,11 @@ class DeepseekV4AttnBackend(
                 if graph_window
                 else len(extend_seq_lens_cpu)
             ),
-            request_window_live_rows=num_tokens if graph_window else None,
+            # CP's padded causal rows are queries only. The ring layout must
+            # commit the live global token order, not the padding positions.
+            request_window_live_rows=(
+                num_tokens if graph_window or cp_window else None
+            ),
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -2073,7 +2078,7 @@ class DeepseekV4AttnBackend(
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
         swa_out_cache_loc = (
-            metadata.core_attn_metadata.request_window_layout.write_loc
+            metadata.core_attn_metadata.swa_out_cache_loc
             if self.token_to_kv_pool.request_window is not None
             else self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
                 torch.int32
@@ -4347,9 +4352,12 @@ class DeepseekV4AttnBackend(
             ).to(torch.int32)
         metadata = self.forward_metadata
         if window is not None:
-            layout = metadata.core_attn_metadata.request_window_layout
+            core = metadata.core_attn_metadata
+            layout = core.request_window_layout
             window.activate(layout)
-            return layout.write_loc
+            # The gathered CP KV has only live global rows, even though its
+            # query metadata (and workspace layout) has padded local rows.
+            return core.swa_out_cache_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # The tail's q rows are a subset of the extend, so the full
             # out_cache_loc below would be the wrong length; the tail owns its own.
@@ -5110,7 +5118,9 @@ class DeepseekV4AttnBackend(
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
-            swa_out_cache_loc = request_layout.write_loc
+            # Only the query indices are reindexed across CP; the write
+            # locations follow the unpadded full-order compressor/KV stream.
+            swa_out_cache_loc = request_layout.write_loc[:num_tokens]
         elif dspark_block_size is not None:
             assert (
                 self.is_dspark_draft
