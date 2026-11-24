@@ -55,7 +55,7 @@ import sys
 import weakref
 from array import array
 from concurrent.futures import Future
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -148,6 +148,8 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.logit_bias import LogitBiasEntries
+from sglang.srt.sampling.sampler_params import SamplerParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -494,6 +496,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        filler_seed: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -509,8 +512,6 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
-        # Leading output_ids already fed to the batch's penalizers.
-        self.penalty_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -570,6 +571,11 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
+        # Seed this row samples with in a seeded batch when it has no sampling_seed.
+        self.filler_seed = filler_seed
+        # Index in the scheduler's PenaltyStatusPool, held while the request uses
+        # a penalty; a retraction keeps it.
+        self.penalty_index: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
         self.page_guard_state: Optional[PageGuardState] = None
@@ -709,8 +715,6 @@ class Req(ReqDllmMixin):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
         )
-        self.temp_scaled_logprobs = False
-        self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
         self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
@@ -908,6 +912,14 @@ class Req(ReqDllmMixin):
             self.cache_request_handle,
             attempt_id=self.cache_request_handle.attempt_id + 1,
         )
+
+    @cached_property
+    def logit_bias_entries(self) -> Optional[LogitBiasEntries]:
+        """sampling_params.logit_bias parsed at the first launch, None without
+        one; the request's sampling_params no longer change once it is admitted."""
+        if self.sampling_params.logit_bias is None:
+            return None
+        return LogitBiasEntries.parse(self.sampling_params.logit_bias)
 
     @property
     def seqlen(self) -> int:
@@ -1551,8 +1563,6 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
-        # The re-prefill batch starts the penalizers from zero.
-        self.penalty_cumulated_len = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
@@ -1997,7 +2007,7 @@ def branch_checkpoint(
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
-    # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
+    # === Core: request list (ForwardBatch derives lora_ids / rids / positions from it) ===
     reqs: List[Req]
 
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
@@ -2690,10 +2700,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
-        # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
+        # Per-request sampling state is built at each launch.
+        self.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=self.device
         )
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
@@ -3183,10 +3192,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
+        self.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=self.device
         )
+        # Workers launch some idle batches themselves, without the scheduler's builds.
+        self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
+        self.sampling_info.set_seeds_and_mask_rows([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
         return alloc_tracking_slots(
@@ -3277,28 +3288,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions[i] = -1
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
-    def cumulate_penalty_output_tokens(self):
-        # Feed every output token since the last call: one per request in a
-        # decode step, a variable number after a speculative verify round. Under
-        # overlap, the step in flight is not in output_ids yet and is fed on the
-        # next call.
-        output_ids, req_indices = [], []
-        for i, req in enumerate(self.reqs):
-            new_tokens = req.output_ids[req.penalty_cumulated_len :]
-            output_ids.extend(new_tokens)
-            req_indices.extend([i] * len(new_tokens))
-            req.penalty_cumulated_len = len(req.output_ids)
-        if not output_ids:
-            return
-        output_ids, req_indices = torch.tensor(
-            [output_ids, req_indices],
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            output_ids, req_indices
-        )
-
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
@@ -3312,13 +3301,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
-
-        # Clear context parallel metadata - CP is only for prefill, not decode
-        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
-            self.attn_cp_metadata = None
-
-        if self.sampling_info.penalizer_orchestrator.is_required:
-            self.cumulate_penalty_output_tokens()
 
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
@@ -3482,10 +3464,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
-        self.sampling_info.refresh_top_k_flags(
-            [req.sampling_params.top_k for req in self.reqs]
-        )
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
@@ -3495,10 +3473,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
-        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
-        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
-        # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
