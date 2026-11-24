@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
+from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -61,7 +62,9 @@ class _FencedController(InstantWriteBackController):
         self.log = []
         self.submitted = []
         self._pool_names = pool_names
-        forward = SimpleNamespace()
+        forward = SimpleNamespace(
+            wait_event=lambda event: self.log.append(("wait", "forward", event.n))
+        )
         self.write_fence_stream = forward
 
         def wait_stream(stream):
@@ -91,7 +94,7 @@ class _FencedController(InstantWriteBackController):
         self.submitted.append(pages)
         self.log.append(("submit", n))
         finish = SimpleNamespace(
-            synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
+            n=n, synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
         )
         return SimpleNamespace(
             start_event=None, finish_event=finish, timing_enabled=False
@@ -236,6 +239,53 @@ class _WriteBackBatchingSuite:
         self.assertTrue(any(event[0] == "free" for event in cc.log))
         cc.assert_copies_behind_the_fence(self)
         cache.sanity_check()
+
+    def test_stream_fenced_demotion_orders_the_forward_behind_the_copies(self):
+        """With the load stream fenced on the forward stream, the host never
+        waits on a copy: the forward stream (and, without overlap, the current
+        stream) waits on each copy's finish event before its victims' device
+        pages are freed."""
+        setup_allocator_context()
+        for forward_on_fence_stream in (True, False):
+            with self.subTest(forward_on_fence_stream=forward_on_fence_stream):
+                cache, allocator, host_pool = self._fill_host_with_one_batch()
+                for seq in batch_seqs(1):
+                    insert_seq(cache, allocator, seq)
+                cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
+                cc.load_fence_stream = cc.write_fence_stream
+                cc.forward_on_fence_stream = forward_on_fence_stream
+                cache.cache_controller = cc
+                current = SimpleNamespace(
+                    wait_event=lambda event: cc.log.append(("wait", "current", event.n))
+                )
+
+                with (
+                    cc.record_frees("kv", allocator),
+                    mock.patch.object(
+                        unified_radix_cache.device_module,
+                        "current_stream",
+                        return_value=current,
+                    ),
+                ):
+                    result = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+
+                self.assertEqual(result.num_tokens_evicted, BATCH_TOKENS)
+                self.assertEqual(len(cc.submitted), 1)
+                self.assertFalse(any(event[0] == "sync" for event in cc.log))
+                streams = {"forward"} | (
+                    set() if forward_on_fence_stream else {"current"}
+                )
+                waited = set()
+                freed = False
+                for event in cc.log:
+                    if event[0] == "wait":
+                        waited.add((event[1], event[2]))
+                    elif event[0] == "free" and event[2] & cc.submitted[0]["kv"]:
+                        freed = True
+                        self.assertTrue({(s, 0) for s in streams} <= waited)
+                self.assertTrue(freed)
+                self.assertEqual({e[1] for e in cc.log if e[0] == "wait"}, streams)
+                cache.sanity_check()
 
     def test_allocation_reclaim_on_a_token_chain_batches_its_copies(self):
         """Regression: on a token-only chain, an allocation reclaim's write-back
