@@ -123,3 +123,18 @@ Inkling-2-Mini runs on a 4-chip TPU7x slice (one host, 8 TensorCores) as one TP8
 Select **TPU7x** and **DSpark** above for the command. It sets only what Inkling-2-Mini needs; everything else is left at its default. The DSpark draft is bundled in the checkpoint.
 
 The DSpark command was verified with GSM8K and an image-input check; AIME26 and GPQA Diamond were also run with the tuned flags of the Inkling-2-Small recipe `recipe/configs/inkling2/server.py`. The **Balanced** recipe, the same command without speculative decoding, has not been run end to end. Not yet run on TPU7x: contexts above 131072 tokens, the **Loop Passes** and **Loop KV Cache** options, PD disaggregation, and HiCache.
+
+<a id="quark" />
+
+## 4. Quark-quantized checkpoints on MI355X
+
+Inkling-2-Mini checkpoints exported by [AMD Quark](https://quark.docs.amd.com/) with packed weights (`"quant_method": "quark"` in `config.json`) are served natively on MI355X (gfx950). The expert weights stay packed in GPU memory and are decoded one tile at a time inside the expert GEMM. The method is read from `config.json`, so no `--quantization` flag is needed.
+
+| Export | Routed experts | Attention linears | Weights in GPU memory | Decode speed, one request |
+| --- | --- | --- | --- | --- |
+| UINT4-AWQ | uint4, one scale and zero point per 128 weights; BF16 activations (W4A16) | BF16 | 15.9 GiB | 88% |
+| MXFP4-RTN | MXFP4, one E8M0 scale per 32 weights; activations quantized to MXFP4 (W4A4 numerics, BF16 compute) | BF16 | 15.9 GiB | 65% |
+| UINT4-AWQ + FP8 attention | as UINT4-AWQ | FP8 E4M3, per-channel weight scales, per-token activation scales | 15.3 GiB | 75% |
+| MXFP4-RTN + FP8 attention | as MXFP4-RTN | as above | 15.3 GiB | 57% |
+
+The native release (NVFP4 / MXFP8 experts) takes 18.3 GiB and is the 100% speed reference. To launch, select **MI355X** and **Balanced** above, replace the model path with the export directory and, on one GPU, use `--tp 1 --ep 1`. The published `inkling-2-mini-mi35x` image does not include Quark support yet; build the image from source. Keep `--ep` equal to `--tp`: the packed experts cannot be split by tensor parallelism. Only MI355X was tested, and the packed experts refuse to load on GPUs other than gfx950. Not supported: a quantized KV cache (`--kv-cache-dtype fp8_e4m3` fails at the first prefill graph capture, as for the native release) and `POST /update_weights_from_disk` on the FP8-attention exports (the server exits).
