@@ -788,10 +788,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # budget.
         self._runtime = bind_dflash_runtime(self, target_model)
         # Side stream only where KV frees wait on it (overlap scheduler, no unified
-        # memory or HiCache) and the stock round owns the draft KV writes.
+        # memory or HiCache), and beside a bound runtime only if it joins the aux.
         self._aux_overlap = (
             self._use_aux_graph
-            and self._runtime is None
+            and (self._runtime is None or "join_aux" in self._runtime.bindings)
             and envs.SGLANG_OPT_DFLASH_AUX_OVERLAP.get()
             and not get_schedule().disable_overlap_schedule
             and not get_memory().enable_unified_memory
