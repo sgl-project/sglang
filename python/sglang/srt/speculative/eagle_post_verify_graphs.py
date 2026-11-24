@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.speculative.eagle_worker_common import STOCK_SPECULATIVE_RUNTIME_HOOKS
 
 if TYPE_CHECKING:
+    from sglang.kernels.plugin_kernels.nvidia.spec import LocalKeysFn
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 
@@ -134,7 +135,7 @@ class EaglePostVerifyGraphs:
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
             or route.adjusts_logits
-            # the replayed sampling view carries no seeds and no min-p
+            # the replayed sampling info carries no seeds and no min-p
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             # compute_spec_logprobs reads the gathered logits off logits_output
@@ -200,7 +201,7 @@ class EaglePostVerifyGraphs:
         from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 
         predict, accept_lens, accept_index = _sample(
-            slot, self._speculative_runtime_hooks
+            slot, self._speculative_runtime_hooks.local_keys
         )
         new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
             prepare_verify_commit_outputs(
@@ -252,7 +253,7 @@ class EaglePostVerifyGraphs:
         )
 
 
-def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
+def _sample(slot: SimpleNamespace, local_keys: LocalKeysFn) -> tuple:
     """eagle_sample over the slot's staged inputs, with the runtime hooks' local
     keys as on the eager path."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -319,7 +320,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         uno_target_max_top_k=slot.max_top_k,
         simulated_acc_len=staged.get("sim_accept_len"),
         sparse_bonus_argmax=slot.max_top_k is not None,
-        local_keys=speculative_runtime_hooks.local_keys,
+        local_keys=local_keys,
     )
 
 

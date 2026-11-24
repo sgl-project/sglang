@@ -117,7 +117,8 @@ def accept_draft_tree(
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     local_keys = None
     simulated_acc_len = None
-    # The runtime hooks serve no custom logit processor.
+    # A custom logit processor keeps the stock verify: the host draws its forced
+    # length, and its edited logits are gathered for the stock sampler anyway.
     if (
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         and not batch.sampling_info.has_custom_logit_processor

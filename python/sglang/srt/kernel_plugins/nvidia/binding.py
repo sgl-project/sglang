@@ -1059,9 +1059,9 @@ def bind_speculative_runtime_hooks(
     model: torch.nn.Module,
     defaults: SpeculativeRuntimeHooks,
 ) -> SpeculativeRuntimeHooks:
-    """Resolve target-side speculative strategies once at the binding boundary.
+    """Resolve the target-side speculative runtime hooks once, at binding.
 
-    The caller's stock strategies are returned by identity when the runtime master
+    The caller's stock hooks are returned by identity when the runtime master
     switch is off or the built provider has no factory. Provider presence must agree
     across ranks before any rank can call it. The provider may change only the
     local key builder.

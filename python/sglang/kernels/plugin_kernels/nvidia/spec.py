@@ -232,7 +232,7 @@ class BuiltMegakernel(Protocol):
     when it provides no factory. A target's factory receives SGLang's stock bundle
     and returns a bundle. SGLang selects it only under the independent
     runtime-optimization master switch and otherwise keeps the caller's stock
-    strategies unchanged. A provider replaces only the local key builder; the
+    hooks unchanged. A provider replaces only the local key builder; the
     verify itself stays SGLang's.
     """
 
