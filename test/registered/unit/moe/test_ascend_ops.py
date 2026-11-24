@@ -13,11 +13,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.routing import (
     MXFP8_QUANT_MODE,
     RoutedTokens,
     npu_moe_token_unpermute,
 )
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
     AscendOpsCombineInput,
     AscendOpsDispatcher,
@@ -60,27 +62,41 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
 
     def test_prefill_graph_uses_prefill_capacity_with_extend_flag_false(self):
         # Prefill graph capture clears the extend flag. Without the graph
-        # scope check, dispatch selects the smaller decode buffer.
-        dispatcher = self._dispatcher_for_quant_mode()
-        dispatcher.moe_ascend_ops_config = AscendOpsConfig(
-            prefill="fused_op", decode="fused_op"
+        # scope check, dispatch enforces the smaller decode limit.
+        module = "sglang.srt.layers.moe.token_dispatcher.ascend_ops"
+        ep_group = SimpleNamespace(device_group=object(), world_size=4, rank_in_group=0)
+        parallel = SimpleNamespace(tp_group=ep_group, moe_ep_group=ep_group)
+        runner_config = MoeRunnerConfig(
+            num_experts=4, num_local_experts=1, top_k=1, hidden_size=4
         )
-        dispatcher._fused_prefill_capacity = 4
-        dispatcher._fused_decode_capacity = 1
-        dispatcher.ep_group = object()
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.max_prefill_buffer_tokens", return_value=4),
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1),
+        ):
+            dispatcher = AscendOpsDispatcher(
+                runner_config, AscendOpsConfig(prefill="fused_op", decode="fused_op")
+            )
+
         hidden_states = torch.zeros((2, 4))
-        topk_output = (torch.ones((2, 1)), torch.zeros((2, 1), dtype=torch.int32), None)
+        weights = torch.ones((2, 1))
+        ids = torch.zeros((2, 1), dtype=torch.int32)
+        topk_output = (weights, ids, None)
 
         with (
             get_forward().scoped(is_extend_in_batch=False),
             get_flags().dp.override(enabled=False),
         ):
+            decode_result = dispatcher.dispatch(
+                hidden_states[:1], (weights[:1], ids[:1], None)
+            )
             with self.assertRaisesRegex(ValueError, "decode.*capacity of 1"):
                 dispatcher.dispatch(hidden_states, topk_output)
             with prefill_graph_scope(full_graph=True):
-                result = dispatcher.dispatch(hidden_states, topk_output)
-        self.assertEqual(result.forward_state.capacity, 4)
-        self.assertIs(result.hidden_states, hidden_states)
+                prefill_result = dispatcher.dispatch(hidden_states, topk_output)
+        self.assertEqual(decode_result.forward_state.buffer_capacity, 4)
+        self.assertEqual(prefill_result.forward_state.buffer_capacity, 4)
+        self.assertIs(prefill_result.hidden_states, hidden_states)
 
     # Protects mode-specific quantization settings from being ignored in favor
     # of the shared dispatcher dtype.
