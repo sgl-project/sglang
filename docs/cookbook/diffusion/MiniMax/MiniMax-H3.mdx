@@ -2311,6 +2311,43 @@ i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
 against the unpruned 66.3 GB. Those are different weights, so it is not a
 like-for-like comparison with the recipes above.
 
+### Native QKV weights on small hosts
+
+The released transformers interleave the Q, K and V rows of each attention head, so
+layerwise offload keeps a reordered copy of the fused QKV weights in host memory
+(11.20 GB per video DiT, 12.35 GB for H3-Image). The copy cannot be dropped like the
+file mapping. Convert a partition once, then serve the converted copy:
+
+```bash Command
+python3 -m sglang.multimodal_gen.tools.convert_minimax_h3_native_qkv \
+  <snapshot>/FL2VA /models/MiniMaxAI/MiniMax-H3/FL2VA
+sglang serve --model-path /models/MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --pin-cpu-memory false
+```
+
+The output holds the rewritten transformer (about 62 GB) and links the other components
+to `<snapshot>`, so keep the download. For H3-Image pass the snapshot root and any new
+directory. A local `--model-path` for the video pipeline needs `MiniMax-H3` in its path,
+as above, to be recognized without a top-level `model_index.json`.
+
+Measured on RTX 4090 24 GB with layerwise offload and `--pin-cpu-memory false`,
+480p 5 s video at 8 steps and 2048 × 2048 images, on two pods (a real 32 GiB cgroup cap
+with a 2.3 GiB/s disk; about 32 GiB left with an 8 GiB/s disk):
+
+| | Released layout | Converted |
+| --- | ---: | ---: |
+| Peak unreclaimable host memory, video | 25.2 / 25.8 GiB | 14.5 / 15.3 GiB |
+| Peak unreclaimable host memory, image | 21.5 / 22.3 GiB | 11.0 / 11.7 GiB |
+| Video latency, 8 GiB/s disk | 90–94 s | 75 s |
+| Image latency, 8 GiB/s disk | 23–24 s | 30 s |
+
+Outputs were byte-identical on both pods (two videos and two images each). The QKV weights are read from the
+disk on every pass instead of staying in host memory, so images get slower when the disk
+is the bottleneck. On the slower disk, image denoise was 13–24% slower and video latency
+was unchanged within the noise of two runs. Converting does not prevent the default-pinning
+OOM on a 32 GiB host: the larger pin budget uses the freed memory. LoRA, quantization,
+FSDP and tensor parallelism are untested with converted weights.
+
 ### RTX 5090 single card, physical desktop
 
 Every consumer figure above this point was measured with at least one axis
