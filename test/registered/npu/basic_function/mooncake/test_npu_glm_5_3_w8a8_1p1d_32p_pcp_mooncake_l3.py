@@ -2,6 +2,7 @@ import json
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+    EVALSCOPE,
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
@@ -254,27 +255,33 @@ GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
 # 4-node PD separation, prefill tp8 + attn-cp8 (interleave) + pp4,
 # decode tp32/dp32/ep32, GLM-5.3-w8a8
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
-class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Serve GLM-5.3-w8a8 with PD separation, PCP and L3 Mooncake; check accuracy and hit rates"""
+class TestNPUGLM5_3_W8A8_1P1D_PCP_DEEPSWE(TestNpuAccuracyMultiNodePdSepTestCaseBase):
+    """Serve GLM-5.3-w8a8 with PD separation, PCP and L3 Mooncake; check DeepSWE accuracy and hit rates"""
 
+    benchmark_tool = EVALSCOPE
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
-    accuracy = 0.912
-    datasets = ["gpqa_diamond"]
-    # Weekday nightly overrides this to gsm8k (baseline is provisional).
-    dataset_baselines = {
-        "gsm8k": 0.92,
-    }
+    datasets = ["deep_swe"]
+    # DeepSWE has no measured baseline yet: 0.2 is a placeholder to be replaced
+    # with the observed accuracy once a full (non-limited) run is available.
+    accuracy = 0.2
     dataset_args = {
-        "gpqa_diamond": {
-            "filters": {"remove_until": "</think>"},
-            "system_prompt": "Your response should be in the following format:\nExplanation: {your explanation for your final answer}\nExact Answer: {your succinct, final answer}\nConfidence: {your confidence score between 0% and 100% for your answer}.",
+        "deep_swe": {
+            "extra_params": {
+                # SGLang only exposes an OpenAI-compatible API, so the Pier
+                # mini-swe-agent reaches it through LiteLLM with the openai/
+                # provider prefix instead of the Responses API.
+                "pier_agent_kwargs": {
+                    "model_class": "litellm",
+                    "provider": "openai",
+                },
+            },
         },
-        "gsm8k": {"filters": {"remove_until": "</think>"}},
     }
-    eval_batch_size = 48
-    # Temporary: run only 1 GPQA Diamond question to shorten the step runtime.
-    limit = 1
+    # Each sample starts its own Docker environment, so keep concurrency at 1.
+    eval_batch_size = 1
+    # Temporary: run only 1 DeepSWE task to shorten the step runtime.
+    limit = 10
     generation_config = {
         "max_tokens": 131072,
         "temperature": 1.0,
@@ -309,8 +316,8 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
                 # L1 and exercises the L2 host tier. The 1.2x host pool (about
                 # 78k tokens) plus the device pool cover ~144k tokens, while the
                 # hit-rate test's six prefixes need ~192k, so evictions reach the
-                # L3 store. Accuracy is unaffected: gpqa prompts are short and
-                # only the prefill-side cache is capped.
+                # L3 store. Accuracy is unaffected: DeepSWE prompts are short
+                # and only the prefill-side cache is capped.
                 "--max-total-tokens",
                 65536,
                 "--hicache-storage-backend-extra-config",
@@ -334,8 +341,8 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         }
         super().setUpClass()
 
-    def test_npu_glm_5_3_w8a8_1p1d_pcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
+    def test_npu_glm_5_3_w8a8_1p1d_pcp_deep_swe(self):
+        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP on DeepSWE"""
         self.run_accuracy()
 
     def test_npu_glm_5_3_w8a8_1p1d_32p_pcp_l2_l3_hit_rate(self):

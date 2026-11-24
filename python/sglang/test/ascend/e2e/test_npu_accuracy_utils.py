@@ -161,7 +161,8 @@ def extract_report_accuracy(report_data):
     metrics = report_data.get("metrics")
     if not isinstance(metrics, list):
         metrics = []
-    for name in (primary, "accuracy"):
+    # Agent benchmarks (e.g. deep_swe) expose the binary reward as ``acc``.
+    for name in (primary, "accuracy", "acc"):
         if not name:
             continue
         for metric in metrics:
@@ -237,7 +238,8 @@ def run_evalscope(
     install_cmd = f"/bin/bash {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'run_evalscope.sh')}"
     subprocess.run(install_cmd, shell=True, check=True)
 
-    python_bin = "test_env_evalscope/bin/python"
+    # Same interpreter run_evalscope.sh installs evalscope/pier into (system python).
+    python_bin = "python"
     cmd = f"{python_bin} {script_path}"
 
     logger.info(f"Command: {cmd}")

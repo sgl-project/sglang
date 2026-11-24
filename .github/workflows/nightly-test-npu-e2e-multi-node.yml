@@ -403,10 +403,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: npu-metrics-${{ inputs.test_config_name }}-attempt-${{ github.run_attempt }}
-          # Only this case's directory: every job of the run writes under the
-          # same run-scoped output root on the shared PVC, so a glob over the
-          # whole test_type directory would also package the cases that earlier
-          # jobs already left there.
           path: |
             /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${{ steps.run_test.outputs.name }}
             /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/commit_id

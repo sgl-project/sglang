@@ -137,7 +137,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--hicache-io-backend",
     "kernel_ascend",
     "--hicache-mem-layout",
-    "page_first",
+    "layer_first",
     "--hicache-write-policy",
     "write_through",
     "--hicache-storage-prefetch-policy",

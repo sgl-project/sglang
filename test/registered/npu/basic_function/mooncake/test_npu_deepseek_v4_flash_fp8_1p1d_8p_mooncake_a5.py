@@ -209,7 +209,7 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
     stream = True
     timeout = 6000
     seed = 1
-    # Use a subset of GPQA Diamond (198 questions) to cut the step runtime.
+    # Temporary: run only 1 GPQA Diamond question to shorten the step runtime.
     limit = 1
     # Thinking mode streams up to 125k tokens per answer; the router's 1800s
     # default would cut those responses off mid-stream.
