@@ -194,6 +194,7 @@ class TestModelOptLoaderSelection(CustomTestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = ModelConfig.__new__(ModelConfig)
             config.model_path = directory
+            config.revision = None
             config.quantization = "modelopt_fp8"
             for serialized, workflow, (load_format, shard_loader) in product(
                 (False, True),
@@ -227,6 +228,103 @@ class TestModelOptLoaderSelection(CustomTestCase):
                     self.assertIsInstance(
                         loader, shard_loader if serialized else ModelOptModelLoader
                     )
+
+    def test_nested_metadata_matches_quant_config_loading(self):
+        """Text-only quant metadata must not send processed shards to calibration."""
+        from transformers import PretrainedConfig
+
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.model_loader.weight_utils import get_quant_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = ModelConfig.__new__(ModelConfig)
+            config.model_path = directory
+            config.revision = None
+            config.quantization = "modelopt_fp8"
+            config.is_draft_model = False
+            config.hf_config = PretrainedConfig(
+                text_config=PretrainedConfig(
+                    quantization_config={
+                        "quant_method": "modelopt",
+                        "quant_algo": "FP8",
+                    }
+                )
+            )
+            quant_config = get_quant_config(config, LoadConfig(), {})
+            self.assertTrue(quant_config.is_checkpoint_fp8_serialized)
+            for load_format, expected in (
+                (LoadFormat.SHARDED_STATE, loader_mod.ShardedStateLoader),
+                (LoadFormat.PRESHARDED, loader_mod.PreshardedModelLoader),
+            ):
+                with self.subTest(load_format=load_format):
+                    loader = loader_mod.get_model_loader(
+                        LoadConfig(load_format=load_format), config
+                    )
+                    self.assertIsInstance(loader, expected)
+
+    def test_shard_selection_uses_checkpoint_revision(self):
+        """A pinned cached export must agree with config parsing, not query main."""
+        from transformers import PretrainedConfig
+
+        from sglang.srt.configs.model_config import ModelConfig
+
+        with (
+            tempfile.TemporaryDirectory() as cache,
+            patch("huggingface_hub.constants.HF_HUB_CACHE", cache),
+            patch("huggingface_hub.constants.HF_HUB_OFFLINE", True),
+        ):
+            commit = "a" * 40
+            repo_cache = os.path.join(cache, "models--test-org--fp8-model")
+            snapshot = os.path.join(repo_cache, "snapshots", commit)
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "hf_quant_config.json"), "w") as f:
+                json.dump({"quantization": {"quant_algo": "FP8"}}, f)
+            os.makedirs(os.path.join(repo_cache, "refs"))
+            with open(os.path.join(repo_cache, "refs", "fp8-export"), "w") as f:
+                f.write(commit)
+
+            config = ModelConfig.__new__(ModelConfig)
+            config.model_path = "test-org/fp8-model"
+            config.quantization = "modelopt_fp8"
+            config.hf_config = PretrainedConfig()
+            for revision, serialized in (
+                (commit, True),
+                ("fp8-export", True),
+                (None, False),
+            ):
+                config.revision = revision
+                parsed = config._parse_quant_hf_config()
+                self.assertEqual(parsed is not None, serialized)
+                for load_format, shard_loader in (
+                    (LoadFormat.SHARDED_STATE, loader_mod.ShardedStateLoader),
+                    (LoadFormat.PRESHARDED, loader_mod.PreshardedModelLoader),
+                ):
+                    with self.subTest(revision=revision, load_format=load_format):
+                        loader = loader_mod.get_model_loader(
+                            LoadConfig(load_format=load_format), config
+                        )
+                        self.assertIsInstance(
+                            loader, shard_loader if serialized else ModelOptModelLoader
+                        )
+
+            # A cache miss online must ask the Hub about the same revision too.
+            config.revision = "remote-export"
+            with (
+                self.subTest(online=True),
+                patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
+                patch(
+                    "huggingface_hub.HfApi.file_exists",
+                    side_effect=lambda *args, revision=None: (
+                        revision == "remote-export"
+                    ),
+                ),
+            ):
+                self.assertIsInstance(
+                    loader_mod.get_model_loader(
+                        LoadConfig(load_format=LoadFormat.SHARDED_STATE), config
+                    ),
+                    loader_mod.ShardedStateLoader,
+                )
 
     def test_every_modelopt_quantization_selects_the_modelopt_loader(self):
         """Without an explicit shard format, retain the ModelOpt loader."""
