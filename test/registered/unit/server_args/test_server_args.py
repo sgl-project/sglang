@@ -483,6 +483,30 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
+    def test_elastic_ep_backend_none_leaves_elastic_ep_off(self):
+        """`--elastic-ep-backend none` is the documented off choice: it must
+        resolve to None, which is what every reader tests, on the command line
+        and in a config file."""
+        cases = (
+            (None, [], None),
+            (None, ["--elastic-ep-backend", "none"], None),
+            (None, ["--elastic-ep-backend=none"], None),
+            ("elastic-ep-backend: none\n", [], None),
+            (None, ["--elastic-ep-backend", "nixl"], "nixl"),
+            ("elastic-ep-backend: mooncake\n", [], "mooncake"),
+        )
+        for config, cli, expected in cases:
+            with self.subTest(config=config, cli=cli):
+                argv = ["--model-path", "dummy", *cli]
+                if config is not None:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", delete=False
+                    ) as f:
+                        f.write(config)
+                    self.addCleanup(os.unlink, f.name)
+                    argv += ["--config", f.name]
+                self.assertEqual(prepare_server_args(argv).elastic_ep_backend, expected)
+
     def test_monokernel_flags_in_config_and_cli(self):
         """--enable-amd-monokernel and --enable-nvidia-megakernel parse the same
         from the command line and from a config file."""
