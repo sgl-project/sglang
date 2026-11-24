@@ -12,7 +12,7 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, and approving a commit for NVIDIA PR Test Base and Extra; write access to the repo grants the same |
+| `can_tag_run_ci_label` | `/tag-and-rerun-ci`, `/approve-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, and approving a commit for NVIDIA PR Test Base and Extra; write access to the repo grants the same |
 | `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
@@ -34,9 +34,9 @@ The workflows in `run_ci_approval.APPROVAL_WORKFLOWS` (`pr-test.yml`, `pr-test-e
 `pr-test-sgl-router.yml`, `pr-test-mlu.yml`) call the gate with `approval-mode: commit`:
 unless the PR's author can approve, besides the `run-ci` label they need a
 `ci/run-ci-approved` status on the PR's head commit, so every push needs a new
-approval. Only the slash command handler records it, when an approver runs a
-command that adds `run-ci`, and only for a head pushed before the comment;
-`scripts/ci/utils/run_ci_approval.py` holds the approver rule.
+approval. Only the slash command handler records it, when an approver runs
+`/approve-ci` or a command that adds `run-ci`, and only for a head pushed
+before the comment; `scripts/ci/utils/run_ci_approval.py` holds the approver rule.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where
