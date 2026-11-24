@@ -2402,7 +2402,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             state.free_group_end()
             state.free_group_begin()
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         """Fixed-shape counterpart of `free()` for a segment whose window pages
         are all bound; see `Band._page_reps`."""
         if free_index is None or free_index.numel() == 0:

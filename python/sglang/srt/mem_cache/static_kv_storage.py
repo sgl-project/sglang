@@ -552,14 +552,24 @@ class StaticKVStorage:
     def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
         self._band(sub_pool).free(ids)
 
-    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+    def free_units(
+        self,
+        sub_pool: str,
+        ids: torch.Tensor,
+        *,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         if sub_pool == _WINDOW:
             self._allocator.free_swa_segment(ids, start_pos=0)
         else:
-            self._band(sub_pool).free_segment(ids, start_pos=0)
+            self._band(sub_pool).free_segment(
+                ids, start_pos=0, rotation_base=rotation_base
+            )
 
-    def free_token_rows(self, ids: torch.Tensor) -> None:
-        self._allocator.free_segment(ids, start_pos=0)
+    def free_token_rows(
+        self, ids: torch.Tensor, *, rotation_base: Optional[int] = None
+    ) -> None:
+        self._allocator.free_segment(ids, start_pos=0, rotation_base=rotation_base)
 
     def free_owner_rows(self, ids: torch.Tensor) -> None:
         self._allocator.free_full_segment(ids, start_pos=0)
@@ -1351,19 +1361,20 @@ def _kv_shard_rotation_bases(
 
     The owner class of position-page P is ``(b_i + P) % shard_size``. Rules:
 
-    - Read through ``req.last_node`` at alloc time, never a value cached on
-      the request: a ``checkpoint`` can rebind a chunked request onto
-      another chain's canonical locs between chunks, changing the base. The
-      read goes through ``tree_cache.rotation_base_of`` because the node
-      handle is tree-specific (a NodeId on the unified tree).
+    - Read through ``req.last_node`` when extending a cached prefix: on the
+      first extend ``req.kv_rotation_base`` is not yet set, and subsequent
+      ``checkpoint`` calls keep the same base (cross-base grafts are declined
+      by ``_rotation_conflict``, so a request never rebinds onto a different
+      rotation base). The read goes through ``tree_cache.rotation_base_of``
+      because the node handle is tree-specific (a NodeId on the unified tree).
     - A request without a cached prefix starts a new chain: None here — the
       allocator draws from the least-full class at that request's turn (so
       the draw sees earlier requests' pops in the same batch) and resolves
       the entry in place.
-    - A radix-disabled cache keeps no nodes past the root, which carries no
-      base; its chunked continuations fall back to the base recorded on the
-      request at the previous chunk's alloc (no cross-request reuse, no
-      rebind there).
+    - When ``req.last_node`` carries no base (a radix-disabled cache, or a
+      chunked request whose earlier insert stayed on the root after a declined
+      graft), fall back to the base recorded on the request at the previous
+      chunk's alloc.
     """
     assert batch is not None and len(batch.reqs) == len(prefix_lens_cpu)
     bases = []
@@ -1373,6 +1384,10 @@ def _kv_shard_rotation_bases(
             continue
         node_base = tree_cache.rotation_base_of(req.last_node)
         if node_base is not None:
+            assert req.kv_rotation_base is None or req.kv_rotation_base == node_base, (
+                f"req.kv_rotation_base ({req.kv_rotation_base}) out of sync with "
+                f"req.last_node rotation base ({node_base})"
+            )
             bases.append(node_base)
         else:
             assert req.kv_rotation_base is not None, (

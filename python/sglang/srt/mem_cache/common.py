@@ -90,9 +90,12 @@ def free_kv_row_segments(
     *,
     window_evicted_seqlen: int,
     window_dead_lo: int = 0,
+    rotation_base: Optional[int] = None,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row; ``[window_dead_lo, window_evicted_seqlen)`` goes back full-side only."""
+    request's kv row; ``[window_dead_lo, window_evicted_seqlen)`` goes back full-side only.
+    ``rotation_base``: the row's rotation base under logical-page KV sharding
+    (see ``BaseTokenToKVPoolAllocator.free_segment``)."""
     dead_lo, dead_hi = window_dead_lo, max(window_evicted_seqlen, window_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
@@ -126,7 +129,7 @@ def free_kv_row_segments(
     if swa_alive:
         if is_cp_sharded_padded():
             swa_alive = get_cp_sharded_padded_kv_segments(swa_alive)
-        allocator.free_segments(swa_alive)
+        allocator.free_segments(swa_alive, rotation_base=rotation_base)
 
 
 def _req_radix_key(
@@ -413,8 +416,18 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         tree_cache.checkpoint(req, up_to=owned_kv_len)
+    if req.kv_rotation_base is not None and req.last_node is not None:
+        node_base = tree_cache.rotation_base_of(req.last_node)
+        assert node_base is None or node_base == req.kv_rotation_base, (
+            f"req.kv_rotation_base ({req.kv_rotation_base}) out of sync with "
+            f"req.last_node rotation base ({node_base})"
+        )
     # The protected prefix is not this req's to free.
-    tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+    tree_cache.free_kv_row(
+        req.kv,
+        [(req.kv.cache_protected_len, owned_kv_len)],
+        rotation_base=req.kv_rotation_base,
+    )
     tree_cache.unlock(req.lock)
     req.lock = None
     _release_overallocated_kv_indices(
@@ -457,7 +470,9 @@ def _release_overallocated_kv_indices(
     if start_p < end_p:
         # start_p is aligned to the allocator's page above, so it never shares a
         # page with the tail free_kv_row in this group.
-        tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
+        tree_cache.free_kv_row(
+            req.kv, [(start_p, end_p)], rotation_base=req.kv_rotation_base
+        )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
