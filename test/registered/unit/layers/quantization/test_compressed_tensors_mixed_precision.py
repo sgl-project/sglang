@@ -9,9 +9,12 @@ for every group. Both are config-parsing paths, so these tests run on CPU.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
+import ast
+import re
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -599,6 +602,118 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
         scheme = self._lfm2_scheme(["re:.*layers\\.0\\.feed_forward\\.w2$"])
         self.assertIsNone(scheme("model.layers.0.feed_forward.down_proj"))
         self.assertIsNotNone(scheme("model.layers.1.feed_forward.down_proj"))
+
+
+def _declared_fused_mappings():
+    """(model, fused, shards) for every literal packed_modules_mapping entry.
+
+    Read with ast so the sweep needs no model imports. Mappings built at
+    runtime (Qwen3.5, Glm5Next, ...) are left out, and so are entries whose
+    shards are not plain leaf names: Solar's (name, shard_id) tuples are read
+    only by its own load_weights, and dotted keys (Gemma3n's ".qkv_proj") are
+    never found by the leaf-name lookup, so the fallback table covers them.
+    """
+    import sglang
+
+    models_dir = Path(sglang.__file__).parent / "srt" / "models"
+    entries = []
+    for path in sorted(models_dir.rglob("*.py")):
+        for cls in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if not (
+                    isinstance(stmt, ast.Assign)
+                    and [getattr(t, "id", None) for t in stmt.targets]
+                    == ["packed_modules_mapping"]
+                ):
+                    continue
+                try:
+                    mapping = ast.literal_eval(stmt.value)
+                except ValueError:
+                    continue
+                for fused, shards in mapping.items():
+                    names = [fused, *shards]
+                    if all(isinstance(n, str) and "." not in n for n in names):
+                        entries.append((f"{path.stem}.{cls.name}", fused, shards))
+    return entries
+
+
+class TestDeclaredFusedMappingSweep(CustomTestCase):
+    """Every model's declared fusion resolves ignore lists and schemes the same way."""
+
+    PREFIX = "model.layers.0.blk"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.entries = _declared_fused_mappings()
+
+    def _cases(self):
+        for model, fused, shards in self.entries:
+            with self.subTest(model=model, fused=fused):
+                yield (
+                    f"{self.PREFIX}.{fused}",
+                    [f"{self.PREFIX}.{shard}" for shard in shards],
+                    {fused: list(shards)},
+                )
+
+    def test_the_sweep_sees_the_common_fusions(self):
+        """Guard against the ast reader silently finding nothing."""
+        fused_names = {fused for _, fused, _ in self.entries}
+        self.assertGreater(len(self.entries), 50)
+        self.assertLessEqual({"qkv_proj", "gate_up_proj"}, fused_names)
+
+    def test_ignore_list_follows_the_shards(self):
+        """All shards listed: ignored. None: kept. The fused name itself: ignored."""
+        for layer, shard_names, mapping in self._cases():
+            self.assertTrue(should_ignore_layer(layer, shard_names, mapping))
+            self.assertFalse(should_ignore_layer(layer, ["lm_head"], mapping))
+            self.assertTrue(should_ignore_layer(layer, [layer], mapping))
+
+    def test_some_shards_ignored_raises(self):
+        """A literal entry or a regex on one shard only is a mixed scheme, even
+        when the regex also matches the fused name (`re:.*v_proj$` on qkv_proj)."""
+        for layer, shard_names, mapping in self._cases():
+            if len(shard_names) < 2:
+                continue
+            last = re.escape(shard_names[-1].rsplit(".", 1)[1])
+            for ignore in (
+                shard_names[:1],
+                [f"re:.*\\.{last}$"],
+                [f"re:.*{last}$"],
+            ):
+                with self.assertRaisesRegex(ValueError, "same scheme"):
+                    should_ignore_layer(layer, ignore, mapping)
+
+    @staticmethod
+    def _scheme(mapping, *groups):
+        quant_config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(*groups)
+        )
+        quant_config.update_packed_modules_mapping(mapping)
+        return quant_config
+
+    def test_shard_targets_resolve_to_one_scheme(self):
+        """Per-shard exact targets: one scheme loads, two different schemes raise."""
+        for layer, shard_names, mapping in self._cases():
+            linear = torch.nn.Linear(1, 1)
+            mse = {**WNA16_GROUP["weights"], "observer": "mse"}
+            same = self._scheme(
+                mapping,
+                {**WNA16_GROUP, "targets": shard_names[:1]},
+                {**WNA16_GROUP, "weights": mse, "targets": shard_names[1:]},
+            )
+            self.assertEqual(same.get_scheme_dict(linear, layer)["weights"].num_bits, 4)
+            if len(shard_names) < 2:
+                continue
+            mixed = self._scheme(
+                mapping,
+                {**FP8_GROUP, "targets": shard_names[:-1]},
+                {**WNA16_GROUP, "targets": shard_names[-1:]},
+            )
+            with self.assertRaisesRegex(ValueError, "same scheme"):
+                mixed.get_scheme_dict(linear, layer)
 
 
 if __name__ == "__main__":
