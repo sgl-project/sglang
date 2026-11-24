@@ -37,7 +37,7 @@ class ChainAccept(msgspec.Struct):
     """A chain verify's (DFlash, DSpark) accept, per request: the first
     ``correct_len`` drafts match the target, ``bonus`` follows them, and the
     first ``commit_lens`` tokens of ``out_tokens`` [bs, width] commit. A
-    request capped by ``VerifyStep.cap_chain_accept`` commits one token, not
+    request capped by ``VerifyStep.run`` commits one token, not
     ``correct_len + 1``; ``correct_len`` stays the accept kernel's, for the
     acceptance estimators."""
 
@@ -49,3 +49,6 @@ class ChainAccept(msgspec.Struct):
     cap_trim_lens: Optional[torch.Tensor] = None
     # prefix_lens + commit_lens; None when the accept did not compute it.
     new_seq_lens: Optional[torch.Tensor] = None
+    # The accept ran in a CUDA graph (DSpark's verify-graph fold or its
+    # sampling-accept region): its tensors are views of the graph's buffers.
+    in_graph: bool = False

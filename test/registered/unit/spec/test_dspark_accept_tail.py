@@ -105,6 +105,8 @@ class TestAcceptTailParity(CustomTestCase):
         )
 
         got, want = msgspec.structs.asdict(graph), msgspec.structs.asdict(eager)
+        self.assertTrue(got.pop("in_graph"))
+        self.assertFalse(want.pop("in_graph"))
         for field, value in want.items():
             self.assertTrue(
                 torch.equal(got[field].cpu().long(), value.cpu().long()), field
@@ -198,6 +200,7 @@ class TestFusedStaticAcceptTail(CustomTestCase):
                     )
                     got = msgspec.structs.asdict(fused.read_accept(BS))
                     ref = msgspec.structs.asdict(separate.read_accept(BS))
+                    self.assertEqual(got.pop("in_graph"), ref.pop("in_graph"))
                     for field, value in ref.items():
                         self.assertTrue(torch.equal(got[field], value), field)
 

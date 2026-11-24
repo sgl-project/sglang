@@ -10,10 +10,8 @@ Two entries run it:
   in one call;
 - verify: `SamplingPipeline.plan_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch EAGLE, NGRAM, and DFlash make one call, `VerifyStep.run`, which takes
-  the worker's accept core as a function; DSpark calls `build_row_inputs`, the
-  stages (`VerifyStep.adjust`), its accept core, the cap (`cap_chain_accept`),
-  and `commit`.
+  launch every verify worker makes one call, `VerifyStep.run`, which takes the
+  worker's accept core as a function.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
@@ -26,7 +24,7 @@ and the grammar mask.
 
 Each entry probes the model's logits for NaN before the stages
 (`detect_nan_logits`): decode in `SamplingPipeline.sample`, verify in
-`VerifyStep.build_row_inputs`; `VerifyStep.run` also probes them for inf. The
+`VerifyStep.run`, which also probes them for inf. The
 sanitize, which heals NaN and inf only under SGLANG_SANITIZE_NAN_LOGITS, ends the
 stages on every path; a verify's route turns off the fast paths that skip the
 stages in that mode.
@@ -372,90 +370,100 @@ class VerifyStep(msgspec.Struct):
         accept_core: Callable[[torch.Tensor, SamplingBatchInfo], _Accept],
         tree: Optional[EagleVerifyInput] = None,
         draft_tokens: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
         prefix_lens: Optional[torch.Tensor] = None,
     ) -> _Accept:
         """A verify after its target forward, in one call: probe the model's
-        logits, build the stages' row inputs (`build_row_inputs`, which reads
-        `host_tree` and `barrier`), apply the stages when the route says some
-        stage edits the logits, never on an idle batch (on the full logits, so a
-        vocabulary shard is gathered first), accept, cap each first-row-only
-        request to one token, and commit.
+        logits, build the stages' row inputs, apply the stages when the route
+        says some stage edits the logits, never on an idle batch (on the full
+        logits, so a vocabulary shard is gathered first), accept, cap each
+        first-row-only request to one token, and commit.
         A tree verify passes its verify input as `tree`, and its `accept_core`
         returns a `VerifyAccept`; a chain verify passes its [bs, width]
-        `draft_tokens` and the `prefix_lens` its accept commits after, and its
-        `accept_core` returns a `ChainAccept`.
+        `draft_tokens` and `positions` and the `prefix_lens` its accept commits
+        after, and its `accept_core` returns a `ChainAccept`.
+        The row inputs come from `host_tree`, the verify tree's host copy, which
+        the worker builds when `needs_verify_tree`: the grammar mask, the custom
+        logit processors' row prefixes, and `first_row_only_reqs`. Under overlap
+        the previous step's result is still queued; `barrier` advances the
+        grammar FSM over its tokens and returns them per request, as result
+        processing will append them to req.output_ids.
         `accept_core(logits, sampling_info)` is the worker's accept over the
         logits and sampling info after the stages; when no stage runs, the
         model's logits (possibly a vocabulary shard) and the batch's sampling
         info."""
-        self.build_row_inputs(logits_output, tree=host_tree, barrier=barrier)
-        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         batch = self.batch
-        logits, sampling_info = logits_output.next_token_logits, batch.sampling_info
+        logits = logits_output.next_token_logits
+        detect_nan_logits(logits, "verify")
+        if host_tree is not None:
+            # Lazy: spec_utils imports the scheduler stack.
+            from sglang.srt.speculative.spec_utils import (
+                build_grammar_vocab_mask,
+                verify_row_prefixes,
+            )
+
+            pending = barrier() if barrier is not None else {}
+            if batch.has_grammar:
+                self.grammar_mask = build_grammar_vocab_mask(
+                    reqs=batch.reqs,
+                    tree=host_tree,
+                    sampling_info=batch.sampling_info,
+                    device=logits.device,
+                )
+            info = batch.sampling_info
+            if info is not None and info.has_custom_logit_processor:
+                self.row_prefixes = verify_row_prefixes(
+                    *host_tree.resolve(),
+                    pending_tokens=[pending.get(req, []) for req in batch.reqs],
+                )
+                self.first_row_only_reqs = first_row_only_requests(info)
+        maybe_detect_inf(logits, "verify: target model logits")
+
+        sampling_info = batch.sampling_info
         if self.route.adjusts_logits and not batch.forward_mode.is_idle():
             if tree is not None:
                 draft_tokens = tree.draft_token.reshape(
                     len(batch.seq_lens), tree.draft_token_num
                 )
-            logits, sampling_info = self.adjust(
-                logits_output.gather_vocab_shard(), draft_tokens, tree=tree
+            logits, sampling_info = self._adjust(
+                logits_output.gather_vocab_shard(),
+                draft_tokens,
+                positions=positions,
+                tree=tree,
             )
         result = accept_core(logits, sampling_info)
+
+        # Each first-row-only request commits its first token: the accepted
+        # first draft, or else the bonus from the first row. That is the first
+        # row's distribution, so the sampling stays exact.
+        capped = self.first_row_only_reqs
         if tree is not None:
-            self.cap_tree_accept(result.accept_lens, result.accept_index)
+            if capped is not None:
+                result.accept_lens.index_fill_(0, capped, 1)
+                result.accept_index[:, 1:].index_fill_(0, capped, -1)
             committed = result
         else:
-            self.cap_chain_accept(result, prefix_lens=prefix_lens)
+            if capped is not None:
+                # New tensors, not in place: an accept may return views of
+                # buffers it reuses.
+                is_capped = torch.zeros_like(result.commit_lens, dtype=torch.bool)
+                is_capped.index_fill_(0, capped, True)
+                result.commit_lens = torch.where(is_capped, 1, result.commit_lens)
+                result.bonus = torch.where(
+                    is_capped,
+                    result.out_tokens[:, 0].to(result.bonus.dtype),
+                    result.bonus,
+                )
+                result.new_seq_lens = prefix_lens + result.commit_lens.to(
+                    prefix_lens.dtype
+                )
             committed = VerifyAccept(
                 tokens=result.out_tokens, accept_lens=result.commit_lens
             )
         self.commit(committed, logits_output=logits_output)
         return result
 
-    def build_row_inputs(
-        self,
-        logits_output: LogitsProcessorOutput,
-        *,
-        tree: Optional[HostVerifyTree],
-        barrier: Optional[Callable[[], Dict[Req, List[int]]]],
-    ) -> None:
-        """Build the stages' per-row inputs from `tree`, the verify tree's host
-        copy, which the worker builds when `needs_verify_tree`: the grammar mask,
-        the custom logit processors' row prefixes, and `first_row_only_reqs`.
-        It also probes the target's logits for NaN. Each verify worker calls it
-        once after the target verify launches, so the host work overlaps the
-        forward. Under overlap the previous step's result is still queued;
-        `barrier` advances the grammar FSM over its tokens and returns them per
-        request, as result processing will append them to req.output_ids. The
-        probe reads `logits_output`, which also gives the grammar mask its
-        device."""
-        detect_nan_logits(logits_output.next_token_logits, "verify")
-        if tree is None:
-            return
-        # Lazy: spec_utils imports the scheduler stack.
-        from sglang.srt.speculative.spec_utils import (
-            build_grammar_vocab_mask,
-            verify_row_prefixes,
-        )
-
-        pending = barrier() if barrier is not None else {}
-        batch = self.batch
-        if batch.has_grammar:
-            self.grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=tree,
-                sampling_info=batch.sampling_info,
-                device=logits_output.next_token_logits.device,
-            )
-        info = batch.sampling_info
-        if info is not None and info.has_custom_logit_processor:
-            self.row_prefixes = verify_row_prefixes(
-                *tree.resolve(),
-                pending_tokens=[pending.get(req, []) for req in batch.reqs],
-            )
-            self.first_row_only_reqs = first_row_only_requests(info)
-
-    def adjust(
+    def _adjust(
         self,
         logits: torch.Tensor,
         draft_tokens: torch.Tensor,
@@ -519,34 +527,6 @@ class VerifyStep(msgspec.Struct):
             verify_logits, logprob_logits=None if verify_logits is logits else logits
         )
         return verify_logits, sampling_info
-
-    def cap_tree_accept(
-        self, accept_lens: torch.Tensor, accept_index: torch.Tensor
-    ) -> None:
-        """Cut each `first_row_only_reqs` request's tree accept to its first token, in
-        place: the accepted first draft, or else the bonus from the first row.
-        That is the first row's distribution, so the sampling stays exact."""
-        if self.first_row_only_reqs is None:
-            return
-        accept_lens.index_fill_(0, self.first_row_only_reqs, 1)
-        accept_index[:, 1:].index_fill_(0, self.first_row_only_reqs, -1)
-
-    def cap_chain_accept(
-        self, accept: ChainAccept, *, prefix_lens: torch.Tensor
-    ) -> None:
-        """Cut each `first_row_only_reqs` request's chain accept to its first
-        token, `out_tokens[:, 0]`, as `cap_tree_accept` does: it replaces
-        `accept`'s `commit_lens`, `bonus`, and `new_seq_lens` with new tensors,
-        since DSpark's are views of its graph buffers."""
-        if self.first_row_only_reqs is None:
-            return
-        capped = torch.zeros_like(accept.commit_lens, dtype=torch.bool)
-        capped.index_fill_(0, self.first_row_only_reqs, True)
-        accept.commit_lens = torch.where(capped, 1, accept.commit_lens)
-        accept.bonus = torch.where(
-            capped, accept.out_tokens[:, 0].to(accept.bonus.dtype), accept.bonus
-        )
-        accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
 
     def commit(
         self, accept: VerifyAccept, *, logits_output: LogitsProcessorOutput

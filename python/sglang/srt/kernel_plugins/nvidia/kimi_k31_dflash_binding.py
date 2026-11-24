@@ -80,7 +80,7 @@ class DFlashRuntime(Protocol):
         """The decode branch of ``forward_batch_generation``. None, decided alike on
         every TP rank before any launch, runs SGLang's round. A round that applies
         the grammar mask or custom logit processors passes ``grammar_barrier`` to
-        ``VerifyStep.build_row_inputs``; under overlap the barrier advances the
+        ``VerifyStep.run``; under overlap the barrier advances the
         grammar FSM and returns the previous step's tokens, which req.output_ids
         lacks yet."""
 
