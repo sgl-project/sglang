@@ -4831,7 +4831,7 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
-        with self.assertRaises(ValueError):
+        with envs.SGLANG_RUST_SERVER.override(False), self.assertRaises(ValueError):
             handle_grpc_args(sa)
 
     def test_rust_server_grpc_accepts_multi_tokenizer(self):
