@@ -546,7 +546,18 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     kv_cache_dtype = view.kv_cache_dtype
     has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
-    if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+    hy4_flash_fp8 = (
+        hf_config.architectures[0] == "HYV4FlashForConditionalGeneration"
+        and kv_cache_dtype == "fp8_e4m3"
+        and major == 9
+        and not get_platform().is_hip
+        and view.dcp_size == 1
+    )
+    if (
+        has_attention_sinks
+        and kv_cache_dtype not in ("auto", "bf16", "bfloat16")
+        and not hy4_flash_fp8
+    ):
         raise ValueError(
             "Learnable DSA attention sinks require a bfloat16 KV cache; "
             f"got kv_cache_dtype={kv_cache_dtype}."
@@ -719,7 +730,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
 
     if getattr(hf_config, "learnable_sink", False):
-        backend = "flashmla_sparse"
+        backend = "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
         declared = _pin_dsa_backends(
             view,
             backend,

@@ -340,6 +340,16 @@ def _adjacent_absorbed_q(
     return q_nope.as_strided((num_tokens, num_heads, head_dim), strides)
 
 
+def _apply_flashmla_kv_sink(o, lse, attn_sink):
+    # A zero-valued sink adds exp(sink) to the softmax denominator.
+    # FlashMLA returns natural-log LSE [batch, heads, query] and uses
+    # +inf for empty rows. Apply the factor before restoring padded rows.
+    log_mass = lse[:, : o.shape[2], :].transpose(1, 2)
+    weight = torch.sigmoid(log_mass - attn_sink.view(1, 1, -1))
+    weight = weight.masked_fill(log_mass.isposinf(), 0)
+    return (o.float() * weight.unsqueeze(-1)).to(o.dtype)
+
+
 def _flashmla_kv_padded_heads(num_heads: int) -> int:
     """Use native head counts when the installed SM100 kernel supports them."""
     if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
@@ -873,6 +883,9 @@ class DeepseekSparseAttnBackend(
         ):
             # The one-shot FP8 dequantizers require scaled KV rows; TileLang
             # consumes raw FP8 KV without per-block scales.
+            self.supports_mha_one_shot = False
+        # Sink-bearing layers always execute sparse MLA, including short prefills.
+        if self.dsa_kv_cache_store_fp8 and getattr(hf_config, "learnable_sink", False):
             self.supports_mha_one_shot = False
         self.flashmla_prefill_token_packing = False
         if (
@@ -2728,9 +2741,9 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in ("flashmla_sparse", "flashmla_kv"):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"Unsupported DSA backend for learnable attention sinks: {dsa_impl}"
             )
 
         phase = (
@@ -3046,6 +3059,7 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if (
                 self.flashmla_prefill_token_packing
+                and attn_sink is None
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and layer.v_head_dim == 512
             ):
@@ -3074,6 +3088,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
                 dcp_partial=self.dsa_shards_index_k
                 and forward_batch.forward_mode.is_target_verify(),
             )
@@ -3151,9 +3166,9 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in ("flashmla_sparse", "flashmla_kv"):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"Unsupported DSA backend for learnable attention sinks: {dsa_impl}"
             )
 
         if uses_raw_fp8_dsa_kv_layout(dsa_impl):
@@ -3261,6 +3276,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                attn_sink=attn_sink,
                 dcp_partial=self.dsa_shards_index_k,
             )
         elif dsa_impl == "tilelang":
@@ -4001,6 +4017,7 @@ class DeepseekSparseAttnBackend(
         page_table_1,
         forward_batch: ForwardBatch,
         dcp_partial: bool = False,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # dcp_partial: DCP decode, q gathered from the group attends over this
         # rank's KV shard; returns (o, lse) for the merge instead of o.
@@ -4047,9 +4064,19 @@ class DeepseekSparseAttnBackend(
                 topk_length = None
             num_splits = None
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        if attn_sink is not None and indices.shape[-1] != self.dsa_index_topk:
+            # Window layers select fewer slots, while DFly appends the candidate
+            # slots to the historical selection. Schedule their actual widths.
+            tile_scheduler_metadata, num_splits = self._call_get_mla_metadata(
+                cache_seqlens=cache_seqlens,
+                num_q_tokens_per_head_k=target_q_heads,
+                num_heads_k=1,
+                num_heads_q=target_q_heads,
+                is_fp8_kvcache=True,
+                topk=indices.shape[-1],
+            )
+        else:
+            assert indices.shape[-1] == self.dsa_index_topk
         if dcp_partial:
             tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
                 q_input, indices, topk_length
@@ -4081,6 +4108,8 @@ class DeepseekSparseAttnBackend(
         )
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
+        if attn_sink is not None:
+            o = _apply_flashmla_kv_sink(o, lse, attn_sink)
         if not dcp_partial:
             return _restore_live_rows(o, plan)
 
