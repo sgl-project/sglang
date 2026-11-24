@@ -1987,12 +1987,20 @@ def _flash_attn_fwd(
     return out, lse
 
 
+class _JitSourcePaths:
+    """Iterated when a cache path is first resolved: the device arch that
+    selects the SM12x kernels is not known at import."""
+
+    def __iter__(self):
+        cute_dir = os.path.dirname(os.path.abspath(__file__))
+        yield cute_dir
+        if get_forward_host(_get_device_arch()) is not None:
+            # On SM12x these caches also hold the kernels compiled from fa4_sm120/.
+            yield os.path.join(cute_dir, "..", "..", "fa4_sm120")
+
+
 def _get_jit_cache(name: str):
-    return get_jit_cache(
-        name,
-        source_paths=(os.path.dirname(os.path.abspath(__file__)),),
-        enable_tvm_ffi=True,
-    )
+    return get_jit_cache(name, source_paths=_JitSourcePaths(), enable_tvm_ffi=True)
 
 
 _flash_attn_fwd.compile_cache = _get_jit_cache("fwd")
