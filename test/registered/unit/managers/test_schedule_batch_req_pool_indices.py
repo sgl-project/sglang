@@ -1,6 +1,6 @@
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -52,11 +52,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
             _make_req(req_pool_idx=9, origin_input_ids=[1, 2], output_ids=[8]),
         ]
 
-        with patch(
-            "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
-            return_value=MagicMock(),
-        ):
-            batch = scheduler._build_hisparse_decode_batch(reqs)
+        batch = scheduler._build_hisparse_decode_batch(reqs)
 
         # Assert the invariant (cpu mirror == device tensor), not a hardcoded
         # copy of the input -- the latter would just restate the builder line.
