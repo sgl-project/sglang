@@ -31,7 +31,7 @@ FN_MAP = {
 
 
 @marker.parametrize("tokens", [2160, 8640], [8640])
-@marker.benchmark("impl", ["eager", "jit"])
+@marker.benchmark("impl", ["eager", "jit"], gate=["jit"])
 def benchmark(tokens: int, impl: str):
     generator = torch.Generator(device="cuda").manual_seed(20260826)
     q = torch.randn(
