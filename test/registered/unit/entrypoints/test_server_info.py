@@ -194,17 +194,27 @@ class TestServerInfoTransportParity(CustomTestCase):
                 with self.subTest(model=name):
                     scheduler.model_config.hf_config.model_type = name
                     info = json.loads(rust_config._launch_server_info(scheduler))
-                    self.assertTrue(info["accepts_encoder_handoff"])
+                    layout = rust_config.staged_layout_for(name)
                     self.assertEqual(
-                        info["encoder_handoff_key_id"],
-                        hashlib.sha256(bytes(32)).hexdigest(),
+                        info.get("accepts_encoder_handoff", False), layout is not None
                     )
-                    self.assertEqual(info["supports_staged_video"], supported)
+                    self.assertEqual(
+                        info.get("staged_layout_id"),
+                        layout.wire_id(name) if layout else None,
+                    )
+                    self.assertEqual(
+                        info.get("encoder_handoff_key_id"),
+                        hashlib.sha256(bytes(32)).hexdigest() if layout else None,
+                    )
+                    self.assertEqual(
+                        info.get("supports_staged_video", False), supported
+                    )
                     self.assertEqual(
                         info.get("native_model_type"),
                         name if name in {"kimi_k3", "glm4v"} else None,
                     )
 
+            scheduler.model_config.hf_config.model_type = "qwen3_vl"
             for mode, backend in (
                 ("prefill", "nixl"),
                 ("null", "zmq_to_scheduler"),
@@ -221,6 +231,11 @@ class TestServerInfoTransportParity(CustomTestCase):
                         info.get("staged_transfer_backend"),
                         None if mode == "decode" else backend,
                     )
+
+        with envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(False):
+            info = json.loads(rust_config._launch_server_info(scheduler))
+            self.assertNotIn("staged_layout_id", info)
+            self.assertNotIn("staged_transfer_backend", info)
 
     def test_rust_launch_info_redacts_the_api_keys(self):
         # Only the API key (or nothing) guards /server_info, so reporting the

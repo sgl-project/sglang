@@ -57,6 +57,8 @@ message GetEncoderInfoResponse {
   string handoff_peer = 11;
   // Resolved backend used to deliver staged embeddings (nixl or zmq_to_scheduler).
   string staged_transfer_backend = 12;
+  // Model and static descriptor layout, independent of available source decoders.
+  string staged_layout_id = 13;
 }
 
 message StagedMediaPolicy {

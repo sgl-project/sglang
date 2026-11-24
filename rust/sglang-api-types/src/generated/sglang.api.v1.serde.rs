@@ -24523,6 +24523,9 @@ impl ::serde::Serialize for GetServerInfoResponse {
         if let Some(v) = &self.staged_transfer_backend {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "staged_transfer_backend", v)?;
         }
+        if let Some(v) = &self.staged_layout_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "staged_layout_id", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24562,6 +24565,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_supports_staged_images = None;
                 let mut f_encoder_handoff_key_id = None;
                 let mut f_staged_transfer_backend = None;
+                let mut f_staged_layout_id = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24747,6 +24751,15 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             f_staged_transfer_backend =
                                 Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
+                        "staged_layout_id" => {
+                            if f_staged_layout_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "staged_layout_id",
+                                ));
+                            }
+                            f_staged_layout_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24777,6 +24790,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     supports_staged_images: f_supports_staged_images.flatten(),
                     encoder_handoff_key_id: f_encoder_handoff_key_id.flatten(),
                     staged_transfer_backend: f_staged_transfer_backend.flatten(),
+                    staged_layout_id: f_staged_layout_id.flatten(),
                 })
             }
         }

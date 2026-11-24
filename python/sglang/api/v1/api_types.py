@@ -4282,6 +4282,7 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     supports_staged_images: Optional[bool] = None
     encoder_handoff_key_id: Optional[str] = None
     staged_transfer_backend: Optional[str] = None
+    staged_layout_id: Optional[str] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -12156,6 +12157,8 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["encoder_handoff_key_id"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "staged_transfer_backend":
             kw["staged_transfer_backend"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "staged_layout_id":
+            kw["staged_layout_id"] = None if x is None else _expect_str(x, expected="a string")
     return GetServerInfoResponse(**kw)
 
 
@@ -12190,6 +12193,8 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
         d["encoder_handoff_key_id"] = v.encoder_handoff_key_id
     if v.staged_transfer_backend is not None:
         d["staged_transfer_backend"] = v.staged_transfer_backend
+    if v.staged_layout_id is not None:
+        d["staged_layout_id"] = v.staged_layout_id
     return d
 
 

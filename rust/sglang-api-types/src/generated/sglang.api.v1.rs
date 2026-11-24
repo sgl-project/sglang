@@ -3945,6 +3945,9 @@ pub struct GetServerInfoResponse {
     /// Resolved receiver backend on P/PD. Decode only consumes the layout.
     #[prost(string, optional, tag = "23")]
     pub staged_transfer_backend: ::core::option::Option<::prost::alloc::string::String>,
+    /// Model and static descriptor layout for external encoder handoffs, including on D.
+    #[prost(string, optional, tag = "24")]
+    pub staged_layout_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

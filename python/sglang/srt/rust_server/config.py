@@ -504,22 +504,20 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             require_handoff_key,
         )
 
-        info["accepts_encoder_handoff"] = True
-        info["encoder_handoff_key_id"] = handoff_key_id(require_handoff_key())
-        if info["disaggregation_mode"] != "decode":
-            info["staged_transfer_backend"] = info["encoder_transfer_backend"]
         model_type = scheduler.model_config.hf_config.model_type
         layout = staged_layout_for(model_type)
-        info["supports_staged_images"] = bool(layout and layout.images)
-        info["supports_staged_video"] = bool(layout and layout.video is not None)
-        if layout and layout.language_audio_enabled(scheduler):
-            info["staged_audio_model_type"] = model_type
-        if (
-            layout
-            and (layout.images or layout.video is not None)
-            and not layout.legacy_vision
-        ):
-            info["native_model_type"] = model_type
+        if layout is not None:
+            info["accepts_encoder_handoff"] = True
+            info["encoder_handoff_key_id"] = handoff_key_id(require_handoff_key())
+            if info["disaggregation_mode"] != "decode":
+                info["staged_transfer_backend"] = info["encoder_transfer_backend"]
+            info["staged_layout_id"] = layout.wire_id(model_type)
+            info["supports_staged_images"] = layout.images
+            info["supports_staged_video"] = layout.video is not None
+            if layout.language_audio_enabled(scheduler):
+                info["staged_audio_model_type"] = model_type
+            if (layout.images or layout.video is not None) and not layout.legacy_vision:
+                info["native_model_type"] = model_type
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

@@ -2,6 +2,7 @@
 
 import re
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import msgspec
@@ -502,6 +503,20 @@ def test_invalid_audio_descriptor(change):
         data["audios"][0][key] = "bad" if change == "identity" else 0
     with pytest.raises(ValueError):
         EncoderHandoff.parse(msgspec.json.encode(data), 0, 0, count)
+
+
+def test_staged_layout_id_distinguishes_model_and_wire_changes():
+    layout = QwenVLImageProcessor.staged_layouts["qwen3_omni_moe"]
+    original = layout.wire_id("qwen3_omni_moe")
+    assert original != layout.wire_id("qwen2_5_vl")
+    for change in (
+        {"legacy_vision": False},
+        {"video": None},
+        {"audio": False},
+        {"per_frame_items": not layout.per_frame_items},
+        {"wire_revision": layout.wire_revision + 1},
+    ):
+        assert original != replace(layout, **change).wire_id("qwen3_omni_moe")
 
 
 def test_additional_processor_uses_existing_native_wire(monkeypatch):

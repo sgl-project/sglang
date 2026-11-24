@@ -11,7 +11,7 @@ class GetEncoderInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetEncoderInfoResponse(_message.Message):
-    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy", "native_model_type", "staged_audio_model_type", "supports_staged_images", "instance_id", "handoff_key_id", "handoff_peer", "staged_transfer_backend")
+    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy", "native_model_type", "staged_audio_model_type", "supports_staged_images", "instance_id", "handoff_key_id", "handoff_peer", "staged_transfer_backend", "staged_layout_id")
     MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
     TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
     SERVED_MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
@@ -24,6 +24,7 @@ class GetEncoderInfoResponse(_message.Message):
     HANDOFF_KEY_ID_FIELD_NUMBER: _ClassVar[int]
     HANDOFF_PEER_FIELD_NUMBER: _ClassVar[int]
     STAGED_TRANSFER_BACKEND_FIELD_NUMBER: _ClassVar[int]
+    STAGED_LAYOUT_ID_FIELD_NUMBER: _ClassVar[int]
     model_path: str
     tokenizer_path: str
     served_model_name: str
@@ -36,7 +37,8 @@ class GetEncoderInfoResponse(_message.Message):
     handoff_key_id: str
     handoff_peer: str
     staged_transfer_backend: str
-    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ..., native_model_type: _Optional[str] = ..., staged_audio_model_type: _Optional[str] = ..., supports_staged_images: _Optional[bool] = ..., instance_id: _Optional[bytes] = ..., handoff_key_id: _Optional[str] = ..., handoff_peer: _Optional[str] = ..., staged_transfer_backend: _Optional[str] = ...) -> None: ...
+    staged_layout_id: str
+    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ..., native_model_type: _Optional[str] = ..., staged_audio_model_type: _Optional[str] = ..., supports_staged_images: _Optional[bool] = ..., instance_id: _Optional[bytes] = ..., handoff_key_id: _Optional[str] = ..., handoff_peer: _Optional[str] = ..., staged_transfer_backend: _Optional[str] = ..., staged_layout_id: _Optional[str] = ...) -> None: ...
 
 class StagedMediaPolicy(_message.Message):
     __slots__ = ("allowed_domains", "max_bytes", "timeout_secs")

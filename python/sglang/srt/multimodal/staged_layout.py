@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -32,6 +33,27 @@ class StagedMediaLayout:
     original_image_sizes: bool = False
     use_routing_hash: bool = True
     legacy_vision: bool = False
+
+    # Bump when a processor changes the interpretation of an existing wire field.
+    wire_revision: int = 1
+
+    def wire_id(self, model_type):
+        """Identify the descriptor layout shared by E, P/PD and D at discovery."""
+        return json.dumps(
+            {
+                "model_type": model_type,
+                "revision": self.wire_revision,
+                "legacy_vision": self.legacy_vision,
+                "images": self.images,
+                "video": self.video.value if self.video is not None else None,
+                "audio": self.audio,
+                "per_frame_items": self.per_frame_items,
+                "original_image_sizes": self.original_image_sizes,
+                "use_routing_hash": self.use_routing_hash,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     def encoder_vision_enabled(self, encoder):
         return True

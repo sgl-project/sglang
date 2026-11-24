@@ -609,6 +609,7 @@ class TestStagedNativeTransfer(CustomTestCase):
 
     def test_staging_images_without_a_usable_video_pipeline(self):
         from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.multimodal.staged_layout import staged_layout_for
 
         async def run(processor, decoder):
             with self.native_encoder(
@@ -616,6 +617,10 @@ class TestStagedNativeTransfer(CustomTestCase):
             ) as (svc, _, _, _, _):
                 info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
                 self.assertFalse(info.supports_staged_video)
+                self.assertEqual(
+                    info.staged_layout_id,
+                    staged_layout_for("qwen3_vl").wire_id("qwen3_vl"),
+                )
                 transfer = (
                     await svc.Stage(
                         pb.StageRequest(request_id="img", mm_items=["i1", "i2"]), Mock()
