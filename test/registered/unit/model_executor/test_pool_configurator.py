@@ -505,7 +505,6 @@ class TestDefaultConfigurator(CustomTestCase):
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(12288),
-            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             mock_cpu_env(kv_size=2),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
@@ -1170,7 +1169,6 @@ class TestEagleConfigurator(CustomTestCase):
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
-            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             # Isolate the hardware predicate; all config decisions are real.
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
@@ -1204,18 +1202,15 @@ class TestEagleConfigurator(CustomTestCase):
             used = sizes.max_total_num_tokens * cell_size + cfg._fixed_overhead_bytes
             self.assertLessEqual(used, available)
 
-            # The HBM limit caps actual allocations; it must not reserve the
-            # complete limit when automatic C is determined by query width.
-            with (
-                envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
-                envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(128),
-            ):
+            # With automatic C, charge the plan for query width times TopK.
+            with envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0):
                 mr.sparse_kv_budget_plan = None
-                capped = DefaultPoolConfigurator(mr)
-                actual = get_sparse_kv_budget(num_layers=4, **options)
+                automatic = DefaultPoolConfigurator(mr)
+                plan = mr.sparse_kv_budget_plan
+                self.assertEqual(plan.cache_tokens, 3 * 2048)
                 self.assertEqual(
-                    capped._fixed_overhead_bytes,
-                    actual.managed_hbm_bytes,
+                    automatic._fixed_overhead_bytes,
+                    plan.managed_hbm_bytes,
                 )
 
             # Eager MLP-sync can pad a one-row target to attention TP=8 even
@@ -1275,7 +1270,6 @@ class TestEagleConfigurator(CustomTestCase):
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
-            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
                 return_value=True,
@@ -1418,7 +1412,6 @@ class TestEagleConfigurator(CustomTestCase):
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
-            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
                 return_value=True,

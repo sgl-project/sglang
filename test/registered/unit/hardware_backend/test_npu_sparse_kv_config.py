@@ -80,7 +80,6 @@ def test_budget_validates_normalized_query_geometry(
     with (
         envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
         envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
-        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
     ):
         if valid:
             plan = make_plan()

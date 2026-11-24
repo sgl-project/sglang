@@ -157,7 +157,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         with (
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
-            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             patch(
                 prefix + "get_parallel", return_value=SimpleNamespace(attn_tp_size=8)
             ),
@@ -200,7 +199,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         with (
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
-            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             patch(
                 prefix + "get_exec",
                 return_value=SimpleNamespace(
@@ -263,7 +261,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             with (
                 self.subTest(mode=mode, switch=switch, cap=cap),
                 envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
-                envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
                 envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
                 patch(
                     prefix + "get_disagg",

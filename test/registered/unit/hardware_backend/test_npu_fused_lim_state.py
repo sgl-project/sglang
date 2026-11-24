@@ -131,27 +131,6 @@ class TestLIMState(CustomTestCase):
         self.assertIn("prefill_nope", plan.manager_buffers)
         self.assertEqual(without_workspace.managed_hbm_bytes, base.managed_hbm_bytes)
         self.assertNotIn("prefill_nope", without_workspace.manager_buffers)
-        fitting = resolve_sparse_kv_budget(
-            **self.options(
-                prefill_workspace_tokens=129, hbm_budget_bytes=plan.managed_hbm_bytes
-            )
-        )
-        self.assertEqual(fitting.prefill_workspace_tokens, 129)
-        fallback = resolve_sparse_kv_budget(
-            **self.options(
-                prefill_workspace_tokens=129,
-                hbm_budget_bytes=base.managed_hbm_bytes,
-            )
-        )
-        self.assertEqual(fallback.prefill_workspace_tokens, 0)
-        self.assertEqual(fallback.managed_hbm_bytes, base.managed_hbm_bytes)
-        with self.assertRaisesRegex(ValueError, "exceeding"):
-            resolve_sparse_kv_budget(
-                **self.options(
-                    prefill_workspace_tokens=129,
-                    hbm_budget_bytes=base.managed_hbm_bytes - 1,
-                )
-            )
 
     def test_budget_rejects_insufficient_union_capacity_and_width(self):
         for width in (2, 3, 5, 14):
@@ -205,10 +184,6 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(small.device_kv_bytes, padded.device_kv_bytes)
         self.assertEqual(small.slot_map_bytes, padded.slot_map_bytes)
         self.assertGreater(padded.copy_sfa_bytes, small.copy_sfa_bytes)
-        with self.assertRaisesRegex(ValueError, "exceeding"):
-            resolve_sparse_kv_budget(
-                **self.options(hbm_budget_bytes=small.managed_hbm_bytes)
-            )
 
     def test_adapter_budget_matches_actual_dynamic_query_allocations(self):
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
@@ -295,17 +270,6 @@ class TestLIMState(CustomTestCase):
                     plan = resolve_sparse_kv_budget(**options)
                     self.assertEqual(plan.context_len, 4224)
                     self.assertEqual(plan.batch_capacity, batch)
-
-                    self.assertEqual(
-                        resolve_sparse_kv_budget(
-                            **options, hbm_budget_bytes=plan.managed_hbm_bytes
-                        ).managed_hbm_bytes,
-                        plan.managed_hbm_bytes,
-                    )
-                    with self.assertRaisesRegex(ValueError, "exceeding"):
-                        resolve_sparse_kv_budget(
-                            **options, hbm_budget_bytes=plan.managed_hbm_bytes - 1
-                        )
         with self.assertRaises(ValueError):
             resolve_sparse_kv_budget(**self.options(kv_dtype=torch.float32))
 

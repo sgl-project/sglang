@@ -194,7 +194,7 @@ def build_sparse_kv_budget_options(
     )
     running_rows = max(1, get_schedule().max_running_requests // attn_dp_size)
     request_rows = running_rows + extra_rows + 1
-    budget_options = dict(
+    return dict(
         model_config=model_config,
         request_rows=request_rows,
         resident_rows=running_rows + 1 if pd_sparse_decode else request_rows,
@@ -207,10 +207,6 @@ def build_sparse_kv_budget_options(
         num_layers=num_layers,
         kv_dtype=kv_dtype,
     )
-    if pd_sparse_decode:
-        # Fit the manager HBM limit after building the initial candidate.
-        budget_options["hbm_budget_bytes"] = 0
-    return budget_options
 
 
 def get_sparse_kv_budget(
@@ -224,7 +220,6 @@ def get_sparse_kv_budget(
     graph_batch_capacity: Optional[int] = None,
     resident_rows: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
-    hbm_budget_bytes: Optional[int] = None,
 ) -> BudgetPlan:
     resident_rows = request_rows if resident_rows is None else resident_rows
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -249,8 +244,6 @@ def get_sparse_kv_budget(
             graph_batch_capacity = get_cuda_graph_max_batch_size(resident_rows)
             if decode is not None and decode.bs:
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
-    if hbm_budget_bytes is None:
-        hbm_budget_bytes = envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
     return resolve_sparse_kv_budget(
         model_config=model_config,
         page_size=page_size,
@@ -261,7 +254,6 @@ def get_sparse_kv_budget(
         top_k=top_k,
         kv_bytes_per_token=kv_bytes_per_token,
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
-        hbm_budget_bytes=hbm_budget_bytes,
         kv_dtype=kv_dtype,
         prefill_workspace_tokens=prefill_rows * aligned_context,
         max_query_width=get_sparse_kv_max_query_width(),
@@ -285,7 +277,6 @@ def fit_pd_sparse_budget_from_config(
         available_bytes,
         page_size,
         build_plan=partial(get_sparse_kv_budget, **budget_options),
-        hbm_limit=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
         token_limit=get_schedule().max_total_tokens,
         num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
     )

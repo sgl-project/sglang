@@ -235,7 +235,6 @@ def resolve_sparse_kv_budget(
     copy_sfa_query_heads: int,
     kv_dtype: torch.dtype = torch.bfloat16,
     cache_tokens: int = 0,
-    hbm_budget_bytes: int = 0,
     max_query_width: int = 1,
     graph_batch_capacity: int = 0,
     prefill_workspace_tokens: int = 0,
@@ -266,7 +265,7 @@ def resolve_sparse_kv_budget(
             "Native LIM cache capacity must cover query width * TopK, be <= 32640 and aligned to 128."
         )
     resident_rows = request_rows if resident_rows is None else resident_rows
-    plan_options = dict(
+    return BudgetPlan(
         request_rows=request_rows,
         resident_rows=resident_rows,
         context_len=ceil_div(context_len, page_size) * page_size,
@@ -281,29 +280,8 @@ def resolve_sparse_kv_budget(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
+        prefill_workspace_tokens=prefill_workspace_tokens,
     )
-    base = BudgetPlan(**plan_options)
-    workspace_bytes = sum(
-        BufferSpec((prefill_workspace_tokens, 1, width), kv_dtype).nbytes
-        for width in (kv_lora_rank, qk_rope_head_dim)
-    )
-    planned_bytes = base.managed_hbm_bytes + workspace_bytes
-    if (
-        prefill_workspace_tokens
-        and hbm_budget_bytes
-        and planned_bytes > hbm_budget_bytes
-    ):
-        prefill_workspace_tokens = 0
-    result = (
-        BudgetPlan(**plan_options, prefill_workspace_tokens=prefill_workspace_tokens)
-        if prefill_workspace_tokens
-        else base
-    )
-    if hbm_budget_bytes and result.managed_hbm_bytes > hbm_budget_bytes:
-        raise ValueError(
-            f"Sparse KV manager needs {result.managed_hbm_bytes} bytes, exceeding SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB ({hbm_budget_bytes} bytes)."
-        )
-    return result
 
 
 def fit_pd_sparse_budget(
@@ -312,14 +290,12 @@ def fit_pd_sparse_budget(
     page_size: int,
     *,
     build_plan: Callable[..., BudgetPlan],
-    hbm_limit: int,
     token_limit: int | None,
     num_reserved_decode_tokens: int,
 ) -> BudgetPlan:
     """Select the largest P/D Decode resident pool within the HBM budget."""
     requested_rows = requested.resident_rows - 1
     extra_rows = requested.request_rows - requested.resident_rows
-    budget_bytes = min(available_bytes, hbm_limit) if hbm_limit else available_bytes
     max_rows = requested_rows
     if token_limit is not None:
         aligned_limit = token_limit // page_size * page_size
@@ -341,7 +317,7 @@ def fit_pd_sparse_budget(
         )
 
     def exceeds_budget(rows: int) -> bool:
-        return plan_for(rows).managed_hbm_bytes > budget_bytes
+        return plan_for(rows).managed_hbm_bytes > available_bytes
 
     # Buffer sizes are nondecreasing, including aligned graph and eager scratch.
     fitting_rows = bisect_right(range(1, max_rows + 1), False, key=exceeds_budget)
@@ -352,6 +328,5 @@ def fit_pd_sparse_budget(
     raise RuntimeError(
         "Cannot fit one sparse KV resident row: "
         f"manager needs {one_row.managed_hbm_bytes} bytes, have {available_bytes} bytes "
-        f"(manager HBM limit={hbm_limit or 'unset'}, "
-        f"max_total_tokens={token_limit})."
+        f"(max_total_tokens={token_limit})."
     )
