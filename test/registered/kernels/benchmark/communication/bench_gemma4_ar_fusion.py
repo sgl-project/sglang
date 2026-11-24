@@ -114,7 +114,7 @@ def _buffers():
 
 
 @marker.parametrize("num_tokens", NUM_TOKENS)
-@marker.benchmark("provider", PROVIDERS)
+@marker.benchmark("provider", PROVIDERS, gate=["fused", "fused-nocopy"])
 def benchmark(num_tokens: int, provider: str):
     coord, comm = _init()
     world_size, rank = coord.world_size, coord.rank
