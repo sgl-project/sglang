@@ -1,15 +1,18 @@
 """Single-machine PD-separated DeepSeek-V4-Flash FP8 GPQA on Ascend 950.
 
 One 8-card machine runs a 4-card prefill worker (cards 0-3) and a 4-card
-decode worker (cards 4-7). KV is transferred by the Ascend transfer backend
-(memfabric_hybrid, SDMA over the device path, ranks handed out by an
-ASCEND_MF_STORE_URL store), and sgl-router fronts both workers so every GPQA
+decode worker (cards 4-7). KV is transferred with the Mooncake backend (TENT
+over the device URMA path), and sgl-router fronts both workers so every GPQA
 question exercises the prefill -> decode handoff.
 """
 
 import os
+import time
 import unittest
 
+import requests
+
+from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     EVALSCOPE,
     TestNpuAccuracyTestCaseBase,
@@ -17,12 +20,13 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
 )
-from sglang.test.ascend.test_ascend_utils import append_ld_library_path
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.server_fixtures.disaggregation_fixture import (
-    PDDisaggregationServerBase,
-    popen_launch_sgl_router,
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    write_memfabric_tent_conf,
 )
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.server_fixtures.disaggregation_fixture import popen_launch_sgl_router
+from sglang.test.test_utils import popen_launch_pd_server
 
 register_npu_ci(
     est_time=7200,
@@ -127,8 +131,7 @@ DEEPSEEK_V4_FLASH_FP8_PD_SHARED_ARGS = [
     "--disable-radix-cache",
 ]
 
-# Prefill worker: 4 cards. The transfer backend is appended by
-# PDDisaggregationServerBase from ``cls.transfer_backend``.
+# Prefill worker: 4 cards. The transfer backend is appended in start_prefill.
 DEEPSEEK_V4_FLASH_FP8_PD_PREFILL_ARGS = [
     *DEEPSEEK_V4_FLASH_FP8_PD_SHARED_ARGS,
     "--disaggregation-mode",
@@ -170,25 +173,20 @@ DEEPSEEK_V4_FLASH_FP8_PD_GENERATION_CONFIG_MAX = {
 
 
 class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
-    PDDisaggregationServerBase, TestNpuAccuracyTestCaseBase
+    TestDisaggregationBase, TestNpuAccuracyTestCaseBase
 ):
-    """DeepSeek-V4-Flash FP8 GPQA: 4-card prefill + 4-card decode on Ascend.
+    """DeepSeek-V4-Flash FP8 GPQA: 4-card prefill + 4-card decode, Mooncake KV transfer.
 
-    The accuracy helpers come from TestNpuAccuracyTestCaseBase (per-case metrics
-    directory and metrics.json for release data), while the two workers and the
-    router are launched by PDDisaggregationServerBase on one host.
+    TestDisaggregationBase only assigns the three ports; both workers and the
+    router are launched here so this case owns every flag and env var. The
+    accuracy helpers come from TestNpuAccuracyTestCaseBase (per-case metrics
+    directory and metrics.json for release data).
     """
 
     model = DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH
     prefill_tp_size = 4
     decode_tp_size = 4
     decode_base_gpu_id = 4
-    # The Ascend backend moves KV through memfabric's device path, so neither
-    # worker needs an RDMA NIC list.
-    use_rdma = False
-
-    extra_prefill_args = DEEPSEEK_V4_FLASH_FP8_PD_PREFILL_ARGS
-    extra_decode_args = DEEPSEEK_V4_FLASH_FP8_PD_DECODE_ARGS
 
     benchmark_tool = EVALSCOPE
     datasets = ["gpqa_diamond"]
@@ -209,26 +207,29 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
     server_launch_timeout = 5400
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=None, process=None):
-        super().wait_server_ready(
-            url, timeout=timeout or cls.server_launch_timeout, process=process
-        )
-
-    @classmethod
     def setUpClass(cls):
         # Per-case metrics directory + metrics.json contract used by the
         # release-data pipeline.
         cls._setup_per_case_output()
         super().setUpClass()
-        # Both workers join the same memfabric store on this host: it hands out
-        # the transfer ranks, and memfabric refuses to register KV memory
-        # without one (rank 1023 is rejected). ASCEND_MF_TRANSFER_PROTOCOL is
-        # left unset so the backend uses its default, SDMA: URMA is not usable
-        # on this runner, whose board is missing from memfabric's URMA topo
-        # table ("unknown board id: 108").
+        base_port = int(cls.lb_port)
+        # Pin the bootstrap and rendezvous ports next to the three test ports;
+        # both workers derive them from get_free_port() otherwise and can race
+        # onto the same one.
+        cls.bootstrap_port = str(base_port + 500)
+        cls.prefill_nccl_port = str(base_port + 300)
+        cls.decode_nccl_port = str(base_port + 400)
+        # Mooncake reaches the NPU through the memory fabric, so both workers
+        # get the TENT config of this host plus the memfabric/mooncake libs.
         transfer_envs = {
-            "ASCEND_MF_STORE_URL": "tcp://127.0.0.1:24666",
-            "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
+            "MC_USE_TENT": "1",
+            "MF_PROTOCOL": "device_urma",
+            "MF_TRANSFER_TIMEOUT": "10000",
+            "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
+            "MC_TENT_CONF": write_memfabric_tent_conf(),
+            "LD_LIBRARY_PATH": append_ld_library_path(
+                ("memfabric_hybrid", "lib"), ("mooncake", None)
+            ),
         }
         cls.extra_prefill_env = {
             **DEEPSEEK_V4_FLASH_FP8_PD_COMMON_ENVS,
@@ -238,8 +239,79 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
             **DEEPSEEK_V4_FLASH_FP8_PD_COMMON_ENVS,
             **transfer_envs,
         }
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
-        cls.launch_all()
+        cls.start_prefill()
+        cls.start_decode()
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.launch_lb()
+        # run_accuracy reads the test host from base_url, which
+        # TestNpuAccuracyTestCaseBase normally fills in for single-server cases.
+        cls.base_url = cls.lb_url
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            *DEEPSEEK_V4_FLASH_FP8_PD_PREFILL_ARGS,
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
+            "--tp",
+            str(cls.prefill_tp_size),
+            "--disaggregation-transfer-backend",
+            "mooncake",
+        ]
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=cls.server_launch_timeout,
+            other_args=prefill_args,
+            env=dict(cls.extra_prefill_env),
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            *DEEPSEEK_V4_FLASH_FP8_PD_DECODE_ARGS,
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--nccl-port",
+            cls.decode_nccl_port,
+            "--tp",
+            str(cls.decode_tp_size),
+            "--base-gpu-id",
+            str(cls.decode_base_gpu_id),
+            "--disaggregation-transfer-backend",
+            "mooncake",
+        ]
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=cls.server_launch_timeout,
+            other_args=decode_args,
+            env=dict(cls.extra_decode_env),
+        )
+
+    @classmethod
+    def wait_server_ready(cls, url, timeout=None, process=None):
+        # The base loop only watches the clock, so a worker that dies during
+        # startup would be waited on until the whole budget runs out.
+        deadline = time.time() + (timeout or cls.server_launch_timeout)
+        while True:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Server process exited with code {process.returncode} "
+                    f"while waiting for {url}"
+                )
+            try:
+                if requests.get(url, timeout=5).status_code == 200:
+                    print(f"Server {url} is ready")
+                    return
+            except requests.RequestException:
+                pass
+            if time.time() > deadline:
+                raise TimeoutError(f"Server {url} did not become ready in time")
+            time.sleep(1)
 
     @classmethod
     def launch_lb(cls):
@@ -261,7 +333,7 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
         cls._backup_plog()
 
     def test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_gpqa(self):
-        """Run NPU accuracy for DSV4-Flash FP8 4P4D PD-Sep with Ascend transfer."""
+        """Run NPU accuracy for DSV4-Flash FP8 4P4D PD-Sep with Mooncake transfer."""
         self.run_accuracy()
 
 
