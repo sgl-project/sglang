@@ -1,6 +1,8 @@
 """Inkling2's ROCm kernels against float64 / torch references, and their run-to-run
 determinism (two ROCm Triton miscompilations showed up only as nondeterminism)."""
 
+import sys
+
 import pytest
 import torch
 
@@ -163,3 +165,7 @@ def test_experts_load_in_mfma_order(monkeypatch, precision, tokens):
             expected = plain(x, gammas, ids)
             actual = loaded(x, gammas, ids)
             assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
