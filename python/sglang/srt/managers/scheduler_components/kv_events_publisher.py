@@ -28,9 +28,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
-class SchedulerStats: ...  # type: ignore[no-redef]
-
-
 class KvMetrics(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     request_active_slots: int = 0
     request_total_slots: int = 0

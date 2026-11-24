@@ -61,10 +61,6 @@ class SlidingTileAttentionBackend(AttentionBackend):
         return SlidingTileAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["SlidingTileAttentionMetadata"]:
-        return SlidingTileAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["SlidingTileAttentionMetadataBuilder"]:
         return SlidingTileAttentionMetadataBuilder
 
