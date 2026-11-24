@@ -49,9 +49,10 @@ Unavailable cold cost cells remain explicit data gaps.
 
 ## Configuration
 
-Install SimOpus with its native prepared-region public API; the integration was
-targets SimOpus `2a78cfd2cbc0757605322791497ed4ce095832b7`. Pin the
-installed revision in `provider_revision`. Use a reviewed local model config
+Use a compatible SimOpus SDK exposing the public `PerfDB` and native
+prepared-region APIs. Use SDK commit
+`2a78cfd2cbc0757605322791497ed4ce095832b7` for the integration checks below.
+Pin the actual installed revision in `provider_revision`. Use a reviewed local model config
 matching the SDK's authoritative model revision, without downloading weights.
 
 The `predictor` object selects these inputs:
