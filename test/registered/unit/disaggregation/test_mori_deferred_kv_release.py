@@ -299,21 +299,65 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             failure_reason="Transfer submission failed: later target failed",
         )
 
-    def test_coalesced_post_failure_never_acks(self):
-        """A chunk's writes go out in one batch_write. If it raises, the entries
-        it already posted have no status to drain, so the room must never ACK."""
-        manager = _manager()
-        manager._coalesce_transfers = True
+    def test_submission_failure_without_deferred_release_waits_for_posted(self):
+        manager = _manager(enabled=False)
+        status = MagicMock()
+
+        def submit(*args, **kwargs):
+            manager._record_submitted_statuses([status])
+            raise RuntimeError("later target failed")
+
+        manager._submit_kv_transfer = submit
+        manager.engine = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "later target failed"):
+            manager._submit_transfer_chunk(_chunk())
+
+        manager.engine.wait_all.assert_called_once_with([status])
+
+    def _fail_submission(self, manager, chunk, post):
+        """Submit `chunk` with `post` as the engine's BatchWrite, which raises, and
+        return the statuses handed to the drain."""
         manager.disaggregation_mode = DisaggregationMode.PREFILL
         manager.request_status[11] = KVPoll.WaitingForInput
         manager.transfer_infos[11] = {
             "decode": SimpleNamespace(
-                engine_key="decode", is_dummy=False, dst_kv_indices=np.array([1])
+                engine_key="decode",
+                is_dummy=False,
+                dst_kv_indices=np.array([1]),
+                dst_aux_index=0,
             )
         }
         manager.decode_kv_args_table = {
-            "decode": SimpleNamespace(requires_dcp_relayout=False)
+            "decode": SimpleNamespace(
+                requires_dcp_relayout=False, dst_aux_mem_descs=["dst0", "dst1"]
+            )
         }
+        manager.engine = MagicMock()
+        manager.engine._engine.BatchWrite.side_effect = post
+        manager.conclude_failure = MagicMock()
+        manager._mark_transfer_started(chunk)
+
+        def new_status():
+            status = MagicMock()
+            status.InProgress.return_value = False
+            status.Failed.return_value = False
+            return status
+
+        with (
+            patch("sglang.srt.disaggregation.mori.conn.TransferStatus", new_status),
+            self.assertRaises(_MoriTransferSubmissionError) as raised,
+        ):
+            manager._submit_transfer_chunk(chunk)
+        manager._handle_submission_failure(chunk, raised.exception)
+        manager._handle_abort_message(_abort_message())
+        return manager._drain_queue.get_nowait()[1]
+
+    def test_coalesced_post_failure_acks_after_posted_entries_drain(self):
+        """A chunk's writes go out in one BatchWrite. If it raises after posting
+        an entry, the drain owns that entry's status and the ACK waits for it."""
+        manager = _manager()
+        manager._coalesce_transfers = True
         plan = BatchTransferPlan([0], [0], [8])
         manager.send_kvcache = lambda *args: [
             status
@@ -322,20 +366,52 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
                 "src" + layer, "dst" + layer, plan
             )
         ]
-        manager.engine = MagicMock()
-        manager.engine.batch_write.side_effect = RuntimeError("CreateSession failed")
-        manager.conclude_failure = MagicMock()
+        posted = []
+
+        def post(*args):
+            posted.extend(args[5])
+            posted[0].InProgress.return_value = True
+            raise RuntimeError("CreateSession failed")
+
         chunk = _chunk()
-        manager._mark_transfer_started(chunk)
+        drained = self._fail_submission(manager, chunk, post)
 
-        with self.assertRaises(_MoriTransferSubmissionError) as raised:
-            manager._submit_transfer_chunk(chunk)
-        manager._handle_submission_failure(chunk, raised.exception)
-        manager._handle_abort_message(_abort_message())
-
-        manager.engine.batch_write.assert_called_once()
-        self.assertEqual(manager.engine.batch_write.call_args.args[0], ["src0", "src1"])
+        post_call = manager.engine._engine.BatchWrite.call_args
+        manager.engine._engine.BatchWrite.assert_called_once()
+        self.assertEqual(post_call.args[0], ["src0", "src1"])
+        self.assertEqual(drained, posted)
         self.assertEqual(manager._sent, [])
+
+        manager._drain_transfer_statuses(chunk, drained)
+
+        posted[0].Wait.assert_called_once()
+        posted[1].Wait.assert_not_called()
+        self.assertEqual(
+            manager._sent, [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))]
+        )
+
+    def test_aux_rdma_post_failure_drains_earlier_aux_writes(self):
+        manager = _manager()
+        manager._send_aux_rdma = True
+        manager.aux_mem_descs = ["src0", "src1"]
+        manager.kv_args = SimpleNamespace(aux_item_lens=[8, 8])
+        manager.pp_group = SimpleNamespace(is_last_rank=True)
+        manager.send_kvcache = lambda *args: []
+        posted = []
+
+        def post(*args):
+            if posted:
+                raise RuntimeError("CreateSession failed")
+            posted.extend(args[5])
+
+        chunk = _chunk()
+        chunk.is_last_chunk = True
+        chunk.prefill_aux_index = 0
+        drained = self._fail_submission(manager, chunk, post)
+
+        self.assertEqual(manager.engine._engine.BatchWrite.call_count, 2)
+        self.assertEqual(len(posted), 1)
+        self.assertIs(drained[0], posted[0])
 
     def test_drain_worker_retries_same_item_after_exception(self):
         manager = _manager()
