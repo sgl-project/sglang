@@ -11,10 +11,15 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark import blockwise_rejection as bwr
 from sglang.srt.speculative.dspark_components import dspark_verify
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -26,6 +31,7 @@ def _info(temps, **overrides):
         is_any_greedy=False,
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -227,6 +233,10 @@ def test_routes_to_blockwise_only_with_noise(monkeypatch):
     )
     assert (
         accept(_info(temps, need_top_k_sampling=True), rejection_noise=noise)
+        == "classic"
+    )
+    assert (
+        accept(_info(temps, need_min_p_sampling=True), rejection_noise=noise)
         == "classic"
     )
     assert (

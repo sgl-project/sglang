@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Collection, Dict, List, Optional
 
@@ -37,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,22 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    # Another algorithm's fields, set directly as server arguments; the config
+    # loader refuses them in the file.
+    allowed = ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
+    others = sorted(
+        f"watermark_{name}"
+        for name in set().union(*ALGORITHM_CONFIG_FIELDS.values()) - allowed
+    )
+    fields = {field.name: field for field in record_fields(type(server_args))}
+    unread = [
+        name for name in others if getattr(cfg, name) != _field_default(fields[name])
+    ]
+    if unread:
+        raise ValueError(
+            f"server arguments {unread} are not supported with "
+            f"--watermark-algorithm {cfg.watermark_algorithm}"
+        )
     # lazy: the algorithm's adapter imports torch and its kernels.
     from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
 
@@ -436,6 +454,59 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--retraction-policy priority requires --enable-priority-scheduling"
         )
+    halving_chunks = cfg.shortest_prefill_boundary_halving_chunks
+    budget_min_ratio = cfg.shortest_prefill_budget_min_ratio
+    doubling_chunks = cfg.shortest_prefill_budget_doubling_chunks
+    # Unset values derive from halving_chunks and the chunk when the policy is built.
+    explicit_values = [
+        value
+        for value in (
+            cfg.shortest_prefill_boundary_decay_start_chunks,
+            budget_min_ratio,
+            doubling_chunks,
+        )
+        if value is not None
+    ]
+    if not all(
+        math.isfinite(value) and value >= 0
+        for value in (halving_chunks, *explicit_values)
+    ):
+        raise ValueError(
+            "--shortest-prefill-boundary-* and --shortest-prefill-budget-* values "
+            "must be finite and >= 0"
+        )
+    if explicit_values and not halving_chunks:
+        raise ValueError(
+            "--shortest-prefill-boundary-decay-start-chunks and "
+            "--shortest-prefill-budget-* require "
+            "--shortest-prefill-boundary-halving-chunks"
+        )
+    if budget_min_ratio is not None and budget_min_ratio > 1:
+        raise ValueError(
+            f"--shortest-prefill-budget-min-ratio ({budget_min_ratio}) must be at "
+            "most 1, the chunked prefill size"
+        )
+    if doubling_chunks == 0 or (doubling_chunks is not None and budget_min_ratio == 0):
+        raise ValueError(
+            "--shortest-prefill-budget-doubling-chunks must be positive, and the "
+            "budget on (--shortest-prefill-budget-min-ratio not 0)"
+        )
+    if halving_chunks:
+        if cfg.schedule_policy != "shortest-prefill-first":
+            raise ValueError(
+                "--shortest-prefill-boundary-halving-chunks requires "
+                "--schedule-policy shortest-prefill-first"
+            )
+        if cfg.shortest_prefill_aging_factor:
+            raise ValueError(
+                "--shortest-prefill-boundary-halving-chunks and "
+                "--shortest-prefill-aging-factor cannot be combined"
+            )
+        if cfg.dllm_algorithm is not None:
+            raise ValueError(
+                "--shortest-prefill-boundary-halving-chunks is not supported with "
+                "--dllm-algorithm"
+            )
 
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -923,6 +994,11 @@ def validate_removed_options(server_args: Any):
     The CLI rejects a removed value while parsing; this covers the Python API.
     """
     cfg = resolving_view(server_args)
+    if cfg.num_continuous_decode_steps is not None:
+        logger.warning("num_continuous_decode_steps is deprecated and has no effect.")
+        declare_resolution(
+            server_args, "validate_removed_options", num_continuous_decode_steps=None
+        )
     for field in REMOVED_CHOICES:
         message = removed_choice_message(field, getattr(cfg, field))
         if message is not None:

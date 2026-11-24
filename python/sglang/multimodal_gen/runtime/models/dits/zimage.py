@@ -804,7 +804,6 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     norm_cls = ZImageRMSNorm
     block_cls = ZImageTransformerBlock
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
@@ -860,7 +859,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.rope_theta = arch_config.rope_theta
         self.t_scale = arch_config.t_scale
-        self.gradient_checkpointing = False
 
         assert len(self.all_patch_size) == len(self.all_f_patch_size)
 
