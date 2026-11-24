@@ -18,7 +18,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
-from sglang.srt.beam_search.decode_cuda_graph import (
+from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     SharedContextCapacity,
 )

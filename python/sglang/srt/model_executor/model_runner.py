@@ -1712,7 +1712,7 @@ class ModelRunner:
             and self.spec_algorithm.is_none()
             and get_parallel().pp_size == 1
         ):
-            from sglang.srt.beam_search.decode_cuda_graph import (
+            from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
                 BeamDecodeCudaGraphRunner,
             )
 

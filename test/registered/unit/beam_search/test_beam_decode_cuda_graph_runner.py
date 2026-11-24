@@ -19,7 +19,7 @@ import unittest
 import msgspec
 import torch
 
-from sglang.srt.beam_search.decode_cuda_graph import (
+from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
     SharedContextCapacity,
 )
@@ -79,7 +79,7 @@ class TestBeamGraphInputs(CustomTestCase):
                     torch.tensor([1, 2, 1, 2]) if trie_head else None,
                     _metadata(prompt_lens=[1, 2], decode_lens=[1, 2]),
                 )
-                self.assertTrue(inputs.can_replay(batch, captured_rows=4))
+                self.assertTrue(inputs.can_replay(batch, graph_size=4))
                 inputs.stage(batch)
 
                 if trie_head:
@@ -110,7 +110,7 @@ class TestBeamGraphInputs(CustomTestCase):
             decode_lens=[CAPACITY.max_decode, 1],
         )
         self.assertTrue(
-            inputs.can_replay(BeamForwardInputs(levels, at_capacity), captured_rows=4)
+            inputs.can_replay(BeamForwardInputs(levels, at_capacity), graph_size=4)
         )
 
         two_widths = _metadata(prompt_lens=[1, 1], decode_lens=[1, 1])
@@ -139,12 +139,12 @@ class TestBeamGraphInputs(CustomTestCase):
             "two widths in the batch": (levels, two_widths, 4),
             "ordinary attention": (levels, None, 4),
         }
-        for name, (trie_levels, metadata, captured_rows) in rejected.items():
+        for name, (trie_levels, metadata, graph_size) in rejected.items():
             with self.subTest(name):
                 self.assertFalse(
                     inputs.can_replay(
                         BeamForwardInputs(trie_levels, metadata),
-                        captured_rows=captured_rows,
+                        graph_size=graph_size,
                     )
                 )
 
@@ -157,11 +157,11 @@ class TestBeamGraphInputs(CustomTestCase):
         inputs.for_capture(4)
         levels = torch.zeros(3, dtype=torch.int64)
         self.assertTrue(
-            inputs.can_replay(BeamForwardInputs(levels, None), captured_rows=4)
+            inputs.can_replay(BeamForwardInputs(levels, None), graph_size=4)
         )
         shared = _metadata(prompt_lens=[1, 1], decode_lens=[1, 1])
         self.assertFalse(
-            inputs.can_replay(BeamForwardInputs(levels, shared), captured_rows=4)
+            inputs.can_replay(BeamForwardInputs(levels, shared), graph_size=4)
         )
 
 
