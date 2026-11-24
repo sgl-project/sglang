@@ -610,7 +610,10 @@ class SchedulerMetricsReporter:
                     hf_text_config, "full_attention_layer_ids", None
                 )
             if full_attention_layer_ids is None:
-                logger.warning(
+                # No hybrid metadata is also the normal state for plain dense
+                # models, where this fallback is correct, not degraded -- debug,
+                # not warning, since we can't tell the two cases apart here.
+                logger.debug(
                     "Could not determine hybrid attention/MLP layer split for "
                     "model %s (no recognized layers_block_type convention and "
                     "no full_attention_layer_ids on model_config or "

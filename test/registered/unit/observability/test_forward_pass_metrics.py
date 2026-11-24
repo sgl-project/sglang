@@ -2212,10 +2212,15 @@ class TestEstimatedPerfConstants(CustomTestCase):
             2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
         )
 
-    def test_warns_when_hybrid_layer_split_cannot_be_determined(self):
+    def test_logs_debug_when_hybrid_layer_split_cannot_be_determined(self):
+        # Debug, not warning: this fallback also fires for plain dense models
+        # (no layers_block_type/full_attention_layer_ids at all), where it's
+        # the correct behavior, not a degraded one -- see
+        # test_dense_gqa_matches_generic_formula, which uses this same
+        # no-hybrid-metadata fixture and asserts the resulting FLOPs are right.
         with self.assertLogs(
             "sglang.srt.managers.scheduler_components.metrics_reporter",
-            level="WARNING",
+            level="DEBUG",
         ) as cm:
             self._init(_fake_model_config(num_attention_layers=4))
         self.assertTrue(
