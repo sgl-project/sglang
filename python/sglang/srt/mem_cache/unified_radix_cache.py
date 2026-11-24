@@ -4713,6 +4713,16 @@ class UnifiedRadixCache(BasePrefixCache):
             or (self.buffer_pipeline is not None and not self.buffer_pipeline.is_idle())
         )
 
+    def storage_io_in_flight(self) -> bool:
+        # Buffer mode tracks its storage writes in the pipeline.
+        return bool(
+            self.ongoing_prefetch
+            or self.ongoing_backup
+            or (
+                self.buffer_pipeline is not None and self.buffer_pipeline.ongoing_backup
+            )
+        )
+
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""
         if self.linker is not None or self.cache_controller is None:

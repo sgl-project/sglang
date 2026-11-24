@@ -4,14 +4,18 @@ A non-storage no-batch stall spins on_idle without sleeping, so the gate must
 cap the O(queue) get_loads for both the DP-balancing writer and the load
 socket, while an attention-DP rank stepping only idle batches must publish
 every step. Work held outside the admitted request queues (async SHM
-materialization) must keep the scheduler non-idle. CPU-only: builds a bare
-Scheduler with mocked collaborators, like test_scheduler_flush_cache.
+materialization) must keep the scheduler non-idle. A single-rank stall with
+HiCache storage I/O in flight blocks for input rather than spinning. CPU-only:
+builds a bare Scheduler with mocked collaborators, like test_scheduler_flush_cache.
 """
 
+import time
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+
+import zmq
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -33,6 +37,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import AsyncShmMaterializer
 from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
@@ -83,6 +88,83 @@ class TestOnIdleStallPublish(CustomTestCase):
             mono.return_value = 100.10  # > LOAD_STALL_REFRESH_S
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
+
+    def test_stall_blocks_for_storage_io_and_only_for_it(self):
+        """A single-rank stall with HiCache storage I/O in flight must wait for input;
+        PD polls, held responses and engines with more ranks keep the zero sleep."""
+        null, prefill = DisaggregationMode.NULL, DisaggregationMode.PREFILL
+        write = {7: None}
+        # (case, prefetches, backups, buffer-mode backups, disaggregation mode,
+        #  engine ranks, responses held, whether the stall must block)
+        cases = [
+            ("L3 read", {"rid": None}, {}, None, null, 1, False, True),
+            ("L3 write", {}, write, None, null, 1, False, True),
+            ("buffer-mode write", {}, {}, write, null, 1, False, True),
+            ("storage idle, cache mode", {}, {}, None, null, 1, False, False),
+            ("storage idle, buffer mode", {}, {}, {}, null, 1, False, False),
+            ("L3 write in PD", {}, write, None, prefill, 1, False, False),
+            ("L3 write with two ranks", {}, write, None, null, 2, False, False),
+            ("L3 write, responses held", {}, write, None, null, 1, True, False),
+        ]
+        for name, prefetches, backups, buffered, mode, ranks, held, blocks in cases:
+            with self.subTest(name):
+                s = self._stalled_scheduler()
+                s.enable_hicache_storage = True
+                s.disaggregation_mode = mode
+                s.world_group = SimpleNamespace(world_size=ranks)
+                if held:
+                    s.deferred_responses = MagicMock()
+                    s.deferred_responses.has_pending.return_value = True
+                cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+                cache.ongoing_prefetch = prefetches
+                cache.ongoing_backup = backups
+                cache.buffer_pipeline = (
+                    None
+                    if buffered is None
+                    else SimpleNamespace(ongoing_backup=buffered)
+                )
+                s.tree_cache = cache
+                s.request_receiver = MagicMock()
+                with patch("sglang.srt.managers.scheduler.time.sleep") as sleep:
+                    s.on_idle()
+                wait = s.request_receiver.wait_for_input
+                if blocks:
+                    wait.assert_called_once()
+                    # pyzmq truncates a fractional millisecond to a non-blocking poll.
+                    self.assertGreaterEqual(wait.call_args.args[0], 1)
+                else:
+                    wait.assert_not_called()
+                    sleep.assert_called_once_with(0)
+
+
+class TestWaitForInput(CustomTestCase):
+    def test_input_ends_the_wait_and_otherwise_it_lasts_the_timeout(self):
+        """The storage wait must end at once when the tokenizer socket has a request;
+        with no input, or no zmq socket at all, it must last the whole timeout."""
+        context = zmq.Context()
+        self.addCleanup(context.term)
+        pull = context.socket(zmq.PULL)
+        self.addCleanup(pull.close, 0)
+        push = context.socket(zmq.PUSH)
+        self.addCleanup(push.close, 0)
+        pull.bind("inproc://wait-for-input")
+        push.connect("inproc://wait-for-input")
+        receiver = object.__new__(SchedulerRequestReceiver)
+
+        for name, source in (("no zmq socket", object()), ("zmq socket", pull)):
+            with self.subTest(name):
+                object.__setattr__(receiver, "recv_from_tokenizer", source)
+                start = time.monotonic()
+                receiver.wait_for_input(20)
+                elapsed = time.monotonic() - start
+                self.assertGreaterEqual(elapsed, 0.015)
+                self.assertLess(elapsed, 5)
+
+        object.__setattr__(receiver, "recv_from_tokenizer", pull)
+        push.send(b"request")
+        start = time.monotonic()
+        receiver.wait_for_input(10_000)
+        self.assertLess(time.monotonic() - start, 5)
 
 
 class TestBatchResultPublish(CustomTestCase):

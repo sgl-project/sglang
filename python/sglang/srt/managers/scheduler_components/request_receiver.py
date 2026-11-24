@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import pickle
 import secrets
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -92,6 +93,15 @@ class SchedulerRequestReceiver:
 
     def wait_for_progress(self) -> None:
         pass
+
+    def wait_for_input(self, timeout_ms: int) -> None:
+        """Block until the tokenizer socket has input or timeout_ms passes;
+        without a zmq socket, sleep for timeout_ms."""
+        if isinstance(self.recv_from_tokenizer, zmq.Socket):
+            self.recv_from_tokenizer.poll(timeout_ms)
+        else:
+            # The Rust ring's wait returns at once without --sleep-on-idle.
+            time.sleep(timeout_ms / 1000)
 
     def close(self) -> None:
         pass

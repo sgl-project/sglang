@@ -839,6 +839,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         they release when they end (a backup, a load-back, a prefetch)."""
         return False
 
+    def storage_io_in_flight(self) -> bool:
+        """Whether storage reads or writes this cache submitted are not retired yet."""
+        return False
+
     def flush_pending_backups(self) -> None:
         """
         Submit queued host backups.
