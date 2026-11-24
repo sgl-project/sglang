@@ -20,6 +20,7 @@ from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_ssm_state,
 )
 from sglang.kernels.ops.mamba.kda_prefill_track import kda_track_ssm_state
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -36,6 +37,9 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     build_track_rows,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     PoolStaging,
     stage_pool_states,
@@ -369,6 +373,13 @@ def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
             "GDN target verify views a dense [batch, draft tokens] window. Use "
             "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
         )
+
+
+def use_track_state_snapshot(kernel: LinearAttnKernelBase) -> bool:
+    """Take prefix-cache checkpoints from the kernel's fp32 snapshot. It costs an fp32
+    buffer per tracked request in every GDN layer, so only batch-invariant mode uses it:
+    checkpoints rounded to bf16 change the results after a prefix-cache hit."""
+    return kernel.supports_track_state_snapshot and is_batch_invariant_mode_enabled()
 
 
 class GDNKernelDispatcher:
@@ -1393,9 +1404,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # As in eager forward_extend: a snapshot-capable kernel writes each tracked
         # row's FP32 chunk-boundary state, not the per-chunk states h.
         h_track = None
-        if (
-            meta.track
-            and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+        if meta.track and use_track_state_snapshot(
+            self.kernel_dispatcher.extend_kernel
         ):
             h_track = torch.empty(
                 (meta.max_seqs, *ssm_states.shape[1:]),
@@ -1655,7 +1665,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if (
                 forward_metadata.has_mamba_track_mask
                 and forward_metadata.track_ssm_h_src.numel() > 0
-                and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+                and use_track_state_snapshot(self.kernel_dispatcher.extend_kernel)
             ):
                 # Snapshot-capable kernels can supply just the selected FP32
                 # checkpoint instead of materializing all per-chunk states.

@@ -281,6 +281,11 @@ class TestTrackMambaStateDtype(CustomTestCase):
                         patch.object(gdn_backend, "is_hip", return_value=False),
                         patch.object(gdn_backend, "is_xpu", return_value=False),
                         patch.object(gdn_backend, "is_npu", return_value=False),
+                        patch.object(
+                            gdn_backend,
+                            "is_batch_invariant_mode_enabled",
+                            return_value=True,
+                        ),
                     ):
                         output = backend.forward_extend(layer, batch, qkv, None, None)
                     backend._prefill_gates.assert_called_once_with(layer, None, None)
@@ -333,6 +338,20 @@ class TestTritonGDNTrackSnapshot(CustomTestCase):
         kwargs = self._extend(TritonGDNKernel())
         self.assertIs(kwargs["track_state"], sentinel.track_state)
         self.assertIs(kwargs["track_chunk_idx"], sentinel.track_chunk_idx)
+
+    def test_backend_uses_the_snapshot_only_in_batch_invariant_mode(self):
+        """The snapshot costs an fp32 buffer per tracked request in every GDN layer;
+        normal mode keeps the per-chunk checkpoints."""
+        kernel = TritonGDNKernel()
+        kernel.supports_track_state_snapshot = True
+        for enabled in (False, True):
+            with (
+                self.subTest(batch_invariant=enabled),
+                patch.object(
+                    gdn_backend, "is_batch_invariant_mode_enabled", return_value=enabled
+                ),
+            ):
+                self.assertIs(gdn_backend.use_track_state_snapshot(kernel), enabled)
 
     def test_extend_without_snapshot_support_passes_nothing(self):
         kernel = TritonGDNKernel()
