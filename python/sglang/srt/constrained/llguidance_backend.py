@@ -36,6 +36,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     register_vocab_mask_buffer,
 )
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import get_int_env_var
 
@@ -108,27 +111,56 @@ class GuidanceGrammar(BaseGrammarObject):
         self._check_err()
 
         self.eos_tokens = set(self.llguidance_tokenizer.eos_tokens)
+        # Whether the EOS that finished this grammar is in ll_matcher's history.
+        self._eos_in_matcher = False
 
     def accept_token(self, token: int):
         if self.finished:
             return
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
             self.finished = True
+            self._eos_in_matcher = False
             return
         # consume_token leaves the matcher in a sticky error state on reject;
-        # validate first so a rejected token raises with the state untouched.
-        if self.ll_matcher.validate_tokens([token]) == 0:
+        # check first so a rejected token raises with the state untouched.
+        if not self._is_allowed(token):
             raise ValueError(f"Tokens not accepted: {token}")
         self.ll_matcher.consume_token(token)
         self._check_err()
+        if token in self.eos_tokens and self.ll_matcher.is_stopped():
+            # The grammar consumed this EOS id itself (e.g. a lark `<[id]>`
+            # literal that is also a model EOS), which ends it like an EOS
+            # after stop does; stop here so tokens past it are never accepted.
+            self.finished = True
+            self._eos_in_matcher = True
+
+    def _is_allowed(self, token: int) -> bool:
+        if token not in self.eos_tokens:
+            return self.ll_matcher.validate_tokens([token]) > 0
+        # validate_tokens only counts an EOS id as end of sequence, so it
+        # rejects one the grammar expects as a literal token; the mask
+        # allows both.
+        mask = self.ll_matcher.compute_bitmask()
+        return bool(mask[token // 8] >> (token % 8) & 1)
+
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        # consume_token on a rejected token leaves the matcher in its error state,
+        # so validate the whole sequence before consuming any of it.
+        if self.finished or self.ll_matcher.validate_tokens(tokens) != len(tokens):
+            return False
+        for token in tokens:
+            self.accept_token(token)
+        return True
 
     def rollback(self, num_tokens: int) -> None:
         if num_tokens <= 0:
             return
         if self.finished:
             self.finished = False
-            # EOS token after stop isn't tracked in ll_matcher
-            num_tokens -= 1
+            if not self._eos_in_matcher:
+                # EOS token after stop isn't tracked in ll_matcher
+                num_tokens -= 1
+            self._eos_in_matcher = False
         self.ll_matcher.rollback(num_tokens)
         self._check_err()
 
@@ -169,9 +201,9 @@ class GuidanceGrammar(BaseGrammarObject):
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         else:
             apply_token_bitmask_inplace(logits, vocab_mask)
 
@@ -197,8 +229,9 @@ class GuidanceBackend(BaseGrammarBackend):
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
         eos_token_ids: Optional[Union[int, Iterable[int]]] = None,
+        cache_limit_bytes: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
 
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
@@ -223,6 +256,14 @@ class GuidanceBackend(BaseGrammarBackend):
             max_rows, self.llguidance_tokenizer.vocab_size
         )
         return register_vocab_mask_buffer(name, vocab_mask, max_rows)
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        set_token_filter_torch(
+            vocab_mask, token_ids, batch_idx, is_allowed, reset_vocab_mask
+        )
 
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:

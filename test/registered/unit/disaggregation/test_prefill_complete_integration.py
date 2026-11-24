@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServe
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -40,7 +41,11 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    decode_queue,
+    release_only_retirer,
+)
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -108,6 +113,7 @@ class TestAllocationIntegration(CustomTestCase):
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
@@ -354,6 +360,9 @@ class TestAllocationIntegration(CustomTestCase):
             cache_request_handle=CacheRequestHandle(rid="retry", attempt_id=0),
             prefill_attempt_count=1,
             output_ids=[42],
+            grammar=None,
+            return_logprob=False,
+            return_sampling_mask=False,
             skip_radix_cache_insert=False,
             kv=SimpleNamespace(cache_protected_len=16),
             full_untruncated_fill_ids=list(range(32)),
@@ -435,6 +444,9 @@ class TestAllocationIntegration(CustomTestCase):
         req.multimodal_inputs = Mock()
         req.prefill_attempt_count = 0
         req.output_ids = [42]
+        req.grammar = None
+        req.return_logprob = False
+        req.return_sampling_mask = False
         req.skip_radix_cache_insert = False
         req.kv = SimpleNamespace(cache_protected_len=16)
         req.full_untruncated_fill_ids = list(range(32))
@@ -646,6 +658,7 @@ class TestAllocationIntegration(CustomTestCase):
             req.pending_bootstrap = True
             req.disagg_kv_sender = self.sender(room=i + 1)
         scheduler = self.inflight_scheduler(reqs)
+        scheduler.prefill_admission_no_token = False
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
         waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
@@ -667,6 +680,44 @@ class TestAllocationIntegration(CustomTestCase):
 
             scheduler.process_disagg_prefill_transfer_queue()
             scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
+
+    def mm_req(self, rid, *, sent, session=None):
+        req = Req(rid, "", [1], SamplingParams())
+        req.session = session
+        req.multimodal_inputs = Mock()
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        req.time_stats = Mock()
+        req.disagg_kv_sender = FakeKVSender(self.prefill, "fake:0", 0)
+        if sent:
+            req.disagg_kv_sender.send([])
+        return req
+
+    def drain_transfer_queue(self, reqs):
+        scheduler = self.inflight_scheduler(reqs)
+        scheduler.request_retirer = release_only_retirer(scheduler.tree_cache)
+        scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+        scheduler._release_mm_inputs = MethodType(
+            Scheduler._release_mm_inputs, scheduler
+        )
+        return scheduler.process_disagg_prefill_transfer_queue()
+
+    def test_transferred_request_releases_multimodal_features(self):
+        done = self.mm_req("done", sent=True)
+        transferring = self.mm_req("transferring", sent=False)
+        mm_inputs = done.multimodal_inputs
+
+        self.assertEqual(self.drain_transfer_queue([done, transferring]), [done])
+
+        mm_inputs.release_features.assert_called_once_with()
+        self.assertIsNone(done.multimodal_inputs)
+        transferring.multimodal_inputs.release_features.assert_not_called()
+
+    def test_transferred_session_request_keeps_multimodal_features(self):
+        req = self.mm_req("session", sent=True, session=object())
+
+        self.assertEqual(self.drain_transfer_queue([req]), [req])
+
+        req.multimodal_inputs.release_features.assert_not_called()
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()

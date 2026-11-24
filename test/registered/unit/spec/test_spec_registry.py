@@ -1,11 +1,16 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -312,15 +317,60 @@ class TestConformanceGuard(_RegistryIsolated):
                 return MagicMock
 
     def test_enum_interface_subset_of_custom_spec_algo(self):
-        # Every is_*/supports_* method on the enum exists on CustomSpecAlgo.
+        # Every public instance method on the enum exists on CustomSpecAlgo.
         # vars() (not dir()) because EnumMeta.__dir__ hides instance methods.
         interface = {
             name
-            for name in vars(SpeculativeAlgorithm)
-            if name.startswith(("is_", "supports_"))
+            for name, member in vars(SpeculativeAlgorithm).items()
+            if inspect.isfunction(member) and not name.startswith("_")
         }
-        self.assertTrue(interface)  # guard against an empty (no-op) interface
+        self.assertIn("create_future_map", interface)
+        self.assertNotIn("from_string", interface)
         self.assertEqual(interface - set(dir(CustomSpecAlgo)), set())
+
+    def test_missing_non_predicate_method_raises(self):
+        # A standalone copy of CustomSpecAlgo that lost one non-predicate method.
+        body = {
+            name: member
+            for name, member in vars(CustomSpecAlgo).items()
+            if inspect.isfunction(member) and name != "create_future_map"
+        }
+        with self.assertRaisesRegex(TypeError, r"\['create_future_map'\]"):
+            _assert_custom_spec_algo_conforms(type("Broken", (), body))
+
+
+class TestPluginAlgoRelay(_RegistryIsolated):
+    def test_plugin_algo_builds_and_stashes_a_future_map(self):
+        """A plugin-registered algorithm must serve the relay the scheduler
+        builds for every algorithm: constructing the FutureMap and stashing a
+        decode payload must not depend on builtin-only methods."""
+
+        @SpeculativeAlgorithm.register("MY_FOO")
+        def _factory(server_args):
+            return MagicMock
+
+        algo = SpeculativeAlgorithm.from_string("MY_FOO")
+        future_map = algo.create_future_map(
+            torch.device("cpu"),
+            SimpleNamespace(req_to_token=torch.zeros(4, 4)),
+            needs_cpu_seq_lens=False,
+        )
+        self.assertIsInstance(future_map, FutureMap)
+        self.assertIs(future_map.spec_algo, algo)
+
+        with get_context().override_server_args(speculative_algorithm="MY_FOO"):
+            future_map.stash(
+                torch.tensor([1, 2]),
+                RelayPayload(
+                    bonus_tokens=torch.tensor([7, 8]),
+                    topk_p=torch.ones(2, 1),
+                    topk_index=torch.zeros(2, 1, dtype=torch.int64),
+                ),
+            )
+        self.assertEqual(future_map.output_tokens_buf[1:3].tolist(), [7, 8])
+        # A plugin algorithm does not relay top-k unless its class says so.
+        self.assertFalse(future_map.need_topk)
+        self.assertFalse(algo.carries_draft_hidden_states())
 
 
 class TestCrossTypeIdentity(_RegistryIsolated):
