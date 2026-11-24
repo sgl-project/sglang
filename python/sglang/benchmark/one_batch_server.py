@@ -956,26 +956,11 @@ def run_one_case(
             payload["logprobs"] = 1
         gen_url = url + "/v1/completions"
     else:
-        # Load sampling parameters
-        use_structured_outputs = False
-        if use_structured_outputs:
-            texts = []
-            for _ in range(batch_size):
-                texts.append(
-                    "Human: What is the capital city of france? can you give as many trivial information as possible about that city? answer in json.\n"
-                    * 50
-                    + "Assistant:"
-                )
-            json_schema = "$$ANY$$"
-        else:
-            json_schema = None
-
         payload = {
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
                 "ignore_eos": ignore_eos,
-                "json_schema": json_schema,
                 "stream_interval": stream_interval,
             },
             "return_logprob": return_logprob,
