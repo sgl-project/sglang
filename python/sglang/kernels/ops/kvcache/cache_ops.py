@@ -56,11 +56,13 @@ def concat_and_cast_mha_k_pad_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_BLOCK: tl.constexpr,
 ):
     """
-    concat_and_cast_mha_k_kernel for a head count that is not a power of two.
-    tl.arange needs a power-of-two extent, so walk HEAD_BLOCK == next_power_of_2(head_cnt)
-    lanes and mask the tail.
+    concat_and_cast_mha_k_kernel for a head count or nope/rope width that is not a
+    power of two (Kimi-K3's 12 heads at TP8, GLM-5.x's 192-wide nope). tl.arange
+    needs a power-of-two extent, so walk the next power of two and mask the tail.
     """
     pid_loc = tl.program_id(0)
     head_range = tl.arange(0, HEAD_BLOCK)
@@ -68,7 +70,7 @@ def concat_and_cast_mha_k_pad_kernel(
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    nope_offs = tl.arange(0, NOPE_BLOCK)
 
     src_nope_ptr = (
         k_nope_ptr
@@ -78,18 +80,19 @@ def concat_and_cast_mha_k_pad_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    nope_mask = tl.broadcast_to(head_mask[:, None], (HEAD_BLOCK, nope_dim))
+    nope_mask = head_mask[:, None] & (nope_offs < nope_dim)[None, :]
     src_nope = tl.load(src_nope_ptr, mask=nope_mask, other=0)
     tl.store(dst_nope_ptr, src_nope, mask=nope_mask)
 
-    rope_offs = tl.arange(0, rope_dim)
+    rope_offs = tl.arange(0, ROPE_BLOCK)
+    rope_in_range = rope_offs < rope_dim
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    rope_mask = tl.broadcast_to(head_mask[:, None], (HEAD_BLOCK, rope_dim))
-    src_rope = tl.load(src_rope_ptr)
+    rope_mask = head_mask[:, None] & rope_in_range[None, :]
+    src_rope = tl.load(src_rope_ptr, mask=rope_in_range[None, :], other=0)
     tl.store(
         dst_rope_ptr,
-        tl.broadcast_to(src_rope, (HEAD_BLOCK, rope_dim)),
+        tl.broadcast_to(src_rope, (HEAD_BLOCK, ROPE_BLOCK)),
         mask=rope_mask,
     )
 
@@ -118,9 +121,10 @@ def concat_and_cast_mha_k_triton(
     grid = (k.shape[0],)
 
     head_cnt = k.shape[1]
-    if head_cnt != triton.next_power_of_2(head_cnt):
-        # Not the power of two concat_and_cast_mha_k_kernel's tl.arange needs;
-        # Kimi-K3's 96 heads give 12 at TP8.
+    extents = (head_cnt, nope_dim, rope_dim)
+    if any(n != triton.next_power_of_2(n) for n in extents):
+        # Not the powers of two concat_and_cast_mha_k_kernel's tl.arange needs;
+        # Kimi-K3's 96 heads give 12 at TP8, GLM-5.x's qk_nope_head_dim is 192.
         concat_and_cast_mha_k_pad_kernel[grid](
             k,
             k_nope,
@@ -134,6 +138,8 @@ def concat_and_cast_mha_k_triton(
             nope_dim,
             rope_dim,
             HEAD_BLOCK=triton.next_power_of_2(head_cnt),
+            NOPE_BLOCK=triton.next_power_of_2(nope_dim),
+            ROPE_BLOCK=triton.next_power_of_2(rope_dim),
         )
         return
 
