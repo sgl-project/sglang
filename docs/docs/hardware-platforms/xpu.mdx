@@ -41,6 +41,9 @@ uv pip install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
+# Any release tag works. If SGLang-Omni is going to run on top of this build, use
+# v0.5.23: Omni's XPU port targets that release's APIs and carries no
+# compatibility shims for later ones.
 git checkout <YOUR-DESIRED-VERSION>
 
 # Use dedicated toml file
@@ -50,6 +53,15 @@ cp pyproject_xpu.toml pyproject.toml
 uv pip install -v ".[dev,diffusion]"
 ```
 
+> **Note**: the uv command above resolves `torch==2.14.0+xpu` through the `[[tool.uv.index]]`
+> and `[tool.uv.sources]` sections of `pyproject_xpu.toml`. Checkouts that predate those
+> sections — `v0.5.23` and earlier — carry no index configuration, so it stops with
+> `Because there is no version of torch==2.14.0+xpu and you require torch==2.14.0+xpu, we can
+> conclude that your requirements are unsatisfiable`. On those tags pass the indexes
+> explicitly (`uv pip install -v ".[dev,diffusion]" --extra-index-url
+> https://download.pytorch.org/whl/xpu --extra-index-url https://docs.sglang.io/whl/xpu/`) or
+> use the pip command below.
+
 pip ignores the `[tool.uv.*]` sections of `pyproject.toml`. To install with pip instead of uv, pass the package indexes explicitly:
 
 ```bash Command
@@ -57,6 +69,29 @@ pip install -v ".[dev,diffusion]" \
     --extra-index-url https://download.pytorch.org/whl/xpu \
     --extra-index-url https://docs.sglang.io/whl/xpu/
 ```
+
+> **Note**: `uv venv` ships no `pip`, so the command above fails with
+> `No module named pip` in the environment created at step 3. Either run
+> `uv pip install pip` once, or keep using the `uv pip install` form.
+
+### Runtime environment
+
+Do **not** `source /opt/intel/oneapi/setvars.sh` in the environment you build and run SGLang
+in. `setvars.sh` prepends `/opt/intel/oneapi/compiler/<version>/lib` to `LD_LIBRARY_PATH`, and
+the `libur_loader.so.0` found there is loaded in preference to the `intel-cmplr-lib-ur` build
+that sits beside `libsycl.so.9` in the environment (`$ORIGIN`):
+
+```text
+ImportError: .../libsycl.so.9: undefined symbol: urKernelSetArgLocal, version LIBUR_LOADER_0.12
+```
+
+Both libraries declare the `LIBUR_LOADER_0.12` version node, but only the
+`intel-cmplr-lib-ur` build exports `urKernelSetArgLocal`. The same shadowing breaks any step
+that imports torch, including the `setuptools-rust` build of SGLang itself. If the shell is
+already contaminated, `deactivate`, start a fresh shell and re-activate — or run the command
+with `LD_LIBRARY_PATH=` to drop the inherited value.
+
+No other environment variables are needed; the XPU backend is auto-detected.
 
 ### Install Using Docker
 
