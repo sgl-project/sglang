@@ -1339,7 +1339,10 @@ class LoRAManager:
             if (
                 module_name.startswith("model.meta_mlp.")
                 and isinstance(module, (FusedMoE, InklingBatchDenseMLP))
-                and all(x in self.target_modules for x in ["gate_up_proj", "down_proj"])
+                and all(
+                    x in self.target_modules
+                    for x in ["gate_up_proj_moe", "down_proj_moe"]
+                )
                 and get_layer_id(module_name) is None
             ):
                 raise ValueError(
@@ -1395,7 +1398,18 @@ class LoRAManager:
                 continue
 
             if isinstance(module, (FusedMoE, InklingBatchDenseMLP)):
-                expert_projections = ("gate_up_proj", "down_proj")
+                # A shared-expert sink, or routed experts carrying fused shared
+                # experts, also serves the shared expert's targets.
+                serves_routed_only = (
+                    isinstance(module, FusedMoE)
+                    and not module.is_shared_fused_moe
+                    and not module.num_fused_shared_experts
+                )
+                expert_projections = (
+                    ("gate_up_proj_moe", "down_proj_moe")
+                    if serves_routed_only
+                    else ("gate_up_proj", "down_proj")
+                )
                 missing = [
                     x for x in expert_projections if x not in self.target_modules
                 ]
@@ -1459,7 +1473,7 @@ class LoRAManager:
             ):
                 raise ValueError(
                     f"--moe-runner-backend {backend.value} requires "
-                    "the LoRA target modules to include gate_up_proj and down_proj; "
+                    "the LoRA target modules to include the routed experts' gate_up_proj and down_proj; "
                     "this adapter leaves the MoE experts without a runner"
                 )
 

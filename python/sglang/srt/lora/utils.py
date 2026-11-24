@@ -352,6 +352,7 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
+        routed = _matches_routed_experts(name)
         # Models may fuse adapter projections differently from the common HF layout.
         if base_model is not None and hasattr(
             base_model, "get_lora_target_module_name"
@@ -369,7 +370,20 @@ def get_normalized_target_modules(
             continue
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
+        if routed and normalized_name in ("gate_up_proj", "down_proj"):
+            # Routed experts are their own target module, so a shared-expert or
+            # dense MLP target does not wrap them.
+            result.add(f"{normalized_name}_moe")
     return result
+
+
+def _matches_routed_experts(name: str) -> bool:
+    """Whether a target can match a routed expert: a bare leaf, as in PEFT, or one
+    under `experts`."""
+    parents = [
+        part for part in name.split(".")[:-1] if part != "*" and not part.isdigit()
+    ]
+    return not parents or parents[-1] == "experts"
 
 
 def get_stacked_multiply(
@@ -482,6 +496,8 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "up_proj",
         "gate_up_proj",
         "down_proj",
+        "gate_up_proj_moe",
+        "down_proj_moe",
         "fc1_latent_proj",
         "fc2_latent_proj",
         "embed_tokens",

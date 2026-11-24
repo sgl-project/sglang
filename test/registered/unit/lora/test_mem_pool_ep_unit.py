@@ -1905,6 +1905,13 @@ class TestDenseMlpBuffersWithoutSharedExperts(unittest.TestCase):
     """Allocate dense MLP buffers only on layers with dense/shared projections."""
 
     HIDDEN, INTER, MOE_INTER, EXPERTS, TP, RANK, SLOTS = 64, 256, 32, 4, 4, 8, 2
+    # what bare gate_up_proj / down_proj targets resolve to
+    BARE_MLP_TARGETS = {
+        "gate_up_proj",
+        "down_proj",
+        "gate_up_proj_moe",
+        "down_proj_moe",
+    }
 
     def _model(self, n_dense: int, n_moe: int, shared: bool = False):
         model = torch.nn.Module()
@@ -1936,7 +1943,7 @@ class TestDenseMlpBuffersWithoutSharedExperts(unittest.TestCase):
             model.model.layers.append(layer)
         return model
 
-    def _pool(self, model) -> LoRAMemoryPool:
+    def _pool(self, model, target_modules=BARE_MLP_TARGETS) -> LoRAMemoryPool:
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
         pool.num_layer = len(model.model.layers)
         pool.dtype = torch.bfloat16
@@ -1953,7 +1960,7 @@ class TestDenseMlpBuffersWithoutSharedExperts(unittest.TestCase):
         pool.experts_shared_outer_loras = False
         pool.lora_added_tokens_size = 0
         pool.base_hf_config = model.config
-        pool.target_modules = {"gate_up_proj", "down_proj"}
+        pool.target_modules = target_modules
         pool.A_buffer, pool.B_buffer = {}, {}
         with mock.patch.dict(
             "sys.modules",
@@ -2002,6 +2009,29 @@ class TestDenseMlpBuffersWithoutSharedExperts(unittest.TestCase):
         pool = self._pool(self._model(n_dense=0, n_moe=2))
         self.assertEqual(sorted(pool.A_buffer), ["down_proj_moe", "gate_up_proj_moe"])
         self.assertEqual(sorted(pool.B_buffer), ["down_proj_moe", "gate_up_proj_moe"])
+
+    def test_shared_expert_targets_get_expert_buffers_only_for_fused_shared_experts(
+        self,
+    ):
+        """Routed experts get no buffers for shared-expert targets, unless the shared
+        expert is fused into them as an expert slot."""
+        separate = self._pool(
+            self._model(n_dense=0, n_moe=2, shared=True),
+            target_modules={"gate_up_proj", "down_proj"},
+        )
+        self.assertEqual(sorted(separate.A_buffer), ["down_proj", "gate_up_proj"])
+
+        model = self._model(n_dense=0, n_moe=2)
+        for layer in model.model.layers:
+            experts = layer.mlp.experts
+            experts.num_fused_shared_experts = 1
+            experts._num_global_routed = self.EXPERTS
+            experts.num_experts = experts.num_local_experts = self.EXPERTS + 1
+        fused = self._pool(model, target_modules={"gate_up_proj", "down_proj"})
+        self.assertEqual(
+            [t.shape[1] for t in fused.A_buffer["gate_up_proj_moe"]],
+            [self.EXPERTS + 1] * 2,
+        )
 
 
 @mock.patch.dict(

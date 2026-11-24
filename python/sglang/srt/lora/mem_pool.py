@@ -692,6 +692,9 @@ class LoRAMemoryPool:
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
             target_modules = target_modules - set(EMBEDDING_NAMES)
             for module_name in target_modules:
+                if module_name.endswith("_moe"):
+                    # The routed experts' target module; allocated with its projection.
+                    continue
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
@@ -718,26 +721,31 @@ class LoRAMemoryPool:
                             for idx, dense in enumerate(dense_layers)
                         ]
 
-                    # MoE expert version (4D)
+                    # MoE expert version (4D): for the routed experts, and for fused
+                    # shared experts, which take an expert slot.
                     moe_key = f"{module_name}_moe"
-                    buffer[moe_key] = []
-                    for idx in range(self.num_layer):
-                        shape = get_lora_shape_fn(
-                            moe_key, base_model, self.max_lora_rank, idx
-                        )
-                        fused_moe = self._get_fused_shared_moe(base_model, idx)
-                        if fused_moe is not None:
-                            num_experts = (
-                                fused_moe.num_local_experts
-                                if self.moe_use_local_expert_ids
-                                else fused_moe.num_experts
+                    if moe_key in target_modules or any(
+                        self._get_fused_shared_moe(base_model, idx) is not None
+                        for idx in range(self.num_layer)
+                    ):
+                        buffer[moe_key] = []
+                        for idx in range(self.num_layer):
+                            shape = get_lora_shape_fn(
+                                moe_key, base_model, self.max_lora_rank, idx
                             )
-                            assert shape[1] == num_experts, (
-                                "LoRA/base expert layout mismatch"
+                            fused_moe = self._get_fused_shared_moe(base_model, idx)
+                            if fused_moe is not None:
+                                num_experts = (
+                                    fused_moe.num_local_experts
+                                    if self.moe_use_local_expert_ids
+                                    else fused_moe.num_experts
+                                )
+                                assert shape[1] == num_experts, (
+                                    "LoRA/base expert layout mismatch"
+                                )
+                            buffer[moe_key].append(
+                                torch.zeros(shape, dtype=self.dtype, device=device)
                             )
-                        buffer[moe_key].append(
-                            torch.zeros(shape, dtype=self.dtype, device=device)
-                        )
 
                     # Shared-expert MoE version (4D, separate sink namespace).
                     if self._has_shared_fused_moe(base_model):
