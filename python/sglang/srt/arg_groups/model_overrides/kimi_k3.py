@@ -182,16 +182,7 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     platform = get_platform()
     overrides = {"decode_state_free_radix_default": True}
-    if cfg.dcp_size > 1:
-        if platform.is_npu:
-            if (
-                cfg.speculative_algorithm == "DFLASH"
-                and cfg.speculative_draft_attention_backend is None
-            ):
-                overrides["speculative_draft_attention_backend"] = "ascend"
-            if cfg.kv_cache_dtype == "auto":
-                overrides["kv_cache_dtype"] = "bfloat16"
-            return overrides
+    if cfg.dcp_size > 1 and not platform.is_npu:
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
                 "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
