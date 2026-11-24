@@ -111,10 +111,11 @@ def situ_and_mul(
     out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
+    cast: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
-    return impl(input, out, beta, linear_beta)
+    return impl(input, out, beta, linear_beta, cast)
 
 
 __all__ = [

@@ -6,7 +6,7 @@ images (camera-name -> [B,3,H,W] float tensor in [-1,1]), image_masks
 (camera-name -> [B] bool), tokens/token_masks ([B,L]), and noise ([B,T,D]).
 Use the checkpoint's actual preprocessing/tokenizer and robot normalization.
 Use --dummy-calibration explicitly for synthetic pipeline checks. Dataset errors
-never silently fall back to synthetic inputs. See the accompanying README.
+never silently fall back to synthetic inputs.
 """
 
 from __future__ import annotations

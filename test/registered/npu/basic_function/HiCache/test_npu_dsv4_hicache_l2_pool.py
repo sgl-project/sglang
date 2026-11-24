@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=10, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=10, suite="extra-b-test-1-npu-a3")
 
 
 class TestDSV4PoolAssembly(CustomTestCase):

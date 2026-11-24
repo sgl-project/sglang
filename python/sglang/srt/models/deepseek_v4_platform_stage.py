@@ -108,6 +108,7 @@ class NonCudaDecoderMixin:
         self._next_layer = None
         self.local_boundary = None
         self.next_boundary = None
+        self._extend_boundaries = (None, None)
 
     def bind_next(self, next_layer):
         if not self.hc_pre_from_prev_sublayer:
@@ -141,6 +142,11 @@ class NonCudaDecoderMixin:
         """The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix."""
         self._init_boundaries()
+        local_boundary, next_boundary = (
+            self._extend_boundaries
+            if mhc.is_local_extend(forward_batch)
+            else (self.local_boundary, self.next_boundary)
+        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -172,7 +178,7 @@ class NonCudaDecoderMixin:
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.local_boundary,
+                next=local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
             )
@@ -201,7 +207,7 @@ class NonCudaDecoderMixin:
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.next_boundary,
+                next=next_boundary,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
             )
@@ -227,6 +233,11 @@ class NonCudaDecoderMixin:
                 hc=self._next_layer.attn_hc,
                 accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
             )
+        # Built once, but Mega-mHC reads `extend` per step.
+        self._extend_boundaries = tuple(
+            None if b is None else b._replace(extend=True)
+            for b in (self.local_boundary, self.next_boundary)
+        )
 
     def forward(
         self,
@@ -570,11 +581,12 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
+        attn_state = mhc.HcState(hidden_states, prev_pre)
+        x = mhc.combine(self.attn_hc, attn_state)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
-        attn_pre, attn_post, attn_comb = mhc.mix_stats(
-            self.attn_hc, hidden_states, stats_stream
+        attn_pre, attn_post, attn_comb = mhc.mix_stats_from_state(
+            self.attn_hc, hidden_states, attn_state, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
@@ -582,10 +594,11 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
+        ffn_state = mhc.HcState(hidden_states, attn_pre)
+        x = mhc.combine(self.ffn_hc, ffn_state)
         x = self._run_ffn(x, forward_batch)
-        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
-            self.ffn_hc, hidden_states, stats_stream
+        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats_from_state(
+            self.ffn_hc, hidden_states, ffn_state, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)

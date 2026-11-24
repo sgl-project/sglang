@@ -39,9 +39,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
-    _get_feat_extract_output_lengths,
-)
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -50,6 +47,9 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
+)
+from sglang.srt.multimodal.mrope_rope_index import (
+    _get_feat_extract_output_lengths,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cpu, is_npu, logger
