@@ -6,7 +6,6 @@ on:
       - "scripts/ci/**"
       - ".github/workflows/pr-test.yml"
       - ".github/workflows/pr-gate.yml"
-      - ".github/workflows/pr-gate-approve.yml"
       - ".github/workflows/ci-scripts-test.yml"
 
 permissions:
