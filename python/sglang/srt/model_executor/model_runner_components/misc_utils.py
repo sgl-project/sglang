@@ -38,10 +38,14 @@ def maybe_disable_chunked_prefix_cache(
         return
     # Chunked prefix cache is a prefill feature: the prefill half decides.
     prefill_backend, _ = attention_backends()
-    if (
-        not use_mla_backend
-        or prefill_backend not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-    ):
+    supported = prefill_backend in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+    # intel_xpu implements the chunked-prefix branch but is not on the list, so
+    # non-DCP XPU keeps the one-shot path it has always used. Under DCP it is
+    # mandatory: it is what gathers the sharded prefix latent across the group,
+    # and the absorbed MLA extend it would otherwise take has no cross-rank merge.
+    if prefill_backend == "intel_xpu" and get_parallel().dcp_enabled:
+        supported = True
+    if not use_mla_backend or not supported:
         if not get_schedule().disable_chunked_prefix_cache:
             get_context().override(
                 "model_runner.chunked_prefix_cache_gate",

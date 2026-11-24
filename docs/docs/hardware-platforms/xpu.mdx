@@ -334,6 +334,26 @@ KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
 Unsupported features are refused at startup. If startup fails with
 `UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
 
+Dense MLA models work too, with no KV-head restriction, because MLA's single
+latent KV head is replicated on every rank:
+
+```bash
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V2-Lite \
+    --device xpu --attention-backend intel_xpu --tp 2 --dcp-size 2 \
+    --trust-remote-code --disable-radix-cache --mem-fraction-static 0.72
+```
+
+For MLA the model all-gathers Q across the DCP group and owns the cross-rank
+merge, so `flash_mla_decode` returns the rank-local partial and its base-2
+log-sum-exp instead of a finished output. Prefill uses the chunked prefix cache,
+which is what gathers the sharded prefix latent so each rank attends the whole
+sequence for its own Q heads; DCP turns it on for you.
+
+Sparse-attention (DSA) MLA models such as DeepSeek-V3.2 and GLM-5 are refused:
+their sparse decode returns no softmax LSE, so the merge has nothing to weight
+its partials with. A quantized MLA KV cache is refused for a similar reason, as
+the scaled latent write has no DCP-aware path.
+
 With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
 kernel runs only on CUDA, so KV is transferred per token instead.
 

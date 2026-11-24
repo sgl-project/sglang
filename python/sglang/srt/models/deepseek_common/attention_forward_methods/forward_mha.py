@@ -32,6 +32,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_mlu,
     _is_musa,
     _is_npu,
+    _is_xpu,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
@@ -635,8 +636,10 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda:
-            # Save latent cache
+        if _is_cuda or _is_xpu:
+            # XPU joins this door because it is the only MLA write that resolves
+            # the DCP owner rule; the combined-row store below takes a widened
+            # loc it has no path for. The scatter is Triton, so it runs on both.
             get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),

@@ -252,6 +252,13 @@ def handle_attention_triton(attn, forward_batch):
 
 
 def handle_attention_intel_xpu(attn, forward_batch):
+    if get_parallel().dcp_enabled and forward_batch.forward_mode.is_extend():
+        # Absorbed MLA extend attends the paged latent, which DCP shards, and has
+        # no cross-rank merge on this backend. Chunked-KV instead: the model
+        # gathers the prefix latent over the group, so each rank attends the whole
+        # sequence for its own Q heads. Below chunked_prefix_cache_threshold the
+        # shared handler would pick absorbed MLA.
+        return AttnForwardMethod.MHA_CHUNKED_KV
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 

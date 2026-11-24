@@ -54,6 +54,54 @@ logger = logging.getLogger(__name__)
 XPU_DECODE_MAX_Q_GROUP_SIZE = 16
 
 
+# MAX_HEADS in sgl-kernel-xpu's flash_mla_decode.
+XPU_MLA_DECODE_MAX_HEADS = 128
+
+
+def _check_xpu_dcp_mla(
+    view: Any, model_config: Any, attn_tp_size: int, dcp_size: int
+) -> None:
+    """DCP admission for an absorbed-MLA model on the intel_xpu backend.
+
+    The KV-head checks above do not apply: MLA has one latent KV head, which TP
+    replicates on every rank, so a DCP group never spans distinct KV heads.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if is_deepseek_dsa(model_config.hf_config):
+        raise ValueError(
+            "--dcp-size > 1 is not supported for sparse-attention (DSA) MLA "
+            "models on Intel XPU: the sparse decode path returns no softmax "
+            "LSE, so the cross-rank merge has nothing to weight its partials "
+            "with. Dense MLA models are supported."
+        )
+    if view.kv_cache_dtype != "auto":
+        raise ValueError(
+            "--dcp-size > 1 with an MLA model on Intel XPU needs "
+            "--kv-cache-dtype auto: the scaled latent write takes the "
+            "combined-row cache door, which has no DCP-aware path, but got "
+            f"--kv-cache-dtype={view.kv_cache_dtype}."
+        )
+    if view.disable_chunked_prefix_cache:
+        raise ValueError(
+            "--dcp-size > 1 with an MLA model on Intel XPU needs the chunked "
+            "prefix cache: it is what gathers the DCP-sharded prefix latent so "
+            "each rank can attend the whole sequence during prefill. Drop "
+            "--disable-chunked-prefix-cache."
+        )
+    # The model all-gathers Q across the group before the decode kernel sees it.
+    gathered_heads = (
+        max(1, model_config.get_max_num_attention_heads() // attn_tp_size) * dcp_size
+    )
+    if gathered_heads > XPU_MLA_DECODE_MAX_HEADS:
+        raise ValueError(
+            f"--dcp-size {dcp_size} gives the intel_xpu MLA decode kernel "
+            f"{gathered_heads} all-gathered query heads, above the "
+            f"{XPU_MLA_DECODE_MAX_HEADS} it is built for. Use a smaller "
+            "--dcp-size or a larger --tp-size."
+        )
+
+
 def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
     from sglang.srt.configs.model_config import is_qwen3_5
 
@@ -63,14 +111,19 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
         raise ValueError(
             "--dcp-size > 1 on Intel XPU needs --attention-backend intel_xpu."
         )
-    if use_mla_backend(server_args):
-        raise ValueError("--dcp-size > 1 is not supported for MLA models on Intel XPU.")
-    # Other ranks' rows are written at -1, which only store_cache_xpu skips; unequal
-    # K/V widths fall back to an indexed write that would hit the last slot.
-    if model_config.v_head_dim != model_config.head_dim:
-        raise ValueError("--dcp-size > 1 on Intel XPU needs equal K and V head dims.")
     if tp_size % dcp_size != 0:
         raise ValueError(f"--dcp-size {dcp_size} must divide --tp-size {tp_size}.")
+
+    attn_tp_size = tp_size // view.attn_cp_size
+    if use_mla_backend(server_args):
+        _check_xpu_dcp_mla(view, model_config, attn_tp_size, dcp_size)
+        return
+
+    # Other ranks' rows are written at -1, which only store_cache_xpu skips; unequal
+    # K/V widths fall back to an indexed write that would hit the last slot. MLA is
+    # exempt: its write resolves the owner rule inside set_mla_kv_buffer.
+    if model_config.v_head_dim != model_config.head_dim:
+        raise ValueError("--dcp-size > 1 on Intel XPU needs equal K and V head dims.")
     # Every rank of a DCP group must hold the same KV heads: qwen3_5 shards qkv that
     # way, other models only when kv_heads <= tp / dcp. Otherwise KV silently corrupts.
     kv_head_layout_supported = is_qwen3_5(model_config.hf_config) or (
@@ -85,7 +138,6 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
             "--dcp-size."
         )
 
-    attn_tp_size = tp_size // view.attn_cp_size
     q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
     kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp_size))
     q_group = q_heads * dcp_size // kv_heads
