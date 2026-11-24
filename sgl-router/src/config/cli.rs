@@ -152,6 +152,10 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
+    /// API key required by Worker management mutation endpoints.
+    #[arg(long)]
+    pub worker_management_api_key: Option<String>,
+
     /// Upstream timeout in seconds: the whole response of a non-streaming request,
     /// the response headers of a streaming one. SGLang's chat endpoint sends those
     /// headers with the first token, so for streaming chat this bounds time to
@@ -669,7 +673,13 @@ impl Cli {
             .server
             .worker_api_key
             .as_deref()
-            .map(bearer)
+            .map(|key| bearer(key, "--worker-api-key"))
+            .transpose()?;
+        let worker_management_auth = self
+            .server
+            .worker_management_api_key
+            .as_deref()
+            .map(|key| bearer(key, "--worker-management-api-key"))
             .transpose()?;
         let config = Config {
             server: ServerConfig {
@@ -679,6 +689,7 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                worker_management_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -1246,9 +1257,9 @@ fn join_selector(terms: &[String]) -> Option<String> {
 }
 
 /// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
-fn bearer(key: &str) -> Result<HeaderValue> {
+fn bearer(key: &str, option: &str) -> Result<HeaderValue> {
     let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
-        .context("--worker-api-key is not a valid HTTP header value")?;
+        .with_context(|| format!("{option} is not a valid HTTP header value"))?;
     value.set_sensitive(true);
     Ok(value)
 }
@@ -1517,6 +1528,21 @@ mod tests {
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 30);
+        assert!(c.server.worker_management_auth.is_none());
+    }
+
+    #[test]
+    fn worker_management_api_key_maps_to_sensitive_bearer_header() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--worker-management-api-key",
+            "management-secret",
+        ]))
+        .unwrap();
+        let auth = c.server.worker_management_auth.unwrap();
+        assert_eq!(auth, "Bearer management-secret");
+        assert!(auth.is_sensitive());
     }
 
     /// Several values, not just the default: a clamp or a rescale in the
@@ -3159,6 +3185,26 @@ mod tests {
             err.contains("--cache-pending-prefix-max-followers"),
             "{err}"
         );
+    }
+
+    /// Reorg's cache-aware groups build their own prefix provider; it must honor
+    /// --cache-pending-prefix-consult-below like the other routing path does.
+    #[tokio::test]
+    async fn reorg_prefix_provider_honors_pending_consult_below() {
+        let state = crate::state::kv_events::KvEventIndex::new();
+        let provider = |argv: &str| {
+            let config = cfg_of(argv).unwrap();
+            crate::policies_reorg::factory::local_prefix_provider(&config.model, &state)
+        };
+        let set = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000 \
+             --cache-pending-prefix-consult-below 0.8",
+        );
+        assert_eq!(set.pending_consult_below(), Some(0.8));
+        let unset = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000",
+        );
+        assert_eq!(unset.pending_consult_below(), None);
     }
 
     #[test]
