@@ -344,7 +344,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; on SM12x without deterministic inference, BF16 projections of at most 16 rows with at least 2048 output columns and the FP32-output LM head at up to 16 rows use the SM12x GEMVs; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; on SM12x without deterministic inference, BF16 projections of at most 32 rows with at least 2048 output columns, the FP32-output LM head and the DSpark draft vocab projection at up to 32 rows use the SM12x GEMVs; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; bias-free M <= 16 uses FlashInfer's autotuned CuTe DSL mm_bf16 except on SM107 or with --disable-flashinfer-autotune, other shapes dispatch between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),

@@ -882,6 +882,14 @@ def sm12x_fp32_lm_head(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def sm12x_bf16_lm_head_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return _sm12x_bf16_gemv_eligible(x, weight)
+
+
+def sm12x_bf16_lm_head(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _sm12x_bf16_gemv(x, weight)
+
+
 def bf16_gemm_needs_autotune() -> bool:
     return _mm_bf16 is not None
 

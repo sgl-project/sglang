@@ -13,7 +13,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once
 
-MAX_M = 16
+# RTX PRO 6000, RTX 5090: at 17-32 rows this kernel takes 0.63-1.00x cuBLAS's time
+# on inkling2's projections and LM head (2048 to 201024 columns).
+MAX_M = 32
 # RTX PRO 6000: at 1024 columns cuBLAS is up to 1.25x faster (K 2048-14336);
 # from 2048 columns this kernel takes 0.56-1.03x cuBLAS's time.
 MIN_N = 2048
@@ -121,6 +123,7 @@ def sm12x_bf16_gemv(x, weight, bias=None, out_dtype=None, out=None):
     lead = x.shape[:-1]
     x2 = x.reshape(-1, x.shape[-1])
     m, k = x2.shape
+    assert m <= MAX_M, f"one program covers at most {MAX_M} rows, got {m}"
     n = weight.shape[0]
     if out is None:
         out = torch.empty((m, n), device=x.device, dtype=out_dtype or x.dtype)
@@ -139,7 +142,7 @@ def sm12x_bf16_gemv(x, weight, bias=None, out_dtype=None, out=None):
             HAS_BIAS=bias is not None,
             BN=_BN,
             BK=_BK,
-            MP=16,
+            MP=16 if m <= 16 else MAX_M,
             num_warps=4,
         )
     return out.view(*lead, n)
