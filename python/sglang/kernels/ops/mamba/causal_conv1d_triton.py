@@ -4,7 +4,9 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 
-from typing import List, Optional, Union
+import functools
+import logging
+from typing import Callable, List, Optional, Union
 
 import torch
 import triton
@@ -12,7 +14,9 @@ import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.spec import KernelBackend
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend
+
+logger = logging.getLogger(__name__)
 
 PAD_SLOT_ID = -1
 
@@ -620,10 +624,49 @@ def _causal_conv1d_fn_triton(
     return out
 
 
+@functools.lru_cache(maxsize=1)
+def _flydsl_causal_conv1d() -> Optional[Callable]:
+    """AITER's FlyDSL ``causal_conv1d_fn``, or None where it is not used.
+
+    Same contract as the Triton kernel: one output, ``conv_states`` updated in
+    place. Validated and tuned on gfx950 (MI355X) only, under SGLANG_USE_AITER.
+    """
+    from sglang.kernels.arch import current_arch
+    from sglang.srt.environ import envs
+
+    hip = current_arch().hip
+    if (
+        hip is None
+        or not hip.gcn_arch.startswith("gfx95")
+        or not envs.SGLANG_USE_AITER.get()
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl.causal_conv1d_flydsl import (
+            causal_conv1d_prefill_flydsl_fn,
+        )
+    except ImportError:
+        logger.info("aiter FlyDSL causal conv1d unavailable; using the Triton kernel")
+        return None
+    return causal_conv1d_prefill_flydsl_fn
+
+
 class CausalConv1dOp(BaseFusedOp):
     op = "mamba.causal_conv1d_fn"
-    priority = (KernelBackend.TRITON,)
-    capabilities = {KernelBackend.TRITON: frozenset()}
+    # FlyDSL measured 1.1-1.8x Triton on MI355X at Qwen3.5/3.8 GDN prefill shapes.
+    priority = (KernelBackend.FLYDSL, KernelBackend.TRITON)
+    capabilities = {
+        KernelBackend.FLYDSL: frozenset({CapabilityRequirement.HIP}),
+        KernelBackend.TRITON: frozenset(),
+    }
+
+    def _auto_backend_candidates(self):
+        # FlyDSL availability is fixed per process, so it is settled once here
+        # instead of in a per-call backend_eligible gate.
+        candidates = super()._auto_backend_candidates()
+        if _flydsl_causal_conv1d() is None:
+            return tuple(b for b in candidates if b is not KernelBackend.FLYDSL)
+        return candidates
 
     def _torch_compile_forward(self, num_tokens: int) -> None:
         return None
@@ -649,6 +692,67 @@ class CausalConv1dOp(BaseFusedOp):
         **kwargs,
     ) -> torch.Tensor:
         return _causal_conv1d_fn_triton(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            seq_lens_cpu,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            validate_data=validate_data,
+            block_table=block_table,
+            output_split_size=output_split_size,
+            **kwargs,
+        )
+
+    def forward_flydsl(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Union[torch.Tensor, None],
+        conv_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: List[int],
+        cache_indices: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        activation: Optional[str] = "silu",
+        pad_slot_id: int = PAD_SLOT_ID,
+        validate_data=False,
+        block_table: Optional[torch.Tensor] = None,
+        output_split_size: int = 0,
+        **kwargs,
+    ) -> torch.Tensor:
+        flydsl_conv = _flydsl_causal_conv1d()
+        if flydsl_conv is None:
+            raise NotImplementedError(f"{self._op_label()}: FlyDSL is unavailable")
+        # Block-table and split-output launches are Triton-only;
+        # strided conv-state pools were not validated with FlyDSL.
+        if (
+            block_table is None
+            and not output_split_size
+            and (conv_states is None or conv_states.is_contiguous())
+        ):
+            try:
+                return flydsl_conv(
+                    x,
+                    weight,
+                    bias,
+                    conv_states,
+                    query_start_loc,
+                    seq_lens_cpu,
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_state,
+                    activation=activation,
+                    pad_slot_id=pad_slot_id,
+                    validate_data=validate_data,
+                )
+            except ValueError as exc:
+                # AITER raises on shapes and dtypes it does not cover.
+                logger.debug("FlyDSL causal conv1d declined this batch: %s", exc)
+        return self.forward_triton(
             x,
             weight,
             bias,

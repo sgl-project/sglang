@@ -9,6 +9,7 @@ register_amd_ci(est_time=25, suite="base-b-test-1-gpu-small-amd")
 
 
 from typing import Optional
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,14 +17,18 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.mamba import causal_conv1d_triton
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     _CAUSAL_CONV1D_OP,
     PAD_SLOT_ID,
     CausalConv1dOp,
+    _causal_conv1d_fn_triton,
     _causal_conv1d_fwd_kernel,
+    _flydsl_causal_conv1d,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import empty_gpu_cache
 
@@ -660,6 +665,79 @@ def test_causal_conv1d_oot_dispatch(monkeypatch):
 
     actual = causal_conv1d_fn(expected, expected, None, expected, expected, [])
     assert actual is expected
+
+
+def test_causal_conv1d_flydsl_dispatch(monkeypatch):
+    """FlyDSL serves only the calls it covers: a forced backend, a block table
+    and a declined batch reach Triton, and without FlyDSL Triton is picked once."""
+    from sglang.kernels import fused_op
+
+    flydsl_out, triton_out = torch.empty(1), torch.empty(2)
+    flydsl = Mock(return_value=flydsl_out)
+    monkeypatch.setattr(fused_op, "_oot_dispatch_key", lambda: None)
+    monkeypatch.setattr(fused_op, "_platform", lambda: PlatformInfo(device_type="hip"))
+    monkeypatch.setattr(fused_op, "_forced_backend", None)
+    monkeypatch.setattr(causal_conv1d_triton, "_flydsl_causal_conv1d", lambda: flydsl)
+    monkeypatch.setattr(
+        causal_conv1d_triton, "_causal_conv1d_fn_triton", Mock(return_value=triton_out)
+    )
+    monkeypatch.setattr(_CAUSAL_CONV1D_OP, "_forward_method", None)
+    state = torch.zeros(1, 4, 3)
+
+    def conv(**kwargs):
+        return causal_conv1d_fn(state, state, None, state, state, [1], **kwargs)
+
+    assert conv() is flydsl_out
+    assert conv(block_table=torch.zeros(1, 2, dtype=torch.int32)) is triton_out
+    monkeypatch.setattr(fused_op, "_forced_backend", KernelBackend.TRITON)
+    assert conv() is triton_out
+    monkeypatch.setattr(fused_op, "_forced_backend", None)
+    flydsl.side_effect = ValueError("unsupported shape")
+    assert conv() is triton_out
+
+    monkeypatch.setattr(causal_conv1d_triton, "_flydsl_causal_conv1d", lambda: None)
+    monkeypatch.setattr(_CAUSAL_CONV1D_OP, "_forward_method", None)
+    assert conv() is triton_out
+    assert _CAUSAL_CONV1D_OP._forward_method == _CAUSAL_CONV1D_OP.forward_triton
+
+
+@pytest.mark.parametrize("seq_lens", [[1024], [5, 300, 1, 64]])
+def test_causal_conv1d_flydsl_matches_triton(seq_lens, monkeypatch):
+    """FlyDSL keeps the Triton contract on the GDN prefill layout:
+    a channel-strided input, a scattered state pool and mixed initial states."""
+    if _flydsl_causal_conv1d() is None:
+        pytest.skip("needs AITER FlyDSL on gfx950 with SGLANG_USE_AITER")
+    torch.manual_seed(0)
+    device, dtype, dim, width = get_device(), torch.bfloat16, 10240, 4
+    batch = len(seq_lens)
+    # [tokens, dim] transposed, as GDN passes mixed_qkv.
+    x = torch.randn(sum(seq_lens), dim, device=device, dtype=dtype).T
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    states = torch.randn(2 * batch, dim, width - 1, device=device, dtype=dtype)
+    starts = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    args = dict(
+        cache_indices=torch.arange(batch, dtype=torch.int32, device=device) * 2,
+        has_initial_state=torch.arange(batch, device=device) % 2 == 0,
+        activation="silu",
+    )
+    expected_states = states.clone()
+    expected = _causal_conv1d_fn_triton(
+        x, weight, bias, expected_states, starts, seq_lens, **args
+    )
+    # Fail rather than pass on a silent fallback to Triton.
+    monkeypatch.setattr(
+        _CAUSAL_CONV1D_OP, "forward_triton", Mock(side_effect=AssertionError)
+    )
+    actual = _CAUSAL_CONV1D_OP.forward_flydsl(
+        x, weight, bias, states, starts, seq_lens, **args
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-2)
+    assert torch.equal(states, expected_states)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-import logging
 import time
 from typing import Optional, Tuple, Union
 
@@ -62,18 +61,9 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
-from sglang.srt.utils import (
-    is_cpu,
-    is_cuda,
-    is_gfx95_supported,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
-
-logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
@@ -355,52 +345,6 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
-
-
-_AITER_GDN_CONV_UNAVAILABLE = False
-
-
-def _aiter_gdn_prefill_conv():
-    """AITER's FlyDSL prefill causal conv, or None if it cannot be used.
-
-    On by default on gfx950 under SGLANG_USE_AITER. It implements the same
-    ``causal_conv1d_fn`` contract (one output, ``conv_states`` updated in place),
-    mapping channels to lanes instead of going through an implicit GEMM.
-    Measured on MI355X at ISL 32768 it is ~1.8x the Triton prefill convolution.
-    """
-    global _AITER_GDN_CONV_UNAVAILABLE
-    if _AITER_GDN_CONV_UNAVAILABLE:
-        return None
-    # Validated and tuned on gfx950 (MI355X) only; other archs keep Triton.
-    if not (_is_hip and is_gfx95_supported() and envs.SGLANG_USE_AITER.get()):
-        _AITER_GDN_CONV_UNAVAILABLE = True
-        return None
-    try:
-        from aiter.ops.flydsl.causal_conv1d_flydsl import (
-            causal_conv1d_prefill_flydsl_fn,
-        )
-    except ImportError:
-        logger.info(
-            "aiter FlyDSL prefill conv unavailable; keeping the Triton convolution"
-        )
-        _AITER_GDN_CONV_UNAVAILABLE = True
-        return None
-    return causal_conv1d_prefill_flydsl_fn
-
-
-def _prefill_causal_conv1d(*args, **kwargs):
-    """Dispatch the GDN prefill convolution, falling back to Triton.
-
-    The AITER kernel raises on shapes or dtypes it does not cover rather than
-    degrading silently, so an unsupported batch simply lands on Triton here.
-    """
-    fn = _aiter_gdn_prefill_conv()
-    if fn is not None:
-        try:
-            return fn(*args, **kwargs)
-        except ValueError as exc:
-            logger.debug("aiter FlyDSL prefill conv declined this batch: %s", exc)
-    return causal_conv1d_fn(*args, **kwargs)
 
 
 def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
@@ -722,8 +666,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
-    # Resolved once in __init__ so the default path calls causal_conv1d_fn directly.
-    use_aiter_prefill_conv: bool = False
 
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
@@ -744,7 +686,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
-        self.use_aiter_prefill_conv = _aiter_gdn_prefill_conv() is not None
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -1350,14 +1291,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         block_table = self.forward_metadata.conv_block_table
         conv_kwargs = {"block_table": block_table} if block_table is not None else {}
-        if not conv_states.is_contiguous() and not is_cpu():
-            # The compiled CUDA conv assumes packed slots; Triton follows the strides.
-            conv_fn = causal_conv1d_fn_triton
-        elif block_table is not None or not self.use_aiter_prefill_conv:
-            # The block-table launch is Triton-only, so AITER never sees it either.
-            conv_fn = causal_conv1d_fn
-        else:
-            conv_fn = _prefill_causal_conv1d
+        # The compiled CUDA conv assumes packed slots; Triton follows the strides.
+        conv_fn = (
+            causal_conv1d_fn_triton
+            if not conv_states.is_contiguous() and not is_cpu()
+            else causal_conv1d_fn
+        )
         return conv_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
