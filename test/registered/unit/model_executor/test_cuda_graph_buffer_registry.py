@@ -16,6 +16,7 @@ context.
 
 import dataclasses
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -388,7 +389,8 @@ class TestFieldCopyPlan(unittest.TestCase):
             return plans[-1]
 
         with (
-            patch.object(small_field_copy, "_PLANS", {}),
+            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_PLANS", OrderedDict()),
             patch.object(small_field_copy, "SmallFieldCopyPlan", make_plan),
         ):
             for dsts in ([dst], [dst], [other], [dst, other]):
@@ -396,13 +398,52 @@ class TestFieldCopyPlan(unittest.TestCase):
         self.assertEqual(len(plans), 3)
         self.assertEqual(plans[0].call_count, 2)
 
+    def test_least_recently_used_plan_is_evicted(self):
+        """Eager fills with new layouts evict the coldest plan, not a layout in use."""
+        from sglang.kernels.ops.memory import small_field_copy
+
+        stable = torch.zeros(4)
+        eager = [torch.zeros(n) for n in range(1, 8)]
+        made = []
+
+        def make_plan():
+            made.append(Mock(return_value=True))
+            return made[-1]
+
+        with (
+            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_PLANS", OrderedDict()),
+            patch.object(small_field_copy, "_MAX_PLANS", 3),
+            patch.object(small_field_copy, "SmallFieldCopyPlan", make_plan),
+        ):
+            for dst in eager:
+                small_field_copy.cached_small_field_copy([stable], [stable])
+                small_field_copy.cached_small_field_copy([dst], [dst])
+        self.assertEqual(len(made), 1 + len(eager))
+        self.assertEqual(made[0].call_count, len(eager))
+
+    def test_non_cuda_build_keeps_the_stock_copy(self):
+        from sglang.kernels.ops.memory import small_field_copy
+
+        with (
+            patch.object(small_field_copy, "_CUDA_BUILD", False),
+            patch.object(small_field_copy, "SmallFieldCopyPlan") as plan,
+        ):
+            self.assertFalse(
+                small_field_copy.cached_small_field_copy(
+                    [torch.zeros(4)], [torch.ones(4)]
+                )
+            )
+        plan.assert_not_called()
+
     def test_large_or_many_fields_keep_the_stock_copy(self):
         from sglang.kernels.ops.memory import small_field_copy
 
         large = [torch.zeros(8193)]
         many = [torch.zeros(1) for _ in range(17)]
         with (
-            patch.object(small_field_copy, "_PLANS", {}),
+            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_PLANS", OrderedDict()),
             patch.object(small_field_copy, "SmallFieldCopyPlan") as plan,
         ):
             for dsts in (large, large, many):
@@ -431,6 +472,23 @@ class TestFieldCopyPlan(unittest.TestCase):
                     module._grouped_foreach_copy_([dst], [object()])
                 self.assertEqual(plan.call_count, 1)
                 self.assertEqual(small_copy.call_count, int(not planned))
+
+    def test_fill_fast_path_wins_for_one_dense_int_pair(self):
+        from sglang.srt.model_executor import cuda_graph_buffer_registry as registry
+
+        dst = SimpleNamespace(is_cuda=True)
+        with (
+            envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True),
+            patch.object(registry, "_has_foreach_copy", True),
+            patch.object(registry, "_one_dense_int_pair", return_value=True),
+            patch.object(torch, "_foreach_copy_") as foreach,
+            patch(
+                "sglang.kernels.ops.memory.small_field_copy.cached_small_field_copy"
+            ) as plan,
+        ):
+            registry._grouped_foreach_copy_([dst], [object()])
+        foreach.assert_called_once()
+        plan.assert_not_called()
 
 
 class TestMissingAndOptionalSlots(unittest.TestCase):

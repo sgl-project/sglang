@@ -9,6 +9,7 @@ field plus a C++ range check, so the per-call host cost stays small.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -145,15 +146,19 @@ class SmallFieldCopyPlan:
         return _run_host_desc(dsts[0], self._desc)
 
 
-_PLANS: dict = {}
+# The kernel is CUDA C++; ROCm builds keep the caller's stock copy.
+_CUDA_BUILD = torch.version.cuda is not None
+_PLANS: OrderedDict = OrderedDict()
+_MAX_PLANS = 256
 # try_small_copy's per-field bound: a larger field copies faster through torch._foreach_copy_.
 _MAX_PLAN_FIELD_NUMEL = 8192
 
 
 def cached_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
     """One-launch copy through a SmallFieldCopyPlan per destination layout (pointer,
-    shape, stride, dtype of every destination); False when a field is not supported."""
-    if len(dsts) > _MAX_FIELDS:
+    shape, stride, dtype of every destination; least recently used evicted first);
+    False when a field is not supported or the build is not CUDA."""
+    if not _CUDA_BUILD or len(dsts) > _MAX_FIELDS:
         return False
     for d in dsts:
         if d.numel() > _MAX_PLAN_FIELD_NUMEL:
@@ -161,9 +166,11 @@ def cached_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) 
     key = tuple((d.data_ptr(), d.shape, d.stride(), d.dtype) for d in dsts)
     plan = _PLANS.get(key)
     if plan is None:
-        if len(_PLANS) >= 256:
-            _PLANS.clear()
+        if len(_PLANS) >= _MAX_PLANS:
+            _PLANS.popitem(last=False)
         plan = _PLANS[key] = SmallFieldCopyPlan()
+    else:
+        _PLANS.move_to_end(key)
     return plan(dsts, srcs)
 
 
