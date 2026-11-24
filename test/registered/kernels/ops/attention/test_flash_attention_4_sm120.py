@@ -1,5 +1,6 @@
 """Focused SM120 FlashAttention-4 regression tests."""
 
+import itertools
 import math
 
 import cutlass.cute as cute
@@ -2041,6 +2042,88 @@ def test_sm120_short_prompt_in_large_pool_keeps_one_split(monkeypatch):
     )
 
     assert plan_splits == [1]
+
+
+@pytest.mark.parametrize(
+    ("q_lengths", "pack_gqa", "has_idle_mblocks"),
+    [
+        ((128,) + (1,) * 16, True, True),
+        ((9,) * 12, True, False),
+        ((128,) + (1,) * 16, False, False),
+    ],
+    ids=["chunk_with_decode_rows", "uniform_rows", "unpacked_gqa"],
+)
+def test_sm120_extend_splits_count_busy_m_blocks(
+    monkeypatch, q_lengths, pack_gqa, has_idle_mblocks
+):
+    """The varlen grid sizes every row by the longest one. Picking splits counts only M
+    blocks with work: a short chunk with decode rows splits its KV, while uniform rows
+    whose last block is partial and unpacked GQA heads keep the launch's count."""
+    sm120_forward_host.clear_launch_plans()
+    launched_mblocks, split_choices = [], []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+    original_select_num_splits = Sm120ForwardHost.select_num_splits
+
+    def record_plan(**kwargs):
+        launched_mblocks.append(kwargs["total_mblocks"])
+        return original_resolve_plan(**kwargs)
+
+    def record_select(**kwargs):
+        num_splits = original_select_num_splits(**kwargs)
+        split_choices.append((kwargs["total_mblocks"], num_splits))
+        return num_splits
+
+    monkeypatch.setattr(Sm120ForwardHost, "resolve_plan", staticmethod(record_plan))
+    monkeypatch.setattr(
+        Sm120ForwardHost, "select_num_splits", staticmethod(record_select)
+    )
+    torch.manual_seed(20261124)
+    # Qwen3-30B-A3B heads under TP4.
+    num_q_heads, head_dim, page_size = 8, 128, 128
+    k_lengths = [4096 + q_len for q_len in q_lengths]
+    pages_per_sequence = math.ceil(max(k_lengths) / page_size)
+    batch_size = len(q_lengths)
+    q = torch.randn(
+        sum(q_lengths), num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * pages_per_sequence,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = (
+        torch.randperm(batch_size * pages_per_sequence, device="cuda")
+        .to(torch.int32)
+        .view(batch_size, pages_per_sequence)
+    )
+    q_offsets = [0, *itertools.accumulate(q_lengths)]
+    cu_seqlens_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+
+    def run(num_splits):
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=torch.tensor(k_lengths, device="cuda", dtype=torch.int32),
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(q_lengths),
+            causal=True,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+        )
+
+    output = run(0)
+    busy_mblocks, num_splits = split_choices[0]
+    if has_idle_mblocks:
+        assert busy_mblocks < launched_mblocks[0] and num_splits > 1
+    else:
+        assert busy_mblocks == launched_mblocks[0]
+    torch.testing.assert_close(output, run(1), atol=4e-3, rtol=0.0)
 
 
 def test_sm120_paged_decode_graph_splits_follow_replay_lengths(monkeypatch):
