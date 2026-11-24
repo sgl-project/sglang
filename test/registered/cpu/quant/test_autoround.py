@@ -76,6 +76,29 @@ class TestAutoRoundCPUConfig(CustomTestCase):
 
         self.assertIsInstance(quant_method, UnquantizedLinearMethod)
 
+    def test_fused_layer_regex_rule_wins_over_shard_expansion(self):
+        """An extra_config regex that matches the fused in_proj_ba but neither
+        of its shards must still select 16-bit; expanding the fused layer into
+        shards first misses the rule and falls back to 4-bit."""
+        prefix = "model.language_model.layers.0.linear_attn"
+        quant_config = AutoRoundConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "packing_format": "auto_round:auto_gptq",
+                "extra_config": {
+                    r".*\.in_proj_ba$": {"bits": 16, "data_type": "fp"},
+                },
+                "packed_modules_mapping": {"in_proj_ba": ["in_proj_b", "in_proj_a"]},
+            }
+        )
+
+        layer = LinearBase.__new__(LinearBase)
+        quant_method = quant_config.get_quant_method(layer, f"{prefix}.in_proj_ba")
+
+        self.assertIsInstance(quant_method, UnquantizedLinearMethod)
+
 
 @unittest.skipUnless(
     cpu_has_amx_support(),
