@@ -344,7 +344,15 @@ Contract checks run without model execution. The HTTP checks in
 `SIMOPUS_E2E_SYSTEMS_ROOT` and `SIMOPUS_E2E_MODEL_PATH`; missing inputs are reported
 as skipped rather than presented as integration evidence.
 
-The compatible SDK must expose `PerfDatabase.stack_sha256`. The adapter records
-that original stack digest through the SDK; it never opens a slice metadata path
-or selects a storage format. Directory and SQLite data therefore use the same
-initialization and provenance contract.
+The adapter opens performance data through `simopus.sdk.PerfDB`, passing its
+`systems_root` configuration as the SDK's `perfdb_dir` argument. The configuration
+key and value stay unchanged. The SDK owns storage interpretation and queries;
+the adapter does not open SQLite tables or inspect SDK implementation modules.
+An older SDK can use the former public opening entry. `stack_digest` is an
+optional SDK-provided label and is null when absent; it is not a data checksum.
+
+Execution profiles use the fields in the R1 example. Remove the obsolete
+`profile_id` and `runtime_compatibility_manifest_sha256` keys from older context
+and decode profiles. Keep the actual execution settings and independent context
+and decode profiles. Use an SDK-compatible PerfDB; migrate an existing personal
+database with that SDK's documented migration command before starting readers.

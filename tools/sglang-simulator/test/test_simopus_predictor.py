@@ -1,5 +1,4 @@
 import copy
-import hashlib
 import json
 import math
 import sys
@@ -157,26 +156,31 @@ class _Provider:
 
 
 @pytest.fixture(autouse=True)
-def sdk_double(tmp_path, monkeypatch):
+def sdk_double(monkeypatch):
     """Patch public SDK entry points; production construction stays unchanged."""
-    stack = tmp_path / "stack.json"
-    stack.write_bytes(b'{"stack":"test"}')
     module = ModuleType("simopus.sdk")
-    module.database = SimpleNamespace(
-        slice_ref=SimpleNamespace(stack_path=stack),
-        stack_sha256=hashlib.sha256(stack.read_bytes()).hexdigest(),
-    )
+    module.database = SimpleNamespace(stack_sha256="test-stack")
     module.opened, module.built = [], []
 
-    def open_fidb(*args, **kwargs):
-        module.opened.append((args, kwargs))
+    def open_scope(system, *, perfdb_dir, backend, version, database_mode):
+        module.opened.append(
+            (
+                (system,),
+                dict(
+                    perfdb_dir=perfdb_dir,
+                    backend=backend,
+                    version=version,
+                    database_mode=database_mode,
+                ),
+            )
+        )
         return module.database
 
     def build(*args, **kwargs):
         module.built.append((args, kwargs))
         return module.provider
 
-    module.PerfDatabase = SimpleNamespace(open_fidb=open_fidb)
+    module.PerfDB = open_scope
     module.build_umd_static_model = build
     module.ExtendRequestShape = lambda **values: values
     module.ExtendExecutionProfile = _ExecutionProfile
@@ -413,15 +417,23 @@ def test_model_revision_is_exact():
 def test_production_binding_and_portable_provenance(sdk_double):
     predictor = _predictor(_Provider())
     assert predictor.requires_prepared_batch
-    assert sdk_double.opened[0][0] == ("mi350x", "sglang", "0.5.17")
-    assert sdk_double.opened[0][1]["database_mode"] == "SILICON"
+    assert sdk_double.opened == [
+        (
+            ("mi350x",),
+            {
+                "backend": "sglang",
+                "version": "0.5.17",
+                "perfdb_dir": "/unused",
+                "database_mode": "SILICON",
+            },
+        )
+    ]
     assert sdk_double.built[0][0] == (sdk_double.database, _MODEL_ID)
     assert sdk_double.built[0][1] == {"backend": "sglang", "revision": "c" * 40}
     metrics = predictor.get_metrics()["simopus"]
-    stack = sdk_double.database.slice_ref.stack_path
     assert metrics["model_revision"] == "c" * 40
     assert metrics["provider_revision"] == "a" * 40
-    assert metrics["stack_digest"] == hashlib.sha256(stack.read_bytes()).hexdigest()
+    assert metrics["stack_digest"] == sdk_double.database.stack_sha256
     assert "systems_root" not in metrics and "database_path" not in metrics
 
 
@@ -571,7 +583,6 @@ def test_real_sdk_decode_profile_is_independent_of_context(canonical_predictor):
         runtime_compatibility_id="test-eager-decode",
         full_forward_realization="test-whole-forward-eager",
         component_realization="test-mla-eager",
-        runtime_compatibility_manifest_sha256="e" * 64,
     )
     provider = _Provider()
     predictor = canonical_predictor(provider, decode_execution_profile=eager.to_dict())
@@ -595,19 +606,17 @@ def test_real_sdk_decode_profile_is_independent_of_context(canonical_predictor):
         ("decode_execution_profile", "invalid_decode_execution_profile"),
     ],
 )
-@pytest.mark.parametrize("mutation", ["digest", "unknown_field", "missing_field"])
-def test_real_sdk_rejects_tampered_or_malformed_profiles(
+@pytest.mark.parametrize("mutation", ["unknown_field", "missing_field"])
+def test_real_sdk_rejects_malformed_profiles(
     canonical_predictor, field, code, mutation
 ):
     payload = copy.deepcopy(
         _REALIZATION_PROFILE if field == "execution_profile" else _DECODE_PROFILE
     )
-    if mutation == "digest":
-        payload["kv_page_size"] = 64
-    elif mutation == "unknown_field":
+    if mutation == "unknown_field":
         payload["reduction_policy"] = "obsolete"
     else:
-        del payload["runtime_compatibility_manifest_sha256"]
+        del payload["runtime_compatibility_id"]
     provider = _Provider()
     with pytest.raises(PredictorError) as exc_info:
         canonical_predictor(provider, **{field: payload})
@@ -646,3 +655,12 @@ def test_real_sdk_rejects_valid_profile_for_another_scheduler_page_size(
         )
     assert exc_info.value.code == code
     assert provider.calls == []
+
+
+def test_sdk_without_a_stack_label_preserves_prediction(sdk_double):
+    del sdk_double.database.stack_sha256
+    predictor = _predictor(_Provider())
+    assert predictor.get_metrics()["simopus"]["stack_digest"] is None
+    assert predictor.predict_infer_time(_batch("DECODE", (1, 127))) == pytest.approx(
+        0.0125
+    )
