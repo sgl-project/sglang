@@ -343,11 +343,16 @@ def _sm100_mha_backend(model_config) -> str:
     if trtllm_gen_mha_serves_head_dims(model_config):
         return "trtllm_mha"
     backend = "fa4" if fa4_sm100_serves_head_dims(model_config) else "triton"
+    missing = sorted(
+        {
+            (qk, vo)
+            for qk, vo in _attn_head_dim_pairs(model_config)
+            if not (qk == vo and qk in _TRTLLM_GEN_MHA_HEAD_DIMS)
+        }
+    )
     logger.info(
-        "trtllm-gen has no SM100 MHA kernels for head_dim=%s (v_head_dim=%s); "
-        "using %s.",
-        model_config.head_dim,
-        model_config.v_head_dim,
+        "trtllm-gen has no SM100 MHA kernels for (head_dim, v_head_dim) %s; using %s.",
+        ", ".join(map(str, missing)),
         backend,
     )
     return backend
