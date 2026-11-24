@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import json
 import re
 import unittest
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -99,9 +100,27 @@ class Sample:
         return chunks
 
 
-def _json_calls(fmt: str) -> Tuple[str, str]:
+def _calls(call: str, arg: str = "", arg_sep: str = "") -> Tuple[str, str]:
+    """EXPECTED_CALLS rendered with the `call` template.
+
+    `call` can use {i}, {name}, {args_json}, and {args}: each argument rendered
+    with the `arg` template ({k}, {v}), joined by `arg_sep`.
+    """
     return tuple(
-        fmt.format(json.dumps({"name": name, "arguments": args}))
+        call.format(
+            i=i,
+            name=name,
+            args_json=json.dumps(args),
+            args=arg_sep.join(arg.format(k=k, v=v) for k, v in args.items()),
+        )
+        for i, (name, args) in enumerate(EXPECTED_CALLS)
+    )
+
+
+def _json_calls(call: str, args_key: str = "arguments") -> Tuple[str, str]:
+    """EXPECTED_CALLS as `{"name": ..., args_key: ...}` objects, at {json} in `call`."""
+    return tuple(
+        call.format(json=json.dumps({"name": name, args_key: args}))
         for name, args in EXPECTED_CALLS
     )
 
@@ -110,7 +129,7 @@ def _json_calls(fmt: str) -> Tuple[str, str]:
 # the detector's documented format where the template is not public.
 
 _HERMES = Sample(
-    calls=_json_calls("<tool_call>\n{}\n</tool_call>"),
+    calls=_json_calls("<tool_call>\n{json}\n</tool_call>"),
     separator="\n",
     special_tokens=("<tool_call>", "</tool_call>"),
 )
@@ -124,11 +143,9 @@ _DSV3_TOKENS = (
 )
 
 _QWEN3_CODER = Sample(
-    calls=tuple(
-        f"<tool_call>\n<function={name}>\n"
-        + "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in args.items())
-        + "</function>\n</tool_call>"
-        for name, args in EXPECTED_CALLS
+    calls=_calls(
+        "<tool_call>\n<function={name}>\n{args}</function>\n</tool_call>",
+        "<parameter={k}>\n{v}\n</parameter>\n",
     ),
     separator="\n",
     special_tokens=("<tool_call>", "</tool_call>"),
@@ -143,29 +160,11 @@ _ARG_TAGS = (
     "</arg_value>",
 )
 
-_GLM45 = Sample(
-    calls=tuple(
-        f"<tool_call>{name}\n"
-        + "".join(
-            f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n"
-            for k, v in args.items()
-        )
-        + "</tool_call>"
-        for name, args in EXPECTED_CALLS
-    ),
-    separator="\n",
-    special_tokens=_ARG_TAGS,
-)
-
 # zai-org/GLM-4.7; RecursiveSI/flint renders the same call bodies.
 _GLM47 = Sample(
-    calls=tuple(
-        f"<tool_call>{name}"
-        + "".join(
-            f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in args.items()
-        )
-        + "</tool_call>"
-        for name, args in EXPECTED_CALLS
+    calls=_calls(
+        "<tool_call>{name}{args}</tool_call>",
+        "<arg_key>{k}</arg_key><arg_value>{v}</arg_value>",
     ),
     special_tokens=_ARG_TAGS,
 )
@@ -190,8 +189,6 @@ def _dsml(block: str, invoke: str = "invoke", parameter: str = "parameter"):
         special_tokens=("｜DSML｜",),
     )
 
-
-_MINIMAX_NS = "]<]minimax[>["
 
 # thinkingmachines/Inkling-Small; inkling2 parses the same format.
 _INKLING = Sample(
@@ -220,13 +217,10 @@ SAMPLES = {
     # reflection/Beam-1.0-501B-A23B, after the reasoning parser consumed the
     # first `<|start|>assistant`.
     "beam": Sample(
-        calls=tuple(
-            f" to={name}<|channel|>analysis <|constrain|>xml<|message|>"
-            + "\n".join(
-                f'<rfl:parameter name="{k}">\n{v}\n</rfl:parameter>'
-                for k, v in args.items()
-            )
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            " to={name}<|channel|>analysis <|constrain|>xml<|message|>{args}",
+            '<rfl:parameter name="{k}">\n{v}\n</rfl:parameter>',
+            arg_sep="\n",
         ),
         separator="<|end|><|start|>assistant",
         suffix="<|call|>",
@@ -253,10 +247,9 @@ SAMPLES = {
         special_tokens=("<|START_ACTION|>", "<|END_ACTION|>"),
     ),
     "deepseekv3": Sample(
-        calls=tuple(
-            f"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\n```json\n"
-            f"{json.dumps(args)}\n```<｜tool▁call▁end｜>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\n"
+            "```json\n{args_json}\n```<｜tool▁call▁end｜>"
         ),
         prefix="<｜tool▁calls▁begin｜>",
         separator="\n",
@@ -264,10 +257,8 @@ SAMPLES = {
         special_tokens=_DSV3_TOKENS,
     ),
     "deepseekv31": Sample(
-        calls=tuple(
-            f"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>{json.dumps(args)}"
-            "<｜tool▁call▁end｜>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>{args_json}<｜tool▁call▁end｜>"
         ),
         prefix="<｜tool▁calls▁begin｜>",
         suffix="<｜tool▁calls▁end｜>",
@@ -279,39 +270,27 @@ SAMPLES = {
     "deepseekv41": _dsml(" calls", " invoke", " parameter"),
     # dots-studio/dots3-note-prev
     "dots": Sample(
-        calls=tuple(
-            f'<dots_function_call>\n<invoke name="{name}">'
-            + "".join(
-                f'\n<parameter name="{k}">\n{v}\n</parameter>' for k, v in args.items()
-            )
-            + "\n</invoke>\n</dots_function_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            '<dots_function_call>\n<invoke name="{name}">{args}\n</invoke>\n'
+            "</dots_function_call>",
+            '\n<parameter name="{k}">\n{v}\n</parameter>',
         ),
         prefix="\n",
         separator="\n",
     ),
     "ernie55": Sample(
-        calls=tuple(
-            f'<invoke name="{name}">\n'
-            + "".join(
-                f'<parameter name="{k}">{v}</parameter>\n' for k, v in args.items()
-            )
-            + "</invoke>\n"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            '<invoke name="{name}">\n{args}</invoke>\n',
+            '<parameter name="{k}">{v}</parameter>\n',
         ),
         prefix="<ernie:tool_call>\n",
         suffix="</ernie:tool_call>",
     ),
     # ai-sage/GigaChat3.5-432B-A28B
     "gigachat35": Sample(
-        calls=tuple(
-            f'<｜GCML｜invoke name="{name}">\n'
-            + "".join(
-                f'<｜GCML｜parameter name="{k}" string="true">{v}</｜GCML｜parameter>\n'
-                for k, v in args.items()
-            )
-            + "</｜GCML｜invoke>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            '<｜GCML｜invoke name="{name}">\n{args}</｜GCML｜invoke>',
+            '<｜GCML｜parameter name="{k}" string="true">{v}</｜GCML｜parameter>\n',
         ),
         prefix="<｜GCML｜tool_calls>\n",
         separator="\n",
@@ -329,15 +308,21 @@ SAMPLES = {
         ),
         special_tokens=("<|tool_call>", "<tool_call|>", '<|"|>'),
     ),
-    "glm": _GLM45,
+    "glm": Sample(
+        calls=_calls(
+            "<tool_call>{name}\n{args}</tool_call>",
+            "<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n",
+        ),
+        separator="\n",
+        special_tokens=_ARG_TAGS,
+    ),
     "glm47": _GLM47,
     "flint": _GLM47,
     # openai/gpt-oss-20b, as generated: the recipient is in the channel header.
     "gpt-oss": Sample(
-        calls=tuple(
-            f"<|start|>assistant<|channel|>commentary to=functions.{name} "
-            f"<|constrain|>json<|message|>{json.dumps(args)}<|call|>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<|start|>assistant<|channel|>commentary to=functions.{name} "
+            "<|constrain|>json<|message|>{args_json}<|call|>"
         ),
         special_tokens=(
             "<|start|>",
@@ -357,14 +342,9 @@ SAMPLES = {
     "hermes": _HERMES,
     # tencent/Hy3-preview
     "hunyuan": Sample(
-        calls=tuple(
-            f"<tool_call>{name}<tool_sep>\n"
-            + "".join(
-                f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n"
-                for k, v in args.items()
-            )
-            + "</tool_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<tool_call>{name}<tool_sep>\n{args}</tool_call>",
+            "<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n",
         ),
         prefix="<tool_calls>\n",
         separator="\n",
@@ -375,38 +355,25 @@ SAMPLES = {
     "inkling2": _INKLING,
     # Detokenized with spaces_between_special_tokens, the server default.
     "interns1": Sample(
-        calls=tuple(
-            "<|action_start|> <|plugin|>\n"
-            + json.dumps({"name": name, "parameters": args})
-            + "<|action_end|>"
-            for name, args in EXPECTED_CALLS
+        calls=_json_calls(
+            "<|action_start|> <|plugin|>\n{json}<|action_end|>", args_key="parameters"
         ),
         separator="\n",
         special_tokens=("<|action_start|>", "<|plugin|>", "<|action_end|>"),
     ),
     # IQuestLab/IQuest-Q1
     "iquest_q1": Sample(
-        calls=tuple(
-            f"<iquest_tool_call>{name}"
-            + "".join(
-                f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>"
-                for k, v in args.items()
-            )
-            + "</iquest_tool_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<iquest_tool_call>{name}{args}</iquest_tool_call>",
+            "<arg_key>{k}</arg_key><arg_value>{v}</arg_value>",
         ),
         special_tokens=("<iquest_tool_call>", "</iquest_tool_call>") + _ARG_TAGS[2:],
     ),
     # IFM/K2-Horizon-0.9B
     "k2_horizon": Sample(
-        calls=tuple(
-            f"<ifm|tool_call>{name}\n"
-            + "".join(
-                f"<ifm|arg_key>{k}</ifm|arg_key>\n<ifm|arg_value>{v}</ifm|arg_value>\n"
-                for k, v in args.items()
-            )
-            + "</ifm|tool_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<ifm|tool_call>{name}\n{args}</ifm|tool_call>",
+            "<ifm|arg_key>{k}</ifm|arg_key>\n<ifm|arg_value>{v}</ifm|arg_value>\n",
         ),
         prefix="<ifm|tool_calls>\n",
         separator="\n",
@@ -423,10 +390,9 @@ SAMPLES = {
         ),
     ),
     "kimi_k2": Sample(
-        calls=tuple(
-            f"<|tool_call_begin|>functions.{name}:{i}<|tool_call_argument_begin|>"
-            f"{json.dumps(args)}<|tool_call_end|>"
-            for i, (name, args) in enumerate(EXPECTED_CALLS)
+        calls=_calls(
+            "<|tool_call_begin|>functions.{name}:{i}<|tool_call_argument_begin|>"
+            "{args_json}<|tool_call_end|>"
         ),
         prefix="<|tool_calls_section_begin|>",
         suffix="<|tool_calls_section_end|>",
@@ -455,10 +421,7 @@ SAMPLES = {
     ),
     # LiquidAI/LFM2.5-1.2B-Instruct
     "lfm2": Sample(
-        calls=tuple(
-            f"{name}(" + ", ".join(f"{k}={v!r}" for k, v in args.items()) + ")"
-            for name, args in EXPECTED_CALLS
-        ),
+        calls=_calls("{name}({args})", "{k}={v!r}", arg_sep=", "),
         prefix="<|tool_call_start|>[",
         separator=", ",
         suffix="]<|tool_call_end|>",
@@ -466,57 +429,41 @@ SAMPLES = {
     ),
     # inclusionAI/Ling-3.0-flash
     "ling3": Sample(
-        calls=tuple(
-            f"<tool_call>{name}\n"
-            + "".join(
-                f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>"
-                for k, v in args.items()
-            )
-            + "\n</tool_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<tool_call>{name}\n{args}\n</tool_call>",
+            "<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>",
         ),
         separator="\n",
         special_tokens=_ARG_TAGS,
     ),
     "llama3": Sample(
-        calls=tuple(
-            json.dumps({"name": name, "parameters": args})
-            for name, args in EXPECTED_CALLS
-        ),
+        calls=_json_calls("{json}", args_key="parameters"),
         prefix="<|python_tag|>",
         separator=";",
         special_tokens=("<|python_tag|>",),
     ),
     # XiaomiMiMo/MiMo-V2-Flash
     "mimo": Sample(
-        calls=tuple(
-            f"<tool_call>\n<function={name}>\n"
-            + "".join(f"<parameter={k}>{v}</parameter>\n" for k, v in args.items())
-            + "</function>\n</tool_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<tool_call>\n<function={name}>\n{args}</function>\n</tool_call>",
+            "<parameter={k}>{v}</parameter>\n",
         ),
         special_tokens=("<tool_call>", "</tool_call>"),
     ),
     # openbmb/MiniCPM5-2B
     "minicpm5": Sample(
-        calls=tuple(
-            f'<function name="{name}">'
-            + "".join(f'<param name="{k}">{v}</param>' for k, v in args.items())
-            + "</function>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            '<function name="{name}">{args}</function>',
+            '<param name="{k}">{v}</param>',
         ),
         separator="\n",
         special_tokens=("<function", "</function>", "<param", "</param>"),
     ),
     # MiniMaxAI/MiniMax-M2
     "minimax-m2": Sample(
-        calls=tuple(
-            f'<invoke name="{name}">\n'
-            + "".join(
-                f'<parameter name="{k}">{v}</parameter>\n' for k, v in args.items()
-            )
-            + "</invoke>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            '<invoke name="{name}">\n{args}</invoke>',
+            '<parameter name="{k}">{v}</parameter>\n',
         ),
         prefix="\n<minimax:tool_call>\n",
         separator="\n",
@@ -525,41 +472,28 @@ SAMPLES = {
     ),
     # MiniMaxAI/MiniMax-M3
     "minimax-m3": Sample(
-        calls=tuple(
-            f'{_MINIMAX_NS}<invoke name="{name}">'
-            + "".join(
-                f"{_MINIMAX_NS}<{k}>{v}{_MINIMAX_NS}</{k}>" for k, v in args.items()
-            )
-            + f"{_MINIMAX_NS}</invoke>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            ']<]minimax[>[<invoke name="{name}">{args}]<]minimax[>[</invoke>',
+            "]<]minimax[>[<{k}>{v}]<]minimax[>[</{k}>",
         ),
-        prefix=f"{_MINIMAX_NS}<tool_call>\n",
+        prefix="]<]minimax[>[<tool_call>\n",
         separator="\n",
-        suffix=f"\n{_MINIMAX_NS}</tool_call>",
-        special_tokens=(_MINIMAX_NS, "<tool_call>", "</tool_call>"),
+        suffix="\n]<]minimax[>[</tool_call>",
+        special_tokens=("]<]minimax[>[", "<tool_call>", "</tool_call>"),
     ),
     "mistral": Sample(
-        calls=tuple(
-            json.dumps({"name": name, "arguments": args})
-            for name, args in EXPECTED_CALLS
-        ),
+        calls=_json_calls("{json}"),
         prefix="[TOOL_CALLS] [",
         separator=", ",
         suffix="]",
         special_tokens=("[TOOL_CALLS]",),
     ),
-    # meta-models/Muse-Glimmer-30B, after the generation prompt's
-    # `<|start|>assistant`.
+    # meta-models/Muse-Glimmer-30B, after the prompt's `<|start|>assistant`.
     "muse": Sample(
-        calls=tuple(
-            f" to={name}<|message|><atem:function_calls>\n"
-            f'<atem:invoke name="{name}">\n'
-            + "".join(
-                f'<atem:parameter name="{k}">{v}</atem:parameter>\n'
-                for k, v in args.items()
-            )
-            + "</atem:invoke>\n</atem:function_calls>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            " to={name}<|message|><atem:function_calls>\n"
+            '<atem:invoke name="{name}">\n{args}</atem:invoke>\n</atem:function_calls>',
+            '<atem:parameter name="{k}">{v}</atem:parameter>\n',
         ),
         separator="<|eom|><|start|>assistant",
         suffix="<|eot|>",
@@ -568,24 +502,14 @@ SAMPLES = {
     "nanbeige": _QWEN3_CODER,
     # poolside/Laguna-XS.2
     "poolside_v1": Sample(
-        calls=tuple(
-            f"<tool_call>{name}\n"
-            + "".join(
-                f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n"
-                for k, v in args.items()
-            )
-            + "</tool_call>\n"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<tool_call>{name}\n{args}</tool_call>\n",
+            "<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n",
         ),
         special_tokens=("<tool_call>", "</tool_call>"),
     ),
     "pythonic": Sample(
-        calls=tuple(
-            f"{name}("
-            + ", ".join(f"{k}={json.dumps(v)}" for k, v in args.items())
-            + ")"
-            for name, args in EXPECTED_CALLS
-        ),
+        calls=_calls("{name}({args})", '{k}="{v}"', arg_sep=", "),
         prefix="[",
         separator=", ",
         suffix="]",
@@ -595,15 +519,10 @@ SAMPLES = {
     "spark25": Sample(calls=_GLM47.calls),
     # stepfun-ai/step3
     "step3": Sample(
-        calls=tuple(
+        calls=_calls(
             "<｜tool_call_begin｜>\nfunction<｜tool_sep｜>"
-            f'<steptml:invoke name="{name}">'
-            + "".join(
-                f'<steptml:parameter name="{k}">{v}</steptml:parameter>'
-                for k, v in args.items()
-            )
-            + "</steptml:invoke><｜tool_call_end｜>"
-            for name, args in EXPECTED_CALLS
+            '<steptml:invoke name="{name}">{args}</steptml:invoke><｜tool_call_end｜>',
+            '<steptml:parameter name="{k}">{v}</steptml:parameter>',
         ),
         prefix="<｜tool_calls_begin｜>\n",
         separator="\n",
@@ -611,19 +530,12 @@ SAMPLES = {
     ),
     "step3p5": _QWEN3_CODER,
     # arcee-ai/Trinity-Mini
-    "trinity": Sample(
-        calls=_json_calls("<tool_call>\n{}\n</tool_call>"), separator="\n"
-    ),
+    "trinity": Sample(calls=_HERMES.calls, separator="\n"),
     # XingChen-AGI/Xing4.0-29B-A4B
     "xing4_0": Sample(
-        calls=tuple(
-            f"<tool_call>{name}"
-            + "".join(
-                f"<param_key>{k}</param_key><param_value>{v}</param_value>"
-                for k, v in args.items()
-            )
-            + "</tool_call>"
-            for name, args in EXPECTED_CALLS
+        calls=_calls(
+            "<tool_call>{name}{args}</tool_call>",
+            "<param_key>{k}</param_key><param_value>{v}</param_value>",
         ),
         special_tokens=("<tool_call>", "</tool_call>"),
     ),
@@ -637,6 +549,9 @@ NOT_COVERED = {
         "test/registered/unit/parser/test_chat_parsing.py"
     ),
 }
+
+_LATER_CALLS_TO_CONTENT = "calls after the first go to content"
+_SECTION_END_DROPS_CALLS = "section end discards buffered calls"
 
 # Each step of these detectors sends at most one name or one argument diff, so
 # the rest of a chunk waits for the next chunk and is lost when the stream ends.
@@ -660,13 +575,13 @@ KNOWN_FAILURES = {
     ("llama3", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("mimo", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("minimax-m2", "both_calls_in_one_chunk"): "#36691",
-    ("mistral", "one_call_per_chunk"): "calls after the first go to content",
-    ("mistral", "both_calls_in_one_chunk"): "calls after the first go to content",
-    ("mistral", "one_token_per_chunk"): "calls after the first go to content",
+    ("mistral", "one_call_per_chunk"): _LATER_CALLS_TO_CONTENT,
+    ("mistral", "both_calls_in_one_chunk"): _LATER_CALLS_TO_CONTENT,
+    ("mistral", "one_token_per_chunk"): _LATER_CALLS_TO_CONTENT,
     ("qwen", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
     ("qwen", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("step3", "one_call_per_chunk"): "section end discards buffered calls",
-    ("step3", "both_calls_in_one_chunk"): "section end discards buffered calls",
+    ("step3", "one_call_per_chunk"): _SECTION_END_DROPS_CALLS,
+    ("step3", "both_calls_in_one_chunk"): _SECTION_END_DROPS_CALLS,
     ("trinity", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
     ("trinity", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
 }
@@ -685,21 +600,16 @@ def _stream(parser_name: str, chunks: List[str]):
     concatenated arguments.
     """
     parser = FunctionCallParser(tools=TOOLS, tool_call_parser=parser_name)
-    content, names, arguments = "", {}, {}
+    results = [parser.parse_stream_chunk(chunk) for chunk in chunks]
+    results.append(parser.parse_stream_end())
 
-    def collect(text, calls):
-        nonlocal content
-        content += text or ""
+    content = "".join(text for text, _ in results)
+    names, arguments = defaultdict(list), defaultdict(str)
+    for _, calls in results:
         for call in calls:
             if call.name:
-                names.setdefault(call.tool_index, []).append(call.name)
-            arguments[call.tool_index] = arguments.get(call.tool_index, "") + (
-                call.parameters or ""
-            )
-
-    for chunk in chunks:
-        collect(*parser.parse_stream_chunk(chunk))
-    collect(*parser.parse_stream_end())
+                names[call.tool_index].append(call.name)
+            arguments[call.tool_index] += call.parameters
 
     # The server sends the arguments of the last call that were not streamed.
     flush = OpenAIServingChat._check_for_unstreamed_tool_args(
@@ -713,16 +623,15 @@ def _stream(parser_name: str, chunks: List[str]):
     if flush:
         delta = json.loads(flush[len("data: ") :])["choices"][0]["delta"]
         for call in delta["tool_calls"]:
-            index = call["index"]
-            arguments[index] = arguments.get(index, "") + call["function"]["arguments"]
+            arguments[call["index"]] += call["function"]["arguments"]
     return content, names, arguments
 
 
 class TestStreamingChunkBoundaries(CustomTestCase):
     def test_every_registered_parser_is_covered(self):
-        registered = set(FunctionCallParser.ToolCallParserEnum)
-        self.assertEqual(registered - set(SAMPLES) - set(NOT_COVERED), set())
-        self.assertEqual(set(SAMPLES) - registered, set())
+        self.assertEqual(
+            set(SAMPLES) | set(NOT_COVERED), set(FunctionCallParser.ToolCallParserEnum)
+        )
 
     def test_samples_parse_without_streaming(self):
         for name, sample in SAMPLES.items():
