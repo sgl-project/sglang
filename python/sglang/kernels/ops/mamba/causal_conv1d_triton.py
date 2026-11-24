@@ -651,6 +651,21 @@ def _flydsl_causal_conv1d() -> Optional[Callable]:
     return causal_conv1d_prefill_flydsl_fn
 
 
+# Measured crossovers on MI355X (bf16, widths 3-4, 1-4 sequences): below these
+# sizes FlyDSL is 0.88-0.99x Triton. Re-tune when either kernel changes.
+_FLYDSL_MIN_NUMEL_CHANNEL_CONTIGUOUS = 1 << 22  # [tokens, dim].T, as GDN passes
+_FLYDSL_MIN_NUMEL_TOKEN_CONTIGUOUS = 1 << 19  # contiguous [dim, tokens]
+
+
+def _flydsl_beats_triton(x: torch.Tensor) -> bool:
+    min_numel = (
+        _FLYDSL_MIN_NUMEL_CHANNEL_CONTIGUOUS
+        if x.stride(0) == 1
+        else _FLYDSL_MIN_NUMEL_TOKEN_CONTIGUOUS
+    )
+    return x.numel() >= min_numel
+
+
 class CausalConv1dOp(BaseFusedOp):
     op = "mamba.causal_conv1d_fn"
     # FlyDSL measured 1.1-1.8x Triton on MI355X at Qwen3.5/3.8 GDN prefill shapes.
@@ -734,6 +749,7 @@ class CausalConv1dOp(BaseFusedOp):
             block_table is None
             and not output_split_size
             and (conv_states is None or conv_states.is_contiguous())
+            and _flydsl_beats_triton(x)
         ):
             try:
                 return flydsl_conv(

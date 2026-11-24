@@ -668,8 +668,9 @@ def test_causal_conv1d_oot_dispatch(monkeypatch):
 
 
 def test_causal_conv1d_flydsl_dispatch(monkeypatch):
-    """FlyDSL serves only the calls it covers: a forced backend, a block table
-    and a declined batch reach Triton, and without FlyDSL Triton is picked once."""
+    """FlyDSL serves only the calls it covers and wins: a forced backend, a block
+    table, a declined batch and a short prefill reach Triton, and without FlyDSL
+    Triton is picked once."""
     from sglang.kernels import fused_op
 
     flydsl_out, triton_out = torch.empty(1), torch.empty(2)
@@ -683,15 +684,24 @@ def test_causal_conv1d_flydsl_dispatch(monkeypatch):
     )
     monkeypatch.setattr(_CAUSAL_CONV1D_OP, "_forward_method", None)
     state = torch.zeros(1, 4, 3)
+    # 1024 tokens x 4096 channels, [tokens, dim].T as GDN passes it.
+    x = torch.empty(1024, 4096, dtype=torch.bfloat16).T
 
-    def conv(**kwargs):
-        return causal_conv1d_fn(state, state, None, state, state, [1], **kwargs)
+    def conv(x=x, **kwargs):
+        return causal_conv1d_fn(x, state, None, state, state, [1], **kwargs)
 
     assert conv() is flydsl_out
     assert conv(block_table=torch.zeros(1, 2, dtype=torch.int32)) is triton_out
     monkeypatch.setattr(fused_op, "_forced_backend", KernelBackend.TRITON)
     assert conv() is triton_out
     monkeypatch.setattr(fused_op, "_forced_backend", None)
+
+    # The short-prefill cutoff depends on the layout: a contiguous [dim, tokens]
+    # input switches to FlyDSL 8x earlier than a channel-contiguous one.
+    assert conv(x[:, :-1]) is triton_out
+    assert conv(torch.empty(512, 1024, dtype=torch.bfloat16)) is flydsl_out
+    assert conv(torch.empty(1024, 512, dtype=torch.bfloat16).T) is triton_out
+
     flydsl.side_effect = ValueError("unsupported shape")
     assert conv() is triton_out
 
@@ -701,7 +711,7 @@ def test_causal_conv1d_flydsl_dispatch(monkeypatch):
     assert _CAUSAL_CONV1D_OP._forward_method == _CAUSAL_CONV1D_OP.forward_triton
 
 
-@pytest.mark.parametrize("seq_lens", [[1024], [5, 300, 1, 64]])
+@pytest.mark.parametrize("seq_lens", [[1024], [5, 300, 1, 64, 2048]])
 def test_causal_conv1d_flydsl_matches_triton(seq_lens, monkeypatch):
     """FlyDSL keeps the Triton contract on the GDN prefill layout:
     a channel-strided input, a scattered state pool and mixed initial states."""
