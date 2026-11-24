@@ -55,6 +55,7 @@ try:
         configure_kv_cache_dtype,
         resolve_indexer_quant_mode,
     )
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
     from sglang.srt.model_executor import pool_configurator
     from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
     from sglang.srt.runtime_context import get_context
@@ -70,6 +71,12 @@ INDEX_HEAD_DIM = 128
 # 512 one-byte latent values + 4 FP32 tile scales + 64 BF16 rope values.
 PACKED_KV_CACHE_DIM = 656
 INT8 = torch.int8
+
+
+def _model_config(arch):
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+    )
 
 
 class _NpuPatchedTestCase(CustomTestCase):
@@ -599,6 +606,7 @@ class TestAscendMlaPoolBuilder(_NpuPatchedTestCase):
             is_draft_worker=True,
             is_dflash=False,
             speculative_draft_attention_backend="ascend",
+            model_config=_model_config("GlmMoeDsaForCausalLMNextN"),
         )
         kwargs = self._build_kwargs(
             dtype,
@@ -610,6 +618,40 @@ class TestAscendMlaPoolBuilder(_NpuPatchedTestCase):
         self.assertEqual(kwargs["dtype"], INT8)
         self.assertTrue(kwargs["kv_capability"].main_kv_packed)
         self.assertEqual(kwargs["kv_cache_dim"], PACKED_KV_CACHE_DIM)
+
+    def test_a_draft_that_cannot_read_the_record_keeps_its_compute_dtype(self):
+        """INT8 is the packed DSA record only: a dense draft, a DSA draft on
+        another backend or an unknown draft would cast K/V to INT8 without
+        scales, so each resolves to its compute dtype. The target is untouched."""
+
+        def resolve(arch, backend, *, is_draft_worker=True, is_dflash=True):
+            return configure_kv_cache_dtype(
+                server_args_kv_cache_dtype="int8",
+                quant_config=None,
+                model_dtype=torch.bfloat16,
+                is_draft_worker=is_draft_worker,
+                is_dflash=is_dflash,
+                speculative_draft_attention_backend=backend,
+                model_config=None if arch is None else _model_config(arch),
+            )
+
+        for arch, backend in (
+            ("Qwen3ForCausalLM", "ascend"),
+            ("Qwen3ForCausalLM", None),
+            ("GlmMoeDsaForCausalLM", "triton"),
+            (None, "ascend"),
+        ):
+            with self.subTest(arch=arch, backend=backend):
+                self.assertEqual(resolve(arch, backend), ("auto", torch.bfloat16))
+        for backend in ("ascend", None):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    resolve("GlmMoeDsaForCausalLM", backend), ("int8", INT8)
+                )
+        self.assertEqual(
+            resolve("Qwen3ForCausalLM", None, is_draft_worker=False, is_dflash=False),
+            ("int8", INT8),
+        )
 
     def test_dsa_int8_on_arch35_is_a_startup_error(self):
         """arch35 has no INT8 packed path; it must not fall back to a plain
@@ -702,10 +744,11 @@ class TestConfigureInt8KvCacheDtype(CustomTestCase):
             is_draft_worker=is_draft_worker,
             is_dflash=False,
             speculative_draft_attention_backend="ascend",
+            model_config=_model_config("GlmMoeDsaForCausalLM"),
         )
 
     def test_a_draft_inherits_the_int8_record(self):
-        """The target and its draft both resolve --kv-cache-dtype int8."""
+        """The target and its DSA draft both resolve --kv-cache-dtype int8."""
         self.assertEqual(self._configure(is_draft_worker=False), ("int8", INT8))
         self.assertEqual(self._configure(is_draft_worker=True), ("int8", INT8))
 
@@ -760,6 +803,31 @@ class TestPackedKvWriteAndSparseRead(_MockedNpuOpsTestCase):
                 key = quant_attn.call_args.kwargs["key"]
                 self.assertEqual(key.dtype, dtype)
                 self.assertEqual(key.shape[-1], PACKED_KV_CACHE_DIM)
+
+    def test_the_packed_record_is_read_through_the_hybrid_wrapper(self):
+        """HybridLinearKVPool forwards the packed flag and the K buffer but
+        has no ``store_dtype``: the reader takes the K tensor as it is handed
+        back, for INT8 and for FP8."""
+        for dtype, arch35 in ((INT8, False), (FP8, True)):
+            with self.subTest(dtype=dtype):
+                self.torch_npu.reset_mock()
+                full_kv_pool = _build_pool(dtype, arch35=arch35)
+                pool = object.__new__(HybridLinearKVPool)
+                pool.full_kv_pool = full_kv_pool
+                pool.full_attention_layer_id_mapping = {0: 0, 1: 1}
+                pool.layer_transfer_counter = None
+                pool.start_layer = 0
+                pool.use_mla = True
+                self.assertFalse(hasattr(pool, "store_dtype"))
+                quant_attn, bf16_attn = self._decode(pool)
+                bf16_attn.assert_not_called()
+                key = quant_attn.call_args.kwargs["key"]
+                self.assertEqual(key.dtype, dtype)
+                self.assertEqual(key.shape[-1], PACKED_KV_CACHE_DIM)
+                self.assertIs(quant_attn.call_args.kwargs["value"], key)
+                self.assertEqual(
+                    key.data_ptr(), full_kv_pool.get_kv_buffer(1)[0].data_ptr()
+                )
 
     def test_write_and_read_derive_from_the_pool_quant_block_size(self):
         """The record-width check, the packer's tile and scale columns and the

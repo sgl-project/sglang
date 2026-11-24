@@ -39,6 +39,7 @@ def resolve_dflash_draft_cell_size(
             speculative_draft_attention_backend=(
                 get_spec().speculative_draft_attention_backend
             ),
+            model_config=draft_model_config,
         )
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,

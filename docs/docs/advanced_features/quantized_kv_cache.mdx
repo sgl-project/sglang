@@ -49,10 +49,15 @@ stores on arch35, so `int8` supports what that path supports, including a
 speculative draft model, prefill context parallelism and HiCache.
 With `SGLANG_NPU_USE_MLAPO`, MLAProlog writes the record during decode; this
 needs dynamic INT8 QKV-A and Q-B projection weights, so a draft model with BF16
-weights needs `--speculative-draft-kv-cache-dtype bf16`.
+weights needs `--speculative-draft-kv-cache-dtype bf16`. A draft that is not a
+DSA model cannot read the record and keeps its KV cache in the compute dtype.
 
 `--kv-cache-dtype int8` is rejected at startup on other platforms, for non-DSA
-models and on arch35 NPUs (use `fp8_e4m3` there). It is also rejected
+models and on arch35 NPUs (use `fp8_e4m3` there). The kernel reading the record
+takes a 64-wide RoPE, and the record keeps its RoPE in BF16 next to a BF16
+query, so a DSA model with another `qk_rope_head_dim` and a `--dtype` other
+than `bfloat16` are rejected as well.
+It is also rejected
 with `--dcp-size` above 1 (the DCP read of the packed record is wired for
 `fp8_e4m3` on arch35 only), with `--enable-dsa-cache-layer-split` and, like
 `fp8_e4m3` on arch35, with sparse KV offload, which has no packed-record path.

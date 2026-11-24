@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
@@ -3459,14 +3460,19 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _check(self, arch="GlmMoeDsaForCausalLM", **kwargs):
+    def _check(
+        self,
+        arch="GlmMoeDsaForCausalLM",
+        qk_rope_head_dim=64,
+        dtype=torch.bfloat16,
+        **kwargs,
+    ):
         server_args = ServerArgs(model_path="dummy", kv_cache_dtype="int8", **kwargs)
         hf_config = SimpleNamespace(architectures=[arch], index_topk=2048)
-        with patch.object(
-            kv_cache_hook,
-            "model_config_of",
-            return_value=SimpleNamespace(hf_config=hf_config),
-        ):
+        model_config = SimpleNamespace(
+            hf_config=hf_config, qk_rope_head_dim=qk_rope_head_dim, dtype=dtype
+        )
+        with patch.object(kv_cache_hook, "model_config_of", return_value=model_config):
             handle_int8_kv_cache_compatibility(server_args)
 
     def test_the_launcher_pipeline_runs_the_check(self):
@@ -3508,6 +3514,16 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "not a DSA model"):
                 self._check(arch="Qwen3ForCausalLM")
             self._check()
+
+    def test_the_reader_rope_width_and_compute_dtype_are_required(self):
+        """The sparse attention reading the INT8 record takes a 64-wide RoPE
+        and a BF16 query: a NoPE DSA model or an FP16 run fails at startup,
+        not on the first forward."""
+        with override_platform(is_npu=True):
+            with self.assertRaisesRegex(ValueError, "qk_rope_head_dim=0"):
+                self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
+            with self.assertRaisesRegex(ValueError, "bfloat16 model dtype"):
+                self._check(dtype=torch.float16)
 
     def test_mlapo_is_accepted(self):
         """MLAProlog writes the INT8 record; it checks the projection weights

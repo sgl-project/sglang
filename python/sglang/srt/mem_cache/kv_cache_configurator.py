@@ -1490,6 +1490,7 @@ class KVCacheConfigurator:
             is_dflash=self.spec_algorithm.is_dflash_family(),
             speculative_draft_attention_backend=draft_backend,
             speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
+            model_config=aux.draft_model_config,
         )
         decision = place_fused_draft(
             profile=profile,
