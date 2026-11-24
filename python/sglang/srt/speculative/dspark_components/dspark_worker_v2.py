@@ -72,6 +72,8 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    ragged_capture_num_tokens,
+    ragged_layout_exceeds_captured_grid,
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
@@ -92,6 +94,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
     read_ragged_verify_mode,
+    round_up_grid,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
@@ -383,6 +386,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_hidden_projection_enabled = False
 
         self._acceptance_estimator = self._build_acceptance_estimator()
+        self._uses_ascend_glm_dsa = False
+        if _is_npu:
+            from sglang.srt.configs.model_config import is_glm_moe_dsa
+
+            self._uses_ascend_glm_dsa = is_glm_moe_dsa(
+                self.model_runner.model_config.hf_config
+            )
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -392,12 +402,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
             online_confidence=self._acceptance_estimator is not None,
+            use_dp_tier_hints=not self._uses_ascend_glm_dsa,
+        )
+        self._compact_attention_dp = (
+            self._uses_ascend_glm_dsa
+            and self._verify_planner.is_compact_mode
+            and get_parallel().attn_dp_enabled
         )
         if (
             get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
+            and not self._compact_attention_dp
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
@@ -702,6 +719,24 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
+        if self._uses_ascend_glm_dsa and self._verify_planner.mode_value != "static":
+            # Scheduler initializes the target backend before the draft worker.
+            # Fail before capture/serving if it cannot honor the selected path,
+            # instead of coordinating tiers while silently skipping packed inputs.
+            if not getattr(
+                self.model_runner.attn_backend, "_dspark_dsa_ragged_verify", False
+            ):
+                raise ValueError(
+                    "GLM NPU DSpark ragged verify requires an attention backend "
+                    "with GLM DSA ragged metadata support."
+                )
+            if self._compact_attention_dp and get_parallel().tp_rank == 0:
+                logger.info(
+                    "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
+                    "target_tier=global-full-window).",
+                    get_parallel().attn_dp_size,
+                    get_parallel().attn_tp_size,
+                )
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
@@ -962,6 +997,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
+        if self._compact_attention_dp:
+            num_reqs = self._compact_dp_verify_num_reqs(batch)
+            if num_reqs is None:
+                return None
+            # GLM directs all padding to the sink KV row. The placeholder slot
+            # has no real query rows.
+            return RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=torch.zeros(1, dtype=torch.int32, device=self.device),
+                graph_num_tokens=round_up_grid(
+                    num_reqs * self.verify_num_draft_tokens,
+                    ragged_capture_num_tokens(model_runner=self.model_runner),
+                ),
+            )
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
         global_bs = max(batch.global_num_tokens)
@@ -986,6 +1034,33 @@ class DSparkWorkerV2(BaseSpecWorker):
         return dp_global_verify_tier_num_tokens(
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
+
+    def _compact_dp_verify_num_reqs(self, batch: ScheduleBatch) -> Optional[int]:
+        """Return the common request count only when its full window fits a graph."""
+        counts = batch.global_num_tokens
+        runner = self.model_runner.decode_cuda_graph_runner
+        if (
+            # A singleton contains only the local count under attention DP.
+            counts is not None
+            and len(counts) > 1
+            and batch.can_run_decode_cuda_graph
+            and not batch.is_extend_in_batch
+            and runner is not None
+            and runner.ragged_verify_mode
+            and runner.attn_backend.supports_ragged_verify_graph
+            and runner.capture_hidden_mode >= CaptureHiddenMode.FULL
+        ):
+            num_reqs = max(counts)
+            if num_reqs > 0 and not ragged_layout_exceeds_captured_grid(
+                num_reqs=num_reqs,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+            ):
+                return num_reqs
+        # Without a common tier, IDLE must not replay a graph while busy
+        # groups run uniform target verify eagerly.
+        batch.can_run_decode_cuda_graph = False
+        return None
 
     def _decode_idle_result(
         self,
@@ -1166,15 +1241,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
+        if self._compact_attention_dp:
+            global_num_reqs = self._compact_dp_verify_num_reqs(batch)
+        layout = None
+        if not self._compact_attention_dp or global_num_reqs is not None:
+            layout = self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids

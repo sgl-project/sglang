@@ -88,6 +88,7 @@ class DSparkVerifyPlanner:
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
         online_confidence: bool = False,
+        use_dp_tier_hints: bool = True,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -176,7 +177,8 @@ class DSparkVerifyPlanner:
             )
             self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
-                self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+                use_dp_tier_hints
+                and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1

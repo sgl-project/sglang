@@ -31,7 +31,8 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
 class BuildRaggedVerifyWindow:
     @classmethod
     def execute(cls, *args, **kwargs) -> RaggedVerifyWindow:
-        if inputs_on_cuda(*args, **kwargs):
+        # transfer_to_npu can make NPU tensors report is_cuda=True.
+        if not _is_npu and inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 

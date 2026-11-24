@@ -7,7 +7,11 @@ import torch
 import torch_npu
 from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_glm_moe_dsa,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -69,6 +73,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 import logging
 
@@ -353,6 +358,13 @@ class AscendAttnBackend(AttentionBackend):
             speculative_step_id + 1, device="npu"
         )
         self.page_size = model_runner.page_size
+        self._dspark_dsa_ragged_verify = (
+            is_glm_moe_dsa(model_runner.model_config.hf_config)
+            and model_runner.spec_algorithm.is_dspark()
+            and not model_runner.is_draft_worker
+        )
+        if self._dspark_dsa_ragged_verify:
+            self.supports_ragged_verify_graph = True
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -636,7 +648,21 @@ class AscendAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        layout = self._get_ragged_verify_layout(forward_batch)
         bs = forward_batch.batch_size
+        if layout is not None:
+            key = (bs, layout.graph_num_tokens)
+            if in_capture and key not in self.graph_metadata:
+                self.graph_metadata[key] = self._allocate_padded_verify_metadata(
+                    bs, layout.graph_num_tokens
+                )
+            metadata = self.graph_metadata[key]
+            self._update_ragged_verify_metadata(
+                metadata, layout, forward_batch.seq_lens, forward_batch.req_pool_indices
+            )
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
         if in_capture:
             self._init_cuda_graph_metadata(
                 bs,
@@ -664,8 +690,86 @@ class AscendAttnBackend(AttentionBackend):
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
 
+    def _get_ragged_verify_layout(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[RaggedVerifyLayout]:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self._dspark_dsa_ragged_verify
+        ):
+            return getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+        return None
+
+    def _allocate_padded_verify_metadata(
+        self, bs: int, num_tokens: int
+    ) -> ForwardMetadata:
+        # The last row covers padding queries. Keep a row even when capture's
+        # synthetic requests use the entire token tier.
+        rows = bs + 1
+        table_width = (
+            max(self.req_to_token.shape[1], num_tokens) + self.page_size - 1
+        ) // self.page_size
+        q_ends = torch.empty(rows, dtype=torch.int32, device=self.device)
+        kv_lens = torch.empty_like(q_ends)
+        return ForwardMetadata(
+            seq_lens=kv_lens,
+            actual_seq_lengths_kv=kv_lens,
+            actual_seq_lengths_q=q_ends,
+            block_tables=torch.empty(
+                (rows, table_width), dtype=torch.int32, device=self.device
+            ),
+        )
+
+    def _update_ragged_verify_metadata(
+        self,
+        metadata: ForwardMetadata,
+        layout: RaggedVerifyLayout,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        bs = layout.bs
+        if not 0 < bs <= min(seq_lens.numel(), req_pool_indices.numel()):
+            raise ValueError("NPU ragged verify requires metadata for every request")
+        verify_lens = layout.verify_lens
+        q_ends = layout.qo_indptr_device[1:]
+        # Device lengths hold the committed prefix even when the CPU mirror
+        # has already been advanced for a speculative step.
+        kv_lens = seq_lens[:bs].int() + verify_lens
+        # Both graph replay and eager fallback can retain token-tier padding.
+        # Assign it to a separate row mapped to the reserved KV page 0.
+        metadata.actual_seq_lengths_q[:bs].copy_(q_ends)
+        metadata.actual_seq_lengths_q[bs:-1].copy_(q_ends[-1])
+        metadata.actual_seq_lengths_q[-1].fill_(layout.graph_num_tokens)
+        metadata.seq_lens.zero_()
+        metadata.seq_lens[:bs].copy_(torch.where(verify_lens > 0, kv_lens, 0))
+        metadata.seq_lens[-1].copy_((layout.graph_num_tokens - q_ends[-1]).clamp(min=1))
+        pages = (
+            self.req_to_token[req_pool_indices[:bs], :: self.page_size]
+            // self.page_size
+        )
+        page_starts = torch.arange(pages.shape[1], device=pages.device) * self.page_size
+        metadata.block_tables.zero_()
+        metadata.block_tables[:bs, : pages.shape[1]].copy_(
+            torch.where(page_starts < metadata.seq_lens[:bs, None], pages, 0)
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        layout = self._get_ragged_verify_layout(forward_batch)
+        if layout is not None:
+            # A selected graph tier survives a later graph-admission failure.
+            # Use the same sink-row contract in eager, with or without DP.
+            self.forward_metadata = self._allocate_padded_verify_metadata(
+                forward_batch.batch_size, layout.graph_num_tokens
+            )
+            self._update_ragged_verify_metadata(
+                self.forward_metadata,
+                layout,
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+            )
+            self.graph_mode = False
+            return
         self.forward_metadata = self._create_forward_metadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()
