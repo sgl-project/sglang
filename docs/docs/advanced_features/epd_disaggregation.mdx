@@ -29,9 +29,23 @@ On the Rust language workers, use `--language-only` with
 uses the encoder identified by the descriptor, so you can omit `--encoder-urls`.
 Use the same `--encoder-transfer-backend nixl` or
 `--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. NIXL requires
-the UCX plugin on both ends. Send handoffs to a private language-worker listener
-from a trusted router. The selected encoder receives NIXL access to the registered
-receive region.
+the UCX plugin on both ends.
+
+Mount a file containing the same 32 random bytes on E, P/PD and D. Set
+`SGLANG_ENCODER_HANDOFF_KEY_FILE` to its path on each worker. Generate it once
+per deployment with `(umask 077 && openssl rand 32 > encoder-handoff.key)`.
+On each E, set `SGLANG_ENCODER_HANDOFF_ENDPOINT=grpc://host:port` to the
+address P/PD can reach when the bind address is a wildcard or differs from
+that address. E authenticates its endpoint, process instance, transfer ID and
+media layout with HMAC-SHA256. P/PD and D verify the receipt at ingress before
+using its metadata or contacting E. Keep the encoder and language listeners
+private. Restart the workers with a new shared key to rotate it.
+
+The router owns the receipt until P/PD claims it. It can call `Release` on the
+issuing E after cancellation or a definitive routing rejection. E keeps unclaimed
+receipts in its native request registry for `SGLANG_ENCODER_SEND_TIMEOUT`
+(default 180 seconds) to recover from a lost response or a router crash.
+P/PD owns a claimed transfer and its receive buffer. D only uses the layout.
 
 With NIXL, rank 0 of P/PD registers a host-memory pool at startup. Set
 `SGLANG_ENCODER_NIXL_POOL_SIZE_MB` to size it (default 256 MiB). Each transfer
@@ -40,6 +54,12 @@ view is released. Each sender thread on E caches the peer registration across
 writes to the same pool. P/PD registers individual buffers when the pool is
 disabled, when startup registration fails, or when the embedding does not fit
 an available slice. Set the size to `0` to disable pooling.
+
+If a NIXL write's outcome is unknown, P/PD tries to fence it with the issuing E
+for up to `SGLANG_ENCODER_GRPC_TIMEOUT_SECS` (default 60 seconds). Without a
+matching acknowledgement or a native write-completion notification, the memory
+stays registered in quarantine. Quarantine permits up to one additional
+destination per configured live slot before applying backpressure.
 
 | Model family | Image | Video | Separate audio input |
 |---|---|---|---|
@@ -56,6 +76,11 @@ Use PP=DP=1. Each encoder replica can use tensor parallelism within one node.
 All media in a request go to one replica. On P/PD, TP rank 0 receives the
 embeddings and broadcasts them to its peers. In E/P/D, D reconstructs the token
 positions from the descriptor. Configure P→D KV transfer independently.
+
+A registered Python multimodal processor declares its `staged_layouts` by
+model type. Its `StagedMediaLayout` supplies the media capabilities, embedding
+dimensions, and grid or timing rules used on E and P/PD. A processor with the
+same metadata requirements can reuse the existing wire format.
 
 Qwen-family image and video handoffs use v1 and v2 respectively. Other model
 families use v3 to carry the native model type, tensor width and per-item row

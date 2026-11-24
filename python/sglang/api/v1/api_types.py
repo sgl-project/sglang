@@ -4280,6 +4280,7 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     native_model_type: str = ""
     staged_audio_model_type: str = ""
     supports_staged_images: Optional[bool] = None
+    encoder_handoff_key_id: Optional[str] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -12150,6 +12151,8 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["staged_audio_model_type"] = _expect_str(x, expected="a string")
         elif key == "supports_staged_images":
             kw["supports_staged_images"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "encoder_handoff_key_id":
+            kw["encoder_handoff_key_id"] = None if x is None else _expect_str(x, expected="a string")
     return GetServerInfoResponse(**kw)
 
 
@@ -12180,6 +12183,8 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["staged_audio_model_type"] = v.staged_audio_model_type
     if v.supports_staged_images is not None:
         d["supports_staged_images"] = v.supports_staged_images
+    if v.encoder_handoff_key_id is not None:
+        d["encoder_handoff_key_id"] = v.encoder_handoff_key_id
     return d
 
 

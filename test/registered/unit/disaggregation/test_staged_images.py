@@ -2,7 +2,9 @@
 
 import asyncio
 import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import grpc
@@ -11,14 +13,20 @@ import zmq.asyncio
 
 from sglang.encoder.v1 import encoder_pb2 as pb
 from sglang.encoder.v1 import encoder_pb2_grpc as rpc
-from sglang.srt.disaggregation.encoder.staged import StagedImageService
+from sglang.srt.disaggregation.encoder.handoff_auth import (
+    EncoderHandoffSigner,
+    require_handoff_key,
+)
+from sglang.srt.disaggregation.encoder.server import meta_registry
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.staged_encoder import StagedEncoderFixture
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
-    def __init__(self, sockets):
+class FakeEncoder(StagedEncoderFixture):
+    def __init__(self, sockets, signer):
         self.encoded = []
         self.parts = {}
         self.released = []
@@ -28,17 +36,15 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
         self.encoding = asyncio.Event()
         self.release_done = asyncio.Event()
         super().__init__(
-            encode=self.encode_images,
-            send=self.send_images,
-            release=self.release_images,
-            make_part_id=lambda rid, idx: f"{rid}_local_part_{idx}",
-            info=pb.GetEncoderInfoResponse(model_path="fake"),
+            pb.GetEncoderInfoResponse(model_path="fake"),
+            backend="zmq_to_scheduler",
             stage_timeout=3,
             ttl=5,
             capacity=2,
+            signer=signer,
         )
 
-    async def encode_images(self, rid, images, videos, audios):
+    async def _stage_media(self, rid, images, videos, audios):
         self.encoded.append((rid, images))
         self.parts[rid] = [image.encode() for image in images]
         self.encoding.set()
@@ -55,12 +61,17 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
             [],
         )
 
-    async def release_images(self, rid):
+    async def release(self, state):
+        rid = state.req_id
         self.parts.pop(rid, None)
         self.released.append(rid)
         self.release_done.set()
 
-    async def send_images(self, rid, url):
+    async def send(self, state, destination):
+        rid, url = state.req_id, destination.endpoint
+        if destination.nixl_target:
+            await self.write(rid, destination.nixl_target)
+            return
         if url == "fail":
             raise OSError("receiver unavailable")
         if url == "wait":
@@ -72,6 +83,36 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
             await socket.send_multipart([rid.encode(), *self.parts[rid]])
 
 
+class TestHandoffKeyConfig(unittest.TestCase):
+    def test_external_workers_require_a_key_and_encoders_sign_their_configured_endpoint(
+        self,
+    ):
+        with envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(""):
+            self.assertIsNone(EncoderHandoffSigner.from_config())
+            with self.assertRaisesRegex(ValueError, "SGLANG_ENCODER_HANDOFF_KEY_FILE"):
+                require_handoff_key()
+
+        with tempfile.TemporaryDirectory() as directory:
+            key_file = Path(directory) / "key"
+            with envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(str(key_file)):
+                for size in (0, 31, 33):
+                    key_file.write_bytes(bytes(size))
+                    with self.assertRaisesRegex(ValueError, "32 bytes"):
+                        require_handoff_key()
+                key_file.write_bytes(bytes(32))
+                with envs.SGLANG_ENCODER_HANDOFF_ENDPOINT.override(
+                    "grpc://0.0.0.0:4200"
+                ):
+                    with self.assertRaisesRegex(ValueError, "reachable"):
+                        EncoderHandoffSigner.from_config()
+                with envs.SGLANG_ENCODER_HANDOFF_ENDPOINT.override(
+                    "grpc://encoder.internal:4200"
+                ):
+                    signer = EncoderHandoffSigner.from_config()
+                self.assertEqual(signer.peer, "grpc://encoder.internal:4200")
+                self.assertEqual(signer.key_id, hashlib.sha256(bytes(32)).hexdigest())
+
+
 class TestStagedImages(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.sockets = zmq.asyncio.Context()
@@ -79,11 +120,12 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         self.backends = []
         self.peers = []
         for _ in range(2):
-            backend = FakeEncoder(self.sockets)
-            self.backends.append(backend)
             server = grpc.aio.server()
-            rpc.add_SglangEncoderServicer_to_server(backend, server)
             port = server.add_insecure_port("127.0.0.1:0")
+            signer = EncoderHandoffSigner(f"grpc://127.0.0.1:{port}", b"k" * 32)
+            backend = FakeEncoder(self.sockets, signer)
+            self.backends.append(backend)
+            rpc.add_SglangEncoderServicer_to_server(backend, server)
             await server.start()
             self.addAsyncCleanup(server.stop, 0)
             channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
@@ -96,6 +138,13 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         )
         info = await self.peers[replica].GetEncoderInfo(pb.GetEncoderInfoRequest())
         self.assertEqual(reply.instance_id, info.instance_id)
+        signer = self.backends[replica]._handoff_signer
+        self.assertEqual(
+            (info.handoff_peer, info.handoff_key_id), (signer.peer, signer.key_id)
+        )
+        self.assertEqual(
+            reply.handoff_mac, signer.sign(reply.transfer, info.instance_id)
+        )
         return reply.transfer
 
     async def error(self, code, awaitable):
@@ -149,11 +198,13 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         deliver = pb.DeliverRequest(transfer=transfer, nixl_target=b"registered buffer")
         await self.error(grpc.StatusCode.FAILED_PRECONDITION, peer.Describe(describe))
         await self.error(grpc.StatusCode.INVALID_ARGUMENT, peer.Deliver(deliver))
-        backend._send = None
-        backend._write = AsyncMock()
+        backend.encoder.transfer_backend = "nixl"
+        backend.write = AsyncMock()
         descriptor = pb.DescribeResponse(shape=[2, 2048], dtype="bfloat16")
-        backend._describe = lambda part_id: descriptor
-        self.assertEqual(descriptor, await peer.Describe(describe))
+        backend._describe_part = lambda part_id: descriptor
+        description = await peer.Describe(describe)
+        self.assertEqual(description.instance_id, backend._info.instance_id)
+        self.assertEqual(description, descriptor)
         invalid = pb.DescribeRequest(transfer=transfer)
         invalid.transfer.images[0].identity = "another image"
         await self.error(grpc.StatusCode.INVALID_ARGUMENT, peer.Describe(invalid))
@@ -161,7 +212,7 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         await self.error(grpc.StatusCode.INVALID_ARGUMENT, peer.Deliver(deliver))
         deliver.ClearField("receive_url")
         await peer.Deliver(deliver)
-        backend._write.assert_awaited_once_with(transfer.part_id, b"registered buffer")
+        backend.write.assert_awaited_once_with(transfer.part_id, b"registered buffer")
         await self.error(grpc.StatusCode.NOT_FOUND, peer.Deliver(deliver))
         await self.error(grpc.StatusCode.NOT_FOUND, peer.Describe(describe))
 
@@ -178,7 +229,8 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
                 draining.set()
                 await complete.wait()
 
-        backend._send, backend._write = None, write
+        backend.encoder.transfer_backend = "nixl"
+        backend.write = write
         transfer = await self.stage(0)
         deliver = peer.Deliver(pb.DeliverRequest(transfer=transfer, nixl_target=b"dst"))
         await asyncio.wait_for(posted.wait(), 2)
@@ -191,7 +243,7 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         complete.set()
         await asyncio.wait_for(release, 2)
         await asyncio.wait_for(backend.release_done.wait(), 2)
-        self.assertFalse(backend._writing)
+        self.assertFalse(backend.encoder.req_states)
         self.assertEqual(backend.released, [transfer.part_id])
 
     async def test_repeated_cancel_cannot_detach_an_active_write(self):
@@ -212,7 +264,8 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
                     await done.wait()
                 raise
 
-        backend._write = write
+        backend.encoder.transfer_backend = "nixl"
+        backend.write = write
         delivery = asyncio.create_task(
             backend.Deliver(
                 pb.DeliverRequest(transfer=transfer, nixl_target=b"dst"), None
@@ -241,9 +294,10 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         first = await self.stage(0)
         await self.error(grpc.StatusCode.RESOURCE_EXHAUSTED, self.stage(0))
         for _ in range(2):
-            await self.peers[0].Release(
+            reply = await self.peers[0].Release(
                 pb.ReleaseRequest(transfer_id=first.transfer_id)
             )
+            self.assertEqual(reply.instance_id, backend._info.instance_id)
         backend.release_done.clear()
         backend._ttl = 0.02
         transfer = await self.stage(0)
@@ -256,6 +310,20 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
                 pb.DeliverRequest(transfer=transfer, receive_url="late")
             ),
         )
+
+    async def test_native_request_release_retires_staged_capacity_and_descriptor(self):
+        backend, peer = self.backends[0], self.peers[0]
+        backend._capacity = 1
+        first = await self.stage(0)
+        await backend.encoder.release_request(first.part_id)
+        self.assertNotIn(first.part_id, meta_registry._pending)
+        self.assertEqual(backend.released, [first.part_id])
+        await self.error(
+            grpc.StatusCode.NOT_FOUND, peer.Describe(pb.DescribeRequest(transfer=first))
+        )
+        second = await self.stage(0)
+        await peer.Release(pb.ReleaseRequest(transfer_id=second.transfer_id))
+        self.assertEqual(backend.released, [first.part_id, second.part_id])
 
     async def test_audio_must_be_advertised_before_staging_mixed_requests(self):
         await self.error(
@@ -319,12 +387,14 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         transfer = await self.stage(0)
         started, resume = asyncio.Event(), asyncio.Event()
 
-        async def delayed_release(rid):
+        release_part = backend.release
+
+        async def delayed_release(state):
             started.set()
             await resume.wait()
-            await backend.release_images(rid)
+            await release_part(state)
 
-        backend._release = delayed_release
+        backend.release = delayed_release
         release = self.peers[0].Release(
             pb.ReleaseRequest(transfer_id=transfer.transfer_id)
         )
@@ -333,7 +403,7 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         resume.set()
         await asyncio.wait_for(backend.release_done.wait(), 2)
         self.assertEqual(backend.released, [transfer.part_id])
-        self.assertEqual(backend._active, 0)
+        self.assertFalse(backend.encoder.req_states)
 
     async def test_claimed_send_has_deadline_without_client_timeout(self):
         backend = self.backends[0]
@@ -351,7 +421,7 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
     async def test_expired_claim_before_reaper_callback(self):
         backend = self.backends[0]
         transfer = await self.stage(0)
-        deadline = backend._leases[transfer.transfer_id].expiry.when()
+        deadline = meta_registry._pending[transfer.part_id].deadline
         ctx = AsyncMock()
         ctx.abort.side_effect = RuntimeError("expired")
         loop = asyncio.get_running_loop()

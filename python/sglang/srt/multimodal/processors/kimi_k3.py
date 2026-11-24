@@ -56,6 +56,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
     KimiLoadedImage,
+    KimiStagedLayout,
     kimi_image_identity,
     unwrap_kimi_images,
 )
@@ -497,6 +498,11 @@ class KimiK3ImageProcessor(
     MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
+    staged_layouts = {
+        "kimi_k3": KimiStagedLayout(original_image_sizes=True, use_routing_hash=False),
+        "kimi_k31": KimiStagedLayout(original_image_sizes=True),
+    }
+
     models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0

@@ -110,6 +110,11 @@ class _RegisteredMemory:
         self.agent.deregister_memory(self.registration)
 
 
+# Cancelling a scheduler or dropping its receiver cannot revoke a submitted WRITE.
+# Hold abandoned registrations through receiver teardown until a real fence.
+_unfenced_targets = set()
+
+
 class NixlTarget:
     """A transfer destination. Tensor views can outlive its write fence."""
 
@@ -118,6 +123,7 @@ class NixlTarget:
         self._notification = uuid4().bytes
         self._completed = False
         self._abandoned = False
+        self._quarantined = False
         self._one_shot = None
         pool = receiver._pool
         slot = pool.try_alloc(size) if pool is not None else None
@@ -154,6 +160,9 @@ class NixlTarget:
                 self._one_shot.close()
                 self._one_shot = None
             self._receiver._targets.pop(self._notification, None)
+            if self._quarantined:
+                self._receiver._quarantined -= 1
+            _unfenced_targets.discard(self)
             # A pooled range stays occupied if a consumer retains any alias.
             self.tensor = None
 
@@ -161,7 +170,14 @@ class NixlTarget:
         """Retain an unfenced destination under the receiver's admission limit."""
         if self.tensor is not None:
             self._abandoned = True
+            _unfenced_targets.add(self)
             self._receiver._reap()
+
+    def quarantine(self):
+        """Stop RPC recovery. Only a late native WRITE notification can free this memory."""
+        if self.tensor is not None and not self._quarantined:
+            self._quarantined = True
+            self._receiver._quarantined += 1
 
     def reaped(self):
         """Poll completion notifications while a Release fence is unavailable."""
@@ -185,6 +201,7 @@ class NixlReceiver:
             raise ValueError("NIXL receiver pool size must be a nonnegative byte count")
         self._agent = _agent()
         self._capacity = capacity
+        self._quarantined = 0
         self._targets = {}
         self._pool = None
         if pool_bytes:
@@ -221,7 +238,11 @@ class NixlReceiver:
         if type(size) is not int or size <= 0:
             raise ValueError("NIXL destination requires a positive byte count")
         self._reap()
-        if len(self._targets) >= self._capacity:
+        # A lost encoder should not take the last serving slot. Reserve at most
+        # one extra quarantine slot per configured live slot, then backpressure.
+        if len(self._targets) >= self._capacity + min(
+            self._quarantined, self._capacity
+        ):
             raise RuntimeError("NIXL receiver has no free transfer slots")
         target = NixlTarget(self, size)
         self._targets[target._notification] = target

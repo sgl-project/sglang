@@ -18,6 +18,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout, VideoTiming
 from sglang.srt.utils import print_warning_once
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -506,6 +507,11 @@ def _passthrough_video_metadata(video, video_config):
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
+    staged_layouts = dict.fromkeys(
+        ("glm4v", "glm4v_moe", "glm5_next"),
+        StagedMediaLayout(video=VideoTiming.TIMESTAMPS),
+    )
+
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [

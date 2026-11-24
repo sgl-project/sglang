@@ -352,11 +352,11 @@ def handle_encoder_disaggregation(server_args: Any):
     # Validate model type for encoder disaggregation
     hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
+    external_handoff = (cfg.encoder_only and cfg.grpc_mode) or (
+        cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+    )
     if cfg.encoder_transfer_backend == "nixl":
-        if not (
-            (cfg.encoder_only and cfg.grpc_mode)
-            or (cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get())
-        ):
+        if not external_handoff:
             raise ValueError(
                 "--encoder-transfer-backend nixl requires --encoder-only --grpc-mode "
                 "or --language-only with SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
@@ -369,19 +369,6 @@ def handle_encoder_disaggregation(server_args: Any):
             raise ValueError(
                 "Staged NIXL embeddings require PP=DP=1 and a single-node encoder"
             )
-        from sglang.srt.disaggregation.encoder.native_handoff import (
-            NATIVE_IMAGE_MODEL_TYPES,
-            STAGED_AUDIO_MODEL_TYPES,
-            STAGED_VIDEO_MODEL_TYPES,
-        )
-
-        if (
-            hf_config.model_type
-            not in STAGED_VIDEO_MODEL_TYPES
-            | NATIVE_IMAGE_MODEL_TYPES
-            | STAGED_AUDIO_MODEL_TYPES
-        ):
-            raise ValueError(f"Staged NIXL embeddings do not support {model_arch}")
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(
             server_args,
@@ -419,17 +406,16 @@ def handle_encoder_disaggregation(server_args: Any):
         "MuseSparkForConditionalGeneration",
         "Inkling2ForConditionalGeneration",
     ]
-    if cfg.encoder_transfer_backend in ("nixl", "zmq_to_scheduler") and (
-        (cfg.encoder_only and cfg.grpc_mode)
-        or (cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get())
+    if external_handoff and cfg.encoder_transfer_backend in (
+        "nixl",
+        "zmq_to_scheduler",
     ):
-        supported_architectures.extend(
-            (
-                "Glm4vForConditionalGeneration",
-                "Glm4vMoeForConditionalGeneration",
-                "Qwen3ASRForConditionalGeneration",
-            )
-        )
+        from sglang.srt.multimodal.staged_layout import staged_layout_for
+
+        if staged_layout_for(hf_config.model_type) is not None:
+            supported_architectures.append(model_arch)
+        elif cfg.encoder_transfer_backend == "nixl":
+            raise ValueError(f"Staged NIXL embeddings do not support {model_arch}")
     if (
         cfg.encoder_only or cfg.language_only
     ) and model_arch not in supported_architectures:

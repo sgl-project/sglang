@@ -24517,6 +24517,9 @@ impl ::serde::Serialize for GetServerInfoResponse {
         if let Some(v) = &self.supports_staged_images {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "supports_staged_images", v)?;
         }
+        if let Some(v) = &self.encoder_handoff_key_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "encoder_handoff_key_id", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24554,6 +24557,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_native_model_type = None;
                 let mut f_staged_audio_model_type = None;
                 let mut f_supports_staged_images = None;
+                let mut f_encoder_handoff_key_id = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24721,6 +24725,15 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             }
                             f_supports_staged_images = Some(map.next_value::<Option<bool>>()?);
                         }
+                        "encoder_handoff_key_id" => {
+                            if f_encoder_handoff_key_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "encoder_handoff_key_id",
+                                ));
+                            }
+                            f_encoder_handoff_key_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24749,6 +24762,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     native_model_type: f_native_model_type.unwrap_or_default(),
                     staged_audio_model_type: f_staged_audio_model_type.unwrap_or_default(),
                     supports_staged_images: f_supports_staged_images.flatten(),
+                    encoder_handoff_key_id: f_encoder_handoff_key_id.flatten(),
                 })
             }
         }

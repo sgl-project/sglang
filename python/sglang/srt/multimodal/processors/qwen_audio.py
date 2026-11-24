@@ -10,11 +10,19 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 
 logger = logging.getLogger(__name__)
 
 
+class _QwenAudioStagedLayout(StagedMediaLayout):
+    def audio_rows(self, lengths):
+        return (lengths + 1) // 4
+
+
 class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
+    staged_layouts = {"qwen2_audio": _QwenAudioStagedLayout(images=False, audio=True)}
+
     models = [Qwen2AudioForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):

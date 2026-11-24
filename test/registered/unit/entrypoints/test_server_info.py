@@ -21,6 +21,7 @@ Current coverage:
 """
 
 import asyncio
+import hashlib
 import json
 import unittest
 from types import SimpleNamespace
@@ -176,7 +177,13 @@ class TestServerInfoTransportParity(CustomTestCase):
             max_req_input_len=1024,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
-        with envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True):
+        with (
+            envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True),
+            patch(
+                "sglang.srt.disaggregation.encoder.handoff_auth.require_handoff_key",
+                return_value=bytes(32),
+            ),
+        ):
             for name, supported in (
                 ("qwen3_vl", True),
                 ("qwen3_5", True),
@@ -188,6 +195,10 @@ class TestServerInfoTransportParity(CustomTestCase):
                     scheduler.model_config.hf_config.model_type = name
                     info = json.loads(rust_config._launch_server_info(scheduler))
                     self.assertTrue(info["accepts_encoder_handoff"])
+                    self.assertEqual(
+                        info["encoder_handoff_key_id"],
+                        hashlib.sha256(bytes(32)).hexdigest(),
+                    )
                     self.assertEqual(info["supports_staged_video"], supported)
                     self.assertEqual(
                         info.get("native_model_type"),

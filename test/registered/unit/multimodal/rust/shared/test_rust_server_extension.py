@@ -1294,6 +1294,10 @@ class TestRustServerExtension(CustomTestCase):
         )
         with (
             server_module.envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True),
+            patch(
+                "sglang.srt.disaggregation.encoder.handoff_auth.require_handoff_key",
+                return_value=bytes(32),
+            ),
             launch_context(RustServer, disagg=disagg),
             patch.object(RustServer, "_load_extension", return_value=extension),
             patch.object(RustServer, "_resolve_multimodal") as resolve_mm,

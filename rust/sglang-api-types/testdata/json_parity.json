@@ -575,9 +575,10 @@
         "supports_staged_video": false,
         "native_model_type": "",
         "supports_staged_images": false,
-        "staged_audio_model_type": "qwen2_audio"
+        "staged_audio_model_type": "qwen2_audio",
+        "encoder_handoff_key_id": "abababababababababababababababababababababababababababababababab"
       },
-      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":1,\"version\":\"0.5.0\",\"host\":\"127.0.0.1\",\"port\":30000,\"incremental_streaming_output\":false,\"disaggregation_mode\":\"null\",\"allow_auto_truncate\":false,\"skip_tokenizer_init\":false,\"num_reserved_tokens\":0,\"instance_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"accepts_encoder_handoff\":true,\"supports_staged_video\":false,\"native_model_type\":\"\",\"staged_audio_model_type\":\"qwen2_audio\",\"supports_staged_images\":false}"
+      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":1,\"version\":\"0.5.0\",\"host\":\"127.0.0.1\",\"port\":30000,\"incremental_streaming_output\":false,\"disaggregation_mode\":\"null\",\"allow_auto_truncate\":false,\"skip_tokenizer_init\":false,\"num_reserved_tokens\":0,\"instance_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"accepts_encoder_handoff\":true,\"supports_staged_video\":false,\"native_model_type\":\"\",\"staged_audio_model_type\":\"qwen2_audio\",\"supports_staged_images\":false,\"encoder_handoff_key_id\":\"abababababababababababababababababababababababababababababababab\"}"
     },
     {
       "type": "SamplingParams",

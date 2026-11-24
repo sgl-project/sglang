@@ -2054,6 +2054,8 @@ class Envs:
     # ===================================================================
     # Accept staged descriptors from a trusted orchestrator on a private listener.
     SGLANG_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
+    SGLANG_ENCODER_HANDOFF_KEY_FILE = EnvStr(None)
+    SGLANG_ENCODER_HANDOFF_ENDPOINT = EnvStr(None)
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")

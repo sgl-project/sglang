@@ -254,6 +254,7 @@ class RustServer:
         # The launching process, which `_fail_startup` signals; looked up now,
         # so a failure after it died cannot signal whoever adopted this one.
         self._launcher = psutil.Process().parent()
+        self._handoff_key = None
         self._external_media_markers = None
         self._external_media_limits = {}
 
@@ -489,7 +490,12 @@ class RustServer:
 
         external_handoff = envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
         if external_handoff:
+            from sglang.srt.disaggregation.encoder.handoff_auth import (
+                require_handoff_key,
+            )
+
             cls._check_external_encoder_handoff(scheduler)
+            handoff_key = require_handoff_key()
         rust_mm = scheduler.model_config.is_multimodal and not external_handoff
 
         _, server_cores = cls._partition_cores(
@@ -541,6 +547,7 @@ class RustServer:
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if external_handoff:
+            instance._handoff_key = handoff_key
             instance._external_media_limits = get_mm().limit_mm_data_per_request or {}
 
         if rust_mm:
@@ -603,11 +610,7 @@ class RustServer:
 
     @staticmethod
     def _check_external_encoder_handoff(scheduler: Scheduler) -> None:
-        from sglang.srt.disaggregation.encoder.native_handoff import (
-            NATIVE_IMAGE_MODEL_TYPES,
-            STAGED_AUDIO_MODEL_TYPES,
-            STAGED_VIDEO_MODEL_TYPES,
-        )
+        from sglang.srt.multimodal.staged_layout import staged_layout_for
 
         # The effective backend and DP size can be resolved after argument validation.
         backend = get_disagg().encoder_transfer_backend
@@ -619,11 +622,7 @@ class RustServer:
         if get_parallel().num_dp_ranks != 1:
             raise RuntimeError("External encoder handoff requires one DP rank.")
         model_type = scheduler.model_config.hf_config.model_type
-        if model_type not in (
-            STAGED_VIDEO_MODEL_TYPES
-            | NATIVE_IMAGE_MODEL_TYPES
-            | STAGED_AUDIO_MODEL_TYPES
-        ):
+        if staged_layout_for(model_type) is None:
             raise RuntimeError(f"No staged encoder layout for {model_type!r}")
 
     def bind_external_encoder_processor(self, processor):
@@ -1016,15 +1015,18 @@ class RustServer:
         markers = self._external_media_markers
         if handoff is not None:
             from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
+            from sglang.srt.disaggregation.encoder.handoff_auth import verify_handoff
 
-            if markers is None:
+            if markers is None or self._handoff_key is None:
                 raise ValueError(
                     "encoder_handoff requires SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
                 )
-            obj.encoder_handoff = EncoderHandoff.parse(
+            receipt = EncoderHandoff.parse(
                 memoryview(handoff),
                 *markers.counts(obj.input_ids),
             )
+            verify_handoff(receipt, self._handoff_key)
+            obj.encoder_handoff = receipt
             for modality, count in (
                 ("image", obj.encoder_handoff.image_count),
                 ("video", len(obj.encoder_handoff.videos)),

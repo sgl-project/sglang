@@ -19,13 +19,14 @@ from sglang.encoder.v1 import encoder_pb2 as pb
 from sglang.encoder.v1 import encoder_pb2_grpc as rpc
 from sglang.srt.disaggregation.encoder import receiver
 from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
-from sglang.srt.disaggregation.encoder.staged import StagedImageService
+from sglang.srt.disaggregation.encoder.handoff_auth import EncoderHandoffSigner
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.rust_server.server import MissingEncoderHandoff, RustServer
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.staged_encoder import StagedEncoderFixture
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -66,9 +67,13 @@ def request(rid):
     )
 
 
+_HANDOFF_TEST_KEY = bytes(range(32))
+
+
 def bridge(external=True):
     rust = RustServer(Mock(), http_port=0)
     if external:
+        rust._handoff_key = _HANDOFF_TEST_KEY
         rust.bind_external_encoder_processor(processor())
     return rust
 
@@ -136,17 +141,22 @@ async def staged_encoder(
     async def release(part_id):
         held.remove(part_id)
 
-    class Service(StagedImageService, rpc.SglangEncoderServicer):
-        pass
+    class Service(StagedEncoderFixture):
+        _stage_media = staticmethod(encode)
+        _describe_part = staticmethod(describe)
+
+        async def send(self, state, destination):
+            if destination.nixl_target:
+                await write(state.req_id, destination.nixl_target)
+            else:
+                await send(state.req_id, destination.endpoint)
+
+        async def release(self, state):
+            await release(state.req_id)
 
     service = Service(
-        encode=encode,
-        send=send if writer is None else None,
-        describe=describe if writer is not None else None,
-        write=write if writer is not None else None,
-        release=release,
-        make_part_id=receiver.create_part_req_id,
-        info=pb.GetEncoderInfoResponse(supports_staged_video=True),
+        pb.GetEncoderInfoResponse(supports_staged_video=True),
+        backend="zmq_to_scheduler" if writer is None else "nixl",
         ttl=10,
         stage_timeout=5,
         capacity=1,
@@ -154,6 +164,9 @@ async def staged_encoder(
     server = grpc.aio.server()
     rpc.add_SglangEncoderServicer_to_server(service, server)
     port = server.add_insecure_port("127.0.0.1:0")
+    service._handoff_signer = EncoderHandoffSigner(
+        f"grpc://127.0.0.1:{port}", _HANDOFF_TEST_KEY
+    )
     await server.start()
     try:
         async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
@@ -170,13 +183,79 @@ async def staged_encoder(
             preserving_proto_field_name=True,
             always_print_fields_with_no_presence=True,
         )
-        metadata["peer"] = f"grpc://127.0.0.1:{port}"
+        metadata.update(
+            peer=service._handoff_signer.peer,
+            instance_id=response.instance_id.hex(),
+            signature=response.handoff_mac,
+        )
         yield metadata, calls, held
     finally:
         await server.stop(0)
 
 
 class TestStagedImageReceiver(unittest.TestCase):
+    def test_public_handoff_authenticates_peer_instance_and_layout_before_admission(
+        self,
+    ):
+        peer = "grpc://encoder.internal:5000"
+        instance = bytes(range(16))
+        transfer_id = "62" * 16
+        transfer = pb.StagedImageTransfer(
+            version=1,
+            request_id="router-request",
+            transfer_id=transfer_id,
+            part_id=transfer_id + "_local_part_0",
+            num_parts=1,
+            image_count=1,
+            images=[pb.ImageLayout(t=1, h=2, w=2, identity="41" * 32)],
+        )
+        descriptor = MessageToDict(
+            transfer,
+            preserving_proto_field_name=True,
+            always_print_fields_with_no_presence=True,
+        )
+        signer = EncoderHandoffSigner(peer, _HANDOFF_TEST_KEY)
+        descriptor.update(
+            peer=peer,
+            instance_id=instance.hex(),
+            signature=signer.sign(transfer, instance),
+        )
+        rust = bridge()
+
+        def admit(body):
+            obj = request("native")
+            rust._attach_buffers(
+                obj,
+                {
+                    "input_ids": array("q", [7, 8, 9]),
+                    "epd.handoff": msgspec.json.encode(body),
+                },
+            )
+            return obj
+
+        self.assertEqual(admit(descriptor).encoder_handoff.peer, peer)
+        forged = [
+            descriptor | {"peer": "grpc://untrusted.internal:8888"},
+            descriptor | {"instance_id": "ff" * 16},
+            descriptor | {"images": [descriptor["images"][0] | {"w": 4}]},
+            descriptor | {"request_id": "another"},
+            {k: v for k, v in descriptor.items() if k != "signature"},
+            descriptor
+            | {
+                "signature": EncoderHandoffSigner(peer, bytes(32)).sign(
+                    transfer, instance
+                )
+            },
+        ]
+        with patch("grpc.aio.insecure_channel") as dial:
+            for body in forged:
+                with (
+                    self.subTest(body=body),
+                    self.assertRaisesRegex(ValueError, "signature"),
+                ):
+                    admit(body)
+            dial.assert_not_called()
+
     def test_external_ingress_rejects_missing_handoff_and_bypasses_text(self):
         with self.assertRaisesRegex(ValueError, "requires the private"):
             GenerateReqInput(
@@ -214,12 +293,15 @@ class TestStagedImageReceiver(unittest.TestCase):
         kimi = SimpleNamespace(mm_tokens=SimpleNamespace(image_token_id=163605))
         rust.bind_external_encoder_processor(kimi)
         self.assertEqual(rust._external_media_markers.counts([163605]), (1, 0, 0))
-        muse = SimpleNamespace(
-            patch_id=30,
-            video_id=31,
-            image_placeholder_ids=[7, 8],
-            video_placeholder_ids=[7, 9],
+        from sglang.srt.multimodal.processors.muse_spark_omni import (
+            MuseSpark1xOmniMultimodalProcessor,
         )
+
+        muse = MuseSpark1xOmniMultimodalProcessor.__new__(
+            MuseSpark1xOmniMultimodalProcessor
+        )
+        muse.patch_id, muse.video_id = 30, 31
+        muse.image_placeholder_ids, muse.video_placeholder_ids = [7, 8], [7, 9]
         rust.bind_external_encoder_processor(muse)
         for prompt in ([7, 8], [42, 7, 9], [30], [31]):
             with self.assertRaises(MissingEncoderHandoff):
@@ -248,7 +330,19 @@ class TestStagedImageReceiver(unittest.TestCase):
         }
 
         def descriptor(**change):
-            return msgspec.json.encode(meta | {"videos": [video | change]})
+            payload = meta | {"videos": [video | change]}
+            transfer = pb.StagedImageTransfer(
+                **{k: v for k, v in payload.items() if k != "peer"}
+            )
+            instance = bytes(16)
+            signer = EncoderHandoffSigner(meta["peer"], _HANDOFF_TEST_KEY)
+            return msgspec.json.encode(
+                payload
+                | dict(
+                    instance_id=instance.hex(),
+                    signature=signer.sign(transfer, instance),
+                )
+            )
 
         q = processor()
         q.model_type = "qwen2_5_vl"
@@ -419,7 +513,7 @@ class TestStagedImageReceiver(unittest.TestCase):
                 asyncio.run(run(fail))
 
     def test_nixl_uncertain_delivery_keeps_registration_until_fenced(self):
-        async def run(fence_ok):
+        async def run(case):
             transfer_id = "11" * 16
             handoff = EncoderHandoff.parse(
                 msgspec.json.encode(
@@ -437,44 +531,63 @@ class TestStagedImageReceiver(unittest.TestCase):
                 ),
                 1,
             )
+            issuer = b"E" * 16
+            fence = pb.ReleaseResponse(instance_id=issuer)
+            responses = {
+                "fenced": [fence],
+                "retry": [grpc.RpcError("lost fence"), fence],
+                "replacement": [pb.ReleaseResponse(instance_id=b"R" * 16)],
+                "legacy": [pb.ReleaseResponse()],
+                "deadline": [grpc.RpcError("encoder gone")],
+            }
             stub = SimpleNamespace(
                 Describe=AsyncMock(
-                    return_value=pb.DescribeResponse(shape=[1, 4], dtype="bfloat16")
+                    return_value=pb.DescribeResponse(
+                        shape=[1, 4], dtype="bfloat16", instance_id=issuer
+                    )
                 ),
                 Deliver=AsyncMock(side_effect=RuntimeError("lost Deliver response")),
-                Release=AsyncMock(
-                    side_effect=[None]
-                    if fence_ok
-                    else [grpc.RpcError("lost fence"), None]
-                ),
+                Release=AsyncMock(side_effect=responses[case]),
             )
             target = Mock(
-                tensor=torch.empty(8, dtype=torch.uint8), descriptor=b"destination"
+                tensor=torch.empty(8, dtype=torch.uint8), descriptor=b"target"
             )
-            target.reaped.return_value = False
-            released = asyncio.Event()
-            target.close.side_effect = released.set
+            retired = asyncio.Event()
+            target.reaped.side_effect = lambda: target.close.called
+            target.close.side_effect = retired.set
+            target.quarantine.side_effect = retired.set
             rx = Mock()
             rx.allocate.return_value = target
             with patch.object(rpc, "SglangEncoderStub", return_value=stub):
+                timeout = 0.05 if case == "deadline" else 2
+                signed = msgspec.structs.replace(handoff, instance_id=issuer.hex())
+                for previous in (b"", b"R" * 16):
+                    stub.Describe.return_value.instance_id = previous
+                    with self.assertRaisesRegex(
+                        ValueError, "different encoder instance"
+                    ):
+                        await signed.receive_nixl(rx, (1, 4), timeout)
+                    rx.allocate.assert_not_called()
+                    stub.Deliver.assert_not_called()
+                stub.Describe.return_value.instance_id = issuer
                 with self.assertRaisesRegex(ValueError, "shape differs"):
-                    await handoff.receive_nixl(rx, (2, 4), 1)
+                    await handoff.receive_nixl(rx, (2, 4), timeout)
                 rx.allocate.assert_not_called()
-                with self.assertRaises((RuntimeError, grpc.RpcError)):
-                    await handoff.receive_nixl(rx, (1, 4), 1)
-                if fence_ok:
-                    target.abandon.assert_not_called()
-                    stub.Release.assert_awaited_once()
+                with self.assertRaisesRegex(RuntimeError, "lost Deliver"):
+                    await handoff.receive_nixl(rx, (1, 4), timeout)
+                target.abandon.assert_called_once()
+                await asyncio.wait_for(retired.wait(), 3)
+                self.assertEqual(stub.Release.await_count, len(responses[case]))
+                if case in ("fenced", "retry"):
+                    target.close.assert_called_once()
+                    target.quarantine.assert_not_called()
                 else:
                     target.close.assert_not_called()
-                    target.abandon.assert_called_once()
-                    await asyncio.wait_for(released.wait(), 2)
-                    self.assertEqual(stub.Release.await_count, 2)
-                target.close.assert_called_once()
+                    target.quarantine.assert_called_once()
 
-        for fenced in (True, False):
-            with self.subTest(fenced=fenced):
-                asyncio.run(run(fenced))
+        for case in ("fenced", "retry", "replacement", "legacy", "deadline"):
+            with self.subTest(case=case):
+                asyncio.run(run(case))
 
     def test_native_part_to_prefill_and_decode_layout_only(self):
         async def run(backend, video_model=None, video_only=False):

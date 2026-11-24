@@ -556,6 +556,7 @@ class TestStagedNativeTransfer(CustomTestCase):
                 )
                 self.assertEqual(tuple(shape.shape), tuple(tensor.shape))
                 self.assertEqual(shape.dtype, "float32")
+                self.assertEqual(shape.instance_id, response.instance_id)
                 state = enc.req_states[transfer.part_id]
 
                 async def inspect_write(source, descriptor, timeout):
@@ -571,6 +572,10 @@ class TestStagedNativeTransfer(CustomTestCase):
                         ),
                         Mock(),
                     )
+                released = await svc.Release(
+                    pb.ReleaseRequest(transfer_id=transfer.transfer_id), Mock()
+                )
+                self.assertEqual(released.instance_id, response.instance_id)
                 self.assert_retired(svc, enc, [state])
                 enc._compute_embedding.assert_awaited_once()
 
@@ -645,7 +650,9 @@ class TestStagedNativeTransfer(CustomTestCase):
                 )
                 self.assertEqual(len(transfer.images), len(images))
                 self.assertEqual(list(enc.req_states), [transfer.part_id])
-                self.assertEqual(len(svc._leases), 1)
+                self.assertEqual(
+                    enc.req_states[transfer.part_id].staged_transfer, transfer
+                )
                 video = torch.arange(20, dtype=image.dtype).reshape(5, 4) + 100
                 expected = torch.cat((image, video)) if images else video
                 for i, (layout, tensor) in enumerate(
@@ -801,18 +808,29 @@ class TestStagedNativeTransfer(CustomTestCase):
 
     def test_staged_native_model_layout(self):
         from sglang.encoder.v1 import encoder_pb2 as pb
-        from sglang.srt.disaggregation.encoder.native_handoff import (
-            NATIVE_IMAGE_MODEL_TYPES,
-            NATIVE_VIDEO_MODEL_TYPES,
-        )
+
+        video_models = {
+            "glm4v",
+            "glm4v_moe",
+            "glm5_next",
+            "muse_spark",
+            "minimax_m3_vl",
+            "mimo_v2",
+        }
+        image_models = video_models | {
+            "dots3_note",
+            "kimi_vl",
+            "kimi_k25",
+            "kimi_k3",
+            "kimi_k31",
+            "inkling2",
+        }
 
         async def run(model, backend):
             with self.native_encoder(backend, model) as (svc, enc, _, _, _):
                 info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
                 self.assertEqual(info.native_model_type, model)
-                self.assertEqual(
-                    info.supports_staged_video, model in NATIVE_VIDEO_MODEL_TYPES
-                )
+                self.assertEqual(info.supports_staged_video, model in video_models)
                 videos = ["video1", "video2"] if info.supports_staged_video else []
                 transfer = (
                     await svc.Stage(
@@ -869,7 +887,7 @@ class TestStagedNativeTransfer(CustomTestCase):
                 )
                 self.assertEqual(enc.req_states, {})
 
-        for model in sorted(NATIVE_IMAGE_MODEL_TYPES):
+        for model in sorted(image_models):
             for backend in ("nixl", "zmq_to_scheduler"):
                 with self.subTest(model=model, backend=backend):
                     asyncio.run(run(model, backend))
@@ -974,7 +992,7 @@ class TestStagedNativeTransfer(CustomTestCase):
                     context.abort.await_args.args[0],
                     grpc_server.grpc.StatusCode.INVALID_ARGUMENT,
                 )
-                self.assertFalse(svc._leases or enc.req_states or svc._active)
+                self.assertFalse(enc.req_states)
 
         asyncio.run(run())
 
@@ -1052,7 +1070,9 @@ class TestStagedNativeTransfer(CustomTestCase):
                 if cancel:
                     call.cancel()
                     await asyncio.sleep(0)
-                    self.assertEqual(svc._active, 1)
+                    self.assertEqual(
+                        sum(s.externally_staged for s in enc.req_states.values()), 1
+                    )
                     resume.set()
                     with self.assertRaises(asyncio.CancelledError):
                         await call
@@ -1074,9 +1094,6 @@ class TestStagedNativeTransfer(CustomTestCase):
                 asyncio.run(run(cancel))
 
     def assert_retired(self, svc, enc, states):
-        self.assertEqual(svc._leases, {})
-        self.assertEqual(svc._active, 0)
-        self.assertFalse(svc._cleanup_tasks)
         self.assertFalse(enc.has_pending_embeddings())
         for state in states:
             self.assertIsNone(state.embedding_data)
@@ -1085,7 +1102,7 @@ class TestStagedNativeTransfer(CustomTestCase):
             for registry in (
                 enc.abandoned_req_ids,
                 encoder_server.meta_registry._rid_to_meta,
-                encoder_server.meta_registry._pending_at,
+                encoder_server.meta_registry._pending,
                 encoder_server.rid_to_cond,
                 encoder_server.rid_to_receive_endpoint,
                 encoder_server.rid_to_receive_count,
@@ -1181,7 +1198,7 @@ class TestStagedNativeTransfer(CustomTestCase):
                     self.assertCountEqual(received, [t.part_id for t in initial[:8]])
 
                 async def drained():
-                    while svc._active or svc._cleanup_tasks:
+                    while enc.req_states:
                         await asyncio.sleep(0.001)
 
                 await asyncio.wait_for(drained(), 2)
@@ -1278,7 +1295,9 @@ class TestStagedNativeTransfer(CustomTestCase):
                 await asyncio.wait_for(started.wait(), 1)
                 call.cancel()
                 await asyncio.sleep(0)
-                self.assertEqual(svc._active, 1)
+                self.assertEqual(
+                    sum(s.externally_staged for s in enc.req_states.values()), 1
+                )
                 self.assertEqual(states[-1].active_encodes, 1)
                 resume.set()
                 with self.assertRaises(asyncio.CancelledError):
@@ -1305,7 +1324,8 @@ class TestEncoderMetaRegistry(CustomTestCase):
                     fast_released.set()
 
             registry.on_release = release
-            registry._pending_at.update(blocked=0, fast=0)
+            registry.arm("blocked", 5)
+            registry.arm("fast", 5)
 
             blocked_task = registry._schedule_stale_release("blocked")
             await asyncio.wait_for(blocked_started.wait(), timeout=1)
@@ -1313,12 +1333,38 @@ class TestEncoderMetaRegistry(CustomTestCase):
             await asyncio.wait_for(fast_released.wait(), timeout=1)
             await fast_task
 
-            self.assertIn("blocked", registry._pending_at)
-            self.assertNotIn("fast", registry._pending_at)
+            self.assertIn("blocked", registry._pending)
+            self.assertNotIn("fast", registry._pending)
 
             unblock.set()
             await blocked_task
-            self.assertNotIn("blocked", registry._pending_at)
+            self.assertNotIn("blocked", registry._pending)
+
+        asyncio.run(run())
+
+    def test_new_deadline_survives_a_previous_release_in_flight(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            started, finish, new_release = (asyncio.Event() for _ in range(3))
+
+            async def slow_release(req_id):
+                started.set()
+                await finish.wait()
+
+            async def staged_release(req_id):
+                new_release.set()
+
+            registry.arm("part", 0, slow_release)
+            await asyncio.wait_for(started.wait(), 1)
+            registry.arm("part", 0, staged_release)
+            # Process the new deadline while the old release is still blocked.
+            processed = asyncio.Event()
+            asyncio.get_running_loop().call_later(0, processed.set)
+            await processed.wait()
+            self.assertFalse(new_release.is_set())
+            finish.set()
+            await asyncio.wait_for(new_release.wait(), 1)
+            self.assertNotIn("part", registry._pending)
 
         asyncio.run(run())
 
@@ -1334,15 +1380,15 @@ class TestEncoderMetaRegistry(CustomTestCase):
                     raise RuntimeError("transient cleanup failure")
 
             registry.on_release = release
-            registry._pending_at["req"] = 0
+            registry.arm("req", 5)
 
             await registry._release_stale("req")
-            self.assertIn("req", registry._pending_at)
-            retry_at = registry._pending_at["req"]
+            self.assertIn("req", registry._pending)
+            retry_at = registry._pending["req"].deadline
             self.assertGreater(retry_at, 0)
 
             await registry._release_stale("req")
-            self.assertNotIn("req", registry._pending_at)
+            self.assertNotIn("req", registry._pending)
             self.assertEqual(attempts, 2)
 
         asyncio.run(run())

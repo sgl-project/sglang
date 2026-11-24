@@ -11,7 +11,7 @@ class GetEncoderInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetEncoderInfoResponse(_message.Message):
-    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy", "native_model_type", "staged_audio_model_type", "supports_staged_images", "instance_id")
+    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy", "native_model_type", "staged_audio_model_type", "supports_staged_images", "instance_id", "handoff_key_id", "handoff_peer")
     MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
     TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
     SERVED_MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
@@ -21,6 +21,8 @@ class GetEncoderInfoResponse(_message.Message):
     STAGED_AUDIO_MODEL_TYPE_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_STAGED_IMAGES_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    HANDOFF_KEY_ID_FIELD_NUMBER: _ClassVar[int]
+    HANDOFF_PEER_FIELD_NUMBER: _ClassVar[int]
     model_path: str
     tokenizer_path: str
     served_model_name: str
@@ -30,7 +32,9 @@ class GetEncoderInfoResponse(_message.Message):
     staged_audio_model_type: str
     supports_staged_images: bool
     instance_id: bytes
-    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ..., native_model_type: _Optional[str] = ..., staged_audio_model_type: _Optional[str] = ..., supports_staged_images: _Optional[bool] = ..., instance_id: _Optional[bytes] = ...) -> None: ...
+    handoff_key_id: str
+    handoff_peer: str
+    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ..., native_model_type: _Optional[str] = ..., staged_audio_model_type: _Optional[str] = ..., supports_staged_images: _Optional[bool] = ..., instance_id: _Optional[bytes] = ..., handoff_key_id: _Optional[str] = ..., handoff_peer: _Optional[str] = ...) -> None: ...
 
 class StagedMediaPolicy(_message.Message):
     __slots__ = ("allowed_domains", "max_bytes", "timeout_secs")
@@ -129,12 +133,14 @@ class StagedImageTransfer(_message.Message):
     def __init__(self, version: _Optional[int] = ..., request_id: _Optional[str] = ..., transfer_id: _Optional[str] = ..., part_id: _Optional[str] = ..., part_idx: _Optional[int] = ..., num_parts: _Optional[int] = ..., image_count: _Optional[int] = ..., images: _Optional[_Iterable[_Union[ImageLayout, _Mapping]]] = ..., videos: _Optional[_Iterable[_Union[VideoLayout, _Mapping]]] = ..., native_model_type: _Optional[str] = ..., embedding_width: _Optional[int] = ..., audios: _Optional[_Iterable[_Union[AudioLayout, _Mapping]]] = ...) -> None: ...
 
 class StageResponse(_message.Message):
-    __slots__ = ("transfer", "instance_id")
+    __slots__ = ("transfer", "instance_id", "handoff_mac")
     TRANSFER_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    HANDOFF_MAC_FIELD_NUMBER: _ClassVar[int]
     transfer: StagedImageTransfer
     instance_id: bytes
-    def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ..., instance_id: _Optional[bytes] = ...) -> None: ...
+    handoff_mac: str
+    def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ..., instance_id: _Optional[bytes] = ..., handoff_mac: _Optional[str] = ...) -> None: ...
 
 class DescribeRequest(_message.Message):
     __slots__ = ("transfer",)
@@ -143,12 +149,14 @@ class DescribeRequest(_message.Message):
     def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ...) -> None: ...
 
 class DescribeResponse(_message.Message):
-    __slots__ = ("shape", "dtype")
+    __slots__ = ("shape", "dtype", "instance_id")
     SHAPE_FIELD_NUMBER: _ClassVar[int]
     DTYPE_FIELD_NUMBER: _ClassVar[int]
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     shape: _containers.RepeatedScalarFieldContainer[int]
     dtype: str
-    def __init__(self, shape: _Optional[_Iterable[int]] = ..., dtype: _Optional[str] = ...) -> None: ...
+    instance_id: bytes
+    def __init__(self, shape: _Optional[_Iterable[int]] = ..., dtype: _Optional[str] = ..., instance_id: _Optional[bytes] = ...) -> None: ...
 
 class DeliverRequest(_message.Message):
     __slots__ = ("transfer", "receive_url", "nixl_target")
@@ -171,8 +179,10 @@ class ReleaseRequest(_message.Message):
     def __init__(self, transfer_id: _Optional[str] = ...) -> None: ...
 
 class ReleaseResponse(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
+    __slots__ = ("instance_id",)
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    instance_id: bytes
+    def __init__(self, instance_id: _Optional[bytes] = ...) -> None: ...
 
 class EncodeRequest(_message.Message):
     __slots__ = ("mm_items", "req_id", "num_parts", "part_idx", "prefill_host", "embedding_port")

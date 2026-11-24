@@ -10,6 +10,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
@@ -18,7 +19,18 @@ DEFAULT_ASR_PROMPT = (
 )
 
 
+class _ASRStagedLayout(StagedMediaLayout):
+    def audio_rows(self, lengths):
+        from sglang.srt.multimodal.mrope_rope_index import (
+            _get_feat_extract_output_lengths,
+        )
+
+        return _get_feat_extract_output_lengths(lengths)
+
+
 class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
+    staged_layouts = {"qwen3_asr": _ASRStagedLayout(images=False, audio=True)}
+
     models = [Qwen3ASRForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):

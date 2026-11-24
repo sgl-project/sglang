@@ -12,12 +12,6 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.disaggregation.encoder.native_handoff import (
-    NATIVE_IMAGE_MODEL_TYPES,
-    NATIVE_VIDEO_MODEL_TYPES,
-    STAGED_AUDIO_MODEL_TYPES,
-    STAGED_VIDEO_MODEL_TYPES,
-)
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.server_utils import (
     build_model_info_fields,
@@ -32,6 +26,7 @@ from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.multimodal.staged_layout import staged_layout_for
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
 from sglang.srt.observability.request_logger import (
     WHITELISTED_HEADERS,
@@ -504,30 +499,25 @@ def _launch_server_info(scheduler: Scheduler) -> str:
         )
     )
     if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
-        info["accepts_encoder_handoff"] = True
-        model_type = scheduler.model_config.hf_config.model_type
-        info["supports_staged_images"] = (
-            model_type in NATIVE_IMAGE_MODEL_TYPES | STAGED_VIDEO_MODEL_TYPES
+        from sglang.srt.disaggregation.encoder.handoff_auth import (
+            handoff_key_id,
+            require_handoff_key,
         )
-        audio_supported = model_type in STAGED_AUDIO_MODEL_TYPES
-        if model_type == "muse_spark":
-            from sglang.srt.multimodal.processors.muse_spark_omni import (
-                muse_audio_delimiters,
-            )
 
-            audio_supported = None not in muse_audio_delimiters(scheduler.tokenizer)
-        elif model_type == "mimo_v2":
-            audio_supported = (
-                getattr(scheduler.model_config.hf_config, "audio_config", None)
-                is not None
-            )
-        if audio_supported:
+        info["accepts_encoder_handoff"] = True
+        info["encoder_handoff_key_id"] = handoff_key_id(require_handoff_key())
+        model_type = scheduler.model_config.hf_config.model_type
+        layout = staged_layout_for(model_type)
+        info["supports_staged_images"] = bool(layout and layout.images)
+        info["supports_staged_video"] = bool(layout and layout.video is not None)
+        if layout and layout.language_audio_enabled(scheduler):
             info["staged_audio_model_type"] = model_type
-        if model_type in NATIVE_IMAGE_MODEL_TYPES:
+        if (
+            layout
+            and (layout.images or layout.video is not None)
+            and not layout.legacy_vision
+        ):
             info["native_model_type"] = model_type
-        info["supports_staged_video"] = model_type in (
-            STAGED_VIDEO_MODEL_TYPES | NATIVE_VIDEO_MODEL_TYPES
-        )
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

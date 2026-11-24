@@ -52,6 +52,7 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
     smart_nframes as smart_nframes,
 )
 from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart_resize
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout, VideoTiming
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -199,7 +200,50 @@ async def preprocess_video(
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
+class _QwenStagedLayout(StagedMediaLayout):
+    def vision_merge_size(self, processor, video):
+        return processor.spatial_merge_size
+
+    def embedding_width(self, processor, hidden_size, visual):
+        if not visual:
+            return hidden_size
+        vision = processor.hf_config.vision_config
+        levels = 1 + len(getattr(vision, "deepstack_visual_indexes", None) or ())
+        if hidden_size is not None:
+            return hidden_size * levels
+        if processor.model_type == "qwen2_vl":
+            width = vision.hidden_size
+        elif getattr(vision, "disable_merger_proj", False):
+            width = vision.hidden_size * processor.spatial_merge_size**2
+        else:
+            width = vision.out_hidden_size
+        return width * levels
+
+    def audio_rows(self, lengths):
+        from sglang.srt.multimodal.mrope_rope_index import (
+            _get_feat_extract_output_lengths,
+        )
+
+        return _get_feat_extract_output_lengths(lengths)
+
+
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+    staged_layouts = {
+        "qwen2_vl": _QwenStagedLayout(video=VideoTiming.NONE, legacy_vision=True),
+        "qwen2_5_vl": _QwenStagedLayout(
+            video=VideoTiming.GRID_DURATION, legacy_vision=True
+        ),
+        "qwen3_omni_moe": _QwenStagedLayout(
+            video=VideoTiming.GRID_DURATION, legacy_vision=True, audio=True
+        ),
+        **dict.fromkeys(
+            ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "intern_s2_preview"),
+            _QwenStagedLayout(
+                video=VideoTiming.TIMESTAMPS, per_frame_items=True, legacy_vision=True
+            ),
+        ),
+    }
+
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE

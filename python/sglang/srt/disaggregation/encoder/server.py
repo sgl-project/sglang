@@ -10,7 +10,18 @@ import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import numpy as np
@@ -146,6 +157,17 @@ async def _await_transfer_completion(awaitable, operation: str):
     )
 
 
+if TYPE_CHECKING:
+    from sglang.encoder.v1.encoder_pb2 import StagedImageTransfer
+
+
+@dataclass
+class _RequestExpiry:
+    deadline: float
+    timer: asyncio.TimerHandle
+    release: Optional[Callable[[str], Awaitable[None]]]
+
+
 class EncoderMetaRegistry:
     """Per-part metadata shared by every encoder request lifecycle.
 
@@ -161,45 +183,34 @@ class EncoderMetaRegistry:
         self.sweep_timeout = sweep_timeout
         self._rid_to_meta: Dict[str, dict] = {}
         self._rid_to_send_done: Dict[str, Set[str]] = {}
-        self._pending_at: Dict[str, float] = {}
-        self._sweeper_task: Optional[asyncio.Task] = None
+        self._pending: Dict[str, _RequestExpiry] = {}
         self._stale_release_tasks: Dict[str, asyncio.Task] = {}
         # Set only where the embedding also lives; None in the DP main process.
         self.on_release: Optional[Callable[[str], Awaitable[None]]] = None
 
-    def _touch(self, req_id: str) -> None:
-        self._pending_at[req_id] = time.monotonic()
-        self._ensure_sweeper()
+    def arm(self, req_id: str, timeout: float, release=None) -> None:
+        """Expire metadata and its native request through one registry."""
+        self.disarm(req_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        timer = loop.call_at(deadline, self._schedule_stale_release, req_id)
+        self._pending[req_id] = _RequestExpiry(deadline, timer, release)
 
-    def _ensure_sweeper(self) -> None:
-        if self._sweeper_task is not None and not self._sweeper_task.done():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._sweeper_task = loop.create_task(self._sweep_loop())
+    def expired(self, req_id: str) -> bool:
+        entry = self._pending.get(req_id)
+        return entry is None or asyncio.get_running_loop().time() >= entry.deadline
 
-    async def _sweep_loop(self) -> None:
-        # Same idiom as DPDispatcher._cleanup_stale_mappings: one eternal
-        # scanner; interval re-read each pass so the MMEncoder override applies.
-        while True:
-            await asyncio.sleep(max(self.sweep_timeout / 4, 0.01))
-            now = time.monotonic()
-            stale = [
-                rid
-                for rid, ts in self._pending_at.items()
-                if now - ts > self.sweep_timeout
-                and rid not in self._stale_release_tasks
-            ]
-            for rid in stale:
-                self._schedule_stale_release(rid)
+    def disarm(self, req_id: str) -> None:
+        if entry := self._pending.pop(req_id, None):
+            entry.timer.cancel()
 
     def _schedule_stale_release(self, req_id: str) -> asyncio.Task:
         """Release one stale request without blocking cleanup of other requests."""
         if task := self._stale_release_tasks.get(req_id):
             return task
-        task = asyncio.create_task(self._release_stale(req_id))
+        task = asyncio.create_task(
+            self._release_stale(req_id, self._pending.get(req_id))
+        )
         self._stale_release_tasks[req_id] = task
         task.add_done_callback(
             lambda done, rid=req_id: self._finish_stale_release(rid, done)
@@ -209,17 +220,28 @@ class EncoderMetaRegistry:
     def _finish_stale_release(self, req_id: str, task: asyncio.Task) -> None:
         if self._stale_release_tasks.get(req_id) is task:
             self._stale_release_tasks.pop(req_id)
+            # Re-arming during a slow release can produce a second deadline
+            # before the first task finishes. Handle it after that task exits.
+            if req_id in self._pending and self.expired(req_id):
+                self._schedule_stale_release(req_id)
 
-    async def _release_stale(self, req_id: str) -> None:
+    async def _release_stale(self, req_id: str, expected=None) -> None:
+        entry = self._pending.get(req_id)
+        if entry is None or (expected is not None and entry is not expected):
+            return
         try:
-            await self._release(req_id)
+            release = entry.release or self.on_release
+            if release is not None:
+                await release(req_id)
+            if self._pending.get(req_id) is entry:
+                await self.discard(req_id)
         except Exception:
             logger.exception("Failed to release stale encoder request %s", req_id)
             # Keep the request eligible for a later sweep without retrying in a
             # tight loop. Its metadata and buffer ownership remain intact.
             async with rid_lock:
-                if req_id in self._pending_at:
-                    self._pending_at[req_id] = time.monotonic()
+                if self._pending.get(req_id) is entry:
+                    self.arm(req_id, self.sweep_timeout, entry.release)
 
     async def publish(
         self,
@@ -241,7 +263,7 @@ class EncoderMetaRegistry:
         )
         async with rid_lock:
             self._rid_to_meta[req_id] = meta
-            self._touch(req_id)
+            self.arm(req_id, self.sweep_timeout)
         cond = await _get_receive_condition(req_id)
         async with cond:
             cond.notify_all()
@@ -279,7 +301,7 @@ class EncoderMetaRegistry:
         async with rid_lock:
             self._rid_to_meta.pop(req_id, None)
             self._rid_to_send_done.pop(req_id, None)
-            self._pending_at.pop(req_id, None)
+            self.disarm(req_id)
         async with cond_dict_lock:
             rid_to_cond.pop(req_id, None)
 
@@ -367,6 +389,10 @@ class ReqState:
     lifecycle_condition: asyncio.Condition = field(
         default_factory=asyncio.Condition, repr=False
     )
+    # Reserved before a Stage can queue. Its descriptor is claimable exactly
+    # once; active_sends continues to fence a claimed transfer.
+    externally_staged: bool = False
+    staged_transfer: Optional["StagedImageTransfer"] = None
 
 
 @dataclass(frozen=True)
@@ -904,6 +930,7 @@ class MMEncoder:
             return
         async with state.lifecycle_condition:
             state.release_requested = True
+            state.staged_transfer = None
             state.preserve_metadata_on_release |= preserve_metadata
             encode_is_active = state.active_encodes > 0
 
@@ -921,6 +948,8 @@ class MMEncoder:
             self.req_states.pop(req_id, None)
         await self.delivery.release(state)
         state.embedding_data = None
+        if state.externally_staged and self.mm_global_cache_enabled:
+            self.mm_global_cache.discard_prefetch_waiter(req_id)
         if not state.preserve_metadata_on_release:
             await meta_registry.discard(req_id)
 

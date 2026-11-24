@@ -20,7 +20,6 @@ import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encoder.native_handoff import GLM_VIDEO_MODEL_TYPES
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
@@ -839,7 +838,7 @@ class EncoderPreprocessor:
                 video_timestamps.append(timestamps)
             processor_input["video_timestamps"] = video_timestamps
         elif (
-            self.model_type in GLM_VIDEO_MODEL_TYPES
+            self.model_type in {"glm4v", "glm4v_moe", "glm5_next"}
             and (video_metadata := video_processor_kwargs.get("video_metadata"))
             is not None
         ):

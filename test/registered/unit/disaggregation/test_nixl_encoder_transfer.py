@@ -128,6 +128,30 @@ class TestNixlEncoderTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current.reaped())
         receiver.allocate(256).close()
 
+    def test_quarantine_preserves_memory_and_bounds_replacement_slots(self):
+        agent = Mock()
+        agent.get_partial_agent_metadata.return_value = b"pool"
+        agent.get_new_notifs.return_value = {}
+        with patch.object(nixl, "_agent", return_value=agent):
+            receiver = nixl.NixlReceiver(capacity=1, pool_bytes=512)
+
+        first = receiver.allocate(256)
+        first_desc = msgspec.msgpack.decode(first.descriptor, type=nixl._Destination)
+        first.abandon()
+        first.quarantine()
+        second = receiver.allocate(256)
+        self.assertNotEqual(first_desc.address, second.tensor.data_ptr())
+        second.abandon()
+        second.quarantine()
+        with self.assertRaisesRegex(RuntimeError, "no free transfer slots"):
+            receiver.allocate(1)
+        agent.get_new_notifs.return_value = {"encoder": [first_desc.notification]}
+        self.assertTrue(first.reaped())
+        replacement = receiver.allocate(256)
+        self.assertEqual(replacement.tensor.data_ptr(), first_desc.address)
+        replacement.close()
+        second.close()  # A positive fence from its original issuer.
+
     def test_writer_reuses_peers_and_bounds_retired_receiver_instances(self):
         agent = Mock()
         agent.add_remote_agent.side_effect = bytes.decode

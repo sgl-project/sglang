@@ -1,24 +1,17 @@
 """Private, single-receiver multimodal handoffs."""
 
 import asyncio
+import logging
 import math
 import re
 from urllib.parse import urlsplit
 
 import msgspec
 
-from sglang.srt.disaggregation.encoder.native_handoff import (
-    FRAME_VIDEO_MODEL_TYPES,
-    NATIVE_IMAGE_MODEL_TYPES,
-    NATIVE_VIDEO_MODEL_TYPES,
-    STAGED_AUDIO_MODEL_TYPES,
-    STAGED_VIDEO_MODEL_TYPES,
-    TIMED_VIDEO_MODEL_TYPES,
-)
+logger = logging.getLogger(__name__)
 
-# Keep one recovery task per ambiguous registered destination until the original
-# write completes or E fences it. The receiver's admission limit bounds this set
-# for each scheduler, including when an encoder remains unreachable.
+# One short-lived refencing task per ambiguous destination. A target whose
+# owner cannot be reached stays registered independently of this task.
 _fence_tasks: set[asyncio.Task] = set()
 
 
@@ -36,6 +29,8 @@ class StagedPromptMarkers:
 
     @classmethod
     def from_processor(cls, processor):
+        if custom := getattr(processor, "get_staged_prompt_markers", None):
+            return custom()
         mm_tokens = getattr(processor, "mm_tokens", None)
         image = getattr(
             processor, "IM_TOKEN_ID", getattr(mm_tokens, "image_token_id", None)
@@ -51,18 +46,6 @@ class StagedPromptMarkers:
         audio = getattr(processor, "audio_token_id", None)
         if audio is None:
             audio = getattr(mm_tokens, "audio_token_id", None)
-        if hasattr(processor, "image_placeholder_ids"):
-            # Muse also accepts expanded spans and literal media placeholders.
-            return cls(
-                processor.patch_id,
-                processor.video_id,
-                (
-                    tuple(processor.image_placeholder_ids),
-                    tuple(processor.video_placeholder_ids),
-                    tuple(getattr(processor, "audio_placeholder_ids", None) or ()),
-                ),
-                audio=getattr(processor, "audio_id", None),
-            )
         if image is None and audio is None:
             raise ValueError("staged encoder processor has no media placeholder")
         return cls(
@@ -141,6 +124,8 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     native_model_type: str = ""
     embedding_width: int = 0
     audios: list[AudioLayout] = msgspec.field(default_factory=list)
+    instance_id: str = ""
+    signature: str = ""
 
     @classmethod
     def parse(
@@ -152,35 +137,18 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     ) -> "EncoderHandoff":
         transfer = msgspec.json.decode(data, type=cls)
         native = transfer.version in (3, 4)
-        if transfer.audios:
+        if native:
             if (
-                transfer.version != 4
-                or transfer.native_model_type not in STAGED_AUDIO_MODEL_TYPES
+                bool(transfer.audios) != (transfer.version == 4)
+                or not transfer.native_model_type
                 or not 0 < transfer.embedding_width <= 0xFFFFFFFF
-                or (
-                    transfer.images
-                    and transfer.native_model_type
-                    not in NATIVE_IMAGE_MODEL_TYPES | STAGED_VIDEO_MODEL_TYPES
-                )
-                or (
-                    transfer.videos
-                    and transfer.native_model_type
-                    not in NATIVE_VIDEO_MODEL_TYPES | STAGED_VIDEO_MODEL_TYPES
-                )
             ):
-                raise ValueError("invalid staged audio model or layout version")
-        elif transfer.version == 3:
-            if (
-                transfer.native_model_type not in NATIVE_IMAGE_MODEL_TYPES
-                or (
-                    transfer.videos
-                    and transfer.native_model_type not in NATIVE_VIDEO_MODEL_TYPES
+                raise ValueError(
+                    "invalid native staged model, modality or embedding width"
                 )
-                or transfer.embedding_width <= 0
-            ):
-                raise ValueError("invalid native staged model or embedding width")
         elif (
             transfer.version != (2 if transfer.videos else 1)
+            or transfer.audios
             or transfer.native_model_type
             or transfer.embedding_width
         ):
@@ -243,11 +211,6 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 or min(image.original_size) < 1
             ):
                 raise ValueError("invalid staged original image dimensions")
-            if (
-                transfer.native_model_type in {"kimi_k3", "kimi_k31"}
-                and not image.original_size
-            ):
-                raise ValueError("Kimi K3 requires original image dimensions")
             if min(image.t, image.h, image.w) < 1 or not re.fullmatch(
                 "[0-9a-f]{64}", image.identity
             ):
@@ -271,17 +234,6 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 raise ValueError("invalid staged video sampling interval")
         return transfer
 
-    def validate_layout(
-        self, merge_size: int, prompt_len: int, max_length: int
-    ) -> None:
-        rows = 0
-        for layout in (*self.images, *self.videos):
-            if layout.h % merge_size or layout.w % merge_size:
-                raise ValueError("staged media grid is incompatible with the model")
-            rows += layout.t * (layout.h // merge_size) * (layout.w // merge_size)
-        if prompt_len - self.image_count - len(self.videos) + rows >= max_length:
-            raise ValueError("staged media exceed the model's input length limit")
-
     @property
     def packed_modality(self):
         from sglang.srt.multimodal.modality import Modality
@@ -293,200 +245,32 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     def grids(self):
         return [[image.t, image.h, image.w] for image in self.images]
 
-    def _native_layout(self, processor, prompt, max_length):
-        import torch
-
-        model = self.native_model_type
-        if getattr(processor, "model_type", processor.hf_config.model_type) != model:
+    def build_layout(self, processor, prompt, max_length, hidden_size=None):
+        model = getattr(processor, "model_type", None) or processor.hf_config.model_type
+        if self.version >= 3 and model != self.native_model_type:
             raise ValueError("staged encoder and consumer model types differ")
-        if (
-            sum(x.embedding_rows for x in (*self.images, *self.videos, *self.audios))
-            >= max_length
+        layout = getattr(processor, "staged_layouts", {}).get(model)
+        if layout is None or (
+            (self.images and not layout.images)
+            or (self.videos and layout.video is None)
+            or (self.audios and not layout.audio)
         ):
-            raise ValueError("staged media exceed the model's input length limit")
-        for layout in (*self.images, *self.videos):
-            if model in {"kimi_vl", "kimi_k25", "kimi_k3", "kimi_k31"}:
-                expected = processor._num_image_tokens_from_grid(
-                    [layout.t, layout.h, layout.w]
-                )
-            elif model in {"inkling2", "muse_spark"}:
-                expected = layout.t * layout.h * layout.w
-            else:
-                if model in {"mimo_v2", "qwen3_omni_moe"}:
-                    merge = processor.spatial_merge_size
-                elif model == "dots3_note":
-                    merge = processor.image_preprocessor.merge_size
-                else:
-                    component = (
-                        processor._processor.video_processor
-                        if isinstance(layout, VideoLayout)
-                        else processor._processor.image_processor
-                    )
-                    merge = component.merge_size
-                if layout.h % merge or layout.w % merge:
-                    raise ValueError("staged media grid is incompatible with the model")
-                frames = layout.t
-                if model == "mimo_v2" and isinstance(layout, VideoLayout):
-                    ratio = processor.mimo_processor.temporal_compression_ratio
-                    if frames % ratio:
-                        raise ValueError(
-                            "staged grid differs from native temporal compression"
-                        )
-                    frames //= ratio
-                expected = frames * (layout.h // merge) * (layout.w // merge)
-            if expected != layout.embedding_rows:
-                raise ValueError("staged embedding rows differ from model grid")
-        kwargs = {}
-        if self.audios:
-            # Qwen descriptors carry the input mel-frame lengths. Other native
-            # processors use the audio encoder's output sequence lengths.
-            lengths = torch.tensor([a.feature_length for a in self.audios])
-            if model in {"qwen3_asr", "qwen3_omni_moe"}:
-                from sglang.srt.multimodal.mrope_rope_index import (
-                    _get_feat_extract_output_lengths,
-                )
-
-                rows = _get_feat_extract_output_lengths(lengths)
-            elif model == "qwen2_audio":
-                rows = (lengths + 1) // 4
-            else:
-                rows = lengths
-            if rows.tolist() != [a.embedding_rows for a in self.audios]:
-                raise ValueError("audio feature length differs from its staged rows")
-            kwargs["audio_feature_lens"] = lengths
-        if self.images:
-            grids = self.grids()
-            if model == "kimi_vl":
-                if any(t != 1 for t, _, _ in grids):
-                    raise ValueError(
-                        "Kimi-VL image grids require a single temporal patch"
-                    )
-                grids = [grid[1:] for grid in grids]
-            kwargs["img_grid_thw"] = torch.tensor(grids)
-            if model in {"kimi_k3", "kimi_k31"}:
-                kwargs["original_image_sizes"] = [
-                    img.original_size for img in self.images
-                ]
-        if self.videos:
-            for video in self.videos:
-                if model == "qwen3_omni_moe":
-                    if (
-                        len(video.identities) != 1
-                        or video.timestamps
-                        or video.second_per_grid_ts is None
-                    ):
-                        raise ValueError(
-                            "staged video metadata differs from native model layout"
-                        )
-                    continue
-                frames = video.t
-                if model == "mimo_v2":
-                    frames //= processor.mimo_processor.temporal_compression_ratio
-                if (
-                    len(video.identities) != (frames if model == "mimo_v2" else 1)
-                    or (
-                        len(video.timestamps) != frames
-                        and (model != "minimax_m3_vl" or bool(video.timestamps))
-                    )
-                    or video.second_per_grid_ts is not None
-                ):
-                    raise ValueError(
-                        "staged video metadata differs from native model layout"
-                    )
-            kwargs["video_grid_thw"] = torch.tensor(
-                [[v.t, v.h, v.w] for v in self.videos]
+            raise ValueError(f"staged media unsupported for {model}")
+        if self.version < 3 and not layout.legacy_vision:
+            raise ValueError("native encoder requires explicit embedding dimensions")
+        if self.version >= 3 and hidden_size is not None:
+            width = layout.embedding_width(
+                processor, hidden_size, bool(self.images or self.videos)
             )
-            if model == "qwen3_omni_moe":
-                kwargs["second_per_grid_ts"] = torch.tensor(
-                    [v.second_per_grid_ts for v in self.videos], dtype=torch.float32
-                )
-            else:
-                kwargs["video_timestamps"] = (
-                    [t for video in self.videos for t in video.timestamps]
-                    if model == "mimo_v2"
-                    else [video.timestamps or None for video in self.videos]
-                )
-        # All native processors consume the same grid/timing inputs as ordinary EPD.
-        staged_layout = getattr(processor, "get_staged_media_layout", None)
-        if staged_layout is None:
-            mm = processor.get_mm_data(list(prompt), embeddings=None, **kwargs)
-        else:
-            mm = staged_layout(list(prompt), **kwargs)
-        from sglang.srt.multimodal.modality import Modality
-
-        for modality, layouts in (
-            (Modality.IMAGE, self.images),
-            (Modality.VIDEO, self.videos),
-            (Modality.AUDIO, self.audios),
-        ):
-            items = [item for item in mm.mm_items if item.modality == modality]
-            rows = (
-                [
-                    layout.embedding_rows // len(layout.identities)
-                    for layout in layouts
-                    for _ in layout.identities
-                ]
-                if modality == Modality.VIDEO
-                else [layout.embedding_rows for layout in layouts]
-            )
-            if len(items) != len(rows) or any(
-                not item.offsets
-                or sum(end - start + 1 for start, end in item.offsets) != count
-                for item, count in zip(items, rows)
+            if self.embedding_width != width or any(
+                audio.embedding_width != hidden_size for audio in self.audios
             ):
-                raise ValueError("staged media rows differ from rebuilt native prompt")
-        # Native processors may group items by modality. Routing hints and cache
-        # event labels arrive in media order across modalities.
-        mm.mm_items.sort(key=lambda item: item.offsets[0][0])
-        if len(mm.input_ids) >= max_length:
-            raise ValueError("staged media exceed the model's input length limit")
-        return mm
-
-    def build_layout(self, processor, prompt, max_length):
-        import torch
-
-        if self.version >= 3:
-            return self._native_layout(processor, prompt, max_length)
-        if (
-            getattr(getattr(processor, "hf_config", None), "model_type", None)
-            in NATIVE_IMAGE_MODEL_TYPES
-        ):
-            raise ValueError("native encoder requires a version 3 handoff")
-        self.validate_layout(processor.spatial_merge_size, len(prompt), max_length)
-        kwargs = {}
-        if self.images:
-            kwargs["img_grid_thw"] = torch.tensor(self.grids())
-        if self.videos:
-            if processor.model_type not in STAGED_VIDEO_MODEL_TYPES:
                 raise ValueError(
-                    f"staged video is unsupported for {processor.model_type}"
+                    "staged embedding width differs from the language model"
                 )
-            frame_items = processor.model_type in FRAME_VIDEO_MODEL_TYPES
-            timed_grid = processor.model_type in TIMED_VIDEO_MODEL_TYPES
-            for video in self.videos:
-                segments = video.t if frame_items else 1
-                if (
-                    len(video.identities) != segments
-                    or len(video.timestamps) != (video.t if frame_items else 0)
-                    or (video.second_per_grid_ts is not None) != timed_grid
-                ):
-                    raise ValueError("staged video metadata differs from model layout")
-            kwargs["video_grid_thw"] = torch.tensor(
-                [[v.t, v.h, v.w] for v in self.videos]
-            )
-            if frame_items:
-                kwargs["video_timestamps"] = [v.timestamps for v in self.videos]
-            if timed_grid:
-                kwargs["second_per_grid_ts"] = torch.tensor(
-                    [v.second_per_grid_ts for v in self.videos], dtype=torch.float32
-                )
-        mm = processor.get_staged_media_layout(list(prompt), **kwargs)
-        # Qwen3 inserts timestamp text and delimiters for each temporal slice.
-        if len(mm.input_ids) >= max_length:
-            raise ValueError("staged media exceed the model's input length limit")
-        return mm
+        return layout.build(processor, self, prompt, max_length)
 
-    def bind_identities(self, mm_items, routing_hashes):
+    def bind_identities(self, mm_items, routing_hashes, *, use_routing_hash=True):
         from sglang.srt.environ import envs
         from sglang.srt.managers.req_types import MultimodalDataItem
         from sglang.srt.multimodal.cache.digest import structured_digest
@@ -600,17 +384,14 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 if payload.cache_key != identity:
                     raise ValueError("staged media embedding identity mismatch")
             item.set_identity(cache_identity)
-            if hint is not None and self.native_model_type not in {
-                "kimi_k25",
-                "kimi_k3",
-            }:
+            if hint is not None and use_routing_hash:
                 item.hash = hint
 
     def native_transfer(self):
         from sglang.encoder.v1.encoder_pb2 import StagedImageTransfer
 
         fields = msgspec.to_builtins(self)
-        del fields["peer"]
+        del fields["peer"], fields["signature"], fields["instance_id"]
         if not self.videos:
             del fields["videos"]
         if not self.audios:
@@ -644,6 +425,9 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             spec = await stub.Describe(
                 encoder_pb2.DescribeRequest(transfer=transfer), timeout=timeout
             )
+            issuer = spec.instance_id
+            if self.instance_id and issuer.hex() != self.instance_id:
+                raise ValueError("NIXL Describe came from a different encoder instance")
             if tuple(spec.shape) != shape:
                 raise ValueError(
                     "NIXL embedding shape differs from staged media layout/model"
@@ -667,44 +451,49 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                     timeout=max(0, deadline - asyncio.get_running_loop().time()),
                 )
             except BaseException:
-                # A lost Deliver response can leave E writing this memory. Release
-                # retires the transfer and fences any writer that already claimed it.
-                fenced = False
-                try:
-                    await stub.Release(
-                        encoder_pb2.ReleaseRequest(transfer_id=self.transfer_id),
-                        timeout=timeout,
-                    )
-                    fenced = True
-                finally:
-                    if fenced:
-                        target.close()
-                    else:
-                        target.abandon()
-                        task = asyncio.create_task(
-                            self._refence_target(target, timeout)
-                        )
-                        _fence_tasks.add(task)
-                        task.add_done_callback(_fence_tasks.discard)
+                # An RPC timeout cannot revoke an already submitted NIXL WRITE.
+                # Return the request error now; the receiver owns the destination.
+                target.abandon()
+                task = asyncio.create_task(
+                    self._refence_target(target, issuer, timeout)
+                )
+                _fence_tasks.add(task)
+                task.add_done_callback(_fence_tasks.discard)
                 raise
             target.close()
             return tensor
 
-    async def _refence_target(self, target, timeout: float):
+    async def _refence_target(self, target, issuer: bytes, timeout: float):
         import grpc
 
         delay = 0.25
-        while not target.reaped():
-            await asyncio.sleep(delay)
-            if target.reaped():
-                return
-            try:
-                await self.release(timeout)
-            except grpc.RpcError:
-                delay = min(delay * 2, 30)
-            else:
-                target.close()
-                return
+        deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                while not target.reaped():
+                    try:
+                        ack = await self.release(
+                            deadline - asyncio.get_running_loop().time()
+                        )
+                    except grpc.RpcError:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 5)
+                        continue
+                    # A restarted E also acknowledges unknown transfers. Its
+                    # acknowledgement says nothing about the previous E's WRITE.
+                    if len(issuer) == 16 and ack.instance_id == issuer:
+                        target.close()
+                        return
+                    break
+        except TimeoutError:
+            pass
+        finally:
+            if not target.reaped():
+                target.quarantine()
+                logger.warning(
+                    "Quarantined NIXL target for transfer %s after losing its encoder fence",
+                    self.transfer_id,
+                )
 
     async def release(self, timeout: float):
         import grpc
@@ -713,7 +502,7 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
         async with grpc.aio.insecure_channel(urlsplit(self.peer).netloc) as channel:
             stub = encoder_pb2_grpc.SglangEncoderStub(channel)
-            await stub.Release(
+            return await stub.Release(
                 encoder_pb2.ReleaseRequest(transfer_id=self.transfer_id),
                 timeout=timeout,
             )

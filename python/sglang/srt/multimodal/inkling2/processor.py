@@ -12,6 +12,7 @@ from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.multimodal.media_io import ImageData, download_remote_media
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
 
 
@@ -68,7 +69,14 @@ def build_encoder_inputs(images, modality: Modality) -> EncoderPreprocessOutput:
     )
 
 
+class _InklingStagedLayout(StagedMediaLayout):
+    def vision_merge_size(self, processor, video):
+        return 1
+
+
 class Inkling2MultimodalProcessor(BaseMultimodalProcessor):
+    staged_layouts = {"inkling2": _InklingStagedLayout()}
+
     gpu_image_decode = False
     prefer_tokenized_input = True
 

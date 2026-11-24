@@ -171,6 +171,7 @@ def test_glm_interleaved_frame_offsets_positions_and_packed_rows(model):
     waiting.recv_req = SimpleNamespace(
         encoder_handoff=handoff, encoder_routing_hashes=None, mm_routing_labels=None
     )
+    waiting.mm_processor, waiting.model_type = p, model
     waiting.staged_layout = layout
     waiting._bind_pool_slot_to_mm_inputs = lambda mm: None
     waiting._finish_assemble({Modality.IMAGE: torch.cat((img, vid))})
@@ -343,6 +344,7 @@ def check_audio_receive(handoff, processor, prompt, packed, audios):
     waiting.recv_req = SimpleNamespace(
         encoder_handoff=handoff, encoder_routing_hashes=None, mm_routing_labels=None
     )
+    waiting.mm_processor, waiting.model_type = processor, handoff.native_model_type
     waiting.staged_layout = prefill
     waiting._bind_pool_slot_to_mm_inputs = lambda mm: None
     assert waiting._embedding_shape() == tuple(packed.shape)
@@ -482,6 +484,12 @@ def test_invalid_audio_descriptor(change):
         data["version"] = 3
     elif change == "model":
         data["native_model_type"] = "glm5_next"
+        handoff = EncoderHandoff.parse(msgspec.json.encode(data), 0, 0, 1)
+        processor = Glm4vImageProcessor.__new__(Glm4vImageProcessor)
+        processor.hf_config = SimpleNamespace(model_type="glm5_next")
+        with pytest.raises(ValueError, match="unsupported"):
+            handoff.build_layout(processor, [5], 32)
+        return
     elif change == "count":
         count = 2
     else:
@@ -494,3 +502,39 @@ def test_invalid_audio_descriptor(change):
         data["audios"][0][key] = "bad" if change == "identity" else 0
     with pytest.raises(ValueError):
         EncoderHandoff.parse(msgspec.json.encode(data), 0, 0, count)
+
+
+def test_additional_processor_uses_existing_native_wire(monkeypatch):
+    from sglang.srt.managers import multimodal_processor
+    from sglang.srt.multimodal.staged_layout import StagedMediaLayout, staged_layout_for
+
+    class AudioProcessor:
+        model_type = "additional_audio_model"
+        staged_layouts = {model_type: StagedMediaLayout(images=False, audio=True)}
+
+        def get_staged_media_layout(self, prompt, audio_feature_lens):
+            rows = audio_feature_lens.item()
+            item = MultimodalDataItem(modality=Modality.AUDIO, offsets=[(0, rows - 1)])
+            return SimpleNamespace(input_ids=prompt * rows, mm_items=[item])
+
+    monkeypatch.setenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", "staged_test_plugin")
+
+    def register(name, overwrite=False):
+        if name == "staged_test_plugin":
+            assert overwrite
+            monkeypatch.setitem(
+                multimodal_processor.PROCESSOR_MAPPING, object(), AudioProcessor
+            )
+
+    monkeypatch.setattr(multimodal_processor, "import_processors", register)
+    p = AudioProcessor()
+    assert staged_layout_for(p.model_type) is p.staged_layouts[p.model_type]
+    data = descriptor(p.model_type, [])
+    data.update(version=4, audios=[audio_layout(torch.zeros(2, 2), 2)])
+    handoff = EncoderHandoff.parse(msgspec.json.encode(data), 0, 0, 1)
+    assert handoff.native_transfer().version == 4
+    mm = handoff.build_layout(p, [8], 16, hidden_size=2)
+    assert mm.input_ids == [8, 8]
+    assert mm.mm_items[0].offsets == [(0, 1)]
+    with pytest.raises(ValueError, match="width differs"):
+        handoff.build_layout(p, [8], 16, hidden_size=5)

@@ -26,6 +26,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +174,15 @@ def preprocess_dots_video(
         return run(_cfg_for_pure_visual(cfg))
 
 
+class _DotsStagedLayout(StagedMediaLayout):
+    def vision_merge_size(self, processor, video):
+        return processor.image_preprocessor.merge_size
+
+
 class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     """Native image/audio processor for dots.note.omni."""
+
+    staged_layouts = {"dots3_note": _DotsStagedLayout(audio=True)}
 
     models: ClassVar[list] = [Dots3NoteForCausalLM]
     gpu_image_decode = False

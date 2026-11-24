@@ -2,6 +2,7 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 import grpc
 import msgspec
@@ -53,11 +54,21 @@ class TestStagedImageHandoff(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "placeholders"):
             EncoderHandoff.parse(msgspec.json.encode(descriptor()), 1)
         handoff = EncoderHandoff.parse(msgspec.json.encode(descriptor()), 2)
-        handoff.validate_layout(2, 10, 21)
+        from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor.model_type = "qwen2_vl"
+        processor._spatial_merge_size = 2
+        processor.get_staged_media_layout = lambda prompt, **kw: SimpleNamespace(
+            input_ids=prompt
+        )
+        prompt = list(range(10))
+        handoff.build_layout(processor, prompt, 21)
         with self.assertRaisesRegex(ValueError, "input length"):
-            handoff.validate_layout(2, 10, 20)
+            handoff.build_layout(processor, prompt, 20)
+        processor._spatial_merge_size = 3
         with self.assertRaisesRegex(ValueError, "incompatible"):
-            handoff.validate_layout(3, 10, 128)
+            handoff.build_layout(processor, prompt, 128)
 
     def test_caller_hash_does_not_replace_content_identity(self):
         from sglang.srt.multimodal.modality import Modality

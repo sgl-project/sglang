@@ -22,6 +22,7 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.cache.digest import media_identity
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout
 
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")
 
@@ -64,6 +65,11 @@ def _item_grid_thw(item: MultimodalDataItem) -> List[int]:
     if len(values) != 3:
         raise ValueError(f"Kimi image item needs one [t, h, w] grid, got {values}")
     return values
+
+
+class KimiStagedLayout(StagedMediaLayout):
+    def vision_rows(self, processor, layout, video):
+        return processor._num_image_tokens_from_grid([layout.t, layout.h, layout.w])
 
 
 class KimiGridMMDataMixin:

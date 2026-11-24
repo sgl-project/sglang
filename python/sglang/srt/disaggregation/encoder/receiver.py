@@ -1349,19 +1349,15 @@ class WaitingStagedImage(WaitingZmqRequest):
                 ),
                 handoff.embedding_width,
             )
-        merge = self.mm_processor.spatial_merge_size
+        layout = self.mm_processor.staged_layouts[self.model_type]
         rows = sum(
-            layout.t * (layout.h // merge) * (layout.w // merge)
-            for layout in (*handoff.images, *handoff.videos)
+            layout.vision_rows(self.mm_processor, image, video=False)
+            for image in handoff.images
+        ) + sum(
+            layout.vision_rows(self.mm_processor, video, video=True)
+            for video in handoff.videos
         )
-        vision = self.mm_processor.hf_config.vision_config
-        if self.model_type == "qwen2_vl":
-            width = vision.hidden_size
-        elif getattr(vision, "disable_merger_proj", False):
-            width = vision.hidden_size * merge**2
-        else:
-            width = vision.out_hidden_size
-        width *= 1 + len(getattr(vision, "deepstack_visual_indexes", None) or ())
+        width = layout.embedding_width(self.mm_processor, None, visual=True)
         return rows, width
 
     def _is_valid_embedding_part(self, recv_obj):
@@ -1400,11 +1396,12 @@ class WaitingStagedImage(WaitingZmqRequest):
         handoff = self.recv_req.encoder_handoff
         (packed,) = recv_embedding.values()
         if handoff.version >= 3:
-            image_rows = sum(item.embedding_rows for item in handoff.images)
+            image_rows = sum(image.embedding_rows for image in handoff.images)
         else:
-            merge = self.mm_processor.spatial_merge_size
+            layout = self.mm_processor.staged_layouts[self.model_type]
             image_rows = sum(
-                v.t * (v.h // merge) * (v.w // merge) for v in handoff.images
+                layout.vision_rows(self.mm_processor, image, video=False)
+                for image in handoff.images
             )
         audio_start = packed.shape[0] - sum(a.embedding_rows for a in handoff.audios)
         ends = {
@@ -1437,7 +1434,11 @@ class WaitingStagedImage(WaitingZmqRequest):
     def _publish_layout(self):
         mm = self.staged_layout
         self.recv_req.encoder_handoff.bind_identities(
-            mm.mm_items, self.recv_req.encoder_routing_hashes
+            mm.mm_items,
+            self.recv_req.encoder_routing_hashes,
+            use_routing_hash=self.mm_processor.staged_layouts[
+                self.model_type
+            ].use_routing_hash,
         )
         attach_mm_routing_labels(mm.mm_items, self.recv_req.mm_routing_labels)
         self.recv_req.mm_inputs = mm
@@ -2250,6 +2251,8 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
+        if package := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+            import_processors(package, overwrite=True)
         register_token_space_models()
 
         extra_kwargs = {}
@@ -2591,27 +2594,15 @@ class MMReceiverBase(ABC):
                 error_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 try:
                     if handoff is not None:
-                        if handoff.version >= 3:
-                            hidden_size = self.scheduler.model_config.hidden_size
-                            expected_width = hidden_size
-                            if handoff.native_model_type == "qwen3_omni_moe" and (
-                                handoff.images or handoff.videos
-                            ):
-                                vision = self.mm_processor.hf_config.vision_config
-                                expected_width *= 1 + len(
-                                    getattr(vision, "deepstack_visual_indexes", None)
-                                    or ()
-                                )
-                            if handoff.embedding_width != expected_width or any(
-                                a.embedding_width != hidden_size for a in handoff.audios
-                            ):
-                                raise ValueError(
-                                    "staged embedding width differs from the language model"
-                                )
                         mm = handoff.build_layout(
                             self.mm_processor,
                             recv_req.input_ids,
                             self.scheduler.max_req_input_len,
+                            hidden_size=(
+                                self.scheduler.model_config.hidden_size
+                                if handoff.version >= 3
+                                else None
+                            ),
                         )
                         transport_kwargs = {**extra_kwargs, "staged_layout": mm}
                         if get_disagg().disaggregation_mode == "decode" or (

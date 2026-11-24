@@ -52,6 +52,9 @@ message GetEncoderInfoResponse {
   optional bool supports_staged_images = 8;
   // Random 16-byte UUID for the lifetime of this staged encoder service.
   bytes instance_id = 9;
+  // Nonsecret fingerprint and advertised address used to authenticate Stage receipts.
+  string handoff_key_id = 10;
+  string handoff_peer = 11;
 }
 
 message StagedMediaPolicy {
@@ -120,11 +123,15 @@ message StageResponse {
   StagedImageTransfer transfer = 1;
   // The producing service's GetEncoderInfo.instance_id.
   bytes instance_id = 2;
+  // HMAC over the configured endpoint, producer instance and transfer message.
+  string handoff_mac = 3;
 }
 message DescribeRequest { StagedImageTransfer transfer = 1; }
 message DescribeResponse {
   repeated uint64 shape = 1; // [tokens, hidden dimensions] of the staged part
   string dtype = 2; // bfloat16, float16 or float32
+  // Identity of the process holding this transfer. Only its Release can fence a WRITE.
+  bytes instance_id = 3;
 }
 message DeliverRequest {
   StagedImageTransfer transfer = 1;
@@ -135,7 +142,10 @@ message DeliverRequest {
 message DeliverResponse {}
 // Release also fences a claimed NIXL write before the receiver frees its memory.
 message ReleaseRequest { string transfer_id = 1; }
-message ReleaseResponse {}
+message ReleaseResponse {
+  // A replacement at the same endpoint cannot fence the previous process's writes.
+  bytes instance_id = 1;
+}
 
 // =====================
 // Encode Request/Response

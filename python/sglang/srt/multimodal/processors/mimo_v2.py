@@ -43,6 +43,7 @@ from sglang.srt.multimodal.processors.mimo_audio import (
     MiMoAudioPipeline,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
+from sglang.srt.multimodal.staged_layout import StagedMediaLayout, VideoTiming
 from sglang.srt.runtime_context import get_device
 
 logger = logging.getLogger(__name__)
@@ -1456,7 +1457,56 @@ class MiMoProcessor:
         return image
 
 
+class _MiMoStagedLayout(StagedMediaLayout):
+    def encoder_vision_enabled(self, encoder):
+        return getattr(encoder.model, "visual", None) is not None
+
+    def encoder_audio_enabled(self, encoder):
+        return getattr(encoder.model, "thinker", encoder.model)._is_multimodal
+
+    def language_audio_enabled(self, scheduler):
+        return (
+            getattr(scheduler.model_config.hf_config, "audio_config", None) is not None
+        )
+
+    def vision_merge_size(self, processor, video):
+        return processor.spatial_merge_size
+
+    def video_compression(self, processor):
+        return processor.mimo_processor.temporal_compression_ratio
+
+    def processor_video_timestamps(self, videos):
+        return [t for v in videos for t in v.timestamps]
+
+    def encoder_video_metadata(self, encoder, data):
+        if any(
+            getattr(data, attr, None) is not None
+            for attr in ("video_audio_embedding", "video_audio_feature_lens")
+        ):
+            raise ValueError("MiMo staged video requires a clip without an audio track")
+        compression = encoder.model._encoder_processor.temporal_compression_ratio
+        timestamps = getattr(data, "video_timestamps", None)
+        if timestamps is None or compression <= 0:
+            raise ValueError("Missing MiMo staged video metadata")
+        clips, offset = [], 0
+        for grid in data.get_grid():
+            frames, remainder = divmod(int(grid[0]), compression)
+            if remainder or frames <= 0:
+                raise ValueError("Invalid MiMo staged video temporal grid")
+            clips.append(timestamps[offset : offset + frames])
+            offset += frames
+        if len(timestamps) != offset:
+            raise ValueError("MiMo timestamps differ from its staged video grid")
+        return clips, compression
+
+
 class MiMoV2Processor(BaseMultimodalProcessor):
+    staged_layouts = {
+        "mimo_v2": _MiMoStagedLayout(
+            video=VideoTiming.TIMESTAMPS, per_frame_items=True, audio=True
+        )
+    }
+
     accepts_staged_expanded_spans = True
     models = [MiMoV2ForCausalLM]
 

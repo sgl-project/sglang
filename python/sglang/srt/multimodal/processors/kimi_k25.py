@@ -18,7 +18,10 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.multimodal.processors.kimi_common import (
+    KimiGridMMDataMixin,
+    KimiStagedLayout,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -524,6 +527,8 @@ class KimiGPUProcessorWrapper:
 
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
+    staged_layouts = {"kimi_k25": KimiStagedLayout(use_routing_hash=False)}
+
     models = [KimiK25ForConditionalGeneration]
     gpu_image_decode = not _FORCE_CPU_IMAGE_PREPROCESSING
     prefer_tokenized_input = True

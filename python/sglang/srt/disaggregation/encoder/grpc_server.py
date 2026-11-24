@@ -14,8 +14,8 @@ import multiprocessing as mp
 import traceback
 from concurrent import futures
 from http import HTTPStatus
-from itertools import pairwise
 from typing import List
+from uuid import uuid4
 
 import grpc
 import torch
@@ -25,30 +25,23 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
-from sglang.srt.disaggregation.encoder.native_handoff import (
-    FRAME_VIDEO_MODEL_TYPES,
-    GLM_VIDEO_MODEL_TYPES,
-    NATIVE_IMAGE_MODEL_TYPES,
-    NATIVE_VIDEO_MODEL_TYPES,
-    STAGED_AUDIO_MODEL_TYPES,
-    STAGED_VIDEO_MODEL_TYPES,
-    TIMED_VIDEO_MODEL_TYPES,
-)
+from sglang.srt.disaggregation.encoder.handoff_auth import EncoderHandoffSigner
 from sglang.srt.disaggregation.encoder.receiver import create_part_req_id
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
 from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
+    ReqState,
     SendDestination,
     await_task_completion_on_cancel,
     launch_encoder,
     meta_registry,
 )
-from sglang.srt.disaggregation.encoder.staged import StagedImageService
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.media_io import media_url_security_config, media_url_timeout
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.staged_layout import staged_layout_for
 from sglang.srt.runtime_context import (
     get_disagg,
     get_model,
@@ -96,7 +89,7 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         yield await self.Check(request, context)
 
 
-class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
+class SGLangEncoderServer(SGLangEncoderServicer):
     """
     gRPC service implementation for SGLang encoder.
     """
@@ -113,28 +106,36 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
         self._dispatch_failed = False
         self.send_sockets = send_sockets
         info = None
-        native = encoder.model_type in NATIVE_IMAGE_MODEL_TYPES and (
-            encoder.model_type != "mimo_v2"
-            or getattr(encoder.model, "visual", None) is not None
-        )
-        qwen = encoder.model_type in STAGED_VIDEO_MODEL_TYPES
-        images_enabled = (qwen or native) and encoder.preprocessor.supports_modality(
-            Modality.IMAGE
-        )
-        feature_model = getattr(encoder.model, "thinker", encoder.model)
-        audio_enabled = (
-            encoder.model_type in STAGED_AUDIO_MODEL_TYPES
-            and encoder.preprocessor.supports_modality(Modality.AUDIO)
-            and callable(getattr(feature_model, "get_audio_feature", None))
-            and (encoder.model_type != "mimo_v2" or feature_model._is_multimodal)
-        )
         parallel = get_parallel()
-        if (
+        staging_enabled = (
             encoder.transfer_backend in ("zmq_to_scheduler", "nixl")
             and parallel.num_dp_ranks == parallel.pp_size == parallel.nnodes == 1
             and len(send_sockets) == parallel.tp_size - 1
-            and (images_enabled or audio_enabled)
-        ):
+        )
+        self._staged_layout = layout = (
+            staged_layout_for(encoder.model_type) if staging_enabled else None
+        )
+        vision_enabled = layout is not None and layout.encoder_vision_enabled(encoder)
+        images_enabled = bool(
+            vision_enabled
+            and layout.images
+            and encoder.preprocessor.supports_modality(Modality.IMAGE)
+        )
+        videos_enabled = bool(
+            vision_enabled
+            and layout.video is not None
+            and encoder.preprocessor.supports_modality(Modality.VIDEO)
+            and video_decoder_available()
+        )
+        feature_model = getattr(encoder.model, "thinker", encoder.model)
+        audio_enabled = bool(
+            layout
+            and layout.audio
+            and encoder.preprocessor.supports_modality(Modality.AUDIO)
+            and callable(getattr(feature_model, "get_audio_feature", None))
+            and layout.encoder_audio_enabled(encoder)
+        )
+        if images_enabled or videos_enabled or audio_enabled:
             model = get_model().model_path
             domains, max_mb, _, _ = media_url_security_config()
             # With no configured timeout, media I/O uses per-modality defaults.
@@ -143,33 +144,37 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
                 model_path=model,
                 tokenizer_path=get_serving().tokenizer_path or model,
                 served_model_name=get_serving().served_model_name or model,
-                native_model_type=encoder.model_type if native else "",
+                native_model_type=encoder.model_type
+                if (images_enabled or videos_enabled) and not layout.legacy_vision
+                else "",
                 supports_staged_images=images_enabled,
                 staged_audio_model_type=encoder.model_type if audio_enabled else "",
-                supports_staged_video=(
-                    (qwen or encoder.model_type in NATIVE_VIDEO_MODEL_TYPES)
-                    and encoder.preprocessor.supports_modality(Modality.VIDEO)
-                    and video_decoder_available()
-                ),
+                supports_staged_video=videos_enabled,
                 staged_media_policy=encoder_pb2.StagedMediaPolicy(
                     allowed_domains=domains,
                     max_bytes=max_mb * 1024 * 1024,
                     timeout_secs=remote_timeout,
                 ),
             )
-        nixl_enabled = encoder.transfer_backend == "nixl"
-        super().__init__(
-            encode=self._stage_media,
-            send=None if nixl_enabled else self._deliver_part,
-            describe=self._describe_part,
-            write=self._write_part if nixl_enabled else None,
-            release=self._release_staged_part,
-            make_part_id=create_part_req_id,
-            info=info,
+        self._configure_staging(
+            info,
             stage_timeout=envs.SGLANG_ENCODER_REQ_TIMEOUT.get(),
             ttl=encoder.send_timeout,
             capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get(),
+            signer=EncoderHandoffSigner.from_config() if info is not None else None,
         )
+
+    def _configure_staging(self, info, *, stage_timeout, ttl, capacity, signer=None):
+        self._info = info
+        self._stage_timeout = stage_timeout
+        self._ttl = ttl
+        self._capacity = capacity
+        self._handoff_signer = signer
+        if info is not None:
+            info.instance_id = uuid4().bytes
+            if signer is not None:
+                info.handoff_key_id = signer.key_id
+                info.handoff_peer = signer.peer
 
     async def _stage_media(self, part_id, images, videos, audios):
         # The native encoder batches one modality at a time. Publish one lease
@@ -224,7 +229,7 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
                 finally:
                     if index:
                         await await_task_completion_on_cancel(
-                            asyncio.create_task(self._release_staged_part(name)),
+                            asyncio.create_task(self._release_staged_modality(name)),
                             f"Retire staged {modality.name.lower()} {name}",
                         )
             if len(tensors) > 1:
@@ -269,13 +274,13 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
     def _image_layouts(self, data, *, explicit_rows=False):
         native = explicit_rows or bool(self._info.native_model_type)
         original_sizes = getattr(data, "original_image_sizes", None)
-        if self.encoder.model_type in {"kimi_k3", "kimi_k31"} and (
+        if self._staged_layout.original_image_sizes and (
             original_sizes is None or len(original_sizes) != len(data.get_grid())
         ):
-            raise RuntimeError("Missing Kimi-K3 original image sizes for staged images")
+            raise RuntimeError("Missing original image sizes for staged images")
         layouts = []
         for index, (grid, tensor) in enumerate(self._item_embeddings(data)):
-            if native and self.encoder.model_type == "kimi_vl" and len(grid) == 2:
+            if native and len(grid) == 2:
                 t, h, w = 1, *map(int, grid)
             else:
                 t, h, w = map(int, grid)
@@ -315,82 +320,13 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
         return layouts
 
     def _video_layouts(self, data, *, explicit_rows=False):
-        timestamps = getattr(data, "video_timestamps", None)
-        seconds = getattr(data, "second_per_grid_ts", None)
-        timed_grid = self.encoder.model_type in TIMED_VIDEO_MODEL_TYPES
-        frame_items = self.encoder.model_type in FRAME_VIDEO_MODEL_TYPES
-        compression = 1
-        if self.encoder.model_type == "mimo_v2":
-            if (
-                getattr(data, "video_audio_embedding", None) is not None
-                or getattr(data, "video_audio_feature_lens", None) is not None
-            ):
-                raise ValueError(
-                    "MiMo staged video requires a clip without an audio track"
-                )
-            # MiMo's native EPD metadata concatenates the timestamps of all clips.
-            compression = (
-                self.encoder.model._encoder_processor.temporal_compression_ratio
-            )
-            clips, offset = [], 0
-            if timestamps is None or compression <= 0:
-                raise RuntimeError("Missing MiMo staged video metadata")
-            for grid in data.get_grid():
-                frame_count, remainder = divmod(int(grid[0]), compression)
-                if remainder or not frame_count:
-                    raise RuntimeError("Invalid MiMo staged video temporal grid")
-                clips.append(timestamps[offset : offset + frame_count])
-                offset += frame_count
-            if len(timestamps) != offset:
-                raise RuntimeError("MiMo timestamps differ from its staged video grid")
-            timestamps = clips
-            frame_items = True
-        requires_timestamps = (
-            frame_items
-            or self.encoder.model_type in GLM_VIDEO_MODEL_TYPES
-            or self.encoder.model_type == "muse_spark"
+        return self._staged_layout.encode_video_layouts(
+            self.encoder,
+            data,
+            self._item_embeddings,
+            lambda tensor: self._item_identity(Modality.VIDEO, tensor),
+            explicit_rows or bool(self._info.native_model_type),
         )
-        optional_timestamps = self.encoder.model_type == "minimax_m3_vl"
-        count = len(data.get_grid())
-        if (
-            requires_timestamps or (optional_timestamps and timestamps is not None)
-        ) and (timestamps is None or len(timestamps) != count):
-            raise RuntimeError("Missing native timestamps for staged video")
-        if timed_grid and (seconds is None or len(seconds) != count):
-            raise RuntimeError("Missing native grid duration for staged video")
-        layouts = []
-        for i, (grid, tensor) in enumerate(self._item_embeddings(data)):
-            t, h, w = map(int, grid)
-            frames = t // compression
-            if min(t, h, w) <= 0 or tensor.shape[0] % frames:
-                raise RuntimeError("Invalid staged video grid or embedding length")
-            layout = encoder_pb2.VideoLayout(t=t, h=h, w=w)
-            if explicit_rows or self._info.native_model_type:
-                layout.embedding_rows = tensor.shape[0]
-            if requires_timestamps or (
-                optional_timestamps
-                and timestamps is not None
-                and timestamps[i] is not None
-            ):
-                times = [float(x) for x in timestamps[i]]
-                if (
-                    len(times) != frames
-                    or any(not math.isfinite(x) or x < 0 for x in times)
-                    or any(a > b for a, b in pairwise(times))
-                ):
-                    raise RuntimeError("Invalid staged video frame timestamps")
-                layout.timestamps.extend(times)
-            chunks = tensor.tensor_split(frames) if frame_items else (tensor,)
-            if timed_grid:
-                duration = float(seconds[i])
-                if not math.isfinite(duration) or duration <= 0:
-                    raise RuntimeError("Invalid staged video grid duration")
-                layout.second_per_grid_ts = duration
-            layout.identities.extend(
-                self._item_identity(Modality.VIDEO, chunk) for chunk in chunks
-            )
-            layouts.append(layout)
-        return layouts
 
     def _describe_part(self, part_id):
         tensor = self.encoder.req_states[part_id].embedding_data.embedding
@@ -398,21 +334,237 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             shape=tensor.shape, dtype=str(tensor.dtype).removeprefix("torch.")
         )
 
-    async def _write_part(self, part_id, target):
-        await self.encoder.send_to_destination(
-            self.encoder.req_states[part_id], SendDestination(nixl_target=target)
-        )
-
-    async def _deliver_part(self, part_id, receive_url):
-        await self.encoder.send_to_destination(
-            self.encoder.req_states[part_id],
-            SendDestination(endpoint=receive_url, ephemeral=True),
-        )
-
-    async def _release_staged_part(self, part_id):
+    async def _release_staged_modality(self, part_id):
         await self.encoder.release_request(part_id)
         if self.encoder.mm_global_cache_enabled:
             self.encoder.mm_global_cache.discard_prefetch_waiter(part_id)
+
+    async def _check_staging_config(self, context):
+        if (
+            self._info is None
+            or not 0 < self._stage_timeout < math.inf
+            or not 0 < self._ttl < math.inf
+            or self._capacity <= 0
+        ):
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Staged media require a compatible processor, zmq_to_scheduler or nixl, "
+                "a single-node TP group with PP=DP=1 and positive staging limits",
+            )
+
+    async def GetEncoderInfo(self, request, context):
+        await self._check_staging_config(context)
+        return self._info
+
+    async def Stage(self, request, context):
+        await self._check_staging_config(context)
+        images, videos = list(request.mm_items), list(request.video_urls)
+        audios = list(request.audio_urls)
+        if (
+            not request.request_id
+            or not (images or videos or audios)
+            or not all(images)
+            or not all(videos)
+            or not all(audios)
+        ):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "request_id and nonempty media are required",
+            )
+        if (
+            images
+            and self._info.HasField("supports_staged_images")
+            and not self._info.supports_staged_images
+        ):
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "staged images are unavailable"
+            )
+        if audios and not self._info.staged_audio_model_type:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "staged audio is unavailable"
+            )
+        if videos and not self._info.supports_staged_video:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "staged video is unavailable"
+            )
+        states = self.encoder.req_states
+        if sum(state.externally_staged for state in states.values()) >= self._capacity:
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED, "encoder staging full"
+            )
+
+        transfer_id = uuid4().hex
+        part_id = create_part_req_id(transfer_id, 0)
+        # Reserve before the dispatch lock can suspend. batch_encode acquires
+        # its normal native encode reference on this same state.
+        state = states[part_id] = ReqState(part_id, externally_staged=True)
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._stage_timeout
+            image_layouts, video_layouts, audio_layouts = await asyncio.wait_for(
+                self._stage_media(part_id, images, videos, audios), self._stage_timeout
+            )
+            if loop.time() >= deadline:
+                raise asyncio.TimeoutError
+            if (len(image_layouts), len(video_layouts), len(audio_layouts)) != (
+                len(images),
+                len(videos),
+                len(audios),
+            ):
+                raise ValueError("staged layout count differs from media count")
+            transfer = encoder_pb2.StagedImageTransfer(
+                version=2 if videos else 1,
+                request_id=request.request_id,
+                transfer_id=transfer_id,
+                part_id=part_id,
+                part_idx=0,
+                num_parts=1,
+                image_count=len(images),
+                images=image_layouts,
+                videos=video_layouts,
+                audios=audio_layouts,
+            )
+            native_type = (
+                self._info.staged_audio_model_type
+                if audios
+                else self._info.native_model_type
+            )
+            if native_type:
+                shape = self._describe_part(part_id).shape
+                rows = sum(
+                    item.embedding_rows
+                    for item in (*image_layouts, *video_layouts, *audio_layouts)
+                )
+                if len(shape) != 2 or shape[0] != rows or shape[1] <= 0:
+                    raise RuntimeError(
+                        "Native staged layout does not match its embedding"
+                    )
+                transfer.version = 4 if audios else 3
+                transfer.native_model_type = native_type
+                transfer.embedding_width = shape[1]
+            response = encoder_pb2.StageResponse(
+                transfer=transfer, instance_id=self._info.instance_id
+            )
+            if self._handoff_signer is not None:
+                response.handoff_mac = self._handoff_signer.sign(
+                    transfer, self._info.instance_id
+                )
+            if states.get(part_id) is not state or state.release_requested:
+                raise RuntimeError("Encoder request retired while staging")
+            state.staged_transfer = transfer
+            meta_registry.arm(part_id, self._ttl, self.encoder.release_request)
+            logger.debug(
+                "Stage complete request_id=%s part_id=%s images=%d videos=%d audios=%d",
+                transfer.request_id,
+                part_id,
+                transfer.image_count,
+                len(transfer.videos),
+                len(transfer.audios),
+            )
+            return response
+        except asyncio.CancelledError:
+            await self._retire_staged(part_id)
+            raise
+        except asyncio.TimeoutError:
+            await self._retire_staged(part_id)
+            await context.abort(
+                grpc.StatusCode.DEADLINE_EXCEEDED, "media staging timed out"
+            )
+        except Exception as exc:
+            await self._retire_staged(part_id)
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT
+                if isinstance(exc, ValueError)
+                else grpc.StatusCode.INTERNAL,
+                str(exc),
+            )
+
+    async def _retire_staged(self, part_id):
+        await await_task_completion_on_cancel(
+            asyncio.create_task(self.encoder.release_request(part_id)),
+            f"Release staged encoder part {part_id}",
+        )
+
+    async def _lookup_transfer(self, transfer, context):
+        part_id = create_part_req_id(transfer.transfer_id, 0)
+        state = self.encoder.req_states.get(part_id)
+        if state is not None and state.staged_transfer is not None:
+            if meta_registry.expired(part_id):
+                state.staged_transfer = None
+                meta_registry.disarm(part_id)
+                await self._retire_staged(part_id)
+            elif state.staged_transfer == transfer:
+                return state
+            else:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT, "invalid transfer identity"
+                )
+        await context.abort(grpc.StatusCode.NOT_FOUND, "transfer expired or consumed")
+
+    async def Describe(self, request, context):
+        state = await self._lookup_transfer(request.transfer, context)
+        if self.encoder.transfer_backend != "nixl":
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "NIXL is not enabled"
+            )
+        description = self._describe_part(state.req_id)
+        description.instance_id = self._info.instance_id
+        return description
+
+    async def Deliver(self, request, context):
+        state = await self._lookup_transfer(request.transfer, context)
+        use_nixl = self.encoder.transfer_backend == "nixl"
+        if use_nixl != bool(request.nixl_target) or use_nixl == bool(
+            request.receive_url
+        ):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "missing destination or incompatible encoder transfer backend",
+            )
+        # Claim before the native send acquires its reference. A second
+        # Deliver cannot post another write even if the first RPC is cancelled.
+        state.staged_transfer = None
+        meta_registry.disarm(state.req_id)
+        destination = (
+            SendDestination(nixl_target=request.nixl_target)
+            if use_nixl
+            else SendDestination(endpoint=request.receive_url, ephemeral=True)
+        )
+        send_error = None
+        try:
+            async with asyncio.timeout(self._ttl):
+                await self.encoder.send_to_destination(state, destination)
+        except asyncio.TimeoutError:
+            send_error = "staged media delivery timed out"
+        except Exception as exc:
+            send_error = str(exc)
+        finally:
+            await self._retire_staged(state.req_id)
+        if send_error is not None:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, send_error)
+        return encoder_pb2.DeliverResponse()
+
+    async def Release(self, request, context):
+        part_id = create_part_req_id(request.transfer_id, 0)
+        state = self.encoder.req_states.get(part_id)
+        if state is not None and state.staged_transfer is not None:
+            state.staged_transfer = None
+            meta_registry.disarm(part_id)
+            await self._retire_staged(part_id)
+        elif (
+            state is not None
+            and state.externally_staged
+            and self.encoder.transfer_backend == "nixl"
+        ):
+            # A claimed Deliver owns retirement. Its native send reference
+            # remains live through UCX completion, including on cancellation.
+            async with state.lifecycle_condition:
+                await state.lifecycle_condition.wait_for(
+                    lambda: state.active_sends == 0
+                )
+        return encoder_pb2.ReleaseResponse(
+            instance_id=self._info.instance_id if self._info is not None else b""
+        )
 
     async def _broadcast_to_workers(self, request):
         if self._dispatch_failed:
