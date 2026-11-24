@@ -86,7 +86,7 @@ def destroy_mega_moe_buffers() -> None:
 
 
 def prepare_mega_moe_arch22_weights(
-        layer, prefix, weight, *, packed_int4=False
+    layer, prefix, weight, *, packed_int4=False
 ) -> bool:
     """Build per-expert NZ tensors for arch22.
 
