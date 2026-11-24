@@ -294,6 +294,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
+            SpeculativeAlgorithm.STANDALONE,
         ):
             with self.subTest(algorithm=algorithm):
                 reporter = _make_reporter(self, types.SimpleNamespace())
@@ -455,7 +456,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         enable_metrics=False,
         is_stats_logging_rank=True,
         current_scheduler_metrics_enabled=False,
-        enable_kv_cache_events=False,
         collector=None,
     )
     return SchedulerMetricsReporter(
