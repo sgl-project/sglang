@@ -15,7 +15,7 @@ order, so they differ from the eager path only in the K summation order.
   IEEE kernel). On gfx1250 the three terms are N-major rows of one bf16 weight [3N, K]
   (``_router_split_bf16x3_nk``) under aiter's Gluon a16w16 GEMM with an fp32 output, and the three fp32 partial
   logits are summed (``_router_sum3``).
-* ``router_gemm_tlx``: any M, fbtriton's ``tlx.ops.router_gemm`` (vendored in ``sglang.kernels.tlx_ops``, plain
+* ``router_gemm_tlx``: any M, fbtriton's ``tlx.ops.router_gemm`` (vendored as ``tlx_router_gemm``, plain
   Triton) on an ``[N, K]`` contiguous weight copy; BF16x3-split FP32 weight MFMA, deterministic split order.
   MI355X, K=8192, N=256, HIP graphs: 2.3 us vs 6.1 us gemv at M=1, 125 us vs 337 us torch at M=8192.
 """

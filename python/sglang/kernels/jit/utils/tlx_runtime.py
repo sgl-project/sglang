@@ -1,4 +1,4 @@
-"""Runtime support for the vendored TLX kernels (``sglang.kernels.tlx_ops``) on stock ROCm Triton.
+"""Runtime support for the vendored TLX kernels (``sglang.kernels.ops.<group>.tlx_*``) on stock ROCm Triton.
 
 The kernels import ``triton.language.extra.tlx``. fbtriton ships it. On stock ROCm
 Triton, the uTLX plugin built for that Triton release registers it at interpreter

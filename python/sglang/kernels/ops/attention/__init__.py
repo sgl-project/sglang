@@ -479,7 +479,7 @@ register_kernel(
     KernelSpec(
         op="attention.tlx_qk_norm_rope_kv_cache",
         backend=KernelBackend.TLX,
-        target="sglang.kernels.tlx_ops.kernels.fused.qk_norm_rope_kv_cache.gfx950:qk_norm_rope_kv_cache",
+        target="sglang.kernels.ops.attention.tlx_qk_norm_rope_kv_cache:qk_norm_rope_kv_cache",
         capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )

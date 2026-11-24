@@ -139,7 +139,7 @@ for _op, _target in (
         "layernorm.tlx_norm_residual_norm",
         "sglang.kernels.ops.layernorm.tlx:norm_residual_norm",
     ),
-    ("layernorm.tlx_rmsnorm", "sglang.kernels.tlx_ops.kernels.norm.gfx950:rmsnorm"),
+    ("layernorm.tlx_rmsnorm", "sglang.kernels.ops.layernorm.tlx_rmsnorm:rmsnorm"),
 ):
     register_kernel(
         KernelSpec(

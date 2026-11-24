@@ -32,7 +32,6 @@ sglang/kernels/
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
   plugin_kernels/  # plugin kernel backend: contracts of external kernel
                    # libraries, as <hardware>/<model>/
-  tlx_ops/       # fbtriton tlx.ops kernels, vendored unmodified (see its README)
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -179,6 +178,29 @@ the op's `TRITON` slot. The TLX backend is not in `DEFAULT_PRIORITY`, because
 whether fbtriton or uTLX is installed is not a capability; callers opt in.
 `test_kernels_namespace.py` checks that every spec whose target is a TLX
 kernel is registered as `TLX`.
+
+TLX code lives in the operator groups as `ops/<group>/tlx_<op>.py` (kernels) and
+`ops/<group>/tlx.py` (SGLang wrappers). The kernel files below are copied from
+`third_party/tlx/ops/` in fbtriton (MIT licence); each starts with a line naming
+its upstream path and commit, and the pre-commit config excludes them so their
+formatting stays upstream's. To re-sync one, copy the upstream file, re-apply
+the header and the import edits listed here, and update its commit.
+
+| File | Upstream (`third_party/tlx/ops/`) | Commit | Local edits |
+|---|---|---|---|
+| `gemm/tlx_mm.py` | `kernels/mm/gfx950.py` | `2e8256a9b` | `InvalidInput` from `jit/utils/tlx_runtime.py`; `gemm_fixed_split_k` from `gemm/tlx_mm_invariance.py` |
+| `gemm/tlx_mm_invariance.py` | `_invariance.py` | `2e8256a9b` | `InvalidInput` from `jit/utils/tlx_runtime.py` |
+| `gemm/tlx_router_gemm.py` | `kernels/router_gemm/gfx950.py` | `87abb3f5a` | none |
+| `layernorm/tlx_rmsnorm.py` | `kernels/norm/gfx950.py` | `87abb3f5a` | `UnsupportedOp` from `jit/utils/tlx_runtime.py` |
+| `layernorm/tlx_norm_residual_norm.py` | `kernels/fused/norm_residual_norm/gfx950.py` | `87abb3f5a` | none |
+| `attention/tlx_qk_norm_rope_kv_cache.py` | `kernels/fused/qk_norm_rope_kv_cache/gfx950.py` | `87abb3f5a` | none |
+| `moe/tlx_moe.py` | `kernels/moe/gfx950.py` | `2e8256a9b` | `_register_matmul_core` from `gemm/tlx_mm.py` |
+
+`InvalidInput` and `UnsupportedOp` are the two exception classes of upstream's
+`_catalog.py`, whose op table SGLang does not use. Upstream's
+`kernels/moe/routing_gfx950.py` (`tlx.ops.moe_routing`) is not vendored: with
+triton-utlx 3.9.0.post4 its `tl.where` on a `tlx.require_layout` tensor and a
+plain one fails `arith.select` verification on stock Triton.
 
 ## How it works
 
