@@ -22,6 +22,12 @@ other shape, a bias, an addend or a non-contiguous operand takes the stock dispa
 differ from stock in FP32 summation order; each is checked at load against a relative-L2 bound instead.
 ``NONBITWISE_LOWM_ROUTES`` (opt-in, SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES=1) are the same kind of
 key for the same shape at smaller M, checked the same way.
+
+SM103 (GB300) has its own three tables (``SM103_*``) under the same switches: its cuBLAS 13.8 slices these shapes
+differently (2 K slices for router / index_qk at M 5-32, no split at all for the shared gate_up at M 1-16), so none of
+the SM107 keys is bitwise there. They were picked on GB300 the same way (mb_bf16_gemm_pins.py, cold weights, CUDA
+graph). ``"warp"`` (non-bitwise tables only) is FlashInfer 0.7.2's warp split-K at tactic
+``(output_tile, token_tile, k_tile, stages, b_loader_warps)``.
 """
 
 from __future__ import annotations
@@ -81,6 +87,35 @@ NONBITWISE_LOWM_ROUTES = {
     **{(m, *_OUT_PROJ): ("cl", (64, 8, 4, 8, 128)) for m in range(4, 9)},
     **{(m, *_OUT_PROJ): ("cl", (64, 16, 4, 10, 128)) for m in range(9, 17)},
 }
+# SM103 (GB300, cuBLAS 13.8.1). cuBLAS runs router / index_qk at M 5-7, 9-32 as 2 K slices of 1280 plus a separate
+# reduce; FlashInfer's cluster split-K at 2 slices gives the same bits in one kernel (6.1 -> 4.7-5.5 us). M 1-4 and 8
+# are unquant's tuned FlashInfer split-K already.
+_SM103_SPLIT2 = {m: (64, 8 if m <= 8 else 16 if m <= 16 else 32, 2, 9 if m > 16 else 10, 128) for m in range(5, 33)}
+SM103_ROUTES = {
+    (m, *nk): ("cl", _SM103_SPLIT2[m])
+    for nk in (_ROUTER, _INDEX_QK)
+    for m in (5, 6, 7, *range(9, 17), 20, 24, 28, 32)
+}
+# Non-bitwise on SM103 (relative L2 1e-5 to 2.3e-4 against stock at these keys), measured per call (stock -> route):
+# router / index_qk warp split-K 4.1-6.2 -> 2.8-3.5 us, out_proj warp split-K at M 1-16 9.1 -> 6.9-7.6 us and
+# cluster split-K at M 20-32 9.7 -> 8.9 us, attn_qkv warp split-K at M 1-8 14.8 -> 11.9 us, gdn_in_proj at M 1-7
+# 14.8 -> 14.0 us. The shared expert's GEMMs are left out: they run beside the routed chain, off the critical path.
+SM103_NONBITWISE_ROUTES = {
+    **{(m, *nk): ("warp", (16, 16, 256, 10, 2)) for nk in (_ROUTER, _INDEX_QK) for m in (20, 24, 28, 32)},
+    **{(m, *_OUT_PROJ): ("cl", (64, 32, 2, 9, 128)) for m in (20, 24, 28, 32)},
+}
+SM103_NONBITWISE_LOWM_ROUTES = {
+    **{(m, *nk): ("warp", (16, 8, 256, 10, 2)) for nk in (_ROUTER, _INDEX_QK) for m in range(1, 17)},
+    **{(m, *_OUT_PROJ): ("warp", (32, 8, 256, 11, 2)) for m in range(1, 9)},
+    **{(m, *_OUT_PROJ): ("warp", (32, 16, 256, 9, 2)) for m in range(9, 17)},
+    **{(m, *_ATTN_QKV): ("warp", (16, 8, 128, 4, 1)) for m in range(1, 9)},
+    **{(m, *_GDN_IN_PROJ): ("warp", (16, 8, 128, 4, 1)) for m in range(1, 8)},
+}
+_TABLES = {
+    107: (ROUTES, NONBITWISE_ROUTES, NONBITWISE_LOWM_ROUTES),
+    103: (SM103_ROUTES, SM103_NONBITWISE_ROUTES, SM103_NONBITWISE_LOWM_ROUTES),
+}
+_NONBITWISE_KINDS = ("cl", "warp")
 # Measured 1.2-1.7e-4 at these keys on SM107; one BF16 ulp on every output element is about 4e-3.
 _NONBITWISE_REL_L2_MAX = 1e-3
 # FlashInfer 0.7.2's dense_bf16_gemm_sm100_splitk.py with FlashInfer #7443's hand-off fix, vendored as
@@ -95,6 +130,7 @@ _logged: set = set()
 _checked = False  # set by precompile's check; routes serve only after it
 _fused_act = None  # sm107_shared_expert_act when SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT is on
 _nonbitwise: frozenset = frozenset()  # the NONBITWISE_ROUTES keys in _routes
+_lowm: dict = {}  # this device's NONBITWISE_LOWM_ROUTES
 _precompiling = False
 
 
@@ -158,16 +194,18 @@ def _install_fused_act(routes_on: bool) -> None:
 def _install_routes(
     device_sm: int, splitk_enabled: bool, cutedsl_available: bool
 ) -> bool:
-    global _routes, _fi, _checked, _nonbitwise
+    global _routes, _fi, _checked, _nonbitwise, _lowm
     _routes = None
     _checked = False
     _nonbitwise = frozenset()
-    if not (splitk_enabled and cutedsl_available and device_sm == 107):
+    if not (splitk_enabled and cutedsl_available and device_sm in _TABLES):
         logger.warning(
-            "SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES needs SM107 and the cutedsl BF16 GEMM backend with split-K; "
-            "the stock dispatch stays"
+            "SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES needs SM107 or SM103 and the cutedsl BF16 GEMM backend with "
+            "split-K; the stock dispatch stays"
         )
         return False
+    routes, nonbitwise, lowm = _TABLES[device_sm]
+    _lowm = lowm
     try:
         import cuda.bindings.driver as cuda_driver
         from sglang.kernels.ops.gemm import dense_bf16_gemm_sm100_splitk as fi_splitk
@@ -188,7 +226,7 @@ def _install_routes(
             digest[:16],
         )
         return False
-    for (m, n, k), (kind, tactic) in ROUTES.items():
+    for (m, n, k), (kind, tactic) in routes.items():
         if (kind == "tgvc" and not _tgvc_ok(*tactic)) or (
             kind == "cl" and not _cluster_ok(k, tactic, fi_splitk._SMEM_CAPACITY_BYTES)
         ):
@@ -200,26 +238,34 @@ def _install_routes(
             )
             return False
     _fi = (fi_splitk, cuda_driver.CUstream)
-    _routes = ROUTES
-    kinds = [route[0] for route in ROUTES.values()]
+    _routes = routes
+    kinds = [route[0] for route in routes.values()]
     logger.info(
-        "SM107 bitwise small-M BF16 GEMM routes on: %d keys (cluster split-K %d, TGV %d)",
+        "SM%d bitwise small-M BF16 GEMM routes on: %d keys (cluster split-K %d, TGV %d)",
+        device_sm,
         len(kinds),
         kinds.count("cl"),
         kinds.count("tgv") + kinds.count("tgvc"),
     )
     if envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES.get():
-        _install_nonbitwise(fi_splitk._SMEM_CAPACITY_BYTES)
+        _install_nonbitwise(nonbitwise, fi_splitk._SMEM_CAPACITY_BYTES)
     if envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES.get():
-        _install_nonbitwise_lowm(fi_splitk._SMEM_CAPACITY_BYTES)
+        _install_nonbitwise_lowm(lowm, fi_splitk._SMEM_CAPACITY_BYTES)
     return True
 
 
-def _install_nonbitwise(smem_capacity: int) -> None:
-    """Add NONBITWISE_ROUTES to the installed routes; they serve after precompile's relative-L2 check."""
+def _nonbitwise_ok(k: int, kind: str, tactic: tuple, smem_capacity: int) -> bool:
+    if kind == "cl":
+        return _cluster_ok(k, tactic, smem_capacity)
+    return kind == "warp" and len(tactic) == 5
+
+
+def _install_nonbitwise(table: dict, smem_capacity: int) -> None:
+    """Add this device's NONBITWISE_ROUTES to the installed routes (a key may replace a bitwise one); they serve after
+    precompile's relative-L2 check."""
     global _routes, _nonbitwise
-    for (m, n, k), (kind, tactic) in NONBITWISE_ROUTES.items():
-        if kind != "cl" or not _cluster_ok(k, tactic, smem_capacity):
+    for (m, n, k), (kind, tactic) in table.items():
+        if not _nonbitwise_ok(k, kind, tactic, smem_capacity):
             logger.warning(
                 "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES: route %s %s at %s is invalid; "
                 "only the bitwise routes serve",
@@ -228,16 +274,16 @@ def _install_nonbitwise(smem_capacity: int) -> None:
                 (m, n, k),
             )
             return
-    _routes = {**ROUTES, **NONBITWISE_ROUTES}
-    _nonbitwise = frozenset(NONBITWISE_ROUTES)
+    _routes = {**_routes, **table}
+    _nonbitwise = frozenset(table)
 
 
-def _install_nonbitwise_lowm(smem_capacity: int) -> None:
-    """Add NONBITWISE_LOWM_ROUTES to the installed routes (after NONBITWISE_ROUTES, if on); an invalid tactic leaves
-    every other installed key alone. They serve after precompile's relative-L2 check, as NONBITWISE_ROUTES."""
+def _install_nonbitwise_lowm(table: dict, smem_capacity: int) -> None:
+    """Add this device's NONBITWISE_LOWM_ROUTES to the installed routes (after NONBITWISE_ROUTES, if on); an invalid
+    tactic leaves every other installed key alone. They serve after precompile's relative-L2 check."""
     global _routes, _nonbitwise
-    for (m, n, k), (kind, tactic) in NONBITWISE_LOWM_ROUTES.items():
-        if kind != "cl" or not _cluster_ok(k, tactic, smem_capacity) or (m, n, k) in _routes:
+    for (m, n, k), (kind, tactic) in table.items():
+        if not _nonbitwise_ok(k, kind, tactic, smem_capacity) or (m, n, k) in _nonbitwise:
             logger.warning(
                 "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES: route %s %s at %s is invalid or already "
                 "routed; the low-M keys keep the stock dispatch",
@@ -246,8 +292,8 @@ def _install_nonbitwise_lowm(smem_capacity: int) -> None:
                 (m, n, k),
             )
             return
-    _routes = {**_routes, **NONBITWISE_LOWM_ROUTES}
-    _nonbitwise = _nonbitwise | frozenset(NONBITWISE_LOWM_ROUTES)
+    _routes = {**_routes, **table}
+    _nonbitwise = _nonbitwise | frozenset(table)
 
 
 def _cluster_out(
@@ -340,7 +386,18 @@ def _tgv_out(
     )
 
 
-_RUNNERS = {"cl": _cluster_out, "tgvc": _tgvc_out, "tgv": _tgv_out}
+def _warp_out(
+    x_2d: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, tactic
+) -> None:
+    from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+        WarpSplitKTactic,
+        run_warp_splitk_dense,
+    )
+
+    run_warp_splitk_dense(x_2d, weight.T, out, True, WarpSplitKTactic(*tactic))
+
+
+_RUNNERS = {"cl": _cluster_out, "tgvc": _tgvc_out, "tgv": _tgv_out, "warp": _warp_out}
 
 
 def route_for(x: torch.Tensor, weight: torch.Tensor) -> Optional[tuple]:
@@ -398,7 +455,7 @@ def gemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
         _nonbitwise
         and not _precompiling
         and "nonbitwise_lowm" not in _logged
-        and (m, *weight.shape) in NONBITWISE_LOWM_ROUTES
+        and (m, *weight.shape) in _lowm
         and (m, *weight.shape) in _nonbitwise
     ):
         _logged.add("nonbitwise_lowm")

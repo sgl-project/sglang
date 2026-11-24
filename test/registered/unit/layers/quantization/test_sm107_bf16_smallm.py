@@ -1,5 +1,6 @@
 """SM107 bitwise small-M BF16 GEMM routes and the shared-expert fused act: tables, gating, fallback (CPU)."""
 
+import contextlib
 import hashlib
 import struct
 import sys
@@ -48,6 +49,20 @@ def _fake_flashinfer(source: bytes):
     }
 
 
+@contextlib.contextmanager
+def _vendored_splitk(module):
+    """install() imports the vendored sglang copy of the split-K module: serve ``module`` there (None: missing)."""
+    import sglang.kernels.ops.gemm as gemm_pkg
+
+    name = "dense_bf16_gemm_sm100_splitk"
+    with mock.patch.dict(sys.modules, {f"{gemm_pkg.__name__}.{name}": module}):
+        with mock.patch.dict(gemm_pkg.__dict__):
+            gemm_pkg.__dict__.pop(name, None)
+            if module is not None:
+                setattr(gemm_pkg, name, module)
+            yield
+
+
 class TestRouteTable(CustomTestCase):
     def test_stock_tuned_keys_keep_the_stock_route(self):
         """The routes are consulted before the split-K allowlist, so a shared key would change a tuned shape."""
@@ -66,6 +81,25 @@ class TestRouteTable(CustomTestCase):
             self.assertEqual((k // split_k) % cta_k, 0, (m, n, k))
             self.assertLessEqual(-(-m // mma_n), 4, (m, n, k))
             self.assertTrue(routes._cluster_ok(k, tactic, _SMEM_CAPACITY), (m, n, k))
+
+    def test_sm103_tables(self):
+        """GB300's cuBLAS 13.8 slices router / index_qk into 2 K slices; M 1-4 and 8 stay on the tuned split-K."""
+        stock = set(unquant._BF16_SPLITK_TUNED_TACTICS) | set(
+            unquant._BF16_WARP_SPLITK_TUNED_TACTICS
+        )
+        self.assertEqual(set(routes.SM103_ROUTES) & stock, set())
+        for (m, n, k), (kind, tactic) in routes.SM103_ROUTES.items():
+            self.assertEqual((kind, tactic[2]), ("cl", 2), (m, n, k))
+            self.assertTrue(routes._cluster_ok(k, tactic, _SMEM_CAPACITY), (m, n, k))
+        for table, low, high in (
+            (routes.SM103_NONBITWISE_ROUTES, 17, 32),
+            (routes.SM103_NONBITWISE_LOWM_ROUTES, 1, 16),
+        ):
+            for (m, n, k), (kind, tactic) in table.items():
+                self.assertTrue(low <= m <= high, (m, n, k))
+                self.assertTrue(
+                    routes._nonbitwise_ok(k, kind, tactic, _SMEM_CAPACITY), (m, n, k)
+                )
 
     def test_tgv_routes_are_valid_tiles(self):
         kinds = [kind for kind, _ in routes.ROUTES.values()]
@@ -88,10 +122,10 @@ class TestInstall(CustomTestCase):
         routes._routes = None
         routes._fi = None
 
-    def test_refused_off_sm107_or_without_split_k(self):
+    def test_refused_off_sm103_sm107_or_without_split_k(self):
         for kwargs in (
             dict(device_sm=100, splitk_enabled=True, cutedsl_available=True),
-            dict(device_sm=103, splitk_enabled=True, cutedsl_available=True),
+            dict(device_sm=103, splitk_enabled=False, cutedsl_available=True),
             dict(device_sm=107, splitk_enabled=False, cutedsl_available=True),
             dict(device_sm=107, splitk_enabled=True, cutedsl_available=False),
         ):
@@ -102,7 +136,9 @@ class TestInstall(CustomTestCase):
     def test_installed_only_against_the_checked_flashinfer_source(self):
         source = b"# split-K kernel source\n"
         digest = hashlib.sha256(source).hexdigest()
-        with mock.patch.dict(sys.modules, _fake_flashinfer(source)):
+        fake = _fake_flashinfer(source)
+        splitk = fake["flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"]
+        with mock.patch.dict(sys.modules, fake), _vendored_splitk(splitk):
             self.assertFalse(
                 routes.install(
                     device_sm=107, splitk_enabled=True, cutedsl_available=True
@@ -116,6 +152,14 @@ class TestInstall(CustomTestCase):
                     )
                 )
         self.assertIs(routes._routes, routes.ROUTES)
+        with mock.patch.dict(sys.modules, fake), _vendored_splitk(splitk):
+            with mock.patch.object(routes, "_FI_SPLITK_SHA256", digest):
+                self.assertTrue(
+                    routes.install(
+                        device_sm=103, splitk_enabled=True, cutedsl_available=True
+                    )
+                )
+        self.assertIs(routes._routes, routes.SM103_ROUTES)
 
 
 class TestFailClosed(CustomTestCase):
@@ -129,7 +173,7 @@ class TestFailClosed(CustomTestCase):
             "flashinfer.gemm.kernels": None,
             "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk": None,
         }
-        with mock.patch.dict(sys.modules, missing):
+        with mock.patch.dict(sys.modules, missing), _vendored_splitk(None):
             self.assertFalse(
                 routes.install(
                     device_sm=107, splitk_enabled=True, cutedsl_available=True

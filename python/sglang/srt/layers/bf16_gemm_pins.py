@@ -1,6 +1,7 @@
 """Pinned kernels for unquantized BF16 GEMMs at listed (M, N, K) (default off).
 
-``SGLANG_BF16_GEMM_PIN_FILE`` names a JSON file (``.json.py`` so a source overlay can carry it)::
+``SGLANG_BF16_GEMM_PIN_FILE`` names a JSON file (``.json.py`` so a source overlay can carry it; a bare name is looked
+up in this package's ``moe/tactic_pins``)::
 
     {"_metadata": {"flashinfer_version": "0.7.2", "cuda_version": "13.4",
                    "cublas_version": "13.8.1", "gpu": "NVIDIA VR NVL72", "sm": "10.7"},
@@ -85,6 +86,9 @@ def _load() -> dict:
     path = envs.SGLANG_BF16_GEMM_PIN_FILE.get()
     if not path:
         return _state
+    if not os.path.isabs(path):
+        # A bare name is a file of this package's moe/tactic_pins, wherever the package (or an overlay) lives.
+        path = os.path.join(os.path.dirname(__file__), "moe", "tactic_pins", path)
     from sglang.srt.layers.moe.flashinfer_tactic_pins import (
         read_tuning_file,
         tuning_file_applies,

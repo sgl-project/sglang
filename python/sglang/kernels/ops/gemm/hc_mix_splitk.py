@@ -162,6 +162,22 @@ _WIDE_TACTICS = (
     (448, (64, 32, 2, 8), (64, 32, 64, 8, 3)),
     (512, (64, 32, 2, 8), (128, 32, 64, 8, 3)),
 )
+# GB300 (SM103): the same split_k per row as above, so the same K slices, rank order and bits; token tiles, stages and
+# Triton tiles re-picked on GB300 (mb_hc_mix_wide.py, cold weights, CUDA graph). Per call: down 10.6 -> 8.0 us at
+# 113-144 rows, 16.7 -> 10.1 at 289-320, 18.5 -> 15.6 at 512; up 6.3 -> 5.6 at <= 64, 7.0 -> 6.1 at 65-96,
+# 12.4-13.3 -> 9.4-11.3 at 321-448.
+_WIDE_TACTICS_SM103 = (
+    (48, (64, 16, 8, 8), (32, 16, 64, 4, 3)),
+    (64, (64, 32, 8, 7), (32, 16, 64, 4, 3)),
+    (96, (64, 16, 4, 8), (32, 32, 64, 4, 3)),
+    (112, (64, 16, 4, 8), (64, 32, 64, 8, 3)),
+    (144, (64, 32, 4, 8), (64, 32, 64, 8, 3)),
+    (288, (64, 32, 4, 8), (64, 32, 64, 4, 3)),
+    (320, (64, 32, 2, 9), (64, 32, 64, 4, 3)),
+    (384, (64, 32, 2, 9), (128, 32, 64, 8, 3)),
+    (448, (64, 32, 2, 9), (64, 64, 64, 8, 2)),
+    (512, (128, 32, 2, 5), (128, 32, 64, 8, 3)),
+)
 WIDE_MAX_ROWS = _WIDE_TACTICS[-1][0]
 _wide_scratch_cache = {}
 _wide_tactic_cache = {}
@@ -186,7 +202,12 @@ def _get_wide_tactics(m: int, lowrank: int, k: int):
             validate_tactic,
         )
 
-        down, up = next((d, u) for rows, d, u in _WIDE_TACTICS if m <= rows)
+        table = (
+            _WIDE_TACTICS_SM103
+            if torch.cuda.get_device_capability() == (10, 3)
+            else _WIDE_TACTICS
+        )
+        down, up = next((d, u) for rows, d, u in table if m <= rows)
         tactics = (SplitKTactic(*down), up)
         validate_tactic(tactics[0], m, lowrank, k, max_m=WIDE_MAX_ROWS)
         _wide_tactic_cache[key] = tactics
