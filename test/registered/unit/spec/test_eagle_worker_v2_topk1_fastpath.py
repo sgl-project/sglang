@@ -184,7 +184,7 @@ class _Fold:
 
 
 class TestEagleDraftStepFold(CustomTestCase):
-    def run_round(self, fold, *, mrope=True, return_logprob=False, bs=2):
+    def run_round(self, fold, *, mrope=True, return_logprob=False, bs=2, shard=None):
         steps = 3
         worker = object.__new__(EagleDraftWorker)
         worker.topk, worker.speculative_num_steps = 1, steps
@@ -199,7 +199,11 @@ class TestEagleDraftStepFold(CustomTestCase):
         def forward(fb):
             seen.append(fb.draft_step_fold)
             logits.append(torch.randn(bs, 16))
-            out = SimpleNamespace(next_token_logits=logits[-1], hidden_states=None)
+            out = SimpleNamespace(
+                next_token_logits=logits[-1],
+                next_token_logits_vocab_shard=shard,
+                hidden_states=None,
+            )
             return SimpleNamespace(logits_output=out)
 
         worker.draft_runner = SimpleNamespace(
@@ -207,6 +211,7 @@ class TestEagleDraftStepFold(CustomTestCase):
             forward=forward,
             model_config=SimpleNamespace(
                 model_is_mrope=mrope,
+                vocab_size=16,
                 hf_config=SimpleNamespace(architectures=["Qwen4ExpForCausalLMMTP"]),
             ),
         )
@@ -243,6 +248,10 @@ class TestEagleDraftStepFold(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess", stock
             ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2._vocab_shard_top1",
+                lambda out: (torch.ones(bs, 1), torch.full((bs, 1), len(logits))),
+            ),
         ):
             out = worker.draft_forward(fb, greedy=False)
         return SimpleNamespace(
@@ -271,6 +280,13 @@ class TestEagleDraftStepFold(CustomTestCase):
             self.assertEqual(r.fb.mrope_positions.tolist(), [[2, 2]] * 3)
             self.assertIs(r.fb.draft_step_fold, offered)
         self.assertEqual(fold.calls, [])
+
+    def test_vocab_shards_skip_the_full_vocab_argmax(self):
+        # shard logits are this rank's column slice; the full-vocab argmax must not read them
+        r = self.run_round(None, shard=object())
+        r.stock.assert_not_called()
+        self.assertEqual(r.positions.tolist(), [2, 3])
+        self.assertEqual(r.out[2][:, 1:].tolist(), [[1, 2], [1, 2]])
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

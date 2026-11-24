@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import built_megakernel
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -108,6 +109,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     run_eagle_verify,
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
+from sglang.srt.speculative.sharded_verify import sharded_target_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -183,6 +185,16 @@ def _prefill_graph_max_tokens(graph_runner: Optional[BaseRunner]) -> int:
     if isinstance(graph_runner, PrefillCudaGraphRunner):
         return graph_runner.max_num_tokens
     return 0
+
+
+def _vocab_shard_top1(logits_output) -> tuple[torch.Tensor, torch.Tensor]:
+    """draft_topk1_postprocess's (topk_p, topk_index) from every TP rank's vocab shard."""
+    topk_index = sharded_target_tokens(
+        logits=logits_output.next_token_logits,
+        shard=logits_output.next_token_logits_vocab_shard,
+        tp_group=get_parallel().tp_group,
+    )[:, None]
+    return torch.ones_like(topk_index, dtype=torch.float32), topk_index
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -342,6 +354,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.hot_token_id is not None:
             return self.hot_token_id.shape[0]
         return self.draft_runner.model_config.vocab_size
+
+    def sharded_top1_model(self) -> Optional[torch.nn.Module]:
+        """The draft model when a topk-1 argmax is the only reader of its logits."""
+        model = self.draft_runner.model
+        if (
+            self.hot_token_id is None
+            and built_megakernel(model) is None
+            and not get_spec().speculative_use_rejection_sampling
+            # the key exchange state is shared with the target verify: same TP group,
+            # and the same vocab so its LM-head shards (hence key splits) match
+            and self.parallel_layout.tp_group is None
+            and self.draft_runner.model_config.vocab_size
+            == self.target_worker.model_config.vocab_size
+        ):
+            return model
+        return None
 
     def init_attention_backends(self):
         with (
@@ -987,6 +1015,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
+                elif logits_output.next_token_logits_vocab_shard is not None:
+                    topk_p, topk_index = _vocab_shard_top1(logits_output)
+                    if draft_tokens_topk1 is not None:
+                        draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
+                    forward_batch.positions.add_(1)
                 elif self.topk == 1:
                     if fold is not None:
                         topk_p, topk_index = fold.finalize(
@@ -1020,10 +1053,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
-                    topk_index,
-                    0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    indices=topk_index,
+                    low=0,
+                    high=self.draft_probs_vocab_size,
+                    msg=f"draft_forward step {i}: topk_index OOB vs vocab_size={self.draft_probs_vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -1530,7 +1563,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     positions=batch_result.new_seq_lens,
                     fused=self.use_fused_draft_sample,
                 )
-            if self.topk == 1 and _is_hip:
+            if draft_logits_output.next_token_logits_vocab_shard is not None:
+                ret_topk_p, ret_topk_index = _vocab_shard_top1(draft_logits_output)
+            elif self.topk == 1 and _is_hip:
                 ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
                     draft_logits_output.next_token_logits
                 )
@@ -1672,7 +1707,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_attention_backends()
         # Resolve once before any eager or captured post-verify path runs.
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
-            self.target_worker, supports_sharded_verify=self.topk == 1
+            self.target_worker,
+            supports_sharded_verify=self.topk == 1,
+            # a frozen-KV draft runs its own draft_forward
+            sharded_draft_model=(
+                self._draft_worker.sharded_top1_model()
+                if isinstance(self._draft_worker, EagleDraftWorker)
+                else None
+            ),
         )
         # not in __init__, which the standalone and frozen-KV workers do not run
         if (

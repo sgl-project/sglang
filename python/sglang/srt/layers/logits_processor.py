@@ -566,6 +566,7 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        self.sharded_draft = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -621,6 +622,10 @@ class LogitsProcessor(nn.Module):
         self.sharded_verify = self._sharded_verify_eligible
         self._sharded_verify_temperature_keys = temperature_keys
 
+    def enable_sharded_draft(self) -> None:
+        """Opt in a draft whose decode and draft-extend logits feed only a top-1."""
+        self.sharded_draft = self._sharded_verify_eligible
+
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
         """Whether this target verify keeps its logits as vocabulary shards.
 
@@ -649,6 +654,9 @@ class LogitsProcessor(nn.Module):
         ) and spec_allows_vocab_shards(get_spec())
 
     def _batch_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
+        if self.sharded_draft:
+            mode = forward_batch.forward_mode
+            return mode.is_decode() or mode.is_draft_extend_v2()
         if not self.sharded_verify:
             return False
         from sglang.srt.model_executor.runner_utils.capture_mode import (
@@ -839,12 +847,10 @@ class LogitsProcessor(nn.Module):
     def _verify_vocab_shard(
         self, lm_head: VocabParallelEmbedding, logits_metadata: LogitsMetadata
     ):
-        """The VocabShard a target verify keeps its logits in, or None for the gather."""
+        """The VocabShard a verify or draft forward keeps its logits in, or None to gather."""
         if not (
-            self.sharded_verify
-            and logits_metadata.verify_vocab_shards
+            logits_metadata.verify_vocab_shards
             and not self.defer_verify_gather
-            and logits_metadata.forward_mode.is_target_verify()
             and self.final_logit_softcapping is None
             and isinstance(lm_head, VocabParallelEmbedding)
             and lm_head.shard_indices.num_added_elements_padded == 0

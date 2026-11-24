@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
-from sglang.srt.speculative import eagle_utils, sharded_verify
+from sglang.srt.speculative import eagle_utils, eagle_worker_v2, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -223,6 +224,45 @@ class TestShardedGreedy(CustomTestCase):
         ll.assert_called_once()
         mc.assert_called_once()
         self.assertTrue(torch.equal(got, torch.argmax(full.float(), dim=-1)))
+
+
+def _none(*_):
+    return None
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestShardedDraftTop1(CustomTestCase):
+    def test_matches_stock_draft_top1(self):
+        full = (torch.randn(8, VOCAB, device="cuda") * 4).bfloat16()
+        peak = float(full.float().max()) + 1
+        full[1, 7], full[1, 9] = float("nan"), peak
+        # TP 4; the padded tail holds the largest values and must never win
+        width = VOCAB // 4 + 64
+        padded = torch.nn.functional.pad(full, (0, 4 * width - VOCAB), value=peak + 1)
+        shards = [part.contiguous() for part in padded.split(width, dim=1)]
+
+        def shard(rank):
+            valid = min(width, VOCAB - rank * width)
+            return VocabShard(start=rank * width, valid=valid, vocab_size=VOCAB)
+
+        keys = [
+            shard_keys(logits=s, shard=shard(r), splits=key_splits(width))
+            for r, s in enumerate(shards)
+        ]
+        output = SimpleNamespace(
+            next_token_logits=shards[0], next_token_logits_vocab_shard=shard(0)
+        )
+        parallel = SimpleNamespace(tp_group=_FakeGroup(keys))
+        with (
+            patch.multiple(sharded_verify, _ll_keys=_none, _mc_gather_keys=_none),
+            patch.object(eagle_worker_v2, "get_parallel", return_value=parallel),
+        ):
+            got = eagle_worker_v2._vocab_shard_top1(output)
+        want = draft_topk1_postprocess(
+            next_token_logits=full,
+            positions=torch.zeros(8, dtype=torch.long).cuda(),
+        )
+        self.assertTrue(all(torch.equal(g, w) for g, w in zip(got, want)))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")

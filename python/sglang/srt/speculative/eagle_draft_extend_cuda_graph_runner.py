@@ -785,6 +785,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if out.next_token_logits is None
                 else out.next_token_logits[:raw_bs]
             ),
+            next_token_logits_vocab_shard=out.next_token_logits_vocab_shard,
             # The unchanged megakernel batch consumes the graph-owned rows before
             # replay; every other path detaches the recurrent state from that buffer.
             hidden_states=(
