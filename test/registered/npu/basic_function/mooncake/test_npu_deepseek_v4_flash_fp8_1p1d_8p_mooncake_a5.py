@@ -205,6 +205,16 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
     # Thinking mode streams up to 125k tokens per answer; the router's 1800s
     # default would cut those responses off mid-stream.
     lb_request_timeout_secs = 10800
+    # A cold runner reads the 48 checkpoint shards at ~20-25 s each, and both
+    # workers load concurrently, so the 600 s default launch budget expires
+    # while the weights are still loading.
+    server_launch_timeout = 5400
+
+    @classmethod
+    def wait_server_ready(cls, url, timeout=None, process=None):
+        super().wait_server_ready(
+            url, timeout=timeout or cls.server_launch_timeout, process=process
+        )
 
     @classmethod
     def setUpClass(cls):
