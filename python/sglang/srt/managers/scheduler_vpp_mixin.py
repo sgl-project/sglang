@@ -547,9 +547,8 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         metadata = self.mb_metadata[slot_id]
         if batch is None or metadata is None:
             raise RuntimeError("VPP completion missing batch or forward metadata")
-        # Global completion follows every local stage write; local event is still
-        # the authority for request lifecycle and workspace reuse.
-        metadata.forward_done.synchronize()
+        # Order local writes and the relayed output on the copy stream, then
+        # fence once before processing results and retiring launch leases.
         for req in batch.reqs:
             generation = int(getattr(req, "session_generation", None) or 0)
             entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
@@ -561,6 +560,7 @@ class SchedulerVPPMixin(SchedulingVPPCore):
                 req.skip_radix_cache_insert = req._vpp_original_skip_radix_cache_insert
         with self.copy_stream_ctx:
             self.copy_stream.wait_stream(self.schedule_stream)
+            self.copy_stream.wait_event(metadata.forward_done)
             output_tensors = {
                 key: value.to(self.device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
@@ -570,11 +570,9 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             result = self._pp_prep_batch_result(
                 batch, metadata, PPProxyTensors(output_tensors)
             )
-            result.copy_done = self.device_module.Event()
-            result.copy_to_cpu(
-                return_logprob=batch.return_logprob, return_hidden_states=False
-            )
-        result.copy_done.synchronize()
+            copy_done = self.device_module.Event()
+            copy_done.record(self.copy_stream)
+        copy_done.synchronize()
         with self._pp_vpp_select_chunk(
             {req.rid for req in batch.reqs}, include_retained=True
         ):

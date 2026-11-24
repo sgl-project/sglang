@@ -2077,6 +2077,57 @@ class TestSchedulerVPP(CustomTestCase):
 
 
 class TestNativeVPPAdapter(CustomTestCase):
+    def test_completion_fences_copy_before_retiring_batch(self):
+        order = []
+
+        class Event:
+            def record(self, stream):
+                order.append("record")
+
+            def synchronize(self):
+                order.append("copy_ready")
+
+        class Stream:
+            def wait_stream(self, stream):
+                order.append("wait_schedule")
+
+            def wait_event(self, event):
+                order.append("wait_forward")
+
+        batch = SimpleNamespace(reqs=[], contains_last_prefill_chunk=False)
+        launch = object()
+        metadata = SimpleNamespace(forward_launch=launch, forward_done=object())
+        result = SimpleNamespace(copy_done=None, forward_launch=launch)
+        scheduler = object.__new__(SchedulerVPPMixin)
+        scheduler.__dict__.update(
+            mbs=[batch, None],
+            mb_metadata=[metadata, None],
+            last_mbs=[None, None],
+            _vpp_forward_batches={0: object()},
+            copy_stream_ctx=nullcontext(),
+            copy_stream=Stream(),
+            schedule_stream=object(),
+            device="cpu",
+            device_module=SimpleNamespace(Event=Event),
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            _pp_prep_batch_result=lambda *args: result,
+            _pp_process_batch_result=lambda batch, result: order.append("processed"),
+        )
+        slots = [0, None]
+        scheduler._pp_vpp_finalize_rank_local_batch(
+            0, slots, {"next_token_ids": torch.tensor([3])}
+        )
+        self.assertEqual(
+            order,
+            ["wait_schedule", "wait_forward", "record", "copy_ready", "processed"],
+        )
+        self.assertIsNone(result.copy_done)
+        self.assertIs(result.forward_launch, launch)
+        self.assertIs(scheduler.last_mbs[0], batch)
+        self.assertIsNone(scheduler.mbs[0])
+        self.assertEqual(slots, [None, None])
+        self.assertFalse(scheduler._vpp_forward_batches)
+
     def test_snapshot_preserves_owned_outputs_and_freezes_reused_metadata(self):
         hidden = torch.arange(6).reshape(2, 3)
         source = torch.arange(8)
