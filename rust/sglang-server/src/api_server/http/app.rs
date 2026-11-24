@@ -9,8 +9,8 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    anthropic, auth, connections, corpus, dp_relay, hicache, info, loads, metrics, native_api,
-    ollama, openai, parsers, pre_generate, request_decompression, responses, weights, wrappers,
+    anthropic, auth, connections, corpus, hicache, info, loads, metrics, native_api, ollama,
+    openai, parsers, pre_generate, request_decompression, responses, weights, wrappers,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -141,7 +141,6 @@ pub async fn serve(
         generate_hook,
         openai_chat,
     });
-    let relay_failure = startup_failure.clone();
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(
         state.core.clone(),
@@ -190,24 +189,8 @@ pub async fn serve(
         .merge(hicache::routes(hicache_manager))
         .layer(axum::extract::DefaultBodyLimit::disable());
     if let Some(http_layer) = http_layer {
-        app = pre_generate::apply(app, &http_layer, core.clone());
+        app = pre_generate::apply(app, &http_layer, core);
     }
-    // Outside the embedding package's layers, so a request naming another DP
-    // rank goes to that rank's listener before any of its work here.
-    app = match dp_relay::apply(
-        app,
-        &server_args.deployment_info,
-        server_args.enable_request_header_overrides,
-        core,
-    ) {
-        Ok(app) => app,
-        Err(error) => {
-            // Takes the server down, as a failed startup warmup does.
-            tracing::error!("{error}");
-            let _ = relay_failure.try_send(error);
-            return;
-        }
-    };
     // Outside the embedding package's layers, so they read decompressed bodies.
     app = request_decompression::apply(app, &server_args);
     // Python's generation wrappers (`/vertex_generate`, `/invocations`)
