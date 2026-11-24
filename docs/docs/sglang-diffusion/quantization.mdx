@@ -125,7 +125,7 @@ backend.
       <td><code>convrot_int8</code> (online quantization)</td>
       <td>Unquantized BF16/FP16 checkpoint</td>
       <td><code>--component-quantizations.&lt;component&gt; convrot_int8</code></td>
-      <td>MiniMax-H3, Qwen-Image, Qwen-Image-Edit (quality-validated); other BF16 DiTs load but are not quality-validated</td>
+      <td>MiniMax-H3, Qwen-Image, Qwen-Image-Edit, Wan2.2 T2V-A14B, I2V-A14B and Wan-Animate-2 14B (quality-validated); other BF16 DiTs load but are not quality-validated</td>
       <td>SGLang JIT ops (bundled, need nvcc) or <code>comfy-kitchen</code></td>
       <td>Data-free INT8 ConvRot W8A8 at load time, per layer on the fused JIT-compiled ops (CC 9.0, 10.0, 12.0, 12.1) or on <code>comfy_kitchen.int8_linear</code> (Turing+); <code>SGLANG_DIFFUSION_CONVROT_INT8_BACKEND</code> forces one. Layers whose input dim is not divisible by the group size stay in BF16. TP, LoRA, FSDP and memory notes under ConvRot INT8 below.</td>
     </tr>
@@ -468,8 +468,9 @@ few-row Qwen-Image GEMMs (AdaLN modulation,
 text-stream FFN down-projection) in BF16 at the cost of memory (45.5 GB peak)
 for no consistent speed gain, so the default quantizes everything.
 
-Measured against BF16 on GB200 in eager execution with every eligible layer
-quantized:
+Measured against BF16 in eager execution, on GB200 unless the row names the
+GPU, with every eligible layer quantized except for the Wan2.2 and Wan-Animate-2
+rows, which keep `proj_out` in BF16:
 
 | Model | Backend | Speedup vs BF16 | Peak GPU memory |
 | --- | --- | ---: | --- |
@@ -477,6 +478,12 @@ quantized:
 | Qwen-Image-Edit 1024x1024, 1 GPU | `jit` | 1.32x | |
 | MiniMax-H3 1344x768, 5 s, 50 steps, 1 GPU | `jit` | 1.07x (1.15x on 4 GPUs, Ulysses 4) | 125 -> 107 GiB |
 | MiniMax-H3, same | `comfy_kitchen` | 0.86x | 125 -> 107 GiB |
+| Wan2.2 T2V-A14B 832x480, 81 frames, 30 steps, CFG 5, 1 GPU | `jit` | 1.17x (1.18x on 2 GPUs, CFG parallel; 1.19x on 4 GPUs, CFG parallel x Ulysses 2) | 87.5 -> 60.6 GiB |
+| Wan2.2 I2V-A14B, same | `jit` | 1.17x (1.17x on 2 GPUs; 1.19x on 4 GPUs) | 88.1 -> 61.8 GiB |
+| Wan2.2 T2V-A14B, same, 1x H100 NVL 94 GB (CC 9.0, 310 W cap) | `jit` | 1.23x | 87.5 -> 60.6 GiB |
+| Wan2.2 I2V-A14B, same, 1x H100 NVL 94 GB | `jit` | 1.20x | 88.1 -> 61.8 GiB |
+| Wan-Animate-2 14B, 640x800 budget, clip_len 37, 40 steps, CFG 3, 1 GPU | `jit` | 1.07x (1.07x on 2 GPUs, CFG parallel; 1.08x on 4 GPUs, CFG parallel x Ulysses 2) | 86.5 -> 71.9 GiB |
+| Wan-Animate-2 14B distilled, same budget, 10 steps (DPM-Solver++), no CFG, text encoder offloaded, 1 GPU | `jit` | 1.07x (1.06x on 2 GPUs, Ulysses 2; 1.04x on 4 GPUs, Ulysses 4) | 65.3 -> 50.7 GiB |
 
 On MiniMax-H3 both backends quantize the same 209 linears and sit in the same
 quality class against BF16 over six prompt/seed pairs (video PSNR 23.4 vs 23.8
@@ -486,13 +493,26 @@ an online-quantized H3 without offload peaks at 115 GiB resident; the
 serialized Comfy INT8 checkpoint loads at 96 GiB resident and runs on `jit` at
 the same speed.
 
+On Wan2.2 A14B both experts are quantized at load, 400 of the 401 eligible
+linears each (26.17 -> 13.09 GiB per expert) with `proj_out` in BF16. Over six
+prompts at the shape above the same-seed PSNR to BF16 is 21.4 to 23.4 dB for
+T2V, 0.6 to 3.4 dB below the band BF16 shows against itself across the 1-, 2-
+and 4-GPU layouts (24.0 to 24.8 dB), and 28.1 to 28.5 dB for I2V, at the lower
+edge of its band (28.2 to 29.9 dB); see the
+[Wan2.2 cookbook](/cookbook/diffusion/Wan/Wan2.2#4-2-4-convrot-int8-quantization).
+On Wan-Animate-2 14B (one expert, 480 of 481 linears) it measures 29.4 dB /
+LPIPS 0.049 on an 81-frame request and 33.9 dB / 0.021 on the distilled
+checkpoint; the base checkpoint drifts over long chained-clip requests (28.4 dB
+/ LPIPS 0.118 over 7 clips), see the
+[Wan-Animate-2 cookbook](/cookbook/diffusion/Wan/Wan-Animate-2#4-4-convrot-int8-quantization).
+
 <Warning>
 `convrot_int8` is approximate: same-seed outputs are not bit-exact with BF16 or
 between the two backends (both stay within INT8 quantization noise of BF16), so
 it is not a consistency ground-truth mode. Quality was validated against BF16 on
-MiniMax-H3, Qwen-Image and Qwen-Image-Edit; other DiTs load but are not
-quality-validated. Without `convrot_int8` neither backend is loaded and the BF16
-path is untouched. See the
+MiniMax-H3, Qwen-Image, Qwen-Image-Edit, Wan2.2 T2V-A14B, I2V-A14B and
+Wan-Animate-2 14B; other DiTs load but are not quality-validated. Without
+`convrot_int8` neither backend is loaded and the BF16 path is untouched. See the
 [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#9-feature-contracts-and-advanced-recipes)
 for the 24 GB offload recipe, including why `vae` must stay out of
 `--layerwise-offload-components`.
