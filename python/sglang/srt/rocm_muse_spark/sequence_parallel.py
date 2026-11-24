@@ -35,6 +35,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.gemm.fp8_prefill_gemm import (
     fp8_prefill_gemm,
+    preshuffle_weight,
     quantize_head_rows_fp8,
     quantize_rows_fp8,
 )
@@ -61,6 +62,7 @@ _PREFILL_SP = envs.SGLANG_ROCM_MUSE_PREFILL_SP.get()
 _PREFILL_ULYSSES = envs.SGLANG_ROCM_MUSE_PREFILL_ULYSSES.get()
 _ULYSSES_LOCAL_GATE = envs.SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE.get()
 _ULYSSES_PIPELINE = envs.SGLANG_ROCM_MUSE_ULYSSES_PIPELINE.get()
+_ULYSSES_FP8_PRESHUFFLE = envs.SGLANG_ROCM_MUSE_PREFILL_FP8_PRESHUFFLE.get()
 _comm_stream = None
 _VERIFY_SP = os.environ.get("SGLANG_ROCM_MUSE_VERIFY_SP", "1") == "1"
 # From 128-row verify widths; narrower ones keep the all-reduce path.
@@ -665,8 +667,13 @@ def prepare_ulysses(attention, fp8: bool) -> None:
     o = group.all_gather(attention.o_proj.weight.data.contiguous(), dim=1).contiguous()
     attention.ulysses_qkv_weight = None if fp8 else qkv
     attention.ulysses_o_weight = None if fp8 else o
-    attention.ulysses_qkv_fp8 = quantize_weight(qkv) if fp8 else None
-    attention.ulysses_o_fp8 = quantize_weight(o) if fp8 else None
+    attention.ulysses_qkv_fp8 = _ulysses_fp8_weight(qkv) if fp8 else None
+    attention.ulysses_o_fp8 = _ulysses_fp8_weight(o) if fp8 else None
+
+
+def _ulysses_fp8_weight(weight: torch.Tensor):
+    fp8_weight = quantize_weight(weight)
+    return preshuffle_weight(fp8_weight) if _ULYSSES_FP8_PRESHUFFLE else fp8_weight
 
 
 def ulysses_prepared(attention) -> bool:
@@ -753,6 +760,9 @@ def _o_projection(attention, heads: torch.Tensor, gate: torch.Tensor) -> torch.T
 def _fp8_prefill_gemm_into(out, xq, xs, fp8_weight) -> None:
     """``fp8_prefill_gemm`` written into ``out``, a row block of a preallocated output: the same aiter CK call
     (no tuned config for these shapes, so no split-K)."""
+    if len(fp8_weight) == 3:
+        fp8_prefill_gemm(xq, xs, fp8_weight, out=out)
+        return
     from aiter import gemm_a8w8_ck
 
     wq, ws = fp8_weight
