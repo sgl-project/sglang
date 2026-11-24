@@ -386,7 +386,7 @@ def _low_ratio_source_projections(
                 put("score", score)
     if run_indexer and layer.indexer is not None:
         # Only the captured consumers read these; a full top-k layer projects
-        # once inside its eager break (_index_q_and_weights), so skip them there.
+        # once inside its eager break (index_q_and_weights), so skip them there.
         indexer = layer.indexer
         put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
         put("w", indexer.head_weights(x[:real]))
@@ -3604,8 +3604,11 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        index_q: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> None:
-        """Runs on every ratio 1/2 layer before its attention."""
+        """Runs on every ratio 1/2 layer before its attention. ``index_q`` holds the
+        decode indexer's projected queries for the rows of
+        `low_ratio_decode_index_positions`."""
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:
@@ -3695,7 +3698,41 @@ class DeepseekV4AttnBackend(
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            self._low_ratio_index_topk(
+                layer, x, q_lora, req, pos, forward_batch, index_q=index_q
+            )
+
+    def low_ratio_decode_index_positions(
+        self, *, layer, positions: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """The positions this decode or verify step's layer indexer scores, when it
+        scores through `get_deep_gemm_decode_data` and so takes its queries projected
+        ahead (`index_q` of `forward_low_ratio_sources`); None otherwise."""
+        mode = forward_batch.forward_mode
+        if layer.indexer is None or not (mode.is_decode() or mode.is_target_verify()):
+            return None
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_candidate_filtering,
+            skip_low_ratio_indexer,
+        )
+
+        if skip_low_ratio_indexer(layer.compress_ratio):
+            return None
+        uses_candidates = not skip_candidate_filtering() and (
+            layer.indexer.is_candidate_source or layer.indexer.uses_candidates
+        )
+        if uses_candidates:
+            if not isinstance(self.decode_candidates, SparseTableBackend):
+                return None
+        elif not self.full_topk_indexer.use_deep_gemm_decode:
+            return None
+        hoisted_pos = getattr(self.forward_metadata, "low_ratio_pos_i64", None)
+        if hoisted_pos is None:
+            return positions
+        # Mirrors forward_low_ratio_sources, which keeps the first n rows.
+        if hoisted_pos.shape[0] < positions.shape[0]:
+            return None
+        return hoisted_pos[: positions.shape[0]]
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
@@ -4101,6 +4138,7 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        index_q=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -4119,7 +4157,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, mode, index_q=index_q
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -4165,7 +4203,9 @@ class DeepseekV4AttnBackend(
             inputs, self.forward_metadata.candidate_metadata
         )
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, mode, index_q=None
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -4187,6 +4227,7 @@ class DeepseekV4AttnBackend(
             out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
                 ratio
             ),
+            index_q=index_q,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(

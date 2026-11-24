@@ -487,6 +487,16 @@ class AttentionBackend(ABC):
         """Check if the current backend supports triton."""
         return True
 
+    def low_ratio_decode_index_positions(
+        self, *, layer, positions: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """The positions whose indexer queries this backend wants projected ahead of
+        its low-ratio scoring, passed back as ``index_q`` of
+        ``forward_low_ratio_sources``. None means the backend scores its own queries,
+        which is the default and what every backend without a DeepGEMM decode path
+        does, ROCm among them."""
+        return None
+
     def get_indexer_metadata(
         self,
         layer_id: int,

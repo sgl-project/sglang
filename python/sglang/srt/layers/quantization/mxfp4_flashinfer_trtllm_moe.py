@@ -39,6 +39,9 @@ if is_flashinfer_available():
 
 logger = logging.getLogger(__name__)
 
+# Arbitrary half of a full 8K prefill chunk; bounds the routed op's workspace.
+_ROUTED_MOE_MAX_ROWS = 4096
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.topk import TopKConfig
@@ -535,32 +538,57 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 hidden_states=symm_output if output is None else output
             )
 
-        result = moe_call(
-            **routing,
-            hidden_states=x_quant,
-            hidden_states_scale=x_scale,
-            gemm1_weights=w13,
-            gemm1_weights_scale=w13_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
-            gemm2_weights=w2,
-            gemm2_weights_scale=w2_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=layer.output1_scale_scalar,
-            output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
-            output2_scale_scalar=layer.output2_scale_scalar,
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            intermediate_size=intermediate_size,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=num_local_experts,
-            do_finalize=not defer_finalize,
-            tune_max_num_tokens=next_power_of_2(num_tokens),
-            output=symm_output,
-            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
-        )
+        def run_moe(rows: slice, output: Optional[torch.Tensor]):
+            n = len(range(num_tokens)[rows])
+            if "topk_ids" in routing:
+                topk_ids, topk_weights = routing["topk_ids"]
+                rows_routing = {
+                    **routing,
+                    "topk_ids": (topk_ids[rows], topk_weights[rows]),
+                }
+            else:
+                rows_routing = routing
+            return moe_call(
+                **rows_routing,
+                hidden_states=x_quant[rows],
+                hidden_states_scale=None if x_scale is None else x_scale[rows],
+                gemm1_weights=w13,
+                gemm1_weights_scale=w13_scale,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+                gemm2_weights=w2,
+                gemm2_weights_scale=w2_scale,
+                gemm2_bias=None,
+                output1_scale_scalar=layer.output1_scale_scalar,
+                output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
+                output2_scale_scalar=layer.output2_scale_scalar,
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                intermediate_size=intermediate_size,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=num_local_experts,
+                do_finalize=not defer_finalize,
+                tune_max_num_tokens=next_power_of_2(n),
+                output=output,
+                enable_pdl=trtllm_moe_enable_pdl(n),
+            )
+
+        if (
+            num_tokens > _ROUTED_MOE_MAX_ROWS
+            and "topk_ids" in routing
+            and not defer_finalize
+            and symm_output is not None
+        ):
+            # Rows are independent; a full prefill chunk would size the op's
+            # workspace for all of its rows at once.
+            for begin in range(0, num_tokens, _ROUTED_MOE_MAX_ROWS):
+                rows = slice(begin, begin + _ROUTED_MOE_MAX_ROWS)
+                run_moe(rows, symm_output[rows])
+            return StandardCombineInput(hidden_states=symm_output)
+
+        result = run_moe(slice(None), symm_output)
         if defer_finalize:
             output = _make_deferred_finalize_output(result, top_k=top_k)
         else:

@@ -17,7 +17,7 @@ import mmap
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -648,6 +648,84 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
     return mapped, huge
 
 
+# Arbitrary; bounds the checkpoint pages a rank keeps mapped while it copies.
+_HOST_LOAD_CHUNK_BYTES = 256 << 20
+
+
+@functools.cache
+def _libc() -> ctypes.CDLL:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    return libc
+
+
+@functools.lru_cache(maxsize=256)
+def _is_safetensors_file(path: str, key: Tuple[int, int]) -> bool:
+    """Whether this path is a safetensors file, by its header rather than its name.
+
+    ``key`` is (st_dev, st_ino) and only memoizes per file identity: a Hugging Face
+    cache reaches a checkpoint through ``snapshots/<rev>/model-0000N.safetensors``,
+    a symlink whose target is ``blobs/<hash>``, and /proc/self/maps reports the
+    resolved target. Matching on the ``.safetensors`` suffix therefore missed every
+    checkpoint loaded from a Hub model ID -- the documented way to run this -- which
+    silently skipped the chunked load below and left the copied source pages
+    resident. The header is eight little-endian length bytes followed by that much
+    JSON, so it identifies the format wherever the file is reached from.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(9)
+    except OSError:
+        return False
+    if len(head) < 9:
+        return False
+    length = int.from_bytes(head[:8], "little")
+    return 0 < length <= (1 << 32) and head[8:9] == b"{"
+
+
+def _in_checkpoint_mapping(t: torch.Tensor) -> bool:
+    """Whether a contiguous CPU tensor lies inside one mapping of a safetensors file."""
+    if t.device.type != "cpu" or not t.is_contiguous() or t.numel() == 0:
+        return False
+    start = t.data_ptr()
+    end = start + t.numel() * t.element_size()
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                fields = line.split()
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                if not (lo <= start and end <= hi):
+                    continue
+                # address perms offset dev inode pathname
+                if len(fields) < 6 or fields[4] == "0":
+                    return False
+                path = fields[5]
+                if path.endswith(".safetensors"):
+                    return True
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    return False
+                return _is_safetensors_file(path, (st.st_dev, st.st_ino))
+    except OSError:
+        pass
+    return False
+
+
+def _unmap_pages(t: torch.Tensor) -> None:
+    """Drop this process's mapping of the whole pages inside a file-backed tensor;
+    touching them again refaults them from the file."""
+    page = mmap.PAGESIZE
+    start = t.data_ptr()
+    end = start + t.numel() * t.element_size()
+    lo = -(-start // page) * page
+    hi = end // page * page
+    if hi > lo:
+        _libc().madvise(
+            ctypes.c_void_p(lo), ctypes.c_size_t(hi - lo), mmap.MADV_DONTNEED
+        )
+
+
 _page_cache_dropped = False
 
 
@@ -704,6 +782,13 @@ def _hip_runtime() -> ctypes.CDLL:
         ctypes.c_uint,
     ]
     return lib
+
+
+# A lookup with fewer ids reads them unsorted: a decode or verify step touches a few
+# rows of a multi-GiB shard, about one huge page each, so address order shares no page
+# and the single-block sort costs several times the gather. Arbitrary, between the
+# decode-step and prefill-chunk lookup sizes.
+_MIN_SORTED_HOST_READS = 4096
 
 
 @functools.cache
@@ -1420,7 +1505,16 @@ class EngramEmbedding(nn.Module):
             f"{dst.dtype} {tuple(dst.shape)}; an MXFP4 table needs "
             "quantization_config.engram_embed_quant = 'mxfp4'"
         )
-        dst.copy_(src)
+        if self.host_table is None or not _in_checkpoint_mapping(src):
+            dst.copy_(src)
+        else:
+            # A rank reads a quarter of a ~100 GB checkpoint tensor; its pages would
+            # stay mapped (resident) until the loader drops the whole file.
+            step = max(1, _HOST_LOAD_CHUNK_BYTES // max(1, src[0].nbytes))
+            for begin in range(0, src.shape[0], step):
+                chunk = src[begin : begin + step]
+                dst[begin : begin + step].copy_(chunk)
+                _unmap_pages(chunk)
         if self.host_table is not None:
             self.host_table.dirty = True
 
@@ -1454,7 +1548,7 @@ class EngramEmbedding(nn.Module):
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
-                sort_ids=self._sort_host_reads,
+                sort_ids=self._sorts_host_reads(indices),
                 mxfp4=self.mxfp4,
             )
             return out
@@ -1560,10 +1654,13 @@ class EngramEmbedding(nn.Module):
             FP8_BLOCK_SIZE,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
-            sort_ids=self._sort_host_reads,
+            sort_ids=self._sorts_host_reads(indices),
             mxfp4=self.mxfp4,
         )
         return out
+
+    def _sorts_host_reads(self, indices: torch.Tensor) -> bool:
+        return self._sort_host_reads and indices.numel() >= _MIN_SORTED_HOST_READS
 
     def _dp_sharded_lookup(
         self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
@@ -1810,7 +1907,16 @@ class Engram(nn.Module):
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
             return x
+        return self.gate(x, self.project(emb), input_ids=input_ids)
+
+    def project(self, emb: torch.Tensor) -> torch.Tensor:
+        """[T, (hc_mult + 1) * dim] keys and shared value of looked-up rows [T, cols, head_dim]."""
         kv, _ = self.wkv(emb.flatten(-2))
+        return kv
+
+    def gate(
+        self, x: torch.Tensor, kv: torch.Tensor, *, input_ids: torch.Tensor
+    ) -> torch.Tensor:
         image_ids = input_ids if self.image_token_id is not None else None
         return engram_gate(
             x,
