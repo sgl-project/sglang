@@ -1361,6 +1361,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.2-air",
                       "cookbook/autoregressive/InclusionAI/Ling-3.1-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
@@ -1562,6 +1563,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Mini",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"

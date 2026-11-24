@@ -227,6 +227,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         for idle_iterations in (0, 1, 2):
             with self.subTest(idle_iterations=idle_iterations):
                 batches = self.make_batches(mode)
+                for batch in batches:
+                    batch.sampling_info = Mock()
                 if chained:
                     # Finishing the request drains its already-launched lookahead
                     # before scheduling fresh work, allowing the loop to go idle.
@@ -658,7 +660,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
             return_value=(None, GenerationBatchResult(), Mock())
         )
-        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
         scheduler._pp_pd_get_retract_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prealloc_ids = Mock(return_value=None)
         scheduler._pp_pd_get_decode_transferred_ids = Mock(return_value=None)

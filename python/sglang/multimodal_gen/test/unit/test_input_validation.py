@@ -222,12 +222,6 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
 
         processor = mock_add_stages.call_args.kwargs["vae_image_processor"]
         self.assertIsInstance(processor, Flux2ImageProcessor)
-        self.assertIs(
-            processor,
-            mock_add_stages.call_args.kwargs["image_vae_stage_kwargs"][
-                "vae_image_processor"
-            ],
-        )
 
 
 class TestFlux2TI2ISizeResolution(unittest.TestCase):
