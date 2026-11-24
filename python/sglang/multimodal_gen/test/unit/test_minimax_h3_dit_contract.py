@@ -1566,3 +1566,76 @@ def test_fuses_gate_norm2_disabled_on_npu_without_eps(monkeypatch):
         )
         is False
     )
+
+
+def test_npu_adaln_runs_and_modulation_parity():
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        _modulate_gate,
+        _modulate_scale_shift,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+        _contiguous_index_runs,
+    )
+
+    assert _contiguous_index_runs(torch.tensor([1, 1, 0, 0, 0, 3, 3])) == (
+        (0, 2, 1),
+        (2, 5, 0),
+        (5, 7, 3),
+    )
+    assert _contiguous_index_runs(torch.tensor([4, 4, 4])) == ((0, 3, 4),)
+    assert _contiguous_index_runs(torch.arange(10), max_runs=4) is None
+
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        return
+
+    device = torch.device("npu")
+    torch.manual_seed(7)
+    seq, hidden = 128, 64
+    x = torch.randn(seq, hidden, device=device, dtype=torch.bfloat16)
+    other = torch.randn(seq, hidden, device=device, dtype=torch.bfloat16)
+    shift = torch.randn(6, hidden, device=device, dtype=torch.bfloat16) * 0.1
+    scale = torch.randn(6, hidden, device=device, dtype=torch.bfloat16) * 0.1
+    gate = torch.randn(6, hidden, device=device, dtype=torch.bfloat16) * 0.1
+    indices_cpu = torch.zeros(seq, dtype=torch.long)
+    indices_cpu[:16] = 1
+    indices_cpu[16:48] = 3
+    runs = _contiguous_index_runs(indices_cpu)
+    assert runs == ((0, 16, 1), (16, 48, 3), (48, 128, 0))
+    indices = indices_cpu.to(device)
+
+    with torch.inference_mode():
+        ref_ss = (
+            x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
+        ).to(torch.bfloat16)
+        got_ss_runs = _modulate_scale_shift(
+            x.clone(), shift, scale, indices, dtype=torch.bfloat16, runs=runs
+        )
+        got_ss_idx = _modulate_scale_shift(
+            x.clone(), shift, scale, indices, dtype=torch.bfloat16, runs=None
+        )
+        torch.testing.assert_close(got_ss_runs, ref_ss, rtol=0, atol=0)
+        torch.testing.assert_close(got_ss_idx, ref_ss, rtol=0, atol=0)
+
+        ref_gate = (x + gate.index_select(0, indices) * other).to(torch.bfloat16)
+        got_gate_inplace = _modulate_gate(
+            x.clone(),
+            gate,
+            other.clone(),
+            indices,
+            dtype=torch.bfloat16,
+            allow_inplace=True,
+            runs=runs,
+        )
+        x_preserved = x.clone()
+        got_gate_preserve = _modulate_gate(
+            x_preserved,
+            gate,
+            other.clone(),
+            indices,
+            dtype=torch.bfloat16,
+            allow_inplace=False,
+            runs=runs,
+        )
+        torch.testing.assert_close(got_gate_inplace, ref_gate, rtol=0, atol=0)
+        torch.testing.assert_close(got_gate_preserve, ref_gate, rtol=0, atol=0)
+        torch.testing.assert_close(x_preserved, x, rtol=0, atol=0)

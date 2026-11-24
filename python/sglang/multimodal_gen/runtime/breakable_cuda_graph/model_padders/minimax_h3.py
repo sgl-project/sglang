@@ -187,6 +187,9 @@ def pad_minimax_h3_prompt_kwargs(
 
     out = {**call_kwargs, **branch.by_bucket[bucket]}
     out.pop("local_embedding_layout", None)
+    # Contiguous AdaLN run boundaries depend on prompt length and are only used
+    # outside captured graphs.
+    out.pop("block_combined_runs", None)
     return out
 
 

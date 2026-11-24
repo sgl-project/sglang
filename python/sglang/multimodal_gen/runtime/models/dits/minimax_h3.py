@@ -278,6 +278,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "token_tags",
         "block_token_tags",
         "block_combined_indices",
+        "block_combined_runs",
         "subblock_sparse_query_block_mask",
         "skip_mask_out_condition",
         "prompt_embeds",
@@ -445,6 +446,7 @@ def _modulate_rmsnorm_scale_shift(
     *,
     dtype: torch.dtype,
     fused: bool = False,
+    runs: tuple[tuple[int, int, int], ...] | None = None,
 ) -> torch.Tensor:
     """RMSNorm + indexed AdaLN.
 
@@ -461,7 +463,7 @@ def _modulate_rmsnorm_scale_shift(
     ):
         eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
         return rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices, eps)
-    return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype)
+    return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype, runs=runs)
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
@@ -480,8 +482,9 @@ def _modulate_scale_shift(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    runs: tuple[tuple[int, int, int], ...] | None = None,
 ) -> torch.Tensor:
-    """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
+    """Apply indexed affine modulation, reusing disposable BF16 norm output."""
     # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
     if (
         x.is_cuda
@@ -496,9 +499,46 @@ def _modulate_scale_shift(
             return indexed_scale_shift_bf16_(x, shift, scale, indices)
         if shift.dtype == _FP32_DTYPE:
             return indexed_scale_shift_fp32_(x, shift, scale, indices)
+    if (
+        x.device.type == "npu"
+        and x.dtype == dtype == _BF16_DTYPE
+        and scale.dtype == shift.dtype == _BF16_DTYPE
+        and not torch.is_grad_enabled()
+    ):
+        # Add 1.0 on the tiny [M*3, H] AdaLN table instead of the full sequence,
+        # and update the disposable norm output in place via contiguous slice
+        # broadcast when available (avoiding full-sequence index_select copies).
+        scale_p1 = 1.0 + scale
+        if runs is not None and not is_in_breakable_cuda_graph():
+            if len(runs) == 1:
+                idx = runs[0][2]
+                return x.mul_(scale_p1[idx]).add_(shift[idx])
+            for start, stop, idx in runs:
+                x[start:stop].mul_(scale_p1[idx]).add_(shift[idx])
+            return x
+        return x.mul_(scale_p1.index_select(0, indices)).add_(
+            shift.index_select(0, indices)
+        )
     return (
         x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
     ).to(dtype)
+
+
+def _apply_indexed_gate_npu_inplace(
+    other: torch.Tensor,
+    gate: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    runs: tuple[tuple[int, int, int], ...] | None = None,
+) -> None:
+    if runs is not None and not is_in_breakable_cuda_graph():
+        if len(runs) == 1:
+            other.mul_(gate[runs[0][2]])
+            return
+        for start, stop, idx in runs:
+            other[start:stop].mul_(gate[idx])
+        return
+    other.mul_(gate.index_select(0, indices))
 
 
 def _modulate_gate(
@@ -509,6 +549,7 @@ def _modulate_gate(
     *,
     dtype: torch.dtype,
     allow_inplace: bool = True,
+    runs: tuple[tuple[int, int, int], ...] | None = None,
 ) -> torch.Tensor:
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
@@ -529,6 +570,13 @@ def _modulate_gate(
             if allow_inplace:
                 return indexed_gate_fp32_(x, gate, other, indices)
             return indexed_gate_fp32(x, gate, other, indices)
+    if (
+        x.device.type == "npu"
+        and x.dtype == other.dtype == gate.dtype == dtype == _BF16_DTYPE
+        and not torch.is_grad_enabled()
+    ):
+        _apply_indexed_gate_npu_inplace(other, gate, indices, runs=runs)
+        return x.add_(other) if allow_inplace else other.add_(x)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -2083,6 +2131,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
         block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
+        combined_runs: tuple[tuple[int, int, int], ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -2115,7 +2164,12 @@ class MiniMaxH3DiTBlock(nn.Module):
                 h_prequant = (h_fp8, h_scales)
             else:
                 h = _modulate_scale_shift(
-                    h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+                    h,
+                    shift_msa,
+                    scale_msa,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                    runs=combined_runs,
                 )
         else:
             h = _modulate_rmsnorm_scale_shift(
@@ -2126,6 +2180,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 combined_indices,
                 dtype=_BF16_DTYPE,
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
+                runs=combined_runs,
             )
         peer = self._takes_peer_partials(x)
         h = self.attn(
@@ -2172,6 +2227,42 @@ class MiniMaxH3DiTBlock(nn.Module):
             return self._mlp_gated_residual(
                 residual, gate_mlp, h, combined_indices, peer
             )
+        if (
+            current_platform.is_npu()
+            and partials is None
+            and not torch.is_grad_enabled()
+            and not self.preserve_input_for_cache_dit
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and residual.device.type == "npu"
+            and residual.dtype == h.dtype == gate_msa.dtype == _BF16_DTYPE
+            and hasattr(self.norm2, "variance_epsilon")
+            and self.norm2.weight is not None
+        ):
+            import torch_npu
+
+            _apply_indexed_gate_npu_inplace(
+                h, gate_msa, combined_indices, runs=combined_runs
+            )
+            normed_h, _, residual = torch_npu.npu_add_rms_norm(
+                residual, h, self.norm2.weight, self.norm2.variance_epsilon
+            )
+            h = _modulate_scale_shift(
+                normed_h,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                runs=combined_runs,
+            )
+            return _modulate_gate(
+                residual,
+                gate_mlp,
+                self.mlp(h),
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                runs=combined_runs,
+            )
         if partials is not None and (
             self.preserve_input_for_cache_dit
             or not can_use_indexed_gate_bf16_sum2(
@@ -2189,6 +2280,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 combined_indices,
                 dtype=_BF16_DTYPE,
                 allow_inplace=not self.preserve_input_for_cache_dit,
+                runs=combined_runs,
             )
 
         residual = x
@@ -2201,7 +2293,12 @@ class MiniMaxH3DiTBlock(nn.Module):
                 h = self.mlp((h_fp8, h_scales))
             else:
                 h = _modulate_scale_shift(
-                    h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+                    h,
+                    shift_mlp,
+                    scale_mlp,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                    runs=combined_runs,
                 )
                 h = self.mlp(h)
         else:
@@ -2213,6 +2310,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 combined_indices,
                 dtype=_BF16_DTYPE,
                 fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
+                runs=combined_runs,
             )
             # `residual` is block-local here (see above), so this stays
             # in-place even while Cache-DiT is attached.
@@ -2225,6 +2323,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
+            runs=combined_runs,
         )
 
     def _takes_peer_partials(self, x: torch.Tensor) -> bool:
@@ -3696,12 +3795,14 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     f"({local_seq_len}), got {block_token_tags.shape[0]}."
                 )
         block_combined = kwargs.get("block_combined_indices")
+        block_combined_runs = kwargs.get("block_combined_runs")
         if block_combined is None:
             block_combined = torch.add(
                 block_token_tags,
                 block_inverse,
                 alpha=MINIMAX_H3_ADALN_MODALITY_NUM,
             )
+            block_combined_runs = None
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
@@ -3769,6 +3870,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     ulysses_active=ulysses_ws > 1,
                     ring_active=ring_ws > 1,
                     block_adaln_params=block_adaln_params,
+                    combined_runs=block_combined_runs,
                 )
             if spectrum_on:
                 self._h3_spectrum_record_targets(

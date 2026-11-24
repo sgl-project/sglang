@@ -11,6 +11,7 @@ Euler update on the target rows; see ``minimax_h3_image_denoise_loop``.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -196,6 +197,30 @@ class _StepTimesteps(NamedTuple):
     fp32_bits: tuple[int, ...]
 
 
+def _contiguous_index_runs(
+    indices_cpu: torch.Tensor, *, max_runs: int = 8
+) -> tuple[tuple[int, int, int], ...] | None:
+    """Compress a 1D CPU integer index tensor into (start, stop, value) runs.
+
+    Returns ``None`` if the sequence is empty or splits into more than
+    ``max_runs`` contiguous segments so callers can fall back to index_select.
+    """
+    n = int(indices_cpu.numel())
+    if n == 0:
+        return None
+    flat = indices_cpu.view(-1)
+    if n == 1:
+        return ((0, 1, int(flat[0].item())),)
+    changes = torch.nonzero(flat[1:] != flat[:-1], as_tuple=False).view(-1)
+    if int(changes.numel()) + 1 > max_runs:
+        return None
+    boundaries = [0, *(int(pos) + 1 for pos in changes.tolist()), n]
+    return tuple(
+        (start, stop, int(flat[start].item()))
+        for start, stop in zip(boundaries[:-1], boundaries[1:])
+    )
+
+
 class MiniMaxH3DenoiseBranch:
     """Static per-branch state: packed layout + fixed forward kwargs.
 
@@ -255,6 +280,9 @@ class MiniMaxH3DenoiseBranch:
         self.audio_update_mask_dev = self.audio_update_mask.to(device)
         # Resolve the remaining step-static packed-sequence and anchor row
         # sets once, keeping nonzero-driven work out of the hot loop.
+        self.img_cond_seq_idx_host = self.img_pos[~self.update_mask]
+        self.audio_target_seq_idx_host = self.audio_pos[self.audio_update_mask]
+        self.audio_ref_seq_idx_host = self.audio_pos[~self.audio_update_mask]
         self.img_cond_seq_idx = self.img_pos_dev[~self.update_mask_dev]
         self.img_target_seq_idx = self.img_pos_dev[self.update_mask_dev]
         self.audio_target_seq_idx = self.audio_pos_dev[self.audio_update_mask_dev]
@@ -304,9 +332,17 @@ class MiniMaxH3DenoiseBranch:
         local_row_start = sp_rank * local_seq_len
         local_row_stop = local_row_start + local_seq_len
         self.local_row_slice = slice(local_row_start, local_row_stop)
-        self.block_token_tags = (
-            token_tags_host[local_row_start:local_row_stop].clamp(min=0).to(device)
-        )
+        self.block_token_tags_host = token_tags_host[
+            local_row_start:local_row_stop
+        ].clamp(min=0)
+        self.block_token_tags = self.block_token_tags_host.to(device)
+        self._block_combined_runs_by_id: dict[
+            int,
+            tuple[
+                weakref.ReferenceType[torch.Tensor],
+                tuple[tuple[int, int, int], ...] | None,
+            ],
+        ] = {}
         self.static_kwargs: dict[str, Any] = {
             # Cast the fp64 position grid on the host. MiniMaxH3Rope casts it to
             # fp32 as its first op anyway, so the values are identical; doing the
@@ -393,6 +429,15 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": step_timesteps.inverse_indices,
             "block_combined_indices": step_timesteps.block_combined_indices,
         }
+        block_combined_indices = step_timesteps.block_combined_indices
+        cached_runs = self._block_combined_runs_by_id.get(id(block_combined_indices))
+        block_combined_runs = (
+            cached_runs[1]
+            if cached_runs is not None and cached_runs[0]() is block_combined_indices
+            else None
+        )
+        if block_combined_runs is not None:
+            kwargs["block_combined_runs"] = block_combined_runs
         if adaln_slot is not None:
             # Device scalar, never a Python int: an int would key one breakable
             # CUDA graph per slot value and go stale when LRU reuses the slot.
@@ -422,17 +467,24 @@ class MiniMaxH3DenoiseBranch:
         """
         candidates: list[float] = []
         fill_groups: list[tuple[torch.Tensor, int]] = []
+        fill_groups_host: list[tuple[torch.Tensor, int]] = []
         base_slot = -1
         if self.n_video_timestep_rows > 0:
             base_slot = len(candidates)
             candidates.append(float(t_video))
-        for seq_idx, value in (
-            (self.img_cond_seq_idx, imgvid_cond_timestep),
-            (self.audio_target_seq_idx, t_audio),
-            (self.audio_ref_seq_idx, audio_ref_cond_timestep),
+        for seq_idx, seq_idx_host, value in (
+            (self.img_cond_seq_idx, self.img_cond_seq_idx_host, imgvid_cond_timestep),
+            (self.audio_target_seq_idx, self.audio_target_seq_idx_host, t_audio),
+            (
+                self.audio_ref_seq_idx,
+                self.audio_ref_seq_idx_host,
+                audio_ref_cond_timestep,
+            ),
         ):
             if seq_idx.numel() > 0:
-                fill_groups.append((seq_idx, len(candidates)))
+                slot = len(candidates)
+                fill_groups.append((seq_idx, slot))
+                fill_groups_host.append((seq_idx_host, slot))
                 candidates.append(float(value))
         unique_cpu, slot_to_unique = torch.unique(
             torch.tensor(candidates, dtype=torch.float32, device="cpu"),
@@ -458,6 +510,19 @@ class MiniMaxH3DenoiseBranch:
                 alpha=MINIMAX_H3_ADALN_MODALITY_NUM,
             )
             block_combined_by_pattern[pattern] = block_combined
+            if device.type == "npu":
+                inverse_host = torch.full((self.seq_len,), base_index, dtype=torch.long)
+                for seq_idx_host, slot in fill_groups_host:
+                    inverse_host.index_fill_(0, seq_idx_host, int(slot_to_unique[slot]))
+                combined_host = torch.add(
+                    self.block_token_tags_host,
+                    inverse_host[self.local_row_slice],
+                    alpha=MINIMAX_H3_ADALN_MODALITY_NUM,
+                )
+                self._block_combined_runs_by_id[id(block_combined)] = (
+                    weakref.ref(block_combined),
+                    _contiguous_index_runs(combined_host),
+                )
         return _StepTimesteps(
             unique_cpu.to(device),
             inverse_indices,
@@ -479,6 +544,7 @@ class MiniMaxH3DenoiseBranch:
         """Stage every step's packed timestep state before denoising."""
         if len(video_timesteps) != len(audio_timesteps):
             raise ValueError("video/audio timestep plans must have equal length")
+        self._block_combined_runs_by_id.clear()
         inverse_indices_by_pattern: dict[tuple[int, ...], torch.Tensor] = {}
         block_combined_by_pattern: dict[tuple[int, ...], torch.Tensor] = {}
         return [
