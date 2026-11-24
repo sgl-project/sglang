@@ -348,7 +348,7 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.decode_kv_args_table = {
             "agent": SimpleNamespace(
-                unified_layout_error=None,
+                peer_layout_error=None,
                 decode_tp_size=1,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
@@ -430,7 +430,7 @@ class TestNixlTransferWorker(CustomTestCase):
 
     def test_cached_layout_rejection_blocks_aux_only_transfer(self):
         mgr = self._make_manager(34)
-        mgr.decode_kv_args_table["agent"].unified_layout_error = "layout mismatch"
+        mgr.decode_kv_args_table["agent"].peer_layout_error = "layout mismatch"
         mgr.agent.check_remote_metadata = MagicMock(return_value=False)
         mgr.agent.add_remote_agent = MagicMock()
         mgr.send_kvcache = MagicMock()
@@ -729,7 +729,7 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.decode_kv_args_table = {
             agent: SimpleNamespace(
-                unified_layout_error=None,
+                peer_layout_error=None,
                 decode_tp_size=len(agents),
                 dst_kv_ptrs=[0x3000 + i * 0x100],
                 dst_aux_ptrs=[0],
@@ -1684,6 +1684,7 @@ class TestNixlUnifiedMemory(CustomTestCase):
         mgr.attn_tp_size = mgr.state_tp_size = mgr.pp_size = 1
         mgr.is_mla_backend = False
         mgr.kv_args = SimpleNamespace(
+            require_plain_tp_peer=False,
             gpu_id=0,
             page_size=16,
             prefill_start_layer=0,
@@ -1707,7 +1708,7 @@ class TestNixlUnifiedMemory(CustomTestCase):
             agent_name="peer",
             dst_dcp_size=1,
             dst_dcp_rank=0,
-            unified_layout_error=None,
+            peer_layout_error=None,
             dst_unified_layout=mgr._unified_wire_layout(),
             decode_tp_size=1,
             dst_kv_ptrs=[0x40000],
@@ -1786,12 +1787,12 @@ class TestNixlUnifiedMemory(CustomTestCase):
                 mgr._add_remote_peer(peer)
                 self.assertIs(mgr.decode_kv_args_table["peer"], peer)
                 if field is None:
-                    self.assertIsNone(peer.unified_layout_error)
+                    self.assertIsNone(peer.peer_layout_error)
                     mgr.agent.add_remote_agent.assert_called_once_with(b"metadata")
                     mgr._prepare_payload_xfer.assert_called_once_with(peer)
                     mgr._prepare_state_xfer.assert_called_once_with(peer)
                 else:
-                    self.assertIn("NIXL unified-memory PD", peer.unified_layout_error)
+                    self.assertIn("NIXL unified-memory PD", peer.peer_layout_error)
                     mgr.agent.add_remote_agent.assert_not_called()
                     mgr._prepare_payload_xfer.assert_not_called()
                     mgr._prepare_state_xfer.assert_not_called()

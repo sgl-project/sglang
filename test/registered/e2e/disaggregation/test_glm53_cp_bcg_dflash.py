@@ -9,6 +9,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    configure_nixl_pd_backend,
 )
 from sglang.test.test_utils import try_cached_model
 
@@ -51,6 +52,7 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_temperature = 1.0
     gsm8k_top_p = 0.95
 
+    use_nixl = False
     prefill_tp_size = 4
     decode_tp_size = 4
     decode_base_gpu_id = 4
@@ -70,6 +72,8 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        if cls.use_nixl:
+            configure_nixl_pd_backend(cls)
         cls.model = try_cached_model("zai-org/GLM-5.3-Flash")
         common = COMMON_ARGS + cls.speculative_args()
         cls.extra_prefill_args = common + [
@@ -238,6 +242,14 @@ class TestGlm53CpBcgMtpPD(TestGlm53CpBcgDflashPD):
             self.assertGreaterEqual(
                 meta["spec_num_correct_drafts"], 3, f"length={length}"
             )
+
+
+class TestGlm53CpBcgDflashNixlPD(TestGlm53CpBcgDflashPD):
+    use_nixl = True
+
+
+class TestGlm53CpBcgMtpNixlPD(TestGlm53CpBcgMtpPD):
+    use_nixl = True
 
 
 if __name__ == "__main__":

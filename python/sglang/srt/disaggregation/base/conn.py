@@ -119,6 +119,8 @@ class KVArgs:
     rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
+    # GLM5Next NIXL CP/TP sharing pairs each prefill CP rank with one decode TP rank.
+    require_plain_tp_peer: bool = False
     prefill_start_layer: int
     # Absolute end layer (exclusive) for this prefill PP stage. Needed to
     # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
