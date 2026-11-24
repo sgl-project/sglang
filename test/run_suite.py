@@ -42,7 +42,6 @@ PER_COMMIT_SUITES = {
     HWBackend.AMD: [
         "base-a-test-1-gpu-small-amd",
         "base-b-test-1-gpu-small-amd",
-        "base-b-test-1-gpu-small-amd-nondeterministic",
         "base-b-test-1-gpu-small-amd-mi35x",
         "base-b-disaggregation-test-large-8-gpu-amd-mi35x",
         "base-b-test-1-gpu-large-amd",
@@ -89,10 +88,8 @@ PER_COMMIT_SUITES = {
         # bridge files while sharing this discovery and dispatch entry point.
         "base-b-diffusion-test-1-gpu-large",
         "base-b-diffusion-test-1-gpu-small",
-        "base-b-diffusion-test-1-gpu-b200",
+        "base-b-diffusion-test-4-gpu-b200",
         "base-b-diffusion-test-2-gpu-large",
-        "base-b-diffusion-bcg-test-1-gpu-large",
-        "base-b-diffusion-component-test-2-gpu-large",
         "base-b-diffusion-unit-test-1-gpu-large",
         "base-b-diffusion-unit-test-1-gpu-b300",
         "base-c-test-4-gpu-h100",
@@ -173,6 +170,7 @@ NIGHTLY_SUITES = {
         "nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro",
         "nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark",
+        "nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu",
         "nightly-test-8-gpu-amd-mi35x-qwen38-mxfp4",
         "nightly-test-8-gpu-amd-mi35x-glm53-flash",
         "nightly-accuracy-test-8-gpu-amd-glm53",

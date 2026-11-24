@@ -58,7 +58,8 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             "4",
             "--mem-fraction-static",
             "0.7",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--dtype",
             "bfloat16",
         ]
@@ -117,7 +118,8 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             "4",
             "--mem-fraction-static",
             "0.7",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--dtype",
             "float16",
         ]

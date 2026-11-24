@@ -226,5 +226,5 @@ def _check_weights(model_type: str, opts: dict, *, native_dir: bool) -> None:
     ):
         raise ValueError(
             f"int8_gemm={kernel} has no effect on {model_type}: only MiniMax H3 "
-            "runs ConvRot INT8 weights; leave it at auto"
+            "and Qwen-Image 2.1 run ConvRot INT8 weights; leave it at auto"
         )

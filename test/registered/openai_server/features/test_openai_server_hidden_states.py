@@ -244,7 +244,11 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=["--enable-return-hidden-states", "--disable-cuda-graph"],
+            other_args=[
+                "--enable-return-hidden-states",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+            ],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)

@@ -44,7 +44,6 @@ jobs:
               - '.github/workflows/pr-test-sgl-router.yml'
               - '.github/workflows/_pr-test-sgl-router-build.yml'
               - '.github/actions/download-sgl-router/**'
-              - 'scripts/ci/utils/build_sgl_router.sh'
               - 'scripts/ci/utils/prepare_sgl_router.sh'
               - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
@@ -68,9 +67,37 @@ jobs:
     with:
       runs_on: ubuntu-22.04
 
+  # The HF_TOKEN download in a job of its own: the job below restores rust-cache and
+  # sccache entries that a pull_request_target run could write, so it holds no secret.
+  sgl-router-tokenizers:
+    name: fetch tokenizers
+    needs: sgl-router-gate
+    if: needs.sgl-router-gate.outputs.opted-in != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: sgl-router/tests/fixtures/tokenizer_parity
+
+      - name: Fetch the parity matrix tokenizers
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          for model in $(jq -r .model_id sgl-router/tests/fixtures/tokenizer_parity/*/*.json | sort -u); do
+            pipx run --spec huggingface_hub hf download "$model" tokenizer.json
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sgl-router-parity-tokenizers
+          path: ~/.cache/huggingface/hub
+          retention-days: 1
+
   sgl-router-test:
     name: lint + test
-    needs: sgl-router-gate
+    needs: [sgl-router-gate, sgl-router-tokenizers]
     if: needs.sgl-router-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -129,15 +156,11 @@ jobs:
           cargo install --locked cargo-deny@0.19.6
           cargo deny check licenses bans sources advisories
 
-      # The tokenizer parity matrix reads each fixture model's tokenizer.json
-      # from the HuggingFace cache.
-      - name: Fetch the parity matrix tokenizers
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          for model in $(jq -r .model_id sgl-router/tests/fixtures/tokenizer_parity/*/*.json | sort -u); do
-            pipx run --spec huggingface_hub hf download "$model" tokenizer.json
-          done
+      - name: Download the parity matrix tokenizers
+        uses: actions/download-artifact@v4
+        with:
+          name: sgl-router-parity-tokenizers
+          path: ~/.cache/huggingface/hub
 
       - name: cargo test
         working-directory: sgl-router
@@ -209,13 +232,19 @@ jobs:
   sgl-router-e2e:
     name: e2e
     needs: [sgl-router-test, sgl-router-build]
-    runs-on: 2-gpu-h100
+    runs-on: 4-gpu-h100  # the PD dp-aware test holds a dp2 prefill and a dp2 decode
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # Holds HF_TOKEN: build from source, since a pull_request_target run could have
+      # written the cache.
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          from_source: ${{ secrets.HF_TOKEN != '' }}
       - uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
+          from_source: ${{ secrets.HF_TOKEN != '' }}
 
       # SGLang from this checkout, so the e2e runs against the branch's server.
       - name: Install SGLang dependencies
@@ -243,6 +272,7 @@ jobs:
       - sgl-router-changes
       - sgl-router-gate
       - sgl-router-build
+      - sgl-router-tokenizers
       - sgl-router-test
       - sgl-router-k8s-integration
       - sgl-router-e2e

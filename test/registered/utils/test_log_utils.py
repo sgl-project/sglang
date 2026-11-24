@@ -1,6 +1,9 @@
 import io
 import json
+import os
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -10,10 +13,21 @@ from pathlib import Path
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-register_cpu_ci(est_time=4, suite="extra-test-cpu-intel")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="extra-test-cpu-intel")
 
 _LOG_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
+
+# A worker whose only sglang import is log_utils, like a spawned detokenizer.
+_CONFIGURE_LOGGER_WORKER = """
+import logging
+from types import SimpleNamespace
+
+from sglang.srt.utils.log_utils import configure_logger
+
+configure_logger(SimpleNamespace(log_level="info"))
+print(logging.getLevelName(logging.getLogger("custom").level))
+"""
 
 
 class TestLogUtils(unittest.TestCase):
@@ -61,6 +75,30 @@ class TestLogUtils(unittest.TestCase):
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
             self.assertEqual(stdout_data["x"], file_data["x"])
+
+
+class TestConfigureLoggerFromConfigPath(unittest.TestCase):
+    def test_config_path_applies_without_other_logging_config_importers(self):
+        """SGLANG_LOGGING_CONFIG_PATH must apply in a process where nothing
+        else has imported ``logging.config``."""
+        config = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "loggers": {"custom": {"level": "ERROR"}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp, "logging.json")
+            config_path.write_text(json.dumps(config))
+            result = subprocess.run(
+                [sys.executable, "-c", _CONFIGURE_LOGGER_WORKER],
+                env={**os.environ, "SGLANG_LOGGING_CONFIG_PATH": str(config_path)},
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "ERROR")
 
 
 def _parse_log_json(line: str) -> dict:
