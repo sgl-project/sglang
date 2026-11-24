@@ -373,6 +373,9 @@ class EagleDraftExtendInput(SpecInput):
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None
 
+    # Only write the draft KV cache; the forward returns no logits or hidden states.
+    kv_only: bool = False
+
     # Flat per-req index of each request's last accepted window row
     # (i * window + front + num_correct_drafts[i]). When set, the logits
     # processor runs lm_head and LAST hidden capture only on these rows; FULL

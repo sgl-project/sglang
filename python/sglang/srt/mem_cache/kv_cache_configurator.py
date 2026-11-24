@@ -134,6 +134,7 @@ from sglang.srt.utils.device import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -3421,7 +3422,7 @@ class KVCacheConfigurator:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
-                logging.warning(
+                logger.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."
                 )
@@ -3504,10 +3505,16 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
+        # Foundry LOAD reuses the pool config SAVE resolved;
+        # the free-memory profile the pool sizes come from differs between the two.
+        replayed = get_foundry_adapter().replay_saved_memory_pool_config()
+        if replayed is not None:
+            return replayed
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             config.mem_fraction_static = get_schedule().mem_fraction_static
+            get_foundry_adapter().record_memory_pool_config(config)
             return config
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
@@ -3515,6 +3522,8 @@ class KVCacheConfigurator:
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
+        # Foundry SAVE records the resolved config for LOAD.
+        get_foundry_adapter().record_memory_pool_config(config)
         return config
 
     def config_from_budget(
@@ -3891,7 +3900,6 @@ def calculate_mla_kv_cache_dim(
     *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
-    kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim

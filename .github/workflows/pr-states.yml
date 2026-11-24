@@ -7,8 +7,8 @@ name: PR States
 #   - pull_request_target: push / open / label change (all PRs incl forks).
 #   - workflow_run: pr-test* requested / completed events (incl fork PRs).
 #     `requested` is absent on reruns, but `completed` still fires.
-#   - workflow_dispatch: explicit refreshes for a provided PR number. This
-#     is the only event here that GITHUB_TOKEN can cascade-create.
+#   - workflow_dispatch: refresh for a given PR number (manual, or the
+#     slash-command handler after a command).
 
 on:
   pull_request_target:
@@ -60,12 +60,10 @@ jobs:
               prNumber = context.payload.pull_request.number;
             } else if (context.eventName === 'workflow_run') {
               const wr = context.payload.workflow_run;
-              // Only pull_request runs are the PR gate. The AMD workflow also
-              // accepts workflow_dispatch for a single stage, and such a run on
-              // a PR branch is PR-associated; refreshing off it would rewrite
-              // the block from a run the rows below deliberately ignore.
-              if (wr.event !== 'pull_request') {
-                core.info(`Triggering run event '${wr.event}' is not pull_request; skipping.`);
+              // Only PR-event runs are the PR gate; a workflow_dispatch run on a PR branch is
+              // PR-associated but ignored by the rows below.
+              if (wr.event !== 'pull_request' && wr.event !== 'pull_request_target') {
+                core.info(`Triggering run event '${wr.event}' is not a PR event; skipping.`);
                 return;
               }
               if (wr.pull_requests && wr.pull_requests.length > 0) {
@@ -118,7 +116,7 @@ jobs:
             const justRemovedLabel = context.eventName === 'pull_request_target'
                                      && context.payload.action === 'unlabeled';
 
-            async function findRunBySha(workflowFile) {
+            async function findRunBySha(workflowFile, event) {
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -127,16 +125,16 @@ jobs:
                 // Every row reports the PR gate, so exclude other events for
                 // this SHA: all three workflows also accept workflow_dispatch,
                 // and for AMD that is a single stage rather than the full gate.
-                event: 'pull_request',
+                event,
                 per_page: 10,
               });
               return data.workflow_runs.find((run) => run.conclusion !== 'skipped')
                 || data.workflow_runs[0] || null;
             }
-            async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
+            async function findRun(workflowFile, event, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
               if (preSleepMs > 0) await sleep(preSleepMs);
               for (let i = 0; i < attempts; i++) {
-                const run = await findRunBySha(workflowFile);
+                const run = await findRunBySha(workflowFile, event);
                 if (run) return run;
                 if (i < attempts - 1) await sleep(delayMs);
               }
@@ -158,24 +156,23 @@ jobs:
             // race resolves itself -- `requested` is in the workflow_run
             // subscription above, so a real dispatch refreshes this block.
             const [ptRun, peRun, amdRun] = await Promise.all([
-              findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
+              findRun('pr-test.yml', 'pull_request_target', hasCI ? labelOnOpts : labelOffOpts),
               // pr-test-extra gates on BOTH labels (see call-gate there).
               findRun(
                 'pr-test-extra.yml',
+                'pull_request_target',
                 (hasCI && hasNvExtra) ? labelOnOpts : labelOffOpts,
               ),
-              findRun('pr-test-amd.yml', labelOffOpts),
+              findRun('pr-test-amd.yml', 'pull_request', labelOffOpts),
             ]);
 
-            // Skipped run = "no real run" -- happens when a label is added
-            // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
             // pr-gate.yml runs its "Skip tests" step when a draft, a missing
-            // `run-ci`, or a missing opt-in label skips the caller's tests, so
+            // `run-ci` (or approval), or a missing opt-in label skips the caller's tests, so
             // such a run is green (or, for Base, red) with nothing tested.
             async function skippedAtGate(run) {
-              // A skipped run ends failed (Base) or green; notify-pr-states
+              // A skipped run ends failed (Base) or green; its workflow_run `completed`
               // refreshes this block when it does.
               if (!isReal(run) || !['success', 'failure'].includes(run.conclusion)) return false;
               const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
@@ -194,10 +191,11 @@ jobs:
 
             // GitHub's "skipped" mark, for every row whose tests the gate skipped.
             const skipMark = '\u2298 **Skipped**';
-            const missingCIText = `${skipMark} -- add the \`run-ci\` label to run CI tests.`;
+            const missingCIText = `${skipMark} -- a maintainer comments \`/tag-and-rerun-ci\` to run CI tests.`;
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
-            const draftText = `${skipMark} -- the PR is a draft; mark it ready, then \`/rerun-failed-ci\`.`;
+            const draftText = `${skipMark} -- the PR is a draft; marking it ready starts a new run (AMD: then \`/rerun-failed-ci\`).`;
             const noTestsText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- it predates the labels or the PR leaving draft; \`/rerun-failed-ci\` reruns it.`;
+            const unapprovedText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- its commit has no run-ci approval, or the run predates the labels; a maintainer's \`/tag-and-rerun-ci\` approves this commit and reruns it.`;
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
             // (for example, for merge conflicts or skip annotations).
@@ -218,17 +216,17 @@ jobs:
             }
             const runLink = (run) => `${runIcon(run)} [Run #${run.id}](${run.html_url})`;
             // A row without a tested run says why, in the order the gate checks.
-            function rowText(run, skipped, optInLabel, noRunText) {
+            function rowText(run, skipped, optInLabel, noRunText, skippedText = noTestsText) {
               if (tested(run, skipped)) return runLink(run);
               if (pr.draft) return draftText;
               if (!hasCI) return missingCIText;
               if (optInLabel && !labels.includes(optInLabel)) {
                 return `${skipMark} -- add the \`${optInLabel}\` label to opt in.`;
               }
-              return skipped ? noTestsText(run) : noRunText;
+              return skipped ? skippedText(run) : noRunText;
             }
-            const ptText = rowText(ptRun, ptSkipped, null, '_Not run yet_');
-            const peText = rowText(peRun, peSkipped, 'run-ci-nv-extra', stalePushText);
+            const ptText = rowText(ptRun, ptSkipped, null, '_Not run yet_', unapprovedText);
+            const peText = rowText(peRun, peSkipped, 'run-ci-nv-extra', stalePushText, unapprovedText);
             // No AMD run usually means its paths filter excluded the PR, not a label.
             const amdText = amdRun ? rowText(amdRun, amdSkipped, null, amdNotTriggeredText) : amdNotTriggeredText;
 

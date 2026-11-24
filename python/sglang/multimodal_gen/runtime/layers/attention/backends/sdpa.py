@@ -109,10 +109,6 @@ class SDPABackend(AttentionBackend):
     def get_impl_cls() -> type["SDPAImpl"]:
         return SDPAImpl
 
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
-
 
 class SDPAImpl(AttentionImpl):
     # cuDNN SDPA does not depend on the head count; only flash needs padding.
