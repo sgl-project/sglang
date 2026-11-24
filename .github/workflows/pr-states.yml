@@ -191,7 +191,7 @@ jobs:
 
             // GitHub's "skipped" mark, for every row whose tests the gate skipped.
             const skipMark = '\u2298 **Skipped**';
-            const missingCIText = `${skipMark} -- a maintainer adds the \`run-ci\` label (or comments \`/tag-and-rerun-ci\`) to run CI tests.`;
+            const missingCIText = `${skipMark} -- a maintainer comments \`/tag-and-rerun-ci\` to run CI tests.`;
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
             const draftText = `${skipMark} -- the PR is a draft; marking it ready starts a new run (AMD: then \`/rerun-failed-ci\`).`;
             const noTestsText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- it predates the labels or the PR leaving draft; \`/rerun-failed-ci\` reruns it.`;
