@@ -189,6 +189,11 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     chunked_prefill_size: Optional[int]
     context_len: int
     max_req_input_len: int
+    # Speculative slots the tokenizer adds to each prompt's length.
+    num_reserved_tokens: int
+    # Smallest full-attention KV pool over DP ranks, in tokens.
+    kv_pool_tokens: int
+    page_size: int
 
 
 class ConcurrentPrefillPlan(msgspec.Struct, frozen=True, kw_only=True):
@@ -201,6 +206,7 @@ def concurrent_prefill_limits(
     *,
     context_len: int,
     max_req_input_len: int,
+    num_reserved_tokens: int,
 ) -> ConcurrentPrefillLimits:
     """Collect the limits from the schedulers' `get_internal_state` readback
     (one dict per DP rank)."""
@@ -213,6 +219,11 @@ def concurrent_prefill_limits(
         chunked_prefill_size=state["chunked_prefill_size"],
         context_len=context_len,
         max_req_input_len=max_req_input_len,
+        num_reserved_tokens=num_reserved_tokens,
+        kv_pool_tokens=min(
+            s["memory_usage"]["token_capacity"] for s in internal_states
+        ),
+        page_size=state["page_size"] or 1,
     )
 
 
@@ -224,8 +235,17 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     `_CONCURRENT_PREFILL_TOKENS`) and less than two: each prompt gets an equal
     share plus an offset below that share, stepped by 37 so extends do not align.
     """
-    # leave room for the new tokens under the server's input limit
-    max_prompt = limits.max_req_input_len - _CONCURRENT_PREFILL_NEW_TOKENS
+    page = limits.page_size
+    new_tokens = _CONCURRENT_PREFILL_NEW_TOKENS
+    max_prompt = min(
+        # The scheduler aborts a prompt of max_req_input_len tokens or more.
+        limits.max_req_input_len - 1,
+        # The tokenizer counts the reserved slots and the new tokens in the context.
+        limits.context_len - limits.num_reserved_tokens - new_tokens - 1,
+        # Admission rounds the prompt up to whole pages and reserves one more page.
+        (limits.kv_pool_tokens - limits.num_reserved_tokens - new_tokens) // page * page
+        - 2 * page,
+    )
     slots = limits.max_running_requests
     if limits.max_queued_requests is not None:
         # A round arriving in one scheduler poll must fit in the waiting queue.
@@ -268,6 +288,7 @@ async def concurrent_prefill(
         await tokenizer_manager.get_internal_state(),
         context_len=tokenizer_manager.context_len,
         max_req_input_len=tokenizer_manager.max_req_input_len,
+        num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
     )
     plan = concurrent_prefill_plan(limits)
     logger.info(

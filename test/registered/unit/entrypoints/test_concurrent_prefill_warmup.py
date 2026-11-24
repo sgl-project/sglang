@@ -23,6 +23,9 @@ def _limits(**overrides):
         chunked_prefill_size=16384,
         context_len=131072,
         max_req_input_len=131066,
+        num_reserved_tokens=0,
+        kv_pool_tokens=1888043,
+        page_size=1,
     )
     fields.update(overrides)
     return ConcurrentPrefillLimits(**fields)
@@ -33,6 +36,8 @@ def _internal_state(**overrides):
         "effective_max_running_requests_per_dp": 32,
         "max_queued_requests": None,
         "chunked_prefill_size": 16384,
+        "page_size": 1,
+        "memory_usage": {"token_capacity": 1888043},
     }
     state.update(overrides)
     return state
@@ -62,7 +67,7 @@ class TestConcurrentPrefillPlan(CustomTestCase):
             _internal_state(effective_max_running_requests_per_dp=48),
         ]
         limits = concurrent_prefill_limits(
-            states, context_len=131072, max_req_input_len=131066
+            states, context_len=131072, max_req_input_len=131066, num_reserved_tokens=0
         )
         plan = concurrent_prefill_plan(limits)
         self.assertEqual([len(r) for r in plan.rounds], [1, 12, 96])
@@ -88,6 +93,27 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         for sizes in plan.rounds:
             self.assertGreater(sum(sizes), 16384)
             self.assertLess(sum(sizes), 2 * 40000)
+
+    def test_prompt_leaves_reserved_tokens_under_context(self):
+        """EAGLE with 16 draft tokens on a 4,096 context: the tokenizer counts
+        the 16 reserved slots and the new tokens against the context."""
+        limits = _limits(
+            context_len=4096, max_req_input_len=4090, num_reserved_tokens=16
+        )
+        plan = concurrent_prefill_plan(limits)
+        longest = max(max(r) for r in plan.rounds)
+        self.assertLess(longest + 16, 4096)
+        self.assertLessEqual(longest + 16 + 8, 4096)
+
+    def test_prompt_leaves_page_headroom_in_kv_pool(self):
+        """A 32,768-token pool with 64-token pages: admission rounds the prompt
+        up to pages and reserves one more page plus the new tokens, so a prompt
+        sized to max_req_input_len is never admitted."""
+        page = 64
+        limits = _limits(kv_pool_tokens=32768, max_req_input_len=32762, page_size=page)
+        longest = max(max(r) for r in concurrent_prefill_plan(limits).rounds)
+        charged = -(-longest // page) * page + page + 8
+        self.assertLessEqual(charged, 32768)
 
 
 if __name__ == "__main__":
