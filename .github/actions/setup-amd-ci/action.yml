@@ -18,8 +18,11 @@ inputs:
 runs:
   using: composite
   steps:
+    # Credentialed job: build from source; the cache may hold a pull_request_target run's files.
     - if: inputs.sgl_router == 'true'
       uses: ./.github/actions/download-sgl-router
+      with:
+        from_source: ${{ env.DOCKERHUB_AMD_TOKEN != '' }}
 
     - name: Ensure VRAM is clear
       shell: bash
