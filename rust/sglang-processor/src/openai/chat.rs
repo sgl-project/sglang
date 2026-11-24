@@ -560,6 +560,20 @@ pub fn lower_chat(
             sampling.structural_tag = Some(python_json(&tag, true));
         }
     }
+    // DeepSeek's API applies `stop` to the answer only; the engine would also
+    // match it inside the reasoning. With a reasoning parser and thinking on,
+    // the strings stay out of the engine request and the responder matches
+    // them on the content (one choice only: a content stop ends the stream).
+    let content_stops = match (&request.stop, thinking && request.n == 1) {
+        (Some(stop), true) if deepseek.is_some() || parser.is_some() => {
+            sampling.stop = None;
+            match stop {
+                OneOrList::One(stop) => vec![stop.clone()],
+                OneOrList::List(stops) => stops.clone(),
+            }
+        }
+        _ => Vec::new(),
+    };
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
             Some(string_or_list::Value::Many(stops)) => stops.items,
@@ -620,6 +634,8 @@ pub fn lower_chat(
         finish_reasons: Vec::new(),
         tool_detectors: HashMap::new(),
         has_tool_calls: HashSet::new(),
+        content_stops,
+        held_content: HashMap::new(),
     };
     Ok((lowered, responder))
 }
@@ -1074,9 +1090,79 @@ pub struct ChatResponder {
     tool_detectors: HashMap<u64, Box<dyn ToolDetector>>,
     has_tool_calls: HashSet<u64>,
     finish_reasons: Vec<(u64, String, Value)>,
+    /// The request's `stop` strings when the model thinks first: they are
+    /// kept from the engine (which would match them inside the reasoning)
+    /// and matched here on the content only, as DeepSeek's API does.
+    content_stops: Vec<String>,
+    /// Per choice: content not yet sent because it could be the start of a
+    /// stop string.
+    held_content: HashMap<u64, String>,
+}
+
+/// The longest proper prefix of `stop` that `text` ends with, in bytes.
+fn stop_prefix_suffix(text: &str, stop: &str) -> usize {
+    stop.char_indices()
+        .map(|(i, _)| i)
+        .filter(|&i| i > 0 && text.ends_with(&stop[..i]))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The earliest match of any stop string in `text`: its byte offset and the
+/// string.
+fn earliest_stop(text: &str, stops: &[String]) -> Option<(usize, String)> {
+    stops
+        .iter()
+        .filter_map(|stop| text.find(stop.as_str()).map(|pos| (pos, stop.clone())))
+        .min_by_key(|(pos, stop)| (*pos, stop.len()))
+}
+
+/// Content from the model, minus any stop string and what follows it, holding
+/// back (in `held`) a tail that could still begin one. Returns the content to
+/// send and the stop string that fired, if any.
+fn content_after_stops(
+    stops: &[String],
+    held: &mut HashMap<u64, String>,
+    index: u64,
+    content: String,
+    finished: bool,
+) -> (String, Option<String>) {
+    {
+        if stops.is_empty() {
+            return (content, None);
+        }
+        let pending = held.entry(index).or_default();
+        pending.push_str(&content);
+        if let Some((pos, stop)) = earliest_stop(pending, stops) {
+            let out = pending[..pos].to_owned();
+            pending.clear();
+            return (out, Some(stop));
+        }
+        if finished {
+            return (std::mem::take(pending), None);
+        }
+        let hold = stops
+            .iter()
+            .map(|stop| stop_prefix_suffix(pending, stop))
+            .max()
+            .unwrap_or(0);
+        let cut = pending.len() - hold;
+        let out = pending[..cut].to_owned();
+        pending.drain(..cut);
+        (out, None)
+    }
 }
 
 impl ChatResponder {
+    /// A content stop fired on choice `index`: the finish becomes a `stop`
+    /// on that string and the stream ends, which drops the engine request.
+    fn stop_on_content(&mut self, index: u64, stop: String) {
+        self.finish_reasons.retain(|(i, _, _)| *i != index);
+        self.finish_reasons
+            .push((index, "stop".to_owned(), Value::String(stop)));
+        self.stream.stopped = true;
+    }
+
     /// `_handle_non_streaming_request` over a `/generate` response.
     pub fn unary(self, mut ret: Vec<GenerateResponse>) -> Option<Reply> {
         for item in &mut ret {
@@ -1091,8 +1177,13 @@ impl ChatResponder {
             let logprobs = self.logprobs.then(|| {
                 json!({"content": self.token_logprobs(meta.output_token_logprobs.as_ref().map_or(&[], |p| &p.entries), &meta.output_top_logprobs)})
             });
-            let (reasoning, text, calls) = self.parse_output(item);
+            let (reasoning, mut text, calls) = self.parse_output(item);
             let (mut finish_type, mut matched_stop) = finish_fields(meta.finish_reason.as_ref());
+            if let Some((pos, stop)) = earliest_stop(&text, &self.content_stops) {
+                text.truncate(pos);
+                finish_type = Some("stop".into());
+                matched_stop = Value::String(stop);
+            }
             let mut tool_calls = Value::Null;
             if !calls.is_empty() {
                 let calls = calls
@@ -1225,14 +1316,24 @@ impl ChatResponder {
             ));
         }
 
-        if let OutputParsing::DeepSeek(deepseek) = &mut self.parsing {
-            let incremental = self.settings.incremental_streaming_output;
-            let (delta, called) =
-                deepseek.stream(index, content, &meta, finish_type.as_deref(), incremental);
+        let finished = finish_type.as_deref().is_some_and(|t| t != "abort");
+        let deepseek_delta = match &mut self.parsing {
+            OutputParsing::DeepSeek(deepseek) => {
+                let incremental = self.settings.incremental_streaming_output;
+                Some(deepseek.stream(index, content, &meta, finish_type.as_deref(), incremental))
+            }
+            _ => None,
+        };
+        if let Some(((reasoning, text, pieces), called)) = deepseek_delta {
             if called {
                 self.has_tool_calls.insert(index);
             }
-            events.extend(self.token_output_chunks(index, delta, logprobs));
+            let (text, stopped) =
+                content_after_stops(&self.content_stops, &mut self.held_content, index, text, finished);
+            events.extend(self.token_output_chunks(index, (reasoning, text, pieces), logprobs));
+            if let Some(stop) = stopped {
+                self.stop_on_content(index, stop);
+            }
             return events;
         }
         let (reasoning_config, tools) = self.parsing.text_parsers();
@@ -1272,6 +1373,9 @@ impl ChatResponder {
                 ));
             }
         }
+        let (sendable, content_stop) =
+            content_after_stops(&self.content_stops, &mut self.held_content, index, delta, finished);
+        delta = sendable;
         if let Some(tools) = tools {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
@@ -1315,6 +1419,9 @@ impl ChatResponder {
                 remaining_logprobs.take(),
                 usage,
             ));
+        }
+        if let Some(stop) = content_stop {
+            self.stop_on_content(index, stop);
         }
         let has_parser =
             self.settings.reasoning_parser.is_some() || self.settings.tool_call_parser.is_some();
@@ -1618,6 +1725,111 @@ mod tests {
             {"role": "tool", "content": "42", "tool_call_id": "c"},
         ]);
         assert_eq!(unsupported(messages), None);
+    }
+
+    #[test]
+    fn stop_helpers_match_content_only() {
+        assert_eq!(stop_prefix_suffix("1,2,3,EN", "END"), 2);
+        assert_eq!(stop_prefix_suffix("1,2,3,", "END"), 0);
+        assert_eq!(stop_prefix_suffix("abc", "abc"), 0);
+        let stops = vec!["END".to_owned(), "ZQ7".to_owned()];
+        assert_eq!(earliest_stop("x ZQ7 END", &stops), Some((2, "ZQ7".to_owned())));
+        assert_eq!(earliest_stop("x", &stops), None);
+    }
+
+    /// With a reasoning parser and thinking on, the request's `stop` strings
+    /// stay out of the engine request and fire on the content only: a stop
+    /// word inside the reasoning is ignored, one in the answer truncates it,
+    /// ends the stream with `finish_reason: stop` and names the string.
+    #[test]
+    fn stop_strings_apply_to_content_not_reasoning() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stop": ["END"],
+            "chat_template_kwargs": {"enable_thinking": true},
+        });
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("qwen3".into()),
+            ..OpenAiSettings::default()
+        };
+        let (lowered, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &ChatModel::default(),
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        let Some(sampling_params_or_list::Value::One(sampling)) =
+            lowered.sampling_params.as_ref().and_then(|p| p.value.as_ref())
+        else {
+            panic!("one sampling configuration")
+        };
+        assert!(sampling.stop.is_none(), "{:?}", sampling.stop);
+        assert_eq!(responder.content_stops, vec!["END".to_owned()]);
+        let meta = |finish: Value| json!({"id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1});
+        let mut events = Vec::new();
+        for frame in [
+            json!({"text": "END the plan</think>1,2,3,EN", "output_ids": [2], "meta_info": meta(Value::Null)}),
+            json!({"text": "END the plan</think>1,2,3,END,4,5", "output_ids": [2], "meta_info": meta(Value::Null)}),
+            json!({"text": "END the plan</think>1,2,3,END,4,5 more", "output_ids": [2], "meta_info": meta(Value::Null)}),
+        ] {
+            events.extend(
+                responder
+                    .stream_data(Ok(serde_json::from_value(frame).unwrap()))
+                    .unwrap(),
+            );
+        }
+        assert!(responder.done(), "{events:?}");
+        let chunks: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .collect();
+        let content: String = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(content, "1,2,3,", "{events:?}");
+        let reasoning: String = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str())
+            .collect();
+        assert_eq!(reasoning, "END the plan", "{events:?}");
+        let finish = chunks
+            .iter()
+            .find(|c| c["choices"][0]["finish_reason"].is_string())
+            .expect("finish chunk");
+        assert_eq!(finish["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(finish["choices"][0]["matched_stop"], json!("END"));
+        assert_eq!(events.last().map(String::as_str), Some("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn stop_strings_stay_with_the_engine_without_thinking() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "END",
+        });
+        let (lowered, responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &OpenAiSettings::default(),
+            &ChatModel::default(),
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        let Some(sampling_params_or_list::Value::One(sampling)) =
+            lowered.sampling_params.as_ref().and_then(|p| p.value.as_ref())
+        else {
+            panic!("one sampling configuration")
+        };
+        assert!(sampling.stop.is_some());
+        assert!(responder.content_stops.is_empty());
     }
 
     #[test]
