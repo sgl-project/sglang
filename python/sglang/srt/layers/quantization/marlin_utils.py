@@ -271,12 +271,18 @@ def verify_marlin_supports_layer(
 
 
 def check_moe_marlin_supports_layer(
-    layer: FusedMoE, group_size: int, allow_tile_padding: bool = False
+    layer: FusedMoE,
+    group_size: int,
+    allow_tile_padding: bool = False,
+    has_w13_bias: bool = False,
 ) -> bool:
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
-    # apply_router_weight_on_input is not supported for moe marlin
-    supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
+    # The Marlin runner applies a router weight on the input in GEMM1's
+    # epilogue, after the w13 bias, so it cannot serve such a layer with one.
+    supports_router_weight = not (
+        layer.moe_runner_config.apply_router_weight_on_input and has_w13_bias
+    )
     if layer.moe_runner_config.is_gated:
         supports_activation = layer.moe_runner_config.activation in {"silu", "situ"}
     else:

@@ -109,6 +109,11 @@ def moe_wna16_marlin_gemm(
     if size_m == 0:
         return c
 
+    if mul_topk_weights:
+        # The kernel reads the top-k weights as a flat float32 array, while a
+        # router may return them in the activation dtype.
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+
     # Determine activation ordering
     has_act_order = (
         g_idx_or_none is not None

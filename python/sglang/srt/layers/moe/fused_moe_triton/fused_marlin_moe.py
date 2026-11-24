@@ -176,6 +176,7 @@ def fused_marlin_moe(
     is_gated: bool = True,
     no_combine: bool = False,
     no_combine_keep_router_weight: bool = True,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -203,7 +204,11 @@ def fused_marlin_moe(
     - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
         ``[num_tokens, topk, hidden]``, instead of their top-k sum.
     - no_combine_keep_router_weight (bool): With no_combine, False returns the
-        rows without router weights.
+        rows without router weights, except with apply_router_weight_on_input,
+        where each row already carries its weight (as in the Triton MoE).
+    - apply_router_weight_on_input (bool): Weight each expert's input by its
+        router weight instead of its output, for any top-k. Not supported with
+        a w1 bias.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -211,6 +216,10 @@ def fused_marlin_moe(
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert not (apply_router_weight_on_input and w1_bias is not None), (
+        "Marlin adds the w1 bias before it multiplies GEMM1's rows by the router "
+        "weight, so a router weight on the input would also scale the bias"
+    )
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
         "Hidden size mismatch w2"
@@ -346,7 +355,10 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=topk,
-        mul_topk_weights=False,
+        # Weighting GEMM1's output rows equals weighting its input (up to
+        # rounding) since there is no w1 bias; with NVFP4 the kernel folds the
+        # global scale into the same factor.
+        mul_topk_weights=apply_router_weight_on_input,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,
         has_inactive_prefix_count=expert_map is None,
@@ -410,7 +422,8 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=1,
-        mul_topk_weights=not no_combine or no_combine_keep_router_weight,
+        mul_topk_weights=not apply_router_weight_on_input
+        and (not no_combine or no_combine_keep_router_weight),
         zero_inactive_output=True,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,

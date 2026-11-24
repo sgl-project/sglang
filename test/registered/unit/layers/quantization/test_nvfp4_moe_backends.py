@@ -40,6 +40,10 @@ class TestNvFp4MoeBackends(CustomTestCase):
         backend: str,
         intermediate_size: int = I,
         swiglu_limit: float | None = None,
+        *,
+        top_k: int = TOPK,
+        apply_router_weight_on_input: bool = False,
+        check_magnitude: bool = False,
     ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -65,11 +69,12 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 hidden_size=H,
                 intermediate_size=intermediate_size,
                 layer_id=0,
-                top_k=TOPK,
+                top_k=top_k,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
                 swiglu_limit=swiglu_limit,
                 gate_up_interleaved=False,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             ).cuda()
 
             # Checkpoint-format shards through the real weight_loader;
@@ -148,8 +153,17 @@ class TestNvFp4MoeBackends(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
-                topk_config=TopKConfig(top_k=TOPK, renormalize=True),
+                # Renormalized top-1 weights are all 1, which would hide where
+                # a router-on-input layer applies them.
+                topk_config=TopKConfig(
+                    top_k=top_k, renormalize=not apply_router_weight_on_input
+                ),
             )
+            if apply_router_weight_on_input:
+                # Llama 4's router returns its weights in the activation dtype.
+                topk_output = topk_output._replace(
+                    topk_weights=topk_output.topk_weights.to(torch.bfloat16)
+                )
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             out = layer.forward(x, topk_output)
@@ -158,6 +172,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
+            backend_used = layer.quant_method.get_moe_runner_backend(layer)
             ref = self._torch_moe_reference(
                 x,
                 topk_weights,
@@ -166,16 +181,34 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 refs["w3"],
                 refs["w2"],
                 swiglu_limit,
+                # Marlin keeps 16-bit activations.
+                fp4_activations=not backend_used.is_marlin(),
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
             assert_output_close(self, out, ref)
+            if check_magnitude:
+                # The cosine check can miss a scale error, such as a router
+                # weight applied to the output instead of the input.
+                norm_ratio = (out.float().norm() / ref.norm()).item()
+                self.assertLess(abs(norm_ratio - 1), 0.1)
 
     @staticmethod
     def _torch_moe_reference(
-        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, swiglu_limit
+        x,
+        topk_weights,
+        topk_ids,
+        w1_ref,
+        w3_ref,
+        w2_ref,
+        swiglu_limit,
+        fp4_activations=True,
+        apply_router_weight_on_input=False,
     ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
+            if not fp4_activations:
+                return t2d.to(torch.bfloat16).float()
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
             return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
@@ -185,24 +218,41 @@ class TestNvFp4MoeBackends(CustomTestCase):
         act_gs = torch.tensor(
             FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, dtype=torch.float32, device="cuda"
         )
-        x_dq = quant_roundtrip(x.float(), act_gs)
         m, h = x.shape
         ref = torch.zeros(m, h, dtype=torch.float32, device="cuda")
         for t in range(m):
             for j in range(topk_ids.shape[1]):
                 e = int(topk_ids[t, j])
-                gate = x_dq[t] @ w1_ref[e].T
-                up = x_dq[t] @ w3_ref[e].T
+                weight = float(topk_weights[t, j])
+                x_t = x[t : t + 1].float()
+                if apply_router_weight_on_input:
+                    # Marlin weights GEMM1's output rows, which equals weighting
+                    # the input up to rounding.
+                    x_t = x_t * weight
+                    weight = 1.0
+                x_dq = quant_roundtrip(x_t, act_gs)[0]
+                gate = x_dq @ w1_ref[e].T
+                up = x_dq @ w3_ref[e].T
                 if swiglu_limit is not None:
                     gate = gate.clamp(max=swiglu_limit)
                     up = up.clamp(-swiglu_limit, swiglu_limit)
                 act = torch.nn.functional.silu(gate) * up
                 act_dq = quant_roundtrip(act.unsqueeze(0), act_gs)[0]
-                ref[t] += float(topk_weights[t, j]) * (act_dq @ w2_ref[e].T)
+                ref[t] += weight * (act_dq @ w2_ref[e].T)
         return ref
 
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
+
+    def test_marlin_router_weight_on_input(self):
+        """Marlin applies a router-on-input layer's weight (Llama 4) in its
+        first GEMM, also when the router returns BF16 weights."""
+        self._run_backend(
+            "marlin",
+            top_k=1,
+            apply_router_weight_on_input=True,
+            check_magnitude=True,
+        )
 
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")

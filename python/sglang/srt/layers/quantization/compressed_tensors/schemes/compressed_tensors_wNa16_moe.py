@@ -506,6 +506,9 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             clamp_limit=self.moe_runner_config.swiglu_limit,
             workspace=layer.workspace,
+            apply_router_weight_on_input=(
+                self.moe_runner_config.apply_router_weight_on_input
+            ),
         )
         return StandardCombineInput(hidden_states=output)
 
