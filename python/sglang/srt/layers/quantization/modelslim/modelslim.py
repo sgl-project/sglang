@@ -178,13 +178,21 @@ class ModelSlimConfig(QuantizationConfig):
         super().__init__()
         self.requested_kv_cache_dtype = "auto"
         quant_config = dict(quant_config or {})
-        keys = [k for k in quant_config if isinstance(k, str)]
-        # Some DSV4 ModelSlim exports omit unquantized hc_head_* entries.
-        is_dsv4 = any(
-            k.startswith("hc_head_")
-            or (k.startswith("layers.") and ".ffn.experts." in k)
-            for k in keys
-        )
+        hf_config = quant_config.pop("hf_config", None)
+        if hf_config is None:
+            # Legacy callers can supply just the quantization description.
+            is_dsv4 = any(
+                isinstance(k, str)
+                and (
+                    k.startswith("hc_head_")
+                    or (k.startswith("layers.") and ".ffn.experts." in k)
+                )
+                for k in quant_config
+            )
+        else:
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            is_dsv4 = is_deepseek_v4(hf_config)
         if is_dsv4:
             from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 

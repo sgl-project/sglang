@@ -1345,14 +1345,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        # Low-ratio pools use BF16 rows on A3 and packed FP4 rows elsewhere.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim,
+            use_fp4_indexer=not self._npu_low_ratio_bf16,
+            use_bf16_indexer=self._npu_low_ratio_bf16,
         )
-        if self._npu_low_ratio_bf16:
-            # Matches DSV41NPUIndexerPool: BF16 K only, no packed copy/scales.
-            self.low_ratio_index_bytes = self.indexer_head_dim * torch.bfloat16.itemsize
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)

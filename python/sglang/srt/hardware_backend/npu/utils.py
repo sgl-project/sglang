@@ -312,7 +312,8 @@ def init_npu_backend():
             except ImportError as e:
                 logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
 
-    # Select A5's vendor bindings after device selection. A3 uses sgl-kernel-npu.
+    # The A3 bundle registers overlapping Torch schemas (e.g. sparse_flash_mla).
+    # Don't register them again through the standalone CANN wheel.
     torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
 
     # These imports lead to unpredictable behavior in diffusion models

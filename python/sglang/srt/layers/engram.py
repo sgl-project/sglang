@@ -1335,6 +1335,7 @@ class EngramEmbedding(nn.Module):
                 "group_size": FP8_BLOCK_SIZE,
                 "axis": 1,
                 "scale_suffix": "scale",
+                # Safetensors scale tag; the loader keeps the raw bytes as uint8.
                 "scale_dtype": "F8_E8M0",
                 "weight_shape": [num_embeddings, dim],
                 "scale_shape": [num_embeddings, dim // FP8_BLOCK_SIZE],
@@ -1814,6 +1815,7 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
         storage = None
+        # Select the INT8 layout only when the checkpoint declares it.
         if is_npu() and quant_config is not None:
             storage = (
                 getattr(quant_config, "quant_description", {})

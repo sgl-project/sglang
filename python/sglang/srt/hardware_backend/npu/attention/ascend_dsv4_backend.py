@@ -2377,6 +2377,8 @@ class LowRatioCompressAscendBackendMixin:
             query_tokens is not None and forward_batch.forward_mode.is_target_verify()
         )
         if is_a3_verify and out_loc.numel() < positions.numel():
+            # Fixed-width A3 verify needs one slot per query row. Fill missing
+            # slots with the dummy page and keep the shared full-slot mapping.
             out_loc = F.pad(out_loc, (0, positions.numel() - out_loc.numel()))
         n = min(int(positions.numel()), int(out_loc.numel()))
         if query_tokens is not None:
