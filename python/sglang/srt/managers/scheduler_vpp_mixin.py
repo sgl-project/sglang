@@ -111,7 +111,7 @@ class SchedulerVPPMixin:
             wave = self._vpp_admit_wave()
             if not wave:
                 self._sched_idled = True
-                self._pp_answer_release_requests()
+                self._pp_answer_verdict_requests()
                 if self._vpp_pd_queues_empty():
                     self.on_idle()
                 continue
@@ -445,4 +445,4 @@ class SchedulerVPPMixin:
             self.mb_metadata[state.slot_id] = None
             self.vpp_batches.complete(state.batch_seq)
             self.invariant_checker.run(CheckPhase.BUSY, state.batch)
-        self._pp_answer_release_requests()
+        self._pp_answer_verdict_requests()
