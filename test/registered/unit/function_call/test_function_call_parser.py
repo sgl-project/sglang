@@ -5811,7 +5811,7 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(cities, ["NYC", "LA"])
 
 
-class TestGemma4Detector(unittest.TestCase):
+class TestGemma4Detector(CustomTestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -5944,13 +5944,13 @@ class TestGemma4Detector(unittest.TestCase):
         ]
         text = (
             'Some text <|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
-            ' more text <|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>'
+            'More text <|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>Done.'
         )
         result = self.detector.detect_and_parse(text, extra_tools)
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "get_time")
-        self.assertEqual(result.normal_text, "Some text ")
+        self.assertEqual(result.normal_text, "Some text More text Done.")
 
     def test_parse_gemma4_args_empty(self):
         self.assertEqual(_parse_gemma4_args(""), {})
@@ -6056,6 +6056,25 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Tokyo")
         self.assertEqual(params1["timezone"], "UTC")
+
+    def test_streaming_repeated_tool_calls_use_call_indices(self):
+        """Repeated calls must reconstruct as separate calls in the client."""
+        chunks = [
+            "<|tool_call>call:get_weather{",
+            'location:<|"|>Tokyo<|"|>}<tool_call|>',
+            "<|tool_call>call:get_weather{",
+            'location:<|"|>Paris<|"|>}<tool_call|>',
+        ]
+
+        normal_text, tool_calls = self._collect_streaming(chunks)
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(list(tool_calls), [0, 1])
+        for index, location in enumerate(("Tokyo", "Paris")):
+            self.assertEqual(tool_calls[index]["name"], "get_weather")
+            self.assertEqual(
+                json.loads(tool_calls[index]["parameters"]), {"location": location}
+            )
 
     def test_streaming_very_small_chunks(self):
         """Test streaming with character-by-character chunks."""
