@@ -91,6 +91,35 @@ _QKV_PACK_FUSION = BitExactFusionGate(
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
 
+def _rope_from_positions(positions, axes_dims, device):
+    """Complex rotary embedding for a list of (position, height, width) triples."""
+    pos = torch.tensor(positions, device=device, dtype=torch.float32)
+    angles = torch.cat(
+        [
+            pos[:, axis : axis + 1]
+            * (10000.0 ** (-torch.arange(0, dim, 2, device=device).float() / dim))
+            for axis, dim in enumerate(axes_dims)
+        ],
+        dim=-1,
+    )
+    return torch.polar(torch.ones_like(angles), angles)
+
+
+def build_target_rope(position, height, width, axes_dims, device):
+    """RoPE for the target latent grid, starting at ``position``.
+
+    Progressive resolution rebuilds only this tensor when the target grid
+    changes: the prefix grid (text + reference image tokens) keeps its own
+    positions, so ``prefix_rope`` and the condition K/V caches stay valid.
+    """
+    positions = [
+        (position, h, w)
+        for h in range(-(height - height // 2), height // 2)
+        for w in range(-(width - width // 2), width // 2)
+    ]
+    return _rope_from_positions(positions, axes_dims, device)
+
+
 def build_layout(image_slots, image_shapes, axes_dims, device):
     """Expand each condition-image slot to its complete latent grid before denoising."""
     indices, image_indices, positions, segments = [], [], [], []
@@ -123,16 +152,7 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     for h in range(-(height - height // 2), height // 2):
         for w in range(-(width - width // 2), width // 2):
             positions.append((position, h, w))
-    pos = torch.tensor(positions, device=device, dtype=torch.float32)
-    angles = torch.cat(
-        [
-            pos[:, axis : axis + 1]
-            * (10000.0 ** (-torch.arange(0, dim, 2, device=device).float() / dim))
-            for axis, dim in enumerate(axes_dims)
-        ],
-        dim=-1,
-    )
-    rope = torch.polar(torch.ones_like(angles), angles)
+    rope = _rope_from_positions(positions, axes_dims, device)
     return dict(
         encoder_seq_len=len(image_slots),
         text_indices=torch.tensor(indices, device=device, dtype=torch.long),
@@ -140,6 +160,9 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
         prefix_rope=rope[:prefix_len],
         target_rope=rope[prefix_len:],
         segments=tuple(segments),
+        # position offset of the first target token; progressive resolution
+        # rebuilds target_rope from it without re-deriving the prefix grid
+        target_position=position,
     )
 
 

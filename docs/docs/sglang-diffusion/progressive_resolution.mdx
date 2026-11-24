@@ -281,6 +281,37 @@ Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop on
 | dct_rewind L1 δ=0.10 | 16@64² + 14@128² | 33.86 s | **1.27×** |
 | dct_rewind L1 δ=0.20 | 19@64² + 11@128² | 25.40 s | **1.69×** |
 
+## Qwen-Image 2.1
+
+Qwen-Image 2.1 changed the latent contract: the VAE compresses 16× with no 2×2 patchify, so the DiT consumes the 64-channel latent directly, and positional state lives in precomputed RoPE tables (`layouts[*]["target_rope"]`) instead of `freqs_cis` / `img_shapes`. A dedicated stage rebuilds only the target-grid RoPE at each transition; the text and reference-image prefix, its K/V caches, and the full-resolution sigma schedule are resolution independent.
+
+```bash
+# Standard fullres — unchanged behavior
+sglang generate --model-path Qwen/Qwen-Image-2.1 \
+    --prompt "A snow leopard resting on a rock in falling snow"
+
+# Progressive dct_rewind L1 δ=0.10 → 1.30× end-to-end speedup
+sglang generate --model-path Qwen/Qwen-Image-2.1 \
+    --prompt "A snow leopard resting on a rock in falling snow" \
+    --height 1024 --width 1024 \
+    --num-inference-steps 40 \
+    --progressive-mode dct_rewind --progressive-levels 1 --progressive-delta 0.10 \
+    --dit-cpu-offload false
+```
+
+Hardware: AMD Ryzen AI MAX 395 (gfx1151, ROCm), `torch_sdpa`, `--dit-cpu-offload false`. End-to-end timing is the `Pixel data generated successfully` line; the denoising figure is the stage alone.
+
+| Config | Stage split | Denoise | End-to-end | Denoise speedup | E2E speedup |
+|--------|-------------|---------|------------|-----------------|-------------|
+| Fullres (baseline) | 40 @ 64² | 129.61 s | 158.60 s | 1.00× | 1.00× |
+| dct_rewind L1 δ=0.05 | 10@32² + 30@64² | 101.06 s | 130.61 s | 1.28× | **1.21×** |
+| dct_rewind L1 δ=0.10 | 13@32² + 27@64² | 92.66 s | 122.39 s | 1.40× | **1.30×** |
+| dct_rewind L2 δ=0.05 | 4@16² + 6@32² + 30@64² | 100.70 s | 130.71 s | 1.29× | **1.21×** |
+
+> **Note:** the coarse stages draw their own initial noise instead of downsampling the full-resolution noise, so a progressive output is a different sampling trajectory rather than a perturbation of the baseline. Use FID/CLIP or visual review to judge quality; PSNR against the full-res baseline is not meaningful here.
+
+The transition sigmas come from `QWEN_IMAGE_SPECTRUM_A/BETA`, which are still the FLUX.1-dev fitted values. Refitting them on Qwen-Image latents may change both the speedup and the output.
+
 ## Ideogram 4
 
 Supports `ideogram-ai/ideogram-4-fp8` and `ideogram-ai/ideogram-4-nf4`. Ideogram 4 uses a **dual-transformer architecture**: a conditional transformer (text + image tokens) and a separately-weighted unconditional transformer (image tokens only, zero LLM features). Both transformers shrink at coarse resolution, providing the same token-ratio benefit as single-transformer models.

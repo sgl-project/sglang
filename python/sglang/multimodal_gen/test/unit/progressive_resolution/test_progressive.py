@@ -15,6 +15,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+    _rope_from_positions,
+    build_layout,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -37,6 +41,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     Ideogram4ProgressiveDenoisingStage,
     _ideogram4_pack,
     _ideogram4_unpack,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image21 import (
+    QwenImage21ProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
     dct_2d,
@@ -455,6 +462,57 @@ class TestLatentAdapters(unittest.TestCase):
             stage._repack_latent(latent, 8, 8, SimpleNamespace(), SimpleNamespace()),
             latent,
         )
+
+
+class TestQwenImage21ProgressiveStage(unittest.TestCase):
+    """Qwen-Image 2.1: no patch packing, so latents stay in row-major order."""
+
+    def test_latent_adapter_roundtrip(self):
+        stage = object.__new__(QwenImage21ProgressiveDenoisingStage)
+        x = torch.arange(2 * 64 * 6 * 5, dtype=torch.float32).reshape(2, 64, 6, 5)
+
+        packed = stage._repack_latent(x, 6, 5, SimpleNamespace(), SimpleNamespace())
+
+        self.assertEqual(packed.shape, (2, 6 * 5, 64))
+        torch.testing.assert_close(stage._unpack_latent(packed, 6, 5), x)
+
+    def test_resolution_change_rebuilds_only_target_rope(self):
+        axes_dims = (16, 56, 56)
+        device = torch.device("cpu")
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                dit_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(axes_dims_rope=axes_dims)
+                ),
+                vae_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(vae_scale_factor=16)
+                ),
+            )
+        )
+        # one text token, one 4x4 reference image, one text token; target 6x6
+        layout = build_layout(
+            [False, True, False], [(1, 4, 4), (1, 6, 6)], axes_dims, device
+        )
+        prefix_rope = layout["prefix_rope"]
+        target_position = layout["target_position"]
+        target_rope_6x6 = layout["target_rope"]
+        ctx = SimpleNamespace(pos_cond_kwargs={"layouts": [layout]}, neg_cond_kwargs={})
+
+        stage = object.__new__(QwenImage21ProgressiveDenoisingStage)
+        stage._on_resolution_change(ctx, SimpleNamespace(), server_args, 128, 96)
+
+        # prefix state is resolution independent and must be reused as-is
+        self.assertIs(layout["prefix_rope"], prefix_rope)
+        # 128x96 px at a 16x VAE is an 8x6 latent grid: the grid is rebuilt
+        # from the same offset, so enumerate it here instead of calling the
+        # helper the implementation uses.
+        expected_positions = [
+            (target_position, h, w) for h in range(-4, 4) for w in range(-3, 3)
+        ]
+        expected = _rope_from_positions(expected_positions, axes_dims, device)
+        self.assertEqual(layout["target_rope"].shape, (8 * 6, sum(axes_dims) // 2))
+        torch.testing.assert_close(layout["target_rope"], expected)
+        self.assertFalse(torch.equal(layout["target_rope"], target_rope_6x6))
 
 
 class TestIdeogram4LatentAdapters(unittest.TestCase):
