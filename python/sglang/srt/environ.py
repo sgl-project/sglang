@@ -1702,6 +1702,9 @@ class Envs:
     # grid of this many columns (128, 256, 512 or 1024); 0 keeps one program per
     # token. Same arithmetic per element; only the grid changes.
     SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK = EnvInt(0)
+    # The largest token count the column-chunk grid takes (GB300 verify: chunk 1024 is faster at 208-336 tokens,
+    # slower at 512).
+    SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS = EnvInt(64)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,

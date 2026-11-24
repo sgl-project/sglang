@@ -21,8 +21,8 @@ if _FINALIZE_GATE_COLUMN_CHUNK not in (0,) + _FINALIZE_GATE_COLUMN_CHUNKS:
         "SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK must be 0 or one of "
         f"{_FINALIZE_GATE_COLUMN_CHUNKS}, got {_FINALIZE_GATE_COLUMN_CHUNK}"
     )
-# The column-chunk grid covers the small-grid range only.
-_FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS = 64
+# The column-chunk grid covers the small-grid range only, unless raised.
+_FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS = envs.SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK_MAX_TOKENS.get()
 
 
 
