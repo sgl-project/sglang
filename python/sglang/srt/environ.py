@@ -2403,6 +2403,10 @@ class Envs:
     # ===================================================================
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    # Split decode routed experts across the GPU's two locality domains (SM107),
+    # for calls of up to MAX_TOKENS tokens.
+    SGLANG_OPT_MUSE_SPARK_LOCALIZED_MOE = EnvBool(False)
+    SGLANG_OPT_MUSE_SPARK_LOCALIZED_MOE_MAX_TOKENS = EnvInt(512)
     # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
     # variable is the off-switch of one optimization; the paths are shape-gated, so
     # they only engage on the Muse Spark shapes they were measured on.
