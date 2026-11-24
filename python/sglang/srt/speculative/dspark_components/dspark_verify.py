@@ -1263,13 +1263,18 @@ def build_accept_outs(
 
 
 def _residual_draft_args(draft_block: Optional[DraftBlockResult], bs: int) -> dict:
+    if not envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get():
+        return {}
     if (
-        not envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get()
-        or draft_block is None
+        draft_block is None
         or draft_block.greedy_draft
         or draft_block.corrected_logits is None
         or getattr(draft_block, "vocab_shard", None) is not None
     ):
+        print_warning_once(
+            "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: no draft step logits here; "
+            "the simulated bonus stays a plain target draw"
+        )
         return {}
     print_info_once(
         "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: residual stop token on (eager)"
