@@ -15,6 +15,7 @@ GPU part (skipped unless the device reads pageable host memory): the production
 Triton gather kernel reading from the file-backed table matches a torch gather.
 """
 
+import gc
 import os
 import tempfile
 import unittest
@@ -411,17 +412,24 @@ class TestFileBackendDeviceCheck(CustomTestCase):
 
 class _FakeHostRegister:
     def __init__(self, rc):
-        self.rc, self.calls = rc, []
+        self.rc, self.calls, self.unregistered = rc, [], []
 
     def cudaHostRegister(self, ptr, size, flags):
         self.calls.append((ptr, size, flags))
         return self.rc
 
+    def cudaHostUnregister(self, ptr):
+        self.unregistered.append(ptr)
+        return 0
+
 
 class TestPlePinnedHugepageTable(CustomTestCase):
-    def _allocate(self, hugepage_table):
+    def _allocate(self, hugepage_table, page_size=64 << 10):
         with (
             mock.patch.object(torch.version, "cuda", "13.0"),
+            mock.patch.object(
+                qwen4_exp_ple_table.os, "sysconf", return_value=page_size
+            ),
             mock.patch.object(
                 qwen4_exp_ple_table,
                 "_pinned_hugepage_table",
@@ -434,21 +442,29 @@ class TestPlePinnedHugepageTable(CustomTestCase):
             ) as host_alloc,
         ):
             table = allocate_ple_host_table((4, 8), torch.float32, "pinned")
-        hugepage.assert_called_once_with((4, 8), torch.float32)
-        return table, host_alloc
+        return table, hugepage, host_alloc
 
     def test_pinned_backend_takes_the_hugepage_table(self):
         sentinel = torch.zeros(4, 8)
-        table, host_alloc = self._allocate(sentinel)
+        table, hugepage, host_alloc = self._allocate(sentinel)
         self.assertIs(table, sentinel)
+        hugepage.assert_called_once_with((4, 8), torch.float32)
         host_alloc.assert_not_called()
 
     def test_falls_back_to_cuda_host_alloc(self):
-        table, host_alloc = self._allocate(None)
+        table, hugepage, host_alloc = self._allocate(None)
         self.assertEqual(table, "cudaHostAlloc")
+        hugepage.assert_called_once_with((4, 8), torch.float32)
         host_alloc.assert_called_once_with((4, 8), torch.float32)
 
-    def _table(self, rc, advice_ok=True):
+    def test_hosts_without_64k_base_pages_keep_cuda_host_alloc(self):
+        """Only 64 KiB-page hosts were measured; others keep main's table."""
+        table, hugepage, host_alloc = self._allocate(torch.zeros(4, 8), page_size=4096)
+        self.assertEqual(table, "cudaHostAlloc")
+        hugepage.assert_not_called()
+        host_alloc.assert_called_once_with((4, 8), torch.float32)
+
+    def _table(self, rc, advice_ok=True, coverage=1.0):
         cudart = _FakeHostRegister(rc)
         advised = []
 
@@ -460,25 +476,53 @@ class TestPlePinnedHugepageTable(CustomTestCase):
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
             mock.patch.object(qwen4_exp_ple_table, "_madvise", madvise),
             mock.patch.object(qwen4_exp_ple_table, "_clear_cuda_last_error") as clear,
+            mock.patch.object(
+                qwen4_exp_ple_table,
+                "_huge_page_bytes",
+                side_effect=lambda start, length: int(coverage * length),
+            ),
         ):
             table = qwen4_exp_ple_table._pinned_hugepage_table((100, 160), torch.uint8)
-        return table, cudart.calls, advised, clear.called
+        return table, cudart, advised, clear.called
 
     def test_aligned_registered_mapping(self):
-        table, registered, advised, cleared = self._table(rc=0)
+        table, cudart, advised, cleared = self._table(rc=0)
         align = qwen4_exp_ple_table._HUGEPAGE_ALIGN
         self.assertEqual((tuple(table.shape), table.dtype), ((100, 160), torch.uint8))
         self.assertEqual(table.data_ptr() % align, 0)
         self.assertEqual(advised, [(table.data_ptr(), 16000, 14)])
-        self.assertEqual(registered, [(table.data_ptr(), 16000, 0)])
+        self.assertEqual(cudart.calls, [(table.data_ptr(), 16000, 0)])
         self.assertFalse(cleared)
 
     def test_failed_registration_or_advice_returns_none(self):
         table, _, _, cleared = self._table(rc=1)
         self.assertIsNone(table)
         self.assertTrue(cleared)
-        table, registered, _, _ = self._table(rc=0, advice_ok=False)
-        self.assertEqual((table, registered), (None, []))
+        table, cudart, _, _ = self._table(rc=0, advice_ok=False)
+        self.assertEqual((table, cudart.calls), (None, []))
+
+    def test_low_huge_page_coverage_is_a_warning(self):
+        with self.assertLogs(qwen4_exp_ple_table.logger, "WARNING") as logs:
+            table, _, _, _ = self._table(rc=0, coverage=0.5)
+        self.assertIsNotNone(table)
+        self.assertIn("only 50% of the", logs.output[0])
+        self.assertIn("transparent_hugepage/enabled", logs.output[0])
+
+    def test_the_table_is_unregistered_with_its_last_view(self):
+        table, cudart, _, _ = self._table(rc=0)
+        ptr, view = table.data_ptr(), table[1:]
+        del table
+        gc.collect()
+        self.assertEqual(cudart.unregistered, [])
+        del view
+        gc.collect()
+        self.assertEqual(cudart.unregistered, [ptr])
+
+    def test_huge_page_bytes_reads_the_mapping_of_the_range(self):
+        buf = torch.empty(1 << 20, dtype=torch.uint8)
+        self.assertIsInstance(
+            qwen4_exp_ple_table._huge_page_bytes(buf.data_ptr(), buf.numel()), int
+        )
 
 
 @unittest.skipUnless(

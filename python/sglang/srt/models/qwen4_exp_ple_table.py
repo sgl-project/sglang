@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Sequence
 
@@ -63,8 +64,12 @@ _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
 _MADV_HUGEPAGE = 14
 _PAGE_SHIFT = 12
-# A PMD huge page with 64 KiB base pages; the pinned huge-page mapping starts aligned to it.
+# The huge-page table is used only with 64 KiB base pages (the hosts it was measured on),
+# where a PMD huge page is 512 MiB; the mapping starts aligned to it.
+_HUGEPAGE_BASE_PAGE = 64 << 10
 _HUGEPAGE_ALIGN = 512 << 20
+# Below this share of the table on huge pages the gather is translation-bound again.
+_MIN_HUGEPAGE_COVERAGE = 0.9
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
 # 47.7 GiB table that is ~3.5 s during which every fault in the process --
 # including the ones the gather kernel takes -- stalls. Trim in slices.
@@ -252,9 +257,10 @@ def allocate_ple_host_table(
         )
     if backend == "pinned":
         if torch.version.cuda is not None:
-            table = _pinned_hugepage_table(shape, dtype)
-            if table is not None:
-                return table
+            if os.sysconf("SC_PAGESIZE") == _HUGEPAGE_BASE_PAGE:
+                table = _pinned_hugepage_table(shape, dtype)
+                if table is not None:
+                    return table
             return _alloc_cuda_host_table(tuple(shape), dtype)
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
@@ -532,7 +538,8 @@ def _pinned_hugepage_table(
         if not _madvise(base + offset, nbytes, _MADV_HUGEPAGE):
             raise OSError("madvise(MADV_HUGEPAGE) failed")
         storage = torch.frombuffer(raw, dtype=torch.uint8, count=nbytes, offset=offset)
-        rc = int(torch.cuda.cudart().cudaHostRegister(base + offset, nbytes, 0))
+        cudart = torch.cuda.cudart()
+        rc = int(cudart.cudaHostRegister(base + offset, nbytes, 0))
         if rc != 0:
             _clear_cuda_last_error()
             raise OSError(f"cudaHostRegister returned {rc}")
@@ -543,21 +550,33 @@ def _pinned_hugepage_table(
         )
         return None
     table = storage.view(dtype).view(*[int(d) for d in shape])
-    # The mapping must outlive the tensor; it is never unregistered (one per process).
     table._sglang_ple_mapping = (mapping, raw)
-    logger.info(
-        "PLE table: on transparent huge pages, page-locked "
-        "(%.1f GiB, %s; process AnonHugePages %s)",
-        nbytes / 2**30,
-        dtype,
-        _anon_huge_pages(),
-    )
+    # Unregistered with the table's last view, before the mapping is unmapped; at
+    # interpreter exit the driver reclaims it.
+    weakref.finalize(raw, cudart.cudaHostUnregister, base + offset).atexit = False
+    covered = _huge_page_bytes(base + offset, nbytes)
+    if covered is not None and covered < _MIN_HUGEPAGE_COVERAGE * nbytes:
+        logger.warning(
+            "PLE table: only %.0f%% of the %.1f GiB table is on transparent huge pages, "
+            "so its gather is slower; check /sys/kernel/mm/transparent_hugepage/enabled "
+            "and defrag, and the host's free memory",
+            100 * covered / nbytes,
+            nbytes / 2**30,
+        )
+    else:
+        logger.info(
+            "PLE table: on transparent huge pages, page-locked (%.1f GiB, %s, %s%%)",
+            nbytes / 2**30,
+            dtype,
+            "?" if covered is None else f"{100 * covered / nbytes:.0f}",
+        )
     return table
 
 
 def _clear_cuda_last_error() -> None:
     """A failed cudaHostRegister leaves the runtime's last error set, and torch's next launch
-    check would raise it; clear it in every libcudart this process loaded."""
+    check would raise it; clear it in every libcudart this process loaded. Failure path only:
+    torch's runtime need not be the first libcudart in the process, the one CudaRTLibrary opens."""
     try:
         with open("/proc/self/maps") as f:
             paths = sorted({ln.split()[-1] for ln in f if "libcudart.so" in ln})
@@ -570,15 +589,22 @@ def _clear_cuda_last_error() -> None:
             continue
 
 
-def _anon_huge_pages() -> str:
+def _huge_page_bytes(start: int, length: int) -> Optional[int]:
+    """AnonHugePages of the mappings overlapping ``[start, start + length)``; None if
+    /proc/self/smaps cannot be read."""
+    end, total, inside = start + length, 0, False
     try:
-        with open("/proc/self/smaps_rollup") as f:
+        with open("/proc/self/smaps") as f:
             for line in f:
-                if line.startswith("AnonHugePages:"):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return "unknown"
+                head = line.split(maxsplit=1)[0]
+                if not head.endswith(":"):  # a mapping's header: "lo-hi perms ..."
+                    lo, hi = (int(x, 16) for x in head.split("-"))
+                    inside = lo < end and hi > start
+                elif inside and head == "AnonHugePages:":
+                    total += int(line.split()[1]) << 10
+    except (OSError, ValueError):
+        return None
+    return total
 
 
 def _libc() -> Optional[ctypes.CDLL]:
