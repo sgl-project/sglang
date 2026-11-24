@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.platform_kv_cache_dtype import (
     registered_kv_cache_storage_dtype,
 )
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -626,17 +626,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
+        if cfg.disaggregation_transfer_backend == "nixl":
+            assert (
+                get_platform().is_cuda
+                and envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get() == "UCX"
+            ), "NIXL unified-memory PD currently requires CUDA and UCX"
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
         )
-        assert not (
-            cfg.disaggregation_transfer_backend == "mooncake"
-            and cfg.speculative_algorithm is not None
-        ), (
+        assert cfg.speculative_algorithm is None, (
             "--enable-unified-memory with PD disaggregation does not support "
-            "speculative decoding with the Mooncake transfer backend."
+            "speculative decoding."
         )
         # This flag also selects decode's non-blocking metadata readback, which
         # records a receive as in flight before its destination is published.
@@ -777,7 +779,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         backends = set(attention_backends_of(resolved_view(server_args)))
         backends.discard(None)
         if not backends <= full_cg_backends:
-            _cg_cfg.prefill.backend = Backend.DISABLED
+            declare_resolution(
+                server_args,
+                "handle_unified_memory_pool",
+                cuda_graph_config=with_phase(
+                    _cg_cfg, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "--enable-unified-memory: disabling the FULL prefill "
                 "cuda-graph backend. It builds its block table in "

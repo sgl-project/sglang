@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 
 import torch
@@ -12,12 +13,17 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_world_size,
     get_replica_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -35,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -228,7 +235,30 @@ def _canonical_output_audio_waveform(
     return audio_waveform.permute(1, 0, 2).contiguous()
 
 
+def _trim_audio_to_video_duration(
+    audio_waveform: torch.Tensor, batch: Req, sample_rate: int
+) -> torch.Tensor:
+    """Cut ``[1, C, L]`` audio to the video's duration, as the reference does.
+
+    The audio latents cover whole hops, so the decoded waveform runs past the
+    last video frame (e.g. 165600 samples for 124 frames at 24 fps and 32 kHz,
+    whose duration is 165333 samples). Same rule as the Diffusers Pika H3 Flex
+    audio decode step: ``round(num_frames / fps * sample_rate)``. The base
+    MiniMax-H3 reference keeps the full waveform.
+    """
+    if not batch.num_frames or not batch.fps:
+        return audio_waveform
+    num_samples = round(int(batch.num_frames) / float(batch.fps) * int(sample_rate))
+    if 0 < num_samples < int(audio_waveform.shape[-1]):
+        audio_waveform = audio_waveform[..., :num_samples].contiguous()
+    return audio_waveform
+
+
 _MINIMAX_H3_DECODER_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
+# Video tiles of the audio decoder's rank that the other ranks decode while it
+# decodes the audio beside them (8 x B300, t2va 16:9 768p at 5 / 10 / 15 s:
+# 12 beat 6 and 9; the audio decode alone takes about ten tiles' time)
+_OVERLAP_AUDIO_TILES = 12
 _MINIMAX_H3_CANONICAL_REQUEST_EXTRA_KEY = "minimax_h3_canonical_request"
 _MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY = "minimax_h3_resolved_plan"
 
@@ -263,6 +293,19 @@ def _minimax_h3_decoder_task(batch: Req) -> str | None:
     return task_value
 
 
+@contextmanager
+def _lighten_tile_groups(video_vae, rank: int | None, budget: int, keep: int):
+    """Hand ``budget`` of ``rank``'s tiles to the other ranks, leaving it
+    ``keep`` per tiled decode (see ``tile_owners``)."""
+    video_vae.light_tile_rank = rank
+    video_vae.light_tile_budget, video_vae.light_tile_keep = budget, keep
+    try:
+        yield
+    finally:
+        video_vae.light_tile_rank = None
+        video_vae.light_tile_budget, video_vae.light_tile_keep = 0, 1
+
+
 class MiniMaxH3DecodingStage(DecodingStage):
     def __init__(self, video_vae, audio_vae) -> None:
         """``audio_vae=None`` selects the audio-free image release output."""
@@ -270,6 +313,9 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self._compiled_audio_vae_decode = ActiveTargetCompiledCallable()
+        # thread and stream of an audio decode that overlaps the video decode
+        self._audio_thread: ThreadPoolExecutor | None = None
+        self._audio_stream: torch.cuda.Stream | None = None
 
     @property
     def role_affinity(self) -> RoleType:
@@ -336,59 +382,69 @@ class MiniMaxH3DecodingStage(DecodingStage):
             self.audio_vae = audio_vae
             if audio_vae.training:
                 audio_vae.eval()
-            audio_arch_config = server_args.pipeline_config.audio_vae_config.arch_config
-            audio_decode_latent = _reverse_normalize_latents(
-                audio_latent,
-                mean_values=audio_arch_config.latents_mean,
-                std_values=audio_arch_config.latents_std,
-                name="audio_vae",
-            )
-            audio_vae_dtype = resolve_precision(
-                server_args, "audio_vae", precision_attr="audio_vae_precision"
-            )
-            audio_autocast_enabled = autocast_enabled_for_device(
-                audio_latent, audio_vae_dtype, server_args.disable_autocast
-            )
-            autocast_context = (
-                torch.autocast(
-                    device_type="cuda",
-                    dtype=audio_vae_dtype,
-                    enabled=audio_autocast_enabled,
-                )
-                if audio_latent.is_cuda
-                else nullcontext()
-            )
-            with _deterministic_audio_decode_context(), autocast_context:
-                audio_decode = self._get_vae_decode_fn(
-                    audio_vae,
-                    server_args,
-                    decode_fn=audio_vae.decode,
-                    compiled_callable=self._compiled_audio_vae_decode,
-                )
-                waveform = _required_tensor(
-                    audio_decode(audio_decode_latent), "audio_vae.decode"
-                )
-            return {
-                "waveform": waveform,
-                "sample_rate": int(audio_vae.sample_rate),
-            }
+            return self._run_audio_vae(audio_vae, audio_latent, server_args)
 
-    def _decode_replica_audio(
+    def _run_audio_vae(
+        self, audio_vae, audio_latent: torch.Tensor, server_args: ServerArgs
+    ) -> dict:
+        audio_arch_config = server_args.pipeline_config.audio_vae_config.arch_config
+        audio_decode_latent = _reverse_normalize_latents(
+            audio_latent,
+            mean_values=audio_arch_config.latents_mean,
+            std_values=audio_arch_config.latents_std,
+            name="audio_vae",
+        )
+        audio_vae_dtype = resolve_precision(
+            server_args, "audio_vae", precision_attr="audio_vae_precision"
+        )
+        audio_autocast_enabled = autocast_enabled_for_device(
+            audio_latent, audio_vae_dtype, server_args.disable_autocast
+        )
+        autocast_context = (
+            torch.autocast(
+                device_type="cuda",
+                dtype=audio_vae_dtype,
+                enabled=audio_autocast_enabled,
+            )
+            if audio_latent.is_cuda
+            else nullcontext()
+        )
+        with _deterministic_audio_decode_context(), autocast_context:
+            audio_decode = self._get_vae_decode_fn(
+                audio_vae,
+                server_args,
+                decode_fn=audio_vae.decode,
+                compiled_callable=self._compiled_audio_vae_decode,
+            )
+            waveform = _required_tensor(
+                audio_decode(audio_decode_latent), "audio_vae.decode"
+            )
+        return {
+            "waveform": waveform,
+            "sample_rate": int(audio_vae.sample_rate),
+        }
+
+    def _decode_owner_audio(
         self, audio_latent: torch.Tensor, server_args: ServerArgs
+    ) -> tuple[dict | None, Exception | None]:
+        """Decode the audio on replica rank 0 (the weights are replicated);
+        other ranks return (None, None) and receive it from ``_share_audio``."""
+        if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
+            return None, None
+        try:
+            return self._decode_audio(audio_latent, server_args), None
+        except Exception as exc:
+            return None, exc
+
+    def _share_audio(
+        self, audio_payload: dict | None, owner_exception: Exception | None
     ) -> tuple[torch.Tensor, int]:
-        # Audio VAE weights are replicated. Decode on replica rank 0 and broadcast
-        # only within the request's replica, excluding independent DP replicas.
+        """Broadcast replica rank 0's audio (or its error) within the replica,
+        excluding independent DP replicas."""
         replica_group = get_replica_group() if model_parallel_is_initialized() else None
-        is_audio_owner = replica_group is None or replica_group.rank_in_group == 0
-        owner_exception = None
         owner_error = None
-        audio_payload = None
-        if is_audio_owner:
-            try:
-                audio_payload = self._decode_audio(audio_latent, server_args)
-            except Exception as exc:
-                owner_exception = exc
-                owner_error = f"{type(exc).__name__}: {exc}"
+        if owner_exception is not None:
+            owner_error = f"{type(owner_exception).__name__}: {owner_exception}"
         if replica_group is not None:
             owner_error = replica_group.broadcast_object(owner_error, src=0)
         if owner_error is not None:
@@ -405,6 +461,108 @@ class MiniMaxH3DecodingStage(DecodingStage):
             audio_payload.get("waveform"), "audio_vae.decode"
         )
         return audio_waveform, int(audio_payload["sample_rate"])
+
+    @staticmethod
+    def _overlaps_audio_decode(server_args: ServerArgs) -> bool:
+        """Whether the audio decodes on a side stream alongside the video.
+
+        CUDA only, with other decode ranks to take over the audio rank's
+        tiles, and only for a resident audio VAE: the decode runs on another
+        thread, outside the residency manager's sequential uses.
+        """
+        return (
+            current_platform.is_cuda()
+            and model_parallel_is_initialized()
+            and get_decode_parallel_world_size() > 1
+            and server_args.residency_mode("audio_vae") == RESIDENT
+        )
+
+    def _start_owner_audio(
+        self, audio_latent: torch.Tensor, server_args: ServerArgs, finish
+    ) -> Future | None:
+        """Start replica rank 0's audio decode on a side stream and thread;
+        other ranks return None.
+
+        The future gives the decoded payload, ``finish`` of its waveform (the
+        output audio) and that on the host. The stream has the higher priority:
+        the MP4 encoder waits for the audio, and the other ranks take over most
+        of this rank's first video tiles meanwhile (``_audio_tile_plan``).
+        """
+        if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
+            return None
+        with self.use_declared_component(
+            component_name="audio_vae",
+            module=self.audio_vae,
+        ) as audio_vae:
+            assert audio_vae is not None
+            self.audio_vae = audio_vae
+            if audio_vae.training:
+                audio_vae.eval()
+        if self._audio_thread is None:
+            self._audio_thread = ThreadPoolExecutor(
+                1, thread_name_prefix="sglang-audio-decode"
+            )
+            self._audio_stream = torch.cuda.Stream(priority=-1)
+        stream = self._audio_stream
+        stream.wait_stream(torch.cuda.current_stream())
+        audio_latent.record_stream(stream)
+        device = torch.cuda.current_device()
+        inference = torch.is_inference_mode_enabled()
+
+        def run():
+            with (
+                torch.cuda.device(device),
+                torch.cuda.stream(stream),
+                torch.inference_mode(inference),
+                torch.no_grad(),
+            ):
+                payload = self._run_audio_vae(audio_vae, audio_latent, server_args)
+                waveform = finish(payload["waveform"], payload["sample_rate"])
+                return payload, waveform, waveform[0].cpu()
+
+        return self._audio_thread.submit(run)
+
+    def _join_owner_audio(
+        self, job: Future | None
+    ) -> tuple[dict | None, torch.Tensor | None, Exception | None]:
+        """The started audio decode's payload and output audio, ready on the
+        current stream, or its error; (None, None, None) without one."""
+        if job is None:
+            return None, None, None
+        try:
+            payload, waveform, _ = job.result()
+        except Exception as exc:
+            return None, None, exc
+        current = torch.cuda.current_stream()
+        current.wait_stream(self._audio_stream)
+        payload["waveform"].record_stream(current)
+        waveform.record_stream(current)
+        return payload, waveform, None
+
+    @staticmethod
+    def _audio_tile_plan(overlap: bool) -> tuple[int | None, int, int]:
+        """Decode-group rank of the replica rank that decodes the audio, how
+        many of its video tiles the other ranks take over meanwhile, and how
+        many it keeps per tiled decode until then.
+
+        ROCm decodes the audio before the video and lightens the first tile
+        group, keeping one tile (measured on MI350X: the audio decode costs
+        about six tiles). CUDA decodes it alongside the video, where sharing
+        the GPU with the rank's own tiles gains nothing over running them in
+        turn, so the rank keeps none until the tiles that fit beside the audio
+        are spent (``_OVERLAP_AUDIO_TILES``).
+        """
+        if not model_parallel_is_initialized() or not (
+            overlap or current_platform.is_rocm()
+        ):
+            return None, 0, 1
+        owner = get_replica_group().ranks[0]
+        decode_ranks = get_decode_parallel_group_coordinator().ranks
+        if owner not in decode_ranks:
+            return None, 0, 1
+        if not overlap:
+            return decode_ranks.index(owner), 1, 1
+        return decode_ranks.index(owner), _OVERLAP_AUDIO_TILES, 0
 
     @staticmethod
     def _finish_visual_frames(
@@ -464,9 +622,13 @@ class MiniMaxH3DecodingStage(DecodingStage):
             ):
                 pixels = video_vae.decode_image_raw(raw)
         # decode_image_raw already applies the ImageNet inverse normalization.
-        pixels = pixels.detach().float().cpu()
+        pixels = pixels.detach().float()
         shape = plan.shape
-        if shape["output_width"] is not None:
+        # The resize quantizes (and, when verified exact, resizes) on the device
+        # and returns a host tensor, so only 8-bit pixels cross to the host.
+        if shape["output_width"] is None:
+            pixels = pixels.cpu()
+        else:
             width, height = int(shape["output_width"]), int(shape["output_height"])
             logger.info(
                 "MiniMax H3 image: generated %dx%d (min_generation_area), resized "
@@ -496,15 +658,45 @@ class MiniMaxH3DecodingStage(DecodingStage):
         if self.video_vae is None:
             raise RuntimeError("MiniMax H3 tasks require the video_vae output decoder")
         batch_size = int(visual_latent.shape[0])
-        audio_waveform, audio_sample_rate = self._decode_replica_audio(
-            audio_latent, server_args
-        )
-        output_audio_waveform = _canonical_output_audio_waveform(
-            audio_waveform, batch_size=batch_size
-        )
-        streamed_output_path = streamed_video_output_path(
-            batch, server_args, batch_size
-        )
+
+        def finish_audio(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+            waveform = _canonical_output_audio_waveform(waveform, batch_size=batch_size)
+            if server_args.pipeline_config.trim_audio_to_video:
+                waveform = _trim_audio_to_video_duration(waveform, batch, sample_rate)
+            return waveform
+
+        # Replica rank 0 decodes the audio, alongside its video tiles on CUDA
+        # or before them while the other ranks start theirs; everyone else
+        # receives it after the video decode.
+        overlap_audio = self._overlaps_audio_decode(server_args)
+        owner_audio, owner_exception, audio_job = None, None, None
+        if overlap_audio:
+            audio_job = self._start_owner_audio(
+                audio_latent,
+                server_args,
+                finish_audio,
+            )
+        else:
+            owner_audio, owner_exception = self._decode_owner_audio(
+                audio_latent, server_args
+            )
+        output_audio_waveform = None
+        streamed_output_path = None
+        encoder_audio = None
+        if owner_audio is not None:
+            audio_sample_rate = int(owner_audio["sample_rate"])
+            output_audio_waveform = finish_audio(
+                _required_tensor(owner_audio.get("waveform"), "audio_vae.decode"),
+                audio_sample_rate,
+            )
+            encoder_audio = output_audio_waveform[0]
+        elif audio_job is not None:
+            audio_sample_rate = int(self.audio_vae.sample_rate)
+            encoder_audio = lambda: audio_job.result()[2]  # noqa: E731
+        if encoder_audio is not None:
+            streamed_output_path = streamed_video_output_path(
+                batch, server_args, batch_size
+            )
 
         visual_frames = None
         output_file_paths = None
@@ -553,7 +745,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         streamed_output_path,
                         batch,
                         finish_frames,
-                        output_audio_waveform[0],
+                        encoder_audio,
                         audio_sample_rate,
                     )
                     decode_kwargs["on_frames"] = stream
@@ -563,9 +755,24 @@ class MiniMaxH3DecodingStage(DecodingStage):
                             selected_video_vae,
                             quality_allows(batch.sampling_params.quality, "lossless"),
                         ),
+                        _lighten_tile_groups(
+                            selected_video_vae, *self._audio_tile_plan(overlap_audio)
+                        ),
                         set_forward_context(current_timestep=0, attn_metadata=None),
                     ):
                         decoded = video_decode(visual_decode_latent, **decode_kwargs)
+                    # before closing the encoder, whose x264 and mux tail it overlaps
+                    if overlap_audio:
+                        owner_audio, output_audio_waveform, owner_exception = (
+                            self._join_owner_audio(audio_job)
+                        )
+                    audio_waveform, audio_sample_rate = self._share_audio(
+                        owner_audio, owner_exception
+                    )
+                    if output_audio_waveform is None:
+                        output_audio_waveform = finish_audio(
+                            audio_waveform, audio_sample_rate
+                        )
                     if stream is not None:
                         output_file_paths = stream.finish()
                 except BaseException:
