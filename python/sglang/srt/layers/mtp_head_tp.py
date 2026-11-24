@@ -223,8 +223,6 @@ def configure_draft_head_tp(model, hot_token_id):
     log = logging.getLogger(__name__)
     parallel = get_parallel()
     reason = _ineligible_reason(model, hot_token_id, parallel, get_spec())
-    if reason is not None:
-        log.info("MTP draft head TP4 not enabled: %s", reason)
     # Agree once before capture; eager/prefill never opt into the graph-only path.
     agreement = torch.tensor([int(reason is None)], dtype=torch.int32, device="cpu")
     torch.distributed.all_reduce(
@@ -232,8 +230,11 @@ def configure_draft_head_tp(model, hot_token_id):
     )
     group = parallel.tp_group
     if not agreement.item():
-        if reason is None and group.rank == 0:
-            log.info("MTP draft head TP4 not enabled: another TP rank is ineligible")
+        if group.rank == 0:
+            log.info(
+                "MTP draft head TP4 not enabled: %s",
+                reason or "another TP rank is ineligible",
+            )
         return
     if parallel.tp_size > 4 and group.ranks != list(
         range(torch.distributed.get_world_size())
