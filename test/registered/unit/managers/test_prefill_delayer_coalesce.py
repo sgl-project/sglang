@@ -1,8 +1,10 @@
+import dataclasses
 import unittest
 
 from sglang.srt.managers.prefill_delayer import (
     CoalesceParams,
     CoalesceState,
+    coalesce_budget,
     decide_coalesce,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -112,6 +114,37 @@ class TestPrefillDelayerCoalesce(CustomTestCase):
     def test_pending_capped_at_chunk(self):
         _, allow, reason = tick(CoalesceState(), pending=(100000, 0), queue=(9, 9))
         self.assertEqual((allow, reason), (False, "fill_wait"))
+
+
+A = CoalesceParams(dp_size=2, chunk=16384, interval=10, stall_ticks=3, ttft_ticks=8,
+                   fill_chunk=8192, hi_tokens=24576, wait_ms=2000)
+
+
+def budget(reason="fill", backlog=(8192, 8192), wait_ms=(0, 0), params=A):
+    return coalesce_budget(params, reason=reason, backlog=backlog, wait_ms=wait_ms)
+
+
+class TestPrefillAdaptiveBudget(CustomTestCase):
+    def test_fill_goal_is_base(self):
+        _, allow, reason = tick(CoalesceState(), pending=(8192, 8192), params=A)
+        self.assertEqual((allow, reason), (True, "fill"))
+        _, allow, reason = tick(CoalesceState(), pending=(8192, 8192))
+        self.assertEqual((allow, reason), (False, "fill_wait"))
+
+    def test_light_load_takes_base(self):
+        self.assertEqual(budget(), 8192)
+
+    def test_backlog_or_wait_on_any_rank_takes_chunk(self):
+        self.assertEqual(budget(backlog=(0, 24576)), 16384)
+        self.assertEqual(budget(wait_ms=(2000, 0)), 16384)
+        self.assertEqual(budget(backlog=(24575, 0), wait_ms=(1999, 0)), 8192)
+
+    def test_no_decode_takes_chunk(self):
+        self.assertEqual(budget(reason="no_decode"), 16384)
+
+    def test_off_keeps_chunk(self):
+        self.assertEqual(budget(params=P), 16384)
+        self.assertEqual(budget(wait_ms=(10**6, 0), params=dataclasses.replace(A, wait_ms=0)), 8192)
 
 
 if __name__ == "__main__":

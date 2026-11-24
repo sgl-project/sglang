@@ -71,6 +71,8 @@ class _NegotiateOutput(NamedTuple):
     # cannot convey it to the metrics observation.
     wait_forward_passes: int = 0
     wait_seconds: float = 0.0
+    # Coalesce mode: per-rank token budget of the prefill released on this pass.
+    chunk_budget: int = 0
 
 
 COALESCE_REASONS = frozenset(
@@ -97,10 +99,19 @@ class CoalesceParams:
     fill_ratio: float = 0.9
     stall_ticks: int = 10
     ttft_ticks: int = 200
+    # Load-adaptive budget (0 = off): fill toward fill_chunk and prefill that many tokens a
+    # rank, the whole chunk when some rank holds >= hi_tokens or waited >= wait_ms.
+    fill_chunk: int = 0
+    hi_tokens: int = 0
+    wait_ms: int = 0
 
     @property
     def partial_ticks(self) -> int:
         return max(self.ttft_ticks // 2, 1)
+
+    @property
+    def goal(self) -> int:
+        return self.fill_chunk or self.chunk
 
 
 @dataclass(frozen=True)
@@ -133,7 +144,7 @@ def decide_coalesce(
     remaining = params.interval if armed else state.interval_remaining
     num_prefillable = sum(1 for p in prefillable if p)
     running_decode = sum(running)
-    group_pending = sum(min(p, params.chunk) for p, f in zip(pending, prefillable) if f)
+    group_pending = sum(min(p, params.goal) for p, f in zip(pending, prefillable) if f)
     group_queue = sum(queue)
     work_changed = (
         group_pending > state.prev_pending
@@ -174,11 +185,30 @@ def decide_coalesce(
         if unreachable > 0 and stall >= params.stall_ticks:
             return fire("stall_unaligned")
         return hold("align")
-    if group_pending >= params.fill_ratio * params.chunk * num_prefillable:
+    if group_pending >= params.fill_ratio * params.goal * num_prefillable:
         return fire("fill")
     if stall >= params.stall_ticks:
         return fire("stall")
     return hold("fill_wait")
+
+
+def coalesce_budget(
+    params: CoalesceParams,
+    *,
+    reason: str,
+    backlog: Sequence[int],
+    wait_ms: Sequence[int],
+) -> int:
+    """Per-rank token budget of a released prefill; identical on every rank."""
+    if not params.fill_chunk:
+        return params.chunk
+    if (
+        reason == "no_decode"
+        or max(backlog) >= params.hi_tokens
+        or (params.wait_ms > 0 and max(wait_ms) >= params.wait_ms)
+    ):
+        return params.chunk
+    return params.fill_chunk
 
 
 class PrefillDelayer:
@@ -253,6 +283,8 @@ class PrefillDelayer:
             assert chunk_tokens is not None and chunk_tokens > 0, (
                 "--prefill-delayer-mode coalesce needs a chunked prefill size"
             )
+            fill_chunk = envs.SGLANG_PREFILL_ADAPTIVE_CHUNK_BASE.get()
+            fill_chunk = fill_chunk if 0 < fill_chunk < chunk_tokens else 0
             self._coalesce_params = CoalesceParams(
                 dp_size=dp_size_dim,
                 chunk=chunk_tokens,
@@ -260,13 +292,18 @@ class PrefillDelayer:
                 fill_ratio=schedule.prefill_delayer_fill_ratio,
                 stall_ticks=schedule.prefill_delayer_stall_ticks,
                 ttft_ticks=schedule.prefill_delayer_ttft_ticks,
+                fill_chunk=fill_chunk,
+                hi_tokens=envs.SGLANG_PREFILL_ADAPTIVE_CHUNK_HI_TOKENS.get()
+                or 3 * fill_chunk,
+                wait_ms=envs.SGLANG_PREFILL_ADAPTIVE_CHUNK_WAIT_MS.get(),
             )
             self._kv_high_watermark = schedule.prefill_delayer_kv_high_watermark
             self._coalesce_state = CoalesceState()
             self._coalesce_armed = False
-            # Per rank: prefillable, running, pending tokens, waiting queue, partial, kv_high.
+            # Per rank: prefillable, running, pending tokens, waiting queue, partial, kv_high,
+            # backlog tokens, oldest wait (ms).
             self._coalesce_buffer = torch.empty(
-                (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 6),
+                (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 8),
                 dtype=torch.int64,
                 device=self._gather_device,
             )
@@ -528,15 +565,19 @@ class PrefillDelayer:
         waiting_queue_len: int,
         partial: bool,
         token_usage: float,
+        backlog_tokens: int = 0,
+        oldest_wait_ms: int = 0,
     ) -> _NegotiateOutput:
         local_info = torch.tensor(
             [
                 int(local_prefillable),
                 running_batch,
-                min(pending_tokens, self._coalesce_params.chunk),
+                min(pending_tokens, self._coalesce_params.goal),
                 waiting_queue_len,
                 int(partial),
                 int(token_usage >= self._kv_high_watermark),
+                backlog_tokens,
+                oldest_wait_ms,
             ],
             device=self._gather_device,
             dtype=torch.int64,
@@ -558,6 +599,13 @@ class PrefillDelayer:
             kv_high=cols[5],
         )
         self._coalesce_armed = False
+        budget = (
+            coalesce_budget(
+                self._coalesce_params, reason=reason, backlog=cols[6], wait_ms=cols[7]
+            )
+            if allow
+            else 0
+        )
         return _NegotiateOutput(
             next_state=None,
             input_estimation="coalesce",
@@ -566,6 +614,7 @@ class PrefillDelayer:
             num_prefillable=sum(1 for p in cols[0] if p),
             num_token_watermark_force_allow=0,
             wait_forward_passes=prev.hold_ticks if allow else 0,
+            chunk_budget=budget,
         )
 
 
@@ -589,7 +638,13 @@ class PrefillDelayerSinglePassExecutor:
         return self._result is not None
 
     def negotiate_coalesce(
-        self, *, local_prefillable: bool, pending_tokens: int, partial: bool
+        self,
+        *,
+        local_prefillable: bool,
+        pending_tokens: int,
+        partial: bool,
+        backlog_tokens: int = 0,
+        oldest_wait_ms: int = 0,
     ) -> bool:
         """Coalesce mode: the single negotiation of this pass (every DP rank calls it once)."""
         assert self._prefill_delayer.coalesce and not self._called
@@ -600,8 +655,15 @@ class PrefillDelayerSinglePassExecutor:
             waiting_queue_len=self._waiting_queue_len,
             partial=partial,
             token_usage=self._token_usage,
+            backlog_tokens=backlog_tokens,
+            oldest_wait_ms=oldest_wait_ms,
         )
         return self._result.output_allow
+
+    @property
+    def chunk_budget(self) -> int:
+        """Per-rank token budget of the released prefill (coalesce mode), 0 if none."""
+        return self._result.chunk_budget if self._result is not None else 0
 
     def finalize(self, *, actual_prefill_bs: int) -> int:
         if not self._called:

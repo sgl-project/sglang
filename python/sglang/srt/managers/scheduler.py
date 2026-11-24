@@ -4660,17 +4660,29 @@ class Scheduler(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
 
-    def _coalesce_pending_tokens(self) -> int:
-        budget = self.prefill_delayer._coalesce_params.chunk
+    def _coalesce_load(self) -> Tuple[int, int, int]:
+        """Uncached tokens waiting, capped at the fill goal and (backlog) at 4 chunks,
+        and the oldest waiting request's wait in ms."""
+        params = self.prefill_delayer._coalesce_params
+        cap = 4 * params.chunk if params.fill_chunk else params.goal
         pending = 0
         if self.chunked_req is not None:
             req = self.chunked_req
             pending = len(req.full_untruncated_fill_ids) - req.prefix_len
         for req in self.waiting_queue:
-            if pending >= budget:
+            if pending >= cap:
                 break
             pending += SchedulePolicy._shortest_prefill_work(req)
-        return min(pending, budget)
+        wait_ms = 0
+        if params.fill_chunk and params.wait_ms > 0:
+            entered = [
+                r.time_stats.wait_queue_entry_time
+                for r in self.waiting_queue
+                if r.time_stats.wait_queue_entry_time > 0
+            ]
+            if entered:
+                wait_ms = int((time.perf_counter() - min(entered)) * 1e3)
+        return min(pending, params.goal), min(pending, cap), wait_ms
 
     def _get_new_batch_prefill_raw(
         self,
@@ -4759,16 +4771,24 @@ class Scheduler(
 
         if prefill_delayer_single_pass is not None and self.prefill_delayer.coalesce:
             # After the ranking above, num_matched_prefix_tokens is fresh.
+            pending, backlog, wait_ms = self._coalesce_load()
             if not prefill_delayer_single_pass.negotiate_coalesce(
                 local_prefillable=True,
-                pending_tokens=self._coalesce_pending_tokens(),
+                pending_tokens=pending,
                 partial=self.chunked_req is not None,
+                backlog_tokens=backlog,
+                oldest_wait_ms=wait_ms,
             ):
                 return None, running_batch
+            coalesce_budget = prefill_delayer_single_pass.chunk_budget
             prefill_delayer_single_pass = None
+        else:
+            coalesce_budget = 0
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        if coalesce_budget and chunked_prefill_size is not None:
+            chunked_prefill_size = min(chunked_prefill_size, coalesce_budget)
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)

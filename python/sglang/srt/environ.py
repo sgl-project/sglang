@@ -725,6 +725,13 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
     # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # --prefill-delayer-mode coalesce, load-adaptive prefill budget (0 = off): coalesce toward
+    # and prefill BASE tokens a rank, the whole --chunked-prefill-size when some DP rank has
+    # >= HI_TOKENS uncached tokens waiting (0 = 3 x BASE) or a request waiting >= WAIT_MS
+    # (0 = no wait trigger), or when nothing is decoding.
+    SGLANG_PREFILL_ADAPTIVE_CHUNK_BASE = EnvInt(0)
+    SGLANG_PREFILL_ADAPTIVE_CHUNK_HI_TOKENS = EnvInt(0)
+    SGLANG_PREFILL_ADAPTIVE_CHUNK_WAIT_MS = EnvInt(2000)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
