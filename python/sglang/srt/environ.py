@@ -2467,6 +2467,17 @@ class Envs:
     # FP8-weight small-M GEMMs (activations quantized in-kernel per row and K group) for the attention QKV / O
     # projections and the MoE unpooler at decode / verify widths; =0 keeps BF16 weights.
     SGLANG_ROCM_MUSE_DENSE_FP8 = EnvBool(True)
+    # Full-layer verify at 4 KV heads per rank from 17 requests: two workgroups per CU on twice the length-balanced
+    # segments (only P's BF16 rounding points move). Batches holding fewer KV tokens than ..._MIN_TOKENS keep the
+    # one-workgroup plan.
+    SGLANG_ROCM_MUSE_VERIFY_WIDE = EnvBool(False)
+    SGLANG_ROCM_MUSE_VERIFY_WIDE_MIN_TOKENS = EnvInt(1048576)
+    # Sliding-layer verify: the window's chunks that every verify position sees run the kernel's unmasked loop
+    # body; only the head and tail chunks keep the masks. Same values.
+    SGLANG_ROCM_MUSE_VERIFY_SWA_INTERIOR = EnvBool(False)
+    # Verify / decode widths (up to 512 rows): launch the fused norm-residual kernel with this many warps instead of
+    # the shape table's; 0 keeps the table. Only the reduction order changes.
+    SGLANG_ROCM_MUSE_NORM_RESIDUAL_WARPS = EnvInt(0)
     # Prefill widths (plain extend, > 128 rows): the attention QKV / O projections and the MoE pooler / unpooler on
     # those FP8 weight copies through aiter's CK a8w8 GEMM, activations quantized per row by the boundary kernels or
     # one Triton pass; the Ulysses gathered projections are then kept in FP8 only. Needs SGLANG_ROCM_MUSE_DENSE_FP8;

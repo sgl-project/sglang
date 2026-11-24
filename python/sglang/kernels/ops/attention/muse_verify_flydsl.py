@@ -164,6 +164,7 @@ def _launcher(
     spw=1,
     window=0,
     physical_page=PAGE,
+    swa_interior=False,
 ):
     # physical pages of 32-128 tokens: the kernel keeps its 16-token pages and maps each to its physical page and
     # the 16-row block inside it (kv_s0 becomes the stride of one 16-row block)
@@ -300,6 +301,21 @@ def _launcher(
             win_lo = ctx + 1 - window
         interior = (interior < end).select(interior, end)
         interior = (interior > begin).select(interior, begin)
+        if fx.const_expr(window and swa_interior):
+            # chunks from win_hi to (ctx + 1) // CHUNK are visible to every query position and run unmasked,
+            # between masked head groups and the masked tail: same chunks, order and grouping as the masked loop
+            win_hi = ctx + QL - window + CHUNK - 1
+            win_hi = (win_hi > 0).select(win_hi, fx.Int32(0)) // CHUNK
+            win_hi = (win_hi < end).select(win_hi, end)
+            win_hi = (win_hi > begin).select(win_hi, begin)
+            head_groups = (win_hi - begin + NS - 1) // NS
+            ibegin = begin + head_groups * NS
+            interior = (ctx + 1) // CHUNK
+            interior = (interior < end).select(interior, end)
+            interior = (interior > ibegin).select(interior, ibegin)
+        else:
+            head_groups = fx.Int32(0)
+            ibegin = begin
         row_base = seq * t_stride
 
         # Q^T fragments (B operand): column n = li + 16 nt -> token n // 8, head h * 8 + n % 8; k-step ks holds
@@ -690,17 +706,26 @@ def _launcher(
 
         # unmasked chunk groups, then the rest masked (chunks past the split end are fully masked dummies); every
         # group prefetches the next one, so the masked loop starts from the interior loop's slots
-        ngroups = (interior - begin) // NS
-        mid = begin + ngroups * NS
+        ngroups = (interior - ibegin) // NS
+        mid = ibegin + ngroups * NS
         tail_groups = (end - mid + NS - 1) // NS
+        if fx.const_expr(window and swa_interior):
+            # a split that ends inside its masked head groups
+            tail_groups = (tail_groups > 0).select(tail_groups, fx.Int32(0))
         slots0 = []
         ids0 = []
         for j in range_constexpr(NS):
             slots0.extend(issue(page_ids(clamp(begin + j))))
         for j in range_constexpr(NS):
             ids0.extend(_to_raw(x) for x in page_ids(clamp(begin + NS + j)))
-        for gi, st in range(0, ngroups, 1, init=o0 + n0 + t0 + l0 + slots0 + ids0):
-            c0 = begin + fx.Int32(arith.index_cast(T.i32, _to_raw(gi))) * NS
+        init0 = o0 + n0 + t0 + l0 + slots0 + ids0
+        if fx.const_expr(window and swa_interior):
+            for gi, st in range(0, head_groups, 1, init=init0):
+                c0 = begin + fx.Int32(arith.index_cast(T.i32, _to_raw(gi))) * NS
+                fin0 = yield group_step(c0, st, True)
+            init0 = list(fin0)
+        for gi, st in range(0, ngroups, 1, init=init0):
+            c0 = ibegin + fx.Int32(arith.index_cast(T.i32, _to_raw(gi))) * NS
             fin = yield group_step(c0, st, False)
         for gi, st in range(0, tail_groups, 1, init=list(fin)):
             c0 = mid + fx.Int32(arith.index_cast(T.i32, _to_raw(gi))) * NS
@@ -801,6 +826,7 @@ def verify_fly_partials(
     work_splits=None,
     wg_per_cu=0,
     window=0,
+    swa_interior=False,
 ):
     """FP32 split-KV partials [T, H, S, 64] + max / denom [T, H, S] (log2 domain) of the full-layer verify.
 
@@ -856,6 +882,7 @@ def verify_fly_partials(
             1,
             window,
             k.shape[1],
+            bool(window) and swa_interior,
         ),
         q,
         k.view(torch.uint8),
