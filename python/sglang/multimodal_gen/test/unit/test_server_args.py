@@ -23,6 +23,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
@@ -181,6 +184,35 @@ class TestExplicitCliArgs(unittest.TestCase):
                 self.assertEqual(
                     ServerArgs.get_provided_args(parsed, unknown), {field: value}
                 )
+
+    def test_abbreviated_flags_keep_their_value(self):
+        """argparse accepts an unambiguous prefix of a flag (--tp 2 sets tp_size);
+        the value must count as provided instead of being dropped for the default."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--tp", "2"], "tp_size", 2),
+            (["--num-gpu=4"], "num_gpus", 4),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(getattr(parsed, field), value)
+                self.assertEqual(unknown, [])
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+    def test_full_flag_registered_later_is_not_taken_for_an_abbreviation(self):
+        """A flag another module adds to the same parser is matched exactly by
+        argparse; it must not be resolved to a server flag it happens to prefix."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parser.add_argument("--tp", type=int)
+        argv = ["--tp", "2"]
+        with patch.object(sys, "argv", ["sglang", *argv]):
+            parsed, unknown = parser.parse_known_args(argv)
+            self.assertIsNone(parsed.tp_size)
+            self.assertEqual(ServerArgs.get_provided_args(parsed, unknown), {"tp": 2})
 
 
 class _CudaPlatformTestCase(unittest.TestCase):
@@ -1132,7 +1164,11 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.enable_breakable_cuda_graph = True
         sa.warmup_resolutions = None
         sa.bcg_text_buckets = None
-        sa._validate_breakable_cuda_graph()  # must not raise
+        # the resident-DiT guard resolves residency, which a bare stub lacks
+        with patch.object(
+            ServerArgs, "residency_mode", new=lambda _self, _component: "resident"
+        ):
+            sa._validate_breakable_cuda_graph()  # must not raise
 
     def test_flux_bcg_resolves_hub_and_local_checkpoint_warmup(self):
         for model_path, model_id in (
@@ -2192,6 +2228,57 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(args.is_dit_layerwise_offload_selected)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
+    def test_bcg_rejects_explicit_layerwise_offload(self):
+        """Offload hooks rebind weight storage between forwards; a captured
+        graph replays the addresses recorded at capture, so the combination
+        must fail at startup rather than corrupt a replay."""
+        for selection in (
+            {"layerwise_offload_components": ["dit"]},
+            {"component_residency": {"transformer": "layerwise-offload"}},
+            {"dit_cpu_offload": True},
+        ):
+            with self.subTest(selection=selection):
+                with self.assertRaisesRegex(ValueError, "breakable-cuda-graph"):
+                    self._from_dict_with_pipeline_config(
+                        QwenImagePipelineConfig(),
+                        kwargs={
+                            "model_path": "Qwen/Qwen-Image",
+                            "enable_breakable_cuda_graph": True,
+                            **selection,
+                        },
+                    )
+
+    def test_bcg_ignores_non_dit_layerwise_components(self):
+        """Only the DiT enters the captured graph; an encoder or VAE on
+        layerwise offload must not trip the guard."""
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "enable_breakable_cuda_graph": True,
+                "performance_mode": "manual",
+                "component_residency": {"text_encoder": "layerwise-offload"},
+            },
+        )
+
+        self.assertTrue(args.enable_breakable_cuda_graph)
+
+    def test_bcg_auto_disables_when_dit_layerwise_is_auto_selected(self):
+        """Auto-selected DiT placement must not turn a working flag into an
+        error: the graph is the optional feature, so it is the one that
+        yields."""
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "enable_breakable_cuda_graph": True,
+                "performance_mode": "memory",
+            },
+        )
+
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+        self.assertFalse(args.enable_breakable_cuda_graph)
+
     def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
             SanaWMRealtimeConfig(),
@@ -2419,15 +2506,19 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
     def test_auto_ltx_original_replaces_component_cpu_offload(
         self,
     ):
-        args = self._from_dict_with_pipeline_config(
-            LTX2PipelineConfig(),
-            available_memory_gb=76,
-            kwargs={
-                "model_path": "Lightricks/LTX-2.3",
-                "pipeline_class_name": "LTX2TwoStageHQPipeline",
-                "performance_mode": "auto",
-            },
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_name",
+            return_value="NVIDIA H100 80GB HBM3",
+        ):
+            args = self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                available_memory_gb=76,
+                kwargs={
+                    "model_path": "Lightricks/LTX-2.3",
+                    "pipeline_class_name": "LTX2TwoStageHQPipeline",
+                    "performance_mode": "auto",
+                },
+            )
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "original")
         self.assertFalse(args.dit_cpu_offload)
@@ -3212,19 +3303,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            available_memory_gb={1: 50, 2: 80},
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
-                "num_gpus": 2,
-                "performance_mode": "auto",
-            },
-        )
+        # num_gpus counts every node, but each node probes only its own GPUs;
+        # probing past them fails with an invalid device id on node rank > 0.
+        multi_node = {
+            "num_gpus": 4,
+            "nnodes": 2,
+            "node_rank": 1,
+            "dist_init_addr": "127.0.0.1:5000",
+        }
+        for nodes_kwargs in ({"num_gpus": 2}, multi_node):
+            with self.subTest(**nodes_kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    available_memory_gb={1: 50, 2: 80},
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image",
+                        "base_gpu_id": 1,
+                        "performance_mode": "auto",
+                        **nodes_kwargs,
+                    },
+                )
 
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
+                self.assertFalse(args.use_fsdp_inference)
+                self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
@@ -4111,6 +4212,28 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+    def test_enable_torch_compile_reaches_server_args_for_joy_image_edit(self):
+        """A pipeline config attribute named like a server flag takes the value
+        and removes it from the server args, so the flag does nothing."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+            "--enable-torch-compile",
+            "true",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertIsInstance(server_args.pipeline_config, JoyImageEditPipelineConfig)
+        self.assertTrue(server_args.enable_torch_compile)
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
