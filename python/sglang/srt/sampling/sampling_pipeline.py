@@ -10,10 +10,10 @@ Two entries run it:
   in one call;
 - verify: `SamplingPipeline.plan_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch a tree verify (EAGLE, NGRAM) makes one call, `VerifyStep.run`, which
-  takes its accept core as a function; a chain verify (DFlash, DSpark) calls
-  `build_row_inputs`, the stages (`VerifyStep.adjust`), its accept core, the
-  cap (`cap_chain_accept`), and `commit`.
+  launch EAGLE, NGRAM, and DFlash make one call, `VerifyStep.run`, which takes
+  the worker's accept core as a function; DSpark calls `build_row_inputs`, the
+  stages (`VerifyStep.adjust`), its accept core, the cap (`cap_chain_accept`),
+  and `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
