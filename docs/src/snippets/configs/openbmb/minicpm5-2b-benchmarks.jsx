@@ -51,5 +51,5 @@ export const benchmarks = [
   },
   // Pending — no numbers taken on these platforms yet.
   { match: { hw: "h200",    variant: "default", quant: "bf16", nodes: "single" } },
-  { match: { hw: "rtx6000", variant: "default", quant: "bf16", nodes: "single" } },
+  { match: { hw: "rtxpro6000", variant: "default", quant: "bf16", nodes: "single" } },
 ];
