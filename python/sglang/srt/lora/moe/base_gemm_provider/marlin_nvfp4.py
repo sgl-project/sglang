@@ -99,7 +99,7 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
                 prepare_buffer(
                     workspace,
                     "marlin:padded_intermediate",
-                    (num_pairs, self._padded_intermediate_size),
+                    (num_pairs, self._gate_up_slices * self._padded_intermediate_size),
                     dtype=hidden_states.dtype,
                     device=device,
                 )
@@ -174,7 +174,12 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
             size_k=qi.hidden_size,
         )
         if padded is not None:
-            out.copy_(padded[:, : qi.intermediate_size])
+            # Marlin prep pads gate and up separately.
+            out.view(-1, self._gate_up_slices, qi.intermediate_size).copy_(
+                padded.view(-1, self._gate_up_slices, self._padded_intermediate_size)[
+                    ..., : qi.intermediate_size
+                ]
+            )
 
     def down(
         self,
@@ -185,6 +190,11 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
         qi = self.quant_info
         padded = row_state.padded_intermediate
         if padded is not None:
+            # The first num_pairs * padded_intermediate elements, as one
+            # contiguous (num_pairs, padded_intermediate) input.
+            padded = padded.view(-1)[: padded.numel() // self._gate_up_slices].view(
+                padded.shape[0], self._padded_intermediate_size
+            )
             padded[:, : qi.intermediate_size].copy_(act_out)
             # Gateup reused this buffer; clear its tail on every replay.
             padded[:, qi.intermediate_size :].zero_()

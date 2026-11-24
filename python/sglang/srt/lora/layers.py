@@ -1140,6 +1140,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptNvFp4FusedMoEMethod,
             )
+            from sglang.srt.lora.lora_moe_runner_marlin import (
+                check_lora_fits_marlin_width,
+            )
 
             assert isinstance(
                 base_layer.quant_method,
@@ -1149,6 +1152,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
             )
             self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+            check_lora_fits_marlin_width(
+                self._quant_info,
+                intermediate_size=self.intermediate_size_per_partition,
+                is_gated=base_layer.moe_runner_config.is_gated,
+            )
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)

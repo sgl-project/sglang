@@ -51,7 +51,8 @@ if TYPE_CHECKING:
 # 1 / (fp8_e4m3_max * 6)
 _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
 
-_MARLIN_SHAPE_ALIGNMENT = 64
+# The Marlin MoE kernel tiles GEMM2 output columns (hidden) by 128 or 256.
+_MARLIN_HIDDEN_ALIGNMENT = 128
 _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
 
 
@@ -145,16 +146,9 @@ class MuseSpark1xFp4Experts(nn.Module):
                 "on SM80-SM90."
             )
         if self.use_marlin:
-            assert hidden_size % _MARLIN_SHAPE_ALIGNMENT == 0, (
+            assert hidden_size % _MARLIN_HIDDEN_ALIGNMENT == 0, (
                 f"NVFP4 Marlin MoE needs expert hidden_size divisible by "
-                f"{_MARLIN_SHAPE_ALIGNMENT}, got {hidden_size}. Gated NVFP4 Marlin "
-                "preparation asserts on the unpadded shape instead of padding."
-            )
-            assert intermediate_size % _MARLIN_SHAPE_ALIGNMENT == 0, (
-                f"NVFP4 Marlin MoE needs moe_intermediate_size divisible by "
-                f"{_MARLIN_SHAPE_ALIGNMENT}, got {intermediate_size}. Gated NVFP4 "
-                "Marlin preparation asserts on the unpadded shape instead of "
-                "padding."
+                f"{_MARLIN_HIDDEN_ALIGNMENT}, got {hidden_size}."
             )
 
         # post_expert_norm is unknown until set_post_expert_norm; start with the
@@ -401,7 +395,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         hidden_states = hidden_states.contiguous()
         num_tokens, size_k = hidden_states.shape
         topk = topk_ids.shape[1]
-        size_n = self.intermediate_size_per_partition
+        # The intermediate size the Marlin prep padded each half to.
+        size_n = self.w2_weight.shape[1] * 16
         gemm1_n = 2 * size_n
         expert_map = self._expert_map
 

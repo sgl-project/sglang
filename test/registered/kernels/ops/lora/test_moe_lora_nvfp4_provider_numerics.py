@@ -103,7 +103,7 @@ def _marlin_quant_info(layer):
     return MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
 
 
-@pytest.mark.parametrize("slices,intermediate", [(2, _I), (1, _I), (1, 64)])
+@pytest.mark.parametrize("slices,intermediate", [(2, _I), (1, _I), (1, 64), (2, 96)])
 def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
     _skip_unless_supported()
     device = torch.device("cuda")
@@ -157,6 +157,9 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
         down = torch.zeros(
             provider.down_out_shape(state), dtype=torch.bfloat16, device=device
         )
+        if state.padded_intermediate is not None:
+            # down() reuses gateup's padded buffer and must clear its tail.
+            state.padded_intermediate.fill_(float("nan"))
         provider.down(state, act, down)
 
         ref_down = torch.einsum("pi,phi->ph", act_pairs.float(), w2_eff[experts])
@@ -171,7 +174,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
         assert layer.w2_weight.shape[1] * 16 == 128
         rank = 16
         a13 = rand(_E, rank, _H).float()[experts]
-        b13 = rand(_E, intermediate, rank).float()[experts]
+        b13 = rand(_E, slices * intermediate, rank).float()[experts]
         a2 = rand(_E, rank, intermediate).float()[experts]
         b2 = rand(_E, _H, rank).float()[experts]
         weights = torch.tensor([0.65, 0.35], device=device).repeat(_T, 1)
@@ -188,18 +191,18 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
         def run():
             state = provider.prepare(hidden, topk_ids, _TOPK, workspace=workspace)
             provider.gateup(state, gateup)
-            gate_delta = delta(a13, b13, hidden[tokens].float()).to(torch.bfloat16)
+            gate_up_delta = delta(a13, b13, hidden[tokens].float()).to(torch.bfloat16)
             provider.act_with_delta(
                 state,
                 gateup,
-                gate_delta.view(_T, _TOPK, intermediate),
+                gate_up_delta.view(_T, _TOPK, slices * intermediate),
                 topk_ids,
                 act,
                 act_pairs,
-                activation="relu2",
+                activation="silu" if slices == 2 else "relu2",
             )
             # Padding must be cleared even when its reusable storage is poisoned.
-            state.padded_intermediate[:, intermediate:].fill_(float("nan"))
+            state.padded_intermediate.fill_(float("nan"))
             provider.down(state, act, down)
             down_delta = delta(a2, b2, act_pairs.flatten(0, 1).float()).to(
                 torch.bfloat16
@@ -216,8 +219,13 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
 
         def reference():
             inputs = hidden[tokens].float()
-            gate = torch.einsum("ph,pih->pi", inputs, w13_eff[experts])
-            activation = (gate + delta(a13, b13, inputs)).relu().square()
+            gate_up = torch.einsum("ph,pnh->pn", inputs, w13_eff[experts])
+            gate_up += delta(a13, b13, inputs)
+            if slices == 2:
+                gate, up = gate_up.chunk(2, dim=-1)
+                activation = torch.nn.functional.silu(gate) * up
+            else:
+                activation = gate_up.relu().square()
             pairs = torch.einsum("pi,phi->ph", activation, w2_eff[experts])
             pairs += delta(a2, b2, activation)
             return (pairs.view(_T, _TOPK, _H) * weights[..., None]).sum(1) * 0.75

@@ -216,18 +216,8 @@ class CompressedTensorsW4A16Nvfp4MoE(CompressedTensorsMoEScheme):
         # check_moe_marlin_supports_layer is deliberately not called: its
         # `group_size in [-1, 32, 64, 128]` test rejects NVFP4's group_size=16
         # outright, so it would disable this path on every layer. The helper
-        # below asserts the group size itself; validate shapes explicitly.
-        if layer.hidden_size % 128 != 0:
-            raise ValueError(
-                f"NVFP4 Marlin MoE requires hidden_size % 128 == 0, got "
-                f"{layer.hidden_size}."
-            )
-        if layer.intermediate_size_per_partition % 64 != 0:
-            raise ValueError(
-                "NVFP4 Marlin MoE requires intermediate_size_per_partition % 64 "
-                f"== 0, got {layer.intermediate_size_per_partition}."
-            )
-
+        # below checks the group size and hidden_size, and pads the
+        # intermediate size to a width the kernel tiles.
         prepare_moe_nvfp4_layer_for_marlin(layer, group_size=self.group_size)
 
     def apply_weights(

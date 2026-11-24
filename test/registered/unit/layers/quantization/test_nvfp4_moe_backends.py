@@ -40,6 +40,8 @@ class TestNvFp4MoeBackends(CustomTestCase):
         backend: str,
         intermediate_size: int = I,
         swiglu_limit: float | None = None,
+        *,
+        check_scale_and_halves: bool = False,
     ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -158,24 +160,50 @@ class TestNvFp4MoeBackends(CustomTestCase):
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
-            ref = self._torch_moe_reference(
-                x,
-                topk_weights,
-                topk_ids,
-                refs["w1"],
-                refs["w3"],
-                refs["w2"],
-                swiglu_limit,
-            )
+            def reference(w1, w3):
+                return self._torch_moe_reference(
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    w1,
+                    w3,
+                    refs["w2"],
+                    swiglu_limit,
+                    # Marlin keeps 16-bit activations.
+                    fp4_activations=backend != "marlin",
+                )
+
+            ref = reference(refs["w1"], refs["w3"])
             assert_output_close(self, out, ref)
+            if check_scale_and_halves:
+                # The cosine check cannot see a uniform scale error, such as a
+                # wrong gate or up global scale.
+                norm_ratio = (out.float().norm() / ref.norm()).item()
+                self.assertLess(abs(norm_ratio - 1), 0.1)
+                # Gate and up are told apart: the output must not also match
+                # the reference with w1 and w3 swapped.
+                swapped = reference(refs["w3"], refs["w1"])
+                swapped_cos = torch.nn.functional.cosine_similarity(
+                    out.float().flatten(), swapped.flatten(), dim=0
+                ).item()
+                self.assertLess(swapped_cos, 0.99)
 
     @staticmethod
     def _torch_moe_reference(
-        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, swiglu_limit
+        x,
+        topk_weights,
+        topk_ids,
+        w1_ref,
+        w3_ref,
+        w2_ref,
+        swiglu_limit,
+        fp4_activations=True,
     ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
+            if not fp4_activations:
+                return t2d.to(torch.bfloat16).float()
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
             return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
@@ -203,6 +231,15 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
+
+    def test_marlin(self):
+        """Gated widths no Marlin tile fits (96, Qwen3-30B-A3B's 768 at TP8)
+        are padded per half."""
+        for intermediate_size in (I, 96):
+            with self.subTest(intermediate_size=intermediate_size):
+                self._run_backend(
+                    "marlin", intermediate_size, check_scale_and_halves=True
+                )
 
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")

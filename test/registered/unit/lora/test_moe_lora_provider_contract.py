@@ -230,6 +230,25 @@ class TestRunnerAdmission(CustomTestCase):
             )
 
 
+class TestMarlinLoraPaddedWidth(CustomTestCase):
+    def test_hook_runners_refuse_padded_gated_halves(self):
+        """The marlin and experimental_sgl_marlin LoRA runners add the up delta
+        at the unpadded offset, so a gated layer whose halves Marlin prep padded
+        (96 to 128) stops at startup; a non-gated pad keeps its offset of 0."""
+        from sglang.srt.lora.lora_moe_runner_marlin import (
+            check_lora_fits_marlin_width,
+        )
+
+        # Marlin packs w2 as [experts, intermediate / 16, ...].
+        quant_info = SimpleNamespace(w2_qweight=torch.empty(2, 128 // 16, 4))
+        with self.assertRaisesRegex(ValueError, "lora_marlin"):
+            check_lora_fits_marlin_width(
+                quant_info, intermediate_size=96, is_gated=True
+            )
+        check_lora_fits_marlin_width(quant_info, intermediate_size=96, is_gated=False)
+        check_lora_fits_marlin_width(quant_info, intermediate_size=128, is_gated=True)
+
+
 class TestLayerRunnerBackendResolution(CustomTestCase):
     """The selected lora runner backend binds the new MoE runner and rebinds
     run_moe_core."""
