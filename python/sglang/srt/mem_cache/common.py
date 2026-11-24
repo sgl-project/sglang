@@ -420,6 +420,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         tree_cache.checkpoint(req, up_to=owned_kv_len)
+    if req.kv_rotation_base is not None and req.last_node is not None:
+        node_base = tree_cache.rotation_base_of(req.last_node)
+        assert node_base is None or node_base == req.kv_rotation_base, (
+            f"req.kv_rotation_base ({req.kv_rotation_base}) out of sync with "
+            f"req.last_node rotation base ({node_base})"
+        )
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(
         req.kv,

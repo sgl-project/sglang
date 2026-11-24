@@ -2555,6 +2555,104 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         self.assertEqual(_page_classes(device), _page_classes(host))
         self.assertEqual(len(controller.load_queue), 1)
 
+    def test_alloc_cyclic_rejects_partial_page(self):
+        alloc = _make_allocator()
+        for bad_size in (0, PS - 1, PS + 1):
+            with self.subTest(need_size=bad_size), self.assertRaises(AssertionError):
+                alloc.alloc_cyclic(start_class=1, need_size=bad_size)
+
+    def test_controller_load_rolls_back_without_loc_owners_when_extra_pool_fails(self):
+        host = _host_pool(0).alloc(5 * PS, start_owner=3)
+        extra = [PoolTransfer(name=PoolName.INDEXER, host_indices=host)]
+        devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+        for dev in devices:
+            for need_sort in (False, True):
+                with self.subTest(device=dev, need_sort=need_sort):
+                    alloc = _make_allocator(need_sort=need_sort, device=dev)
+                    before_counts = alloc.class_free_page_counts()
+                    before_sets = [
+                        sorted(alloc.class_free_pages[r].cpu().long().tolist())
+                        for r in range(N)
+                    ]
+                    controller = SimpleNamespace(
+                        mem_pool_device_allocator=alloc,
+                        kv_storage=None,
+                        device=dev,
+                        load_queue=[],
+                        _resolve_device_transfers=lambda *args, **kwargs: None,
+                    )
+                    if dev == "cuda":
+                        torch.cuda.synchronize()
+                    with (
+                        unittest.mock.patch.object(
+                            alloc,
+                            "_free_pages",
+                            side_effect=AssertionError("loc-derived owners"),
+                        ),
+                        unittest.mock.patch(
+                            "torch.unique", side_effect=AssertionError("deduped")
+                        ),
+                    ):
+                        if dev == "cuda":
+                            # alloc_cyclic runs outside sync debug; guard the rollback free_segment.
+                            orig_free_segment = alloc.free_segment
+
+                            def checked_free_segment(*args, **kwargs):
+                                torch.cuda.set_sync_debug_mode("error")
+                                try:
+                                    return orig_free_segment(*args, **kwargs)
+                                finally:
+                                    torch.cuda.set_sync_debug_mode("default")
+
+                            alloc.free_segment = checked_free_segment
+                        out = HybridCacheController.load(
+                            controller, host_indices=host, extra_pools=extra
+                        )
+                    self.assertIsNone(out)
+                    self.assertEqual(controller.load_queue, [])
+                    self.assertEqual(alloc.class_free_page_counts(), before_counts)
+                    after_sets = [
+                        sorted(
+                            torch.cat(
+                                (alloc.class_free_pages[r], *alloc.class_staged_pages[r])
+                            )
+                            .cpu()
+                            .long()
+                            .tolist()
+                        )
+                        for r in range(N)
+                    ]
+                    self.assertEqual(after_sets, before_sets)
+                    alloc.debug_check_classes()
+
+
+class TestRotationBaseHostChecks(_TreeCoreBackendCase):
+    """Host-only invariants guarding req.kv_rotation_base against req.last_node."""
+
+    tree_core_backend = "python"
+
+    def test_release_kv_cache_rejects_mismatched_last_node_base(self):
+        from sglang.srt.mem_cache.common import release_kv_cache
+        from sglang.srt.mem_cache.static_kv_storage import _kv_shard_rotation_bases
+
+        tree = _unified_tree(page_size=4)
+        _insert(tree, list(range(8)), rotation_base=1)
+        matched = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(8))))
+        )
+        req = _GraftReq(list(range(12)))
+        req.last_node = matched.last_device_node
+        req.kv_rotation_base = 2
+        batch = SimpleNamespace(reqs=[req])
+        with self.assertRaisesRegex(AssertionError, "out of sync"):
+            _kv_shard_rotation_bases(tree, batch, torch.tensor([8]))
+
+        req.kv.set_row_len(12)
+        req.owned_kv_len = lambda: 12
+        req.skip_radix_cache_insert = False
+        with self.assertRaisesRegex(AssertionError, "out of sync"):
+            release_kv_cache(req, tree, checkpoint=False)
+
 
 class TestRotationPhase(_TreeCoreBackendCase):
     """The backup's host start class: rotation base + the node's first
