@@ -255,7 +255,7 @@ def create_unified_radix_cache(
         cache.init_cache_linker(linker)
         counter = linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        kvcache.register_layer_transfer_counter(counter)
+        kvcache.register_layer_transfer_counter(linker_layer_wait_counter(counter))
         if PoolName.MAMBA in linker.pools:
             kvcache.layer_router.load_parts_layer_wise()
         if PoolName.DRAFT in linker.pools:
@@ -264,6 +264,30 @@ def create_unified_radix_cache(
                 draft_pool.register_layer_transfer_counter(draft_counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
+
+
+class _HeadGroupLayerWait:
+    """Layer waits of a pool whose layers are the head groups of the model's:
+    every group of a model layer waits on that layer's transfer."""
+
+    def __init__(self, counter, stride: int):
+        self._counter = counter
+        self._stride = stride
+
+    def wait_until(self, threshold: int) -> None:
+        self._counter.wait_until(threshold % self._stride)
+
+
+def linker_layer_wait_counter(counter):
+    """What a KV pool waits on before it reads a layer the linker is loading."""
+    from sglang.srt.rocm_muse_spark.kv_head_groups import (
+        KV_GROUP_STRIDE,
+        kv_head_groups,
+    )
+
+    if kv_head_groups() == 1:
+        return counter
+    return _HeadGroupLayerWait(counter, KV_GROUP_STRIDE)
 
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
