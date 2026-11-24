@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _handle_eagle_family
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,6 +44,14 @@ class TestEagleBundledDraftPathDefaulting(CustomTestCase):
                     resolution_result(server_args, "speculative_draft_model_revision"),
                     expected,
                 )
+
+    def test_modelscope_rejects_another_revision_for_a_bundled_draft(self):
+        server_args = _make_nextn_server_args(draft_revision="draft")
+        with (
+            envs.SGLANG_USE_MODELSCOPE.override(True),
+            self.assertRaisesRegex(ValueError, "ModelScope"),
+        ):
+            _handle_eagle_family(server_args)
 
 
 if __name__ == "__main__":

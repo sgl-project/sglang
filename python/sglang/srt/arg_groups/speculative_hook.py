@@ -623,6 +623,20 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+def _check_bundled_draft_revision(cfg) -> None:
+    """The ModelScope cache keeps one revision of each repo, and
+    handle_modelscope_paths has already resolved --model-path to it."""
+    revision = cfg.speculative_draft_model_revision
+    if envs.SGLANG_USE_MODELSCOPE.get() and revision not in (None, cfg.revision):
+        raise ValueError(
+            f"--speculative-draft-model-revision {revision!r} differs from "
+            f"--revision {cfg.revision!r}, but the draft is bundled in the target "
+            "checkpoint and the ModelScope cache keeps one revision of each repo. "
+            "Download the draft revision to a local directory and pass it with "
+            "--speculative-draft-model-path."
+        )
+
+
 _DSPARK_DRAFT_SUBFOLDER = "dspark"
 
 
@@ -747,6 +761,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "_handle_dspark",
                 speculative_draft_model_path=cfg.model_path,
             )
+            _check_bundled_draft_revision(cfg)
             if cfg.speculative_draft_model_revision is None:
                 declare_resolution(
                     server_args,
@@ -759,8 +774,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 cfg.model_path,
             )
         elif draft_dir := _target_checkpoint_dspark_subfolder(
-            cfg.model_path, cfg.revision, cfg.download_dir
+            cfg.model_path,
+            cfg.speculative_draft_model_revision or cfg.revision,
+            cfg.download_dir,
         ):
+            _check_bundled_draft_revision(cfg)
             declare_resolution(
                 server_args,
                 "_handle_dspark",
@@ -1346,6 +1364,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "_handle_eagle_family",
                 speculative_draft_model_path=cfg.model_path,
             )
+            _check_bundled_draft_revision(cfg)
             if cfg.speculative_draft_model_revision is None:
                 declare_resolution(
                     server_args,
