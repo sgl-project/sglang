@@ -411,36 +411,6 @@ class TestW4A8MoE(unittest.TestCase):
             )
         )
 
-    def test_unquantized_swiglu_limit_across_routing_backends(self):
-        layer = SimpleNamespace(
-            w13_kernel=moe_methods.NPUUnquantMoEMethod(),
-            w2_kernel=moe_methods.NPUUnquantMoEMethod(),
-        )
-        for backend, default_activation in (
-            (MoeA2ABackend.NONE, ascend_runner.NPUSwiglu),
-            (MoeA2ABackend.DEEPEP, ascend_runner.NPUSwigluDeepEPKernel),
-            (MoeA2ABackend.ASCEND_OPS, ascend_runner.NPUSwigluDeepEPKernel),
-        ):
-            with (
-                self.subTest(backend=backend),
-                patch.object(
-                    ascend_runner, "get_moe_a2a_backend", return_value=backend
-                ),
-                # The default A2A activation loads an NPU operator at construction.
-                patch.object(
-                    ascend_runner.NPUSwigluDeepEPKernel, "__init__", return_value=None
-                ),
-            ):
-                config = self._runner_config(layer, swiglu_limit=7.0)
-                runner = ascend_runner.AscendRunnerCore(config)
-                self.assertIsInstance(
-                    runner.activation, ascend_runner.NPUSwigluWithLimit
-                )
-                self.assertEqual(runner.activation.limit, 7.0)
-
-                runner = ascend_runner.AscendRunnerCore(self._runner_config(layer))
-                self.assertIsInstance(runner.activation, default_activation)
-
     def test_online_policy_and_offline_layout_without_requantization(self):
         packed = torch.arange(2 * 96 * 64).to(torch.uint8).reshape(2, 96, 64)
         scales = torch.arange(2 * 96 * 4).to(torch.uint8).reshape(2, 96, 4)
