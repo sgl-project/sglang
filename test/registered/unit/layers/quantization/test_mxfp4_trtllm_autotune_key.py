@@ -1,15 +1,18 @@
-"""A deferred-finalize MXFP4 trtllm-gen MoE call above 32 rows must pass the same
-output shape as a finalized one: FlashInfer keys its tactic cache on that shape, so a
-mismatch silently runs the untuned default tactic. At <= 32 rows deferred calls keep
-the (M, 0) placeholder key on purpose (the default tactic measured faster there)."""
+"""FlashInfer keys its trtllm-gen MoE tactic cache on the output shape, so a
+deferred-finalize call that passes a different shape from the finalized call silently
+runs the untuned default tactic. MXFP4 deferred calls pass the finalized shape above 32
+rows; at <= 32 rows they keep the (M, 0) placeholder key on purpose (the default tactic
+measured faster there). NVFP4 logits-bypassed deferred calls pass it at every row count,
+as the routed path does (flashinfer-ai/flashinfer#6077)."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import sys
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -18,8 +21,13 @@ import torch
 import sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as mxfp4
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopKConfig,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
 
@@ -86,6 +94,49 @@ class TestMxfp4AutotuneKey(CustomTestCase):
                             method.apply(layer, dispatch)
                         width = 0 if deferred and rows <= 32 else HIDDEN
                         self.assertEqual(outputs[-1], (rows, width))
+
+
+class TestNvfp4BypassedAutotuneKey(CustomTestCase):
+    """A deferred NVFP4 logits-bypassed call passes the finalized output shape."""
+
+    def test_deferred_calls_pass_the_finalized_output_shape(self):
+        outputs = []
+
+        def moe_call(**kwargs):
+            # FlashInfer keys a missing output as its (M, 0) deferred placeholder.
+            out = kwargs.get("output")
+            rows = kwargs["hidden_states"].shape[0]
+            outputs.append((rows, 0) if out is None else tuple(out.shape))
+            return (out,)
+
+        fused = ModuleType("flashinfer.fused_moe")
+        fused.trtllm_fp4_block_scale_moe = moe_call
+        fused.trtllm_fp4_block_scale_routed_moe = moe_call
+        byte, one = torch.zeros(1, dtype=torch.uint8), torch.ones(1)
+        # Weights and weight scales, the four scalar scales, then expert metadata.
+        info = flashinfer_trtllm.FlashInferTrtllmFp4MoeQuantInfo(
+            *[byte] * 4, *[one] * 4, EXPERTS, 0, EXPERTS, INTER, None
+        )
+        with (
+            patch.dict(sys.modules, {"flashinfer.fused_moe": fused}),
+            patch.object(flashinfer_trtllm, "get_activation_type", return_value=0),
+            patch.object(
+                flashinfer_trtllm, "trtllm_moe_enable_pdl", return_value=False
+            ),
+            patch.object(flashinfer_trtllm, "_make_deferred_finalize_output"),
+            flashinfer_trtllm.flashinfer_trtllm_deferred_finalize_context(True),
+        ):
+            for rows in (8, 64):
+                # FP4 activations as an NVFP4 dispatcher delivers them.
+                x = torch.zeros(rows, HIDDEN // 2, dtype=torch.uint8)
+                scale = torch.zeros(rows, HIDDEN // 16, dtype=torch.uint8)
+                logits = torch.zeros(rows, EXPERTS)
+                topk = BypassedTopKOutput(x, logits, TopKConfig(top_k=TOP_K))
+                with self.subTest(rows=rows):
+                    flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp4(
+                        StandardDispatchOutput(x, scale, topk), info, MoeRunnerConfig()
+                    )
+                    self.assertEqual(outputs[-1], (rows, HIDDEN))
 
 
 if __name__ == "__main__":

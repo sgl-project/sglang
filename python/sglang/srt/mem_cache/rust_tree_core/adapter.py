@@ -1233,6 +1233,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
 
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        return self._binding.needs_incremental_component_backup(node_id)
+
     def is_root(self, node_id: NodeId) -> bool:
         return self._binding.is_root(node_id)
 

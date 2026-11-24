@@ -8,7 +8,7 @@ from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
-    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 register_amd_ci(est_time=6, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
@@ -45,7 +45,7 @@ FN_MAP = {"fused": _fused, "separate": _separate}
 
 
 @marker.parametrize("T", [16, 64, 256, 1024, 4096, 16384], [256, 4096])
-@marker.benchmark("impl", ["fused", "separate"])
+@marker.benchmark("impl", ["fused", "separate"], gate=["fused"])
 def benchmark(T: int, impl: str):
     k = torch.randn(T, NUM_KV_HEADS * HEAD_DIM, dtype=DTYPE, device="cuda")
     v = torch.randn_like(k)

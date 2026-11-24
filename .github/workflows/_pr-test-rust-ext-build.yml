@@ -53,7 +53,7 @@ on:
 # check-maintenance reads.
 env:
   SGLANG_IS_IN_CI: true
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
   restore:
@@ -68,7 +68,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           # Just what the cache key hashes, plus the action and script this job
           # runs: the workspace is cold here and the rest of the tree is mostly
           # docs. Both jobs must hash the same Rust extension inputs, which this
@@ -156,7 +160,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -185,7 +193,8 @@ jobs:
               echo "key=${PREFIX}${LOCKS}"
               # Only main saves, so PRs add no multi-GB entries; a PR falls back to
               # main's entry for an older lock, while main starts clean on a miss.
-              if [ "${GITHUB_REF}" = refs/heads/main ]; then
+              # A pull_request_target run's GITHUB_REF is main too, so test the event.
+              if [ "${GITHUB_EVENT_NAME}" != pull_request_target ] && [ "${GITHUB_REF}" = refs/heads/main ]; then
                   echo "save=true"
               else
                   echo "restore-prefix=${PREFIX}"
@@ -336,7 +345,8 @@ jobs:
 
       # An exact hit means the entry is already there.
       - name: Save cargo target dir
-        if: steps.target-key.outputs.save == 'true' && steps.target-cache.outputs.cache-hit != 'true'
+        # Not from pull_request_target runs: their caches count as the default branch's.
+        if: steps.target-key.outputs.save == 'true' && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request_target'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.target-key.outputs.dir }}
@@ -355,7 +365,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           # Mirrors the restore job: this one writes the entry that job reads, so
           # both have to check out the same set for hashFiles to agree.
           sparse-checkout: |
@@ -393,6 +407,7 @@ jobs:
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.
       - name: Save built modules
+        if: github.event_name != 'pull_request_target'
         uses: actions/cache/save@v4
         with:
           path: |
