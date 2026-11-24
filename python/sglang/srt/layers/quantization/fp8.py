@@ -2193,12 +2193,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # AMD FP4 experts: use aiter's native MXFP4 MoE path.
             elif not self.dequant_fp4_to_fp8:
-                # Native MXFP4 (A4W4) SiLU experts default to the SEPARATED
-                # (de-interleaved) layout: it maps to the tuned AITER kernel,
-                # is faster, and matches interleaved accuracy (gsm8k parity),
-                # while avoiding the untuned interleaved FlyDSL path.
-                # Interleaving is opt-in via SGLANG_USE_AITER_MOE_GU_ITLV=1 on
-                # builds that support it.
                 gu_intv = (
                     envs.SGLANG_USE_AITER_MOE_GU_ITLV.is_set()
                     and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
