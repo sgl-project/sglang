@@ -11,16 +11,15 @@ stock-Triton runtime support in `kernels/jit/utils/tlx_runtime.py`.
 
 | File | Upstream commit | Local edits |
 |---|---|---|
-| `_catalog.py` | `2e8256a9b` | none (supplies `InvalidInput` and `UnsupportedOp`; its op table is unused here) |
-| `_invariance.py` | `2e8256a9b` | none |
+| `_invariance.py` | `2e8256a9b` | header line; `InvalidInput` from `sglang.kernels.jit.utils.tlx_runtime` |
 | `kernels/__init__.py`, `kernels/mm/__init__.py`, `kernels/moe/__init__.py` | `2e8256a9b` | none |
-| `kernels/mm/gfx950.py` | `2e8256a9b` | none |
-| `kernels/moe/gfx950.py` | `2e8256a9b` | `_register_matmul_core` imported from `sglang.kernels.tlx_ops.kernels.mm.gfx950` instead of `triton.tlx.ops.kernels.mm.gfx950` |
+| `kernels/mm/gfx950.py` | `2e8256a9b` | header line; `InvalidInput` from `sglang.kernels.jit.utils.tlx_runtime`; absolute `_invariance` import |
+| `kernels/moe/gfx950.py` | `2e8256a9b` | `_register_matmul_core` imported from `sglang.kernels.tlx_ops.kernels.mm.gfx950` instead of `triton.tlx.ops.kernels.mm.gfx950`; header line |
 | `kernels/fused/__init__.py` | `87abb3f5a` | none |
-| `kernels/fused/norm_residual_norm/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
-| `kernels/fused/qk_norm_rope_kv_cache/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
-| `kernels/norm/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
-| `kernels/router_gemm/__init__.py`, `gfx950.py` | `87abb3f5a` | none |
+| `kernels/fused/norm_residual_norm/__init__.py`, `gfx950.py` | `87abb3f5a` | header line in `gfx950.py` |
+| `kernels/fused/qk_norm_rope_kv_cache/__init__.py`, `gfx950.py` | `87abb3f5a` | header line in `gfx950.py` |
+| `kernels/norm/__init__.py`, `gfx950.py` | `87abb3f5a` | header line in `gfx950.py`; `UnsupportedOp` from `sglang.kernels.jit.utils.tlx_runtime` |
+| `kernels/router_gemm/__init__.py`, `gfx950.py` | `87abb3f5a` | header line in `gfx950.py` |
 
 Upstream's `kernels/moe/routing_gfx950.py` (`tlx.ops.moe_routing`) is not
 vendored: with triton-utlx 3.9.0.post4 its `tl.where` on a `tlx.require_layout`

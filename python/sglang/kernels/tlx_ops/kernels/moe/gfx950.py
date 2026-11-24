@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/moe/gfx950.py at 2e8256a9b (MIT); see kernels/README.md.
 """BF16 routed MoE on gfx950, built on the shared ``tlx.ops.mm`` register core.
 
 One call runs: local-expert block alignment, the stage-1 gate/up dual-B GEMM with fused SiLU

@@ -39,6 +39,14 @@ _CODEGEN_FLAGS = {
 _llvm_flags = contextvars.ContextVar("tlx_llvm_flags", default=())
 
 
+class UnsupportedOp(RuntimeError):
+    """Raised by a vendored TLX kernel for a configuration it does not implement (fbtriton ``tlx.ops``)."""
+
+
+class InvalidInput(ValueError):
+    """Raised by a vendored TLX kernel for inputs outside its contract (fbtriton ``tlx.ops``)."""
+
+
 @functools.cache
 def add_missing_triton_knobs() -> None:
     """Define fbtriton-only instrumentation knobs as False on stock Triton; a no-op on fbtriton.

@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/mm/gfx950.py at 2e8256a9b (MIT); see kernels/README.md.
 """gfx950 GEMM implementation for :func:`triton.tlx.ops.mm`.
 
 The single public entry dispatches to reusable LocalSplitU, persistent,
@@ -18,8 +19,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.runtime.driver import driver
 
-from ..._catalog import InvalidInput
-from ..._invariance import gemm_fixed_split_k
+from sglang.kernels.jit.utils.tlx_runtime import InvalidInput
+from sglang.kernels.tlx_ops._invariance import gemm_fixed_split_k
 
 # Regular wave-grid implementation and dispatch policy.
 
