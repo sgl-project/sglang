@@ -86,7 +86,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
         native_segment_profile_id=options["native_segment_profile_id"],
         native_source_binding=options["source_binding"],
     )
-    monkeypatch.setattr(sdk.PerfDatabase, "open_fidb", lambda *a, **k: database)
+    monkeypatch.setattr(sdk, "PerfDB", lambda *a, **k: database, raising=False)
     monkeypatch.setattr(
         simopus_dspark,
         "_bind_local_model_config",
