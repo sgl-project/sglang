@@ -1857,6 +1857,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            vocab_size = self.model_config.token_id_vocab_size
+            if obj.token_ids_logprob is not None:
+                if not isinstance(obj.token_ids_logprob, list) or any(
+                    type(t) is not int or not (0 <= t < vocab_size)
+                    for t in obj.token_ids_logprob
+                ):
+                    raise ValueError(
+                        f"token_ids_logprob must be integers in [0, {vocab_size - 1}], got {obj.token_ids_logprob}."
+                    )
+            if obj.token_ids_logprob_rows is not None:
+                for row in obj.token_ids_logprob_rows:
+                    if row is not None and (
+                        not isinstance(row, list)
+                        or any(
+                            type(t) is not int or not (0 <= t < vocab_size)
+                            for t in row
+                        )
+                    ):
+                        raise ValueError(
+                            f"token_ids_logprob_rows entries must be integers in [0, {vocab_size - 1}], got {row}."
+                        )
+
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )

@@ -429,6 +429,33 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.subTest(grammar=grammar):
                 self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
+    def test_custom_params_token_ids_validation(self):
+        """Test that custom_params['token_ids'] are validated within [0, vocab_size)."""
+        # Valid token ids pass
+        self._make(custom_params={"token_ids": [0, self.VOCAB_SIZE - 1]}).verify(
+            self.VOCAB_SIZE
+        )
+
+        # Out-of-bounds token id raises
+        with self.assertRaisesRegex(
+            ValueError, r"custom_params\['token_ids'\] must be integers in"
+        ):
+            self._make(custom_params={"token_ids": [self.VOCAB_SIZE]}).verify(
+                self.VOCAB_SIZE
+            )
+
+        # Negative token id raises
+        with self.assertRaisesRegex(
+            ValueError, r"custom_params\['token_ids'\] must be integers in"
+        ):
+            self._make(custom_params={"token_ids": [-1]}).verify(self.VOCAB_SIZE)
+
+        # Non-integer token id raises
+        with self.assertRaisesRegex(
+            ValueError, r"custom_params\['token_ids'\] must be integers in"
+        ):
+            self._make(custom_params={"token_ids": ["123"]}).verify(self.VOCAB_SIZE)
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
     def _mock_tokenizer(self, encode_map=None):

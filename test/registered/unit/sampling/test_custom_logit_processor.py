@@ -175,6 +175,18 @@ class TestDisallowedTokensLogitsProcessor(CustomTestCase):
         with self.assertRaises(AssertionError):
             self.processor(logits, params)
 
+    def test_filters_out_of_bounds_and_negative_token_ids(self):
+        """Test that out-of-bounds and negative token_ids are safely filtered."""
+        logits = torch.zeros(2, 10)
+        params = [{"token_ids": [20, -1, 3]}, {"token_ids": [20, -1, 3]}]
+        result = self.processor(logits, params)
+        self.assertEqual(
+            (result[0] == -float("inf")).nonzero().flatten().tolist(), [3]
+        )
+        self.assertEqual(
+            (result[1] == -float("inf")).nonzero().flatten().tolist(), [3]
+        )
+
 
 # ThinkingBudgetLogitProcessor (using Qwen3 variant)
 class TestThinkingBudgetLogitProcessor(CustomTestCase):

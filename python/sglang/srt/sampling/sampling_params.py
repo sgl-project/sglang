@@ -348,6 +348,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             strict=True,
         )
 
+        if isinstance(self.custom_params, dict):
+            token_ids = self.custom_params.get("token_ids")
+            if token_ids is not None:
+                if not isinstance(token_ids, list) or any(
+                    type(t) is not int or not (0 <= t < vocab_size)
+                    for t in token_ids
+                ):
+                    raise ValueError(
+                        f"custom_params['token_ids'] must be integers in [0, {vocab_size - 1}], got {token_ids}."
+                    )
+
         grammars = [
             self.json_schema,
             self.regex,
