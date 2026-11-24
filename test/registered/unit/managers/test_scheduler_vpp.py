@@ -329,6 +329,222 @@ class TestSchedulingVPPCore(CustomTestCase):
                         bool(other_ready),
                     )
 
+    def test_control_round_consumes_only_the_tp_leaders_fifo_prefix(self):
+        """A follower with more received messages must retain its extra message."""
+        broadcast_round = []
+        for tp_rank in (0, 1):
+            scheduler = self._fixed_scheduler()
+            scheduler._pp_vpp_slot_batch_seqs[1] = 1
+            scheduler._pp_vpp_round_candidate = False
+            queued = deque([self._wire(batch_seq=0)])
+            if tp_rank == 1:
+                queued.append(self._wire(batch_seq=1))
+            progressed = []
+            scheduler._pp_vpp_activation_receiver = SimpleNamespace(
+                progress=lambda: progressed.append(True),
+                receive_count=lambda: len(queued),
+                take=queued.popleft,
+            )
+            envelope = scheduler._pp_vpp_new_control(
+                PipelineControlKind.RESOURCE, payload={}
+            )
+            wire = envelope.to_dict()
+            if tp_rank == 0:
+                scheduler._pp_vpp_poll_control_receiver = lambda: (envelope, wire)
+
+            def broadcast(value, *, src):
+                self.assertEqual(src, 0)
+                self.assertEqual(progressed, [True])
+                if tp_rank == 0:
+                    broadcast_round.append(value)
+                else:
+                    self.assertIsNone(value)
+                return broadcast_round[0]
+
+            scheduler.attn_tp_group = SimpleNamespace(
+                rank_in_group=tp_rank, broadcast_object=broadcast
+            )
+            result = scheduler._pp_vpp_poll_control_receiver_tp_broadcast()
+            self.assertEqual(result, (envelope, wire))
+            self.assertEqual(list(scheduler._pp_vpp_ready_proxies), [(0, 2)])
+            self.assertEqual(list(scheduler._pp_vpp_arrivals), [(0, 2)])
+            self.assertEqual(len(queued), tp_rank)
+            self.assertTrue(scheduler._pp_vpp_fixed_activation_received)
+            self.assertFalse(scheduler._pp_vpp_round_check)
+
+    def test_control_round_progresses_activations_without_a_control_message(self):
+        scheduler = self._fixed_scheduler()
+        queued = deque([self._wire()])
+        scheduler._pp_vpp_activation_receiver = SimpleNamespace(
+            progress=lambda: None,
+            receive_count=lambda: len(queued),
+            take=queued.popleft,
+        )
+        scheduler._pp_vpp_poll_control_receiver = lambda: None
+        scheduler._pp_vpp_round_candidate = True
+        scheduler.attn_tp_group = SimpleNamespace(
+            rank_in_group=0, broadcast_object=lambda value, src: value
+        )
+        self.assertIsNone(scheduler._pp_vpp_poll_control_receiver_tp_broadcast())
+        self.assertEqual(list(scheduler._pp_vpp_ready_proxies), [(0, 2)])
+        self.assertTrue(scheduler._pp_vpp_round_check)
+        self.assertEqual(list(queued), [])
+
+    def test_control_broadcast_rejects_foreign_protocol_epoch_and_layout(self):
+        scheduler = self._scheduler()
+        scheduler._pp_vpp_fixed_tp = False
+        scheduler.attn_tp_group = SimpleNamespace(
+            rank_in_group=0, broadcast_object=lambda value, src: value
+        )
+        envelope = scheduler._pp_vpp_new_control(PipelineControlKind.RESOURCE)
+        for changes, error in (
+            ({"protocol_version": 2}, "protocol version mismatch"),
+            ({"runtime_epoch": 2}, "stale VPP control runtime epoch"),
+            ({"layout_digest": "other"}, "layout digest mismatch"),
+        ):
+            with self.subTest(changes=changes):
+                wire = {**envelope.to_dict(), **changes}
+                scheduler._pp_vpp_poll_control_receiver = lambda: (envelope, wire)
+                with self.assertRaisesRegex(RuntimeError, error):
+                    scheduler._pp_vpp_poll_control_receiver_tp_broadcast()
+        scheduler._pp_vpp_poll_control_receiver = lambda: None
+        self.assertIsNone(scheduler._pp_vpp_poll_control_receiver_tp_broadcast())
+
+    def test_bootstrap_merge_uses_consensus_and_the_smallest_resource_frontier(self):
+        scheduler = self._scheduler()
+        cpu_group = object()
+        scheduler.attn_tp_group = SimpleNamespace(world_size=2, cpu_group=cpu_group)
+        scheduler.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=lambda: 4
+        )
+        # This boundary supplies the prefix lengths from the bootstrap queue.
+        boundaries = {"a": 4, "b": 12}
+        scheduler._pp_vpp_bootstrap_prefix_boundaries = lambda rids: {
+            rid: boundaries[rid] for rid in rids
+        }
+
+        def gather(output, local, *, group):
+            self.assertIs(group, cpu_group)
+            self.assertEqual(local.tolist(), [4])
+            output.copy_(torch.cat((local, torch.tensor([1]))))
+
+        for carried_slots, expected_slots in ((3, 1), (0, 0)):
+            with self.subTest(carried_slots=carried_slots):
+                payload = {
+                    "good": ["c", "b", "a", "a"],
+                    "bad": ["x"],
+                    "metadata_slots": carried_slots,
+                    "prefix_boundaries": {"a": 8, "b": 6, "c": 10},
+                }
+                with patch(
+                    "torch.distributed.all_gather_into_tensor", side_effect=gather
+                ):
+                    scheduler._pp_vpp_merge_bootstrap_status(
+                        payload, ["b", "a"], ["c", "x"]
+                    )
+                self.assertEqual(
+                    payload,
+                    {
+                        "good": ["a", "b"],
+                        "bad": ["c", "x"],
+                        "metadata_slots": expected_slots,
+                        "prefix_boundaries": {"a": 4, "b": 6},
+                    },
+                )
+                self.assertEqual(
+                    scheduler._pp_vpp_bootstrap_apply_status(payload),
+                    [["a"][:expected_slots], ["c", "x"]],
+                )
+
+    def test_bootstrap_application_deduplicates_sorts_and_caps_admissions(self):
+        scheduler = self._scheduler()
+        for slots, expected in ((-1, []), (0, []), (1, ["a"]), (8, ["a", "b"])):
+            with self.subTest(slots=slots):
+                self.assertEqual(
+                    scheduler._pp_vpp_bootstrap_apply_status(
+                        {
+                            "good": ["b", "a", "b"],
+                            "bad": ["z", "c", "c"],
+                            "metadata_slots": slots,
+                        }
+                    ),
+                    [expected, ["c", "z"]],
+                )
+
+    def test_prefix_notifications_commit_only_the_shared_stage_frontier(self):
+        scheduler = self._scheduler()
+        registry = scheduler._pp_vpp_prefix_registry = PipelinePrefixRegistry()
+        entry = registry.plan("request", 1, 1, 0, 8, range(4))
+
+        def notify(stage, end, generation=1):
+            scheduler._pp_vpp_apply_prefix_materialized(
+                scheduler._pp_vpp_new_control(
+                    PipelineControlKind.PREFIX_MATERIALIZED,
+                    payload={
+                        "rid": "request",
+                        "request_generation": generation,
+                        "stage_id": stage,
+                        "end": end,
+                    },
+                )
+            )
+
+        notify(0, 8, generation=2)
+        self.assertEqual(entry.materialized_end, 0)
+        for stage in (2, 0, 3):
+            notify(stage, 8)
+            self.assertEqual(entry.committed_end, 0)
+            self.assertTrue(entry.locked)
+        notify(1, 4)
+        self.assertEqual(entry.committed_end, 4)
+        self.assertTrue(entry.locked)
+        notify(1, 8)
+        self.assertEqual(entry.committed_end, 8)
+        self.assertFalse(entry.locked)
+        notify(1, 8)
+        self.assertEqual(entry.committed_end, 8)
+        with self.assertRaisesRegex(RuntimeError, "invalid materialized"):
+            notify(1, 4)
+        with self.assertRaisesRegex(RuntimeError, "not a prefix dependency"):
+            notify(4, 8)
+
+    def test_local_completion_waits_before_reading_and_checks_batch_identity(self):
+        scheduler = self._scheduler()
+        for output_seq in (0, 1, None):
+            with self.subTest(output_seq=output_seq):
+                synchronized = []
+                tensors = {"next_token_ids": torch.tensor([7]), "metadata": "done"}
+                if output_seq is not None:
+                    tensors["vpp_batch_seq"] = output_seq
+
+                class OutputProxy:
+                    @property
+                    def tensors(proxy):
+                        self.assertEqual(synchronized, [True])
+                        return tensors
+
+                queued = deque(
+                    [
+                        (
+                            SimpleNamespace(
+                                synchronize=lambda: synchronized.append(True)
+                            ),
+                            OutputProxy(),
+                        )
+                    ]
+                )
+                if output_seq == 0:
+                    result = scheduler._pp_vpp_take_local_completion(0, queued)
+                    self.assertEqual(result["next_token_ids"].tolist(), [7])
+                    self.assertEqual(result["next_token_ids"].device.type, "cpu")
+                    self.assertEqual(result["metadata"], "done")
+                    self.assertEqual(result["vpp_batch_seq"], 0)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "completion mismatch"):
+                        scheduler._pp_vpp_take_local_completion(0, queued)
+                self.assertEqual(list(queued), [])
+                self.assertEqual(synchronized, [True])
+
     def test_fixed_wave_requires_the_supported_layout_and_capacity(self):
         for pp_size, virtual_stages, inflight, overlap in (
             (3, 2, 2, False),

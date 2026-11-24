@@ -474,3 +474,125 @@ class SchedulingVPPCore:
         # All TP lanes must agree before entering batch-building collectives.
         states = self._pp_vpp_all_gather_cpu_state((int(ready),))
         return bool(states[:, 0].min())
+
+    def _pp_vpp_poll_control_receiver_tp_broadcast(
+        self: Scheduler,
+    ) -> Optional[Tuple[PipelineControlEnvelope, Dict[str, object]]]:
+        if self._pp_vpp_fixed_tp:
+            # Progress each lane's P2P receive, but never enter a TP collective
+            # until all lanes receive the same consume command below.
+            self._pp_vpp_activation_receiver.progress()
+        wire = None
+        if self.attn_tp_group.rank_in_group == 0:
+            message = self._pp_vpp_poll_control_receiver()
+            if message is not None:
+                wire = message[1]
+        if self._pp_vpp_fixed_tp:
+            progress = (
+                (
+                    wire,
+                    self._pp_vpp_activation_receiver.receive_count(),
+                    self._pp_vpp_round_candidate,
+                )
+                if self.attn_tp_group.rank_in_group == 0
+                else None
+            )
+            wire, consume, self._pp_vpp_round_check = (
+                self.attn_tp_group.broadcast_object(progress, src=0)
+            )
+            for _ in range(consume):
+                # Follow exactly the leader's FIFO prefix, even when local
+                # metadata arrives later. Device waits stay on the receive stream.
+                self._pp_vpp_accept_received_tensors(
+                    self._pp_vpp_activation_receiver.take()
+                )
+                self._pp_vpp_fixed_activation_received = True
+        else:
+            wire = self.attn_tp_group.broadcast_object(wire, src=0)
+        if wire is None:
+            return None
+        envelope = PipelineControlEnvelope.from_dict(wire)
+        if envelope.protocol_version != _VPP_PROTOCOL_VERSION:
+            raise RuntimeError("VPP control protocol version mismatch")
+        if envelope.runtime_epoch != self._pp_vpp_runtime_epoch:
+            raise RuntimeError("stale VPP control runtime epoch")
+        if envelope.layout_digest != self._pp_vpp_control_layout_digest:
+            raise RuntimeError("VPP control layout digest mismatch")
+        return envelope, wire
+
+    def _pp_vpp_merge_bootstrap_status(
+        self: Scheduler,
+        payload: Dict[str, object],
+        local_good: List[str],
+        local_bad: List[str],
+    ) -> None:
+        payload["good"] = sorted(set(payload["good"]).intersection(local_good))
+        payload["bad"] = sorted(set(payload["bad"]).union(local_bad))
+        metadata_states = self._pp_vpp_all_gather_cpu_state(
+            (self.req_to_metadata_buffer_idx_allocator.available_size(),)
+        )
+        local_metadata_slots = int(metadata_states[:, 0].min())
+        payload["metadata_slots"] = min(
+            int(payload["metadata_slots"]),
+            local_metadata_slots,
+        )
+        local_boundaries = self._pp_vpp_bootstrap_prefix_boundaries(payload["good"])
+        payload["prefix_boundaries"] = {
+            rid: min(
+                int(payload["prefix_boundaries"][rid]),
+                local_boundaries[rid],
+            )
+            for rid in payload["good"]
+        }
+
+    def _pp_vpp_bootstrap_apply_status(
+        self: Scheduler,
+        payload: Dict[str, object],
+    ) -> List[List[str]]:
+        good = sorted(set(payload["good"]))
+        metadata_slots = max(0, int(payload["metadata_slots"]))
+        return [
+            good[:metadata_slots],
+            sorted(set(payload["bad"])),
+        ]
+
+    def _pp_vpp_apply_prefix_materialized(
+        self: Scheduler,
+        envelope: PipelineControlEnvelope,
+    ) -> None:
+        payload = envelope.payload or {}
+        rid = str(payload["rid"])
+        request_generation = int(payload["request_generation"])
+        entry = self._pp_vpp_prefix_registry.get(rid, request_generation)
+        if entry is None:
+            return
+        end = int(payload["end"])
+        materialized_end = self._pp_vpp_prefix_registry.mark_materialized(
+            rid,
+            request_generation,
+            int(payload["stage_id"]),
+            end,
+        )
+        if materialized_end >= end and entry.committed_end < end:
+            self._pp_vpp_prefix_registry.commit(
+                rid,
+                request_generation,
+                end,
+            )
+
+    def _pp_vpp_take_local_completion(
+        self: Scheduler,
+        batch_seq: int,
+        last_rank_comm_queue: deque,
+    ) -> Dict[str, object]:
+        output_event, output_proxy = last_rank_comm_queue.popleft()
+        output_event.synchronize()
+        output_batch_seq = int(output_proxy.tensors.get("vpp_batch_seq", -1))
+        if output_batch_seq != batch_seq:
+            raise RuntimeError(
+                f"VPP completion mismatch: expected {batch_seq}, got {output_batch_seq}"
+            )
+        return {
+            key: value.to("cpu") if isinstance(value, torch.Tensor) else value
+            for key, value in output_proxy.tensors.items()
+        }
