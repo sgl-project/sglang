@@ -404,3 +404,30 @@ class TestDFlashBinding(CustomTestCase):
             self.assertRaisesRegex(RuntimeError, "guard values differ"),
         ):
             kimi_k31_dflash_binding.bind_dflash_runtime(_DFlashWorker(), Lm())
+
+    def test_every_binding_names_a_member_the_worker_defines(self):
+        """A runtime pulls each name from the worker without its target-worker
+        fallback, so a member the worker lost would fail only at a GPU startup."""
+        import ast
+
+        from sglang.srt.speculative import dflash_worker_v2
+
+        tree = ast.parse(Path(dflash_worker_v2.__file__).read_text())
+        (worker,) = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DFlashWorkerV2"
+        ]
+        # what __init__ and the rest assign on the instance; the class has the others
+        assigned = {
+            node.attr
+            for node in ast.walk(worker)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+        }
+        missing = {
+            name: member.attr
+            for name, member in kimi_k31_dflash_binding.BINDINGS.items()
+            if member.attr not in assigned
+            and not hasattr(dflash_worker_v2.DFlashWorkerV2, member.attr)
+        }
+        self.assertEqual(missing, {})

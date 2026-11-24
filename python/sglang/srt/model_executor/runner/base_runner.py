@@ -50,6 +50,7 @@ from sglang.srt.model_executor.model_runner_components.capture_state import (
     prepare_capture_state,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    attach_flashinfer_managed_autotune_cache,
     autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -264,6 +265,9 @@ class BaseRunner(ABC):
 
         if mr.device != "cuda":
             return
+
+        # First, so that everything below tunes into the store serving reads.
+        attach_flashinfer_managed_autotune_cache(mr)
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
