@@ -13,11 +13,12 @@ those. The abort-route test also sets `control_message_step` and builds the real
 dispatch table with `init_dispatcher`.
 """
 
+import importlib
 import threading
 import time
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
@@ -279,6 +280,93 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+
+
+class TestRayAttentionDpPortArgs(CustomTestCase):
+    def test_scheduler_actors_share_the_launcher_instance_id(self):
+        """Under DP attention every scheduler actor derives its own PortArgs but must
+        keep the launcher's instance_id, which names the load-snapshot SHM file and
+        the drain notification; this holds for both placement-group branches."""
+        ray = ModuleType("ray")
+        ray.remote = lambda cls: cls
+        ray.get = lambda refs: []
+        placement = ModuleType("ray.util.placement_group")
+        placement.PlacementGroup = object
+        strategies = ModuleType("ray.util.scheduling_strategies")
+        strategies.PlacementGroupSchedulingStrategy = object
+        stubs = {
+            "ray": ray,
+            "ray.util": ModuleType("ray.util"),
+            "ray.util.placement_group": placement,
+            "ray.util.scheduling_strategies": strategies,
+        }
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_enabled=True,
+            tp_size=2,
+            pp_size=1,
+            attn_dp_size=2,
+            attn_cp_size=1,
+        )
+        launcher_port_args = SimpleNamespace(
+            nccl_port=1234,
+            instance_id="launcher",
+            detokenizer_ipc_name="detokenizer",
+            tokenizer_ipc_name="tokenizer",
+        )
+        srt_package = importlib.import_module("sglang.srt")
+        with patch.dict("sys.modules", stubs), patch.dict(vars(srt_package)):
+            ray_dp = importlib.import_module("sglang.srt.ray.data_parallel_controller")
+            for is_custom_pg in (False, True):
+                with self.subTest(is_custom_pg=is_custom_pg):
+                    controller = ray_dp.RayDataParallelController.__new__(
+                        ray_dp.RayDataParallelController
+                    )
+                    controller.scheduler_actors = []
+                    controller.event_loop_refs = []
+                    controller.is_custom_pg = is_custom_pg
+                    controller.bundle_for_node = [0]
+                    controller.rank0_node_ip = "127.0.0.1"
+                    controller.pg = object()
+                    # Like the real init_new, each call mints a new instance_id.
+                    rank_port_args = [
+                        SimpleNamespace(instance_id=f"rank-{i}") for i in range(2)
+                    ]
+                    actor_port_args = []
+
+                    def create_actor(**kwargs):
+                        actor_port_args.append(kwargs["port_args"])
+                        remote = SimpleNamespace(remote=lambda: None)
+                        return SimpleNamespace(get_info=remote, run_event_loop=remote)
+
+                    with (
+                        patch.object(ray_dp, "get_parallel", return_value=parallel),
+                        patch.object(
+                            ray_dp,
+                            "_calculate_rank_ranges",
+                            return_value=(range(1), range(2), 1, 2),
+                        ),
+                        patch.object(ray_dp, "_compute_world_size", return_value=2),
+                        patch.object(
+                            ray_dp, "_resolve_bundle_indices", return_value=[0, 1]
+                        ),
+                        patch.object(
+                            ray_dp.PortArgs, "init_new", side_effect=rank_port_args
+                        ),
+                        patch.object(
+                            ray_dp, "_create_scheduler_actor", side_effect=create_actor
+                        ),
+                    ):
+                        controller._launch_ray_tp_group(
+                            SimpleNamespace(),
+                            launcher_port_args,
+                            dp_rank=None,
+                            worker_ports=[7000, 7001],
+                        )
+                    self.assertEqual(
+                        [args.instance_id for args in actor_port_args],
+                        ["launcher", "launcher"],
+                    )
 
 
 class TestInitInfoReply(CustomTestCase):
@@ -695,7 +783,6 @@ def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         request_retirer=None,
