@@ -55,11 +55,22 @@ def _cleanup_mmmu_dataset_cache():
         return False
 
 
+# lmms-eval logs its evaluation-tracker arguments, including the Hugging Face
+# token, at INFO level. MMMU is a public dataset, so run it without one.
+_HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+
+def _lmms_eval_env() -> dict:
+    """The current environment without Hugging Face tokens, read at call time."""
+    return {k: v for k, v in os.environ.items() if k not in _HF_TOKEN_ENV_VARS}
+
+
 def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
     """Run lmms_eval command with automatic retry on MMMU parquet corruption."""
     try:
         result = subprocess.run(
             cmd,
+            env=_lmms_eval_env(),
             check=True,
             timeout=timeout,
             capture_output=True,
@@ -79,7 +90,12 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
                     HF_DATASETS_DOWNLOAD_MODE="force_redownload",
                 ):
                     retry_result = subprocess.run(
-                        cmd, check=True, timeout=timeout, capture_output=True, text=True
+                        cmd,
+                        env=_lmms_eval_env(),
+                        check=True,
+                        timeout=timeout,
+                        capture_output=True,
+                        text=True,
                     )
                     # Print retry output
                     if retry_result.stdout:
@@ -108,7 +124,12 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
                     HF_DATASETS_DOWNLOAD_MODE="force_redownload",
                 ):
                     retry_result = subprocess.run(
-                        cmd, check=True, timeout=timeout, capture_output=True, text=True
+                        cmd,
+                        env=_lmms_eval_env(),
+                        check=True,
+                        timeout=timeout,
+                        capture_output=True,
+                        text=True,
                     )
                     # Print retry output
                     if retry_result.stdout:
