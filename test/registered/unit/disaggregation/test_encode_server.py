@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.encoder.server import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
@@ -480,12 +481,13 @@ class TestStagedNativeTransfer(CustomTestCase):
 
         async def run():
             with self.native_encoder() as (svc, enc, receivers, grids, tensor):
-                transfer = (
-                    await svc.Stage(
-                        pb.StageRequest(request_id="request", mm_items=["a", "b"]),
-                        Mock(),
-                    )
-                ).transfer
+                with envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(True):
+                    transfer = (
+                        await svc.Stage(
+                            pb.StageRequest(request_id="request", mm_items=["a", "b"]),
+                            Mock(),
+                        )
+                    ).transfer
                 self.assertEqual(
                     [x.identity for x in transfer.images],
                     [

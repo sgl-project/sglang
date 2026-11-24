@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 _fence_tasks: set[asyncio.Task] = set()
 
 
+def staged_embedding_digest(modality, tensor) -> bytes:
+    """The wire commits to modality, dtype, shape and embedding contents."""
+    from sglang.srt.multimodal.cache.identity import resolve_multimodal_item_identity
+    from sglang.srt.multimodal.modality import MultimodalInputFormat
+
+    return resolve_multimodal_item_identity(
+        modality=modality.name,
+        input_format=MultimodalInputFormat.NORMAL.name,
+        precomputed_embeddings=tensor,
+        metadata={},
+        require_content_hash=True,
+    )
+
+
 class StagedPromptMarkers:
     """Raw media token IDs used at ingress, before the native processor expands them."""
 
@@ -271,8 +285,6 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         return layout.build(processor, self, prompt, max_length)
 
     def bind_identities(self, mm_items, routing_hashes, *, use_routing_hash=True):
-        from sglang.srt.environ import envs
-        from sglang.srt.managers.req_types import MultimodalDataItem
         from sglang.srt.multimodal.cache.digest import structured_digest
         from sglang.srt.multimodal.modality import Modality
 
@@ -371,17 +383,11 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 cache_identity = identity
             if all_media_hints:
                 hint = hints[media_index]
-            if (
-                item.precomputed_embeddings is not None
-                and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
-            ):
-                payload = item
-                if self.version >= 3:
-                    payload = MultimodalDataItem(
-                        modality=item.modality,
-                        precomputed_embeddings=item.precomputed_embeddings,
-                    )
-                if payload.cache_key != identity:
+            if item.precomputed_embeddings is not None:
+                if (
+                    staged_embedding_digest(item.modality, item.precomputed_embeddings)
+                    != identity
+                ):
                     raise ValueError("staged media embedding identity mismatch")
             item.set_identity(cache_identity)
             if hint is not None and use_routing_hash:

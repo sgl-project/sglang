@@ -25,6 +25,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
+from sglang.srt.disaggregation.encoder.handoff import staged_embedding_digest
 from sglang.srt.disaggregation.encoder.handoff_auth import EncoderHandoffSigner
 from sglang.srt.disaggregation.encoder.receiver import create_part_req_id
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
@@ -38,7 +39,6 @@ from sglang.srt.disaggregation.encoder.server import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
-from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.media_io import media_url_security_config, media_url_timeout
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.staged_layout import staged_layout_for
@@ -285,7 +285,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             else:
                 t, h, w = map(int, grid)
             layout = encoder_pb2.ImageLayout(
-                t=t, h=h, w=w, identity=self._item_identity(Modality.IMAGE, tensor)
+                t=t,
+                h=h,
+                w=w,
+                identity=staged_embedding_digest(Modality.IMAGE, tensor).hex(),
             )
             if native:
                 layout.embedding_rows = tensor.shape[0]
@@ -297,12 +300,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             layouts.append(layout)
         return layouts
 
-    @staticmethod
-    def _item_identity(modality, tensor):
-        return MultimodalDataItem(
-            modality=modality, precomputed_embeddings=tensor
-        ).cache_key.hex()
-
     def _audio_layouts(self, data):
         layouts = []
         for feature_length, tensor in self._item_embeddings(data):
@@ -311,7 +308,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 raise ValueError("Empty audio or invalid audio embedding")
             layouts.append(
                 encoder_pb2.AudioLayout(
-                    identity=self._item_identity(Modality.AUDIO, tensor),
+                    identity=staged_embedding_digest(Modality.AUDIO, tensor).hex(),
                     feature_length=length,
                     embedding_rows=tensor.shape[0],
                     embedding_width=tensor.shape[1],
@@ -324,7 +321,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             self.encoder,
             data,
             self._item_embeddings,
-            lambda tensor: self._item_identity(Modality.VIDEO, tensor),
+            lambda tensor: staged_embedding_digest(Modality.VIDEO, tensor).hex(),
             explicit_rows or bool(self._info.native_model_type),
         )
 

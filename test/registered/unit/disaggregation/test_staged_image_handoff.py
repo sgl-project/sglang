@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import grpc
 import msgspec
+import torch
 
 from sglang.encoder.v1 import encoder_pb2 as pb
 from sglang.encoder.v1 import encoder_pb2_grpc as rpc
@@ -70,31 +71,50 @@ class TestStagedImageHandoff(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible"):
             handoff.build_layout(processor, prompt, 128)
 
-    def test_caller_hash_does_not_replace_content_identity(self):
+    def test_staged_content_identity_is_independent_of_cache_settings_and_routing_hints(
+        self,
+    ):
+        from sglang.srt.disaggregation.encoder.handoff import staged_embedding_digest
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.req_types import MultimodalDataItem
         from sglang.srt.multimodal.modality import Modality
 
-        class Item:
-            modality = Modality.IMAGE
+        def item(embedding):
+            return MultimodalDataItem(
+                modality=Modality.IMAGE, precomputed_embeddings=embedding
+            )
 
-            def __init__(self, embedding, key):
-                self.precomputed_embeddings = embedding
-                self.cache_key = key
-
-            def set_identity(self, value):
-                self.identity = value
-                self.hash = int.from_bytes(value[:8], "big")
-
-        handoff = EncoderHandoff.parse(msgspec.json.encode(descriptor()), 2)
-        ids = [bytes.fromhex(image.identity) for image in handoff.images]
-        # P verifies actual embeddings; D starts with metadata only.
-        for embedding in (object(), None):
-            items = [Item(embedding, key) for key in ids]
-            handoff.bind_identities(items, [42, None])
-            self.assertEqual([item.identity for item in items], ids)
-            self.assertEqual(items[0].hash, 42)
-            self.assertEqual(items[1].hash, int.from_bytes(ids[1][:8], "big"))
-        with self.assertRaisesRegex(ValueError, "identity mismatch"):
-            handoff.bind_identities([Item(object(), k) for k in reversed(ids)], [])
+        data = descriptor()
+        embeddings = [torch.full((1, 4), 1.0), torch.full((2, 4), 2.0)]
+        with envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(False):
+            expected = [item(t).cache_key for t in embeddings]
+        for encoder_skip in (False, True):
+            with envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(encoder_skip):
+                for layout, tensor in zip(data["images"], embeddings):
+                    layout["identity"] = staged_embedding_digest(
+                        Modality.IMAGE, tensor
+                    ).hex()
+            handoff = EncoderHandoff.parse(msgspec.json.encode(data), 2)
+            for receiver_skip in (False, True):
+                with (
+                    self.subTest(encoder=encoder_skip, receiver=receiver_skip),
+                    envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(receiver_skip),
+                ):
+                    # P/PD verifies bytes. D reconstructs the same cache identity from the receipt.
+                    for tensors in (embeddings, (None, None)):
+                        items = [item(t) for t in tensors]
+                        handoff.bind_identities(items, [42, None])
+                        self.assertEqual([i.identity for i in items], expected)
+                        self.assertEqual(items[0].hash, 42)
+                        self.assertEqual(
+                            items[1].hash, int.from_bytes(expected[1][:8], "big")
+                        )
+                    changed = item(embeddings[0] + 1)
+                    changed.set_identity(expected[0])
+                    with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                        handoff.bind_identities(
+                            [changed, item(embeddings[1])], [42, None]
+                        )
 
     def test_delivery_reaches_only_selected_grpc_peer(self):
         class Encoder(rpc.SglangEncoderServicer):

@@ -38,7 +38,11 @@ On each E, set `SGLANG_ENCODER_HANDOFF_ENDPOINT=grpc://host:port` to the
 address P/PD can reach when the bind address is a wildcard or differs from
 that address. E authenticates its endpoint, process instance, transfer ID and
 media layout with HMAC-SHA256. P/PD and D verify the receipt at ingress before
-using its metadata or contacting E. Keep the encoder and language listeners
+using its metadata or contacting E. E computes a content digest for each staged
+embedding from its modality, dtype, shape and tensor bytes. P/PD verifies the
+received tensors against these digests even when `SGLANG_MM_SKIP_COMPUTE_HASH`
+is enabled on either worker. D uses the authenticated digests to reconstruct the
+same media identities. Keep the encoder and language listeners
 private. Restart the workers with a new shared key to rotate it.
 
 The router owns the receipt until P/PD claims it. It can call `Release` on the
