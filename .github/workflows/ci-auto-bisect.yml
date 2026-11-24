@@ -14,11 +14,6 @@ on:
         options: [nvidia, xpu]
         default: nvidia
 
-concurrency:
-  # One group per source workflow so an XPU bisect never cancels an Nvidia one.
-  group: ci-auto-bisect-${{ github.event.workflow_run.name || inputs.target || 'nvidia' }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
   actions: read
@@ -32,6 +27,11 @@ jobs:
         (github.event.workflow_run.event == 'schedule' &&
          github.event.workflow_run.conclusion != 'cancelled')
       )
+    # Job-level so skipped push completions never join (and cancel) the group;
+    # one key per platform, shared by scheduled and manual runs.
+    concurrency:
+      group: ci-auto-bisect-${{ (github.event.workflow_run.name == 'PR Test (XPU)' || inputs.target == 'xpu') && 'xpu' || 'nvidia' }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
