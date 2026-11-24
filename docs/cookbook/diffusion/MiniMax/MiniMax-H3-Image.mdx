@@ -205,6 +205,50 @@ allocator: native 2K/4K generation and editing, including two-reference 4K,
 passed with an 8 GiB allocator limit and a 10.01 GiB measured whole-GPU peak.
 It is not a latency measurement on the listed consumer GPUs.
 
+### RTX 4090 24 GB, and a MiniMax-H3 video server beside it
+
+Measured on one RTX 4090 24 GB with an NVMe disk of about 8 GiB/s, swap off. On
+this card the plain command and the layerwise recipe with default pinning fail at
+startup when about 32 GiB of host memory is available
+([#52761](https://github.com/sgl-project/sglang/issues/52761)). Add
+`--pin-cpu-memory false`:
+
+```bash Command
+sglang serve --model-path MiniMaxAI/MiniMax-H3-Image --port 30020 \
+  --component-residency all=layerwise-offload \
+  --layerwise-prefetch-size transformer=1,text_encoder=1,video_vae=1 \
+  --minimax-h3-adaln-online true --pin-cpu-memory false
+```
+
+At 2048 × 2048 with six steps, a new prompt took 23–24 s and an edit with one
+reference about 40 s. Peak GPU memory was about 10.3–11.0 GiB and peak
+unreclaimable host memory about 22 GiB, with no OOM kill.
+
+**Image and video together.** To animate an image without stopping a server, start
+a [MiniMax-H3](/cookbook/diffusion/MiniMax/MiniMax-H3) `fl2va` server first, then
+the image server above. Start the video server first: the order was not tested
+the other way.
+
+```bash Command
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va --port 30010 --pin-cpu-memory false
+```
+
+Both servers together used 46.8 GiB of unreclaimable host memory at peak, so use a
+host with at least 57 GiB available, the amount tested. With 32 GiB available the
+image server never became ready in 30 minutes. The GPU peak in this run was 20.1 GiB.
+
+| One RTX 4090, 480p 5 s video at 8 steps, 2048 × 2048 image | Image | Video, first frame from that image |
+| --- | ---: | ---: |
+| Two servers, 57 GiB host | 31 s | 92–94 s |
+| Stop one, start the other (restart) | 110 s to the first image | 234 s to the first video |
+| Restart with `--warmup-mode off` | 91–98 s | 144 s |
+
+The restart rows count from stopping the old server to the first output, and are one
+run with warmup and two runs without. With `--warmup-mode off` an OOM shows up on the
+first request instead of at startup. The first video after each warmup-off start was
+not byte-identical to the one from a warmed-up server; later videos and all images
+were.
+
 ### AMD Instinct (MI300X, MI325X, MI350X, MI355X)
 
 Select an AMD GPU in the picker for single-node recipes on 1, 2, 4 and 8 GPUs.
