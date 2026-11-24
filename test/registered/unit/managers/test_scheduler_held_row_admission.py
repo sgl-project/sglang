@@ -4,6 +4,7 @@ load scaling reaches admission."""
 
 import inspect
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -84,6 +85,30 @@ class _ParkingAdder(_Adder):
         return req
 
 
+class _PreemptingAdder(_Adder):
+    """Use real victim selection and batch updates with a test KV budget."""
+
+    def __init__(
+        self,
+        page_size,
+        tree_cache,
+        allocator,
+        running_batch,
+        new_token_ratio,
+        *args,
+        memory_budget,
+        **kwargs,
+    ):
+        super().__init__()
+        self.running_batch = running_batch
+        self.token_to_kv_pool_allocator = allocator
+        self.new_token_ratio = new_token_ratio
+        self.memory_budget = memory_budget
+        self.chunked_req_waits = False
+        self.priority_scheduling_preemption_threshold = 0
+        self.request_retirer = kwargs["request_retirer"]
+
+
 class _LimitsAdder(_Adder):
     """Records the pass limits it gets; the chunked request may continue."""
 
@@ -105,8 +130,9 @@ class _BatchBuilt(Exception):
 
 
 class TestHeldRowAdmission(CustomTestCase):
+    @staticmethod
     def _scheduler(
-        self, disaggregation_mode, running, final_chunk, waiting, adder_class=_Adder
+        disaggregation_mode, running, final_chunk, waiting, adder_class=_Adder
     ):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
@@ -115,7 +141,8 @@ class TestHeldRowAdmission(CustomTestCase):
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
         move(waiting, s.waiting_queue)
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        move([final_chunk], s.chunked_reqs)
+        if final_chunk is not None:
+            move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(
@@ -299,6 +326,127 @@ class TestHeldRowAdmission(CustomTestCase):
         _, adder = self._build_batch(s, ScheduleBatch(reqs=running), False)
         self.assertEqual(adder.rem_input_tokens, 1024 + len(running))
         self.assertEqual(adder.rem_chunk_tokens, 1024 + len(running))
+
+
+class TestPriorityPrefetchAdmission(CustomTestCase):
+    def test_pending_prefetch_keeps_decode_running_until_a_candidate_is_ready(self):
+        """A full batch should lose a decode row only once a candidate can use it."""
+        self._check_priority_preemption(enable_hicache_storage=True)
+
+    def test_priority_preemption_without_storage_prefetch(self):
+        self._check_priority_preemption(enable_hicache_storage=False)
+
+    def test_prefetch_completion_can_leave_too_little_kv_for_preemption(self):
+        """A completed prefetch can pin previously evictable device KV."""
+        self._check_priority_preemption(
+            enable_hicache_storage=True, prefetch_pins_kv=True
+        )
+
+    def _check_priority_preemption(
+        self, *, enable_hicache_storage, prefetch_pins_kv=False
+    ):
+        victim = _Req(True, "running", 3)
+        first = _Req(False, "first", 3)
+        second = _Req(False, "second", 3)
+        for req, priority in ((victim, 0), (first, 2), (second, 1)):
+            req.priority = priority
+            req.finished = lambda: False
+            req.extra_key = req.cache_salt = None
+            req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=True)
+            req.kv.req_pool_idx = None
+            req.cache_request_handle = req.rid
+            req.time_stats = Mock(wait_queue_entry_time=0.0)
+
+        memory_budget = SimpleNamespace(remaining_total=5, total_offset=8)
+        s = TestHeldRowAdmission._scheduler(
+            DisaggregationMode.NULL,
+            [victim],
+            None,
+            [first, second],
+            adder_class=partial(_PreemptingAdder, memory_budget=memory_budget),
+        )
+        move([victim], s.running_reqs)
+        s.enable_priority_scheduling = s.enable_priority_preemption = True
+        s.policy = SchedulePolicy(
+            "fcfs", RadixCache.create_simulated(), enable_hicache_storage, True, False
+        )
+        s.enable_hicache_storage = enable_hicache_storage
+        ready = set()
+        s.tree_cache.check_prefetch_progress = Mock(side_effect=ready.__contains__)
+        s.tree_cache.pop_prefetch_loaded_span = Mock(return_value=(2, 0))
+        s.token_to_kv_pool_allocator.request_slot_reserve = lambda **_: 0
+        s._prefetch_after_device_hit_loss = Mock(return_value=False)
+        s._prefetch_kvcache = Mock()
+        s._abort_on_queued_limit = Mock(return_value=False)
+        s.uocr_runtime = None
+        s.log_schedule_decisions = False
+        running_batch = ScheduleBatch(reqs=[victim])
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        def complete_prefetch(rid):
+            if rid not in ready:
+                return False
+            memory_budget.remaining_total = 2
+            # Further polls see the completed prefetch without pinning more KV.
+            s.tree_cache.check_prefetch_progress.side_effect = ready.__contains__
+            return True
+
+        with (
+            get_context().override_server_args(
+                pp_max_micro_batch_size=1, schedule_low_priority_values_first=False
+            ),
+            patch.object(running_batch, "release_req") as release,
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+
+            def assert_decode_keeps_running():
+                new_batch, decode_batch = s._get_new_batch_prefill_raw(
+                    None, running_batch
+                )
+                self.assertIsNone(new_batch)
+                self.assertEqual([req.rid for req in decode_batch.reqs], [victim.rid])
+                self.assertEqual(list(s.running_reqs), [victim])
+                self.assertEqual(list(s.waiting_queue), [first, second])
+                release.assert_not_called()
+                s.tree_cache.pop_prefetch_loaded_span.assert_not_called()
+
+            victim.priority = 3
+            new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
+            self.assertIsNone(new_batch)
+            s.tree_cache.check_prefetch_progress.assert_not_called()
+            victim.priority = 0
+
+            admitted, waiting = first, second
+            if enable_hicache_storage:
+                assert_decode_keeps_running()
+                ready.add(second.rid)
+                admitted, waiting = second, first
+                if prefetch_pins_kv:
+                    s.tree_cache.check_prefetch_progress.side_effect = complete_prefetch
+                    assert_decode_keeps_running()
+                    self.assertEqual(memory_budget.remaining_total, 2)
+                    self.assertEqual(memory_budget.total_offset, 8)
+                    memory_budget.remaining_total = 5
+
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(None, running_batch)
+            self.assertEqual(built.exception.args[0], [admitted])
+            self.assertEqual(list(s.prefill_launched_reqs), [admitted])
+            self.assertEqual(list(s.waiting_queue), [waiting, victim])
+            self.assertEqual(running_batch.reqs, [])
+            self.assertEqual(list(s.running_reqs), [])
+            release.assert_called_once()
+            if enable_hicache_storage:
+                self.assertEqual(admitted.storage_hit_length, 2)
+                s.tree_cache.pop_prefetch_loaded_span.assert_called_once_with(
+                    admitted.rid
+                )
+            else:
+                s.tree_cache.check_prefetch_progress.assert_not_called()
+                s.tree_cache.pop_prefetch_loaded_span.assert_not_called()
 
 
 class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
