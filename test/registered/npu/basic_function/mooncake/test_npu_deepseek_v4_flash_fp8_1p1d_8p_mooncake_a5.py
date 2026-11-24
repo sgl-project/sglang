@@ -99,6 +99,13 @@ DEEPSEEK_V4_FLASH_FP8_PD_SHARED_ARGS = [
     "--weight-loader-prefetch-checkpoints",
     "--weight-loader-prefetch-num-threads",
     8,
+    # Prefetching alone falls back to the single-threaded loader, which then
+    # waits on whichever shard the prefetchers have not reached yet (observed:
+    # 1/48 for 4.5 minutes). Keep the 8 workers so the loader can always pick a
+    # shard that is already cached; here the loader mostly hits page cache, so
+    # it does not oversubscribe the store.
+    "--model-loader-extra-config",
+    '{"enable_multithread_load": true}',
     # run_accuracy sends the checkpoint basename as the OpenAI ``model`` field;
     # both workers serve that name so sgl-router can route it.
     "--served-model-name",
