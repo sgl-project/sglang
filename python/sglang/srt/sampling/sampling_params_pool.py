@@ -25,7 +25,7 @@ from sglang.srt.sampling.watermarking.runtime import (
     num_watermark_fields,
     watermark_pool_values,
 )
-from sglang.srt.utils.device import async_h2d, async_h2d_tensor
+from sglang.srt.utils.device import async_h2d_tensor
 from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
@@ -130,7 +130,9 @@ class SamplingParamsPool:
         self.has_seed_host[slots] = [p.sampling_seed is not None for p in params]
         self.penalty_indices_host[slots] = penalty_indices
 
-        host_values = np.empty((self.table.shape[0], len(reqs)), dtype=np.int32)
+        # The table's fields, then the slots in a last row: one copy writes them.
+        host_values = np.empty((self.table.shape[0] + 1, len(reqs)), dtype=np.int32)
+        host_values[-1] = slots
         host_floats = host_values.view(np.float32)
         host_floats[self.TEMPERATURE] = [p.temperature for p in params]
         host_floats[self.TOP_P] = [p.top_p for p in params]
@@ -145,10 +147,9 @@ class SamplingParamsPool:
         if self.num_watermark_fields:
             candidates, values = zip(*(watermark_pool_values(r) for r in reqs))
             self.watermark_candidates_host[slots] = candidates
-            host_values[self.WATERMARK :] = np.array(values, dtype=np.int32).T
-        rows = async_h2d(slots, dtype=torch.int64, device=self.table.device)
+            host_values[self.WATERMARK : -1] = np.array(values, dtype=np.int32).T
         values = async_h2d_tensor(torch.from_numpy(host_values), self.table.device)
-        self.table.index_copy_(1, rows, values)
+        self.table.index_copy_(1, values[-1].long(), values[:-1])
 
     def gather(
         self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor

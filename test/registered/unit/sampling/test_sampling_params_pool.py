@@ -314,6 +314,40 @@ class TestSlotLifecycle(_PoolTestCase):
         self.assertEqual(pool.table[pool.WATERMARK, 3].item(), 0)
 
 
+class TestOneCopyWrite(_PoolTestCase):
+    def test_each_field_reads_back_its_own_value(self):
+        """The write copies every field and the slots in one block; a distinct
+        value per field and request reads back from the gathered rows."""
+        self.exec_ns = _exec(watermark_algorithm="gumbel")
+        pool = SamplingParamsPool(
+            num_rows=NUM_ROWS,
+            device=DEVICE,
+            penalty_status_pool=SimpleNamespace(kinds=[1, 1, 1, 1, 1, 1]),
+        )
+        key = SimpleNamespace(enabled=True, key="0x77", context_window=3)
+        pool.write(
+            [
+                _req(6, 0.25, 0.5, 11, 0.125, seed=-5, penalty_index=4, watermark=key),
+                _req(1, 0.75, 0.625, 13, 0.375, seed=2**40, penalty_index=2),
+            ]
+        )
+
+        rows = _gather(pool, [1, 6])
+
+        self.assertEqual(rows.temperatures.view(-1).tolist(), [0.75, 0.25])
+        self.assertEqual(rows.top_ps.tolist(), [0.625, 0.5])
+        self.assertEqual(rows.top_ks.tolist(), [13, 11])
+        self.assertEqual(rows.min_ps.tolist(), [0.375, 0.125])
+        self.assertEqual(rows.sampling_seed.tolist(), [2**40, -5])
+        self.assertEqual(rows.step_penalties.penalty_indices.tolist(), [2, 4])
+        self.assertEqual(rows.watermark.keys.tolist()[1], 0x77)
+        self.assertEqual(rows.watermark.context_windows.tolist(), [4, 3])
+        # Slots never written keep the defaults.
+        defaults = _gather(pool, [0, 7])
+        self.assertEqual(defaults.top_ks.tolist(), [TOP_K_ALL, TOP_K_ALL])
+        self.assertIsNone(defaults.step_penalties)
+
+
 class TestWatermarkFields(_PoolTestCase):
     def test_without_watermarking_the_pool_keeps_no_fields(self):
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
