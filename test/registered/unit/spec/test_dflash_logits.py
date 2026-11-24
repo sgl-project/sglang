@@ -426,7 +426,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         block_size=2,
     )
 
-    result = worker_mod.DFlashWorkerV2._accept_block(
+    accept = worker_mod.DFlashWorkerV2._accept_block(
         worker,
         candidates=torch.tensor([[9, 1]]),
         next_token_logits=torch.tensor([[[0.0, 1.0], [1.0, 0.0]]]),
@@ -436,12 +436,11 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         bs=1,
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _, cap_trim_lens = result
-    assert accept_len.tolist() == [0]
-    assert commit_lens.tolist() == [1]
-    assert bonus.tolist() == [7]
-    assert out_tokens.tolist() == [[7, 0]]
-    assert cap_trim_lens is None
+    assert accept.correct_len.tolist() == [0]
+    assert accept.commit_lens.tolist() == [1]
+    assert accept.bonus.tolist() == [7]
+    assert accept.out_tokens.tolist() == [[7, 0]]
+    assert accept.cap_trim_lens is None
     assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 

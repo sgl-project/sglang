@@ -68,7 +68,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import VerifyStep
-from sglang.srt.sampling.verify_accept import VerifyAccept
+from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -2826,7 +2826,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-    ):
+    ) -> ChainAccept:
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
         it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
@@ -2936,7 +2936,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             cap_trim_lens = None
 
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
+        return ChainAccept(
+            correct_len=accept_len,
+            bonus=bonus,
+            commit_lens=commit_lens,
+            out_tokens=out_tokens,
+            cap_trim_lens=cap_trim_lens,
+            new_seq_lens=new_seq_lens,
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -3660,16 +3667,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # new logits.
             verify.adjust(logits_output.next_token_logits, draft_tokens)
 
-        candidates = draft_tokens
-        (
-            accept_len,
-            commit_lens,
-            bonus,
-            out_tokens,
-            new_seq_lens,
-            cap_trim_lens,
-        ) = self._accept_block(
-            candidates=candidates,
+        accept = self._accept_block(
+            candidates=draft_tokens,
             next_token_logits=logits_output.next_token_logits,
             sampling_info=sampling_info,
             draft_input=draft_input,
@@ -3678,28 +3677,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
-        commit_lens, bonus, new_seq_lens = verify.cap_chain_accept(
-            out_tokens=out_tokens,
-            commit_lens=commit_lens,
-            bonus=bonus,
-            prefix_lens=prefix_lens,
-            new_seq_lens=new_seq_lens,
-        )
+        verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
         verify.commit(
-            VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
+            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
             logits_output=logits_output,
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(
-                correct_len=accept_len,
-                cap_trim_lens=cap_trim_lens,
+                correct_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
                 layout=layout if run_compact else None,
             )
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.commit_spec_accept_tokens(
                 batch=batch,
                 accept_indices=_chain_accept_indices(
-                    commit_lens=commit_lens, block_size=block_size
+                    commit_lens=accept.commit_lens, block_size=block_size
                 ),
             )
 
@@ -3712,28 +3705,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if sampling_mask_capture is not None:
             logits_output.sampling_mask_output = sampling_mask_capture.build_output(
-                out_tokens=out_tokens,
-                commit_lens=commit_lens,
+                out_tokens=accept.out_tokens,
+                commit_lens=accept.commit_lens,
             )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
-            if new_seq_lens is None:
-                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            if accept.new_seq_lens is None:
+                accept.new_seq_lens = prefix_lens + accept.commit_lens.to(
+                    prefix_lens.dtype
+                )
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
-                seq_lens_post_verify=new_seq_lens,
-                commit_lens=commit_lens,
+                seq_lens_post_verify=accept.new_seq_lens,
+                commit_lens=accept.commit_lens,
             )
 
-        if new_seq_lens is None:
-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if accept.new_seq_lens is None:
+            accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             if confidence is not None:
-                on_publish(new_seq_lens, confidence=confidence)
+                on_publish(accept.new_seq_lens, confidence=confidence)
             else:
-                on_publish(new_seq_lens)
+                on_publish(accept.new_seq_lens)
         if self._info_dumper.enabled:
             self._observe_decode_step(
                 batch=batch,
@@ -3742,10 +3737,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_token_budget=verify_token_budget,
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
-                accept_len=accept_len,
-                cap_trim_lens=cap_trim_lens,
-                bonus=bonus,
-                commit_lens=commit_lens,
+                accept_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
+                bonus=accept.bonus,
+                commit_lens=accept.commit_lens,
             )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
@@ -3768,7 +3763,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
-            commit_lens=commit_lens,
+            commit_lens=accept.commit_lens,
             swa_cache_loc=(
                 None
                 if ring_block_locs is not None
@@ -3780,23 +3775,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output.hidden_states = None
 
         next_draft_input = self._make_next_draft_input_decode(
-            bonus_tokens=bonus,
-            new_seq_lens=new_seq_lens,
+            bonus_tokens=accept.bonus,
+            new_seq_lens=accept.new_seq_lens,
         )
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=out_tokens.reshape(-1),
-            accept_lens=commit_lens,
+            next_token_ids=accept.out_tokens.reshape(-1),
+            accept_lens=accept.commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             side_stream_done=self._aux_done if self._aux_pending else None,
             speculative_num_draft_tokens=int(self.block_size),
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
-            new_seq_lens=new_seq_lens,
+            new_seq_lens=accept.new_seq_lens,
             block_accept_lens=(
-                None if cap_trim_lens is None else commit_lens + cap_trim_lens
+                None
+                if accept.cap_trim_lens is None
+                else accept.commit_lens + accept.cap_trim_lens
             ),
             cap_lens=None if layout is None else layout.verify_lens.to(torch.int32),
             routed_experts_output=routed_experts_output,

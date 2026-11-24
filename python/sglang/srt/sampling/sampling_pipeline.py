@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_observer import SamplingObserver
-    from sglang.srt.sampling.verify_accept import VerifyAccept
+    from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
     from sglang.srt.sampling.watermarking.interface import (
         VerifyWatermark,
         WatermarkEngine,
@@ -475,28 +475,21 @@ class VerifyStep(msgspec.Struct):
         accept_index[:, 1:].index_fill_(0, self.first_row_only_reqs, -1)
 
     def cap_chain_accept(
-        self,
-        *,
-        out_tokens: torch.Tensor,
-        commit_lens: torch.Tensor,
-        bonus: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        new_seq_lens: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        self, accept: ChainAccept, *, prefix_lens: torch.Tensor
+    ) -> None:
         """Cut each `first_row_only_reqs` request's chain accept to its first
-        token, `out_tokens[:, 0]`, as `cap_tree_accept` does. Returns the
-        `commit_lens`, `bonus`, and `new_seq_lens` to commit. The accept core's
-        correct lengths stay uncapped: the acceptance estimators read them."""
+        token, `out_tokens[:, 0]`, as `cap_tree_accept` does, in place, and
+        recompute its `new_seq_lens`. The accept kernel's `correct_len` stays
+        uncapped: the acceptance estimators read it."""
         if self.first_row_only_reqs is None:
-            return commit_lens, bonus, new_seq_lens
-        capped = torch.zeros_like(commit_lens, dtype=torch.bool)
+            return
+        capped = torch.zeros_like(accept.commit_lens, dtype=torch.bool)
         capped.index_fill_(0, self.first_row_only_reqs, True)
-        commit_lens = torch.where(capped, 1, commit_lens)
-        return (
-            commit_lens,
-            torch.where(capped, out_tokens[:, 0].to(bonus.dtype), bonus),
-            prefix_lens + commit_lens.to(prefix_lens.dtype),
+        accept.commit_lens = torch.where(capped, 1, accept.commit_lens)
+        accept.bonus = torch.where(
+            capped, accept.out_tokens[:, 0].to(accept.bonus.dtype), accept.bonus
         )
+        accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
 
     def commit(
         self, accept: VerifyAccept, *, logits_output: LogitsProcessorOutput

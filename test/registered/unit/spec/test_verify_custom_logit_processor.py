@@ -23,6 +23,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.verify_accept import ChainAccept
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_common import accept_draft_tree
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -227,33 +228,35 @@ class TestOneTokenCap(CustomTestCase):
     def test_chain_accept_keeps_the_first_token(self):
         """Request 0 accepted draft 1 (commits it), request 1 accepted none
         (commits its first-row bonus), request 2 is not capped."""
-        out_tokens = torch.tensor([[21, 22, 23], [31, 0, 0], [41, 42, 43]])
-        commit_lens, bonus, new_seq_lens = self._verify([0, 1]).cap_chain_accept(
-            out_tokens=out_tokens,
-            commit_lens=torch.tensor([3, 1, 3], dtype=torch.int32),
+        accept = ChainAccept(
+            correct_len=torch.tensor([2, 0, 2]),
             bonus=torch.tensor([23, 31, 43]),
-            prefix_lens=torch.tensor([10, 20, 30]),
-            new_seq_lens=None,
+            commit_lens=torch.tensor([3, 1, 3], dtype=torch.int32),
+            out_tokens=torch.tensor([[21, 22, 23], [31, 0, 0], [41, 42, 43]]),
         )
-        self.assertEqual(commit_lens.tolist(), [1, 1, 3])
-        self.assertEqual(commit_lens.dtype, torch.int32)
-        self.assertEqual(bonus.tolist(), [21, 31, 43])
-        self.assertEqual(new_seq_lens.tolist(), [11, 21, 33])
+        self._verify([0, 1]).cap_chain_accept(
+            accept, prefix_lens=torch.tensor([10, 20, 30])
+        )
+        self.assertEqual(accept.commit_lens.tolist(), [1, 1, 3])
+        self.assertEqual(accept.commit_lens.dtype, torch.int32)
+        self.assertEqual(accept.bonus.tolist(), [21, 31, 43])
+        self.assertEqual(accept.new_seq_lens.tolist(), [11, 21, 33])
+        self.assertEqual(accept.correct_len.tolist(), [2, 0, 2])
 
-    def test_nothing_capped_returns_the_inputs(self):
+    def test_nothing_capped_leaves_the_accept(self):
         verify = self._verify([])
         verify.first_row_only_reqs = None
         commit_lens, bonus = torch.tensor([3]), torch.tensor([7])
-        out = verify.cap_chain_accept(
-            out_tokens=torch.tensor([[5, 6, 7]]),
-            commit_lens=commit_lens,
+        accept = ChainAccept(
+            correct_len=torch.tensor([2]),
             bonus=bonus,
-            prefix_lens=torch.tensor([10]),
-            new_seq_lens=None,
+            commit_lens=commit_lens,
+            out_tokens=torch.tensor([[5, 6, 7]]),
         )
-        self.assertIs(out[0], commit_lens)
-        self.assertIs(out[1], bonus)
-        self.assertIsNone(out[2])
+        verify.cap_chain_accept(accept, prefix_lens=torch.tensor([10]))
+        self.assertIs(accept.commit_lens, commit_lens)
+        self.assertIs(accept.bonus, bonus)
+        self.assertIsNone(accept.new_seq_lens)
 
 
 class TestCustomLogitProcessorSync(CustomTestCase):

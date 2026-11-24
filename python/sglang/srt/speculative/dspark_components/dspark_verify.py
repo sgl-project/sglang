@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
+from sglang.srt.sampling.verify_accept import ChainAccept
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
@@ -190,7 +191,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
-    ) -> AcceptOuts:
+    ) -> ChainAccept:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
@@ -563,15 +564,6 @@ class CommitInjectCtx(msgspec.Struct):
     # SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH: returns the target's engram hasher
     # (or None), whose history commit the static epilogue then records in-graph.
     resolve_engram_hasher: Optional[object] = None
-
-
-class AcceptOuts(msgspec.Struct):
-    correct_len: torch.Tensor
-    bonus: torch.Tensor
-    cap_trim_lens: torch.Tensor
-    commit_lens: torch.Tensor
-    new_seq_lens: torch.Tensor
-    out_tokens: torch.Tensor
 
 
 class StaticVerifyIO(msgspec.Struct, frozen=True):
@@ -953,8 +945,8 @@ class DsparkVerifyEpilogue:
         self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
         self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
 
-    def read_accept(self, bs: int) -> AcceptOuts:
-        return AcceptOuts(
+    def read_accept(self, bs: int) -> ChainAccept:
+        return ChainAccept(
             correct_len=self.correct_len_buf[:bs],
             bonus=self.bonus_buf[:bs],
             cap_trim_lens=self.cap_trim_lens_buf[:bs],
@@ -1153,9 +1145,9 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     simulated_bonus_seed: Optional[int] = None,
-    out: Optional[AcceptOuts] = None,
+    out: Optional[ChainAccept] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
-) -> AcceptOuts:
+) -> ChainAccept:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
     ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
     ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus."""
@@ -1200,7 +1192,7 @@ def build_accept_outs(
         verify_num_draft_tokens=verify_num_draft_tokens,
         gamma=gamma,
     )
-    accept = AcceptOuts(
+    accept = ChainAccept(
         correct_len=correct_len,
         bonus=bonus,
         cap_trim_lens=finalized.cap_trim_lens,
