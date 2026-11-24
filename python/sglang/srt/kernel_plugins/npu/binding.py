@@ -15,10 +15,18 @@ def install_megakernels(runner):
     cfg = resolved_view(runner.server_args)
     architecture = type(runner.model).__name__
     group = get_parallel().tp_group.cpu_group
-    binding = error = None
+    binding = error = decline = None
     try:
         spec = find_spec(architecture)
-        if spec is not None and (spec.role == "nextn") == runner.is_draft_worker:
+        if spec is None:
+            decline = f"no megakernel spec for {architecture}"
+        elif (spec.role == "nextn") != runner.is_draft_worker:
+            decline = (
+                f"spec role {spec.role} does not match "
+                f"draft_worker={runner.is_draft_worker}"
+            )
+        else:
+            spec.prepare.decline_reason = None
             resources = PreparationView(
                 model=runner.model,
                 token_to_kv_pool=runner.token_to_kv_pool,
@@ -26,6 +34,7 @@ def install_megakernels(runner):
                 and not runner.token_to_kv_pool_allocator.hands_out_virtual_ids,
             )
             binding = spec.prepare(resources, cfg)
+            decline = getattr(spec.prepare, "decline_reason", None)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     signature = (
@@ -35,13 +44,21 @@ def install_megakernels(runner):
         cfg.speculative_num_steps,
         cfg.speculative_num_draft_tokens,
         error,
+        decline,
     )
     ranks = [None] * dist.get_world_size(group)
     dist.all_gather_object(ranks, signature, group=group)
-    if any(peer[-1] for peer in ranks):
+    if any(peer[5] for peer in ranks):
         raise RuntimeError(f"NPU megakernel preflight failed: {ranks}")
     if any(peer[1] is None for peer in ranks):
-        logger.info("NPU megakernel declined %s on one or more TP ranks", architecture)
+        reasons = [peer[6] for peer in ranks]
+        # Native draft is an explicit off switch. Any other reason means the
+        # enabled plugin did not install.
+        unexpected = any(
+            reason and "draft mode is native" not in reason for reason in reasons
+        )
+        log = logger.warning if unexpected else logger.info
+        log("NPU megakernel declined %s: %s", architecture, reasons)
         return None
     if any(peer != signature for peer in ranks):
         raise RuntimeError(f"NPU megakernel preflight failed: {ranks}")
