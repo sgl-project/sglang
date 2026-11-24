@@ -562,19 +562,28 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
     # ------------------------------------------------------------------
     def _index_pages(self) -> int:
         buf = self.kv_pool.get_index_k_buffer(0)
-        return buf.shape[0] // self.block_size
+        # Page-major [pages, page_size, ...] here, so dim 0 is a page count;
+        # flatten first, then divide, exactly as index_kv_view reshapes.
+        return buf.numel() // (self.block_size * self.idx_head_dim)
 
     def index_kv_view(self, layer_id: int) -> torch.Tensor:
         """Index side cache as ``[num_pages, block_size, idx_head_dim]``."""
         buf = self.kv_pool.get_index_k_buffer(layer_id)
+        # The NPU pool hands back [pages, block, 1, dim] already.
+        if buf.dim() == 4:
+            return buf.reshape(-1, self.block_size, self.idx_head_dim)
         return buf.view(-1, self.block_size, self.idx_head_dim)
 
     def main_kv_view(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Main K/V as ``[num_pages, block_size, num_kv_heads, head_dim]``."""
         k, v = self.kv_pool.get_kv_buffer(layer_id)
-        heads, dim = k.shape[1], k.shape[2]
+        # The NPU paged pool already returns [pages, block, heads, dim].
+        if k.dim() == 4:
+            heads, dim = k.shape[2], k.shape[3]
+        else:
+            heads, dim = k.shape[1], k.shape[2]
         shape = (-1, self.block_size, heads, dim)
-        return k.view(shape), v.view(shape)
+        return k.reshape(shape), v.reshape(shape)
 
     # ------------------------------------------------------------------
     # page2d RoPE

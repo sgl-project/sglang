@@ -30,6 +30,11 @@ def _get_rope_kernel():
         import triton
         import triton.language as tl
 
+        # Triton resolves kernel source names through the defining module, not
+        # the enclosing function; bind them so the lazy kernels compile.
+        globals().setdefault("triton", triton)
+        globals().setdefault("tl", tl)
+
         @triton.jit
         def _k(
             x_ptr,
@@ -124,6 +129,11 @@ def _get_rope_kernel_pair():
         import triton
         import triton.language as tl
 
+        # Triton resolves kernel source names through the defining module, not
+        # the enclosing function; bind them so the lazy kernels compile.
+        globals().setdefault("triton", triton)
+        globals().setdefault("tl", tl)
+
         @triton.jit
         def _row(
             x_ptr,
@@ -157,6 +167,8 @@ def _get_rope_kernel_pair():
             u = u + 0x7FFF + ((u >> 16) & 1)
             o = (u & 0xFFFF0000).to(tl.float32, bitcast=True).to(x.dtype)
             tl.store(o_ptr + base + d, o)
+
+        globals().setdefault("_row", _row)
 
         @triton.jit
         def _k2(

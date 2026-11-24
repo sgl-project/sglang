@@ -5959,7 +5959,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],
-    v_buffer: List[torch.Tensor],
+    v_buffer: Optional[List[torch.Tensor]],
     tgt_loc: torch.Tensor,
     src_loc: torch.Tensor,
 ):
@@ -5967,19 +5967,23 @@ def move_kv_cache_native(
 
     Per-layer buffers are 3-D ``[max_slots, head_num, head_dim]`` pools. A
     page-major pool may expose 4-D ``[pages, page_size, head_num, head_dim]``;
-    flatten its page axis so ``loc`` still indexes tokens.
+    flatten its page axis so ``loc`` still indexes tokens. ``v_buffer`` is
+    ``None`` for K-only pools.
     """
     if tgt_loc.numel() == 0:
         return
 
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
-    for k_cache, v_cache in zip(k_buffer, v_buffer):
+    for i, k_cache in enumerate(k_buffer):
+        v_cache = v_buffer[i] if v_buffer is not None else None
         if k_cache.dim() == 4:
             k_cache = k_cache.view(-1, *k_cache.shape[-2:])
-            v_cache = v_cache.view(-1, *v_cache.shape[-2:])
+            if v_cache is not None:
+                v_cache = v_cache.view(-1, *v_cache.shape[-2:])
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
-        v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+        if v_cache is not None:
+            v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
 @triton.jit
@@ -6679,6 +6683,32 @@ class MiniMaxSparseKVPool(KVCache):
         return self.main_pool.get_value_buffer(self.main_pool.start_layer).shape[-1]
 
 
+def _move_kv_rows(
+    k_buffer,
+    v_buffer,
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Move KV rows for the layouts ``move_kv_cache_native`` does not cover.
+
+    A fused pool exposes one 5-D ``[layers, pages, page_size, H, D]`` tensor,
+    whose page axis needs the diagonal ``(page, offset)`` gather; advanced
+    indexing on dim 0 alone would move whole pages. Everything else is a list
+    of per-layer buffers.
+    """
+    if tgt_loc.numel() == 0:
+        return
+    if isinstance(k_buffer, torch.Tensor) and k_buffer.dim() == 5:
+        tp, to = tgt_loc // page_size, tgt_loc % page_size
+        sp, so = src_loc // page_size, src_loc % page_size
+        k_buffer[:, tp, to] = k_buffer[:, sp, so]
+        if v_buffer is not None:
+            v_buffer[:, tp, to] = v_buffer[:, sp, so]
+        return
+    move_kv_cache_native(k_buffer, v_buffer, tgt_loc, src_loc)
+
+
 class UnlimitedOCRV2KVPool(MiniMaxSparseKVPool):
     """Main K/V plus DASH's single-head index K, with copyable token slots.
 
@@ -6692,14 +6722,22 @@ class UnlimitedOCRV2KVPool(MiniMaxSparseKVPool):
         for pool in (self.main_pool, self.index_kv_pool):
             if pool is None or pool.layer_num == 0:
                 continue
-            if pool.kv_cache_layout != "nhd":
-                pool.move_kv_cache(tgt_loc, src_loc)
-                continue
-            # Sub-pools are built without enable_kv_cache_copy; move natively.
-            move_kv_cache_native(pool.k_buffer, pool.v_buffer, tgt_loc, src_loc)
-            if pool.k_scale_buffer is not None:
-                move_kv_cache_native(
-                    pool.k_scale_buffer, pool.v_scale_buffer, tgt_loc, src_loc
+            _move_kv_rows(
+                pool.k_buffer, pool.v_buffer, tgt_loc, src_loc, pool.page_size
+            )
+            if getattr(pool, "k_scale_buffer", None) is not None:
+                _move_kv_rows(
+                    pool.k_scale_buffer,
+                    pool.v_scale_buffer,
+                    tgt_loc,
+                    src_loc,
+                    pool.page_size,
                 )
         if self.index_k_pool is not None:
-            self.index_k_pool.move_k_cache(tgt_loc, src_loc)
+            _move_kv_rows(
+                self.index_k_pool.k_buffer,
+                None,
+                tgt_loc,
+                src_loc,
+                self.index_k_pool.page_size,
+            )

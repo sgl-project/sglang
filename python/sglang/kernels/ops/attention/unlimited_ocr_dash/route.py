@@ -890,6 +890,87 @@ def prefill_row2req(*, cu_seqlens_q, device, out=None, total_q=None):
     return row2req.contiguous()
 
 
+def _torch_entmax15(x: torch.Tensor) -> torch.Tensor:
+    """1.5-entmax over the last axis (torch twin of the Triton bisection)."""
+    m = x.max(dim=-1, keepdim=True).values
+    y = (x - m) / 2
+    ys, _ = torch.sort(y, dim=-1, descending=True)
+    n = ys.shape[-1]
+    rho = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+    mean = ys.cumsum(-1) / rho
+    mean_sq = (ys * ys).cumsum(-1) / rho
+    ss = rho * (mean_sq - mean * mean)
+    delta = torch.clamp((1 - ss) / rho, min=0)
+    tau = mean - torch.sqrt(delta)
+    support = (tau <= ys).sum(-1, keepdim=True).clamp(min=1)
+    tau_star = tau.gather(-1, support - 1)
+    return torch.clamp(y - tau_star, min=0) ** 2
+
+
+def _launch_entmax_torch(
+    *,
+    rows: int,
+    scores: torch.Tensor,
+    img,
+    has_img: bool,
+    base,
+    out_idx: torch.Tensor,
+    out_bias: torch.Tensor,
+    W: int,
+    idx_scale: float,
+    prior_floor: float,
+    sigma: float,
+    budget: int,
+    M: int,
+    block_w: int,
+    has_win: bool,
+    rel: bool,
+) -> None:
+    """Torch route: entmax over the candidate blocks, top-K, centered bias."""
+    nd = rows
+    dev = scores.device
+    n = min(int(block_w), int(scores.shape[1]))
+    cols = torch.arange(n, device=dev)
+    if has_win:
+        off = base[:nd].to(torch.long)[:, None] + cols[None, :]
+    else:
+        off = cols[None, :].expand(nd, n)
+    score_cols = cols[None, :].expand(nd, n) if rel else off
+    scat = score_cols.clamp(min=0, max=scores.shape[1] - 1)
+
+    valid = (off < W) & (score_cols >= 0) & (score_cols < scores.shape[1])
+    s = scores[:nd].gather(1, scat)
+    s = torch.where(valid, s, torch.full_like(s, SCORE_NEG))
+    cand = s > (SCORE_NEG * 0.5)
+    if has_img and img is not None:
+        imgv = img[:nd].gather(1, off.clamp(min=0, max=img.shape[1] - 1)).to(torch.bool)
+        cand_img = cand & imgv
+        empty = ~cand_img.any(dim=-1, keepdim=True)
+        cand = torch.where(empty, cand, cand_img)
+
+    x = torch.where(cand, s * idx_scale, torch.full_like(s, ENTMAX_NEG))
+    x = torch.nan_to_num(x, nan=ENTMAX_NEG, posinf=ENTMAX_NEG, neginf=ENTMAX_NEG)
+
+    K = max(1, min(int(budget), M, n))
+    M_eff = max(1, min(M, n))
+    xv, xi = x.topk(M_eff, dim=-1)
+    prior = _torch_entmax15(xv)
+    is_cand = cand.gather(1, xi)
+    rank_ok = torch.arange(M_eff, device=dev)[None, :] < K
+    keep = is_cand & rank_ok
+
+    idx = torch.where(keep, off.gather(1, xi), torch.full_like(xi, -1))
+    logp = torch.log(prior.clamp_min(prior_floor))
+    cnt = keep.sum(dim=-1, keepdim=True).clamp(min=1)
+    mu = torch.where(keep, logp, torch.zeros_like(logp)).sum(dim=-1, keepdim=True) / cnt
+    bias = torch.where(keep, (logp - mu) * (1.0 / sigma), torch.zeros_like(logp))
+
+    out_idx[:nd].zero_()
+    out_idx[:nd, :M_eff] = idx.to(out_idx.dtype)
+    out_bias[:nd].zero_()
+    out_bias[:nd, :M_eff] = bias.to(out_bias.dtype)
+
+
 def _launch_entmax(
     *,
     rows: int,
@@ -911,6 +992,29 @@ def _launch_entmax(
     fit_sel: int,
     rel: bool,
 ) -> None:
+    # Ascend times out in the fused entmax launch; run the torch route instead.
+    from sglang.kernels.spec import PlatformInfo
+
+    if PlatformInfo.detect().device_type == "npu":
+        return _launch_entmax_torch(
+            rows=rows,
+            scores=scores,
+            img=img,
+            has_img=has_img,
+            base=base,
+            out_idx=out_idx,
+            out_bias=out_bias,
+            W=W,
+            idx_scale=idx_scale,
+            prior_floor=prior_floor,
+            sigma=sigma,
+            budget=budget,
+            M=M,
+            block_w=block_w,
+            has_win=has_win,
+            rel=rel,
+        )
+
     _entmax_kernel[(rows,)](
         scores,
         img,
@@ -1169,6 +1273,14 @@ def _plan_decode_route(
 ) -> _DecodeRoutePlan:
     M = _check_out_slots(out_slots, topm, out_idx)
     bw_full = triton.next_power_of_2(W)
+    from sglang.kernels.spec import PlatformInfo
+
+    if PlatformInfo.detect().device_type == "npu":
+        # Ascend times out inside the narrow-window entmax launch; keep the
+        # single full-width pass.
+        return _DecodeRoutePlan(
+            M=M, bw_full=bw_full, ent_win=False, tile=0, rel=False, tiled=False
+        )
     ent_win = (
         entmax_base is not None
         and entmax_fit is not None

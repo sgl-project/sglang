@@ -72,6 +72,11 @@ def _unlimited_ocr_v2_overrides(server_args: Any, hf_config: Any) -> dict:
         "decode_attention_backend",
     ):
         current = getattr(cfg, field)
+        if cfg.device == "npu" and current == "ascend":
+            # The NPU platform hook pins every model to "ascend"; DASH cannot
+            # use it, so take the field back instead of failing the launch.
+            overrides[field] = "unlimited_ocr_v2"
+            current = None
         if current not in (None, "unlimited_ocr_v2"):
             raise ValueError(
                 f"--{field.replace('_', '-')}={current!r} cannot serve "

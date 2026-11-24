@@ -121,6 +121,12 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
         Features stay on the item: a retract or a recompute fallback still has
         them, and a miss here costs only time.
         """
+        if device.type == "npu":
+            # Ascend faults in the cross-stream event handshake this prefetch is
+            # built on ("suspect remote error", 507057) and takes the scheduler
+            # down with it. The fallback below already encodes at prefill, and on
+            # a single chip encoding ahead would only compete for the same cores.
+            return
         items = [
             it
             for it in items

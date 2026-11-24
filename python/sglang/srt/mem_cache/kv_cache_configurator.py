@@ -2797,6 +2797,23 @@ class KVCacheConfigurator:
         sparse_cfg = get_unlimited_ocr_v2_sparse_config(self.model_config.hf_config)
         num_layers = int(self.model_config.num_hidden_layers)
         sparse_layer_ids = list(range(num_layers))
+        if current_platform.is_npu:
+            # DASH maps one sparse block to one KV page, which is exactly the
+            # NPU paged pool's layout, and its write path goes through
+            # torch_npu._npu_reshape_and_cache.
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMHATokenToKOnlyPool,
+                NPUMHATokenToKVPool,
+            )
+
+            main_pool_cls, index_k_pool_cls = (
+                NPUMHATokenToKVPool,
+                NPUMHATokenToKOnlyPool,
+            )
+        else:
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool
+
+            main_pool_cls, index_k_pool_cls = MHATokenToKVPool, MHATokenToKOnlyPool
         return UnlimitedOCRV2KVPool(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -2814,6 +2831,8 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            main_pool_cls=main_pool_cls,
+            index_k_pool_cls=index_k_pool_cls,
         )
 
     def _build_hybrid_linear_kv_pool(
@@ -3113,6 +3132,7 @@ class KVCacheConfigurator:
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
+                or is_unlimited_ocr_v2(self.model_config.hf_config)
                 or is_compressed_kv_model
                 or self.hybrid_gdn_config is not None
             ):

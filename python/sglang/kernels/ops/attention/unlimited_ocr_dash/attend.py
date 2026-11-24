@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.unlimited_ocr_dash.common import (
     SPARSE_BLOCK_SIZE,
     _merge_topk_attn_out_kernel,
 )
+from sglang.kernels.spec import PlatformInfo
 
 # Kernels inline log2(e) as 1.4426950409: @triton.jit bodies read only
 # constexpr module globals.
@@ -551,6 +552,119 @@ def _dash_sparse_decode_kernel(
 
 # Wrappers; same signature as the sparse ones plus ``blk_bias``.
 @torch.no_grad()
+def _dash_sparse_attn_prefill_ref(
+    q,
+    k_cache,
+    v_cache,
+    topk_idx,
+    blk_bias,
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    max_query_len: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    output,
+    local_blocks: int,
+    sparse_block_size: int,
+    tile: int = 1024,
+) -> None:
+    """Block-driven DASH prefill for Ascend.
+
+    Queries are processed in tiles; each tile gathers the union of the pages its
+    queries selected plus the local window, so one gather and one matmul cover
+    hundreds of queries that previously ran one program each.
+
+    Everything stays in the ``[H, C, U*bs]`` layout the key matmul produces: the
+    value matmul is then a batch-of-H bmm instead of a batch-of-C*H one, and the
+    selection mask is built as a ``[1, C, U, bs]`` broadcast from a ``[C, U]``
+    scatter. Both matter on Ascend, where an expanded-then-reshaped operand is
+    materialised (16 GB at C=2606) and a 3-D scatter takes milliseconds.
+    """
+    Nq, Hq, D = q.shape
+    H = num_kv_heads
+    # The checkpoint is MHA; the layout below has no separate query-head axis.
+    assert Hq == H, f"NPU DASH prefill needs MHA, got {Hq} q heads / {H} kv heads"
+    bs = sparse_block_size
+    n_loc = local_blocks + 1
+    W = topk_idx.shape[-1]
+    dev = q.device
+    has_bias = blk_bias is not None
+    dt = q.dtype
+    off_bs = torch.arange(bs, device=dev)
+    off_loc = torch.arange(n_loc, device=dev)
+    cu_cpu = cu_seqlens_q.tolist()
+    prefix_cpu = prefix_lens.tolist()
+    idx_all = topk_idx[0]
+    bias_all = blk_bias[0] if has_bias else None
+
+    for r in range(len(cu_cpu) - 1):
+        a0, b0 = int(cu_cpu[r]), int(cu_cpu[r + 1])
+        if b0 <= a0:
+            continue
+        bt = block_table[r]
+        base = prefix_cpu[r]
+        for c0 in range(a0, b0, tile):
+            c1 = min(c0 + tile, b0)
+            C = c1 - c0
+            qp = base + torch.arange(c0 - a0, c1 - a0, device=dev, dtype=torch.long)
+            ls = (qp - local_blocks * bs + 1).clamp(min=0)
+            kv_len = qp + 1
+            qb = qp // bs
+
+            ids = idx_all[c0:c1]
+            valid = ids >= 0
+            safe = ids.clamp(min=0)
+            loc_ids = (qb[:, None] - off_loc[None, :]).clamp(min=0)
+
+            union = torch.unique(torch.cat([safe.flatten(), loc_ids.flatten()]))
+            rem_r = torch.searchsorted(union, safe)
+            rem_l = torch.searchsorted(union, loc_ids)
+            U = union.numel()
+
+            # Selected / local blocks, one entry per (query, block).
+            sel = torch.zeros(C, U, dtype=torch.bool, device=dev)
+            sel.scatter_(1, rem_r, valid)
+            loc = torch.zeros(C, U, dtype=torch.bool, device=dev)
+            loc.scatter_(1, rem_l, True)
+
+            pages = bt.index_select(0, union)
+            k_u = (
+                k_cache.index_select(0, pages).permute(2, 0, 1, 3).reshape(H, U * bs, D)
+            )
+            v_u = (
+                v_cache.index_select(0, pages).permute(2, 0, 1, 3).reshape(H, U * bs, D)
+            )
+
+            qh = q[c0:c1].permute(1, 0, 2).contiguous()
+            lg = torch.bmm(qh, k_u.transpose(1, 2)).float().mul_(sm_scale)  # [H, C, N]
+
+            pos_u = (union[:, None] * bs + off_bs[None, :]).view(1, 1, U, bs)
+            ls4 = ls.view(1, C, 1, 1)
+            kvl4 = kv_len.view(1, C, 1, 1)
+            qp4 = qp.view(1, C, 1, 1)
+            tail = pos_u < kvl4
+            if has_bias:
+                bias_u = torch.zeros(C, U, dtype=torch.float32, device=dev)
+                bias_u.scatter_(1, rem_r, bias_all[c0:c1].float() * valid)
+                lg = lg.view(H, C, U, bs) + bias_u.view(1, C, U, 1)
+            else:
+                lg = lg.view(H, C, U, bs)
+
+            allow = (
+                sel.view(1, C, U, 1) & (pos_u < ls4)
+                | loc.view(1, C, U, 1) & (pos_u >= ls4) & (pos_u <= qp4)
+            ) & tail
+            empty = ~allow.any(dim=-1).any(dim=-1)  # [1, C]
+            lg = lg.masked_fill(~allow, float("-inf"))
+            lg = lg.masked_fill(empty[:, :, None, None], 0.0)
+
+            probs = torch.softmax(lg.view(H, C, U * bs), dim=-1).to(dt)
+            out = torch.bmm(probs, v_u)  # [H, C, D]
+            output[c0:c1].copy_(out.permute(1, 0, 2).to(output.dtype))
+
+
 def dash_sparse_attn(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_cache: torch.Tensor,  # [num_pages, page_size, num_kv_heads, head_dim]
@@ -569,6 +683,24 @@ def dash_sparse_attn(
     sparse_block_size: int = SPARSE_BLOCK_SIZE,
 ) -> None:
     """Bias-aware block-sparse prefill attention. block_size_q == 1."""
+    if PlatformInfo.detect().device_type == "npu":
+        return _dash_sparse_attn_prefill_ref(
+            q,
+            k_cache,
+            v_cache,
+            topk_idx,
+            blk_bias,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            num_kv_heads,
+            sm_scale,
+            output,
+            local_blocks,
+            sparse_block_size,
+        )
     _, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
@@ -735,6 +867,226 @@ def _launch_merge_partials(
     )
 
 
+def _dash_sparse_attn_decode_ref(
+    q,
+    k_cache,
+    v_cache,
+    topk_idx,
+    blk_bias,
+    block_table,
+    seq_lens,
+    num_kv_heads: int,
+    sm_scale: float,
+    output,
+    decode_query_len: int,
+    local_blocks: int,
+    sparse_block_size: int,
+) -> None:
+    """Torch DASH decode; Ascend cannot launch the fused kernel.
+
+    The router expands one index row across KV heads, so a single page gather
+    and one batched matmul cover every head. q/k/v stay in the model dtype (the
+    cube unit accumulates in fp32); only the logits are computed in fp32.
+    """
+    B, Hq, D = q.shape
+    if decode_query_len != 1 or topk_idx.stride(0) != 0:
+        return _dash_sparse_attn_decode_ref_loop(
+            q,
+            k_cache,
+            v_cache,
+            topk_idx,
+            blk_bias,
+            block_table,
+            seq_lens,
+            num_kv_heads,
+            sm_scale,
+            output,
+            decode_query_len,
+            local_blocks,
+            sparse_block_size,
+        )
+
+    dev = q.device
+    R, H, W = B, num_kv_heads, topk_idx.shape[-1]
+    bs = sparse_block_size
+    gqa = Hq // H
+    n_loc = local_blocks + 1
+    n, nl = W * bs, n_loc * bs
+    off_bs = torch.arange(bs, device=dev)
+
+    idx = topk_idx[0]
+    valid = idx >= 0
+    # A captured decode graph replays over a padded batch whose spare rows are
+    # never written by the update kernel. On Ascend an out-of-range index is not
+    # an inert gather but a wild GM address (aivec error 0x800000), so bound both
+    # the block index and the page id it resolves to.
+    safe = idx.clamp(min=0, max=block_table.shape[1] - 1)
+    seq_len = seq_lens[:R].to(torch.long)
+    q_pos = seq_len - 1
+    local_start = (q_pos - local_blocks * bs + 1).clamp(min=0)
+
+    pages = torch.gather(block_table[:R], 1, safe).clamp(
+        min=0, max=k_cache.shape[0] - 1
+    )
+    pos = safe[:, :, None] * bs + off_bs[None, None, :]
+    keep = (
+        valid[:, :, None]
+        & (pos < seq_len[:, None, None])
+        & (pos < local_start[:, None, None])
+    )
+
+    q3 = q.reshape(R * H, gqa, D)
+    k_r = (
+        k_cache.index_select(0, pages.reshape(-1))
+        .reshape(R, W, bs, H, D)
+        .permute(0, 3, 1, 2, 4)
+        .reshape(R, H, n, D)
+    )
+    v_r = (
+        v_cache.index_select(0, pages.reshape(-1))
+        .reshape(R, W, bs, H, D)
+        .permute(0, 3, 1, 2, 4)
+        .reshape(R, H, n, D)
+    )
+    logits = torch.bmm(q3, k_r.reshape(R * H, n, D).transpose(1, 2)).view(R, H, gqa, n)
+    logits = logits.to(torch.float32) * sm_scale
+    if blk_bias is not None:
+        logits = logits + blk_bias[0].to(torch.float32)[
+            :, None, None, :
+        ].repeat_interleave(bs, dim=-1)
+    logits = logits.masked_fill(~keep.reshape(R, 1, 1, n), float("-inf"))
+
+    q_blk = q_pos // bs
+    lbs = q_blk[:, None] - torch.arange(n_loc, device=dev)[None, :]
+    loc_ok = lbs >= 0
+    safe_l = lbs.clamp(min=0)
+    pages_l = torch.gather(block_table[:R], 1, safe_l).clamp(
+        min=0, max=k_cache.shape[0] - 1
+    )
+    pos_l = safe_l[:, :, None] * bs + off_bs[None, None, :]
+    keep_l = (
+        loc_ok[:, :, None]
+        & (pos_l >= local_start[:, None, None])
+        & (pos_l <= q_pos[:, None, None])
+        & (pos_l < seq_len[:, None, None])
+    )
+    k_l = (
+        k_cache.index_select(0, pages_l.reshape(-1))
+        .reshape(R, n_loc, bs, H, D)
+        .permute(0, 3, 1, 2, 4)
+        .reshape(R, H, nl, D)
+    )
+    v_l = (
+        v_cache.index_select(0, pages_l.reshape(-1))
+        .reshape(R, n_loc, bs, H, D)
+        .permute(0, 3, 1, 2, 4)
+        .reshape(R, H, nl, D)
+    )
+    logits_l = torch.bmm(q3, k_l.reshape(R * H, nl, D).transpose(1, 2)).view(
+        R, H, gqa, nl
+    )
+    logits_l = logits_l.to(torch.float32) * sm_scale
+    logits_l = logits_l.masked_fill(~keep_l.reshape(R, 1, 1, nl), float("-inf"))
+
+    lg = torch.cat([logits, logits_l], dim=-1)
+    vals = torch.cat([v_r, v_l], dim=2)
+    # Padded batch rows have no valid key at all; an all -inf row makes softmax
+    # emit NaN, which faults the Ascend vector core instead of staying inert.
+    empty = ~(keep.reshape(R, -1).any(dim=1) | keep_l.reshape(R, -1).any(dim=1))
+    if lg.shape[0] == empty.shape[0]:
+        lg = lg.masked_fill(empty[:, None, None, None], 0.0)
+    probs = torch.softmax(lg, dim=-1)
+    out = torch.bmm(
+        probs.view(R * H, gqa, n + nl).to(vals.dtype),
+        vals.reshape(R * H, n + nl, D),
+    )
+    output.copy_(out.view(B, Hq, D).to(output.dtype))
+
+
+def _dash_sparse_attn_decode_ref_loop(
+    q,
+    k_cache,
+    v_cache,
+    topk_idx,
+    blk_bias,
+    block_table,
+    seq_lens,
+    num_kv_heads: int,
+    sm_scale: float,
+    output,
+    decode_query_len: int,
+    local_blocks: int,
+    sparse_block_size: int,
+) -> None:
+    """Torch reference for DASH decode; Ascend cannot launch the fused kernel.
+
+    Gathers the selected pages first and upcasts only those slices: converting the
+    whole paged pool per layer would dominate the step.
+    """
+    total_q, num_heads, head_dim = q.shape
+    gqa = num_heads // num_kv_heads
+    bs = sparse_block_size
+    has_bias = blk_bias is not None
+    off_bs = torch.arange(bs, device=q.device)
+    off_local = torch.arange(local_blocks + 1, device=q.device)
+    seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+
+    for r, seq_len in enumerate(seq_lens_cpu):
+        base = r * decode_query_len
+        q_pos = seq_len - decode_query_len
+        kv_len = q_pos + 1
+        local_start = max(0, q_pos - local_blocks * bs + 1)
+        q_blk = q_pos // bs
+
+        lbs = q_blk - off_local
+        lbs = lbs[lbs >= 0]
+        local_pages = block_table[r].index_select(0, lbs)
+        local_pos = lbs[:, None] * bs + off_bs[None, :]
+        local_keep = (
+            (local_pos >= local_start) & (local_pos <= q_pos) & (local_pos < kv_len)
+        )
+
+        for kh in range(num_kv_heads):
+            h0 = kh * gqa
+            q_h = q[base : base + decode_query_len, h0 : h0 + gqa].to(torch.float32)
+            logits = []
+            vals = []
+
+            idx = topk_idx[kh, base : base + decode_query_len][0]
+            idx_v = idx[idx >= 0]
+            if idx_v.numel():
+                pages = block_table[r].index_select(0, idx_v)
+                k_all = k_cache.index_select(0, pages)[:, :, kh, :].to(torch.float32)
+                v_all = v_cache.index_select(0, pages)[:, :, kh, :].to(torch.float32)
+                pos = idx_v[:, None] * bs + off_bs[None, :]
+                keep = (pos < kv_len) & (pos < local_start)
+                lg = torch.einsum("qhd,nkd->qhnk", q_h, k_all) * sm_scale
+                if has_bias:
+                    lg = (
+                        lg
+                        + blk_bias[kh, base : base + decode_query_len][0][idx >= 0].to(
+                            torch.float32
+                        )[None, None, :, None]
+                    )
+                lg = lg.masked_fill(~keep[None, None], float("-inf"))
+                logits.append(lg.reshape(lg.shape[0], lg.shape[1], -1))
+                vals.append(v_all.reshape(-1, k_all.shape[-1]))
+
+            k_loc = k_cache.index_select(0, local_pages)[:, :, kh, :].to(torch.float32)
+            v_loc = v_cache.index_select(0, local_pages)[:, :, kh, :].to(torch.float32)
+            lg = torch.einsum("qhd,nkd->qhnk", q_h, k_loc) * sm_scale
+            lg = lg.masked_fill(~local_keep[None, None], float("-inf"))
+            logits.append(lg.reshape(lg.shape[0], lg.shape[1], -1))
+            vals.append(v_loc.reshape(-1, k_loc.shape[-1]))
+
+            lg = torch.cat(logits, dim=-1)
+            vv = torch.cat(vals, dim=0)
+            out_h = torch.softmax(lg, dim=-1) @ vv
+            output[base : base + decode_query_len, h0 : h0 + gqa] = out_h.to(
+                output.dtype
+            )
+
+
 @torch.no_grad()
 def dash_sparse_attn_decode(
     q: torch.Tensor,
@@ -760,6 +1112,22 @@ def dash_sparse_attn_decode(
     """
     total_q, num_heads, head_dim = q.shape
     assert total_q == seq_lens.shape[0] * decode_query_len
+    if PlatformInfo.detect().device_type == "npu":
+        return _dash_sparse_attn_decode_ref(
+            q,
+            k_cache,
+            v_cache,
+            topk_idx,
+            blk_bias,
+            block_table,
+            seq_lens,
+            num_kv_heads,
+            sm_scale,
+            output,
+            decode_query_len,
+            local_blocks,
+            sparse_block_size,
+        )
     use_pdl = current_arch().supports_pdl
     bias_t, b_strides = _bias_operand(blk_bias, topk_idx)
     cw = topk_idx.shape[-1] if chunk_width is None else int(chunk_width)
