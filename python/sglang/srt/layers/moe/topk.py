@@ -49,17 +49,21 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
     topk_ids_logical_to_physical_and_record,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric, is_dp_max_padding
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
+from sglang.srt.layers.moe.ep_remap import (
+    EpRemapPolicy,
+    prepare_biased_topk_ep_kwargs,
+    prepare_softmax_topk_ep_kwargs,
+    resolve_ep_remap_policy,
+)
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     RoutingMethodType,
-    get_moe_runner_backend,
     has_per_rank_fused_shared_slots,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
@@ -285,6 +289,7 @@ class TopKConfig:
     allow_routed_experts_capture: bool = True
     # Lazy materialization still needs the producer's solver and capture slot.
     layer_id: Optional[int] = None
+    ep_remap_policy: Optional[EpRemapPolicy] = None
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -761,6 +766,17 @@ class TopK(BaseFusedOp):
             allow_routed_experts_capture=allow_routed_experts_capture
             and not self.is_draft,
         )
+        if (
+            self.topk_config.output_format == TopKOutputFormat.STANDARD
+            and custom_routing_function is None
+        ):
+            self.topk_config.ep_remap_policy = resolve_ep_remap_policy(
+                topk_config=self.topk_config,
+                is_cuda=_is_cuda,
+                use_aiter=_use_aiter,
+                is_xpu=_is_xpu,
+                is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+            )
 
     def routing_inputs(self):
         return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
@@ -796,6 +812,17 @@ class TopK(BaseFusedOp):
             runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
         )
         if self.topk_config.output_format is not None:
+            if (
+                self.topk_config.output_format == TopKOutputFormat.STANDARD
+                and self.topk_config.custom_routing_function is None
+            ):
+                self.topk_config.ep_remap_policy = resolve_ep_remap_policy(
+                    topk_config=self.topk_config,
+                    is_cuda=_is_cuda,
+                    use_aiter=_use_aiter,
+                    is_xpu=_is_xpu,
+                    is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+                )
             return
         if runner_backend is not None and (
             runner_backend.is_flashinfer_trtllm()
@@ -812,6 +839,17 @@ class TopK(BaseFusedOp):
         else:
             output_format = TopKOutputFormat.STANDARD
         self.topk_config.output_format = output_format
+        if (
+            output_format == TopKOutputFormat.STANDARD
+            and self.topk_config.custom_routing_function is None
+        ):
+            self.topk_config.ep_remap_policy = resolve_ep_remap_policy(
+                topk_config=self.topk_config,
+                is_cuda=_is_cuda,
+                use_aiter=_use_aiter,
+                is_xpu=_is_xpu,
+                is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+            )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         if self.enable_waterfill and self.waterfill_balancer is None:
@@ -2884,83 +2922,6 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights, recorder_topk_ids
 
 
-def _can_fuse_ep_local_expert_remap(
-    topk_config: TopKConfig,
-    num_routed_experts: int,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
-    routing_overridden: bool,
-) -> bool:
-    if envs.SGLANG_DISABLE_FUSED_EP_REMAP.get():
-        return False
-    if not _is_cuda or _use_aiter:
-        return False
-    parallel = get_parallel()
-    if parallel.moe_ep_size <= 1:
-        return False
-    # DWDP replicates full experts after load and collapses FusedMoE.moe_ep_size=1.
-    if getattr(parallel, "dwdp_size", 1) > 1:
-        return False
-    if num_routed_experts <= 0 or num_routed_experts % parallel.moe_ep_size != 0:
-        return False
-    if topk_config.shared_experts.use_waterfill:
-        return False
-    if get_exec().moe.ep_join_mode == "scale":
-        return False
-    if not get_moe_a2a_backend().is_none():
-        return False
-    # Lazy import: standard.py imports topk.py at module load time.
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        _MASK_DP_PAD_MOE,
-        _keeps_global_expert_ids,
-    )
-
-    runner_backend = topk_config.runner_backend or get_moe_runner_backend()
-    if _keeps_global_expert_ids(runner_backend):
-        return False
-    if should_use_flashinfer_cutlass_moe_fp4_allgather():
-        return False
-    if _MASK_DP_PAD_MOE and is_dp_max_padding():
-        return False
-    if expert_location_dispatch_info is not None or is_expert_remapping_enabled():
-        return False
-    if routing_overridden:
-        return False
-    if has_per_rank_fused_shared_slots(topk_config.num_shared_topk_slots):
-        return False
-    if (
-        topk_config.num_shared_topk_slots > 0
-        and topk_config.fused_shared_experts_scaling_factor is not None
-    ):
-        return False
-    if (
-        topk_config.allow_routed_experts_capture
-        and get_global_experts_capturer() is not None
-    ):
-        return False
-    recorder = get_global_expert_distribution_recorder()
-    if getattr(recorder, "recording", False):
-        return False
-    if (
-        hasattr(recorder, "get_current_pass_count_buffer")
-        and recorder.get_current_pass_count_buffer() is not None
-    ):
-        return False
-    return True
-
-
-def _build_ep_remap_kwargs(num_routed_experts: int) -> dict:
-    parallel = get_parallel()
-    ep_size = parallel.moe_ep_size
-    ep_rank = parallel.moe_ep_rank
-    if envs.SGLANG_EP_INTERLEAVED_EXPERTS.get():
-        return {"ep_interleaved_size": ep_size, "ep_rank": ep_rank}
-    num_local_routed = num_routed_experts // ep_size
-    return {
-        "ep_start": ep_rank * num_local_routed,
-        "ep_end": (ep_rank + 1) * num_local_routed,
-    }
-
-
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -2997,6 +2958,13 @@ def select_experts(
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
     ep_local_remapped = False
+    ep_policy = topk_config.ep_remap_policy or resolve_ep_remap_policy(
+        topk_config=topk_config,
+        is_cuda=_is_cuda,
+        use_aiter=_use_aiter,
+        is_xpu=_is_xpu,
+        is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+    )
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -3162,40 +3130,21 @@ def select_experts(
                 ):
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_shared_topk_slots
-            if (
-                _is_cuda
-                and not _use_aiter
-                and not _is_xpu
-                and packed_topk is None
-                and router_logits_partials is None
-                and not envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
-            ):
-                uses_native_radix = False
-                if (
-                    scoring_func == "sigmoid"
-                    and correction_bias is not None
-                    and num_shared_topk_slots_for_gate == 0
-                ):
-                    from sglang.kernels.ops.moe import moe_route_radix
-
-                    uses_native_radix = correction_bias.stride(
-                        0
-                    ) == 1 and moe_route_radix.covered(
-                        router_logits, correction_bias, top_k_for_gate
-                    )
-                if not uses_native_radix:
-                    if num_token_non_padded is not None:
-                        _packed_kwargs["mask_padded_rows"] = True
-                    if _can_fuse_ep_local_expert_remap(
-                        topk_config,
-                        router_logits.shape[1],
-                        expert_location_dispatch_info,
-                        routing_overridden,
-                    ):
-                        _packed_kwargs.update(
-                            _build_ep_remap_kwargs(router_logits.shape[1])
-                        )
-                        ep_local_remapped = True
+            ep_kwargs, ep_local_remapped = prepare_biased_topk_ep_kwargs(
+                policy=ep_policy,
+                topk_config=topk_config,
+                router_logits=router_logits,
+                correction_bias=correction_bias,
+                scoring_func=scoring_func,
+                top_k_for_gate=top_k_for_gate,
+                num_shared_topk_slots_for_gate=num_shared_topk_slots_for_gate,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                routing_overridden=routing_overridden,
+                packed_topk=packed_topk,
+                router_logits_partials=router_logits_partials,
+            )
+            _packed_kwargs.update(ep_kwargs)
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -3266,25 +3215,19 @@ def select_experts(
                     packed_out=packed_topk,
                     num_token_non_padded=num_token_non_padded,
                 )
-            elif (
-                _is_cuda
-                and not _use_aiter
-                and scoring_func == "softmax"
-                and not envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
-            ):
-                if num_token_non_padded is not None:
-                    _fused_topk_kwargs["num_token_non_padded"] = num_token_non_padded
-                    padded_rows_masked = True
-                if _can_fuse_ep_local_expert_remap(
-                    topk_config,
-                    router_logits.shape[1],
-                    expert_location_dispatch_info,
-                    routing_overridden,
-                ):
-                    _fused_topk_kwargs.update(
-                        _build_ep_remap_kwargs(router_logits.shape[1])
+            else:
+                ep_kwargs, padded_rows_masked, ep_local_remapped = (
+                    prepare_softmax_topk_ep_kwargs(
+                        policy=ep_policy,
+                        topk_config=topk_config,
+                        num_routed_experts=router_logits.shape[1],
+                        scoring_func=scoring_func,
+                        num_token_non_padded=num_token_non_padded,
+                        expert_location_dispatch_info=expert_location_dispatch_info,
+                        routing_overridden=routing_overridden,
                     )
-                    ep_local_remapped = True
+                )
+                _fused_topk_kwargs.update(ep_kwargs)
             # ===== END TO BE REFACTORED ====
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,

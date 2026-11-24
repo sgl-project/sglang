@@ -395,6 +395,7 @@ def moe_fused_gate(
     # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
     # kernel at [1..8192, 896] top-16 on B200.
     if (
+        # Bypass radix fast path when EP remap is requested; radix outputs global IDs only.
         not has_ep_remap
         and scoring_func == "sigmoid"
         and num_fused_shared_experts == 0
@@ -420,6 +421,7 @@ def moe_fused_gate(
     # One-warp-per-token CUDA router: same selection, order and padding contract
     # as the Triton kernel below.
     if (
+        # Bypass warp fast path when EP remap is requested; warp outputs global IDs only.
         not has_ep_remap
         and moe_softcapping == 0.0
         and moe_route_warp.covered(

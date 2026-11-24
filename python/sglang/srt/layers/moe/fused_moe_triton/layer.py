@@ -379,6 +379,7 @@ class FusedMoE(torch.nn.Module):
     scheme = None
 
     _skip_aiter_moe_shuffle: bool = False
+    _interleaved_experts: bool = False
 
     def __init__(
         self,
@@ -438,6 +439,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.moe_ep_size = get_parallel().moe_ep_size
         self.moe_ep_rank = get_parallel().moe_ep_rank
+        self._interleaved_experts = envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
         self.moe_tp_size = get_parallel().moe_tp_size
         self.moe_tp_rank = get_parallel().moe_tp_rank
 
@@ -728,7 +730,6 @@ class FusedMoE(torch.nn.Module):
         self.dispatcher.num_local_experts = self.num_local_experts
         self.dispatcher.num_local_routed_experts = self._num_local_routed
         self.dispatcher.local_expert_mapping = None
-        self.dispatcher._owns_default_local_mapping = False
         self.dispatcher.expert_mask_gpu = None
 
         for name, tensor in weights.items():
@@ -1213,7 +1214,7 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        if envs.SGLANG_EP_INTERLEAVED_EXPERTS.get() and self.moe_ep_size > 1:
+        if self._interleaved_experts and self.moe_ep_size > 1:
             if 0 <= expert_id < self._num_global_routed:
                 if expert_id % self.moe_ep_size == self._expert_storage_rank:
                     return expert_id // self.moe_ep_size
@@ -1231,7 +1232,7 @@ class FusedMoE(torch.nn.Module):
             return -1
 
     def _local_routed_expert_ids(self, physical_expert_ids: List[int]) -> List[int]:
-        if envs.SGLANG_EP_INTERLEAVED_EXPERTS.get() and self.moe_ep_size > 1:
+        if self._interleaved_experts and self.moe_ep_size > 1:
             return [
                 i
                 for i in physical_expert_ids
@@ -1694,7 +1695,7 @@ class FusedMoE(torch.nn.Module):
         expert_data = param.data
         is_bias = expert_data.dim() == 2
         if (
-            envs.SGLANG_EP_INTERLEAVED_EXPERTS.get()
+            self._interleaved_experts
             and self.moe_ep_size > 1
             and loaded_weight.dim() >= 1
             and loaded_weight.shape[0] == self.num_experts

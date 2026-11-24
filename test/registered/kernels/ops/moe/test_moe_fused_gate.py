@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import sys
-from typing import Tuple
+import unittest.mock
+from typing import Optional, Tuple
 
 import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.moe import moe_fused_gate as moe_fused_gate_mod
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cuda"
 
@@ -597,6 +599,258 @@ def test_moe_fused_gate_accepts_non_fp32_bias(
         rtol=0,
         atol=0,
     )
+
+
+def _reference_unfused_ep_gate(
+    scores: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    topk: int,
+    *,
+    scoring_func: str,
+    renormalize: bool = True,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    ep_size: int = 2,
+    ep_rank: int = 0,
+    interleaved: bool = False,
+):
+    with unittest.mock.patch.object(
+        moe_fused_gate_mod.moe_route_warp, "covered", return_value=False
+    ):
+        w_ref, ids_ref = moe_fused_gate(
+            scores,
+            bias,
+            topk,
+            scoring_func=scoring_func,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            num_token_non_padded=None,
+        )
+    m_rows, num_experts = scores.shape
+    if num_token_non_padded is not None and m_rows > 0:
+        rows = torch.arange(m_rows, device=scores.device)[:, None]
+        pad_mask = rows >= num_token_non_padded
+        w_ref = torch.where(pad_mask, torch.zeros_like(w_ref), w_ref)
+        ids_ref = torch.where(pad_mask, -1, ids_ref)
+
+    num_local_routed = num_experts // ep_size
+    mapping = torch.full(
+        (num_experts + num_fused_shared_experts,),
+        -1,
+        dtype=torch.int32,
+        device=scores.device,
+    )
+    if interleaved:
+        mapping[ep_rank:num_experts:ep_size] = torch.arange(
+            num_local_routed, dtype=torch.int32, device=scores.device
+        )
+    else:
+        mapping[ep_rank * num_local_routed : (ep_rank + 1) * num_local_routed] = (
+            torch.arange(num_local_routed, dtype=torch.int32, device=scores.device)
+        )
+    if num_fused_shared_experts > 0:
+        mapping[num_experts:] = torch.arange(
+            num_local_routed,
+            num_local_routed + num_fused_shared_experts,
+            dtype=torch.int32,
+            device=scores.device,
+        )
+    ids_mapped = torch.where(ids_ref < 0, -1, mapping[ids_ref.clamp_min(0)])
+    return w_ref, ids_mapped
+
+
+@pytest.mark.parametrize("m_rows", [0, 1, 7, 48, 64, 1025])
+@pytest.mark.parametrize("ep_size", [2, 4])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_moe_fused_gate_ep_remap_boundary_tokens_and_padding(
+    m_rows: int, ep_size: int, interleaved: bool
+) -> None:
+    torch.manual_seed(42 + m_rows + ep_size)
+    num_experts, topk = 128, 8
+    scores = torch.randn((m_rows, num_experts), dtype=torch.bfloat16, device=DEVICE)
+
+    non_padded_options = [None, 0, 1]
+    if m_rows >= 2:
+        non_padded_options.append(m_rows // 2)
+    if m_rows >= 1:
+        non_padded_options.append(m_rows)
+
+    for non_padded_val in non_padded_options:
+        num_non_padded = (
+            None
+            if non_padded_val is None
+            else torch.tensor([non_padded_val], dtype=torch.int32, device=DEVICE)
+        )
+        for ep_rank in range(ep_size):
+            w_ref, ids_ref = _reference_unfused_ep_gate(
+                scores,
+                None,
+                topk,
+                scoring_func="softmax",
+                num_token_non_padded=num_non_padded,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                interleaved=interleaved,
+            )
+            kwargs = (
+                {"ep_interleaved_size": ep_size, "ep_rank": ep_rank}
+                if interleaved
+                else {
+                    "ep_start": ep_rank * (num_experts // ep_size),
+                    "ep_end": (ep_rank + 1) * (num_experts // ep_size),
+                }
+            )
+            w_fused, ids_fused = moe_fused_gate(
+                scores,
+                None,
+                topk,
+                scoring_func="softmax",
+                renormalize=True,
+                num_token_non_padded=num_non_padded,
+                **kwargs,
+            )
+            assert torch.equal(ids_ref, ids_fused)
+            assert torch.allclose(w_ref, w_fused, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "num_experts,topk,shared,scoring,bias_dtype,n_group,topk_group,apply_scale,ep_size",
+    [
+        (128, 8, 0, "softmax", None, 1, 1, False, 2),
+        (128, 8, 0, "softmax", None, 1, 1, True, 4),
+        (384, 8, 0, "sigmoid", torch.bfloat16, 1, 1, False, 2),
+        (384, 8, 0, "sigmoid", torch.float32, 1, 1, True, 4),
+        (256, 9, 1, "sqrtsoftplus", torch.bfloat16, 1, 1, False, 2),
+        (256, 9, 1, "softmax", None, 1, 1, True, 4),
+        (256, 8, 0, "sigmoid", torch.float32, 8, 4, True, 4),
+    ],
+)
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_moe_fused_gate_ep_remap_topologies_and_scoring_funcs(
+    num_experts: int,
+    topk: int,
+    shared: int,
+    scoring: str,
+    bias_dtype: Optional[torch.dtype],
+    n_group: int,
+    topk_group: int,
+    apply_scale: bool,
+    ep_size: int,
+    interleaved: bool,
+) -> None:
+    torch.manual_seed(123)
+    m_rows = 37
+    scores = torch.randn((m_rows, num_experts), dtype=torch.bfloat16, device=DEVICE)
+    bias = (
+        None
+        if bias_dtype is None
+        else torch.randn((num_experts,), dtype=bias_dtype, device=DEVICE) * 0.1
+    )
+    num_non_padded = torch.tensor([23], dtype=torch.int32, device=DEVICE)
+    scale = 2.5
+
+    for ep_rank in (0, ep_size - 1):
+        w_ref, ids_ref = _reference_unfused_ep_gate(
+            scores,
+            bias,
+            topk,
+            scoring_func=scoring,
+            renormalize=True,
+            num_fused_shared_experts=shared,
+            routed_scaling_factor=scale,
+            apply_routed_scaling_factor_on_output=apply_scale,
+            num_expert_group=n_group,
+            topk_group=topk_group,
+            num_token_non_padded=num_non_padded,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            interleaved=interleaved,
+        )
+        kwargs = (
+            {"ep_interleaved_size": ep_size, "ep_rank": ep_rank}
+            if interleaved
+            else {
+                "ep_start": ep_rank * (num_experts // ep_size),
+                "ep_end": (ep_rank + 1) * (num_experts // ep_size),
+            }
+        )
+        w_fused, ids_fused = moe_fused_gate(
+            scores,
+            bias,
+            topk,
+            scoring_func=scoring,
+            num_fused_shared_experts=shared,
+            renormalize=True,
+            routed_scaling_factor=scale,
+            apply_routed_scaling_factor_on_output=apply_scale,
+            num_expert_group=n_group,
+            topk_group=topk_group,
+            num_token_non_padded=num_non_padded,
+            **kwargs,
+        )
+        assert torch.equal(ids_ref, ids_fused)
+        assert torch.allclose(w_ref, w_fused, atol=1e-6, rtol=1e-5)
+
+
+def test_moe_fused_gate_ep_remap_offset_strided_and_warp_bypass() -> None:
+    torch.manual_seed(7)
+    buf = torch.randn((160, 256), dtype=torch.bfloat16, device=DEVICE)
+    offset_scores = buf[16:80, :128]
+    strided_scores = buf[16:80, ::2]
+    num_non_padded = torch.tensor([41], dtype=torch.int32, device=DEVICE)
+
+    for view in (offset_scores, strided_scores):
+        for ep_rank in (0, 1):
+            w_ref, ids_ref = _reference_unfused_ep_gate(
+                view,
+                None,
+                8,
+                scoring_func="softmax",
+                num_token_non_padded=num_non_padded,
+                ep_size=2,
+                ep_rank=ep_rank,
+            )
+            w_view, ids_view = moe_fused_gate(
+                view,
+                None,
+                8,
+                scoring_func="softmax",
+                num_token_non_padded=num_non_padded,
+                ep_start=ep_rank * 64,
+                ep_end=(ep_rank + 1) * 64,
+            )
+            assert torch.equal(ids_ref, ids_view)
+            assert torch.allclose(w_ref, w_view, atol=1e-6, rtol=1e-5)
+
+    # Verify EP remap bypasses moe_route_warp cleanly even on warp-covered shapes.
+    warp_scores = torch.randn((8, 128), dtype=torch.bfloat16, device=DEVICE)
+    w_warp_bypass, ids_warp_bypass = moe_fused_gate(
+        warp_scores,
+        None,
+        8,
+        scoring_func="softmax",
+        renormalize=True,
+        ep_start=64,
+        ep_end=128,
+    )
+    w_warp_ref, ids_warp_ref = _reference_unfused_ep_gate(
+        warp_scores,
+        None,
+        8,
+        scoring_func="softmax",
+        ep_size=2,
+        ep_rank=1,
+    )
+    assert torch.equal(ids_warp_bypass, ids_warp_ref)
+    assert torch.allclose(w_warp_bypass, w_warp_ref, atol=1e-6, rtol=1e-5)
 
 
 if __name__ == "__main__":

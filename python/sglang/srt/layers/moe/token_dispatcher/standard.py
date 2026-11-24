@@ -104,7 +104,6 @@ def _map_topk_ids_to_local_experts_kernel(
     NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Map global expert IDs [0, NUM_EXPERTS) through mapping_ptr; preserve -1."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < numel
@@ -115,14 +114,22 @@ def _map_topk_ids_to_local_experts_kernel(
 
 
 def _map_topk_ids_to_local_experts(
-    topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
+    topk_ids: torch.Tensor,
+    local_expert_mapping: torch.Tensor,
+    *,
+    use_triton: Optional[bool] = None,
 ) -> torch.Tensor:
     """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    allow_triton = (
+        not _envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
+        if use_triton is None
+        else use_triton
+    )
     if (
         topk_ids.is_cuda
         and topk_ids.is_contiguous()
         and local_expert_mapping.is_contiguous()
-        and not _envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
+        and allow_triton
     ):
         numel = topk_ids.numel()
         out = torch.empty_like(topk_ids)
@@ -130,10 +137,10 @@ def _map_topk_ids_to_local_experts(
             BLOCK_SIZE = 256
             grid = (triton.cdiv(numel, BLOCK_SIZE),)
             _map_topk_ids_to_local_experts_kernel[grid](
-                topk_ids,
-                local_expert_mapping,
-                out,
-                numel,
+                topk_ids_ptr=topk_ids,
+                mapping_ptr=local_expert_mapping,
+                out_ptr=out,
+                numel=numel,
                 NUM_EXPERTS=local_expert_mapping.numel(),
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=1,
@@ -194,11 +201,15 @@ class StandardDispatcher(BaseDispatcher):
             self.num_local_experts - self.num_local_shared_experts
         )
         self.moe_ep_rank = get_parallel().moe_ep_rank
+        self._disable_fused_ep_remap = _envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
+        self._interleaved_experts = _envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
         self.local_expert_mapping = None
-        self._owns_default_local_mapping = False
+        self._default_local_expert_mapping: Optional[torch.Tensor] = None
         self.expert_mask_gpu = None
 
     def _ensure_local_expert_mapping(self) -> None:
+        if self.local_expert_mapping is None:
+            self._default_local_expert_mapping = None
         if (
             self.moe_ep_size <= 1
             or self.skip_local_expert_mapping
@@ -207,7 +218,7 @@ class StandardDispatcher(BaseDispatcher):
             return
         device = get_device()
         mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)
-        if _envs.SGLANG_EP_INTERLEAVED_EXPERTS.get():
+        if self._interleaved_experts:
             mapping[
                 self.moe_ep_rank : self.num_local_routed_experts
                 * self.moe_ep_size : self.moe_ep_size
@@ -236,8 +247,8 @@ class StandardDispatcher(BaseDispatcher):
                 dtype=torch.int32,
                 device=device,
             )
+        self._default_local_expert_mapping = mapping
         self.local_expert_mapping = mapping
-        self._owns_default_local_mapping = True
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -311,8 +322,9 @@ class StandardDispatcher(BaseDispatcher):
         if TopKOutputChecker.format_is_standard(topk_output):
             self._ensure_local_expert_mapping()
 
-        has_custom_mapping = self.local_expert_mapping is not None and not getattr(
-            self, "_owns_default_local_mapping", False
+        has_custom_mapping = (
+            self.local_expert_mapping is not None
+            and self.local_expert_mapping is not self._default_local_expert_mapping
         )
         if (
             isinstance(topk_output, StandardTopKOutputLocalMapped)
@@ -341,7 +353,9 @@ class StandardDispatcher(BaseDispatcher):
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
                     topk_ids_local = _map_topk_ids_to_local_experts(
-                        topk_output.topk_ids, self.local_expert_mapping
+                        topk_ids=topk_output.topk_ids,
+                        local_expert_mapping=self.local_expert_mapping,
+                        use_triton=not self._disable_fused_ep_remap,
                     )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
