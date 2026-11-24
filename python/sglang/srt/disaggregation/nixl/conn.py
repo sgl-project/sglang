@@ -1729,7 +1729,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self.note_send_finished(room, kv_chunk.send_record)
-                    self._staging_outstanding.pop(room, None)
+                    self._pop_staging_outstanding(room)
                     if self.enable_deferred_decode_kv_release:
                         # clear() keeps the target while a chunk is counted.
                         self._maybe_ack_drained_abort(room)
@@ -1740,7 +1740,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the predicate the abort ack relies on. The flag survives
                 # re-enqueue on defer.
                 if not kv_chunk.staging_counted:
-                    self._staging_outstanding[room] += 1
+                    self._add_staging_outstanding(room, 1)
                     kv_chunk.staging_counted = True
 
                 # Same wait as mooncake's worker: before reading source KV, skipped
@@ -1768,7 +1768,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.indices_event = None
                 if self.check_status(room) == KVPoll.Failed:
                     self.note_send_finished(room, kv_chunk.send_record)
-                    self._staging_outstanding.pop(room, None)
+                    self._pop_staging_outstanding(room)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(room)
@@ -1785,7 +1785,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self.note_send_finished(room, kv_chunk.send_record)
-                    self._staging_outstanding.pop(room, None)
+                    self._pop_staging_outstanding(room)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
                     continue
@@ -2071,7 +2071,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # flag, so a raise after this point must not uncount twice.
                 self.note_send_finished(room, kv_chunk.send_record)
                 kv_chunk.staging_counted = False
-                self._staging_outstanding[room] -= 1
+                self._add_staging_outstanding(room, -1)
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
                     # was aborted and nothing else is outstanding.
@@ -2090,7 +2090,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(room) == KVPoll.Failed
                     )
                 ):
-                    self._staging_outstanding.pop(room, None)
+                    self._pop_staging_outstanding(room)
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
@@ -2130,7 +2130,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # the room's abort ack could never fire.
                     if kv_chunk.staging_counted:
                         kv_chunk.staging_counted = False
-                        self._staging_outstanding[room] -= 1
+                        self._add_staging_outstanding(room, -1)
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
                 else:

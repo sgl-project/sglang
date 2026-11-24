@@ -25,7 +25,6 @@ from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.common.conn import (  # noqa: E402
     CommonKVManager,
     _pp_held_key,
-    _PPStagingOutstanding,
 )
 from sglang.srt.disaggregation.pp_consensus_store import (  # noqa: E402
     PPConsensusStore,
@@ -283,18 +282,27 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
                     self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
                     self.assertEqual(stage.streamed, [("x", "error")])
 
+    @staticmethod
+    def _count_staging(mgr):
+        """Give a stage's manager the real staging counts and their PP sync."""
+        mgr.defer_decode_allocation = False
+        mgr._staging_outstanding = {}
+        mgr._staging_lock = threading.Lock()
+        for name in (
+            "staging_holds_success",
+            "_add_staging_outstanding",
+            "_pop_staging_outstanding",
+            "_sync_staging_held",
+        ):
+            setattr(mgr, name, partial(getattr(CommonKVManager, name), mgr))
+
     def test_success_waits_for_staging_chunks_on_every_stage(self):
         # A stage holds Success while its staging chunks are outstanding; PP0
         # must see PP1's hold through the store.
         for stage in (self.pp0, self.pp1):
-            mgr = stage.kv_mgr
-            mgr.defer_decode_allocation = False
-            mgr.staging_holds_success = partial(
-                CommonKVManager.staging_holds_success, mgr
-            )
-            mgr._staging_outstanding = _PPStagingOutstanding(mgr)
+            self._count_staging(stage.kv_mgr)
         self._both("x", 40)
-        self.pp1.kv_mgr._staging_outstanding[40] += 1
+        self.pp1.kv_mgr._add_staging_outstanding(40, 1)
         self.pp0.store[40] = KVPoll.Success
         self.pp1.store[40] = KVPoll.Success
         self._replicated(40, [KVPoll.Success, KVPoll.Success])
@@ -303,29 +311,32 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
         for stage in (self.pp0, self.pp1):
             self.assertEqual(len(stage.disagg_prefill_transfer_queue), 1)
 
-        self.pp1.kv_mgr._staging_outstanding[40] -= 1
+        self.pp1.kv_mgr._add_staging_outstanding(40, -1)
         self._replicated(_pp_held_key(40), [None, 0])
         self._iterate()
         for stage in (self.pp0, self.pp1):
             self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
             self.assertEqual([rid for rid, _ in stage.streamed], ["x"])
 
-    def test_every_staging_counter_mutator_syncs_the_held_flag(self):
+    def test_every_staging_count_change_syncs_the_held_flag(self):
         mgr = self.pp1.kv_mgr
-        mgr.defer_decode_allocation = False
-        mgr.staging_holds_success = partial(CommonKVManager.staging_holds_success, mgr)
-        counts = mgr._staging_outstanding = _PPStagingOutstanding(mgr)
+        self._count_staging(mgr)
         self.pp1.store[41] = KVPoll.Transferring
-        for hold, release in (
-            (lambda: counts.__setitem__(41, 1), lambda: counts.pop(41)),
-            (lambda: counts.setdefault(41, 1), lambda: counts.__delitem__(41)),
-            (lambda: counts.update({41: 2}), lambda: counts.clear()),
-            (lambda: counts.__ior__({41: 1}), lambda: counts.popitem()),
+        for release in (
+            lambda: mgr._add_staging_outstanding(41, -1),
+            lambda: mgr._pop_staging_outstanding(41),
         ):
-            hold()
+            mgr._add_staging_outstanding(41, 1)
             self.assertEqual(self.pp1.store[_pp_held_key(41)], 1)
             release()
             self.assertEqual(self.pp1.store[_pp_held_key(41)], 0)
+        # With deferred allocation the room holds until its count is popped.
+        mgr.defer_decode_allocation = True
+        mgr._add_staging_outstanding(41, 1)
+        mgr._add_staging_outstanding(41, -1)
+        self.assertEqual(self.pp1.store[_pp_held_key(41)], 1)
+        mgr._pop_staging_outstanding(41)
+        self.assertEqual(self.pp1.store[_pp_held_key(41)], 0)
 
     def test_idle_iteration_sends_nothing(self):
         self.assertEqual(self._iterate(), ([], []))

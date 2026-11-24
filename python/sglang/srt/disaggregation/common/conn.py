@@ -110,73 +110,6 @@ def _pp_held_key(bootstrap_room: int) -> str:
     return f"held:{bootstrap_room}"
 
 
-class _PPStagingOutstanding(defaultdict):
-    """_staging_outstanding under PP: also replicates whether each live room's
-    Success is held, because PP0 decides the release for every stage. Every
-    mutator syncs the rooms it touches."""
-
-    def __init__(self, kv_mgr: CommonKVManager):
-        super().__init__(int)
-        self._kv_mgr = kv_mgr
-        self._lock = threading.RLock()
-
-    def __setitem__(self, room: int, count: int) -> None:
-        with self._lock:
-            super().__setitem__(room, count)
-            self._sync(room)
-
-    def __delitem__(self, room: int) -> None:
-        with self._lock:
-            super().__delitem__(room)
-            self._sync(room)
-
-    def pop(self, room: int, *default):
-        with self._lock:
-            value = super().pop(room, *default)
-            self._sync(room)
-            return value
-
-    def setdefault(self, room: int, default: int = 0) -> int:
-        with self._lock:
-            value = super().setdefault(room, default)
-            self._sync(room)
-            return value
-
-    def update(self, *args, **kwargs) -> None:
-        with self._lock:
-            counts = dict(*args, **kwargs)
-            super().update(counts)
-            for room in counts:
-                self._sync(room)
-
-    def __ior__(self, other):
-        self.update(other)
-        return self
-
-    def popitem(self):
-        with self._lock:
-            room, count = super().popitem()
-            self._sync(room)
-            return room, count
-
-    def clear(self) -> None:
-        with self._lock:
-            rooms = list(self)
-            super().clear()
-            for room in rooms:
-                self._sync(room)
-
-    def _sync(self, room: int) -> None:
-        store = self._kv_mgr.request_status
-        # Staging chunks are counted only after the room's status exists, and a
-        # cleared room drops its held key with its status.
-        if room not in store:
-            return
-        held = int(self._kv_mgr.staging_holds_success(room))
-        if store.get(_pp_held_key(room)) != held:
-            store[_pp_held_key(room)] = held
-
-
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -573,7 +506,9 @@ class CommonKVManager(BaseKVManager):
                 self.request_status = PPConsensusStore(
                     self.pp_size, self.pp_rank, self.pp_group
                 )
-                self._staging_outstanding = _PPStagingOutstanding(self)
+                # Under PP every staging-count change also replicates the room's
+                # held flag; the lock keeps the two in step across threads.
+                self._staging_lock = threading.Lock()
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -806,6 +741,40 @@ class CommonKVManager(BaseKVManager):
             self.defer_decode_allocation and bootstrap_room in self._staging_outstanding
         )
 
+    def _add_staging_outstanding(self, room: int, delta: int) -> int:
+        """Add delta to the room's count of staging chunks dequeued and not yet
+        finished, and return the new count. Counts change only here and in
+        _pop_staging_outstanding."""
+        if not isinstance(self.request_status, PPConsensusStore):
+            count = self._staging_outstanding.get(room, 0) + delta
+            self._staging_outstanding[room] = count
+            return count
+        with self._staging_lock:
+            count = self._staging_outstanding.get(room, 0) + delta
+            self._staging_outstanding[room] = count
+            self._sync_staging_held(room)
+        return count
+
+    def _pop_staging_outstanding(self, room: int) -> None:
+        if not isinstance(self.request_status, PPConsensusStore):
+            self._staging_outstanding.pop(room, None)
+            return
+        with self._staging_lock:
+            self._staging_outstanding.pop(room, None)
+            self._sync_staging_held(room)
+
+    def _sync_staging_held(self, room: int) -> None:
+        """PP only: PP0 decides the release for every stage, so each stage
+        replicates whether it holds the room's Success for staging."""
+        store = self.request_status
+        # Staging chunks are counted only after the room's status exists, and a
+        # cleared room drops its held key with its status.
+        if room not in store:
+            return
+        held = int(self.staging_holds_success(room))
+        if store.get(_pp_held_key(room)) != held:
+            store[_pp_held_key(room)] = held
+
     def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
         """Aux (metadata) buffers pair up positionally, so a peer that
         registered a different number of them gets only the leading ones, and
@@ -892,7 +861,7 @@ class CommonKVManager(BaseKVManager):
                 # previous request that used this bootstrap_room.
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
+                self._pop_staging_outstanding(bootstrap_room)
                 self._forget_sends(bootstrap_room)
                 if isinstance(self.request_status, PPConsensusStore):
                     self.request_status.pop(_pp_held_key(bootstrap_room), None)
