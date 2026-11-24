@@ -412,15 +412,11 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
-    # V4's model-default ratio must not disable cap mode or --swa-prefix-tails.
-    # Only the operator's raw ratio selects explicit ratio sizing.
     if cfg._swa_full_tokens_ratio_explicitly_set is None:
         declare_resolution(
             server_args,
             "_handle_cache_compatibility",
-            _swa_full_tokens_ratio_explicitly_set=(
-                server_args._raw_input.get("swa_full_tokens_ratio") is not None
-            ),
+            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
         )
 
     # Validate the effective ratio: model branches may declare a reset
