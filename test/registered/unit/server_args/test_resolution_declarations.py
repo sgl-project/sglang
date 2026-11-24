@@ -1130,6 +1130,7 @@ class TestVPPResolution(CustomTestCase):
                         pp_size=2,
                         pp_virtual_stages=2,
                         language_model_only=True,
+                        enable_decoder_swa_bounded_replay=True,
                         random_seed=42,
                         disaggregation_mode=role,
                     )
@@ -1137,7 +1138,7 @@ class TestVPPResolution(CustomTestCase):
                     cfg = resolving_view(args)
                     self.assertEqual(cfg.cuda_graph_config.decode.backend, "disabled")
                     self.assertEqual(cfg.cuda_graph_config.prefill.backend, "disabled")
-                    self.assertFalse(cfg.enable_decoder_swa_bounded_replay)
+                    self.assertTrue(cfg.enable_decoder_swa_bounded_replay)
             with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
                 ServerArgs(
                     model_path=path,

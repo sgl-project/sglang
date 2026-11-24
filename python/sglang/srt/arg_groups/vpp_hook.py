@@ -52,11 +52,7 @@ def validate_vpp_options(server_args: Any) -> None:
             cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states,
         ),
         ("routed-expert output", cfg.enable_return_routed_experts),
-        (
-            "bounded SWA replay",
-            cfg.enable_encoder_swa_bounded_replay
-            or cfg.enable_decoder_swa_bounded_replay,
-        ),
+        ("encoder bounded SWA replay", cfg.enable_encoder_swa_bounded_replay),
         ("torch.compile", cfg.enable_torch_compile),
         ("elastic EP", cfg.elastic_ep_backend is not None),
         ("non-SGLang model implementations", cfg.model_impl not in ("auto", "sglang")),
@@ -122,5 +118,4 @@ def handle_vpp(server_args: Any) -> None:
         "handle_vpp",
         disable_cuda_graph=True,
         disable_overlap_schedule=True,
-        enable_decoder_swa_bounded_replay=False,
     )
