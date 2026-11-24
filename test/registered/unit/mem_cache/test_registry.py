@@ -260,6 +260,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ),
         )
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.pp_size = 1
         cache.tree_core = SimpleNamespace(
             enable_external_cache_linker=False, write_through_threshold=256
         )

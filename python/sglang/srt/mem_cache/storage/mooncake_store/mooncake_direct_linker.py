@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -298,6 +299,70 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(restorable),
             )
         return restorable
+
+    def prepare_pp_lookup(self, groups, windows):
+        """Collect the keys actually owned by each stage, including sparse sidecars."""
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        widths = {PoolName.KV: 0, PoolName.MAMBA: 1}
+        widths.update(
+            {window.pool_name: window.full_window_pages for window in windows}
+        )
+        layout = set()
+        try:
+            if (
+                isinstance(self.storage, MooncakeStore)
+                and self.storage.unified_suffixes is None
+            ):
+                namespace = self.storage.pp_query_namespace()
+                objects = self.storage.pp_query_layout()
+                layout = {
+                    (source, widths[source], suffix, namespace)
+                    for name, source in self.pool_group.sources.items()
+                    for suffix in objects[name]
+                }
+        except Exception:
+            logger.warning(
+                "Cannot describe this Mooncake shard for PP0 lookup", exc_info=True
+            )
+        for group in groups:
+            peers = [None] * torch.distributed.get_world_size(group)
+            torch.distributed.all_gather_object(peers, layout, group=group)
+            if any(not peer for peer in peers):
+                layout = set()
+            else:
+                layout = set().union(*peers)
+        if len({entry[3] for entry in layout}) != 1:
+            return None
+        pool_suffixes = {}
+        pool_widths = {}
+        for source, width, suffix, _ in sorted(layout, key=lambda item: item[2]):
+            if pool_widths.setdefault(source, width) != width:
+                return None
+            pool_suffixes.setdefault(source, []).append(suffix)
+
+        def lookup(rid, pages):
+            transfers = [
+                PoolTransfer(
+                    name,
+                    keys=pages[-width:] if width else pages,
+                    hit_policy=(
+                        PoolHitPolicy.TRAILING_PAGES
+                        if width
+                        else PoolHitPolicy.ALL_PAGES
+                    ),
+                )
+                for name, width in pool_widths.items()
+            ]
+            result = self.storage.batch_exists_v2(
+                pages, transfers, pool_suffixes=pool_suffixes
+            )
+            self.stats["lookup"] += 1
+            return result.restorable_prefix_pages or []
+
+        return lookup
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
