@@ -545,6 +545,10 @@ If the original data is still needed, back it up before running `analyse()`.
   workers must be profiled separately — see
   [Profile In PD Disaggregation Mode](/docs/developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode).
 
+## Agent skill (external)
+
+For a repeatable end-to-end bottleneck report from operator_details.csv / 	race_view.json, use the NPU profiler analysis skill in [Ascend-SGLang-Skills PR #25](https://github.com/LinyuanLi0046/Ascend-SGLang-Skills/pull/25) (skills/sglang-npu-profiler-analysis/). It wraps the capture methods above and emits a standard markdown report.
+
 ## See Also
 
 - [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling)
