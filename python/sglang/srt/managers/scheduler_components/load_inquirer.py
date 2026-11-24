@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -34,7 +33,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
-    server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver

@@ -78,7 +78,10 @@ class DFlashRuntime(Protocol):
         grammar_barrier: Optional[Callable[[], Any]],
     ) -> Optional[GenerationBatchResult]:
         """The decode branch of ``forward_batch_generation``. None, decided alike on
-        every TP rank before any launch, runs SGLang's round."""
+        every TP rank before any launch, runs SGLang's round. A runtime that binds
+        ``join_aux`` lets SGLang's aux append run on its side stream: it joins the
+        pending append before its draft forward, and returns ``aux_done`` as the
+        result's ``side_stream_done`` after appending there itself."""
 
 
 # ---- Binding: the worker state a runtime may read.
@@ -120,6 +123,18 @@ BINDINGS: dict[str, WorkerMember] = {
         "_rebuild_compact_draft_cache", Callable
     ),
     "accept_block": WorkerMember("_accept_block", Callable),
+    # the stock round's phases, for a runtime that composes its round from both
+    "draft_sampler": WorkerMember("_draft_sampler", object),  # set by init_cuda_graphs
+    "append_target_hidden_decode": WorkerMember(
+        "_append_target_hidden_decode", Callable
+    ),
+    "aux_overlap": WorkerMember("_aux_overlap", bool),
+    "join_aux": WorkerMember("_join_aux", Callable),
+    "aux_done": WorkerMember("_aux_done", (torch.cuda.Event, type(None))),
+    "selector_sampling_accept": WorkerMember("_selector_sampling_accept", Callable),
+    "update_target_mamba_state_after_verify": WorkerMember(
+        "_update_target_mamba_state_after_verify", Callable
+    ),
 }
 
 

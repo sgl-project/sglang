@@ -10,6 +10,8 @@ import msgspec
 from sglang.srt.managers import tokenizer_control_mixin
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -119,7 +121,11 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
             SimpleNamespace(version="v1", weights="v1") for _ in range(worker_count)
         ]
         state = SimpleNamespace(
-            failed_rank=failed_rank, checkpoint="v2", commits=0, flush_ok=True
+            failed_rank=failed_rank,
+            checkpoint="v2",
+            commits=0,
+            flush_ok=True,
+            received=0,
         )
         tasks = []
         updates = []
@@ -136,6 +142,10 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
                 if new_version is not None:
                     resident.version = new_version
 
+            def receive(**kwargs):
+                state.received += 1
+                return []
+
             updater = SimpleNamespace(
                 **{
                     name: load
@@ -146,7 +156,7 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
                         "load_weights_from_distributed",
                     )
                 },
-                receive_weights_from_distributed=lambda **kwargs: [],
+                receive_weights_from_distributed=receive,
             )
             runner = SimpleNamespace(weight_updater=updater, device="cpu")
             native = SchedulerWeightUpdaterManager(
@@ -166,6 +176,7 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
             )
             native._session = _WeightUpdateSession(selector="all")
             updates.append(native)
+        state.native_updates = updates
 
         async def deliver(req):
             for native in updates:
@@ -422,7 +433,11 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
             self.assertTrue(all(s.weights == s.version == "v1" for s in residents))
             self.assertEqual(manager.config_value("weight_version"), "v1")
             self.assertEqual(state.commits, 0)
-            self.assertEqual(tasks, [])
+            if route == "distributed":
+                self.assertEqual(state.received, len(residents))
+                await asyncio.gather(*tasks)
+            else:
+                self.assertEqual(tasks, [])
             manager.abort_request.assert_not_called()
 
         for route in self._requests:
@@ -456,6 +471,214 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
                     ),
                 ):
                     asyncio.run(scenario(route, reason))
+
+    def test_single_dp_pipeline_reply_cannot_publish_checkpoint_metadata(self):
+        """Stage-zero load/flush results cannot establish which checkpoint a
+        later pipeline stage loaded, even with only one DP leader."""
+
+        async def scenario(route, version):
+            manager, residents, state, tasks, _ = self._manager(
+                route, worker_count=1, paused=True
+            )
+            manager.model_path = manager.served_model_name = "old-checkpoint"
+            manager._update_model_path_info = (
+                TokenizerManager._update_model_path_info.__get__(manager)
+            )
+            state.flush_ok = False
+            result = await asyncio.wait_for(
+                getattr(manager, f"update_weights_from_{route}")(
+                    self._requests[route](version)
+                ),
+                timeout=5,
+            )
+            self.assertFalse(result[0])
+            self.assertIn("pipeline parallelism", result[1])
+            self.assertEqual(manager.model_path, "old-checkpoint")
+            self.assertEqual(manager.config_value("weight_version"), "v1")
+            self.assertTrue(all(s.weights == s.version == "v1" for s in residents))
+            await asyncio.gather(*tasks)
+
+        for route in self._requests:
+            for version in (None, "v2"):
+                with (
+                    self.subTest(route=route, version=version),
+                    get_context().override_server_args(weight_version="v1"),
+                    get_parallel().override(
+                        tp_rank=0,
+                        tp_size=1,
+                        dp_size=1,
+                        num_dp_ranks=1,
+                        pp_size=2,
+                        attn_dp_enabled=False,
+                        tp_group=SimpleNamespace(cpu_group=None, world_size=1),
+                    ),
+                ):
+                    asyncio.run(scenario(route, version))
+
+    def test_rejected_distributed_round_still_completes_an_already_started_send(self):
+        """Rejecting before posting receive strands a trainer that is already
+        broadcasting; drain into temporary buffers without loading or locking out live requests."""
+
+        async def scenario():
+            manager, residents, state, tasks, _ = self._manager("distributed")
+            for native in state.native_updates:
+                native._session = None
+            async with manager.model_update_lock.reader_lock:
+                result = await asyncio.wait_for(
+                    manager.update_weights_from_distributed(
+                        self._requests["distributed"]("v2")
+                    ),
+                    timeout=5,
+                )
+            self.assertFalse(result[0])
+            self.assertIn("tokenizer workers", result[1])
+            self.assertEqual(
+                state.received,
+                2,
+                "both scheduler receives must match the sender's round",
+            )
+            self.assertTrue(all(s.weights == s.version == "v1" for s in residents))
+            self.assertTrue(all(n._session is None for n in state.native_updates))
+            self.assertEqual(state.commits, 0)
+            await asyncio.gather(*tasks)
+
+        with (
+            get_context().override_server_args(
+                weight_version="v1", tp_size=2, attn_dp_size=2, tokenizer_worker_num=2
+            ),
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=2,
+                dp_size=1,
+                num_dp_ranks=2,
+                pp_size=1,
+                attn_dp_enabled=True,
+                enable_dp_attention_local_control_broadcast=True,
+                tp_group=SimpleNamespace(cpu_group=None),
+                attn_tp_group=SimpleNamespace(world_size=1),
+                attn_cp_group=SimpleNamespace(world_size=1),
+            ),
+        ):
+            asyncio.run(scenario())
+
+    def test_version_preflight_rejects_before_the_trainer_enters_broadcast(self):
+        """A trainer declaring its intended version can stop at preparation,
+        before restoring weights, starting its collective or opening a session."""
+
+        async def scenario():
+            manager, residents, state, tasks, _ = self._manager("distributed")
+            manager.begin_weight_update_communicator = AsyncMock(
+                return_value=[BeginWeightUpdateReqOutput(success=True, message="ok")]
+            )
+            sender_started = False
+            result = await manager.begin_weight_update(
+                BeginWeightUpdateReqInput(weight_version="v2")
+            )
+            if result[0]:
+                sender_started = True
+            self.assertFalse(result[0])
+            self.assertFalse(sender_started)
+            self.assertIn("tokenizer workers", result[1])
+            self.assertEqual(state.received, 0)
+            self.assertEqual(tasks, [])
+            self.assertTrue(all(s.weights == s.version == "v1" for s in residents))
+            manager.begin_weight_update_communicator.assert_not_awaited()
+
+        with (
+            get_context().override_server_args(
+                weight_version="v1", tp_size=2, attn_dp_size=2, tokenizer_worker_num=2
+            ),
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=2,
+                num_dp_ranks=2,
+                pp_size=1,
+                dp_size=1,
+                tp_group=SimpleNamespace(cpu_group=None),
+            ),
+        ):
+            asyncio.run(scenario())
+
+    def test_accepted_preflight_does_not_publish_a_version_before_a_load(self):
+        """The version in preparation is capability metadata, not evidence
+        that any model weights have changed."""
+
+        async def scenario():
+            manager, residents, state, tasks, _ = self._manager("distributed")
+            manager.begin_weight_update_communicator = AsyncMock(
+                return_value=[
+                    BeginWeightUpdateReqOutput(success=True, message="ok")
+                    for _ in residents
+                ]
+            )
+            result = await manager.begin_weight_update(
+                BeginWeightUpdateReqInput(weight_version="v2")
+            )
+            self.assertTrue(result[0])
+            self.assertEqual(manager.config_value("weight_version"), "v1")
+            self.assertTrue(all(s.weights == s.version == "v1" for s in residents))
+            self.assertEqual(state.commits, 0)
+            self.assertEqual(tasks, [])
+
+        with (
+            get_context().override_server_args(
+                weight_version="v1", tp_size=2, attn_dp_size=2
+            ),
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=2,
+                num_dp_ranks=2,
+                pp_size=1,
+                dp_size=1,
+                tp_group=SimpleNamespace(cpu_group=None),
+            ),
+        ):
+            asyncio.run(scenario())
+
+    def test_engine_passes_the_preflight_and_load_versions_without_early_commit(self):
+        """The SDK must carry the intended version to both phases; dropping
+        either argument bypasses preflight or leaves the loaded version stale."""
+        from sglang.srt.entrypoints.engine import Engine
+
+        with (
+            get_context().override_server_args(weight_version="v1"),
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=1,
+                num_dp_ranks=1,
+                pp_size=1,
+                dp_size=1,
+                attn_dp_enabled=False,
+                tp_group=SimpleNamespace(cpu_group=None, world_size=1),
+            ),
+        ):
+            manager, residents, state, tasks, _ = self._manager(
+                "distributed", worker_count=1
+            )
+            manager.begin_weight_update_communicator = AsyncMock(
+                return_value=[BeginWeightUpdateReqOutput(success=True, message="ok")]
+            )
+            engine = Engine.__new__(Engine)
+            engine.loop = asyncio.new_event_loop()
+            engine.tokenizer_manager = manager
+            try:
+                self.assertTrue(engine.begin_weight_update(weight_version="v2")[0])
+                self.assertEqual(manager.config_value("weight_version"), "v1")
+                self.assertTrue(
+                    engine.update_weights_from_distributed(
+                        names=[], dtypes=[], shapes=[], weight_version="v2"
+                    )[0]
+                )
+                self.assertEqual(manager.config_value("weight_version"), "v2")
+                self.assertTrue(all(s.weights == s.version == "v2" for s in residents))
+                self.assertEqual(state.commits, 0)
+            finally:
+
+                async def finish():
+                    await asyncio.gather(*tasks)
+
+                engine.loop.run_until_complete(finish())
+                engine.loop.close()
 
 
 if __name__ == "__main__":

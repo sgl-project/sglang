@@ -295,7 +295,8 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        if self._session is None:
+        receive_only_error = getattr(recv_req, "receive_only_error", None) or None
+        if self._session is None and receive_only_error is None:
             return UpdateWeightsFromDistributedReqOutput(
                 success=False,
                 message="update_weights_from_distributed must run between "
@@ -319,6 +320,16 @@ class SchedulerWeightUpdaterManager:
             else:
                 success, message = True, "Success"
             success, message = self._agree_native_update(success, message)
+            if receive_only_error is not None:
+                # Match the trainer's collective, but never install a rejected
+                # payload or alter an existing session/version/cache state.
+                return UpdateWeightsFromDistributedReqOutput(
+                    success=False,
+                    message=receive_only_error
+                    if success
+                    else f"{receive_only_error} | {message}",
+                    weights_loaded=False,
+                )
             weights_loaded = False
             if success:
                 success, message, weights_loaded = self._update_native_runners(

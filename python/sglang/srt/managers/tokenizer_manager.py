@@ -218,7 +218,6 @@ from sglang.srt.speculative.spec_decoding_metrics import (
 from sglang.srt.utils import (
     configure_gc_logging,
     freeze_gc,
-    get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
     print_warning_once,
@@ -752,7 +751,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
@@ -2504,7 +2502,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
                     )
-                    if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.get()
                     else nullcontext()
                 ):
                     for i in range(batch_size):

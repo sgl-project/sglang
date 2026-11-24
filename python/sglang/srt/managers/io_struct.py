@@ -2232,6 +2232,9 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Internal rejection fallback: receive an already-started round without
+    # installing it, then report this error to the caller.
+    receive_only_error: Optional[str] = None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
@@ -2417,6 +2420,9 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 
     selector: Literal["target", "draft", "all"] = "all"
+    # Check version-update support before the trainer enters its broadcast.
+    # This does not publish a version or replace the version on each load call.
+    weight_version: Optional[str] = None
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
