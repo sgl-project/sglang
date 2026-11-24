@@ -38,6 +38,10 @@ class MockHiCacheStorage:
 
         self.registered_pools = {}
 
+    def consumes_kv_hints(self) -> bool:
+        """Simulated storage tracks keys only and does not consume request hints."""
+        return False
+
     def register_mem_pool_host(self, mem_pool_host):
         pass
 

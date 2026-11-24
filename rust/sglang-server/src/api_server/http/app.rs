@@ -9,8 +9,8 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    auth, connections, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
-    request_decompression,
+    anthropic, auth, connections, corpus, hicache, info, loads, metrics, native_api, ollama,
+    openai, parsers, pre_generate, request_decompression, responses, weights, wrappers,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -141,7 +141,6 @@ pub async fn serve(
         generate_hook,
         openai_chat,
     });
-    let relay_failure = startup_failure.clone();
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(
         state.core.clone(),
@@ -156,9 +155,15 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
         .merge(info::routes())
+        .merge(weights::routes())
+        .merge(parsers::routes())
+        .merge(corpus::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
-        .merge(openai::routes());
+        .merge(openai::routes())
+        .merge(ollama::routes())
+        .merge(anthropic::routes())
+        .merge(responses::routes());
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
     }
@@ -178,31 +183,23 @@ pub async fn serve(
 
     // No body limit, matching the Python server.
     let core = state.core.clone();
+    let responses_state = state.clone();
     let mut app = router
         .with_state(state)
         .merge(hicache::routes(hicache_manager))
         .layer(axum::extract::DefaultBodyLimit::disable());
     if let Some(http_layer) = http_layer {
-        app = pre_generate::apply(app, &http_layer, core.clone());
+        app = pre_generate::apply(app, &http_layer, core);
     }
-    // Outside the embedding package's layers, so a request naming another DP
-    // rank goes to that rank's listener before any of its work here.
-    app = match dp_relay::apply(
-        app,
-        &server_args.deployment_info,
-        server_args.enable_request_header_overrides,
-        core,
-    ) {
-        Ok(app) => app,
-        Err(error) => {
-            // Takes the server down, as a failed startup warmup does.
-            tracing::error!("{error}");
-            let _ = relay_failure.try_send(error);
-            return;
-        }
-    };
     // Outside the embedding package's layers, so they read decompressed bodies.
     app = request_decompression::apply(app, &server_args);
+    // Python's generation wrappers (`/vertex_generate`, `/invocations`)
+    // rewrite the request and send it back through everything above, so a
+    // wrapped generate is relayed and parsed like a direct one.
+    app = wrappers::apply(app);
+    // `POST /v1/responses` plans a chat request and sends it back through
+    // the chat route, so the served model's own chat path answers it.
+    app = responses::mount(app, responses_state);
     // Outside the extension layer, so its routes are keyed too. The bootstrap
     // registry below stays open, as Python serves it on its own server. Auth
     // runs before decompression, so an unauthenticated body is never inflated.
