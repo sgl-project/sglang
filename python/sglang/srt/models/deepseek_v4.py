@@ -1224,16 +1224,16 @@ class MqaAttentionBase(nn.Module):
         """Whether wo_b consumes FlashInfer-swizzled MXFP8, so wo_a can fuse the
         quantization into its epilogue. Not known until wo_b's weights load."""
         quant_method = getattr(self.wo_b, "quant_method", None)
-        if use_flashinfer_bi_quantizers(self.wo_b.weight.device):
-            # The deterministic mode quantizes in wo_b (FlashInfer's
-            # batch-invariant kernel), not in wo_a's epilogue.
-            return False
-        return getattr(
+        ok = getattr(
             quant_method, "mxfp8_dense_backend", None
         ) == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL and (
             getattr(quant_method, "use_mxfp8", False)
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
         )
+        # The deterministic mode quantizes in wo_b (FlashInfer's batch-invariant
+        # kernel), not in wo_a's epilogue. Only a FlashInfer MXFP8 wo_b has
+        # `weight`; other quant methods (GGUF) are decided above.
+        return ok and not use_flashinfer_bi_quantizers(self.wo_b.weight.device)
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
