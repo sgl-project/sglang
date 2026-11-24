@@ -113,7 +113,7 @@ jobs:
             core.setOutput("approved", ok ? "true" : "false");
             core.info(ok ? `${sha} may run CI.`
               : !labeled ? `The PR lacks run-ci; a maintainer must comment /tag-and-rerun-ci, which adds it and approves ${sha}.`
-              : `${sha} has no run-ci approval; a maintainer must approve this commit with /tag-and-rerun-ci.`);
+              : `${sha} has no run-ci approval; a maintainer must approve this commit with /approve-ci.`);
 
       # Live labels: event-payload expressions do not refresh on rerun. The slash handler
       # and pr-states.yml find these runs by this step's name.
