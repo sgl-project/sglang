@@ -933,8 +933,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "deepseek-recipe"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e9a3c713c6026c73883e20f51a91e21e6dcbb3dd1dd89d9eaaa82b11d97febc"
+source = "git+https://github.com/sgl-project/deepseek-recipe.git?rev=d3cc70eec9876997a39af7627d67a26571fc2e2e#d3cc70eec9876997a39af7627d67a26571fc2e2e"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -956,8 +955,7 @@ dependencies = [
 [[package]]
 name = "deepseek-recipe-core"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82329b9b368a326f06eb0114710c86a085bc8792e6e5cffd259125b422cbabef"
+source = "git+https://github.com/sgl-project/deepseek-recipe.git?rev=d3cc70eec9876997a39af7627d67a26571fc2e2e#d3cc70eec9876997a39af7627d67a26571fc2e2e"
 dependencies = [
  "deepseek-recipe-macros",
  "serde",
@@ -967,8 +965,7 @@ dependencies = [
 [[package]]
 name = "deepseek-recipe-encoding"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "136e9554e91dc94beeb9dfa60e9955db1d1b0a4661429c626a2c6ff2c0f74d45"
+source = "git+https://github.com/sgl-project/deepseek-recipe.git?rev=d3cc70eec9876997a39af7627d67a26571fc2e2e#d3cc70eec9876997a39af7627d67a26571fc2e2e"
 dependencies = [
  "aho-corasick",
  "deepseek-recipe-core",
@@ -982,8 +979,7 @@ dependencies = [
 [[package]]
 name = "deepseek-recipe-macros"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1263cc15fcdc65e4ac61cdee44b1ac5f95868bdaab35579960a6cdc150fa5801"
+source = "git+https://github.com/sgl-project/deepseek-recipe.git?rev=d3cc70eec9876997a39af7627d67a26571fc2e2e#d3cc70eec9876997a39af7627d67a26571fc2e2e"
 dependencies = [
  "proc-macro2",
  "quote",

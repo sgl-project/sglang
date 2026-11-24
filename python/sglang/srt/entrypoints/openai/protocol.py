@@ -2099,6 +2099,8 @@ class ResponsesRequest(PDRoutingFields):
     # By call_id, the name the model called a tool by when the output item
     # reports another; the stored history replays the call under it.
     _called_tool_names: Dict[str, str] = PrivateAttr(default_factory=dict)
+    # The history and stored namespace calls the request continues, as first read.
+    _continued: Optional[Tuple[list, Dict[str, Any]]] = PrivateAttr(default=None)
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)

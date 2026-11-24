@@ -13,9 +13,10 @@ from types import ModuleType
 from typing import Any, Optional, Union
 
 DEEPSEEK_RECIPE_INSTALL_HINT = (
-    "Serving DeepSeek-V4 / V4.1 requires the `deepseek-recipe` package (DeepSeek's "
-    "reference encoder and parser; wheels for Linux and macOS). Install it with "
-    "`pip install deepseek-recipe`."
+    "Serving DeepSeek-V4 / V4.1 requires the `sgl-deepseek-recipe` package "
+    "(SGLang's build of DeepSeek's reference encoder and parser; wheels for Linux "
+    "and macOS). Install it with `pip install sgl-deepseek-recipe`. Do not also "
+    "install `deepseek-recipe`: both provide the `deepseek_recipe` module."
 )
 
 logger = logging.getLogger(__name__)
@@ -38,16 +39,6 @@ TASK_TOKENS = {
 TASKS_AFTER_HEADER = ("action",)
 # V4.1 renders an integer budget as this line; recipe's "high" tier is budget 75.
 BUDGET_TIER, BUDGET_TIER_VALUE = "high", 75
-TOOL_SEARCH = "tool_search"
-TOOL_SEARCH_OUTPUT = "tool_search_output"
-# Converted in the search tool's place beside strict tools, keeping its position and
-# name check: recipe reads its search tool as non-strict and rejects mixed strictness.
-STRICT_SEARCH_STAND_IN = {
-    "type": "function",
-    "name": TOOL_SEARCH,
-    "strict": True,
-    "parameters": {"type": "object", "properties": {}},
-}
 BUDGET_LINE = "Reasoning Effort: {budget}"
 
 
@@ -138,126 +129,6 @@ def _replaced(conversation: Any, **fields: Any) -> Any:
         reasoning_effort=conversation.reasoning_effort,
         response_schema=fields.get("response_schema", conversation.response_schema),
     )
-
-
-def _declares_strict_tool(tools: list[dict[str, Any]]) -> bool:
-    members = [
-        member
-        for tool in tools
-        if tool["type"] == "namespace"
-        for member in tool["tools"]
-    ]
-    return any(tool.get("strict") for tool in [*tools, *members])
-
-
-def _discovered_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        tool
-        for item in body["input"]
-        if isinstance(item, dict) and item.get("type") == TOOL_SEARCH_OUTPUT
-        for tool in item["tools"]
-    ]
-
-
-def _definition_key(
-    tool: dict[str, Any], namespace: Optional[dict[str, Any]] = None
-) -> str:
-    """The fields that render of `tool`, a function or custom tool or a member of
-    `namespace`, as JSON: unlike dict equality, it tells `true` from `1`."""
-    fields = {k: v for k, v in tool.items() if k != "defer_loading" and v is not None}
-    if namespace is not None:
-        fields["namespace"] = {
-            k: v
-            for k, v in namespace.items()
-            if k not in ("tools", "defer_loading") and v is not None
-        }
-    return json.dumps(fields, sort_keys=True)
-
-
-def _without_repeats(
-    body: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, list[Optional[tuple[str, int]]]]]:
-    """`body` without the search-result entries that repeat the definition last
-    listed under their name; and by call_id, each result's items, one per tool or
-    namespace member: None where recipe renders it, else the (call_id, index) of
-    the item to copy."""
-    listed: dict[tuple[Optional[str], str], tuple[str, tuple[str, int]]] = {}
-    results = {}
-    items = []
-    for item in body["input"]:
-        if isinstance(item, dict) and item.get("type") == TOOL_SEARCH_OUTPUT:
-            call_id = item.get("call_id")
-            entries = results[call_id] = []
-            tools = []
-            for tool in item["tools"]:
-                namespace = tool if tool["type"] == "namespace" else None
-                kept = []
-                for member in namespace["tools"] if namespace else [tool]:
-                    key = (namespace["name"] if namespace else None, member["name"])
-                    definition = _definition_key(member, namespace)
-                    earlier = listed.get(key)
-                    if earlier is not None and earlier[0] == definition:
-                        entries.append(earlier[1])
-                        continue
-                    listed[key] = (definition, (call_id, len(entries)))
-                    entries.append(None)
-                    kept.append(member)
-                if namespace:
-                    tools.append({**tool, "tools": kept})
-                elif kept:
-                    tools.append(tool)
-            item = {**item, "tools": tools}
-        items.append(item)
-    return {**body, "input": items}, results
-
-
-def _with_repeats(
-    conversation: Any, results: dict[str, list[Optional[tuple[str, int]]]]
-) -> Any:
-    """`conversation` whose search results list every entry again, as
-    `_without_repeats` describes them."""
-    if all(source is None for entries in results.values() for source in entries):
-        return conversation
-    recipe = load_deepseek_recipe()
-    rendered: dict[str, list[str]] = {}
-    messages = []
-    for message in conversation.messages:
-        entries = isinstance(message, recipe.ToolMessage) and results.get(
-            message.tool_call_id
-        )
-        if entries:
-            converted = _json_array_items(message.content)
-            if len(converted) != entries.count(None):
-                raise RuntimeError(
-                    f"deepseek-recipe rendered {len(converted)} tools for search "
-                    f"result {message.tool_call_id!r}, not {entries.count(None)}"
-                )
-            converted = iter(converted)
-            items = rendered[message.tool_call_id] = []
-            for source in entries:
-                items.append(
-                    next(converted)
-                    if source is None
-                    else rendered[source[0]][source[1]]
-                )
-            message = recipe.ToolMessage(
-                "[" + ",".join(items) + "]", message.tool_call_id
-            )
-        messages.append(message)
-    return _replaced(conversation, messages=messages)
-
-
-def _json_array_items(array: str) -> list[str]:
-    """The items of `array`, a compact JSON array, as it spells them."""
-    decoder = json.JSONDecoder()
-    items, index = [], 1
-    while array[index : index + 1] not in ("]", ""):
-        _, end = decoder.raw_decode(array, index)
-        items.append(array[index:end])
-        index = end + (array[end : end + 1] == ",")
-    if "[" + ",".join(items) + "]" != array:
-        raise RuntimeError("deepseek-recipe rendered a malformed search result")
-    return items
 
 
 def _with_host_settings(
@@ -521,69 +392,21 @@ class DeepSeekRecipe:
         call name stands for; invalid requests raise ValueError."""
         recipe = load_deepseek_recipe()
         options = self._options.with_default_thinking_mode(thinking)
-        if protocol == "messages":
-            conversation = self._converted(recipe.MessagesRequest, body, options)
-            names = {}
-        else:
-            conversation, names = self._convert_responses(body, options)
-        return _with_host_settings(conversation, response_schema=response_schema), names
+        request_type = (
+            recipe.MessagesRequest
+            if protocol == "messages"
+            else recipe.ResponsesRequest
+        )
+        converted = self._converted(request_type, body, options)
+        conversation = _with_host_settings(
+            converted.conversation, response_schema=response_schema
+        )
+        return conversation, converted.namespace_tool_map or {}
 
     def _converted(self, request_type: Any, body: dict[str, Any], options: Any) -> Any:
         recipe = load_deepseek_recipe()
         try:
-            converted = request_type({**body, "model": self.model}).convert(options)
-        except recipe.ConversionError as error:
-            raise ValueError(_error_message(error.body)) from error
-        return converted.conversation
-
-    def _convert_responses(
-        self, body: dict[str, Any], options: Any
-    ) -> tuple[Any, dict[str, tuple[str, str]]]:
-        """recipe's conversion of a Responses `body`, where strict tools may stand
-        beside the search tool and search results may repeat a definition."""
-        recipe = load_deepseek_recipe()
-        body, results = _without_repeats(body)
-        search = next(
-            (tool for tool in body["tools"] if tool["type"] == TOOL_SEARCH), None
-        )
-        tools = [*body["tools"], *_discovered_tools(body)]
-        strict_search = search is not None and _declares_strict_tool(tools)
-        converted = body
-        if strict_search:
-            converted = {
-                **body,
-                "tools": [
-                    STRICT_SEARCH_STAND_IN if tool["type"] == TOOL_SEARCH else tool
-                    for tool in body["tools"]
-                ],
-            }
-        conversation = self._converted(recipe.ResponsesRequest, converted, options)
-        if strict_search:
-            (definition,) = self._converted(
-                recipe.ResponsesRequest, {"input": "", "tools": [search]}, options
-            ).tools
-            conversation = _replaced(
-                conversation,
-                tools=[
-                    definition if tool.name == TOOL_SEARCH else tool
-                    for tool in conversation.tools
-                ],
-            )
-        conversation = _with_repeats(conversation, results)
-        namespaces = [tool for tool in tools if tool["type"] == "namespace"]
-        names = self._namespace_tool_names(namespaces) if namespaces else {}
-        return conversation, names
-
-    def _namespace_tool_names(
-        self, namespaces: list[dict[str, Any]]
-    ) -> dict[str, tuple[str, str]]:
-        """The name recipe's Responses conversion calls each member of `namespaces`
-        by, mapped to its namespace and its name there. `namespaces` lists the
-        request's namespace tools in conversion order: declared, then discovered."""
-        recipe = load_deepseek_recipe()
-        body = {"model": self.model, "input": "", "tools": namespaces}
-        try:
-            return recipe.ResponsesRequest(body).namespace_tool_map(self._options)
+            return request_type({**body, "model": self.model}).convert(options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
 

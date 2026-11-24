@@ -49,3 +49,4 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/sgl-project/deepseek-recipe.git"]

@@ -122,6 +122,7 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.utils import random_uuid
 
 if TYPE_CHECKING:
+    from sglang.srt.entrypoints.openai.chat_encoding_adapters import NativePrompt
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
 
@@ -132,12 +133,38 @@ class _MediaInputValidationError(ValueError):
     pass
 
 
+class _ReplayedCallError(ValueError):
+    pass
+
+
+class _StoredCall(msgspec.Struct, frozen=True, kw_only=True):
+    """What a stored call to a namespace member was made against."""
+
+    name: str
+    """The name the model called the member by."""
+    member: tuple[str, str]
+    """Its namespace and the name the request gave it there."""
+    definition: Function
+
+
 TOOL_SEARCH = "tool_search"
 TOOL_SEARCH_ITEMS = ("tool_search_call", "tool_search_output")
 APPLY_PATCH = "apply_patch"
 NAMESPACE_MEMBERS_ERROR = (
     "namespace tools must list function tools, each with a type and a name"
 )
+
+
+def _json_identity(value: Any) -> Any:
+    """`value` so that equality is recipe's for tool definitions: `true` is not
+    `1` and `1` is not `1.0`, while key order and the sign of a zero do not count."""
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if isinstance(value, dict):
+        return {key: _json_identity(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_identity(item) for item in value]
+    return type(value), value
 
 
 def _holds_function_tools(members: Any) -> bool:
@@ -156,7 +183,7 @@ def _defer_tool_loading(
     `tool_search_output` entries naming a deferred tool, or a namespace with one,
     take the fields they leave out from its declaration, so a search result loads
     it where it returns. recipe's Responses conversion renders a deferred tool up
-    front and rejects a search result that repeats a declared name."""
+    front, where no search result can load it again."""
     deferred: dict[tuple[Optional[str], str], dict[str, Any]] = {}
     namespaces: dict[str, dict[str, Any]] = {}
     shown = []
@@ -346,6 +373,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Note: In production, this should use a proper storage backend (Redis, database)
         # with TTL/expiration to prevent memory leaks
         self.msg_store: dict[str, Union[list[dict], list[OpenAIMessage]]] = {}
+        # The namespace member calls in each stored history, by call id.
+        self.call_store: dict[str, dict[str, _StoredCall]] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
         self.enable_response_store = get_serving().enable_response_store
@@ -579,6 +608,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         except _MediaInputValidationError as e:
             return self.create_error_response(str(e))
+        except _ReplayedCallError as e:
+            return self.create_error_response(str(e), param="input")
         except ResponseToolChoiceError as e:
             return self.create_error_response(str(e), param="tool_choice")
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
@@ -776,11 +807,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)
             if persist:
-                self.msg_store[request.request_id] = (
-                    messages[2:]
-                    if self.use_harmony
-                    else self._response_input_history(request)
-                )
+                if self.use_harmony:
+                    self.msg_store[request.request_id] = messages[2:]
+                else:
+                    self._store_history(request, [])
 
             if request.background and not request.stream and persist:
                 created_time = int(time.time())
@@ -1125,9 +1155,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else context.messages[2:]
                         )
                     else:
-                        self.msg_store[response.id] = self._stored_history(
-                            request, response.output
-                        )
+                        self._store_history(request, response.output)
 
         return response
 
@@ -1578,9 +1606,20 @@ class OpenAIServingResponses(OpenAIServingChat):
             for tool in request.tools
             if tool.type in ("function", "custom")
         }
+        deferred: dict[str, ResponseTool] = {}
         for tool in request.tools:
             if tool.type in ("custom", "namespace") and not tool.name:
                 return f"{tool.type} tools must have a name"
+            if (
+                tool.type in ("function", "custom")
+                and tool.defer_loading
+                and _json_identity(deferred.setdefault(tool.name, tool))
+                != _json_identity(tool)
+            ):
+                return (
+                    f"tools defers {tool.name!r} more than once, with different "
+                    "definitions"
+                )
             if (
                 tool.type == TOOL_SEARCH
                 and tool.model_extra.get("execution") != "client"
@@ -1631,16 +1670,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         """Render the request's own wire form into `chat_request`, whose tools and
         choice become the ones the history has loaded."""
         choice = request.effective_tool_choice()
-        tools, items = _defer_tool_loading(
-            request.tools,
-            [
-                item
-                for item in map(
-                    self._native_input_item, self._response_input_history(request)
-                )
-                if item is not None
-            ],
-        )
+        tools, history = self._loaded_history(request)
+        calls = self.call_store.get(request.previous_response_id) or {}
+        request._continued = history, calls
+        items = [
+            item for item in map(self._native_input_item, history) if item is not None
+        ]
         body = {"input": items, "tools": [_rendered_tool(tool) for tool in tools]}
         if request.instructions:
             body["instructions"] = request.instructions
@@ -1649,6 +1684,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         prompt = self.prepare_native_prompt(
             chat_request, protocol="responses", body=body
         )
+        replay_error = self._stored_calls_error(calls, prompt)
+        if replay_error is not None:
+            raise _ReplayedCallError(replay_error)
         tools = prompt.tools
         request._tool_state = msgspec.structs.replace(
             request._tool_state,
@@ -1689,8 +1727,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tools = request._tool_state.chat_tools
         name = choice["name"]
         if "namespace" in choice:
-            # `tools` keeps conversion order, declared before discovered, so
-            # the last match is the member's latest definition.
+            # Recipe registers each distinct definition once, in conversion order, and
+            # an exact relist reuses it, so this forces the last registered one.
             member = (choice["namespace"], name)
             name = next(
                 (
@@ -1740,13 +1778,76 @@ class OpenAIServingResponses(OpenAIServingChat):
         ):
             request._called_tool_names[call_id] = name
 
-    def _stored_history(self, request: ResponsesRequest, output: list) -> list:
+    def _loaded_history(
+        self, request: ResponsesRequest
+    ) -> tuple[list[dict[str, Any]], list]:
+        """The tools the request shows up front, and its history with the tools of
+        each search result it adds defined; a stored result keeps the definitions
+        it loaded, whatever the request declares."""
         history = self._response_input_history(request)
-        if request._tool_state.chat_tools is not None:
-            # A continuation may drop the deferred declarations that a search
-            # result's name-only tools take their definitions from.
-            _, history = _defer_tool_loading(request.tools, history)
-        return history + self._replayed_output_items(request, output)
+        stored = len(self.msg_store.get(request.previous_response_id) or [])
+        tools, added = _defer_tool_loading(request.tools, history[stored:])
+        return tools, history[:stored] + added
+
+    @staticmethod
+    def _stored_calls_error(
+        calls: dict[str, _StoredCall], prompt: NativePrompt
+    ) -> Optional[str]:
+        """Why a stored namespace member call no longer stands for what the model
+        called: recipe names a member's definitions in conversion order, so other
+        tools can move a name. A call the client sends back carries no such record
+        and binds by its name alone."""
+        definitions = {tool.function.name: tool.function for tool in prompt.tools}
+        offered = set(prompt.namespace_names.values())
+        for call in calls.values():
+            member = prompt.namespace_names.get(call.name)
+            if member is None:
+                # The member is gone like any tool a continuation stops offering.
+                if call.member not in offered:
+                    continue
+                problem = "no longer load under that name"
+            elif member != call.member:
+                problem = f"give to {'.'.join(member)}"
+            elif _json_identity(
+                definitions.get(call.name, call.definition)
+            ) != _json_identity(call.definition):
+                problem = "give a different definition"
+            else:
+                continue
+            return (
+                f"The stored response called {'.'.join(call.member)} as "
+                f"{call.name!r}, which this request's tools and search results "
+                f"{problem}; declare the tools the call was made with"
+            )
+        return None
+
+    def _store_history(self, request: ResponsesRequest, output: list) -> None:
+        """Store what a continuation of the response replays: the history and
+        stored calls the request continued, as it first read them, and `output`.
+        A response it continued while that one ran adds nothing on completing, and
+        an earlier response of the same id leaves nothing behind."""
+        if request._continued is None:
+            request._continued = (
+                self._response_input_history(request),
+                self.call_store.get(request.previous_response_id) or {},
+            )
+        history, calls = request._continued
+        calls = dict(calls)
+        definitions = {
+            tool.function.name: tool.function
+            for tool in request._tool_state.chat_tools or []
+        }
+        for call_id, name in request._called_tool_names.items():
+            member = request._tool_state.names[name]
+            calls[call_id] = _StoredCall(
+                name=name,
+                member=(member["namespace"], member["name"]),
+                definition=definitions[name],
+            )
+        self.msg_store[request.request_id] = history + self._replayed_output_items(
+            request, output
+        )
+        self.call_store[request.request_id] = calls
 
     @staticmethod
     def _replayed_output_items(request: ResponsesRequest, output: list) -> list[dict]:
@@ -1764,11 +1865,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _custom_tool_names(request: ResponsesRequest) -> set[str]:
-        declared = custom_tool_names(request.tools)
+        tools = request.tools
         if request._tool_state.chat_tools is not None:
             # A deferred declaration counts once a search result has loaded it.
-            declared -= {tool.name for tool in request.tools if tool.defer_loading}
-        return declared | request._tool_state.discovered_custom_names
+            tools = [tool for tool in tools if not tool.defer_loading]
+        return custom_tool_names(tools) | request._tool_state.discovered_custom_names
 
     @staticmethod
     def _client_tool_search(request: ResponsesRequest) -> bool:
@@ -3449,9 +3550,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stored = self.response_store.get(final_response.id)
                 if stored is None or stored.status != "cancelled":
                     self.response_store[final_response.id] = final_response
-                    self.msg_store[final_response.id] = self._stored_history(
-                        request, final_response.output
-                    )
+                    self._store_history(request, final_response.output)
 
         yield _send_event(
             ResponsesLifecycleEvent(
