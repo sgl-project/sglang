@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    model_config_of,
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 @_register_for(
     "InklingForConditionalGeneration",
+    "Inkling2ForConditionalGeneration",
     "InklingForConditionalGenerationMTP",
 )
 def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -33,6 +35,33 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
 
     overrides: Dict[str, Any] = {}
+    if "Inkling2ForConditionalGeneration" in hf_config.architectures:
+        if cfg.tool_call_parser is None:
+            overrides["tool_call_parser"] = "inkling2"
+        if cfg.reasoning_parser is None:
+            overrides["reasoning_parser"] = "inkling"
+        moe_ranks = cfg.tp_size // cfg.moe_dp_size
+        # On SM100 / SM103 / SM107, quantized experts above the routed-kernel batch
+        # run only on MegaMoE at full speed.
+        if (
+            cfg.moe_a2a_backend == "none"
+            and moe_ranks > 1
+            and get_platform().is_cuda
+            and get_platform().device_sm in (100, 103, 107)
+            and not cfg.encoder_only
+            and not (cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap)
+            and model_config_of(server_args).quantization == "inkling2"
+        ):
+            overrides["moe_a2a_backend"] = "megamoe"
+        # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
+        # the scheduler-side attn-TP gather would only pad batches to attn_tp_size.
+        megamoe = overrides.get("moe_a2a_backend", cfg.moe_a2a_backend) == "megamoe"
+        if megamoe and cfg.attn_dp_size == 1:
+            overrides["disable_attn_tp_gather"] = True
+        # NVFP4 experts need expert parallelism. ep_size == 1 is the field
+        # default; any other value is the user's and wins.
+        if cfg.ep_size == 1 and moe_ranks > 1:
+            overrides["ep_size"] = moe_ranks
     # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
     # resolved in __post_init__ before declarations are materialized, so a
     # cuda_graph_backend_prefill declared here lands too late (the breakable
