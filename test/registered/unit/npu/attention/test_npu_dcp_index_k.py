@@ -13,10 +13,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestNpuDcpIndexK(unittest.TestCase):
     def test_kimi_k31_dcp_requires_sharded_index_k(self):
-        parallel = SimpleNamespace(attn_dcp_size=2, attn_cp_size=1)
-        disagg = SimpleNamespace(
-            disaggregation_mode="null", enable_pd_role_switch=False
-        )
+        parallel = SimpleNamespace(attn_dcp_size=2)
         kvc = SimpleNamespace(
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(
@@ -24,26 +21,20 @@ class TestNpuDcpIndexK(unittest.TestCase):
                 )
             ),
             is_draft_worker=False,
-            use_mla_backend=True,
-            mambaish_config=object(),
             kv_cache_dtype=torch.bfloat16,
-            modelslim_cache_layout=None,
         )
         scored_indexer = Mock(return_value=None)
         with patch.multiple(
             pool_configurator,
             get_parallel=lambda: parallel,
-            get_memory=lambda: SimpleNamespace(
-                enable_hierarchical_cache=False, enable_hisparse=False
-            ),
-            get_disagg=lambda: disagg,
+            get_memory=lambda: SimpleNamespace(enable_hisparse=False),
             get_scored_indexer=scored_indexer,
         ):
             with self.assertRaisesRegex(RuntimeError, "scored lightning_indexer_v2"):
                 pool_configurator.resolve_kimi_k31_index_k_sharding(kvc)
             scored_indexer.return_value = object()
             self.assertTrue(pool_configurator.resolve_kimi_k31_index_k_sharding(kvc))
-            disagg.disaggregation_mode = "decode"
+            kvc.kv_cache_dtype = torch.float8_e4m3fn
             with self.assertRaisesRegex(ValueError, "requires sharded Index-K"):
                 pool_configurator.resolve_kimi_k31_index_k_sharding(kvc)
             parallel.attn_dcp_size = 1

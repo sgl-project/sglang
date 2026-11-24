@@ -7,7 +7,7 @@ import torch
 from sglang.srt.configs.model_config import get_dsa_index_kpool, is_kimi_k31
 from sglang.srt.hardware_backend.npu.attention.dsa_index_k import get_scored_indexer
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
-from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -20,24 +20,14 @@ def resolve_kimi_k31_index_k_sharding(kvc: KVCacheConfigurator) -> bool:
     if kvc.is_draft_worker or parallel.attn_dcp_size <= 1 or not is_kimi_k31(hf_config):
         return False
 
-    memory = get_memory()
-    disagg = get_disagg()
     if (
-        not kvc.use_mla_backend
-        or kvc.mambaish_config is None
+        kvc.kv_cache_dtype != torch.bfloat16
         or get_dsa_index_kpool(hf_config) != 1
-        or parallel.attn_cp_size > 1
-        or kvc.kv_cache_dtype != torch.bfloat16
-        or kvc.modelslim_cache_layout is not None
-        or disagg.disaggregation_mode != "null"
-        or disagg.enable_pd_role_switch
-        or memory.enable_hierarchical_cache
-        or memory.enable_hisparse
+        or get_memory().enable_hisparse
     ):
         raise ValueError(
-            "Ascend Kimi K3.1 DCP requires sharded Index-K with hybrid MLA, "
-            "index_kpool=1, BF16 KV, and unified serving without prefill CP, "
-            "PD role switching, HiCache, or HiSparse."
+            "Ascend Kimi K3.1 DCP requires sharded Index-K with BF16 KV "
+            "and index_kpool=1, without the HiSparse KV pool."
         )
     if get_scored_indexer() is None:
         raise RuntimeError(
