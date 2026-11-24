@@ -134,6 +134,7 @@ class TestBoundedLPM(CustomTestCase):
         s.enable_priority_scheduling = False
         s.schedule_low_priority_values_first = False
         s.dllm_config = None
+        s.chunked_prefill_size = None
         s.init_schedule_policy()
         s.policy._should_start_bounded_batch = lambda waiting: True
         self.assertIsNone(s.waiting_queue._on_leave)

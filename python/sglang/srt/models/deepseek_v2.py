@@ -270,6 +270,7 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
         init_modelslim_mla_kv,
+        prepare_dcp_extend_metadata_npu,
     )
 else:
     pass
@@ -2983,6 +2984,28 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return (hidden_states, topk_indices)
 
+    def forward_kv_only(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Write this layer's KV cache for the batch's tokens; no attention or MLP."""
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=self._resolve_gfx95_quant_format(),
+        )
+        try:
+            self.self_attn.forward_kv_only(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
+
     def op_comm_prepare_attn(
         self,
         state,
@@ -3626,7 +3649,22 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu or is_deepseek_dsa(self.config):
+        if _is_npu:
+            return prepare_dcp_extend_metadata_npu(
+                self,
+                seq_lens=seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens_sum=seq_lens_sum,
+                kv_buffer_shape=kv_buffer_shape,
+                kv_cache_dtype=kv_cache_dtype,
+                kv_cache_device=kv_cache_device,
+                create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            )
+        if is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

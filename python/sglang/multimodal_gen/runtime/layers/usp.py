@@ -10,6 +10,9 @@ import torch.distributed as dist
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+    flashinfer_ulysses,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -17,7 +20,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
 SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
@@ -121,10 +123,10 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
             IPC_A2A_MULTI,
-            ipc_a2a_multi_ready,
+            plain_exchange_ready,
         )
 
-        if ipc_a2a_multi_ready(ulysses_pg):
+        if plain_exchange_ready(ulysses_pg, x.numel() * x.element_size()):
             world_size = torch.distributed.get_world_size(group=ulysses_pg)
             received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
             if received is not None:
@@ -368,6 +370,13 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange(
+            x, get_sp_group().ulysses_group, scatter=True, head_dim=head_dim
+        )
+        if fast is not None:
+            return fast
+
     if world_size == 2 and head_dim == 2:
         fast = _ipc_varlen_fast(x, [x.shape[1], x.shape[1]], 2, "input")
         if fast is not None:
@@ -420,6 +429,11 @@ def _usp_input_all_to_all_packed_qkv(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
+
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange_qkv(q, k, v, get_sp_group().ulysses_group)
+        if fast is not None:
+            return fast
 
     assert q.ndim == 3 and q.shape == k.shape == v.shape
     s_local, h_global, head_size = q.shape
@@ -576,6 +590,11 @@ def _usp_input_all_to_all_qkv(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
+
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange_qkv(q, k, v, get_sp_group().ulysses_group)
+        if fast is not None:
+            return fast
     if not _can_use_packed_qkv_a2a_4d(q, k, v, world_size):
         return (
             _usp_input_all_to_all(q, head_dim=2),
@@ -637,6 +656,14 @@ def _usp_input_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if (
+        flashinfer_ulysses.enabled()
+        and len(seq_lens) == world_size
+        and len(set(seq_lens)) == 1
+        and x.shape[3 - head_dim] == seq_lens[0]
+    ):
+        return _usp_input_all_to_all(x, head_dim=head_dim)
 
     if world_size == 2:
         fast = _ipc_varlen_fast(x, seq_lens, head_dim, "input")
@@ -716,6 +743,13 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange(
+            x, get_sp_group().ulysses_group, scatter=False, head_dim=head_dim
+        )
+        if fast is not None:
+            return fast
+
     if world_size == 2 and head_dim == 2 and x.shape[1] % 2 == 0:
         half_len = x.shape[1] // 2
         fast = _ipc_varlen_fast(x, [half_len, half_len], 2, "output")
@@ -781,6 +815,14 @@ def _usp_output_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if (
+        flashinfer_ulysses.enabled()
+        and len(seq_lens) == world_size
+        and len(set(seq_lens)) == 1
+        and x.shape[3 - head_dim] == seq_lens[0] * world_size
+    ):
+        return _usp_output_all_to_all(x, head_dim=head_dim)
 
     if world_size == 2:
         fast = _ipc_varlen_fast(x, seq_lens, head_dim, "output")
@@ -905,10 +947,6 @@ def ring_attn(
         output = torch.permute(output, [0, 2, 1, 3])
         return output, softmax_lse, *rest
 
-    # Starting from torch 2.6.0, _templated_ring_attention expects an integer
-    # segment_id for the attention function.
-    use_segment_id = torch_release >= (2, 6)
-
     attn_kwargs = dict(
         op=attn_callable_adapter,
         dropout_p=dropout_p,
@@ -919,17 +957,7 @@ def ring_attn(
         group=ring_pg,  # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
     )
 
-    if use_segment_id:
-        # For torch >= 2.6, segment_id is required. The value '1' is a placeholder
-        # as we are not using complex segmentation features.
-        out, lse, *_ = _templated_ring_attention(
-            seq_dim=1,  # segment_id
-            **attn_kwargs,
-        )
-    else:
-        out, lse, *_ = _templated_ring_attention(
-            **attn_kwargs,
-        )
+    out, lse, *_ = _templated_ring_attention(seq_dim=1, **attn_kwargs)
 
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])

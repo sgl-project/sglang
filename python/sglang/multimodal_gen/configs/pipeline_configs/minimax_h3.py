@@ -39,6 +39,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     # generic TI2V image resize would both duplicate that work and overwrite
     # the already-resolved target canvas.
     skip_input_image_preprocess: bool = True
+    # How fl2va keyframes reach the target canvas: "stretch" resizes the first
+    # keyframe directly (followers cover-crop); "source_crop" center-crops
+    # every keyframe to the canvas aspect at source resolution, then resizes.
+    keyframe_fit: str = "stretch"
+    # Cut the decoded soundtrack to the video's duration. The audio latents
+    # cover whole hops, so the raw waveform runs a few hundred samples long.
+    trim_audio_to_video: bool = False
     native_only_components: tuple[str, ...] = (
         "text_encoder",
         "transformer",
@@ -89,9 +96,20 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
+            # --model-variant fl2va+ref2va loads a second DiT of the same size
+            dit_weight_gb=61.73,
             auto_enable_cfg_parallel=False,
             supports_cfg_parallel=False,
         )
+
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+            MINIMAX_H3_DUAL_VARIANT,
+        )
+
+        variant = str(server_args.model_variant or "").strip().lower()
+        # the Ref2VA DiT of a fl2va+ref2va server
+        return ("transformer_2",) if variant == MINIMAX_H3_DUAL_VARIANT else ()
 
     @staticmethod
     def _server_arg_value(value):
@@ -379,6 +397,10 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
             'Use quality="exact", or the default "lossless".'
         )
 
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        # one partition; validate_server_args rejects --model-variant
+        return ()
+
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
             raise ValueError(
@@ -444,6 +466,11 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
 @dataclass
 class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
     """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
+
+    # Pika's reference pipeline center-crops keyframes before resizing.
+    keyframe_fit: str = "source_crop"
+    # Pika's reference audio decode step trims to the video's duration.
+    trim_audio_to_video: bool = True
 
     def validate_server_args(self, server_args) -> None:
         # A BF16 merge rounds away about a third of the adapters' update (by
