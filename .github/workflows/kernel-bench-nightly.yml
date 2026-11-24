@@ -1,0 +1,130 @@
+name: Kernel Bench Nightly
+
+# Runs every marker-based JIT kernel benchmark suite with full ranges on the
+# runner it is registered for, uploads the records, and publishes a per-GPU
+# baseline (median of recent nightlies) that PR runs compare against
+# (pr-test-jit-kernel.yml, kernel-bench-compare).
+on:
+  schedule:
+    - cron: '30 15 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: kernel-bench-nightly
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+
+jobs:
+  runners:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      runs_on_map: ${{ steps.map.outputs.runs_on_map }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci
+      - id: map
+        run: |
+          python3 -c 'import yaml' 2>/dev/null ||
+            python3 -m pip install --disable-pip-version-check pyyaml
+          python3 scripts/ci/runner_configs.py --map 4-gpu-b200 >> "$GITHUB_OUTPUT"
+
+  bench:
+    name: kernel-bench-${{ matrix.runner_config }}
+    needs: runners
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_config: 1-gpu-small
+            suites: base-b-kernel-benchmark-test-1-gpu-small
+          - runner_config: 1-gpu-large
+            suites: base-b-kernel-benchmark-test-1-gpu-large
+          # The nightly-only B200 benchmarks are too slow for every PR; record them here.
+          - runner_config: 1-gpu-b200
+            suites: base-b-kernel-benchmark-test-1-gpu-b200,nightly-test-4-gpu-b200
+    runs-on: ${{ fromJson(needs.runners.outputs.runs_on_map)[matrix.runner_config] }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ''
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run benchmarks (full ranges)
+        # Cold JIT caches roughly double the warm time.
+        timeout-minutes: 150
+        env:
+          SGLANG_JIT_BENCHMARK_FORCE_FULL: true
+          SGLANG_JIT_BENCHMARK_RUN_KIND: nightly
+        run: |
+          export SGLANG_JIT_BENCHMARK_OUTPUT="$GITHUB_WORKSPACE/kernel-bench-out"
+          # Only marker benchmarks write records; legacy ones would run full ranges for nothing.
+          grep -rl --include='bench_*.py' '@marker.benchmark' test/registered/kernels/benchmark \
+            > "$RUNNER_TEMP/marker-benchmarks.txt"
+          cd test/
+          python3 run_suite.py --hw cuda \
+            --suite ${{ matrix.suites }} \
+            --only-file-list "$RUNNER_TEMP/marker-benchmarks.txt" --continue-on-error
+
+      - name: Upload records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bench-records-${{ matrix.runner_config }}
+          path: kernel-bench-out/
+          retention-days: 30
+          if-no-files-found: ignore
+          overwrite: true
+
+  baseline:
+    needs: bench
+    # A partial nightly still refreshes the GPUs that did run.
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci/utils
+
+      - name: Download this run's records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kernel-bench-records-*
+          path: records/current/
+
+      - name: Download recent nightly records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/ci/utils/fetch_kernel_bench_artifacts.sh \
+            --workflow kernel-bench-nightly.yml --pattern 'kernel-bench-records-*' \
+            --limit 6 --exclude-run "${{ github.run_id }}" --out records/history
+
+      - name: Build baseline
+        run: |
+          python3 scripts/ci/utils/kernel_bench_baseline.py build \
+            --inputs records/current records/history --window 7 \
+            --out kernel-bench-baseline/baseline.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bench-baseline
+          path: kernel-bench-baseline/
+          retention-days: 90
