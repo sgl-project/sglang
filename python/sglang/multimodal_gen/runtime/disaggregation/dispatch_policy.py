@@ -11,10 +11,6 @@ class DispatchPolicy(abc.ABC):
             raise ValueError(f"num_instances must be >= 1, got {num_instances}")
         self._num_instances = num_instances
 
-    @property
-    def num_instances(self) -> int:
-        return self._num_instances
-
     @abc.abstractmethod
     def select_with_capacity(self, free_slots: list[int]) -> int | None:
         """Select an instance that has free capacity, or None if all full."""

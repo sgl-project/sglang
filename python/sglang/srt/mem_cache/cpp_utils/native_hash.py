@@ -40,7 +40,14 @@ def _load_native_hash_module() -> Any:
             with_cuda=False,
         )
     except Exception as exc:
-        raise RuntimeError("Failed to load HiCache native hash extension") from exc
+        raise RuntimeError(
+            "Failed to build or load the HiCache native hash extension; it needs "
+            "OpenSSL headers and libcrypto (e.g. apt-get install libssl-dev)."
+        ) from exc
+
+
+def ensure_native_hash() -> None:
+    _load_native_hash_module()
 
 
 def _native_hash_input(token_ids: Any) -> tuple[array, int, int, bool]:

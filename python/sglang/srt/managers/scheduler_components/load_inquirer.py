@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -34,7 +33,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
-    server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
@@ -143,6 +141,12 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        # A chunked request is in no queue, so count the part of its prompt not yet
+        # in num_used_tokens; prefix_len lags the chunk just run until the next pass.
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            held = max(chunked_req.prefix_len, chunked_req.kv.kv_allocated_len)
+            num_total_tokens += max(0, chunked_req.seqlen - held)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
@@ -184,6 +188,7 @@ class SchedulerLoadInquirer:
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
         num_prealloc_ready_tokens = 0
+        decode_host_pool_blocked = decode_host_staged_landed = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP])
@@ -193,13 +198,20 @@ class SchedulerLoadInquirer:
             decode_prealloc = len(lists[ListKind.PD_PREALLOC])
             decode_transfer = len(lists[ListKind.PD_RECEIVING])
             decode_retracted = len(lists[ListKind.PD_RETRACTED])
+            prealloc_queue = self.get_disagg_decode_prealloc_queue()
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue.items()
+                for decode_req in prealloc_queue.queue.items()
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)
             num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
+            decode_host_pool_blocked = int(
+                prealloc_queue.host_pool_blocked and decode_prealloc_ready > 0
+            )
+            decode_host_staged_landed = (
+                prealloc_queue.transfer_queue.num_host_staged_landed
+            )
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,
@@ -209,6 +221,8 @@ class SchedulerLoadInquirer:
             decode_retracted_queue_reqs=decode_retracted,
             kv_transfer_speed_gb_s=stats.kv_transfer_speed_gb_s,
             kv_transfer_latency_ms=stats.kv_transfer_latency_ms,
+            decode_host_pool_blocked=decode_host_pool_blocked,
+            decode_host_staged_landed_reqs=decode_host_staged_landed,
         )
 
         queues = QueueMetrics(

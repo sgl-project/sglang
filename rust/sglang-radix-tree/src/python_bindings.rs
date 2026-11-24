@@ -1816,6 +1816,16 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            /// Whether an auxiliary component has device data missing from host.
+            fn needs_incremental_component_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                py.detach(|| self.core().needs_incremental_component_backup(node_id))
+                    .map_err(node_access_error)
+            }
+
             /// Whether the node is a (default or named) root.
             fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().is_root(node_id))
@@ -3244,6 +3254,15 @@ macro_rules! tree_core_binding {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
+            }
+
+            /// Whether an auxiliary component has device data missing from host.
+            fn needs_incremental_component_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.needs_incremental_component_backup(py, node_id))
             }
 
             /// Whether the node is a (default or named) root.

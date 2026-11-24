@@ -38,9 +38,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.cpp_utils.native_hash import ensure_native_hash
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
     namespace_digest,
@@ -265,6 +267,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Monotonic; read by the scheduler thread in _drain_backup to time the
+        # enqueue-to-ack span of L2->L3 writes.
+        self.enqueue_time = time.perf_counter()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -458,6 +463,7 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        self.forward_on_fence_stream = False
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -696,9 +702,14 @@ class HiCacheController:
                 "The page_unified host layout requires unified storage keys "
                 "to distinguish its byte order."
             )
-        if key_scheme == "unified" and storage_backend != "file":
+        if (
+            key_scheme == "unified"
+            and storage_backend not in UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
+        ):
             raise NotImplementedError(
-                "The unified key scheme supports only the file storage backend."
+                f"The unified key scheme supports the "
+                f"{', '.join(UNIFIED_KEY_SCHEME_STORAGE_BACKENDS)} storage "
+                f"backends; got {storage_backend!r}."
             )
         if get_parallel().attn_dcp_size > 1:
             if self.host_memory_mode == "buffer_only":
@@ -730,6 +741,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a generic MLA page layout."
                 )
+        # Storage page keys come from the native hash extension;
+        # load it before creating the backend, so attach raises if it cannot build.
+        ensure_native_hash()
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -958,11 +972,7 @@ class HiCacheController:
             # Keep each key paired with its byte span instead of slicing pages
             # consecutively in key order.
             layout = self.storage_host_pool.page_unified_layout
-            unified_chunk_spans = [
-                layout.chunk_span(layer_range, head_group)
-                for layer_range in unified_plan.layer_ranges
-                for head_group in range(unified_plan.head_group_num)
-            ]
+            unified_chunk_spans = unified_plan.chunk_spans(layout)
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -1039,14 +1049,6 @@ class HiCacheController:
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
-        # The pool was sized from the same server arg before any backend
-        # attached; if the two disagree the objects would not match their keys.
-        pool_groups = getattr(host_pool, "head_group_num", 1)
-        if plan.head_group_num != pool_groups:
-            raise ValueError(
-                f"the unified plan cuts {plan.head_group_num} head groups but "
-                f"the host pool was allocated with {pool_groups}."
-            )
         logger.info(
             "HiCache unified L3 keys: namespace=%s chunks=%s",
             namespace_digest(plan.namespace),
