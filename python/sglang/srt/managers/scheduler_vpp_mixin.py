@@ -24,9 +24,13 @@ from sglang.srt.utils import DynamicGradMode
 
 
 def _snapshot_tensors(tensors: dict) -> dict:
-    # Model outputs can alias workspaces reused by the next virtual stage.
+    # Eager outputs and exported source pages own storage. Only backend index
+    # and candidate metadata can be overwritten by the next virtual stage.
     return {
-        key: value.clone() if isinstance(value, torch.Tensor) else value
+        key: value.clone()
+        if isinstance(value, torch.Tensor)
+        and key.startswith(("vpp_index_", "vpp_candidate_"))
+        else value
         for key, value in tensors.items()
     }
 
@@ -482,7 +486,12 @@ class SchedulerVPPMixin(SchedulingVPPCore):
                 result.extend_logprob_start_len_per_req = (
                     batch.extend_logprob_start_lens if batch.return_logprob else None
                 )
-                tensors = _snapshot_tensors(self._pp_prepare_tensor_dict(result, batch))
+                tensors = (
+                    self._pp_prepare_tensor_dict(result, batch)
+                    if self.attn_tp_group.rank_in_group == 0
+                    else None
+                )
+                tensors = self.attn_tp_group.broadcast_tensor_dict(tensors, src=0)
                 tensors["vpp_batch_seq"] = action.batch_seq
             else:
                 if result.pp_hidden_states_proxy_tensors is None:

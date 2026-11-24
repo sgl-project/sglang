@@ -27,7 +27,7 @@ from sglang.srt.distributed.vpp_policy import (
 from sglang.srt.distributed.vpp_transport import P2PWorkGroup
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
-from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin
+from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin, _snapshot_tensors
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -2077,6 +2077,32 @@ class TestSchedulerVPP(CustomTestCase):
 
 
 class TestNativeVPPAdapter(CustomTestCase):
+    def test_snapshot_preserves_owned_outputs_and_freezes_reused_metadata(self):
+        hidden = torch.arange(6).reshape(2, 3)
+        source = torch.arange(8)
+        index = torch.tensor([1, 2])
+        candidate = torch.tensor([3, 4])
+        snapshot = _snapshot_tensors(
+            {
+                "hidden_states": hidden,
+                "vpp_source_kv": source,
+                "vpp_index_positions": index,
+                "vpp_candidate_blocks": candidate,
+                "stage": 2,
+            }
+        )
+        index.fill_(99)
+        candidate.fill_(99)
+        torch.testing.assert_close(
+            snapshot["vpp_index_positions"], torch.tensor([1, 2])
+        )
+        torch.testing.assert_close(
+            snapshot["vpp_candidate_blocks"], torch.tensor([3, 4])
+        )
+        self.assertIs(snapshot["hidden_states"], hidden)
+        self.assertIs(snapshot["vpp_source_kv"], source)
+        self.assertEqual(snapshot["stage"], 2)
+
     def test_physical_last_rank_samples_only_at_global_final_stage(self):
         """The last physical rank's earlier passes must return activations."""
         samples = []
@@ -2259,7 +2285,7 @@ class TestNativeVPPAdapter(CustomTestCase):
         self.assertFalse(pending)
 
     def test_virtual_passes_retain_sampling_rows_and_snapshot_shared_outputs(self):
-        """Pool-row and model-workspace reuse must not alter an earlier batch."""
+        """Pool-row and backend metadata reuse must not alter an earlier batch."""
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.penalties import PenaltyStatusPool
         from sglang.srt.sampling.sampler_params import SamplerParamsPool
@@ -2327,13 +2353,17 @@ class TestNativeVPPAdapter(CustomTestCase):
             workspace.fill_(seq + vpp_stage_id)
             return SimpleNamespace(
                 pp_hidden_states_proxy_tensors=PPProxyTensors(
-                    {"hidden_states": workspace}
+                    {
+                        "hidden_states": workspace.clone(),
+                        "vpp_index_positions": workspace,
+                    }
                 )
             )
 
-        def send(tensors, *, async_send, tag):
+        def send(tensors, *, async_send, tag, all_gather_group, batch_p2p):
             self.assertTrue(async_send)
             self.assertEqual(tag, 1)
+            self.assertTrue(batch_p2p)
             sent.append(tensors)
             return []
 
@@ -2356,6 +2386,7 @@ class TestNativeVPPAdapter(CustomTestCase):
             forward_stream=stream,
             schedule_stream=stream,
             future_map=None,
+            attn_tp_group=SimpleNamespace(rank_in_group=0, world_size=4),
             device_module=SimpleNamespace(Event=Event, current_stream=lambda: stream),
             tp_worker=SimpleNamespace(
                 model_runner=object(),
@@ -2400,6 +2431,7 @@ class TestNativeVPPAdapter(CustomTestCase):
             self.assertEqual(build.call_count, 2)
         self.assertTrue(all(m.forward_done.recorded for m in scheduler.mb_metadata))
         self.assertEqual([t["hidden_states"].item() for t in sent], [0, 1, 2, 3])
+        self.assertEqual([t["vpp_index_positions"].item() for t in sent], [0, 1, 2, 3])
         self.assertEqual(calls[0][2], calls[2][2])
         self.assertEqual(calls[1][2], calls[3][2])
         self.assertNotEqual(calls[0][2], calls[1][2])
