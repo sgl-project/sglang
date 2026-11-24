@@ -2016,7 +2016,7 @@ class AscendAttnBackend(AttentionBackend):
             # DSA supplies indices that already encode causal visibility.
             output, _, _ = kv_quant_sparse_flash_attention(
                 query=q_nope,
-                query_rope=q_nope[..., :0],
+                query_rope=q_pe,
                 packed_kv=packed_kv.view(torch.uint8),
                 sparse_indices=topk_indices,
                 block_table=self.forward_metadata.block_tables,
