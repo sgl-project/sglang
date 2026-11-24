@@ -2233,6 +2233,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self._validate_unified_peer(decode_kv_args)
         except ValueError as exc:
             decode_kv_args.peer_layout_error = str(exc)
+        if not decode_kv_args.peer_layout_error:
+            decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+            )
+            if decode_kv_args.requires_dcp_relayout:
+                self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
         # Publish the validation result with the peer, including rejected peers
         # whose requests must fail before any KV, state, or aux writes.
         self.decode_kv_args_table[agent_name] = decode_kv_args
@@ -2243,11 +2249,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 decode_kv_args.peer_layout_error,
             )
             return
-        decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-            decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
-        )
-        if decode_kv_args.requires_dcp_relayout:
-            self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.check_peer_aux_buffer_count(
