@@ -85,7 +85,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
                 "TRANSFORMERS_VERBOSITY": "error",
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
                 **os.environ,
-                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )
@@ -162,7 +162,7 @@ class TestEplbMinRebalancingUtilizationThreshold095(
                 "TRANSFORMERS_VERBOSITY": "error",
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
                 **os.environ,
-                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )
