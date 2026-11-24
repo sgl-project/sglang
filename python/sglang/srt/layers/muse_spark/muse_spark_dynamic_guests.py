@@ -2,6 +2,7 @@
 the experts of busy ranks into staging slots over CUDA IPC."""
 
 import ctypes
+import functools
 import logging
 from typing import Sequence, Tuple
 
@@ -22,6 +23,7 @@ def maybe_prepare_dynamic_guests(layers: Sequence[torch.nn.Module]) -> None:
         not layers
         or group.world_size != _EP_SIZE
         or layers[0].global_num_experts != _EP_SIZE * layers[0].num_local_experts
+        or not tp_group_on_one_host(group)
     ):
         return
     if "expandable_segments:True" in torch._C._accelerator_getAllocatorSettings():
@@ -32,6 +34,22 @@ def maybe_prepare_dynamic_guests(layers: Sequence[torch.nn.Module]) -> None:
     setup = _Setup(layers, group.cpu_group, group.rank_in_group)
     for m in layers:
         m.dynamic_guest_setup = setup
+
+
+@functools.cache
+def tp_group_on_one_host(group) -> bool:
+    """Whether CUDA IPC handles and symmetric memory can map every rank of ``group``.
+
+    They open only on the host that created them, so a TP group split over hosts
+    (e.g. TP8 on two 4-GPU nodes) keeps the NCCL paths. A collective on the first
+    call: every rank must reach it in the same order.
+    """
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+    from sglang.srt.runtime_context import get_parallel
+
+    if group.world_size == 1 or get_parallel().nnodes == 1:
+        return True
+    return all(in_the_same_node_as(group.cpu_group, source_rank=0))
 
 
 class _Setup:
