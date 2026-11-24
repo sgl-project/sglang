@@ -11,6 +11,7 @@ export const config = {
   // No variant row: the page serves the Base checkpoints, so the HF slug is keyed on quant.
   matchDims: [
     { id: "quant", title: "Quantization", options: [
+      { id: "fp4",  label: "FP4"  },
       { id: "fp8",  label: "FP8"  },
       { id: "bf16", label: "BF16" },
     ] },
@@ -27,6 +28,9 @@ export const config = {
   ],
 
   modelNames: {
+    // FP4 is the Preview chat checkpoint (MXFP4 routed experts, SM100 only);
+    // FP8 / BF16 point at the Base checkpoints served through completions.
+    fp4:  "baidu/ERNIE-5.5-Flash-Preview",
     fp8:  "baidu/ERNIE-5.5-Flash-Base",
     bf16: "baidu/ERNIE-5.5-Flash-Base-BF16",
   },
@@ -223,6 +227,90 @@ export const config = {
         "--attn-dp-size 8",
         "--context-length 131072",
         "--max-running-requests 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // FP4 (Preview chat checkpoint): MXFP4 routed experts + FP8 activations (w4a8),
+    // SM100 only, ~155 GB. The experts run w4a8 through DeepGEMM MegaMoE, which needs
+    // expert parallelism, so FP4 uses the FP8 GPU counts. Without attention DP each rank
+    // prefills the whole chunk, so low-latency caps it at MegaMoE's default 8192 tokens per rank.
+    {
+      match: { hw: "b300", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "unverified",
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--ep 2",
+        "--moe-runner-backend deep_gemm",
+        "--moe-a2a-backend megamoe",
+        "--enable-fp4-indexer",
+        "--chunked-prefill-size 8192",
+        "--context-length 131072",
+        "--max-running-requests 256",
+        "--reasoning-parser ernie55",
+        "--tool-call-parser ernie55",
+        "--speculative-algorithm DSPARK",
+        "--enable-dp-lm-head",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verificationStatus: "unverified",
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--attn-dp-size 2",
+        "--ep 2",
+        "--moe-runner-backend deep_gemm",
+        "--moe-a2a-backend megamoe",
+        "--enable-fp4-indexer",
+        "--context-length 131072",
+        "--max-running-requests 256",
+        "--reasoning-parser ernie55",
+        "--tool-call-parser ernie55",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "unverified",
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep 4",
+        "--moe-runner-backend deep_gemm",
+        "--moe-a2a-backend megamoe",
+        "--enable-fp4-indexer",
+        "--chunked-prefill-size 8192",
+        "--context-length 131072",
+        "--max-running-requests 256",
+        "--reasoning-parser ernie55",
+        "--tool-call-parser ernie55",
+        "--speculative-algorithm DSPARK",
+        "--enable-dp-lm-head",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verificationStatus: "unverified",
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--attn-dp-size 4",
+        "--ep 4",
+        "--moe-runner-backend deep_gemm",
+        "--moe-a2a-backend megamoe",
+        "--enable-fp4-indexer",
+        "--context-length 131072",
+        "--max-running-requests 256",
+        "--reasoning-parser ernie55",
+        "--tool-call-parser ernie55",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
