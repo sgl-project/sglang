@@ -1180,6 +1180,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             takes_deferred_relay=lambda batch: False, flush_deferred_relay=lambda: None
         )
         scheduler.cur_batch_for_debug = None
+        scheduler.is_generation = True
         scheduler.last_batch = None
         scheduler.running_batch = None
         scheduler.tp_worker = SimpleNamespace(
@@ -1193,6 +1194,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             enable_overlap=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
+            reqs=[],
+            sampling_info=SimpleNamespace(set_plugin_state=lambda reqs: None),
         )
         scheduler.get_next_batch_to_run = lambda running_batch, last_batch: (
             SimpleNamespace(batch_to_run=batch, running_batch=running_batch)

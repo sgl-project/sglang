@@ -24,6 +24,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -31,6 +32,7 @@ from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
+    AttentionInputs,
     MHCState,
     SumGroup,
     TokenAxis,
@@ -53,6 +55,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -120,6 +123,7 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
+    get_forward,
     get_lora,
     get_mm,
     get_parallel,
@@ -1040,19 +1044,27 @@ class Glm5NextDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, capture=capture_output
         )
+        # LayerNorm SP keeps the residual and mHC on this rank's rows; attention
+        # and the FFN run on the gathered rows and hand back this rank's rows.
+        sp_active = get_forward().sp_active
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
-            prev_topk_indices=prev_topk_indices,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states, topk_indices = hidden_states
+        if sp_active:
+            hidden_states, topk_indices = self._run_attn_sp(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
         else:
-            topk_indices = None
+            hidden_states, topk_indices = self._run_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
+                prev_topk_indices=prev_topk_indices,
+            )
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1060,6 +1072,17 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
+
+        if sp_active:
+            hidden_states = layernorm_sp.run_replicated_token_rows(
+                hidden_states,
+                lambda full_rows: self.mlp(
+                    full_rows, forward_batch, gemm_output_zero_allocator
+                ),
+                output_is_tp_partial=self._sp_mlp_output_is_tp_partial(),
+                total_rows=positions.shape[-1],
+            )
+            return self.ffn_boundary.finish(hidden_states, forward_batch), topk_indices
 
         if (
             isinstance(self.mlp, Glm5NextMoE)
@@ -1082,6 +1105,56 @@ class Glm5NextDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return (hidden_states, topk_indices)
+
+    def _run_attn(self, **kwargs):
+        output = self.self_attn(**kwargs)
+        if isinstance(output, tuple):
+            return output
+        return output, None
+
+    def _run_attn_sp(
+        self,
+        *,
+        positions,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        prev_topk_indices,
+    ):
+        topk_indices = None
+
+        def attn_on_full_rows(full_rows):
+            nonlocal topk_indices
+            if not self.is_linear_attn:
+                # MLA reads its QKV latent from the boundary's cached input, which
+                # holds this rank's rows; point it at the gathered rows instead.
+                get_attn_tp_context().set_attn_inputs(
+                    AttentionInputs(
+                        full_rows, forward_batch, self.self_attn.prepare_qkv_latent
+                    )
+                )
+            output, topk_indices = self._run_attn(
+                positions=positions,
+                hidden_states=full_rows,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                input_on_attn_tp_slices=False,
+                prev_topk_indices=prev_topk_indices,
+            )
+            return output
+
+        hidden_states = layernorm_sp.run_replicated_token_rows(
+            hidden_states,
+            attn_on_full_rows,
+            output_is_tp_partial=True,
+            total_rows=positions.shape[-1],
+        )
+        return hidden_states, topk_indices
+
+    def _sp_mlp_output_is_tp_partial(self) -> bool:
+        if isinstance(self.mlp, Glm5NextMoE):
+            return not post_experts_output_is_complete(is_tp_path=True)
+        return not is_dense_ffn_fully_dp()
 
 
 class Glm5NextModel(nn.Module):

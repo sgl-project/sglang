@@ -1,7 +1,7 @@
 """FlashInfer KDA decode/verify wrapper.
 
 Wraps ``flashinfer.recurrent_kda`` (SM100+). KDA prefill uses a separate
-SM100/SM103-only adapter in ``kda_flashinfer_prefill``.
+SM100/SM103/SM107 adapter in ``kda_flashinfer_prefill``.
 
 Contract with the Triton KDA reference:
   - raw per-K gate ``a`` is activated in-kernel as
