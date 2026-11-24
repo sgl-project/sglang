@@ -527,10 +527,9 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            has_device_metadata = (
+            if self.use_fia and not (
                 self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
-            )
-            if self.dsa_dcp_target or (self.use_fia and not has_device_metadata):
+            ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
