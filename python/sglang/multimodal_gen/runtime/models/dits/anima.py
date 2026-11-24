@@ -246,12 +246,17 @@ class AnimaAttention(nn.Module):
             prefix=prefix,
         )
 
-    def forward(self, x, context=None, rope=None, attn_mask_meta=None):
+    def project_context_kv(self, context):
+        shape = (self.heads, self.head_dim)
+        k = self.to_k(context)[0].unflatten(-1, shape)
+        v = self.to_v(context)[0].unflatten(-1, shape)
+        return self.norm_k(k), v
+
+    def forward(self, x, context=None, rope=None, attn_mask_meta=None, context_kv=None):
         context = x if context is None else context
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        k = self.to_k(context)[0].unflatten(-1, (self.heads, self.head_dim))
-        v = self.to_v(context)[0].unflatten(-1, (self.heads, self.head_dim))
-        q, k = self.norm_q(q), self.norm_k(k)
+        q = self.norm_q(q)
+        k, v = self.project_context_kv(context) if context_kv is None else context_kv
         if rope is not None:
             q, k = _anima_rope(q, k, *rope)
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta).flatten(2)
@@ -310,6 +315,7 @@ class AnimaTransformerBlock(nn.Module):
         rope,
         attn_mask_meta=None,
         modulations=None,
+        context_kv=None,
     ):
         kw = {} if modulations is None else {"values": modulations[0]}
         x, gate = self.norm1(hidden_states, embedded_timestep, temb, **kw)
@@ -319,7 +325,9 @@ class AnimaTransformerBlock(nn.Module):
         kw = {} if modulations is None else {"values": modulations[1]}
         x, gate = self.norm2(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = _anima_residual_add(
-            hidden_states, self.attn2(x, context=encoder_hidden_states), gate
+            hidden_states,
+            self.attn2(x, context=encoder_hidden_states, context_kv=context_kv),
+            gate,
         )
         kw = {} if modulations is None else {"values": modulations[2]}
         x, gate = self.norm3(hidden_states, embedded_timestep, temb, **kw)
@@ -416,8 +424,45 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cached[id(self)] = (timestep, key, values)
         return values
 
+    def _text_kvs(self, source, context):
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or is_in_breakable_cuda_graph()
+            or is_device_stream_capturing(context.device)
+            or self.layerwise_offload_managers
+        ):
+            return None
+        req = get_forward_context().forward_batch
+        if req is None or not all(
+            type(block) is AnimaTransformerBlock
+            and "forward" not in vars(block)
+            and type(block.attn2) is AnimaAttention
+            and type(block.attn2.to_k) is ColumnParallelLinear
+            and type(block.attn2.to_v) is ColumnParallelLinear
+            for block in self.transformer_blocks
+        ):
+            return None
+        # Only the two fixed conditioning tensors live for the whole loop.
+        if req.prompt_embeds and source is req.prompt_embeds[0]:
+            branch = "positive"
+        elif req.negative_prompt_embeds and source is req.negative_prompt_embeds[0]:
+            branch = "negative"
+        else:
+            return None
+        cache = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault("anima_kv", {})
+        key = (id(self), branch)
+        entry = cache.get(key)
+        if entry is None or entry[0] is not source:
+            kvs = [block.attn2.project_context_kv(context) for block in self.transformer_blocks]
+            cache[key] = (source, kvs)
+            return kvs
+        return entry[1]
+
     def forward(self, hidden_states, encoder_hidden_states, timestep, **kwargs):
-        encoder_hidden_states = encoder_hidden_states.to(hidden_states.dtype)
+        source = encoder_hidden_states
+        encoder_hidden_states = source.to(hidden_states.dtype)
+        context_kvs = self._text_kvs(source, encoder_hidden_states)
         b, _, t, h, w = hidden_states.shape
         pt, ph, pw = self.config.patch_size
         if t % pt or h % ph or w % pw:
@@ -443,6 +488,8 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 if modulations is None
                 else {"modulations": modulations[3 * i : 3 * i + 3]}
             )
+            if context_kvs is not None:
+                kw["context_kv"] = context_kvs[i]
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
