@@ -793,12 +793,7 @@ def _h20_swapab_opt_out() -> bool:
         batch_invariant_or_deterministic,
     )
 
-    try:
-        return batch_invariant_or_deterministic()
-    except ValueError:
-        # No runtime context: a standalone FP8 linear (diffusion, unit construction)
-        # has no server to have enabled deterministic inference either.
-        return False
+    return batch_invariant_or_deterministic()
 
 
 def _is_h20() -> bool:

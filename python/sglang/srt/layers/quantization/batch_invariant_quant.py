@@ -45,9 +45,9 @@ def flashinfer_bi_quant_supported(device_index: int) -> bool:
 
 def flashinfer_bi_quant_device_ok(device: torch.device) -> bool:
     """The device side of `use_flashinfer_bi_quantizers`: the opt-out
-    ``SGLANG_DETERMINISTIC_FLASHINFER_QUANT=0`` is not set and ``device`` is a
+    ``SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS=0`` is not set and ``device`` is a
     CUDA device the batch-invariant kernels cover."""
-    if not envs.SGLANG_DETERMINISTIC_FLASHINFER_QUANT.get():
+    if not envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.get():
         return False
     if device.type != "cuda":
         return False

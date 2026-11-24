@@ -734,7 +734,9 @@ class TestFlashinferBatchInvariantMxfp8Dispatch(CustomTestCase):
         self.assertTrue(shape_ok(w, torch.bfloat16))
         self.assertTrue(shape_ok(w, torch.float16))
         self.assertFalse(shape_ok(w[:64], torch.bfloat16))
-        self.assertFalse(shape_ok(w[:, :96], torch.bfloat16))
+        self.assertFalse(
+            shape_ok(torch.empty(256, 96, dtype=torch.float8_e4m3fn), torch.bfloat16)
+        )
         self.assertFalse(shape_ok(w[:132], torch.bfloat16))
         self.assertFalse(shape_ok(w.t(), torch.bfloat16))
         self.assertFalse(shape_ok(w, torch.float32))

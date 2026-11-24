@@ -272,10 +272,16 @@ class TestBatchInvariantOps(CustomTestCase):
                 )
                 w_q, w_sf = mxfp8_quantize(weight, is_sf_swizzled_layout=True)
                 with set_batch_invariant_mode(True):
-                    with envs.SGLANG_DETERMINISTIC_FLASHINFER_QUANT.override(False):
+                    with (
+                        envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.override(
+                            False
+                        )
+                    ):
                         pinned = lin(x, w_q, w_sf, backend="cute-dsl", pin_tactic=True)
                     if opt_out:
-                        with envs.SGLANG_DETERMINISTIC_FLASHINFER_QUANT.override(False):
+                        with envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.override(
+                            False
+                        ):
                             out = lin(x, w_q, w_sf, backend="cute-dsl")
                             names = kernels(
                                 lambda: lin(x, w_q, w_sf, backend="cute-dsl")

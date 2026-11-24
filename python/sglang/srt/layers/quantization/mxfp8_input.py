@@ -5,7 +5,7 @@ from typing import NamedTuple, Tuple, Union
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_context, get_exec
 
 
 class Mxfp8SwizzledInput(NamedTuple):
@@ -60,11 +60,10 @@ def batch_invariant_or_deterministic() -> bool:
     """The batch-invariant mode or ``--enable-deterministic-inference``."""
     if is_batch_invariant_mode_enabled():
         return True
-    try:
-        exec_config = get_exec()
-    except ValueError:  # no published exec config (kernel tests, offline tools)
+    # Kernel tests and offline tools run without a published exec config.
+    if not get_context().is_config_namespace_published("exec"):
         return False
-    return exec_config.deterministic.enable_deterministic_inference
+    return get_exec().deterministic.enable_deterministic_inference
 
 
 def deepgemm_pair_takes_flashinfer() -> bool:
