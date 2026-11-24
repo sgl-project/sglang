@@ -511,5 +511,39 @@ class TestIntelXpuKDADispatch(CustomTestCase):
             )
 
 
+class TestQwen35PrefillViewGate(CustomTestCase):
+    def test_the_views_follow_the_resolved_prefill_kernel(self):
+        """Both --linear-attn-prefill-backend override directions.
+
+        The model's unpack choice reads the per-runner resolved prefill
+        backend, so the strided views move with whichever kernel runs extend:
+        an intel_xpu prefill override turns them on from a triton base, and a
+        triton prefill override turns them off from an intel_xpu base. A gate
+        answered from the base --linear-attn-backend leaf would freeze both.
+        """
+        from sglang.srt.layers.attention.linear.utils import LinearAttnBackends
+        from sglang.srt.models.qwen3_5 import _resolved_prefill_is_intel_xpu
+
+        def linear_backend(base, prefill):
+            return SimpleNamespace(
+                linear_attn_backends=LinearAttnBackends(
+                    decode=LinearAttnKernelBackend(base),
+                    prefill=LinearAttnKernelBackend(prefill),
+                    verify=LinearAttnKernelBackend(base),
+                )
+            )
+
+        # No override: an intel_xpu runner serves prefill itself.
+        self.assertTrue(
+            _resolved_prefill_is_intel_xpu(linear_backend("intel_xpu", "intel_xpu"))
+        )
+        self.assertFalse(
+            _resolved_prefill_is_intel_xpu(linear_backend("intel_xpu", "triton"))
+        )
+        self.assertTrue(
+            _resolved_prefill_is_intel_xpu(linear_backend("triton", "intel_xpu"))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
