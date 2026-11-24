@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 class EagleDraftRuntime:
     """Always-present dispatch for draft workers and their graph runners."""
 
+    def propose_chain(self, batch, forward_batch, shape_key=None):
+        return None
+
     def bind_draft_graphs(self, runner: Any) -> frozenset[int]:
         return frozenset()
 

@@ -22,8 +22,12 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
         req = batch.reqs[0] if len(batch.reqs) == 1 else None
         runner = self.worker.cuda_graph_runner
         backend = getattr(runner, "backend", None)
+        attention_backends = getattr(
+            getattr(self.worker, "draft_attn_backend", None), "attn_backends", None
+        )
+        attention = attention_backends[0] if attention_backends else None
         can_run = False
-        if not idle and hasattr(backend, "execute_draft_graph"):
+        if not idle and attention is not None and hasattr(backend, "execute_draft_graph"):
             can_run = (
                 not self.binding.pd_decode
                 or (
@@ -33,7 +37,7 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
                 )
             ) and self.binding.supports_decode(
                 batch, forward_batch, self.worker.hot_token_id
-            ) and backend.has_draft_graph()
+            ) and getattr(backend, "has_draft_graph", lambda: False)()
         # Every rank that entered this call has to vote, including idle ranks.
         if not all_admit(can_run):
             return None
@@ -51,7 +55,6 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
             seed.hidden_states,
             slots[: self.steps - 1],
         )
-        attention = self.worker.draft_attn_backend.attn_backends[0]
         with forward_context(
             ForwardContext(attn_backend=attention), forward_batch=forward_batch
         ):
