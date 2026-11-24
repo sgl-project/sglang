@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention import triton_backend
 from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
     TritonAttnBackend,
@@ -136,8 +137,11 @@ def test_eager_target_verify_uses_bonus_token_width():
 )
 @pytest.mark.parametrize("unset_width", (None, -1, 0))
 def test_graph_capture_and_padded_replay_use_bonus_token_width(
-    batch_size, raw_batch_size, unset_width
+    batch_size, raw_batch_size, unset_width, monkeypatch
 ):
+    # CPU tensors take the shared fill; ROCm's fused fill is a GPU kernel
+    # (test_verify_indptrs_matches_torch).
+    monkeypatch.setattr(triton_backend, "_is_hip", False)
     backend = _make_backend(batch_size)
     capture_spec = None
     if unset_width is not None:
@@ -164,7 +168,8 @@ def test_graph_capture_and_padded_replay_use_bonus_token_width(
 
 
 @pytest.mark.parametrize("with_spec_info", (False, True))
-def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
+def test_unified_target_verify_uses_resolved_metadata(with_spec_info, monkeypatch):
+    monkeypatch.setattr(triton_backend, "_is_hip", False)
     batch_size = 2
     backend = _RecordingTritonBackend.__new__(_RecordingTritonBackend)
     backend.device = torch.device("cpu")
@@ -216,6 +221,7 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
         sliding_window_size=16,
         scaling=0.5,
         xai_temperature_len=None,
+        out_dtype=None,
     )
     forward_batch = SimpleNamespace(
         batch_size=batch_size,

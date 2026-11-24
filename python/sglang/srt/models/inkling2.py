@@ -26,6 +26,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import inkling2_hip
 from sglang.srt.models.inkling_common.inkling2_attn import (
     AttentionSources,
     Inkling2Attention,
@@ -67,6 +68,7 @@ class Inkling2DecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.is_local = layer_id in config.local_layer_ids
+        self.fused_norms = get_platform().is_hip
         self.attn = Inkling2Attention(
             config, layer_id, self.is_local, prefix=add_prefix("attn", prefix)
         )
@@ -159,9 +161,16 @@ class Inkling2DecoderLayer(nn.Module):
             self._forward(state, positions, forward_batch, pass_idx, messages)
 
     def _forward(self, state, positions, forward_batch, pass_idx, messages):
-        attn_input = self._attention_input(
-            state.attention_input(self.layer_id), messages
-        )
+        # ROCm fuses the attention-residual read with the input norms; the loop's
+        # message mixing sits between the two, so a pass with messages takes the
+        # unfused path.
+        fused_norms = self.fused_norms and messages is None
+        if fused_norms:
+            attn_input = inkling2_hip.attention_input(self, state)
+        else:
+            attn_input = self._attention_input(
+                state.attention_input(self.layer_id), messages
+            )
         attention = self.attn(attn_input, positions, forward_batch, pass_idx=pass_idx)
         attention = self.attn_sconv(attention, positions, forward_batch)
         routed = forward_batch.forward_mode.is_decode() or (
@@ -175,15 +184,18 @@ class Inkling2DecoderLayer(nn.Module):
             if forward_batch.forward_mode.is_target_verify() or messages is not None
             else self.mlp.local_input_rows(tokens, combine=not routed)
         )
-        mlp_input = state.mlp_input(self.layer_id, attention, rows)
-        if messages is not None:
-            mlp_input = messages.mix(
-                self.layer_id - self.config.loop_core_layers.start,
-                (mlp_input,),
-                self.controller_weights,
-                "mlp",
-            )[0]
-        mlp_input = self.mlp_norm(mlp_input)
+        if fused_norms:
+            mlp_input = inkling2_hip.mlp_input(self, state, attention)
+        else:
+            mlp_input = state.mlp_input(self.layer_id, attention, rows)
+            if messages is not None:
+                mlp_input = messages.mix(
+                    self.layer_id - self.config.loop_core_layers.start,
+                    (mlp_input,),
+                    self.controller_weights,
+                    "mlp",
+                )[0]
+            mlp_input = self.mlp_norm(mlp_input)
         mlp = self.mlp(
             mlp_input,
             forward_batch,

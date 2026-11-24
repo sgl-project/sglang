@@ -1219,5 +1219,5 @@ def save_intermediate_conv_windows(
         BLOCK_D=BLOCK_D,
         PAD_SLOT_ID=PAD_SLOT_ID,
         USE_PDL=_PDL,
-        launch_pdl=_PDL,
+        **({"launch_pdl": True} if _PDL else {}),
     )
