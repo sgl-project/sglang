@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+import logging
+from collections import deque
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+import torch
 
 from sglang.srt.distributed.vpp_policy import (
     PipelineControlEnvelope,
     PipelineRankSchedule,
     PipelineWavefrontAction,
 )
+from sglang.srt.distributed.vpp_transport import P2PWorkGroup
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
@@ -16,6 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 _VPP_PROTOCOL_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 class SchedulingVPPCore:
@@ -189,3 +195,130 @@ class SchedulingVPPCore:
             raise RuntimeError(
                 f"VPP activation for batch/stage {key} is not ready"
             ) from None
+
+    def _pp_vpp_init_fixed_batch(
+        self: Scheduler,
+        max_inflight: int,
+    ) -> None:
+        self._pp_vpp_fixed_batch = True
+        self._pp_vpp_fixed_tp = True
+        if self._pp_vpp_fixed_tp and not self._pp_vpp_fixed_batch:
+            raise ValueError("SGLANG_VPP_FIXED_TP requires SGLANG_VPP_FIXED_BATCH=1")
+        if self._pp_vpp_fixed_batch:
+            if (
+                self.pp_group.world_size != 2
+                or self._vpp_layout.virtual_stages != 2
+                or max_inflight != 2
+            ):
+                raise ValueError(
+                    "SGLANG_VPP_FIXED_BATCH requires PP2/VPP2/max-inflight=2"
+                )
+            if self._pp_vpp_overlap_chunks:
+                raise ValueError(
+                    "SGLANG_VPP_FIXED_BATCH does not support overlapping chunks"
+                )
+            logger.info(
+                "VPP fixed batch scheduling enabled: two-batch waves, "
+                "activation manifests, cross-rank RESOURCE gate disabled"
+            )
+        self._pp_vpp_resource_control_enabled = not self._pp_vpp_fixed_batch
+        self._pp_vpp_fixed_wave = []
+        self._pp_vpp_fixed_second_pass = False
+        self._pp_vpp_fixed_received = deque()
+        self._pp_vpp_highest_admitted_batch_seq = -1
+        self._pp_vpp_pending_batch_controls = deque()
+        self._pp_vpp_fixed_activation_received = False
+        self._pp_vpp_round_check = True
+        self._pp_vpp_static_send_done = None
+        if self._pp_vpp_fixed_tp:
+            logger.info(
+                "VPP fixed TP scheduling enabled: local task selection, "
+                "scheduler-owned FIFO with GPU event fences, ordered send credits"
+            )
+
+    def _pp_vpp_fixed_next_task(
+        self: Scheduler,
+        rank_schedule: PipelineRankSchedule,
+    ) -> Optional[Tuple[int, int]]:
+        if self.pp_group.is_first_rank:
+            first_pass = sorted(
+                seq for seq, stage in rank_schedule.ready_tasks if stage == 0
+            )
+            if not self._pp_vpp_fixed_second_pass:
+                if first_pass:
+                    return (first_pass[0], 0)
+                if self._pp_vpp_fixed_wave:
+                    key = (
+                        self._pp_vpp_fixed_wave[0],
+                        self.pp_group.world_size,
+                    )
+                    # Admission was attempted before task selection. Drain a
+                    # partial wave once its second pass is ready, even if more
+                    # requests are waiting for bootstrap or local capacity.
+                    if key in self._pp_vpp_ready_proxies:
+                        self._pp_vpp_fixed_second_pass = True
+
+            if self._pp_vpp_fixed_second_pass:
+                if self._pp_vpp_fixed_wave:
+                    key = (
+                        self._pp_vpp_fixed_wave[0],
+                        self.pp_group.world_size,
+                    )
+                    if key in self._pp_vpp_ready_proxies:
+                        return key
+        elif self._pp_vpp_fixed_received:
+            return self._pp_vpp_fixed_received[0]
+        return None
+
+    def _pp_vpp_fixed_record_dispatch(
+        self: Scheduler,
+        action: PipelineWavefrontAction,
+        rank_schedule: PipelineRankSchedule,
+    ) -> None:
+        batch_seq = action.batch_seq
+        stage_id = action.stage_id
+        if self.pp_group.is_first_rank:
+            if stage_id == 0:
+                self._pp_vpp_fixed_wave.append(batch_seq)
+                if len(self._pp_vpp_fixed_wave) == rank_schedule.max_inflight:
+                    self._pp_vpp_fixed_second_pass = True
+            else:
+                if self._pp_vpp_fixed_wave.pop(0) != batch_seq:
+                    raise RuntimeError("fixed VPP second pass is out of order")
+                if not self._pp_vpp_fixed_wave:
+                    self._pp_vpp_fixed_second_pass = False
+
+        if stage_id > 0:
+            self._pp_vpp_fixed_received.remove((batch_seq, stage_id))
+
+    def _pp_vpp_fixed_wait_send_credit(
+        self: Scheduler,
+        pending_work: deque,
+        max_pending: int,
+    ) -> None:
+        """Release the oldest send before dispatch, independent of local polling."""
+        while len(pending_work) >= max_pending:
+            group = pending_work.popleft()
+            if not isinstance(group, (list, P2PWorkGroup)):
+                group.wait()
+                continue
+            items = group if isinstance(group, list) else group.items
+            with self.pp_comm_stream_ctx:
+                for item in items:
+                    if item.work is not None:
+                        item.work.wait()
+                    if isinstance(item.payload, torch.Tensor) and item.payload.is_cuda:
+                        # GPU wait inserts a stream dependency. Keep the storage
+                        # alive until that stream has finished reading it.
+                        item.payload.record_stream(self.device_module.current_stream())
+            items.clear()
+
+    def _pp_vpp_reap_send_work(self: Scheduler, pending_work: deque) -> None:
+        while pending_work:
+            work_group = pending_work[0]
+            if isinstance(work_group, list):
+                work_group = P2PWorkGroup(work_group)
+                pending_work[0] = work_group
+            if not work_group.poll():
+                return
+            pending_work.popleft()

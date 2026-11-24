@@ -21,6 +21,7 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineWavefrontAction,
 )
 from sglang.srt.distributed.vpp_schedule import VPPFixedSchedule
+from sglang.srt.distributed.vpp_transport import P2PWorkGroup
 from sglang.srt.managers import scheduler_vpp_wave_mixin as vpp_mod
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
 from sglang.srt.managers.scheduler_vpp_wave_mixin import SchedulerVPPMixin
@@ -136,7 +137,10 @@ class TestSchedulingVPPCore(CustomTestCase):
             _pp_vpp_fixed_batch=True,
             _pp_vpp_pending_recv=object(),
             pp_group=SimpleNamespace(
-                world_size=2, rank_in_group=rank, is_last_rank=rank == 1
+                world_size=2,
+                rank_in_group=rank,
+                is_first_rank=rank == 0,
+                is_last_rank=rank == 1,
             ),
             mbs=[object() if retained else None, None],
         )
@@ -154,6 +158,158 @@ class TestSchedulingVPPCore(CustomTestCase):
             "vpp_stage_id": stage,
             "hidden_states": torch.tensor([batch_seq]),
         }
+
+    def _fixed_scheduler(self, *, rank=0):
+        scheduler = self._scheduler(rank=rank)
+        scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
+        scheduler._pp_vpp_overlap_chunks = False
+        scheduler._pp_vpp_init_fixed_batch(2)
+        return scheduler
+
+    def test_fixed_wave_requires_the_supported_layout_and_capacity(self):
+        for pp_size, virtual_stages, inflight, overlap in (
+            (3, 2, 2, False),
+            (2, 3, 2, False),
+            (2, 2, 1, False),
+            (2, 2, 2, True),
+        ):
+            with self.subTest(
+                pp=pp_size, vpp=virtual_stages, inflight=inflight, overlap=overlap
+            ):
+                scheduler = self._scheduler()
+                scheduler.pp_group.world_size = pp_size
+                scheduler._vpp_layout = SimpleNamespace(virtual_stages=virtual_stages)
+                scheduler._pp_vpp_overlap_chunks = overlap
+                with self.assertRaises(ValueError):
+                    scheduler._pp_vpp_init_fixed_batch(inflight)
+
+    def test_full_fixed_wave_keeps_second_passes_in_dispatch_order(self):
+        """A later ready activation cannot overtake the wave's first batch."""
+        scheduler = self._fixed_scheduler()
+        scheduler._pp_vpp_slot_batch_seqs[1] = 1
+        schedule = PipelineRankSchedule(0, 2, 2, 2)
+        for seq in (0, 1):
+            schedule.admit(seq)
+            target = scheduler._pp_vpp_fixed_next_task(schedule)
+            self.assertEqual(target, (seq, 0))
+            action = schedule.dispatch(seq, *target)
+            scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+            schedule.complete(action)
+        scheduler._pp_vpp_accept_received_tensors(self._wire(batch_seq=1))
+        self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
+        scheduler._pp_vpp_accept_received_tensors(self._wire(batch_seq=0))
+        while scheduler._pp_vpp_arrivals:
+            schedule.mark_ready(*scheduler._pp_vpp_arrivals.popleft())
+        for seq in (0, 1):
+            target = scheduler._pp_vpp_fixed_next_task(schedule)
+            self.assertEqual(target, (seq, 2))
+            action = schedule.dispatch(seq + 2, *target)
+            scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+            schedule.complete(action)
+        self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
+        self.assertFalse(scheduler._pp_vpp_fixed_second_pass)
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
+        self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
+
+    def test_partial_fixed_wave_drains_when_its_activation_arrives(self):
+        """One admitted batch must finish even when a second cannot be admitted."""
+        scheduler = self._fixed_scheduler()
+        schedule = PipelineRankSchedule(0, 2, 2, 2)
+        schedule.admit(0)
+        action = schedule.dispatch(0, *scheduler._pp_vpp_fixed_next_task(schedule))
+        scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+        schedule.complete(action)
+        self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
+        scheduler._pp_vpp_accept_received_tensors(self._wire())
+        schedule.mark_ready(*scheduler._pp_vpp_arrivals.popleft())
+        target = scheduler._pp_vpp_fixed_next_task(schedule)
+        self.assertEqual(target, (0, 2))
+        action = schedule.dispatch(1, *target)
+        scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+        schedule.complete(action)
+        self.assertFalse(scheduler._pp_vpp_fixed_second_pass)
+        self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
+
+    def test_downstream_fixed_tasks_follow_receive_fifo(self):
+        scheduler = self._fixed_scheduler(rank=1)
+        scheduler._pp_vpp_slot_batch_seqs[1] = 1
+        schedule = PipelineRankSchedule(1, 2, 2, 2)
+        for seq in (0, 1):
+            schedule.admit(seq)
+        for seq in (1, 0):
+            scheduler._pp_vpp_accept_received_tensors(
+                self._wire(batch_seq=seq, stage=1)
+            )
+        while scheduler._pp_vpp_arrivals:
+            schedule.mark_ready(*scheduler._pp_vpp_arrivals.popleft())
+        for seq in (1, 0):
+            target = scheduler._pp_vpp_fixed_next_task(schedule)
+            self.assertEqual(target, (seq, 1))
+            action = schedule.dispatch(seq, *target)
+            scheduler._pp_vpp_fixed_record_dispatch(action, schedule)
+            schedule.complete(action)
+        self.assertIsNone(scheduler._pp_vpp_fixed_next_task(schedule))
+
+    def test_send_credit_waits_for_oldest_payload_before_releasing_capacity(self):
+        scheduler = self._scheduler()
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        completed = []
+        oldest = [
+            SimpleNamespace(
+                payload=torch.ones(1),
+                work=SimpleNamespace(wait=lambda: completed.append("oldest")),
+            )
+        ]
+        newest = [
+            SimpleNamespace(
+                payload=torch.ones(1),
+                work=SimpleNamespace(wait=lambda: completed.append("newest")),
+            )
+        ]
+        pending = deque([oldest, newest])
+        scheduler._pp_vpp_fixed_wait_send_credit(pending, 2)
+        self.assertEqual(completed, ["oldest"])
+        self.assertEqual(oldest, [])
+        self.assertIs(pending[0], newest)
+        self.assertEqual(len(newest), 1)
+        scheduler._pp_vpp_fixed_wait_send_credit(pending, 2)
+        self.assertEqual(completed, ["oldest"])
+        scheduler._pp_vpp_fixed_wait_send_credit(pending, 1)
+        self.assertEqual(completed, ["oldest", "newest"])
+        self.assertEqual(newest, [])
+        self.assertEqual(list(pending), [])
+
+    def test_send_reaping_stops_at_the_first_unfinished_group(self):
+        """A later completion must not release credit ahead of an older send."""
+        from threading import Event
+
+        release = Event()
+        entered = Event()
+
+        def wait():
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("Send was not released")
+
+        items = [SimpleNamespace(payload=torch.ones(1), work=None, wait=wait)]
+        later = SimpleNamespace(poll=lambda: True)
+        pending = deque([items, later])
+        scheduler = self._scheduler()
+        try:
+            scheduler._pp_vpp_reap_send_work(pending)
+            self.assertTrue(entered.wait(timeout=5))
+            self.assertEqual(len(pending), 2)
+            self.assertIsInstance(pending[0], P2PWorkGroup)
+            self.assertIs(pending[0].items, items)
+            self.assertIs(pending[1], later)
+            group = pending[0]
+            release.set()
+            self.assertTrue(group._done.wait(timeout=5))
+            scheduler._pp_vpp_reap_send_work(pending)
+            self.assertEqual(list(pending), [])
+            self.assertEqual(items, [])
+        finally:
+            release.set()
 
     def test_manifest_uses_retained_batch_spans_and_request_incarnations(self):
         """A later request update must not change the retained batch's manifest."""
