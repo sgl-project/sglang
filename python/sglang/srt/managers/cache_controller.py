@@ -815,6 +815,7 @@ class HiCacheController:
                     "tensorcast",
                     "seaweedfs",
                     "fast_file",
+                    "egm",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
