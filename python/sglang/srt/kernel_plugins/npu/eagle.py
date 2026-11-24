@@ -18,33 +18,32 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
         self.steps = worker.speculative_num_steps
 
     def propose_chain(self, batch, forward_batch, shape_key=None):
-        if forward_batch.forward_mode.is_idle():
-            return None
+        idle = forward_batch.forward_mode.is_idle()
         req = batch.reqs[0] if len(batch.reqs) == 1 else None
         runner = self.worker.cuda_graph_runner
         backend = getattr(runner, "backend", None)
-        if not hasattr(backend, "execute_draft_graph"):
-            return None
-
-        if not all_admit(
-            (
+        can_run = False
+        if not idle and hasattr(backend, "execute_draft_graph"):
+            can_run = (
                 not self.binding.pd_decode
                 or (
                     req is not None
                     and getattr(req, "npu_draft_kv_generation", None)
                     == req.retraction_count
                 )
-            )
-            and self.binding.supports_decode(
+            ) and self.binding.supports_decode(
                 batch, forward_batch, self.worker.hot_token_id
-            )
-            and backend.has_draft_graph()
-        ):
+            ) and backend.has_draft_graph()
+        # Every rank that entered this call has to vote, including idle ranks.
+        if not all_admit(can_run):
+            return None
+        if not can_run:
             return None
         seed = forward_batch.spec_info
-        slots = per_step_draft_out_cache_loc(
-            forward_batch.out_cache_loc, 1, 1, self.steps
-        )
+        # topk=1 plans a write window of steps+1. The chain writes the first
+        # ``steps`` columns; the last column belongs to verify.
+        window = forward_batch.out_cache_loc[: self.steps]
+        slots = per_step_draft_out_cache_loc(window, 1, 1, self.steps)
         io = DraftLoopIO(
             forward_batch,
             seed.topk_index.reshape(-1),
