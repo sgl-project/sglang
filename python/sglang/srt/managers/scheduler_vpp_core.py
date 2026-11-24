@@ -183,7 +183,6 @@ class SchedulingVPPCore:
             if hasattr(self, "_pp_vpp_arrivals"):
                 self._pp_vpp_arrivals.append(key)
         self._pp_vpp_pending_recv = None
-        self._pp_vpp_start_receiver()
 
     def _pp_vpp_promote_early_activations(self: Scheduler, batch_seq: int) -> None:
         slot_id = batch_seq % len(self._pp_vpp_slot_batch_seqs)
@@ -786,7 +785,6 @@ class SchedulingVPPCore:
             tag=_VPP_ACTIVATION_TAG,
         )
         self._pp_vpp_activation_receiver.start()
-        self._pp_vpp_start_receiver()
         self._pp_vpp_start_control_receiver()
 
         activation_send_work = deque()
@@ -1541,12 +1539,15 @@ class SchedulingVPPCore:
                 activation_send_work,
             )
             if action is not None:
-                if action.stage_id > 0:
-                    proxy = self._pp_vpp_take_ready_proxy(action)
-                    self._pp_tensor_dict_inbox["vpp_proxy"].appendleft(proxy.tensors)
+                proxy = (
+                    self._pp_vpp_take_ready_proxy(action)
+                    if action.stage_id > 0
+                    else None
+                )
                 action_executed, send_work = self._pp_vpp_execute_wavefront_action(
                     action,
                     slot_batch_seqs,
+                    proxy,
                 )
                 if send_work:
                     activation_send_work.append(send_work)

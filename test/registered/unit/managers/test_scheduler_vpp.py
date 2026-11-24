@@ -55,9 +55,7 @@ class _Event:
 
 
 class _SchedulingCore(SchedulingVPPCore):
-    def _pp_vpp_start_receiver(self):
-        # The native fixed-TP adapter keeps its continuous receiver posted.
-        pass
+    pass
 
 
 class _AdmissionCore(_SchedulingCore):
@@ -233,12 +231,11 @@ class _TickCore(_ControlCore):
         slot_batch_seqs[slot_id] = batch_seq
         return batch
 
-    def _pp_vpp_execute_wavefront_action(self, action, slot_batch_seqs):
+    def _pp_vpp_execute_wavefront_action(self, action, slot_batch_seqs, proxy):
         self.actions.append((action.batch_seq, action.stage_id))
         value = torch.tensor([float(action.batch_seq)])
         if action.stage_id:
-            wire = self._pp_tensor_dict_inbox["vpp_proxy"].popleft()
-            value = wire["hidden_states"]
+            value = proxy.tensors["hidden_states"]
         value = value + 1
         event = SimpleNamespace(
             query=lambda: True,
@@ -2252,8 +2249,9 @@ class TestNativeVPPAdapter(CustomTestCase):
             ) as build,
         ):
             for seq, stage in ((0, 0), (1, 0), (0, 2), (1, 2)):
+                proxy = None
                 if stage:
-                    scheduler._pp_tensor_dict_inbox["vpp_proxy"].append(
+                    proxy = PPProxyTensors(
                         {
                             "hidden_states": torch.ones(1),
                             "vpp_batch_seq": seq,
@@ -2262,7 +2260,7 @@ class TestNativeVPPAdapter(CustomTestCase):
                     )
                 action = PipelineWavefrontAction(0, seq, seq, stage, 0)
                 self.assertEqual(
-                    scheduler._pp_vpp_execute_wavefront_action(action, [0, 1]),
+                    scheduler._pp_vpp_execute_wavefront_action(action, [0, 1], proxy),
                     (True, []),
                 )
                 if stage == 0:

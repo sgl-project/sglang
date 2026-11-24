@@ -2114,18 +2114,11 @@ class ModelRunner:
             ctx_mgr,
         ):
             if vpp_stage_id is not None:
-                from sglang.srt.model_executor.runner.vpp_stage import (
-                    execute_vpp_stage,
-                )
-
                 return ModelRunnerOutput(
-                    logits_output=execute_vpp_stage(
-                        model=self.model,
-                        attn_backend=self.attn_backend,
+                    logits_output=self.eager_runner.execute(
                         forward_batch=forward_batch,
-                        stage_id=vpp_stage_id,
                         pp_proxy_tensors=pp_proxy_tensors,
-                        device_timer=self.device_timer,
+                        vpp_stage_id=vpp_stage_id,
                     ),
                     can_run_graph=False,
                 )

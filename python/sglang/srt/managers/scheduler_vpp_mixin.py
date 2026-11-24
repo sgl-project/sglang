@@ -131,10 +131,6 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             torch.distributed.all_reduce(probe, group=group.device_group)
         self.device_module.synchronize()
 
-    def _pp_vpp_start_receiver(self):
-        # Scheduling fixed TP uses one FIFO per TP lane.
-        return
-
     def _pp_vpp_activation_group(self, source_rank):
         if source_rank == 1:
             group = self.pp_group.vpp_reverse_group
@@ -402,7 +398,7 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         slot_batch_seqs[slot_id] = batch_seq
         return batch
 
-    def _pp_vpp_execute_wavefront_action(self, action, slot_batch_seqs):
+    def _pp_vpp_execute_wavefront_action(self, action, slot_batch_seqs, proxy):
         if action is None:
             return False, []
         if slot_batch_seqs[action.slot_id] != action.batch_seq:
@@ -410,9 +406,7 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         batch = self.mbs[action.slot_id]
         if batch is None or action.physical_rank != self.pp_group.rank_in_group:
             raise RuntimeError("VPP action has wrong rank or empty batch")
-        proxy = None
         if action.stage_id > 0:
-            proxy = PPProxyTensors(self._pp_tensor_dict_inbox["vpp_proxy"].popleft())
             if (
                 int(proxy.tensors["vpp_batch_seq"]) != action.batch_seq
                 or int(proxy.tensors["vpp_stage_id"]) != action.stage_id
