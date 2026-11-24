@@ -145,19 +145,20 @@ jobs:
               continue
             fi
 
-            # Count runs by event type
+            # pr-test.yml and pr-test-extra.yml runs are pull_request_target.
+            is_pr='def is_pr: .event == "pull_request" or .event == "pull_request_target";'
             total_runs=$(echo "$all_runs" | wc -l)
-            pr_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event=="pull_request")] | length')
+            pr_runs=$(echo "$all_runs" | jq -s "$is_pr"' [.[] | select(is_pr)] | length')
             dispatch_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event=="workflow_dispatch")] | length')
-            other_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event!="pull_request" and .event!="workflow_dispatch")] | length')
+            other_runs=$(echo "$all_runs" | jq -s "$is_pr"' [.[] | select((is_pr | not) and .event!="workflow_dispatch")] | length')
 
-            echo "📊 Summary: $total_runs unfinished ($pr_runs pull_request, $dispatch_runs workflow_dispatch, $other_runs other)"
+            echo "📊 Summary: $total_runs unfinished ($pr_runs PR, $dispatch_runs workflow_dispatch, $other_runs other)"
             echo ""
 
             # Other runs: list only, do not cancel.
             if [ "$other_runs" -gt 0 ]; then
               echo "--- Other Runs (listed only, not cancelled) ---"
-              echo "$all_runs" | jq -c 'select(.event!="pull_request" and .event!="workflow_dispatch")' | while read -r run; do
+              echo "$all_runs" | jq -c "$is_pr"' select((is_pr | not) and .event!="workflow_dispatch")' | while read -r run; do
                 run_url=$(echo "$run" | jq -r '.url')
                 run_event=$(echo "$run" | jq -r '.event')
                 run_status=$(echo "$run" | jq -r '.status')
@@ -169,7 +170,7 @@ jobs:
             # PR runs: resolve PR via head=owner:branch.
             if [ "$pr_runs" -gt 0 ]; then
               echo "--- PR Runs (resolving via head=owner:branch) ---"
-              echo "$all_runs" | jq -c 'select(.event=="pull_request")' | while read -r run; do
+              echo "$all_runs" | jq -c "$is_pr"' select(is_pr)' | while read -r run; do
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url')
                 run_status=$(echo "$run" | jq -r '.status')

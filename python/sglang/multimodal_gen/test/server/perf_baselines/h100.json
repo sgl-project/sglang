@@ -3,7 +3,8 @@
         "model": "Diffusion Server",
         "hardware": "CI H100 80GB pool",
         "description": "Reference numbers from source revision 2ee0d38a8553d186faad9c50893480e3c1d79270, with selected stable metrics tightened using calibration_runs.",
-        "last_updated": "2026-10-18",
+        "last_updated": "2026-11-20",
+        "latency_refresh": "Selected request timings: maximum over 10 scheduled main runs from 2026-11-15 to 2026-11-20 plus 5%.",
         "calibration_runs": [
             38554777367,
             38725436953,
@@ -25,40 +26,106 @@
                 "expected_load_ms": 45017.05
             },
             "fast_hunyuan_video": {
-                "expected_load_ms": 44876.52
+                "expected_load_ms": 44876.52,
+                "expected_avg_denoise_ms": 954.57,
+                "expected_median_denoise_ms": 1105.54,
+                "denoise_step_ms": {
+                    "0": 1079.75,
+                    "2": 1088.46,
+                    "3": 1108.36,
+                    "4": 1118.75,
+                    "5": 1112.77
+                },
+                "stages_ms": {
+                    "DenoisingStage": 5730.22
+                }
             },
             "fastwan2_2_ti2v_5b": {
-                "expected_load_ms": 47751.86
+                "expected_load_ms": 47751.86,
+                "stages_ms": {
+                    "DmdDenoisingStage": 337.2
+                }
             },
             "flux3_action_http": {
                 "expected_load_ms": 56936.1
             },
             "flux_2_image_t2i": {
-                "expected_load_ms": 71810.63
+                "expected_load_ms": 71810.63,
+                "stages_ms": {
+                    "TextEncodingStage": 539.81
+                }
             },
             "flux_2_image_t2i_upscaling_4x": {
                 "expected_e2e_ms": 24499.04,
-                "expected_load_ms": 77489.41
+                "expected_load_ms": 77489.41,
+                "expected_avg_denoise_ms": 462.76,
+                "expected_median_denoise_ms": 474.16,
+                "denoise_step_ms": {
+                    "20": 468.91,
+                    "29": 478.1,
+                    "39": 480.22,
+                    "49": 486.07
+                },
+                "stages_ms": {
+                    "DenoisingStage": 23633.02,
+                    "TextEncodingStage": 533.11
+                }
             },
             "flux_2_klein_base_image_t2i": {
                 "expected_load_ms": 41113.32
             },
             "flux_2_klein_image_t2i": {
-                "expected_load_ms": 41554.07
+                "expected_load_ms": 41554.07,
+                "denoise_step_ms": {
+                    "0": 30.5,
+                    "1": 15.01,
+                    "2": 14.71
+                }
             },
             "flux_2_t2i_customized_vae_path": {
                 "expected_load_ms": 72787.6
             },
             "flux_2_ti2i": {
                 "expected_e2e_ms": 49154.32,
-                "expected_load_ms": 76626.82
+                "expected_load_ms": 76626.82,
+                "expected_avg_denoise_ms": 943.07,
+                "expected_median_denoise_ms": 970.38,
+                "denoise_step_ms": {
+                    "39": 983.54,
+                    "49": 996.22
+                },
+                "stages_ms": {
+                    "DenoisingStage": 48163.84,
+                    "ImageVAEEncodingStage": 91.03,
+                    "TextEncodingStage": 530.52
+                }
             },
             "flux_2_ti2i_multi_image_cache_dit": {
                 "expected_e2e_ms": 25629.79,
-                "expected_load_ms": 79741.82
+                "expected_load_ms": 79741.82,
+                "expected_median_denoise_ms": 56.54,
+                "stages_ms": {
+                    "ImageVAEEncodingStage": 166.26,
+                    "TextEncodingStage": 540.92
+                }
             },
             "hunyuan3d_shape_gen": {
-                "expected_load_ms": 56933.66
+                "expected_load_ms": 56933.66,
+                "expected_avg_denoise_ms": 45.74,
+                "expected_median_denoise_ms": 43.34,
+                "denoise_step_ms": {
+                    "0": 148.43,
+                    "10": 43.49,
+                    "20": 42.99,
+                    "29": 42.9,
+                    "39": 43.32,
+                    "49": 43.08
+                },
+                "stages_ms": {
+                    "Hunyuan3DPaintTexGenStage": 3322.71,
+                    "Hunyuan3DShapeBeforeDenoisingStage": 65.58,
+                    "Hunyuan3DShapeDenoisingStage": 2371.52
+                }
             },
             "hunyuanvideo_modelopt_fp8_t2v": {
                 "expected_load_ms": 43034.91
@@ -80,7 +147,10 @@
                 "expected_load_ms": 60520.98
             },
             "longlive2_i2v": {
-                "expected_load_ms": 46418.08
+                "expected_load_ms": 46418.08,
+                "stages_ms": {
+                    "DecodingStage": 2683.65
+                }
             },
             "longlive2_t2v": {
                 "expected_load_ms": 46366.03
@@ -115,7 +185,15 @@
                 "expected_load_ms": 36482.82
             },
             "qwen_image_edit_2509_ti2i": {
-                "expected_load_ms": 59293.66
+                "expected_e2e_ms": 40604.62,
+                "expected_load_ms": 59293.66,
+                "denoise_step_ms": {
+                    "39": 1023.98
+                },
+                "stages_ms": {
+                    "DecodingStage": 60.04,
+                    "ImageEncodingStage": 724.42
+                }
             },
             "qwen_image_edit_2511_ti2i": {
                 "expected_load_ms": 52829.09
@@ -125,10 +203,18 @@
             },
             "qwen_image_edit_ti2i": {
                 "expected_e2e_ms": 34541.8,
-                "expected_load_ms": 57854.47
+                "expected_load_ms": 57854.47,
+                "expected_avg_denoise_ms": 674.42,
+                "expected_median_denoise_ms": 681.84,
+                "denoise_step_ms": {
+                    "39": 690.5
+                }
             },
             "qwen_image_layered_i2i": {
-                "expected_load_ms": 52785.44
+                "expected_load_ms": 52785.44,
+                "stages_ms": {
+                    "QwenImageLayeredBeforeDenoisingStage": 210.52
+                }
             },
             "qwen_image_modelopt_fp8_t2i": {
                 "expected_e2e_ms": 3613.08,
@@ -152,16 +238,26 @@
             },
             "turbo_wan2_1_t2v_1.3b": {
                 "expected_e2e_ms": 1020.07,
-                "expected_load_ms": 44207.54
+                "expected_load_ms": 44207.54,
+                "stages_ms": {
+                    "DecodingStage": 571.4,
+                    "DmdDenoisingStage": 316.23
+                }
             },
             "wan22_modelopt_fp8_t2v": {
                 "expected_load_ms": 109336.73
             },
             "wan2_1_t2v_1.3b": {
-                "expected_load_ms": 40385.25
+                "expected_load_ms": 40385.25,
+                "stages_ms": {
+                    "DecodingStage": 663.55
+                }
             },
             "wan2_1_t2v_1.3b_encoder_permanent_residents": {
-                "expected_load_ms": 43238.32
+                "expected_load_ms": 43238.32,
+                "stages_ms": {
+                    "DecodingStage": 561.59
+                }
             },
             "wan2_1_t2v_1.3b_frame_interp_2x": {
                 "expected_load_ms": 40997.72
@@ -170,7 +266,10 @@
                 "expected_load_ms": 40497.49
             },
             "wan2_1_t2v_1.3b_teacache_enabled": {
-                "expected_load_ms": 41471.57
+                "expected_load_ms": 41471.57,
+                "stages_ms": {
+                    "DecodingStage": 598.94
+                }
             },
             "wan2_1_t2v_1.3b_upscaling_4x": {
                 "expected_load_ms": 41287.88
@@ -187,10 +286,23 @@
             },
             "wan2_2_animate_2_14b_ref2v": {
                 "expected_e2e_ms": 53299.2,
-                "expected_load_ms": 55573.18
+                "expected_load_ms": 55573.18,
+                "expected_avg_denoise_ms": 5441.16,
+                "expected_median_denoise_ms": 5310.89,
+                "denoise_step_ms": {
+                    "4": 5259.0,
+                    "6": 5420.85,
+                    "7": 5359.45
+                },
+                "stages_ms": {
+                    "WanAnimate2DenoisingStage": 49694.35
+                }
             },
             "wan2_2_ti2v_5b": {
-                "expected_load_ms": 48875.06
+                "expected_load_ms": 48875.06,
+                "stages_ms": {
+                    "DecodingStage": 2398.92
+                }
             },
             "zimage_image_t2i": {
                 "expected_load_ms": 41876.41
@@ -238,7 +350,10 @@
                 "expected_load_ms": 60590.2
             },
             "hunyuan3d_shape_gen": {
-                "expected_load_ms": 47635.42
+                "expected_load_ms": 47635.42,
+                "stages_ms": {
+                    "Hunyuan3DShapeDenoisingStage": 1990.09
+                }
             },
             "hunyuanvideo_modelopt_fp8_t2v": {
                 "expected_load_ms": 35041.87
@@ -399,6 +514,27 @@
         ]
     },
     "scenarios": {
+        "flux3_image_t2i_2_gpus": {
+            "stages_ms": {
+                "Flux3ImageTextEncodeStage": 22.72,
+                "Flux3ImageConditionEncodeStage": 0.02,
+                "Flux3ImageDenoiseStage": 244.19,
+                "Flux3ImageDecodeStage": 45.51
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 310.79,
+            "expected_load_ms": 30340.09,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "load_peak_vram_mb": 12858.0,
+            "runtime_peak_vram_mb": 17654.0,
+            "warmup_peak_vram_mb": 17642.0,
+            "load_peak_allocated_mb": 12828.38,
+            "runtime_peak_allocated_mb": 13565.56,
+            "load_peak_host_anon_mb": 2489.92,
+            "runtime_peak_host_anon_mb": 2489.92,
+            "estimated_full_test_time_s": 180.0
+        },
         "sana_wm_ti2v": {
             "expected_load_ms": 32834.99,
             "stages_ms": {},
@@ -439,7 +575,7 @@
             "expected_load_ms": 65085.56,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 370.0,
+            "expected_e2e_ms": 299.95,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "load_peak_vram_mb": 57038.0,
@@ -1138,7 +1274,7 @@
                 "7": 54.42,
                 "8": 54.55
             },
-            "expected_e2e_ms": 752.84,
+            "expected_e2e_ms": 588.67,
             "expected_avg_denoise_ms": 51.13,
             "expected_median_denoise_ms": 54.3,
             "load_peak_vram_mb": 20546.0,
@@ -3315,7 +3451,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 5648.49,
+            "expected_e2e_ms": 2459.56,
             "expected_avg_denoise_ms": 477.49,
             "expected_median_denoise_ms": 56.74,
             "load_peak_vram_mb": 34022.0,
@@ -3797,10 +3933,10 @@
                 "6": 4350.68,
                 "7": 4280.35
             },
-            "expected_e2e_ms": 63988.59,
+            "expected_e2e_ms": 31597.85,
             "expected_load_ms": 64309.0,
-            "expected_avg_denoise_ms": 6355.03,
-            "expected_median_denoise_ms": 4338.7,
+            "expected_avg_denoise_ms": 2834.95,
+            "expected_median_denoise_ms": 2519.85,
             "load_peak_vram_mb": 1776.0,
             "runtime_peak_vram_mb": 36322.0,
             "load_peak_allocated_mb": 1737.0,

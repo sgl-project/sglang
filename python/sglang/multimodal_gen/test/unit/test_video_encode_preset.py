@@ -8,8 +8,10 @@ ffmpeg silently applying its own default.
 """
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -31,6 +33,42 @@ SIZE = 64
 # Options libx264 derives from the preset alone, so a reference encode pins them
 # without hard-coding values that move with the x264 build.
 PRESET_DERIVED_KEYS = ("subme", "ref", "rc_lookahead", "me", "trellis")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fixture uses an executable script")
+def test_local_codec_children_receive_only_execution_settings(tmp_path, monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+        material_io,
+    )
+
+    for key in ("SGLANG_S3_SECRET_ACCESS_KEY", "APP_PRIVATE_FIXTURE"):
+        monkeypatch.setenv(key, "synthetic")
+    monkeypatch.setenv("OMP_THREAD_LIMIT", "2")
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    # Observe the actual child's environment, not a dict built by the parent.
+    script = (
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "assert 'SGLANG_S3_SECRET_ACCESS_KEY' not in os.environ\n"
+        "assert 'APP_PRIVATE_FIXTURE' not in os.environ\n"
+        "assert os.environ['OMP_THREAD_LIMIT'] == '2'\n"
+        "if os.path.basename(sys.argv[0]) == 'ffprobe': print('{\"streams\": []}')\n"
+        "else: assert sys.stdin.buffer.read()\n"
+    )
+    for name in ("ffmpeg", "ffprobe"):
+        tool = tmp_path / name
+        tool.write_text(script)
+        tool.chmod(0o700)
+    monkeypatch.setattr(output_utils, "_resolve_ffmpeg_exe", lambda: "ffmpeg")
+    output_utils._save_video_ffmpeg(
+        str(tmp_path / "fixture.mp4"),
+        [np.zeros((16, 16, 3), dtype=np.uint8)],
+        fps=FPS,
+        quality=5,
+    )
+    monkeypatch.setattr(material_io, "_ffprobe_entries", None)
+    assert material_io._ffprobe_media("fixture") == {"streams": []}
+    assert os.environ["APP_PRIVATE_FIXTURE"] == "synthetic"
 
 
 def _x264_options(path) -> dict[str, str]:
