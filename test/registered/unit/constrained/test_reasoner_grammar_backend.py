@@ -770,20 +770,14 @@ class TestReasonerGrammarBackend(CustomTestCase):
         scheduler.model_config = SimpleNamespace(
             is_generation=True, is_multimodal=False, think_end_ids=None
         )
-        serving = SimpleNamespace(
-            tokenizer_path="unused",
-            tokenizer_mode="auto",
-            tokenizer_backend="default",
-            reasoning_parser="inkling",
-        )
         with (
             patch(
-                "sglang.srt.managers.scheduler.get_tokenizer", return_value=tokenizer
+                "sglang.srt.managers.scheduler.load_scheduler_tokenizer",
+                return_value=(tokenizer, None),
             ),
-            patch("sglang.srt.managers.scheduler.get_serving", return_value=serving),
             patch(
-                "sglang.srt.managers.scheduler.get_model",
-                return_value=SimpleNamespace(trust_remote_code=False, revision=None),
+                "sglang.srt.managers.scheduler.get_serving",
+                return_value=SimpleNamespace(reasoning_parser="inkling"),
             ),
         ):
             scheduler.init_tokenizer()
