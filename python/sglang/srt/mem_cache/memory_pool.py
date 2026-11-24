@@ -3976,6 +3976,14 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                     )
                     for _ in range(self.layer_num)
                 ]
+                self.dq_k_buffer = self.dq_v_buffer = None
+                if self.layer_num and get_platform().is_sm120:
+                    self.dq_k_buffer = torch.zeros(
+                        (m, n, k), dtype=torch.bfloat16, device=self.device
+                    )
+                    self.dq_v_buffer = torch.zeros(
+                        (m, n, v), dtype=torch.bfloat16, device=self.device
+                    )
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -4001,6 +4009,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+        del self.dq_k_buffer
+        del self.dq_v_buffer
 
     def _get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id - self.start_layer]
@@ -4249,6 +4259,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             v_size_bytes += get_tensor_size_bytes(v_cache)
         for v_scale in self.v_scale_buffer:
             v_size_bytes += get_tensor_size_bytes(v_scale)
+        if self.dq_k_buffer is not None:
+            k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
         return k_size_bytes, v_size_bytes
 
 

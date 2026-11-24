@@ -462,6 +462,7 @@ class Inkling2Attention(nn.Module):
             "Inkling2 requires FA4 attention"
         )
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
+        fa4_mxfp8 = mxfp8 and not get_platform().is_sm120
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
             if isinstance(hidden_states, torch.Tensor)
@@ -472,13 +473,14 @@ class Inkling2Attention(nn.Module):
         mode = forward_batch.forward_mode
         verify = mode.is_target_verify()
         compact = (
-            not mxfp8
+            not fa4_mxfp8
             and self.fused_decode_prologue
             and (
                 mode.is_decode()
                 or verify
                 and (
                     get_platform().is_sm90
+                    or mxfp8
                     or envs.SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL.get()
                     and tokens <= VERIFY_REL_BIAS_MAX_TOKENS
                 )
@@ -533,7 +535,7 @@ class Inkling2Attention(nn.Module):
                 q, rel_bias = self._pad_heads(q), self._pad_heads(rel_bias)
         bias_kwargs = {"rel_bias_presheared": True} if presheared else {}
         output_dtype = q.dtype
-        if mxfp8:
+        if fa4_mxfp8:
             from sglang.kernels.ops.quantization.mxfp8_quant import to_mxfp8
 
             quantized_q = to_mxfp8(q.reshape(tokens, -1, self.head_dim))
