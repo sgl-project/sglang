@@ -84,29 +84,45 @@ def _status(state="success", login=rca.APPROVAL_CREATOR):
 
 
 class TestCanApprove(unittest.TestCase):
-    def test_only_write_access_approves(self):
-        for permission, expected in [
-            *((p, True) for p in rca.APPROVER_REPO_PERMISSIONS),
-            *((p, False) for p in ("read", "triage", 403, 404)),
-        ]:
-            with self.subTest(permission=permission):
+    def test_write_access_or_ci_permissions_entry_approves(self):
+        tag = {"can_tag_run_ci_label": True}
+        cases = [
+            *(((p, None), True) for p in rca.APPROVER_REPO_PERMISSIONS),
+            (("read", tag), True),
+            ((404, tag), True),
+            (("read", {"can_rerun_failed_ci": True}), False),
+            ((404, None), False),
+        ]
+        for (permission, perms), expected in cases:
+            with self.subTest(permission=permission, perms=perms):
                 repo = FakeRepo(permissions={"u": permission})
-                self.assertEqual(rca.can_approve(repo, "u")[0], expected)
+                self.assertEqual(rca.can_approve(repo, "u", perms)[0], expected)
 
 
 class TestIsApproved(unittest.TestCase):
-    def test_bot_success_status_and_live_label(self):
+    def test_label_plus_approver_author_or_bot_status(self):
         cases = [
-            ([_status()], {"run-ci"}, True),
-            ([_status(login="someone")], {"run-ci"}, False),
-            ([_status(login=None)], {"run-ci"}, False),
-            ([_status(state="failure")], {"run-ci"}, False),
-            ([_status()], {"run-ci-nv-extra"}, False),
+            ("maint", [], {"run-ci"}, True),
+            ("maint", [], set(), False),
+            ("listed", [], {"run-ci"}, True),
+            ("ext", [_status()], {"run-ci"}, True),
+            ("ext", [], {"run-ci"}, False),
+            ("ext", [_status(login="someone")], {"run-ci"}, False),
+            ("ext", [_status(login=None)], {"run-ci"}, False),
+            ("ext", [_status(state="failure")], {"run-ci"}, False),
+            ("ext", [_status()], {"run-ci-nv-extra"}, False),
         ]
-        for statuses, labels, expected in cases:
-            with self.subTest(statuses=statuses, labels=labels):
-                repo = FakeRepo(statuses=statuses)
-                self.assertEqual(rca.is_approved(repo, HEAD, labels), expected)
+        listed = {"listed": {"can_tag_run_ci_label": True}}
+        with mock.patch.object(rca, "load_permissions", side_effect=listed.get):
+            for author, statuses, labels, expected in cases:
+                with self.subTest(author=author, statuses=statuses, labels=labels):
+                    repo = FakeRepo(
+                        permissions={"maint": "write", "listed": "read", "ext": 404},
+                        statuses=statuses,
+                    )
+                    self.assertEqual(
+                        rca.is_approved(repo, HEAD, labels, author), expected
+                    )
 
 
 class TestHeadSeenBy(unittest.TestCase):
