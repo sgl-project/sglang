@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
@@ -13,7 +12,6 @@ from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     DSV41_MAIN_KV_LAYOUT,
     PackedMainKVView,
     make_dsv41_packed_main_kv_spec,
-    resolve_dsv41_main_kv_layout_specs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
@@ -63,46 +61,12 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "128 or 256"):
             make_dsv41_packed_main_kv_spec(64)
 
-    def test_layout_option_resolution(self):
-        self.assertIsNone(resolve_dsv41_main_kv_layout_specs("auto", 256))
-        self.assertIsNone(resolve_dsv41_main_kv_layout_specs("flashmla_fp8", 256))
-        specs = resolve_dsv41_main_kv_layout_specs("packed_fp4", 256)
-        self.assertEqual(specs[1].page_slots, 256)
-        self.assertEqual(specs[2].page_slots, 128)
-        with self.assertRaisesRegex(ValueError, "unknown"):
-            resolve_dsv41_main_kv_layout_specs("invalid", 256)
-
-    def test_server_args_reserve_packed_layout_options(self):
+    def test_server_args_do_not_expose_packed_main_kv_options(self):
         from sglang.srt.server_args import ServerArgs
 
         args = ServerArgs(model_path="dummy")
-        self.assertEqual(args.dsv41_main_kv_layout, "auto")
-        self.assertEqual(args.dsv41_main_kv_consumer, "auto")
-
-    def test_pr1_rejects_packed_consumer_before_pool_allocation(self):
-        from sglang.srt.arg_groups.deepseek_v4_hook import (
-            validate_deepseek_v41_features,
-        )
-
-        config = SimpleNamespace(
-            dsv41_main_kv_layout="packed_fp4",
-            dsv41_main_kv_consumer="auto",
-        )
-        model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="deepseek_v41")
-        )
-        with (
-            patch(
-                "sglang.srt.arg_groups.deepseek_v4_hook.resolving_view",
-                return_value=config,
-            ),
-            patch(
-                "sglang.srt.arg_groups.deepseek_v4_hook.model_config_of",
-                return_value=model_config,
-            ),
-            self.assertRaisesRegex(ValueError, "no attention consumer in PR1"),
-        ):
-            validate_deepseek_v41_features(object())
+        self.assertFalse(hasattr(args, "dsv41_main_kv_layout"))
+        self.assertFalse(hasattr(args, "dsv41_main_kv_consumer"))
 
     def test_views_share_storage(self):
         spec = make_dsv41_packed_main_kv_spec(128)
@@ -290,38 +254,6 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
                 freqs_cis=freqs,
             )
             writer.assert_called_once_with(0, loc, latent, freqs)
-
-    def test_physical_sizing_uses_page_stride(self):
-        from sglang.srt.model_executor.pool_configurator import (
-            get_dsv4_main_kv_physical_bytes_per_slot,
-        )
-
-        self.assertEqual(
-            get_dsv4_main_kv_physical_bytes_per_slot(
-                ratio=1,
-                full_page_size=256,
-                kv_layout=KVLayout.V4,
-                compressed_kv_layout=None,
-                packed_specs=None,
-            ),
-            585,
-        )
-        specs = {
-            1: make_dsv41_packed_main_kv_spec(256),
-            2: make_dsv41_packed_main_kv_spec(128),
-        }
-        for ratio in (1, 2):
-            with self.subTest(ratio=ratio):
-                self.assertEqual(
-                    get_dsv4_main_kv_physical_bytes_per_slot(
-                        ratio=ratio,
-                        full_page_size=256,
-                        kv_layout=KVLayout.V4,
-                        compressed_kv_layout=None,
-                        packed_specs=specs,
-                    ),
-                    384,
-                )
 
 
 if __name__ == "__main__":

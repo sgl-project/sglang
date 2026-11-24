@@ -64,20 +64,6 @@ def validate_dsv41_packed_main_kv_spec(spec: MainKVLayoutSpec) -> None:
         )
 
 
-def resolve_dsv41_main_kv_layout_specs(
-    option: str, full_page_size: int
-) -> dict[int, MainKVLayoutSpec] | None:
-    option = option.lower()
-    if option in ("auto", "flashmla_fp8"):
-        return None
-    if option != "packed_fp4":
-        raise ValueError(f"unknown DSV4.1 Main-KV layout {option!r}")
-    return {
-        1: make_dsv41_packed_main_kv_spec(full_page_size),
-        2: make_dsv41_packed_main_kv_spec(full_page_size // 2),
-    }
-
-
 class PackedMainKVView(msgspec.Struct, frozen=True):
     storage: torch.Tensor
     spec: MainKVLayoutSpec
