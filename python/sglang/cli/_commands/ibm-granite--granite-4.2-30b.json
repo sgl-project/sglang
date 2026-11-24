@@ -1,0 +1,4 @@
+[
+  {"hw":"h200","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/IBM/Granite-4.2#hw=h200&variant=30b&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path ibm-granite/granite-4.2-30b \\\n  --tp 1 \\\n  --mem-fraction-static 0.8 \\\n  --reasoning-parser auto \\\n  --tool-call-parser auto \\\n  --host 0.0.0.0 \\\n  --port 30000"},
+  {"hw":"b200","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/IBM/Granite-4.2#hw=b200&variant=30b&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path ibm-granite/granite-4.2-30b \\\n  --tp 1 \\\n  --mem-fraction-static 0.8 \\\n  --reasoning-parser auto \\\n  --tool-call-parser auto \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

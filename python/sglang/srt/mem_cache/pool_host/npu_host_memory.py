@@ -190,7 +190,6 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             config.alloc_size = total_bytes
             config.scene = offload.Scene.LOCAL
             config.executor = offload.Executor.AICPU
-            config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
             ret = self._pool.initialize(config)
             if ret != 0:
                 self._pool = None
@@ -329,6 +328,7 @@ def reserve_mla_split_host_memory(
     k_width: int,
     v_width: int,
     dtype: torch.dtype,
+    v_dtype: torch.dtype,
     buffers: MLASplitBuffers,
 ) -> None:
     """Reserve the split MLA host buffers before allocating them."""
@@ -340,7 +340,7 @@ def reserve_mla_split_host_memory(
     num_kv_rows = num_tokens * num_layers
     total_bytes = num_kv_rows * k_width * dtype.itemsize
     if v_width > 0:
-        total_bytes += num_kv_rows * v_width * dtype.itemsize
+        total_bytes += num_kv_rows * v_width * v_dtype.itemsize
 
     # GLM-5.3-Flash index_kpool > 1 packs Indexer pages compressed
     # (index_page_size < page_size).

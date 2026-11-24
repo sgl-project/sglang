@@ -43,7 +43,7 @@ mp.set_start_method("spawn", force=True)
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-1-npu-a3",
+    suite="nightly-test-1-npu-a3",
     nightly=True,
     disabled="run failed",
 )

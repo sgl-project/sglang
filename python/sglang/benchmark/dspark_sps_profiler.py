@@ -62,6 +62,8 @@ except ImportError as exc:
     should_skip_due_to_token_capacity = None
 
 DEFAULT_OUT = "dspark_sps.json"
+# Both plan their verify budget with the DSpark verify planner.
+PROFILED_ALGORITHMS = ("DSPARK", "DFLASH")
 DEFAULT_MAX_BATCH_SIZE = 256
 DEFAULT_INPUT_LEN = 16
 DEFAULT_TEMPERATURE = 1.0
@@ -424,15 +426,17 @@ def fetch_server_context(
     info = response.json()
 
     speculative_algorithm = info.get("speculative_algorithm")
-    if speculative_algorithm != "DSPARK":
+    if speculative_algorithm not in PROFILED_ALGORITHMS:
         raise ValueError(
-            f"Profile against a DSpark server: {base_url} reports "
+            f"Profile against a DSpark or DFLASH server: {base_url} reports "
             f"speculative_algorithm={speculative_algorithm!r}. The SPS table is "
-            "measured from real static-mode DSpark verify steps; relaunch with "
-            "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
+            "measured from real static-mode verify steps; relaunch with "
+            "--speculative-algorithm DSPARK or DFLASH and "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
         )
     if (
         info.get("disable_cuda_graph")
+        or info.get("disable_decode_cuda_graph")
         or info.get("cuda_graph_backend_decode") == "disabled"
     ):
         raise ValueError(
@@ -969,7 +973,7 @@ def postprocess_round(
             f"of {len(common_cts)} common decode steps had every rank at the "
             f"target {batch_size_per_rank} requests (need at least "
             f"{ROUND_WARMUP_STEPS + min_steady_steps}). Increase "
-            "--round-timeout / --target-steady-steps, or inspect the raw "
+            "--round-timeout / --min-steady-steps, or inspect the raw "
             "records for retraction / DP imbalance."
         )
 

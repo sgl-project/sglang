@@ -126,7 +126,7 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on) needs an MLA draft backend; DCP
+            // The draft KV ring needs an MLA draft backend; DCP
             // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
             // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
@@ -138,6 +138,9 @@ export const config = {
             // requests skip it.
             ...(config.isAmd(s) ? ["--speculative-use-block-verification"] : []),
           ],
+          // The draft KV ring is opt-in; every NVIDIA recipe here can serve it, and under PD
+          // both roles must set it.
+          env: (s) => (config.isAmd(s) ? [] : ["SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"]),
           hints: (s) =>
             s.pdMode === "decode" && s.strategy === "high-throughput"
               ? [`High-throughput decode verifies K = ${config.dflashBlock(s) - 1} (block ${config.dflashBlock(s)}); launch the prefill role with the same block size.`]
@@ -397,16 +400,17 @@ export const config = {
 
     flagSelects: [
       {
-        // DSA sparse-MLA kernel. FlashMLA (flashmla_kv) is the K3.1 default and matches the reference
-        // fp8_ds_mla KV; TRT-LLM and Prims-TS read a raw FP8 KV with FP8 q, so PD peers must both
-        // use one of them. Both phases share one KV pool, so prefill and decode get the same value.
+        // DSA sparse-MLA kernel. Prims-TS is the K3.1 default on SM100/103/107 (all hw this select
+        // shows on); FlashMLA (flashmla_kv) matches the reference fp8_ds_mla KV. TRT-LLM and Prims-TS
+        // read a raw FP8 KV with FP8 q, so PD peers must both use one of them. Both phases share one
+        // KV pool, so prefill and decode get the same value.
         id: "attention", title: "Attention Backend",
         showWhen: (b) => ["b300", "gb300", "b200", "gb200"].includes(b.hw),
         stripPrefixes: ["--dsa-prefill-backend", "--dsa-decode-backend"],
         options: [
-          { id: "flashmla", label: "FlashMLA" },
+          { id: "prims_ts", label: "Prims-TS" },
+          { id: "flashmla", label: "FlashMLA", flags: ["--dsa-prefill-backend flashmla_kv", "--dsa-decode-backend flashmla_kv"] },
           { id: "trtllm",   label: "TRT-LLM",  flags: ["--dsa-prefill-backend trtllm", "--dsa-decode-backend trtllm"] },
-          { id: "prims_ts", label: "Prims-TS", flags: ["--dsa-prefill-backend prims_ts", "--dsa-decode-backend prims_ts"] },
         ],
       },
       {
@@ -1507,8 +1511,7 @@ export const config = {
         "--dist-timeout 3600",
         "--tp-size 32",
         "--ep-size 32",
-        "--dp-size 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--linear-attn-prefill-backend flashkda",
         "--moe-runner-backend deep_gemm",
