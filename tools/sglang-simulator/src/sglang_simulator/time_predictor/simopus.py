@@ -16,7 +16,7 @@ from sglang_simulator.time_predictor.base import (
     PredictorError,
     ScheduleBatch,
 )
-from sglang_simulator.time_predictor.simopus_sdk import load_sdk
+from sglang_simulator.time_predictor.simopus_sdk import load_sdk, open_database
 
 PROVIDER_CONTRACT = "simopus-forward-latency"
 _CONTEXT_MODES = {"EXTEND", "MIXED"}
@@ -358,10 +358,9 @@ class SimOpusTimePredictor(InferTimePredictor):
                 mismatches=mismatches,
             )
 
-    def _build_provider(self, systems_root: str) -> tuple[Any, str, str]:
+    def _build_provider(self, systems_root: str) -> tuple[Any, str, str | int | None]:
         try:
             package, sdk = load_sdk()
-            PerfDatabase = sdk.PerfDatabase
             build_umd_static_model = sdk.build_umd_static_model
 
             actual_revision = getattr(package, "__revision__", None)
@@ -380,9 +379,9 @@ class SimOpusTimePredictor(InferTimePredictor):
                     configured_revision=self._provider_revision,
                     actual_revision=actual_revision,
                 )
-            database = PerfDatabase.open_fidb(
+            database = open_database(
+                sdk,
                 self._system,
-                "sglang",
                 str(self.config.backend_version),
                 perfdb_dir=systems_root,
                 database_mode="SILICON",
@@ -396,17 +395,18 @@ class SimOpusTimePredictor(InferTimePredictor):
             return (
                 provider,
                 package.__version__,
-                database.stack_sha256,
+                # A label of the stored stack; an SDK that has none reports nothing.
+                getattr(database, "stack_sha256", None),
             )
         except (ImportError, AttributeError) as error:
             raise _error(
                 "provider_initialization_failed",
-                "SimOpus is not installed or lacks the public storage identity contract",
+                "SimOpus is not installed or lacks the required public SDK interfaces",
             ) from error
         except FileNotFoundError as error:
             raise _error(
                 "data_unavailable",
-                f"SimOpus FIDB data is unavailable: {error}",
+                f"SimOpus performance data is unavailable: {error}",
             ) from error
         except PredictorError:
             raise
