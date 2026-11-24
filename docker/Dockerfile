@@ -540,10 +540,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install nixl nixl-cu13 --no-deps \
     && uv pip install "cuda-python>=13,<14"
 
-# Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+# Pin the AI Dynamo prerelease of the 2026-11-20 nightly (the Qwen3.5 GB300 submission stack).
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+        --extra-index-url https://pypi.nvidia.com/ ai-dynamo==1.8.0.dev20261119
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank

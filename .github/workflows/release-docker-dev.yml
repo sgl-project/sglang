@@ -145,6 +145,7 @@ jobs:
       extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
       tag_config: ${{ needs.prepare.outputs.tag_config }}
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+      mega_use_release_pin: true
     secrets: inherit
 
   build-only:
