@@ -9,7 +9,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 DEVICE = "cuda"
@@ -19,7 +19,7 @@ EPS = 1e-6
 
 
 @marker.parametrize("rows", [512, 4096, 4608], [512])
-@marker.benchmark("impl", ["split", "fused"], unit="us")
+@marker.benchmark("impl", ["split", "fused"], unit="us", gate=["fused"])
 def benchmark(rows: int, impl: str):
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(20260831 + rows)
