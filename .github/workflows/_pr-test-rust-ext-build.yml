@@ -70,6 +70,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           # Just what the cache key hashes, plus the action and script this job
           # runs: the workspace is cold here and the rest of the tree is mostly
           # docs. Both jobs must hash the same Rust extension inputs, which this
@@ -159,6 +162,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -361,6 +367,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           # Mirrors the restore job: this one writes the entry that job reads, so
           # both have to check out the same set for hashFiles to agree.
           sparse-checkout: |
