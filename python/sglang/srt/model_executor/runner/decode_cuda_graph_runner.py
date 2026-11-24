@@ -309,6 +309,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
+    # Set in __init__ under a MAX_LEN DP gather (see _set_dp_real_rows).
+    dp_real_rows: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -585,7 +587,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # Real rows in each DP rank's slot of the gathered MoE input, so routing
         # skips the padding rows; refreshed on every replay (_set_dp_real_rows).
-        self.dp_real_rows: Optional[torch.Tensor] = (
+        self.dp_real_rows = (
             torch.empty(self.num_dp_ranks, dtype=torch.int64, device=self.device)
             if self.require_mlp_tp_gather
             and self.capture_forward_mode.is_decode()
