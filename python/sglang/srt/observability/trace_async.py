@@ -432,7 +432,12 @@ class _TraceExporterProcess(multiprocessing.Process):
                     preset_id = op.get("preset_span_id")
                     if preset_id is not None:
                         TraceCustomIdGenerator.preset_next_span_id(preset_id)
-                    trace_ctx.trace_slice_start(op["name"], op["level"], op.get("ts"))
+                    try:
+                        trace_ctx.trace_slice_start(
+                            op["name"], op["level"], op.get("ts")
+                        )
+                    finally:
+                        TraceCustomIdGenerator.preset_next_span_id(None)
 
                 elif op_type == "slice_end":
                     trace_ctx.trace_slice_end(
@@ -447,27 +452,30 @@ class _TraceExporterProcess(multiprocessing.Process):
                     preset_id = op.get("preset_span_id")
                     if preset_id is not None:
                         TraceCustomIdGenerator.preset_next_span_id(preset_id)
-                    events = None
-                    if op.get("events"):
-                        events = [
-                            TraceEvent(
-                                event_name=e["event_name"],
-                                ts=e["ts"],
-                                attrs=e.get("attrs", {}),
-                            )
-                            for e in op["events"]
-                        ]
-                    slice_ctx = TraceSliceContext(
-                        slice_name=op["slice_name"],
-                        start_time_ns=op["start_time_ns"],
-                        end_time_ns=op.get("end_time_ns"),
-                        level=op.get("level", 1),
-                        attrs=op.get("attrs"),
-                        events=events,
-                    )
-                    trace_ctx.trace_slice(
-                        slice_ctx, op.get("thread_finish_flag", False)
-                    )
+                    try:
+                        events = None
+                        if op.get("events"):
+                            events = [
+                                TraceEvent(
+                                    event_name=e["event_name"],
+                                    ts=e["ts"],
+                                    attrs=e.get("attrs", {}),
+                                )
+                                for e in op["events"]
+                            ]
+                        slice_ctx = TraceSliceContext(
+                            slice_name=op["slice_name"],
+                            start_time_ns=op["start_time_ns"],
+                            end_time_ns=op.get("end_time_ns"),
+                            level=op.get("level", 1),
+                            attrs=op.get("attrs"),
+                            events=events,
+                        )
+                        trace_ctx.trace_slice(
+                            slice_ctx, op.get("thread_finish_flag", False)
+                        )
+                    finally:
+                        TraceCustomIdGenerator.preset_next_span_id(None)
 
                 elif op_type == "event":
                     trace_ctx.trace_event(
@@ -909,23 +917,37 @@ class TraceReqContextAsync:
 
             return TraceNullContext()
 
+        last_id = self._last_span_id
+        if self._span_id_stack:
+            last_id = self._span_id_stack[0]
+
         copied = TraceReqContextAsync.__new__(TraceReqContextAsync)
         copied.rid = self.rid
         copied.tracing_enable = True
         copied.trace_level = self.trace_level
         copied.is_copy = True
         copied._init_args = self._init_args.copy()
-        copied._operations = []
+        copied._operations = [{"type": "init", "init_args": copied._init_args}]
         copied._flush_threshold = self._flush_threshold
         copied.root_span = None
         copied.root_span_context = self.root_span_context
         copied._root_span_carrier = self._root_span_carrier
         copied._id_rng = random.Random(time.time_ns() ^ os.getpid() ^ id(copied))
         copied._span_id_stack = []
-        copied._last_span_id = self._last_span_id
+        copied._last_span_id = last_id
         copied._caller_pid = 0
         copied._context_id = random.getrandbits(64)
         copied._init_last_span_context = None
+        if self._root_span_carrier and last_id:
+            tp_parts = self._root_span_carrier.get("traceparent", "").split("-")
+            if len(tp_parts) >= 2:
+                try:
+                    copied._init_last_span_context = {
+                        "trace_id": int(tp_parts[1], 16),
+                        "span_id": last_id,
+                    }
+                except ValueError:
+                    pass
         return copied
 
     def __getstate__(self) -> Dict[str, Any]:

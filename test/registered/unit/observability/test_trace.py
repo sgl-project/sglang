@@ -236,6 +236,191 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         # Should not register anything
 
 
+class TestTraceReqContextAsyncCopyAndReplay(unittest.TestCase):
+    def setUp(self):
+        import sglang.srt.observability.trace_async as async_mod
+
+        self.async_mod = async_mod
+        self.orig_initialized = mod.opentelemetry_initialized
+        self.orig_tracer = mod.tracer
+        self.orig_async_avail = async_mod.is_async_tracing_available
+        self.orig_get_sock = async_mod._get_zmq_socket
+        from sglang.srt.runtime_context import get_resources
+
+        self.orig_level = get_resources().trace_level
+
+        if _has_otel:
+            otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+            otel_trace._TRACER_PROVIDER = None
+            self.provider = TracerProvider(id_generator=mod.TraceCustomIdGenerator())
+            otel_trace.set_tracer_provider(self.provider)
+            mod.tracer = otel_trace.get_tracer("test_async")
+        mod.opentelemetry_initialized = True
+        async_mod.is_async_tracing_available = lambda: True
+        set_global_trace_level(3)
+
+    def tearDown(self):
+        mod.opentelemetry_initialized = self.orig_initialized
+        mod.tracer = self.orig_tracer
+        self.async_mod.is_async_tracing_available = self.orig_async_avail
+        self.async_mod._get_zmq_socket = self.orig_get_sock
+        mod.TraceCustomIdGenerator.preset_next_span_id(None)
+        from sglang.srt.runtime_context import get_resources
+
+        get_resources().trace_level = self.orig_level
+
+    def test_copy_for_thread_emits_init_and_links_parent_span(self):
+        batches = []
+
+        class _DummySock:
+            def send_pyobj(self, msg, flags=0):
+                batches.append(msg)
+
+        self.async_mod._get_zmq_socket = lambda: _DummySock()
+
+        ctx = self.async_mod.TraceReqContextAsync(rid="req-async-1", role="unified")
+        ctx._root_span_carrier = {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        }
+        ctx.trace_slice_start("parent_slice", level=1, ts=1100)
+        parent_span_id = ctx._span_id_stack[0]
+
+        copied = ctx.copy_for_thread()
+        self.assertTrue(copied.tracing_enable)
+        self.assertTrue(copied.is_copy)
+        self.assertNotEqual(copied._context_id, ctx._context_id)
+        self.assertEqual(copied._last_span_id, parent_span_id)
+        self.assertEqual(
+            copied._init_last_span_context,
+            {
+                "trace_id": int("4bf92f3577b34da6a3ce929d0e0e4736", 16),
+                "span_id": parent_span_id,
+            },
+        )
+        self.assertEqual(copied._operations[0]["type"], "init")
+
+        if _has_otel:
+            copied.rebuild_thread_context(ts=1150)
+        copied.trace_slice_start("worker_slice", level=1, ts=1200)
+        copied.trace_slice_end(
+            "worker_slice", level=1, ts=1300, thread_finish_flag=True
+        )
+        copied.flush()
+        ctx.trace_slice_end("parent_slice", level=1, ts=1400)
+        ctx.trace_req_finish(ts=1500)
+
+        replayed_slices = []
+
+        class _FakeReplayCtx:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.tracing_enable = True
+                self.last_span_context = None
+                self.root_span_context = None
+                self.is_copy = False
+                self.start_time_ns = None
+
+            def trace_req_start(self, ts=None):
+                pass
+
+            def rebuild_thread_context(self, ts=None, pid=None, root_span_context=None):
+                pass
+
+            def trace_slice_start(self, name, level, ts=None):
+                replayed_slices.append(
+                    (
+                        "start",
+                        name,
+                        self.last_span_context,
+                        getattr(
+                            mod.TraceCustomIdGenerator._preset_local,
+                            "span_id",
+                            None,
+                        ),
+                    )
+                )
+                mod.TraceCustomIdGenerator.preset_next_span_id(None)
+
+            def trace_slice_end(
+                self, name, level, ts=None, attrs=None, thread_finish_flag=False
+            ):
+                replayed_slices.append(("end", name, thread_finish_flag))
+
+            def trace_slice(self, slice_ctx, thread_finish_flag=False):
+                pass
+
+            def trace_req_finish(self, ts=None, attrs=None):
+                pass
+
+            def abort(self, ts=None, abort_info=None):
+                pass
+
+        exporter = self.async_mod._TraceExporterProcess.__new__(
+            self.async_mod._TraceExporterProcess
+        )
+        contexts = {}
+        for msg in batches:
+            exporter._replay_batch(
+                msg,
+                contexts,
+                {},
+                mod.TraceCustomIdGenerator,
+                _FakeReplayCtx,
+                mod.TraceSliceContext,
+                mod.TraceEvent,
+            )
+
+        worker_starts = [
+            s for s in replayed_slices if s[:2] == ("start", "worker_slice")
+        ]
+        self.assertEqual(len(worker_starts), 1)
+        if _has_otel:
+            self.assertIsNotNone(worker_starts[0][2])
+            self.assertEqual(worker_starts[0][2].span_id, parent_span_id)
+
+        # Ensure preset_span_id does not leak when a slice fast-returns without consuming it
+        class _FastReturnCtx(_FakeReplayCtx):
+            def trace_slice_start(self, name, level, ts=None):
+                return
+
+            def trace_slice(self, slice_ctx, thread_finish_flag=False):
+                return
+
+        contexts[999] = (_FastReturnCtx(), 0.0)
+        exporter._replay_batch(
+            {
+                "rid": "req-async-1",
+                "context_id": 999,
+                "operations": [
+                    {
+                        "type": "slice_start",
+                        "name": "filtered_out",
+                        "level": 2,
+                        "ts": 2100,
+                        "preset_span_id": 0x123456789ABCDEF0,
+                    },
+                    {
+                        "type": "slice",
+                        "slice_name": "filtered_slice",
+                        "start_time_ns": 2200,
+                        "end_time_ns": 2300,
+                        "level": 2,
+                        "preset_span_id": 0xFEDCBA9876543210,
+                    },
+                ],
+            },
+            contexts,
+            {},
+            mod.TraceCustomIdGenerator,
+            _FastReturnCtx,
+            mod.TraceSliceContext,
+            mod.TraceEvent,
+        )
+        self.assertIsNone(
+            getattr(mod.TraceCustomIdGenerator._preset_local, "span_id", None)
+        )
+
+
 @unittest.skipUnless(_has_otel, "opentelemetry not installed")
 class TestTraceReqContextEnabled(unittest.TestCase):
     def setUp(self):
