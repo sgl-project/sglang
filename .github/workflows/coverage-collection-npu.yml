@@ -1,7 +1,7 @@
 # Coverage baseline collection for the NPU precision test selection.
 # Delegates to pr-test-npu.yml with coverage_mode=true, which switches:
 #   - Test jobs to the coverage pool with use_coverage_runner=true
-#   - base-a to a hosted runner (base-a-test-npu-cov, data merged via artifact)
+#   - extra-a to a hosted runner (extra-a-test-npu-cov, data merged via artifact)
 #   - Runs the multimodal-gen suites too. Their runner is asked for this
 #     shard's targets (case-level pytest node ids) and each target is run in
 #     its own coverage invocation, so diffusion coverage is attributed per

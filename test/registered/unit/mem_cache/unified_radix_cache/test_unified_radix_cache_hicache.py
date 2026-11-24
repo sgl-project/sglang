@@ -47,7 +47,7 @@ from sglang.test.kits.unified_radix_cache.hicache import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=12, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=12, suite="base-b-test-1-gpu-small-amd")
 
 
 class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
@@ -439,7 +439,9 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertFalse(cache.tree_core.is_backuped(node))
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
 
-        with mock.patch.object(cache, "_execute_and_commit_kv_backup", return_value=0):
+        with mock.patch.object(
+            cache, "_execute_and_commit_kv_backup", return_value=None
+        ):
             result = cache.evict(EvictParams(num_tokens=len(seq)))
 
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))

@@ -1163,6 +1163,56 @@ def test_latent_preparation_preserves_offline_noise_and_skips_online_draw(online
         assert torch.equal(result.generator.get_state(), expected.generator.get_state())
 
 
+def test_offline_request_with_several_outputs_runs_one_sample_per_output():
+    from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
+    from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+        SyncExecutor,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        NomasInputValidationStage,
+        NomasLatentPreparationStage,
+    )
+
+    args = SimpleNamespace(
+        pipeline_config=NomasPipelineConfig(), enable_cfg_parallel=False
+    )
+    stages = [
+        object.__new__(NomasInputValidationStage),
+        NomasLatentPreparationStage(FlowMatchEulerDiscreteScheduler(shift=5.0), None),
+    ]
+    executor = object.__new__(SyncExecutor)
+    executor.execute_group = lambda stages, batches, server_args: [
+        stages[0].forward(batch, server_args) for batch in batches
+    ]
+    executor.execute = lambda stages, batch, server_args: stages[0].forward(
+        batch, server_args
+    )
+
+    def run(num_outputs):
+        batch = Req(
+            sampling_params=NomasSamplingParams(
+                request_id="job",
+                prompt="road",
+                num_frames=17,
+                height=64,
+                width=64,
+                seed=42,
+                num_outputs_per_prompt=num_outputs,
+            )
+        )
+        batch.prompt_embeds = [torch.zeros(1, 8, 128)]
+        return list(executor.execute_group_sequentially(stages, [batch], args))
+
+    (single,) = run(1)
+    outputs = run(2)
+    assert [getattr(out, "error", None) for out in outputs] == [None, None]
+    assert [out.seed for out in outputs] == [42, 43]
+    assert [out.latents.shape for out in outputs] == [(1, 32, 5, 2, 2)] * 2
+    torch.testing.assert_close(outputs[0].latents, single.latents, atol=0, rtol=0)
+    assert not torch.equal(outputs[0].latents, outputs[1].latents)
+
+
 def _fp8_linear(in_features, out_features, device=None):
     with torch.device(device or "cpu"):
         return Fp8Linear(
@@ -1458,6 +1508,39 @@ def test_int8_group_boundary_and_partial_final_group(int8_layer):
     inputs[1, 128] = 1
     expected = (127 * int8_layer.weight_scale).bfloat16().T + int8_layer.bias
     torch.testing.assert_close(int8_layer(inputs), expected, rtol=0, atol=0)
+
+
+def test_int8_loading_rejects_invalid_group_metadata(int8_layer):
+    """Reject malformed groupwise scales during weight loading."""
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    int8_layer.weight_scale = torch.nn.Parameter(
+        torch.ones((2, 1), dtype=torch.float32), requires_grad=False
+    )
+    with pytest.raises(ValueError, match="groupwise shape"):
+        int8_layer.quant_method.process_weights_after_loading(int8_layer)
+
+
+@torch.inference_mode()
+def test_int8_dequant_survives_device_moves_and_compile(int8_layer):
+    """Fused dequantization supports component offload and compiled inference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    inputs = torch.ones(2, 130, dtype=torch.bfloat16)
+    expected = int8_layer(inputs)
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    for device in ("cuda", "cpu", "cuda"):
+        int8_layer.to(device)
+        actual = int8_layer(inputs.to(device)).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    compiled = torch.compile(int8_layer, fullgraph=True)
+    torch.testing.assert_close(compiled(inputs.cuda()).cpu(), expected, rtol=0, atol=0)
+    if torch.cuda.device_count() > 1:
+        current = torch.cuda.current_device()
+        other = (current + 1) % torch.cuda.device_count()
+        int8_layer.to(f"cuda:{other}")
+        actual = int8_layer(inputs.to(f"cuda:{other}")).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.cuda.current_device() == current
 
 
 @pytest.mark.parametrize(

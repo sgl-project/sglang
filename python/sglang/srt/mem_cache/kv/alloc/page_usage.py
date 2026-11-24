@@ -364,14 +364,23 @@ class PageUsage:
 
     # -- recording --
 
-    def record_forward(self, event, ids, *, writes_unknown: bool) -> None:
+    def record_forward(
+        self, event, ids, *, writes_unknown: bool, copy: bool = True
+    ) -> None:
+        """Without ``copy`` the caller hands over its own copy of ``ids``."""
         self.register_forward(event)
         self.prune()
         if writes_unknown:
             self.uses.append(PageUse(FORWARD, event, writes=True))
         elif ids is not None and ids.numel() > 0:
             self.uses.append(
-                PageUse(FORWARD, event, writes=True, ids=_owned(ids), widened=True)
+                PageUse(
+                    FORWARD,
+                    event,
+                    writes=True,
+                    ids=_owned(ids) if copy else ids,
+                    widened=True,
+                )
             )
 
     def record_transfer(
