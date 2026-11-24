@@ -76,8 +76,6 @@ def run_performance_test(
     print(f"  Output lens: {output_lens}")
     if spec_accept_length_threshold is not None:
         print(f"  Spec accept length threshold: {spec_accept_length_threshold}")
-    if spec_accept_length_threshold is not None:
-        print(f"  Spec accept length threshold: {spec_accept_length_threshold}")
     if baseline_output_throughput is not None:
         print(f"  Baseline output throughput: {baseline_output_throughput} tok/s")
     if baseline_ftl_s is not None:
@@ -92,8 +90,7 @@ def run_performance_test(
         extra_bench_args.append(f"--dataset-name={dataset_name}")
 
     try:
-        # Scalar gates describe one shape at the largest batch size. Reject
-        # ambiguous configurations before launching an expensive benchmark.
+        # Scalar baselines describe a single shape at the largest batch size.
         if any(
             baseline is not None
             for baseline in (
