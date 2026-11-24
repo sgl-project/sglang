@@ -232,6 +232,7 @@ jobs:
           done
 
       - name: Run test
+        id: run_test
         timeout-minutes: 300
         env:
           CONTAINER_PATCH_DIRS: ${{ steps.container_patches.outputs.dirs }}
@@ -243,14 +244,14 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
 
           test_case="${{ inputs.test_case }}"
+          tc_name=${test_case##*/}
+          tc_name=${tc_name%.*}
+          echo "name=${tc_name}" >> "$GITHUB_OUTPUT"
+
           if [ ! -f "${sglang_source_path}/${test_case}" ]; then
             echo "The testcase does not exit: ${sglang_source_path}/${test_case}"
             exit 1
           fi
-
-          # prepare for output data
-          tc_name=${test_case##*/}
-          tc_name=${tc_name%.*}
 
           # Provided automatically by the GitHub server.
           # run_id is the unique identifier for the workflow run,
@@ -365,15 +366,47 @@ jobs:
           echo "Run command: ${CMD}"
           eval "${CMD}"
 
+      - name: Collect node logs
+        if: ${{ always() && steps.run_test.outcome != 'success' }}
+        continue-on-error: true
+        run: |
+          tc_name="${{ inputs.test_case }}"
+          tc_name="${tc_name##*/}"
+          tc_name="${tc_name%.*}"
+
+          collected=0
+          for out_dir in /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${tc_name}; do
+            [ -d "${out_dir}" ] || continue
+            for src_dir in /root/.cache/tests/logs/log/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${tc_name}/*; do
+              [ -d "${src_dir}" ] || continue
+              [ -f "${src_dir}/${tc_name}.log" ] || continue
+              pod_name="$(basename "${src_dir}")"
+              dest_dir="${out_dir}/node_logs/${pod_name}"
+              # Same name as the pod-side copy and dump_pod_logs: keep whichever
+              # archive landed first so each pod ends up with a single log.
+              if [ -f "${dest_dir}/${pod_name}.log" ]; then
+                continue
+              fi
+              mkdir -p "${dest_dir}"
+              cp -a "${src_dir}/${tc_name}.log" "${dest_dir}/${pod_name}.log"
+              collected=$((collected + 1))
+            done
+          done
+          echo "Collected ${collected} pod log dir(s)"
+          if [ "${collected}" -eq 0 ]; then
+            echo "No pod-side log dir matched; entries under /root/.cache/tests/logs/log:"
+            ls -1 /root/.cache/tests/logs/log 2>/dev/null | head -n 20 || true
+          fi
+
       - name: Upload metrics artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: npu-metrics-${{ inputs.test_config_name }}
-          # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
+          name: npu-metrics-${{ inputs.test_config_name }}-attempt-${{ github.run_attempt }}
           path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
           if-no-files-found: ignore
           retention-days: 7
+          compression-level: 9
 
       - name: Post process
         if: always()
