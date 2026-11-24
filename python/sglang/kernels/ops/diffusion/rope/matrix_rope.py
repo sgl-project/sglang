@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -59,6 +60,7 @@ def _fake_apply_matrix_rope(
     mutates_args=[],
     fake_impl=_fake_apply_matrix_rope,
 )
+@replay_launches
 def apply_matrix_rope(
     x: torch.Tensor, rope: torch.Tensor, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
