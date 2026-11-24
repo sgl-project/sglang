@@ -448,19 +448,9 @@ class KVCacheConfigurator:
     draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
     modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
+    _npu_k31_shard_index_k: bool = field(init=False, default=False)
     _unified_plan: Any = field(init=False, default=None)
     _unified_sized: Any = field(init=False, default=None)
-
-    @property
-    def npu_kimi_k31_index_k_sharding(self) -> bool | None:
-        if not _is_npu:
-            return None
-
-        from sglang.srt.hardware_backend.npu.pool_configurator import (
-            kimi_k31_index_k_sharding,
-        )
-
-        return kimi_k31_index_k_sharding(self)
 
     @property
     def use_combined_kv_buffer(self) -> bool:
@@ -514,6 +504,12 @@ class KVCacheConfigurator:
                 self.model,
                 use_mla_backend=self.use_mla_backend,
             )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.pool_configurator import (
+                resolve_kimi_k31_index_k_sharding,
+            )
+
+            self._npu_k31_shard_index_k = resolve_kimi_k31_index_k_sharding(self)
 
     def hybrid_swa_token_capacity(
         self,
@@ -3037,7 +3033,7 @@ class KVCacheConfigurator:
                 return partial(
                     NPUDSATokenToKVPool,
                     is_draft_worker=self.is_draft_worker,
-                    shard_index_k=bool(self.npu_kimi_k31_index_k_sharding),
+                    shard_index_k=self._npu_k31_shard_index_k,
                 )
             return dsa_pool_class
         if _is_npu:
@@ -3514,13 +3510,12 @@ class KVCacheConfigurator:
         return max_num_reqs
 
     def _create_memory_pool_configurator(self) -> MemoryPoolConfigurator:
-        shard_index_k = self.npu_kimi_k31_index_k_sharding
-        if shard_index_k is not None:
+        if self._npu_k31_shard_index_k:
             from sglang.srt.hardware_backend.npu.pool_configurator import (
                 NPUKimiK31PoolConfigurator,
             )
 
-            return NPUKimiK31PoolConfigurator(self, shard_index_k=shard_index_k)
+            return NPUKimiK31PoolConfigurator(self)
 
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
