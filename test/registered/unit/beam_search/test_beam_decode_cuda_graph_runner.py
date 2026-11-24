@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""What a beam decode graph replays: the staged batch, and only a batch it holds."""
+"""What a beam decode graph replays: the batch loaded into its buffers, and only
+a batch that fits them."""
 
 import itertools
 import unittest
@@ -39,15 +40,15 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-CAPACITY = FixedWidthCapacity(beam_width=2, max_context=4, max_decode=3)
+CAPACITY = FixedWidthCapacity(beam_width=2, max_context_len=4, max_decode_len=3)
 
 
 def _inputs(max_rows, *, trie_head=True, shared_context=True) -> BeamGraphInputs:
     return BeamGraphInputs(
-        trie_levels=(
+        trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        attention=(
+        attention_input=(
             FixedWidthAttentionInput(max_rows=max_rows, device="cpu", capacity=CAPACITY)
             if shared_context
             else None
@@ -81,46 +82,46 @@ def _metadata(prompt_lens, decode_lens, width=2) -> BeamAttentionMetadata:
 
 
 class TestBeamGraphInputs(CustomTestCase):
-    def test_staging_refreshes_every_tensor_the_graph_reads(self):
-        """A graph reads its inputs by address: a batch tensor that staging
+    def test_loading_refreshes_every_tensor_the_graph_reads(self):
+        """A graph reads its inputs by address: a batch tensor that loading
         skips leaves the previous batch's values in the replay. Under the dense
         LM head a batch carries no trie levels and replays all the same."""
         for trie_head in (True, False):
             with self.subTest(trie_head=trie_head):
                 inputs = _inputs(8, trie_head=trie_head)
-                captured = inputs.for_capture(4)
+                captured = inputs.prepare_capture_inputs(4)
                 batch = BeamForwardInputs(
                     torch.tensor([1, 2, 1, 2]) if trie_head else None,
                     _metadata(prompt_lens=[1, 2], decode_lens=[1, 2]),
                 )
                 self.assertTrue(inputs.can_replay(batch, graph_size=4))
-                inputs.stage(batch)
+                inputs.load_replay_inputs(batch)
 
                 if trie_head:
                     self.assertEqual(captured.trie_levels.tolist(), [1, 2, 1, 2])
                 captured_bucket = captured.attention_metadata.buckets[0]
-                source = batch.attention_metadata.buckets[0]
+                batch_bucket = batch.attention_metadata.buckets[0]
                 tensors = 0
                 for field in msgspec.structs.fields(BeamAttentionBucket):
-                    value = getattr(source, field.name)
+                    value = getattr(batch_bucket, field.name)
                     if not isinstance(value, torch.Tensor):
                         continue
                     tensors += 1
-                    staged = getattr(captured_bucket, field.name)[
+                    loaded = getattr(captured_bucket, field.name)[
                         tuple(map(slice, value.shape))
                     ]
-                    self.assertEqual(staged.tolist(), value.tolist(), field.name)
+                    self.assertEqual(loaded.tolist(), value.tolist(), field.name)
                 self.assertEqual(tensors, 5)
 
-    def test_only_a_batch_the_graph_holds_replays(self):
+    def test_only_a_batch_that_fits_the_graph_replays(self):
         """Replaying a beam graph for a batch that does not fit its buffers
         returns the attention of other slots; such a batch runs eagerly."""
         inputs = _inputs(8)
-        inputs.for_capture(4)
+        inputs.prepare_capture_inputs(4)
         levels = torch.zeros(4, dtype=torch.int64)
         at_capacity = _metadata(
-            prompt_lens=[CAPACITY.max_context] * 2,
-            decode_lens=[CAPACITY.max_decode, 1],
+            prompt_lens=[CAPACITY.max_context_len] * 2,
+            decode_lens=[CAPACITY.max_decode_len, 1],
         )
         self.assertTrue(
             inputs.can_replay(BeamForwardInputs(levels, at_capacity), graph_size=4)
@@ -141,7 +142,9 @@ class TestBeamGraphInputs(CustomTestCase):
             ),
             "decode steps past the capacity": (
                 levels,
-                _metadata(prompt_lens=[1, 1], decode_lens=[CAPACITY.max_decode + 1, 1]),
+                _metadata(
+                    prompt_lens=[1, 1], decode_lens=[CAPACITY.max_decode_len + 1, 1]
+                ),
                 4,
             ),
             "another beam width": (
@@ -165,7 +168,7 @@ class TestBeamGraphInputs(CustomTestCase):
         """Without shared-context attention a beam graph holds FlashInfer
         attention, which a batch with shared-context metadata does not run."""
         inputs = _inputs(4, shared_context=False)
-        inputs.for_capture(4)
+        inputs.prepare_capture_inputs(4)
         levels = torch.zeros(3, dtype=torch.int64)
         self.assertTrue(
             inputs.can_replay(BeamForwardInputs(levels, None), graph_size=4)
@@ -188,14 +191,14 @@ class TestFixedWidthAttentionInput(CustomTestCase):
             model_config=SimpleNamespace(context_len=16),
         )
         cases = (
-            # (width, max new tokens, trie codebooks) -> max_decode, or None for no graph
+            # (width, max new tokens, trie codebooks) -> max_decode_len, or None for no graph
             ((None, 4, None), None),
             ((2, None, None), None),
             ((2, 4, None), 3),
             ((2, None, 3), 2),
             ((2, 8, 3), 2),
         )
-        for (width, max_new_tokens, codebooks), max_decode in cases:
+        for (width, max_new_tokens, codebooks), max_decode_len in cases:
             trie_config = (
                 None if codebooks is None else SimpleNamespace(num_codebooks=codebooks)
             )
@@ -214,13 +217,15 @@ class TestFixedWidthAttentionInput(CustomTestCase):
                 ),
             ):
                 attention = FixedWidthAttentionInput.create(runner, max_rows=8)
-                if max_decode is None:
+                if max_decode_len is None:
                     self.assertIsNone(attention)
                 else:
                     self.assertEqual(
                         attention.capacity,
                         FixedWidthCapacity(
-                            beam_width=2, max_context=16, max_decode=max_decode
+                            beam_width=2,
+                            max_context_len=16,
+                            max_decode_len=max_decode_len,
                         ),
                     )
 

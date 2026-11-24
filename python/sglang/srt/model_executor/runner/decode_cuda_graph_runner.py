@@ -1002,7 +1002,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         # Compact-trie logits and shared-context attention run eagerly, unless a
-        # beam-owned runner captured graphs for them.
+        # subclass captured a beam graph that fits the batch.
         if forward_batch.beam is not None and not self._can_replay_beam(forward_batch):
             return False
 

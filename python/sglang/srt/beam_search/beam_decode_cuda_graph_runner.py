@@ -11,14 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Decode CUDA graphs for all-beam batches.
+"""CUDA graphs for decode batches made only of beam requests.
 
-An all-beam decode batch runs the beam fast paths its server has on: the compact
-trie head, shared-context attention, or both. Either one keeps the batch off the
-ordinary decode graphs. The runner here captures a second graph per size that
-holds those paths, and replays it with the batch's beam inputs staged into the
-buffers the graph reads. BeamDecodeCudaGraphRunner lists the batches a beam graph
-replays.
+Such a batch runs the compact trie head, shared-context attention, or both. The
+ordinary decode graphs hold neither, so the parent runner runs the batch eagerly.
+BeamDecodeCudaGraphRunner adds beam graphs:
+
+1. Capture: next to the ordinary graph of a size, it captures a beam graph that
+   reads its beam inputs from fixed buffers.
+2. Replay: it copies the batch's beam inputs into those buffers, then replays
+   the beam graph.
 """
 
 from __future__ import annotations
@@ -49,80 +51,88 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Graph key label of the beam graphs. It sits where the LoRA label does, and a
-# server with LoRA captures no beam graph.
+# Graph key label of the beam graphs. It takes the LoRA label's place in the key;
+# a server with LoRA captures no beam graph.
 BEAM_GRAPH_VARIANT = "beam"
 
 
 class TrieLevelsInput:
-    """The trie levels of the beam graphs, read by the compact trie head. Any row
-    count fits, and a batch pads like any decode batch."""
+    """Graph buffer for the trie levels, which the compact trie head reads.
+
+    Every graph size works; a batch pads like any decode batch.
+    """
 
     def __init__(self, *, max_rows: int, device):
         # [max_rows] int64 SID codebook depth per row.
-        self._levels = torch.zeros(max_rows, dtype=torch.int64, device=device)
+        self._graph_levels = torch.zeros(max_rows, dtype=torch.int64, device=device)
 
-    def supports_rows(self, rows: int) -> bool:
+    def can_capture(self, graph_size: int) -> bool:
         return True
 
-    def for_capture(self, rows: int) -> torch.Tensor:
-        return self._levels[:rows]
+    def prepare_capture_inputs(self, graph_size: int) -> torch.Tensor:
+        return self._graph_levels[:graph_size]
 
     def can_replay(
         self, trie_levels: Optional[torch.Tensor], *, graph_size: int
     ) -> bool:
         return trie_levels is not None
 
-    def stage(self, trie_levels: torch.Tensor) -> None:
+    def load_replay_inputs(self, trie_levels: torch.Tensor) -> None:
         # Padding rows keep an earlier batch's levels; a stale level is a valid depth.
-        self._levels[: trie_levels.shape[0]].copy_(trie_levels)
+        self._graph_levels[: trie_levels.shape[0]].copy_(trie_levels)
 
 
 class FixedWidthCapacity(msgspec.Struct, frozen=True):
-    """What a fixed-width shared-context graph holds per beam group."""
+    """Limits of the fixed-width shared-context graphs."""
 
     # The one beam width the graphs serve.
     beam_width: int
-    # Prompt tokens: the model's context length, so every prompt fits.
-    max_context: int
-    # Generated tokens a decode step attends. The kernel unrolls its decode loop
-    # this many times at compile time, so every replay pays for all of them.
-    max_decode: int
+    # Prompt tokens per request: the model's context length, so every prompt fits.
+    max_context_len: int
+    # Generated tokens per beam that a decode step attends. The kernel unrolls its
+    # decode loop this many times at compile time, so every replay pays for all.
+    max_decode_len: int
 
 
 class FixedWidthAttentionInput:
-    """The shared-context attention metadata of the beam graphs, for one beam width.
+    """Graph buffers for shared-context attention with one beam width.
 
-    The kernel takes whole beam groups of that width and no padding rows. So only
-    graph sizes that are a multiple of the width get a beam graph, and a batch
-    replays the graph of exactly its own row count. One bucket sized for the
-    largest graph serves every size; a graph of fewer groups reads its leading part.
+    The kernel takes whole beam groups (one per request) and no padding rows:
+
+    - Only a graph size that is a multiple of the beam width gets a beam graph.
+    - A batch replays only the graph of exactly its own row count.
+
+    All graph sizes share one bucket, sized for the largest graph; a smaller
+    graph reads its leading groups.
     """
 
     def __init__(self, *, max_rows: int, device, capacity: FixedWidthCapacity):
         self.capacity = capacity
         width = capacity.beam_width
-        groups = max_rows // width
+        num_groups = max_rows // width
         int32 = {"dtype": torch.int32, "device": device}
-        # Captured with one prompt token and max_decode steps per group, on KV slot 0;
-        # every replay stages the batch's values first.
-        self._bucket = BeamAttentionBucket(
-            row_indices=torch.arange(groups * width, **int32).view(groups, width),
-            context_slots=torch.zeros(groups * capacity.max_context, **int32),
-            context_cu_seqlens=torch.arange(groups + 1, **int32),
-            decode_slots=torch.zeros((groups, width * capacity.max_decode), **int32),
+        # Capture-time values: per group, one prompt token and max_decode_len
+        # generated tokens on KV slot 0. Every replay loads the batch's values first.
+        self._graph_bucket = BeamAttentionBucket(
+            row_indices=torch.arange(num_groups * width, **int32).view(
+                num_groups, width
+            ),
+            context_slots=torch.zeros(num_groups * capacity.max_context_len, **int32),
+            context_cu_seqlens=torch.arange(num_groups + 1, **int32),
+            decode_slots=torch.zeros(
+                (num_groups, width * capacity.max_decode_len), **int32
+            ),
             beam_width=width,
-            decode_lens=torch.full((groups,), capacity.max_decode, **int32),
+            decode_lens=torch.full((num_groups,), capacity.max_decode_len, **int32),
         )
 
     @classmethod
     def create(
         cls, model_runner: ModelRunner, *, max_rows: int
     ) -> Optional[FixedWidthAttentionInput]:
-        """None when shared-context attention gets no graph on this server; the
-        reason is logged."""
-        beam_width = cls._beam_width()
-        max_new_tokens = cls._max_new_tokens(model_runner.model_config)
+        """Returns None, and logs why, when shared-context batches get no graph."""
+        beam_width = cls._read_beam_width()
+        max_new_tokens = cls._read_max_new_tokens(model_runner.model_config)
         reason = None
         if model_runner.lora_manager is not None:
             reason = "LoRA is enabled"
@@ -145,14 +155,14 @@ class FixedWidthAttentionInput:
             return None
         capacity = FixedWidthCapacity(
             beam_width=beam_width,
-            max_context=model_runner.model_config.context_len,
+            max_context_len=model_runner.model_config.context_len,
             # The step that generates token n attends the n - 1 tokens before it.
-            max_decode=max_new_tokens - 1,
+            max_decode_len=max_new_tokens - 1,
         )
         return cls(max_rows=max_rows, device=model_runner.device, capacity=capacity)
 
     @staticmethod
-    def _beam_width() -> Optional[int]:
+    def _read_beam_width() -> Optional[int]:
         beam_width = envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH.get()
         if beam_width is not None and beam_width < 2:
             raise ValueError(
@@ -162,9 +172,8 @@ class FixedWidthAttentionInput:
         return beam_width
 
     @staticmethod
-    def _max_new_tokens(model_config: ModelConfig) -> Optional[int]:
-        """Tokens a beam request generates at most inside a graph; None when
-        nothing bounds them."""
+    def _read_max_new_tokens(model_config: ModelConfig) -> Optional[int]:
+        """Tokens a request may generate on the graphs; None when nothing sets it."""
         trie_config = get_beam_trie_config(model_config)
         if trie_config is not None:
             # Admission pins a trie request's max_new_tokens to the codebook count.
@@ -178,8 +187,8 @@ class FixedWidthAttentionInput:
             )
         return max_new_tokens
 
-    def size_requirement(self) -> str:
-        """What to change when no decode graph size holds a beam graph."""
+    def describe_size_requirement(self) -> str:
+        """Which decode graph sizes to add; logged when no size got a beam graph."""
         width = self.capacity.beam_width
         return (
             f"With SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH={width} a beam graph needs "
@@ -188,194 +197,222 @@ class FixedWidthAttentionInput:
             "decode together."
         )
 
-    def supports_rows(self, rows: int) -> bool:
-        return rows % self.capacity.beam_width == 0
+    def can_capture(self, graph_size: int) -> bool:
+        return graph_size % self.capacity.beam_width == 0
 
-    def for_capture(self, rows: int) -> BeamAttentionMetadata:
-        groups = rows // self.capacity.beam_width
-        bucket = BeamAttentionBucket(
-            row_indices=self._bucket.row_indices[:groups],
-            context_slots=self._bucket.context_slots,
-            context_cu_seqlens=self._bucket.context_cu_seqlens[: groups + 1],
-            decode_slots=self._bucket.decode_slots[:groups],
-            beam_width=self._bucket.beam_width,
-            decode_lens=self._bucket.decode_lens[:groups],
+    def prepare_capture_inputs(self, graph_size: int) -> BeamAttentionMetadata:
+        num_groups = graph_size // self.capacity.beam_width
+        graph_bucket = self._graph_bucket
+        leading_groups = BeamAttentionBucket(
+            row_indices=graph_bucket.row_indices[:num_groups],
+            context_slots=graph_bucket.context_slots,
+            context_cu_seqlens=graph_bucket.context_cu_seqlens[: num_groups + 1],
+            decode_slots=graph_bucket.decode_slots[:num_groups],
+            beam_width=graph_bucket.beam_width,
+            decode_lens=graph_bucket.decode_lens[:num_groups],
         )
-        return BeamAttentionMetadata(buckets=[bucket], num_rows=rows)
+        return BeamAttentionMetadata(buckets=[leading_groups], num_rows=graph_size)
 
     def can_replay(
         self, metadata: Optional[BeamAttentionMetadata], *, graph_size: int
     ) -> bool:
-        # No padding rows, whole groups of the one width, and at most max_decode
-        # generated tokens attended per beam.
+        # The batch must have:
+        # - exactly the graph's rows, since the kernel takes no padding rows;
+        # - one bucket, which means one beam width, and it is the graphs' width;
+        # - at most max_decode_len generated tokens per beam.
         return (
             metadata is not None
             and metadata.num_rows == graph_size
             and len(metadata.buckets) == 1
             and metadata.buckets[0].beam_width == self.capacity.beam_width
             and metadata.buckets[0].decode_slots.shape[1]
-            <= self.capacity.beam_width * self.capacity.max_decode
+            <= self.capacity.beam_width * self.capacity.max_decode_len
         )
 
-    def stage(self, metadata: BeamAttentionMetadata) -> None:
-        # Slots past the staged lengths keep an earlier batch's values; the kernel
+    def load_replay_inputs(self, metadata: BeamAttentionMetadata) -> None:
+        # Slots past the batch's lengths keep an earlier batch's values; the kernel
         # reads no slot past a length.
-        source, static = metadata.buckets[0], self._bucket
-        groups = source.row_indices.shape[0]
-        static.row_indices[:groups].copy_(source.row_indices)
-        static.context_slots[: source.context_slots.numel()].copy_(source.context_slots)
-        static.context_cu_seqlens[: groups + 1].copy_(source.context_cu_seqlens)
-        static.decode_slots[:groups, : source.decode_slots.shape[1]].copy_(
-            source.decode_slots
+        batch_bucket, graph_bucket = metadata.buckets[0], self._graph_bucket
+        num_groups = batch_bucket.row_indices.shape[0]
+        graph_bucket.row_indices[:num_groups].copy_(batch_bucket.row_indices)
+        graph_bucket.context_slots[: batch_bucket.context_slots.numel()].copy_(
+            batch_bucket.context_slots
         )
-        static.decode_lens[:groups].copy_(source.decode_lens)
+        graph_bucket.context_cu_seqlens[: num_groups + 1].copy_(
+            batch_bucket.context_cu_seqlens
+        )
+        graph_bucket.decode_slots[
+            :num_groups, : batch_bucket.decode_slots.shape[1]
+        ].copy_(batch_bucket.decode_slots)
+        graph_bucket.decode_lens[:num_groups].copy_(batch_bucket.decode_lens)
 
 
 class BeamGraphInputs:
-    """What the beam graphs read: one part per BeamForwardInputs field, None where
-    no graph reads the field. Every part answers supports_rows, for_capture,
-    can_replay and stage for its own field, and owns buffers sized for the largest
-    graph."""
+    """The buffers the beam graphs read: one input per BeamForwardInputs field.
+
+    An input is None when no graph reads its field. Every input has four methods:
+
+    - can_capture(graph_size): whether a graph of this size can read the input.
+    - prepare_capture_inputs(graph_size): the buffer views that graph captures.
+    - can_replay(batch_value, graph_size=...): whether that graph fits the batch.
+    - load_replay_inputs(batch_value): copy the batch's value into the buffers.
+    """
 
     def __init__(
         self,
         *,
-        trie_levels: Optional[TrieLevelsInput],
-        attention: Optional[FixedWidthAttentionInput],
+        trie_levels_input: Optional[TrieLevelsInput],
+        attention_input: Optional[FixedWidthAttentionInput],
     ):
-        self.trie_levels = trie_levels
-        self.attention = attention
+        self.trie_levels_input = trie_levels_input
+        self.attention_input = attention_input
         # Sizes, in rows, of the beam graphs captured so far.
         self.captured_sizes: set[int] = set()
 
-    def _parts(self, beam: BeamForwardInputs):
-        """Each part with the field of the batch it reads."""
+    def _inputs_with_batch_values(self, beam: BeamForwardInputs):
         return (
-            (self.trie_levels, beam.trie_levels),
-            (self.attention, beam.attention_metadata),
+            (self.trie_levels_input, beam.trie_levels),
+            (self.attention_input, beam.attention_metadata),
         )
 
-    def supports_rows(self, rows: int) -> bool:
-        parts = (self.trie_levels, self.attention)
-        return all(part.supports_rows(rows) for part in parts if part is not None)
+    def can_capture(self, graph_size: int) -> bool:
+        graph_inputs = (self.trie_levels_input, self.attention_input)
+        return all(
+            graph_input.can_capture(graph_size)
+            for graph_input in graph_inputs
+            if graph_input is not None
+        )
 
-    def for_capture(self, rows: int) -> BeamForwardInputs:
-        self.captured_sizes.add(rows)
+    def prepare_capture_inputs(self, graph_size: int) -> BeamForwardInputs:
+        self.captured_sizes.add(graph_size)
         return BeamForwardInputs(
             trie_levels=(
-                None if self.trie_levels is None else self.trie_levels.for_capture(rows)
+                None
+                if self.trie_levels_input is None
+                else self.trie_levels_input.prepare_capture_inputs(graph_size)
             ),
             attention_metadata=(
-                None if self.attention is None else self.attention.for_capture(rows)
+                None
+                if self.attention_input is None
+                else self.attention_input.prepare_capture_inputs(graph_size)
             ),
         )
 
     def can_replay(self, beam: BeamForwardInputs, *, graph_size: int) -> bool:
-        """Whether the beam graph of graph_size rows holds this batch; graph_size
-        is the batch's row count padded up to a decode graph size."""
+        """graph_size is the batch's row count padded up to a decode graph size."""
         if graph_size not in self.captured_sizes:
             return False
-        for part, value in self._parts(beam):
-            if part is None:
-                # The batch runs a path the graphs do not hold.
-                if value is not None:
+        for graph_input, batch_value in self._inputs_with_batch_values(beam):
+            if graph_input is None:
+                # The batch runs a fast path the graphs do not hold.
+                if batch_value is not None:
                     return False
-            elif not part.can_replay(value, graph_size=graph_size):
+            elif not graph_input.can_replay(batch_value, graph_size=graph_size):
                 return False
         return True
 
-    def stage(self, beam: BeamForwardInputs) -> None:
-        """Copy a batch that can_replay accepted into the buffers the graphs read."""
-        for part, value in self._parts(beam):
-            if part is not None:
-                part.stage(value)
+    def load_replay_inputs(self, beam: BeamForwardInputs) -> None:
+        """Only for a batch that can_replay accepted."""
+        for graph_input, batch_value in self._inputs_with_batch_values(beam):
+            if graph_input is not None:
+                graph_input.load_replay_inputs(batch_value)
 
 
-def _beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphInputs]:
-    """None when no all-beam batch could replay a beam graph; the reason is logged."""
-    # The shared logits buffer holds the largest decode graph's rows.
+def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphInputs]:
+    """Returns None, and logs why, when no all-beam batch could replay a beam graph."""
+    # Rows of the largest decode graph; the shared logits buffer holds as many.
     max_rows = model_runner.max_decode_logits_rows()
-    attention = None
+    attention_input = None
     if shared_context_attention.enabled() and (
         shared_context_attention.supports_shared_context(model_runner)
     ):
-        attention = FixedWidthAttentionInput.create(model_runner, max_rows=max_rows)
-        if attention is None:
-            # Every all-beam batch carries shared-context metadata here, so a
-            # graph without it would never replay.
+        attention_input = FixedWidthAttentionInput.create(
+            model_runner, max_rows=max_rows
+        )
+        if attention_input is None:
+            # Every all-beam batch carries shared-context metadata on this server,
+            # so a beam graph without that input would never replay.
             return None
-    trie_levels = (
+    trie_levels_input = (
         TrieLevelsInput(max_rows=max_rows, device=model_runner.device)
         if model_runner.beam_trie_compact_enabled
         else None
     )
-    if trie_levels is None and attention is None:
+    if trie_levels_input is None and attention_input is None:
         logger.info(
             "No beam decode graphs captured; all-beam batches run neither the "
             "compact trie head nor shared-context attention and replay the "
             "ordinary decode graphs."
         )
         return None
-    return BeamGraphInputs(trie_levels=trie_levels, attention=attention)
+    return BeamGraphInputs(
+        trie_levels_input=trie_levels_input, attention_input=attention_input
+    )
 
 
 class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
-    """Decode graph runner that also captures the beam fast paths.
+    """Decode graph runner that also replays decode batches of beam requests.
 
-    Besides the ordinary graph, a decode graph size gets a beam graph that holds
-    the fast paths the server has on: the compact trie head, shared-context
-    attention, or both. A beam graph replays only a decode batch made of beam
-    requests alone:
+    Next to the ordinary graph, a decode graph size gets a beam graph that holds
+    the beam fast paths the server has on: the compact trie head, shared-context
+    attention, or both. A beam graph replays a decode batch made only of beam
+    requests:
 
-    - With shared-context attention, only sizes that are a multiple of
-      SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH get a beam graph. It replays a batch
-      whose requests all have that beam width, whose rows (requests x width) are
-      exactly a captured size, and whose requests are within the graph's token
-      budget: the trie's codebook count, or
-      SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS on a model without a
-      trie. Any other all-beam batch runs eagerly.
-    - With the compact trie head on ordinary attention, every size gets a beam
-      graph. Requests may differ in beam width, and the batch pads to the next
-      captured size like any decode batch.
+    - With shared-context attention:
+        - Only sizes that are a multiple of SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH
+          get a beam graph.
+        - Every request has that beam width.
+        - The batch's rows (requests x width) equal a captured size.
+        - Every request is within the graphs' token budget: the trie's codebook
+          count, or SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS on a
+          model without a trie.
+    - With the compact trie head on ordinary attention:
+        - Every size gets a beam graph.
+        - Requests may differ in beam width.
+        - The batch pads to the next captured size like any decode batch.
 
-    A batch that mixes beam and regular requests carries no beam inputs and
-    decodes on the ordinary path. So does every batch when neither fast path is
-    on; this runner then captures and replays what its parent does.
+    Every other batch runs as it does on the parent:
+
+    - An all-beam batch that fits no beam graph runs eagerly.
+    - A batch that mixes beam and regular requests carries no beam inputs and
+      decodes on the ordinary path.
+    - With neither fast path on, no beam graph is captured.
     """
 
     def __init__(self, model_runner: ModelRunner, **kwargs):
-        # Both are set before the parent's __init__, which captures the graphs.
-        self._beam_inputs = _beam_graph_inputs(model_runner)
+        # Set both before the parent's __init__, which captures the graphs.
+        self._beam_graph_inputs = _create_beam_graph_inputs(model_runner)
         self._capturing_beam_graph = False
         super().__init__(model_runner, **kwargs)
         self._log_captured_beam_graphs()
 
     def _log_captured_beam_graphs(self) -> None:
-        inputs = self._beam_inputs
-        if inputs is None:
+        graph_inputs = self._beam_graph_inputs
+        if graph_inputs is None:
             return
-        if inputs.captured_sizes:
+        if graph_inputs.captured_sizes:
             logger.info(
                 "Beam decode graphs captured for %s rows (compact trie head %s, "
                 "shared-context attention %s).",
-                sorted(inputs.captured_sizes),
-                "on" if inputs.trie_levels is not None else "off",
-                "on" if inputs.attention is not None else "off",
+                sorted(graph_inputs.captured_sizes),
+                "on" if graph_inputs.trie_levels_input is not None else "off",
+                "on" if graph_inputs.attention_input is not None else "off",
             )
         else:
-            # Only the attention part restricts the sizes.
+            # Only the attention input refuses sizes, so it is set here.
             logger.warning(
                 "SGLANG_ENABLE_BEAM_DECODE_GRAPH is set, but no decode graph size "
                 "in %s holds a beam graph, so all-beam batches run eagerly. %s",
                 self.capture_bs,
-                inputs.attention.size_requirement(),
+                graph_inputs.attention_input.describe_size_requirement(),
             )
 
     def capture_one_shape(
         self, size, forward, variant_label=None, attention_variant=None
     ):
         super().capture_one_shape(size, forward, variant_label, attention_variant)
-        if self._beam_inputs is None or not self._beam_inputs.supports_rows(size):
+        graph_inputs = self._beam_graph_inputs
+        if graph_inputs is None or not graph_inputs.can_capture(size):
             return
         self._capturing_beam_graph = True
         try:
@@ -390,7 +427,7 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             size, num_tokens=num_tokens
         )
         if self._capturing_beam_graph:
-            forward_batch.beam = self._beam_inputs.for_capture(size)
+            forward_batch.beam = self._beam_graph_inputs.prepare_capture_inputs(size)
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
@@ -400,20 +437,22 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _can_replay_beam(self, forward_batch: ForwardBatch) -> bool:
         rows = forward_batch.batch_size
-        if self._beam_inputs is None or rows > self.max_bs:
+        if self._beam_graph_inputs is None or rows > self.max_bs:
             return False
         graph_size = (
             rows if self.disable_padding else self._pad_to_bucket(rows, self.capture_bs)
         )
-        return self._beam_inputs.can_replay(forward_batch.beam, graph_size=graph_size)
+        return self._beam_graph_inputs.can_replay(
+            forward_batch.beam, graph_size=graph_size
+        )
 
     def load_batch(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
         if forward_batch.beam is not None:
-            self._beam_inputs.stage(forward_batch.beam)
+            self._beam_graph_inputs.load_replay_inputs(forward_batch.beam)
         super().load_batch(forward_batch, pp_proxy_tensors)
 
     def _init_replay_attn_metadata(self, forward_batch: ForwardBatch, **kwargs):
-        # A shared-context beam graph reads the staged beam metadata and no
+        # A shared-context beam graph reads the loaded beam metadata and needs no
         # FlashInfer plan.
         if (
             forward_batch.beam is not None

@@ -1705,8 +1705,10 @@ class ModelRunner:
 
             return UnoDecodeCudaGraphRunner
 
-        # Beam requests are refused with speculative decoding and with pipeline
-        # parallelism, whose non-last ranks return no logits for the runner to trim.
+        # Only for servers that admit beam requests:
+        # - speculative decoding refuses them;
+        # - pipeline parallelism refuses them, and its non-last ranks return no
+        #   logits for this runner to trim.
         if (
             envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get()
             and self.spec_algorithm.is_none()
