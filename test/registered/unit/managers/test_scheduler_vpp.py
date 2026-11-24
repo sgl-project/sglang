@@ -1,8 +1,12 @@
 """Finite VPP waves against queue transport and CPU model boundaries."""
 
+import ast
+import inspect
+import sys
+import textwrap
 import unittest
 from array import array
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from queue import Queue
@@ -186,6 +190,162 @@ class _ControlCore(_AdmissionCore):
         return not good and not bad
 
 
+class _LoopStopped(Exception):
+    pass
+
+
+def _run_native_ticks(scheduler, ticks, before_tick=None):
+    """Bound the real loop at its tick boundary without changing its body."""
+    method = SchedulingVPPCore._event_loop_pp_disagg_prefill_vpp_rank_local
+    lines, first_line = inspect.getsourcelines(method)
+    definition = ast.parse(textwrap.dedent("".join(lines))).body[0]
+    loop = next(node for node in definition.body if isinstance(node, ast.While))
+    boundary = first_line + loop.body[0].lineno - 1
+    context = {}
+
+    def trace(frame, event, arg):
+        if frame.f_code is method.__code__ and event == "line":
+            if frame.f_lineno == boundary:
+                context.update(frame.f_locals)
+                if context["tick"] >= ticks:
+                    raise _LoopStopped
+                scheduler.loop_tick = context["tick"]
+                if before_tick is not None:
+                    before_tick(scheduler, context)
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        scheduler._event_loop_pp_disagg_prefill_vpp()
+    except _LoopStopped:
+        pass
+    finally:
+        sys.settrace(previous)
+    return context
+
+
+class _ActivationFIFO:
+    """CPU communication boundary with the native receiver's FIFO contract."""
+
+    def __init__(self):
+        self.queue = deque()
+
+    def progress(self):
+        pass
+
+    def receive_count(self):
+        return len(self.queue)
+
+    def take(self):
+        return self.queue.popleft()
+
+
+class _PendingSend:
+    def __init__(self, action, waits):
+        self.action = action
+        self.waits = waits
+
+    def poll(self):
+        return False
+
+    def wait(self):
+        self.waits.append((self.action.batch_seq, self.action.stage_id))
+
+
+class _TickCore(_ControlCore):
+    """Native core with CPU request, model, and communication boundaries."""
+
+    def _init_scheduling_native_loop_state(self):
+        super()._init_scheduling_native_loop_state()
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        self.disagg_prefill_transfer_queue = []
+        self.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=lambda: 2
+        )
+        self._pending_chunked_abort_req = None
+        self._pp_tensor_dict_inbox = defaultdict(deque)
+        self.last_rank_comm_queue = deque()
+        self.controls = deque()
+        self.published = []
+        self.actions = []
+        self.send_waits = []
+        self.output_waits = []
+        self.finalized = []
+        self.idle_ticks = []
+        self.pp_comm_stream_ctx = nullcontext()
+        self.attn_tp_group.broadcast_object = lambda value, src: value
+        self._pp_vpp_available_prefill_tokens = lambda: 32
+
+    def ingest_requests(self):
+        return []
+
+    def process_pending_chunked_abort(self):
+        self._pending_chunked_abort_req = None
+
+    def _pp_vpp_poll_control_receiver(self):
+        return self.controls.popleft() if self.controls else None
+
+    def _pp_vpp_flush_control_outbox(self, pending_work, max_pending):
+        while self._pp_vpp_control_outbox:
+            self.published.append(self._pp_vpp_control_outbox.popleft())
+
+    def _pp_vpp_prepare_wavefront_batch(
+        self, batch_seq, slot_batch_seqs, expected_manifest=None
+    ):
+        batch = self.batches.get(batch_seq)
+        if batch is None:
+            return None
+        if not all(req in self.waiting_queue for req in batch.reqs):
+            return None
+        for req in batch.reqs:
+            self.waiting_queue.remove(req)
+        slot_id = batch_seq % len(slot_batch_seqs)
+        self.mbs[slot_id] = batch
+        slot_batch_seqs[slot_id] = batch_seq
+        return batch
+
+    def _pp_vpp_execute_wavefront_action(self, action, slot_batch_seqs):
+        self.actions.append((action.batch_seq, action.stage_id))
+        value = torch.tensor([float(action.batch_seq)])
+        if action.stage_id:
+            wire = self._pp_tensor_dict_inbox["vpp_proxy"].popleft()
+            value = wire["hidden_states"]
+        value = value + 1
+        event = SimpleNamespace(
+            query=lambda: True,
+            synchronize=lambda: self.output_waits.append(action.batch_seq),
+        )
+        self._pp_vpp_stage_events[(action.batch_seq, action.stage_id)] = event
+        if action.stage_id == 3:
+            self.last_rank_comm_queue.append(
+                (
+                    event,
+                    PPProxyTensors(
+                        {"vpp_batch_seq": action.batch_seq, "next_token_ids": value}
+                    ),
+                )
+            )
+            return True, None
+        return True, _PendingSend(action, self.send_waits)
+
+    def _pp_vpp_finalize_rank_local_batch(
+        self, batch_seq, slot_batch_seqs, output_tensors, release_slot=True
+    ):
+        slot_id = batch_seq % len(slot_batch_seqs)
+        if slot_batch_seqs[slot_id] != batch_seq or self.mbs[slot_id] is None:
+            raise RuntimeError("CPU finalization does not own its batch")
+        self.finalized.append((batch_seq, release_slot, output_tensors))
+        self.last_mbs[slot_id] = self.mbs[slot_id]
+        self.mbs[slot_id] = None
+        self.mb_metadata[slot_id] = None
+        if release_slot:
+            slot_batch_seqs[slot_id] = None
+
+    def on_idle(self):
+        self.idle_ticks.append(self.loop_tick)
+
+
 class TestSchedulingVPPCore(CustomTestCase):
     def _scheduler(self, *, rank=0, owner=0, retained=True, core_type=_SchedulingCore):
         scheduler = core_type()
@@ -278,8 +438,10 @@ class TestSchedulingVPPCore(CustomTestCase):
         )
         return scheduler, PipelineRankSchedule(1, 2, 2, 2), wire
 
-    def _control_loop(self, *, rank=1):
-        scheduler, _, _ = self._remote_admission(core_type=_ControlCore)
+    def _control_loop(
+        self, *, rank=1, core_type=_ControlCore, ticks=0, before_tick=None
+    ):
+        scheduler, _, _ = self._remote_admission(core_type=core_type)
         scheduler.pp_group.rank_in_group = rank
         scheduler.pp_group.is_first_rank = rank == 0
         scheduler.pp_group.is_last_rank = rank == 1
@@ -299,8 +461,160 @@ class TestSchedulingVPPCore(CustomTestCase):
         with get_context().override_server_args(
             chunked_prefill_size=16, enable_dynamic_chunking=False
         ):
-            context = scheduler._event_loop_pp_disagg_prefill_vpp_rank_local()
+            context = _run_native_ticks(scheduler, ticks, before_tick)
         return scheduler, context
+
+    def _tick_batches(self, scheduler, count):
+        scheduler.batches = {}
+        scheduler.waiting_queue = []
+        for seq in range(count):
+            req = SimpleNamespace(
+                rid=f"request-{seq}",
+                session_generation=1,
+                bootstrap_room=seq,
+                origin_input_ids=list(range(8)),
+                extend_end=8,
+                kv=SimpleNamespace(holds_kv=False),
+                finished=lambda: False,
+            )
+            scheduler.waiting_queue.append(req)
+            scheduler.batches[seq] = SimpleNamespace(
+                reqs=[req],
+                prefix_lens=[0],
+                extend_lens=[8],
+                chunked_req=None,
+                contains_last_prefill_chunk=True,
+                disagg_prefill_chunk_end_by_rid={req.rid: 8},
+            )
+        scheduler._pp_vpp_activation_receiver = _ActivationFIFO()
+
+    def _tick_activation(self, scheduler, seq, stage):
+        wire = self._wire(batch_seq=seq, stage=stage)
+        wire["hidden_states"] = torch.tensor([float(seq + stage)])
+        if stage == 1:
+            wire["vpp_batch_manifest"] = scheduler._pp_vpp_batch_manifest(
+                seq, seq % 2, scheduler.batches[seq]
+            )
+        if stage == 3:
+            wire["vpp_source_layer_id"] = 0
+        scheduler._pp_vpp_activation_receiver.queue.append(wire)
+
+    def test_native_ticks_run_two_batch_waves_and_reuse_retired_slots(self):
+        def before_tick(scheduler, context):
+            tick = context["tick"]
+            if tick == 0:
+                self._tick_batches(scheduler, 4)
+            if tick in (2, 3, 6, 7):
+                seq = {2: 0, 3: 1, 6: 2, 7: 3}[tick]
+                self._tick_activation(scheduler, seq, 2)
+            if tick in (4, 5, 8, 9):
+                seq = {4: 0, 5: 1, 8: 2, 9: 3}[tick]
+                envelope, wire = self._control_message(
+                    scheduler, PipelineControlKind.COMPLETION, seq=seq
+                )
+                wire["next_token_ids"] = torch.tensor([seq + 4])
+                scheduler.controls.append((envelope, wire))
+
+        scheduler, context = self._control_loop(
+            rank=0, core_type=_TickCore, ticks=10, before_tick=before_tick
+        )
+        self.assertEqual(
+            scheduler.actions,
+            [(0, 0), (1, 0), (0, 2), (1, 2), (2, 0), (3, 0), (2, 2), (3, 2)],
+        )
+        self.assertEqual(context["rank_schedule"].inflight_count, 0)
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(scheduler._pp_vpp_ready_proxies, {})
+        self.assertEqual(
+            [(seq, released) for seq, released, _ in scheduler.finalized],
+            [(0, True), (1, True), (2, True), (3, True)],
+        )
+        self.assertEqual(
+            [output["next_token_ids"].item() for _, _, output in scheduler.finalized],
+            [4, 5, 6, 7],
+        )
+        self.assertEqual(scheduler.send_waits, scheduler.actions[:-2])
+        self.assertLessEqual(len(context["activation_send_work"]), 2)
+        self.assertFalse(scheduler._pp_vpp_fixed_wave)
+        self.assertFalse(scheduler._pp_vpp_fixed_second_pass)
+        materialized = [
+            wire
+            for wire in scheduler.published
+            if wire["kind"] == PipelineControlKind.PREFIX_MATERIALIZED.value
+        ]
+        self.assertEqual(len(materialized), 8)
+        self.assertEqual(
+            {(wire["batch_seq"], wire["payload"]["stage_id"]) for wire in materialized},
+            set(scheduler.actions),
+        )
+        self.assertTrue(all(wire["payload"]["end"] == 8 for wire in materialized))
+
+    def test_native_ticks_quarantine_next_generation_until_completion_returns(self):
+        snapshots = {}
+
+        def before_tick(scheduler, context):
+            tick = context["tick"]
+            if tick == 0:
+                self._tick_batches(scheduler, 3)
+            snapshots[tick] = (
+                tuple(scheduler._pp_vpp_slot_batch_seqs),
+                tuple(scheduler.mbs),
+            )
+            if tick in (0, 1, 2, 3, 4):
+                seq, stage = [(0, 1), (1, 1), (0, 3), (1, 3), (2, 1)][tick]
+                self._tick_activation(scheduler, seq, stage)
+            if tick in (4, 5):
+                scheduler.controls.append(
+                    self._control_message(
+                        scheduler,
+                        PipelineControlKind.COMPLETION,
+                        seq=tick - 4,
+                        returned=True,
+                    )
+                )
+
+        scheduler, context = self._control_loop(
+            rank=1, core_type=_TickCore, ticks=6, before_tick=before_tick
+        )
+        self.assertEqual(scheduler.actions, [(0, 1), (1, 1), (0, 3), (1, 3), (2, 1)])
+        self.assertEqual(snapshots[4], ((0, 1), (None, None)))
+        self.assertEqual(context["rank_schedule"].slot_batch_seqs, (2, None))
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [2, None])
+        self.assertEqual(scheduler._pp_vpp_early_activations, {})
+        self.assertEqual(scheduler._pp_vpp_ready_proxies, {})
+        self.assertEqual(scheduler.output_waits, [0, 1])
+        self.assertEqual(
+            [(seq, released) for seq, released, _ in scheduler.finalized],
+            [(0, False), (1, False)],
+        )
+        completions = [
+            wire
+            for wire in scheduler.published
+            if wire["kind"] == PipelineControlKind.COMPLETION.value
+        ]
+        self.assertEqual([wire["batch_seq"] for wire in completions], [0, 1])
+        self.assertEqual(
+            [wire["next_token_ids"].item() for wire in completions], [4, 5]
+        )
+        kinds = [wire["kind"] for wire in scheduler.published]
+        self.assertEqual(kinds.count(PipelineControlKind.CACHE_UPDATE.value), 2)
+        self.assertEqual(kinds.count(PipelineControlKind.EVICT_ACK.value), 2)
+        self.assertEqual(scheduler._pp_vpp_batch_replicas, {})
+        self.assertEqual(scheduler._pp_vpp_pending_replica_updates, deque())
+
+    def test_native_ticks_call_idle_only_without_inflight_batches_or_sends(self):
+        def before_tick(scheduler, context):
+            if context["tick"] == 0:
+                self._tick_batches(scheduler, 0)
+
+        scheduler, context = self._control_loop(
+            rank=0, core_type=_TickCore, ticks=3, before_tick=before_tick
+        )
+        self.assertEqual(scheduler.idle_ticks, [0, 1, 2])
+        self.assertEqual(scheduler.actions, [])
+        self.assertEqual(scheduler.published, [])
+        self.assertEqual(context["rank_schedule"].inflight_count, 0)
 
     def _control_message(
         self, scheduler, kind, *, payload=None, seq=-1, returned=False

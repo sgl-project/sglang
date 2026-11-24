@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import pickle
 import time
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -803,6 +805,9 @@ class SchedulingVPPCore:
             return self.chunked_req
         return None
 
+    def _event_loop_pp_disagg_prefill_vpp(self: Scheduler):
+        return self._event_loop_pp_disagg_prefill_vpp_rank_local()
+
     def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
         self._init_scheduling_native_loop_state()
         self._pp_vpp_overlap_chunks = False
@@ -1404,5 +1409,575 @@ class SchedulingVPPCore:
 
             raise RuntimeError(f"unsupported VPP control kind {envelope.kind}")
 
-        # The next integration chunk replaces this checkpoint with the main loop.
-        return locals()
+        while True:
+            server_is_idle = True
+            # TP0's false rules out an all-TP true result. Share it through
+            # the existing control broadcast; newly ingested requests are
+            # eligible for bootstrap/transfer on the next tick.
+            self._pp_vpp_round_candidate = (
+                (
+                    (
+                        not bootstrap_round_active
+                        and (
+                            not self._pp_vpp_resource_control_enabled
+                            or resource_gate.can_bootstrap()
+                        )
+                        and bool(self.disagg_prefill_bootstrap_queue.queue)
+                    )
+                    or (
+                        not transfer_round_active
+                        and bool(self.disagg_prefill_transfer_queue)
+                    )
+                )
+                if self.pp_group.is_first_rank
+                else False
+            )
+            while True:
+                control_message = self._pp_vpp_poll_control_receiver_tp_broadcast()
+                if control_message is None:
+                    break
+                envelope, wire = control_message
+                returned_to_source = (
+                    envelope.source_rank == self.pp_group.rank_in_group
+                    and envelope.hops >= self.pp_group.world_size
+                )
+                if (
+                    envelope.kind == PipelineControlKind.ADMIT
+                    and pending_remote_admits
+                    and not returned_to_source
+                ):
+                    pending_remote_admits.append((envelope, wire))
+                else:
+                    handle_control(envelope, wire)
+                if envelope.kind not in (
+                    PipelineControlKind.RESOURCE,
+                    PipelineControlKind.BOOTSTRAP_STATUS,
+                    PipelineControlKind.TRANSFER_STATUS,
+                ):
+                    mark_progress(f"control:{envelope.kind.value}")
+            if pending_remote_admits:
+                envelope, wire = pending_remote_admits[0]
+                if self._pp_vpp_remote_admit_slot_available(envelope, slot_batch_seqs):
+                    pending_remote_admits.popleft()
+                    handle_control(envelope, wire)
+            if pending_bootstrap_applies:
+                apply_args = pending_bootstrap_applies.popleft()
+                if not try_apply_bootstrap(*apply_args):
+                    pending_bootstrap_applies.append(apply_args)
+            for _ in range(len(self._pp_vpp_pending_batch_controls)):
+                handle_control(*self._pp_vpp_pending_batch_controls.popleft())
+
+            self._pp_vpp_reap_send_work(activation_send_work)
+            self._pp_vpp_flush_control_outbox(
+                control_send_work,
+                max_control_sends,
+            )
+
+            if self._pp_vpp_resource_control_enabled:
+                snapshot = self._pp_vpp_resource_snapshot(activation_send_work)
+                if snapshot != last_resource_snapshot:
+                    last_resource_snapshot = snapshot
+                    if self.pp_group.rank_in_group == 0:
+                        resource_gate.update(0, snapshot)
+                    else:
+                        self._pp_vpp_queue_control(
+                            self._pp_vpp_new_control(
+                                PipelineControlKind.RESOURCE,
+                                payload={
+                                    "request_slots": snapshot.request_slots,
+                                    "kv_tokens": snapshot.kv_tokens,
+                                    "activation_bytes": snapshot.activation_bytes,
+                                    "pending_sends": snapshot.pending_sends,
+                                    "metadata_slots": snapshot.metadata_slots,
+                                },
+                            )
+                        )
+
+            if self.pp_group.is_first_rank:
+                recv_reqs = self.ingest_requests()
+                if recv_reqs:
+                    request_snapshot = pickle.loads(pickle.dumps(tuple(recv_reqs)))
+                    self._pp_vpp_queue_control(
+                        self._pp_vpp_new_control(
+                            PipelineControlKind.REQUEST,
+                            payload={"requests": request_snapshot},
+                        ).forwarded()
+                    )
+
+                round_states = (
+                    self._pp_vpp_all_gather_cpu_state(
+                        (
+                            not bootstrap_round_active
+                            and (
+                                not self._pp_vpp_resource_control_enabled
+                                or resource_gate.can_bootstrap()
+                            )
+                            and bool(self.disagg_prefill_bootstrap_queue.queue),
+                            not transfer_round_active
+                            and bool(self.disagg_prefill_transfer_queue),
+                            int(
+                                self.req_to_metadata_buffer_idx_allocator.available_size()
+                            ),
+                        )
+                    )
+                    if self._pp_vpp_round_check
+                    else None
+                )
+                start_bootstrap_round = round_states is not None and bool(
+                    round_states[:, 0].all()
+                )
+                if start_bootstrap_round:
+                    good, bad = self.get_rids(
+                        self.disagg_prefill_bootstrap_queue.queue,
+                        True,
+                        [KVPoll.WaitingForInput],
+                        [KVPoll.Failed],
+                    )
+                    aborted = {
+                        req.rid
+                        for req in self.disagg_prefill_bootstrap_queue.queue
+                        if isinstance(req.finished_reason, FINISH_ABORT)
+                    }
+                    good, bad = self._route_aborts_to_bad(good, bad, aborted)
+                    metadata_slots = int(round_states[:, 2].min())
+                    bootstrap_round_active = True
+                    self._pp_vpp_queue_control(
+                        self._pp_vpp_new_control(
+                            PipelineControlKind.BOOTSTRAP_STATUS,
+                            payload={
+                                "phase": "collect",
+                                "good": sorted(good),
+                                "bad": sorted(bad),
+                                "prefix_boundaries": (
+                                    self._pp_vpp_bootstrap_prefix_boundaries(good)
+                                ),
+                                "metadata_slots": metadata_slots,
+                            },
+                        ).forwarded()
+                    )
+
+                start_transfer_round = round_states is not None and bool(
+                    round_states[:, 1].all()
+                )
+                if start_transfer_round:
+                    terminal_outcomes = self._vpp_transfer_outcomes()
+                    transfer_round_active = True
+                    self._pp_vpp_queue_control(
+                        self._pp_vpp_new_control(
+                            PipelineControlKind.TRANSFER_STATUS,
+                            payload={
+                                "phase": "collect",
+                                "outcomes": terminal_outcomes,
+                            },
+                        ).forwarded()
+                    )
+
+                pending_abort = self._pending_chunked_abort_req
+                self.process_pending_chunked_abort()
+                if pending_abort is not None:
+                    cancelled_batches = [
+                        slot_batch_seqs[slot_id]
+                        for slot_id, batch in enumerate(self.mbs)
+                        if batch is not None
+                        and slot_batch_seqs[slot_id] is not None
+                        and any(
+                            (
+                                req is pending_abort
+                                if self._pp_vpp_fixed_batch
+                                else req.rid == pending_abort.rid
+                            )
+                            for req in batch.reqs
+                        )
+                    ]
+                    if not cancelled_batches:
+                        cancelled_batches = [-1]
+                    for batch_seq in cancelled_batches:
+                        rank_schedule.cancel(batch_seq)
+                        self._pp_vpp_queue_control(
+                            self._pp_vpp_new_control(
+                                PipelineControlKind.CANCEL,
+                                batch_seq=batch_seq,
+                                payload={
+                                    "rid": pending_abort.rid,
+                                    **(
+                                        {
+                                            "request_generation": int(
+                                                getattr(
+                                                    pending_abort,
+                                                    "session_generation",
+                                                    None,
+                                                )
+                                                or 0
+                                            ),
+                                            "bootstrap_room": getattr(
+                                                pending_abort, "bootstrap_room", None
+                                            ),
+                                        }
+                                        if self._pp_vpp_fixed_batch
+                                        else {}
+                                    ),
+                                },
+                            ).forwarded()
+                        )
+
+                required_activation = token_budget * hidden_size * hc_mult * 2
+                continuation = (
+                    self.chunked_req is not None and self.chunked_req.kv.holds_kv
+                )
+                required_kv_tokens = token_budget + (
+                    self.page_size if self._pp_vpp_overlap_chunks else 0
+                )
+                if (
+                    (
+                        not bootstrap_round_active
+                        or continuation
+                        or bool(self.waiting_queue)
+                    )
+                    and (self._pp_vpp_overlap_chunks or not pending_chunk_batches)
+                    and self._pp_vpp_can_queue_admit(
+                        next_batch_seq,
+                        pending_admits,
+                        slot_batch_seqs,
+                        rank_schedule,
+                    )
+                    and (
+                        not self._pp_vpp_resource_control_enabled
+                        or resource_gate.can_admit(
+                            required_request_slots=0 if continuation else 1,
+                            required_kv_tokens=required_kv_tokens,
+                            required_activation_bytes=required_activation,
+                        )
+                    )
+                ):
+                    slot_id = next_batch_seq % max_inflight
+                    batch = self._pp_vpp_prepare_wavefront_batch(
+                        next_batch_seq,
+                        slot_batch_seqs,
+                    )
+                    if batch is None:
+                        self.mbs[slot_id] = None
+                        self.mb_metadata[slot_id] = None
+                        slot_batch_seqs[slot_id] = None
+                    else:
+                        self._pp_vpp_register_prefix_batch(batch)
+                        manifest = self._pp_vpp_batch_manifest(
+                            next_batch_seq,
+                            slot_id,
+                            batch,
+                        )
+                        if getattr(self, "_pp_vpp_fixed_batch", False):
+                            batch._vpp_fixed_manifest = manifest
+                        else:
+                            envelope = self._pp_vpp_new_control(
+                                PipelineControlKind.ADMIT,
+                                batch_seq=next_batch_seq,
+                                slot_id=slot_id,
+                                payload={
+                                    "manifest": manifest,
+                                    "errors": [],
+                                },
+                            )
+                            self._pp_vpp_queue_control(envelope.forwarded())
+                            pending_admits.add(next_batch_seq)
+                        rank_schedule.admit(next_batch_seq)
+                        self._pp_vpp_highest_admitted_batch_seq = max(
+                            self._pp_vpp_highest_admitted_batch_seq, next_batch_seq
+                        )
+                        if batch.chunked_req is not None:
+                            pending_chunk_batches.add(next_batch_seq)
+                        next_batch_seq += 1
+                        mark_progress("admission")
+                        server_is_idle = False
+            else:
+                self.process_pending_chunked_abort()
+
+            for batch_seq, ranks in tuple(pending_first_pass.items()):
+                if len(ranks) != self.pp_group.world_size:
+                    continue
+                batch = self.mbs[batch_seq % max_inflight]
+                req = None if batch is None else batch.chunked_req
+                if req is not None:
+                    request_generation = int(
+                        getattr(req, "session_generation", None) or 0
+                    )
+                    end = batch.disagg_prefill_chunk_end_by_rid[req.rid]
+                    self._pp_vpp_advance_prefix_mapping(
+                        req.rid,
+                        request_generation,
+                        end,
+                    )
+                    self._pp_vpp_queue_control(
+                        self._pp_vpp_new_control(
+                            PipelineControlKind.PREFIX_COMMIT,
+                            batch_seq=batch_seq,
+                            payload={
+                                "rid": req.rid,
+                                "request_generation": request_generation,
+                                "end": end,
+                            },
+                        ).forwarded()
+                    )
+                else:
+                    pending_chunk_batches.discard(batch_seq)
+                pending_first_pass.pop(batch_seq, None)
+
+            def action_ready(batch_seq: int, stage_id: int) -> bool:
+                if self._pp_vpp_overlap_chunks:
+                    batch = self.mbs[batch_seq % max_inflight]
+                    for req, start in zip(batch.reqs, batch.prefix_lens):
+                        generation = int(getattr(req, "session_generation", None) or 0)
+                        entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
+                        launched = self._pp_vpp_launched_prefix.get(
+                            (req.rid, generation, stage_id), entry.committed_end
+                        )
+                        if launched < start:
+                            return False
+                if (
+                    stage_id < rank_schedule.logical_size - 1
+                    and len(activation_send_work) >= max_inflight
+                ):
+                    return False
+                if stage_id == 0:
+                    return True
+                return (batch_seq, stage_id) in self._pp_vpp_ready_proxies
+
+            if self._pp_vpp_fixed_tp:
+                received = self._pp_vpp_fixed_activation_received
+                self._pp_vpp_fixed_activation_received = False
+                ready_states = None
+            else:
+                received, ready_states = self._pp_vpp_gather_tick_consensus(
+                    rank_schedule,
+                    action_ready,
+                )
+            if received:
+                mark_progress("activation")
+            while self._pp_vpp_arrivals:
+                batch_seq, stage_id = self._pp_vpp_arrivals.popleft()
+                rank_schedule.mark_ready(batch_seq, stage_id)
+
+            if getattr(self, "_pp_vpp_fixed_batch", False):
+                action = self._pp_vpp_fixed_select_tp_action(
+                    rank_schedule,
+                    tick,
+                    action_ready,
+                    activation_send_work,
+                )
+            else:
+                action = self._pp_vpp_select_tp_action(
+                    rank_schedule,
+                    tick,
+                    action_ready,
+                    ready_states,
+                )
+            if action is not None:
+                replica_restores = []
+                if action.stage_id > 0:
+                    proxy = self._pp_vpp_take_ready_proxy(action)
+                    source_id = proxy.tensors.get("vpp_source_layer_id")
+                    batch = self.mbs[action.slot_id]
+                    if source_id is not None and batch is not None:
+                        for req in batch.reqs:
+                            end = batch.disagg_prefill_chunk_end_by_rid.get(req.rid)
+                            if end is None:
+                                continue
+                            content_id = getattr(
+                                req,
+                                "_vpp_replica_content_id",
+                                None,
+                            )
+                            if content_id is None:
+                                content_id = hashlib.sha256(
+                                    pickle.dumps(
+                                        tuple(req.origin_input_ids),
+                                        protocol=pickle.HIGHEST_PROTOCOL,
+                                    )
+                                ).hexdigest()
+                                req._vpp_replica_content_id = content_id
+                            identity = PipelineReplicaIdentity(
+                                content_id=content_id,
+                                source_id=int(source_id),
+                                format_version=1,
+                                consumer_rank=self.pp_group.rank_in_group,
+                            )
+                            state = self._pp_vpp_replica_registry.get(identity)
+                            generation = (
+                                0 if state is None else state.residency_generation
+                            )
+                            missing = self._pp_vpp_replica_registry.missing_range(
+                                identity,
+                                generation,
+                                end,
+                            )
+                            if missing is None:
+                                self._pp_vpp_replica_registry.lock(
+                                    identity,
+                                    end,
+                                    owner_id=action.batch_seq,
+                                )
+                                self._pp_vpp_batch_replicas[action.batch_seq][
+                                    identity
+                                ] = (generation, end)
+                            else:
+                                replica_restores.append(
+                                    (identity, generation, *missing)
+                                )
+                    self._pp_tensor_dict_inbox["vpp_proxy"].appendleft(proxy.tensors)
+                action_executed, send_work = self._pp_vpp_execute_wavefront_action(
+                    action,
+                    slot_batch_seqs,
+                )
+                if send_work:
+                    activation_send_work.append(send_work)
+                if action_executed:
+                    mark_progress(f"stage:{action.stage_id}")
+                    for identity, generation, start, end in replica_restores:
+                        self._pp_vpp_pending_replica_updates.append(
+                            (
+                                action.batch_seq,
+                                action.stage_id,
+                                identity,
+                                generation,
+                                start,
+                                end,
+                            )
+                        )
+                    transition = rank_schedule.complete(action)
+                    batch = self.mbs[action.slot_id]
+                    if batch is not None:
+                        for req in batch.reqs:
+                            if req.extend_end is None:
+                                continue
+                            request_generation = int(
+                                getattr(req, "session_generation", None) or 0
+                            )
+                            end = batch.disagg_prefill_chunk_end_by_rid[req.rid]
+                            if self._pp_vpp_overlap_chunks:
+                                self._pp_vpp_launched_prefix[
+                                    (req.rid, request_generation, action.stage_id)
+                                ] = end
+                            self._pp_vpp_pending_materialized.append(
+                                (
+                                    action.batch_seq,
+                                    action.stage_id,
+                                    req.rid,
+                                    request_generation,
+                                    end,
+                                )
+                            )
+                    if transition.first_pass_done:
+                        if self.pp_group.rank_in_group == 0:
+                            pending_first_pass[action.batch_seq].add(0)
+                        else:
+                            self._pp_vpp_queue_control(
+                                self._pp_vpp_new_control(
+                                    PipelineControlKind.FIRST_PASS_DONE,
+                                    batch_seq=action.batch_seq,
+                                ).forwarded()
+                            )
+                    if transition.batch_complete:
+                        output_tensors = self._pp_vpp_take_local_completion(
+                            action.batch_seq,
+                            self.last_rank_comm_queue,
+                        )
+                        flush_replica_updates()
+                        flush_materialized()
+                        completion = self._pp_vpp_new_control(
+                            PipelineControlKind.COMPLETION,
+                            batch_seq=action.batch_seq,
+                            slot_id=action.slot_id,
+                        )
+                        if batch is not None:
+                            evict_batch_replicas(action.batch_seq, batch)
+                        self._pp_vpp_finalize_rank_local_batch(
+                            action.batch_seq,
+                            slot_batch_seqs,
+                            output_tensors,
+                            release_slot=False,
+                        )
+                        self._pp_vpp_queue_control(
+                            completion.forwarded(),
+                            output_tensors,
+                        )
+                    server_is_idle = False
+
+            flush_replica_updates()
+            flush_materialized()
+
+            self._pp_vpp_flush_control_outbox(
+                control_send_work,
+                max_control_sends,
+            )
+            now = time.monotonic()
+            has_pending_work = (
+                bool(pending_admits)
+                or bool(self._pp_vpp_pending_batch_controls)
+                or bootstrap_round_active
+                or bool(pending_chunk_batches)
+                or bool(pending_bootstrap_applies)
+                or bool(self.waiting_queue)
+                or bool(self.disagg_prefill_bootstrap_queue.queue)
+                or bool(self.disagg_prefill_transfer_queue)
+                or bool(self._pp_vpp_control_outbox)
+                or bool(control_send_work)
+                or bool(activation_send_work)
+                or rank_schedule.inflight_count > 0
+            )
+            if (
+                self.attn_tp_group.rank_in_group == 0
+                and has_pending_work
+                and now - stall_last_progress_at >= 10
+                and now - stall_last_log_at >= 10
+            ):
+                stall_last_log_at = now
+                logger.warning(
+                    "[VPP-STALL] no scheduler progress for %.1fs "
+                    "tick=%s last_progress=%s@%s pp=%s "
+                    "pending_admit=%s bootstrap_round=%s transfer_round=%s "
+                    "pending_chunks=%s pending_first_pass=%s "
+                    "slots=%s ready=%s running=%s "
+                    "waiting=%s bootstrap=%s inflight=%s "
+                    "metadata_slots=%s bootstrap_applies=%s "
+                    "materialized=%s replica_updates=%s "
+                    "control_outbox=%s control_sends=%s activation_sends=%s "
+                    "ready_proxies=%s arrivals=%s resource_ranks=%s blocked_ranks=%s "
+                    "local_resource=%s",
+                    now - stall_last_progress_at,
+                    tick,
+                    stall_last_progress_event,
+                    stall_last_progress_tick,
+                    self.pp_group.rank_in_group,
+                    sorted(pending_admits),
+                    bootstrap_round_active,
+                    transfer_round_active,
+                    sorted(pending_chunk_batches),
+                    {
+                        batch_seq: sorted(ranks)
+                        for batch_seq, ranks in pending_first_pass.items()
+                    },
+                    rank_schedule.slot_batch_seqs,
+                    rank_schedule.ready_tasks,
+                    rank_schedule.running,
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                    len(self.disagg_prefill_transfer_queue),
+                    self.req_to_metadata_buffer_idx_allocator.available_size(),
+                    len(pending_bootstrap_applies),
+                    len(self._pp_vpp_pending_materialized),
+                    len(self._pp_vpp_pending_replica_updates),
+                    len(self._pp_vpp_control_outbox),
+                    len(control_send_work),
+                    len(activation_send_work),
+                    len(self._pp_vpp_ready_proxies),
+                    len(self._pp_vpp_arrivals),
+                    sorted(resource_gate._snapshots),
+                    sorted(resource_gate._blocked),
+                    last_resource_snapshot,
+                )
+            if activation_send_work or control_send_work:
+                server_is_idle = False
+            if rank_schedule.inflight_count or self._pp_vpp_pending_batch_controls:
+                server_is_idle = False
+            if server_is_idle and len(self.disagg_prefill_transfer_queue) == 0:
+                self.on_idle()
+            tick += 1
