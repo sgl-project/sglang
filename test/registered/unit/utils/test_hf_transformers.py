@@ -23,11 +23,11 @@ from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.hf_transformers.config as config_utils
 import sglang.srt.hf_transformers.processor as processor_utils
+import sglang.srt.hf_transformers.tokenizer as tokenizer_utils
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.speculators import (
     normalize_speculators_qwen3_dense_dspark_config,
 )
-import sglang.srt.hf_transformers.tokenizer as tokenizer_utils
 from sglang.srt.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
