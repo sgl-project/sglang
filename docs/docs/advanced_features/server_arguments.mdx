@@ -1385,6 +1385,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--inkling2-tool-call-author-name-mode`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The tool-call header an inkling2 checkpoint writes, which chat prompts render past tool calls with. 'tool_name': the tool's name (Inkling-2-Mini, Inkling-2-Small). 'independent': the assistant message's own name, empty when it has none. 'drop_name': assistant message names are dropped, so the header is always empty. Default: the checkpoint's config.json text_config.tool_call_author_name_mode, else 'tool_name', as Inkling-2-Mini and Inkling-2-Small. Other models ignore it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`tool_name`, `independent`, `drop_name`</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--preferred-sampling-params`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>json-formatted sampling settings that will be returned in /get_model_info</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

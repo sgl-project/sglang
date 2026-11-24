@@ -1,5 +1,6 @@
 """Chat rendering and response parsing across token boundaries."""
 
+import functools
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -497,6 +498,169 @@ def test_abort_never_completes_an_open_tool_call(serving_context, served, increm
         )[2]
         is None
     )
+
+
+_TOOL_CALL_HISTORY = [
+    {"role": "user", "content": "Weather in SF?"},
+    {
+        "role": "assistant",
+        "reasoning_content": "plan",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "weather", "arguments": '{"city": "SF"}'},
+            }
+        ],
+    },
+    {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+]
+
+
+def _contains(ids, sub):
+    return any(ids[i : i + len(sub)] == sub for i in range(len(ids)))
+
+
+def _named(messages, name):
+    return [
+        {**message, "name": name} if message["role"] == "assistant" else message
+        for message in messages
+    ]
+
+
+_render2 = functools.partial(
+    render_inkling_messages, tools=[_WEATHER_TOOL], spec="inkling2"
+)
+_TOOL_NAME_HEADER = ("<|message_model|>", "weather", "<|content_invoke_tool_json|>")
+_EMPTY_HEADER = ("<|message_model|>", "<|content_invoke_tool_json|>")
+
+
+@pytest.mark.parametrize("mode", ["independent", "drop_name"])
+def test_unnamed_tool_calls_render_with_empty_headers(mode):
+    """Without assistant names, independent and drop_name both write
+    <|message_model|><|content_invoke_tool_json|>: only the header name differs from
+    tool_name; the declaration, thinking, payload and tool result do not."""
+    tool_name = _render2(_TOOL_CALL_HISTORY)
+    empty = _render2(_TOOL_CALL_HISTORY, tool_call_author_name_mode=mode)
+    assert _contains(tool_name, _ids(*_TOOL_NAME_HEADER))
+    assert not _contains(tool_name, _ids(*_EMPTY_HEADER))
+    assert _contains(empty, _ids(*_EMPTY_HEADER))
+    assert not _contains(empty, _ids(*_TOOL_NAME_HEADER))
+    assert len(tool_name) - len(empty) == len(_ids("weather"))
+    assert _contains(empty, _ids("<|message_tool|>", "weather", "<|content_text|>"))
+
+
+def test_independent_mode_writes_the_assistant_name():
+    """independent writes a named assistant's own name in every header of its turn,
+    the tool call's included; tool_name refuses that name on a tool call."""
+    named = _named(_TOOL_CALL_HISTORY, "helper")
+    ids = _render2(named, tool_call_author_name_mode="independent")
+    assert _contains(
+        ids, _ids("<|message_model|>", "helper", "<|content_invoke_tool_json|>")
+    )
+    assert _contains(ids, _ids("<|message_model|>", "helper", "<|content_thinking|>"))
+    assert not _contains(ids, _ids(*_TOOL_NAME_HEADER))
+    with pytest.raises(Exception, match="incompatible"):
+        _render2(named)
+
+
+def test_drop_name_mode_drops_assistant_names():
+    """drop_name renders a named conversation exactly as the unnamed one."""
+    named = _named(_TOOL_CALL_HISTORY, "helper") + [
+        {"role": "assistant", "name": "helper", "content": "It is sunny."}
+    ]
+    unnamed = [
+        {key: value for key, value in message.items() if key != "name"}
+        for message in named
+    ]
+    assert _render2(named, tool_call_author_name_mode="drop_name") == _render2(
+        unnamed, tool_call_author_name_mode="drop_name"
+    )
+
+
+def test_tool_call_author_name_mode_needs_an_inkling2_checkpoint():
+    with pytest.raises(ValueError, match="must be one of"):
+        render_inkling_messages(
+            _TOOL_CALL_HISTORY, spec="inkling2", tool_call_author_name_mode="anonymous"
+        )
+    for mode in ("independent", "drop_name"):
+        with pytest.raises(ValueError, match="needs an inkling2 checkpoint"):
+            render_inkling_messages(
+                _TOOL_CALL_HISTORY, spec="inkling", tool_call_author_name_mode=mode
+            )
+
+
+@pytest.mark.parametrize("per_token", [False, True])
+def test_parses_a_tool_call_with_an_anonymous_header(per_token):
+    output_ids = _ids(
+        "<|message_model|>",
+        "<|content_invoke_tool_json|>",
+        '{"name":"weather","args":{"city":"SF"}}',
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+    )
+    parsed = _parse(output_ids, per_token=per_token)
+    assert [(call.name, json.loads(call.arguments)) for call in parsed.tool_calls] == [
+        ("weather", {"city": "SF"})
+    ]
+
+
+@pytest.mark.parametrize("mode", ["tool_name", "independent", "drop_name"])
+def test_tool_call_author_name_mode_comes_from_the_server_flag(served, mode):
+    """--inkling2-tool-call-author-name-mode switches the header chat prompts render."""
+    from sglang.srt.runtime_context import publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", inkling2_tool_call_author_name_mode=mode),
+        role="tokenizer",
+    )
+    try:
+        adapter = _inkling2_serving(served)._encoding_adapter
+    finally:
+        reset_context()
+    assert adapter._tool_call_author_name_mode == mode
+
+
+@pytest.mark.parametrize(
+    "flag,checkpoint,expected",
+    [
+        (None, None, "tool_name"),
+        (None, "independent", "independent"),
+        (None, "drop_name", "drop_name"),
+        ("tool_name", "independent", "tool_name"),
+        ("drop_name", "independent", "drop_name"),
+    ],
+)
+def test_tool_call_author_name_mode_defaults_to_the_checkpoint_config(
+    flag, checkpoint, expected
+):
+    """The flag wins; without it, config.json's text_config.tool_call_author_name_mode;
+    without that, tool_name."""
+    from sglang.srt.configs.inkling2 import Inkling2ModelConfig
+    from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+        _inkling_tool_call_author_name_mode,
+    )
+
+    text_config = (
+        Inkling2ModelConfig()
+        if checkpoint is None
+        else Inkling2ModelConfig(tool_call_author_name_mode=checkpoint)
+    )
+    ctx = SimpleNamespace(
+        inkling2_tool_call_author_name_mode=flag,
+        hf_config=SimpleNamespace(text_config=text_config),
+    )
+    assert _inkling_tool_call_author_name_mode(ctx) == expected
+
+
+def test_checkpoint_tool_call_author_name_mode_is_validated():
+    from sglang.srt.configs.inkling2 import Inkling2ModelConfig
+
+    with pytest.raises(ValueError, match="tool_call_author_name_mode"):
+        Inkling2ModelConfig(tool_call_author_name_mode="anonymous")
 
 
 if __name__ == "__main__":
