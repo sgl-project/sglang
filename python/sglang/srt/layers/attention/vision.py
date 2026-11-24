@@ -249,9 +249,16 @@ def _padded_batch_layout(
 
     Returns ``(padded_cu_seqlens, seq_lens)``: each image's offset in the padded
     rows and its real length, both int32 on the device and without a host sync.
-    Returns None for packed batches (``bsz == 1``).
+    Returns None for packed batches (``bsz == 1``) and for the uniform offsets
+    from ``_get_cu_seqlens_for_shape`` (e.g. InternVL's equal-length tiles),
+    which already match the padded layout.
     """
     if bsz <= 1 or cu_seqlens.numel() != bsz + 1:
+        return None
+    # Identity check against the cached tensor, without a host sync. Callers
+    # pass `device=` by keyword, so they share this lru_cache entry; a miss only
+    # costs the zeroed output below, the result is the same.
+    if cu_seqlens is _get_cu_seqlens_for_shape(bsz, seq_len, device=device):
         return None
     seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=device, dtype=torch.int32)
     return _get_cu_seqlens_for_shape(bsz, seq_len, device=device), seq_lens

@@ -165,6 +165,47 @@ def test_unpadded_batches_are_unchanged(backend, lens, bsz):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("use_metadata", [True, False])
+def test_uniform_tiles_keep_packed_path(backend, use_metadata, monkeypatch):
+    """InternVL passes the cached uniform offsets for its equal-length tiles."""
+    torch.manual_seed(0)
+    bsz, seq_len = 7, 1025
+    q, k, v = _qkv(bsz * seq_len)
+    cu_seqlens = vision._get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+    metadata = (
+        vision.prepare_vision_attention_metadata(cu_seqlens, device=q.device)
+        if use_metadata
+        else None
+    )
+    assert vision._padded_batch_layout(cu_seqlens, bsz, seq_len, q.device) is None
+
+    def fail(*args, **kwargs):
+        raise AssertionError("uniform tiles must not allocate a zeroed output")
+
+    monkeypatch.setattr(vision.torch, "zeros_like", fail)
+    out = backend().forward(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        bsz=bsz,
+        seq_len=seq_len,
+        softmax_scale=HEAD_DIM**-0.5,
+        forward_metadata=metadata,
+    )
+    monkeypatch.undo()
+
+    for b in range(bsz):
+        rows = slice(b * seq_len, (b + 1) * seq_len)
+        torch.testing.assert_close(
+            out[rows].float(),
+            _reference(q[rows], k[rows], v[rows]),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_dense_batch_without_cu_seqlens_skips_padded_path(backend, monkeypatch):
     def fail(*args, **kwargs):
         raise AssertionError("dense batch must not take the padded path")
