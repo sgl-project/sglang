@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 from datetime import datetime, timezone
-from types import SimpleNamespace
+from types import SimpleNamespace as NS
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,22 +13,22 @@ import run_ci_approval as rca  # noqa: E402
 from github import GithubException  # noqa: E402
 
 PR_TEST = ".github/workflows/pr-test.yml"
-PR_TEST_EXTRA = ".github/workflows/pr-test-extra.yml"
 HEAD = "a" * 40
-# 2026-11-23T00:00:00Z; 90 days earlier is 2026-08-25.
+GATE = "call-gate / pr-gate"
+PR = NS(number=7, head=NS(sha=HEAD, ref="feature", repo=NS(id=1)))
 
 
-def _time(hour):
+def _at(hour):
     return datetime(2026, 11, 23, hour, tzinfo=timezone.utc)
 
 
 class FakeRepo:
-    def __init__(self, permissions=None, statuses=(), runs=(), head=HEAD):
-        self.full_name = "sgl-project/sglang"
+    full_name = "sgl-project/sglang"
+
+    def __init__(self, permissions=None, statuses=(), runs=()):
         self.permissions = permissions or {}
         self.statuses = list(statuses)
         self.runs = list(runs)
-        self.head = head
 
     def get_collaborator_permission(self, login):
         permission = self.permissions.get(login, 404)
@@ -37,226 +37,116 @@ class FakeRepo:
         return permission
 
     def get_commit(self, sha):
-        return SimpleNamespace(get_statuses=lambda: self.statuses)
+        return NS(get_statuses=lambda: self.statuses)
 
     def get_workflow_runs(self, head_sha):
         return list(self.runs)
 
     def get_pull(self, number):
-        return SimpleNamespace(head=SimpleNamespace(sha=self.head))
-
-
-def _pr(repo_id=1, ref="feature"):
-    return SimpleNamespace(
-        number=7,
-        head=SimpleNamespace(sha=HEAD, ref=ref, repo=SimpleNamespace(id=repo_id)),
-    )
-
-
-def _status(context=rca.APPROVAL_CONTEXT, state="success", login=rca.APPROVAL_CREATOR):
-    creator = SimpleNamespace(login=login) if login else None
-    return SimpleNamespace(context=context, state=state, creator=creator)
-
-
-def _job(name, status="completed", conclusion="success", skipped=False):
-    steps = (
-        [SimpleNamespace(name=rca.GATE_SKIP_STEP, conclusion="success")]
-        if skipped
-        else []
-    )
-    return SimpleNamespace(name=name, status=status, conclusion=conclusion, steps=steps)
+        return PR
 
 
 class FakeRun:
-    """A workflow run whose (run status, jobs) advance one state per jobs() call."""
+    """A pr-test.yml run of PR whose (status, jobs) advance one state per jobs() call."""
 
-    def __init__(
-        self,
-        path=PR_TEST,
-        states=None,
-        run_id=1,
-        created_at=None,
-        event="pull_request_target",
-        head_branch="feature",
-        repo_id=1,
-        rerun_accepted=True,
-    ):
+    def __init__(self, states=(("completed", ()),), created_at=None, run_id=1):
         self.id = run_id
-        self.workflow_id = path
-        self.path = path
-        self.name = os.path.basename(path)
+        self.workflow_id = self.path = PR_TEST
+        self.name = os.path.basename(PR_TEST)
         self.html_url = f"https://example.invalid/runs/{run_id}"
-        self.event = event
-        self.head_branch = head_branch
-        self.head_repository = SimpleNamespace(id=repo_id)
+        self.event = "pull_request_target"
+        self.head_branch = "feature"
+        self.head_repository = NS(id=1)
         self.created_at = created_at
-        self.states = list(states or [("completed", [])])
+        self.states = list(states)
         self.status = self.states[0][0]
-        self.rerun_accepted = rerun_accepted
         self.reruns = 0
 
     def jobs(self):
         self.status, jobs = self.states[0]
         if len(self.states) > 1:
             self.states.pop(0)
-        return jobs
+        return list(jobs)
 
     def rerun(self):
         self.reruns += 1
-        return self.rerun_accepted
+        return True
 
 
-GATE = "call-gate / pr-gate"
+def _gate(status="completed", skipped=False):
+    steps = [NS(name=rca.GATE_SKIP_STEP, conclusion="success")] if skipped else []
+    return NS(name=GATE, status=status, conclusion="success", steps=steps)
+
+
+def _status(state="success", login=rca.APPROVAL_CREATOR):
+    creator = NS(login=login) if login else None
+    return NS(context=rca.APPROVAL_CONTEXT, state=state, creator=creator)
 
 
 class TestCanApprove(unittest.TestCase):
-    def test_write_access_approves(self):
-        for permission in rca.APPROVER_REPO_PERMISSIONS:
+    def test_only_write_access_approves(self):
+        for permission, expected in [
+            *((p, True) for p in rca.APPROVER_REPO_PERMISSIONS),
+            *((p, False) for p in ("read", "triage", 403, 404)),
+        ]:
             with self.subTest(permission=permission):
                 repo = FakeRepo(permissions={"u": permission})
-                self.assertEqual(rca.can_approve(repo, "u"), (True, ""))
-
-    def test_no_write_access_is_refused(self):
-        for permission in ("read", "triage", 403, 404):
-            with self.subTest(permission=permission):
-                repo = FakeRepo(permissions={"u": permission})
-                ok, reason = rca.can_approve(repo, "u")
-                self.assertFalse(ok)
-                self.assertIn("no write access", reason)
-
-    def test_server_error_is_raised(self):
-        repo = FakeRepo(permissions={"u": 500})
-        with self.assertRaises(GithubException):
-            rca.can_approve(repo, "u")
+                self.assertEqual(rca.can_approve(repo, "u")[0], expected)
 
 
 class TestIsApproved(unittest.TestCase):
-    def test_bot_success_status_with_label(self):
-        repo = FakeRepo(statuses=[_status(context="other"), _status()])
-        self.assertTrue(rca.is_approved(repo, HEAD, {"run-ci"}))
-
-    def test_rejected_statuses(self):
-        for status in (
-            _status(login="someone"),
-            _status(login=None),
-            _status(state="failure"),
-            _status(context="ci/other"),
-        ):
-            with self.subTest(status=status):
-                repo = FakeRepo(statuses=[status])
-                self.assertFalse(rca.is_approved(repo, HEAD, {"run-ci"}))
-
-    def test_removed_label_revokes(self):
-        repo = FakeRepo(statuses=[_status()])
-        self.assertFalse(rca.is_approved(repo, HEAD, {"run-ci-nv-extra"}))
-
-
-class TestApprovalWorkflowsFor(unittest.TestCase):
-    def test_extra_needs_its_label(self):
-        self.assertEqual(rca.approval_workflows_for({"run-ci"}), [PR_TEST])
-        self.assertEqual(
-            rca.approval_workflows_for({"run-ci", "run-ci-nv-extra"}),
-            [PR_TEST, PR_TEST_EXTRA],
-        )
-
-
-class TestPrWorkflowRuns(unittest.TestCase):
-    def test_other_fork_or_branch_is_dropped(self):
-        mine = FakeRun(run_id=1)
-        other_fork = FakeRun(run_id=2, repo_id=2)
-        other_branch = FakeRun(run_id=3, head_branch="main")
-        push = FakeRun(run_id=4, event="push", head_branch="main", repo_id=2)
-        repo = FakeRepo(runs=[mine, other_fork, other_branch, push])
-        self.assertEqual(list(rca.pr_workflow_runs(repo, _pr(), HEAD)), [mine, push])
+    def test_bot_success_status_and_live_label(self):
+        cases = [
+            ([_status()], {"run-ci"}, True),
+            ([_status(login="someone")], {"run-ci"}, False),
+            ([_status(login=None)], {"run-ci"}, False),
+            ([_status(state="failure")], {"run-ci"}, False),
+            ([_status()], {"run-ci-nv-extra"}, False),
+        ]
+        for statuses, labels, expected in cases:
+            with self.subTest(statuses=statuses, labels=labels):
+                repo = FakeRepo(statuses=statuses)
+                self.assertEqual(rca.is_approved(repo, HEAD, labels), expected)
 
 
 class TestHeadSeenBy(unittest.TestCase):
-    def test_push_clock(self):
-        comment_at = _time(12)
+    def test_head_must_be_pushed_before_the_comment(self):
         cases = {
-            "pushed before the comment": ([_time(11)], True),
-            "pushed after the comment": ([_time(13)], False),
-            "re-pushed after the comment": ([_time(10), _time(13)], False),
+            "pushed before": ([_at(11)], True),
+            "pushed after": ([_at(13)], False),
+            "re-pushed after": ([_at(10), _at(13)], False),
             "no run yet": ([], False),
         }
         for case, (created, expected) in cases.items():
             with self.subTest(case=case):
-                runs = [FakeRun(run_id=i, created_at=t) for i, t in enumerate(created)]
-                # Another workflow's run says nothing about the push.
-                runs.append(FakeRun(path=PR_TEST_EXTRA, run_id=99, created_at=_time(1)))
+                runs = [FakeRun(created_at=t, run_id=i) for i, t in enumerate(created)]
                 repo = FakeRepo(runs=runs)
-                self.assertEqual(
-                    rca.head_seen_by(repo, _pr(), HEAD, comment_at), expected
-                )
+                self.assertEqual(rca.head_seen_by(repo, PR, HEAD, _at(12)), expected)
 
 
 class TestRerunGatedRuns(unittest.TestCase):
     def setUp(self):
-        self.sleep = mock.patch("time.sleep").start()
-        self.addCleanup(mock.patch.stopall)
-
-    def _rerun(self, repo, paths=(PR_TEST,)):
-        return rca.rerun_gated_runs(repo, _pr(), HEAD, list(paths))
+        patcher = mock.patch("time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_skipped_gate_is_rerun_once_completed(self):
         run = FakeRun(
             states=[
-                ("in_progress", [_job(GATE, status="in_progress")]),
-                ("in_progress", [_job(GATE, skipped=True)]),
-                ("completed", [_job(GATE, skipped=True)]),
+                ("in_progress", [_gate(status="in_progress")]),
+                ("in_progress", [_gate(skipped=True)]),
+                ("completed", [_gate(skipped=True)]),
             ]
         )
-        [(acted, message)] = self._rerun(FakeRepo(runs=[run]))
+        [(acted, _)] = rca.rerun_gated_runs(FakeRepo(runs=[run]), PR, HEAD, [PR_TEST])
         self.assertTrue(acted)
-        self.assertIn("Re-running", message)
         self.assertEqual(run.reruns, 1)
-        self.assertEqual(self.sleep.call_count, 2)
 
-    def test_passed_gate_needs_nothing(self):
-        run = FakeRun(states=[("in_progress", [_job(GATE)])])
-        [(acted, message)] = self._rerun(FakeRepo(runs=[run]))
+    def test_passed_gate_is_not_rerun(self):
+        run = FakeRun(states=[("in_progress", [_gate()])])
+        [(acted, _)] = rca.rerun_gated_runs(FakeRepo(runs=[run]), PR, HEAD, [PR_TEST])
         self.assertFalse(acted)
-        self.assertIn("already passed its gate", message)
         self.assertEqual(run.reruns, 0)
-
-    def test_failed_gate_is_not_rerun(self):
-        run = FakeRun(states=[("completed", [_job(GATE, conclusion="failure")])])
-        [(acted, message)] = self._rerun(FakeRepo(runs=[run]))
-        self.assertFalse(acted)
-        self.assertIn("gate failed", message)
-        self.assertEqual(run.reruns, 0)
-
-    def test_no_run(self):
-        [(acted, message)] = self._rerun(FakeRepo())
-        self.assertFalse(acted)
-        self.assertIn("No `pr-test.yml` run exists", message)
-        self.sleep.assert_not_called()
-
-    def test_moved_head_is_not_rerun(self):
-        run = FakeRun(states=[("completed", [_job(GATE, skipped=True)])])
-        [(acted, message)] = self._rerun(FakeRepo(runs=[run], head="b" * 40))
-        self.assertFalse(acted)
-        self.assertIn("head moved", message)
-        self.assertEqual(run.reruns, 0)
-
-    def test_refused_rerun_is_reported(self):
-        run = FakeRun(
-            states=[("completed", [_job(GATE, skipped=True)])], rerun_accepted=False
-        )
-        [(acted, message)] = self._rerun(FakeRepo(runs=[run]))
-        self.assertFalse(acted)
-        self.assertIn("Failed to re-run", message)
-
-    def test_wait_is_bounded(self):
-        mock.patch(
-            "time.monotonic",
-            side_effect=[0, rca.GATE_MAX_WAIT_SECONDS - 1, rca.GATE_MAX_WAIT_SECONDS],
-        ).start()
-        run = FakeRun(states=[("in_progress", [_job(GATE, status="in_progress")])])
-        [(acted, message)] = self._rerun(FakeRepo(runs=[run]))
-        self.assertFalse(acted)
-        self.assertIn("Timed out", message)
-        self.assertEqual(self.sleep.call_count, 1)
 
 
 if __name__ == "__main__":

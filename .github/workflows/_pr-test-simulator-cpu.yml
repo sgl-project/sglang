@@ -46,9 +46,6 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-        with:
-          # v5 cannot restore without saving, so no cache for pull_request_target runs.
-          enable-cache: ${{ github.event_name == 'pull_request_target' && 'false' || 'auto' }}
 
       - uses: ./.github/actions/download-rust-ext
         id: rust_ext

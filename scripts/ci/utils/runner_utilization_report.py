@@ -629,7 +629,7 @@ def calculate_utilization(
             _likely_no_gpu_jobs(r.get("name", ""), r.get("path", ""))
             or r.get("conclusion") in ("skipped", "action_required")
             or (
-                r.get("event") in ("pull_request", "pull_request_target", "push")
+                r.get("event") in ("pull_request", "push")
                 and r.get("status") == "completed"
                 and r.get("run_attempt") == 1
                 and parse_time(r["updated_at"]) - parse_time(r["run_started_at"])

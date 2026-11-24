@@ -10,11 +10,9 @@ run-name: >-
 on:
   schedule:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
-  # The workflow file comes from the PR's base branch, never the PR, so a PR can't edit the
-  # gate; pr-gate.yml (approval-mode commit) passes only a head commit a maintainer approved
-  # (pr-gate-approve.yml). Only PRs into main and release branches: base-branch workflows run
-  # with secrets. No `labeled` type: a label event would join the concurrency group below and
-  # cancel the run in progress; the approval workflow re-runs the gated run instead.
+  # The workflow file comes from the base branch, so a PR cannot edit the gate (pr-gate.yml,
+  # approval-mode commit). No `labeled` type: a label event would cancel the run in progress
+  # through the concurrency group; pr-gate-approve.yml reruns the gated run instead.
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, 'release/**']
@@ -203,7 +201,6 @@ jobs:
         needs.detect-changes.outputs.processor == 'true' ||
         needs.detect-changes.outputs.server_args_docs == 'true'
       )
-    # statuses: read (top-level permissions) lets it read the head's approval.
     uses: ./.github/workflows/pr-gate.yml
     with:
       approval-mode: commit
