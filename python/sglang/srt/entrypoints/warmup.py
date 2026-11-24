@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -271,7 +272,14 @@ async def concurrent_prefill(
 ):
     """Warm up multi-sequence prefill, mixed steps and input logprobs, so their
     first JIT compiles happen before serving."""
+    if disaggregation_mode == "decode" or not tokenizer_manager.is_generation:
+        logger.info(
+            "Skipping concurrent_prefill: this server runs no generation prefill"
+        )
+        return
     vocab = min(2**16, tokenizer_manager.model_config.vocab_size)
+    # PD prefill servers need a bootstrap room; concurrent requests need distinct ones.
+    bootstrap_rooms = itertools.count()
 
     async def one(size, **kwargs):
         req = GenerateReqInput(
@@ -282,6 +290,9 @@ async def concurrent_prefill(
             },
             **kwargs,
         )
+        if disaggregation_mode != "null":
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            req.bootstrap_room = next(bootstrap_rooms)
         await tokenizer_manager.generate_request(req, None).__anext__()
 
     limits = concurrent_prefill_limits(

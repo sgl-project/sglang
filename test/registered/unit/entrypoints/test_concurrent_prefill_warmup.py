@@ -2,10 +2,13 @@
 (one prompt, full concurrency, a round larger than one prefill chunk) without
 sending a request the server refuses or can never admit."""
 
+import asyncio
 import unittest
 
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.warmup import (
     ConcurrentPrefillLimits,
+    concurrent_prefill,
     concurrent_prefill_limits,
     concurrent_prefill_plan,
 )
@@ -41,6 +44,32 @@ def _internal_state(**overrides):
     }
     state.update(overrides)
     return state
+
+
+class _FakeModelConfig:
+    vocab_size = 1000
+
+
+class _RecordingTokenizerManager:
+    is_generation = True
+    context_len = 4096
+    max_req_input_len = 4090
+    num_reserved_tokens = 0
+    model_config = _FakeModelConfig()
+
+    def __init__(self):
+        self.requests = []
+
+    async def get_internal_state(self):
+        return [_internal_state(effective_max_running_requests_per_dp=8)]
+
+    def generate_request(self, req, request):
+        self.requests.append(req)
+
+        async def finished():
+            yield {}
+
+        return finished()
 
 
 class TestConcurrentPrefillPlan(CustomTestCase):
@@ -114,6 +143,25 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         longest = max(max(r) for r in concurrent_prefill_plan(limits).rounds)
         charged = -(-longest // page) * page + page + 8
         self.assertLessEqual(charged, 32768)
+
+
+class TestConcurrentPrefillRequests(CustomTestCase):
+    def test_pd_prefill_requests_get_distinct_bootstrap_rooms(self):
+        """A PD prefill server rejects a request without a bootstrap room, and
+        concurrent requests sharing one room collide."""
+        tm = _RecordingTokenizerManager()
+        asyncio.run(concurrent_prefill("prefill", tm))
+        self.assertGreater(len(tm.requests), 2)
+        self.assertTrue(
+            all(r.bootstrap_host == FAKE_BOOTSTRAP_HOST for r in tm.requests)
+        )
+        rooms = [r.bootstrap_room for r in tm.requests]
+        self.assertEqual(len(set(rooms)), len(rooms))
+
+    def test_decode_server_sends_nothing(self):
+        tm = _RecordingTokenizerManager()
+        asyncio.run(concurrent_prefill("decode", tm))
+        self.assertEqual(tm.requests, [])
 
 
 if __name__ == "__main__":
