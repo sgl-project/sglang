@@ -29,7 +29,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -38,6 +38,7 @@ use serde_json::ser::Formatter; // codespell:ignore ser
 use serde_json::{Map, Value};
 
 use super::frame::CoreOutput;
+use super::metrics::ExtensionCounter;
 use crate::message::config::{RequestLogConfig, ServerArgs};
 use crate::message::multimodal::MmItem;
 use crate::message::request::{GenerateRequest, PromptTokenIdsSlot};
@@ -1516,36 +1517,139 @@ fn open_append(path: &std::path::Path) -> std::io::Result<File> {
 }
 
 /// One background writer for the process, so lines from every listener keep
-/// their order. It holds up to [`BUFFERED_LINES`] lines, then blocks the
-/// request thread as Python's synchronous logging would, rather than
-/// buffering without bound. The first line starts it; a server's shutdown
-/// stops it (see [`flush_request_log`]) and the next line starts it again.
+/// their order. It holds up to [`BUFFERED_LINES`] lines; what a line does when
+/// they are all taken is [`FullBuffer`]. The first line starts it; a server's
+/// shutdown stops it (see [`flush_request_log`]) and the next line starts it
+/// again.
 struct Writer {
     writer: tracing_appender::non_blocking::NonBlocking,
     /// The targets it writes to.
     targets: Arc<Targets>,
     /// Dropped to stop the writer, which writes out what is still buffered.
     _guard: tracing_appender::non_blocking::WorkerGuard,
+    /// Dropped after the guard to stop the [`DropReporter`], which then
+    /// reports the last drops (`None` under [`FullBuffer::Wait`]).
+    _stop_reporter: Option<mpsc::Sender<()>>,
 }
 
-/// Lines buffered before a request thread blocks on the write, as a request
-/// blocks on Python's synchronous logging handler.
+/// Lines buffered for the writer thread.
 const BUFFERED_LINES: usize = 1024;
+
+/// What a line does when the writer's buffer is full, from
+/// `SGLANG_RUST_REQUEST_LOG_FULL_BUFFER` (`drop` or `wait`; unset or
+/// invalid is `wait`, as in the Python server).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullBuffer {
+    /// The line is dropped whole, so a slow sink never holds up a request.
+    /// The drops are counted in `sglang:request_log_dropped_lines_total` and
+    /// warned of (see [`DropReporter`]).
+    Drop,
+    /// The request thread waits for room, as a request waits on Python's
+    /// synchronous logging handler. A stuck sink then stalls every request
+    /// that logs.
+    Wait,
+}
+
+const FULL_BUFFER_ENV: &str = "SGLANG_RUST_REQUEST_LOG_FULL_BUFFER";
+
+static FULL_BUFFER: LazyLock<FullBuffer> = LazyLock::new(|| {
+    let Ok(raw) = std::env::var(FULL_BUFFER_ENV) else {
+        return FullBuffer::Wait;
+    };
+    match raw.to_lowercase().as_str() {
+        "drop" => FullBuffer::Drop,
+        "wait" => FullBuffer::Wait,
+        _ => {
+            tracing::warn!(name = FULL_BUFFER_ENV, value = %raw, "invalid env value; using wait");
+            FullBuffer::Wait
+        }
+    }
+});
 
 static WRITER: Mutex<Option<Writer>> = Mutex::new(None);
 
 impl Writer {
     fn new(targets: Arc<Targets>) -> Self {
+        Self::with_output(targets.clone(), *FULL_BUFFER, TargetsWriter(targets))
+    }
+
+    fn with_output(
+        targets: Arc<Targets>,
+        full_buffer: FullBuffer,
+        output: impl std::io::Write + Send + 'static,
+    ) -> Self {
         let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .lossy(false)
+            .lossy(full_buffer == FullBuffer::Drop)
             .buffered_lines_limit(BUFFERED_LINES)
             .thread_name("request-log")
-            .finish(TargetsWriter(targets.clone()));
+            .finish(output);
+        let stop_reporter =
+            (full_buffer == FullBuffer::Drop).then(|| DropReporter::spawn(writer.error_counter()));
         Self {
             writer,
             targets,
             _guard: guard,
+            _stop_reporter: stop_reporter,
         }
+    }
+}
+
+/// How often the [`DropReporter`] reports, so it warns at most this often.
+const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// `sglang:request_log_dropped_lines_total`, written with the frontend's
+/// metrics.
+fn dropped_lines_metric() -> &'static ExtensionCounter {
+    ExtensionCounter::register(
+        "sglang:request_log_dropped_lines_total",
+        "Request log lines dropped because the log writer's buffer was full.",
+    )
+}
+
+/// Reports the lines a [`FullBuffer::Drop`] writer dropped, from its own
+/// thread, so the request path does nothing more than send the line: every
+/// [`DROP_REPORT_INTERVAL`], and once more when the writer stops, it adds the
+/// new drops to the metric and warns once with their count.
+struct DropReporter {
+    dropped: tracing_appender::non_blocking::ErrorCounter,
+    reported: usize,
+}
+
+impl DropReporter {
+    /// Start reporting; dropping the returned sender stops it.
+    fn spawn(dropped: tracing_appender::non_blocking::ErrorCounter) -> mpsc::Sender<()> {
+        dropped_lines_metric().init_series(&[]);
+        let (stop, stopped) = mpsc::channel();
+        let mut reporter = Self {
+            dropped,
+            reported: 0,
+        };
+        std::thread::Builder::new()
+            .name("request-log-drops".into())
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(DROP_REPORT_INTERVAL)
+                {
+                    reporter.report();
+                }
+                reporter.report();
+            })
+            .expect("failed to spawn the request log drop reporter");
+        stop
+    }
+
+    fn report(&mut self) {
+        let total = self.dropped.dropped_lines();
+        let new = total - self.reported;
+        if new == 0 {
+            return;
+        }
+        self.reported = total;
+        dropped_lines_metric().inc_by(&[], new as u64);
+        tracing::warn!(
+            dropped = new,
+            "request log buffer full; lines dropped (set {FULL_BUFFER_ENV}=wait to wait for the sink instead)"
+        );
     }
 }
 

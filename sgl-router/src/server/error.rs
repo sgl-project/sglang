@@ -26,6 +26,8 @@ pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
 enum ErrorClass {
     /// 400 — request rejected at ingress as malformed / invalid.
     BadRequest,
+    /// 401 — the request lacks a valid credential for a protected route.
+    Unauthorized,
     /// 404 — requested model / resource not found.
     NotFound,
     /// 409 — request conflicts with current resource state.
@@ -47,6 +49,7 @@ impl ErrorClass {
     fn status(self) -> StatusCode {
         match self {
             ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
+            ErrorClass::Unauthorized => StatusCode::UNAUTHORIZED,
             ErrorClass::NotFound => StatusCode::NOT_FOUND,
             ErrorClass::Conflict => StatusCode::CONFLICT,
             ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
@@ -222,6 +225,9 @@ impl ApiError {
                 | crate::workers::control::WorkerControlError::InvalidRevision => {
                     ErrorClass::BadRequest
                 }
+                crate::workers::control::WorkerControlError::Unauthorized => {
+                    ErrorClass::Unauthorized
+                }
                 crate::workers::control::WorkerControlError::NotFound(_) => ErrorClass::NotFound,
                 crate::workers::control::WorkerControlError::Conflict { .. } => {
                     ErrorClass::Conflict
@@ -366,6 +372,7 @@ impl ApiError {
         }
         let code = match self.class() {
             ErrorClass::BadRequest => Code::InvalidArgument,
+            ErrorClass::Unauthorized => Code::Unauthenticated,
             ErrorClass::NotFound => Code::NotFound,
             ErrorClass::Conflict => Code::FailedPrecondition,
             ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
