@@ -1129,6 +1129,7 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "b200": "b200.json",
     "5090": "5090.json",
     "xpu_b60": "xpu_b60.json",
+    "xpu_b70": "xpu_b70.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -1142,6 +1143,10 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "5090": "5090",
     "xpu": "xpu_b60",
     "bmg": "xpu_b60",
+    "b60": "xpu_b60",
+    "xpub60": "xpu_b60",
+    "b70": "xpu_b70",
+    "xpub70": "xpu_b70",
 }
 
 
@@ -1157,12 +1162,24 @@ def _normalize_perf_baseline_platform(platform: str) -> str:
     return PERF_BASELINE_PLATFORM_ALIASES[normalized]
 
 
+def _xpu_perf_baseline_platform(device_name: str, total_bytes: int) -> str:
+    # CI pools mix Arc Pro B60 (24 GiB) and B70 (32 GiB) under one runner label;
+    # memory is the fallback when the driver reports a generic device name.
+    name = device_name.upper()
+    if "B70" in name or ("B60" not in name and total_bytes > 28 * 1024**3):
+        return "xpu_b70"
+    return "xpu_b60"
+
+
 def get_perf_baseline_platform() -> str:
     override = os.getenv(PERF_BASELINE_PLATFORM_ENV)
     if override:
         return _normalize_perf_baseline_platform(override)
     if current_platform.is_xpu():
-        return "xpu_b60"
+        return _xpu_perf_baseline_platform(
+            current_platform.get_device_name(),
+            current_platform.get_device_total_memory(),
+        )
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():
