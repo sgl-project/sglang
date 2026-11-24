@@ -51,6 +51,8 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
             request_status={room: KVPoll.WaitingForInput for room in rooms},
             transfer_infos={room: sessions for room in rooms},
             transfer_queues=queues,
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queued_rooms
@@ -116,6 +118,8 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
             transfer_infos={room: {session: requests[room]} for room in rooms},
             req_to_decode_prefix_len={},
             failed_sessions=set(),
+            failed_session_probes={},
+            state_layout_rejections={},
             session_failures=defaultdict(int),
             session_lock=Lock(),
             decode_kv_args_table={
@@ -125,8 +129,12 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
                     dst_kv_layer_ids=[],
                     dst_kv_item_len=1,
                     dst_attn_tp_size=1,
+                    dst_aux_ptrs=[3000],
+                    dst_aux_item_lens=[1],
+                    num_draft_entries=None,
                 )
             },
+            validate_aux_buffers=MagicMock(),
             kv_args=SimpleNamespace(kv_data_ptrs=[1000]),
             is_mla_backend=True,
             is_hybrid_mla_backend=False,
@@ -135,6 +143,8 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
             bootstrap_port=0,
             send_kvcache=MagicMock(side_effect=[17, 0]),
             conclude_failure=MagicMock(),
+            _poison_unsettled_send=MagicMock(),
+            note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         manager._prefill_unique_rank = lambda: 0
