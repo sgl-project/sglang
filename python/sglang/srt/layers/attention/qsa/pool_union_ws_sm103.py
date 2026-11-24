@@ -71,9 +71,15 @@ ENABLED = _env_flag("SGLANG_QSA_FP8_POOL_VERIFY_WS")
 SPLITS = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS", None, int)
 # PDL into this kernel (gdc_wait after its setup); off by default until measured in the engine.
 PDL = _env_flag("SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL")
-# "ns,nbv": the FP8 K+V ring and BF16 V ring stages; None: the most of (2, 2), (1, 1) that fit the device's
-# shared memory (2 + 2 is 328 KB, over SM103's 227 KB).
-STAGES = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_WS_STAGES", None, lambda v: tuple(int(x) for x in v.split(",")))
+# "ns,nbv" (FP8 K and V rings of ns stages each, BF16 V ring of nbv) or "nsk,nsv,nbv" (separate FP8 K and V ring
+# depths); None: the first of (2, 2, 2), (1, 2, 1), (1, 1, 1) that fits the device's shared memory (2 + 2 is 328 KB,
+# over SM103's 227 KB; 1 K + 2 V + 1 BF16 V is 225 KB and lets the V gathers run a tile ahead of the PV chain).
+def _parse_stages(v):
+    t = tuple(int(x) for x in v.split(","))
+    return (t[0], t[0], t[1]) if len(t) == 2 else t
+
+
+STAGES = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_WS_STAGES", None, _parse_stages)
 RESCALE_LOG2 = 8.0
 _LOGGED_ROWS: set = set()
 
@@ -124,9 +130,9 @@ def choose_ws_splits(requests, kv_heads, sms):
     return min(range(1, 5), key=lambda s: (cost(s), s))
 
 
-def ws_smem_bytes(ns, nbv, bn=128, dim=256, qp=64, lm=64):
+def ws_smem_bytes(nsk, nsv, nbv, bn=128, dim=256, qp=64, lm=64):
     """The kernel's shared memory: FP8 K and V rings, the BF16 V ring, P^T, Q, the ones operand, alpha, barriers."""
-    return 2 * ns * bn * dim + 2 * nbv * bn * dim + 2 * bn * qp + 2 * qp * dim + 2 * lm * bn + 4 * qp + 1024
+    return (nsk + nsv) * bn * dim + 2 * nbv * bn * dim + 2 * bn * qp + 2 * qp * dim + 2 * lm * bn + 4 * qp + 1024
 
 
 @functools.lru_cache(maxsize=None)
@@ -134,11 +140,19 @@ def _max_smem(device_index):
     return triton.runtime.driver.active.utils.get_device_properties(device_index)["max_shared_mem"]
 
 
+# devices whose auto ring did not compile within shared memory (compiler scratch on top of ws_smem_bytes)
+_STAGES_REFUSED: dict = {}
+
+
 def ws_stages(device):
     if STAGES is not None:
         return STAGES
-    smem = _max_smem(device.index or 0)
-    return next((s for s in ((2, 2), (1, 1)) if ws_smem_bytes(*s) <= smem), (1, 1))
+    index = device.index or 0
+    smem = _max_smem(index)
+    refused = _STAGES_REFUSED.get(index, ())
+    return next(
+        (s for s in ((2, 2, 2), (1, 2, 1), (1, 1, 1)) if s not in refused and ws_smem_bytes(*s) <= smem), (1, 1, 1)
+    )
 
 
 def _log_engaged(rows: int, width: int, kv_heads: int, device, served: bool) -> None:
@@ -183,8 +197,8 @@ if _GLUON:
         return gl.where(tin & (tm != 0), slot, oob)
 
     @gluon.jit
-    def _ws_load(k_desc, v_desc, TS, TM, k8, v8, f8_ready, f8_empty, r, head, start, end, n_tiles,
-                 NT: gl.constexpr, D: gl.constexpr, BN: gl.constexpr, NS: gl.constexpr):
+    def _ws_load(k_desc, v_desc, TS, TM, k8, v8, k8_ready, k8_empty, v8_ready, v8_empty, r, head, start, end, n_tiles,
+                 NT: gl.constexpr, D: gl.constexpr, BN: gl.constexpr, NSK: gl.constexpr, NSV: gl.constexpr):
         flat: gl.constexpr = gl.BlockedLayout([1], [32], [gl.num_warps()], [0])
         # gather4 takes each 4-row chunk of offsets whole in every lane of one warp
         rows_layout: gl.constexpr = gl.SliceLayout(0, gl.BlockedLayout([1, 4], [32, 1], [1, gl.num_warps()], [1, 0]))
@@ -197,46 +211,57 @@ if _GLUON:
         ra = _ws_rows(TS, TM, base, t, end, oob)
         rb = _ws_rows(TS, TM, base, t + HB, end, oob)
         for i in range(n_tiles):
-            s = i % NS
+            sk = i % NSK
+            sv = i % NSV
             cur_a = ra
             cur_b = rb
             t = start + (i + 1) * BN + gl.arange(0, HB, flat)
             ra = _ws_rows(TS, TM, base, t, end, oob)
             rb = _ws_rows(TS, TM, base, t + HB, end, oob)
-            mbarrier.wait(f8_empty.index(s), ((i // NS) & 1) ^ 1)
-            bar = f8_ready.index(s)
-            mbarrier.expect(bar, 2 * BN * k_desc.block_type.nbytes)
+            # K and V have their own rings: a deeper V ring keeps the V gathers off the PV chain
+            mbarrier.wait(k8_empty.index(sk), ((i // NSK) & 1) ^ 1)
+            kbar = k8_ready.index(sk)
+            mbarrier.expect(kbar, BN * k_desc.block_type.nbytes)
+            mbarrier.wait(v8_empty.index(sv), ((i // NSV) & 1) ^ 1)
+            vbar = v8_ready.index(sv)
+            mbarrier.expect(vbar, BN * v_desc.block_type.nbytes)
             # half tiles keep the offsets, replicated in every lane, within the loader's registers
             rows = gl.convert_layout(cur_a, rows_layout)
-            tma.async_gather(k_desc, rows, col, bar, k8.index(s).slice(0, HB))
-            tma.async_gather(v_desc, rows, col, bar, v8.index(s).slice(0, HB))
+            tma.async_gather(k_desc, rows, col, kbar, k8.index(sk).slice(0, HB))
+            tma.async_gather(v_desc, rows, col, vbar, v8.index(sv).slice(0, HB))
             rows = gl.convert_layout(cur_b, rows_layout)
-            tma.async_gather(k_desc, rows, col, bar, k8.index(s).slice(HB, HB))
-            tma.async_gather(v_desc, rows, col, bar, v8.index(s).slice(HB, HB))
+            tma.async_gather(k_desc, rows, col, kbar, k8.index(sk).slice(HB, HB))
+            tma.async_gather(v_desc, rows, col, vbar, v8.index(sv).slice(HB, HB))
 
     @gluon.jit
-    def _ws_convert(k8, v8, k_tmem, vb, f8_ready, f8_empty, k_ready, k_empty, v_ready, v_empty, n_tiles,
-                    BN: gl.constexpr, D: gl.constexpr, NS: gl.constexpr, NBV: gl.constexpr, KC: gl.constexpr):
+    def _ws_convert(k8, v8, k_tmem, vb, k8_ready, k8_empty, v8_ready, v8_empty, k_ready, k_empty, v_ready, v_empty,
+                    n_tiles, BN: gl.constexpr, D: gl.constexpr, NSK: gl.constexpr, NSV: gl.constexpr,
+                    NBV: gl.constexpr, KC: gl.constexpr):
         # One token row per thread: the layout TMEM stores take, and conflict-free on the swizzled rows.
         k_tl: gl.constexpr = TensorMemoryLayout((BN, KC), col_stride=1)
         row_reg: gl.constexpr = _tmem_reg_layout(gl.bfloat16, [BN, KC], k_tl, [BN, D], gl.num_warps())
         for i in range(n_tiles):
-            s = i % NS
+            sk = i % NSK
+            sv = i % NSV
             bv = i % NBV
-            mbarrier.wait(f8_ready.index(s), (i // NS) & 1)
+            mbarrier.wait(k8_ready.index(sk), (i // NSK) & 1)
             # one K buffer: tile i's K overwrites tile i - 1's once its QK completed
             mbarrier.wait(k_empty.index(0), (i & 1) ^ 1)
             for c in gl.static_range(D // KC):
-                x = k8.index(s).slice(c * KC, KC, dim=1).load(row_reg)
+                x = k8.index(sk).slice(c * KC, KC, dim=1).load(row_reg)
                 k_tmem.slice(c * KC, KC).store(x.to(gl.bfloat16))
             mbarrier.arrive(k_ready.index(0))
+            # order the generic-proxy reads of the K stage with its TMA refill
+            fence_async_shared()
+            mbarrier.arrive(k8_empty.index(sk))
+            mbarrier.wait(v8_ready.index(sv), (i // NSV) & 1)
             mbarrier.wait(v_empty.index(bv), ((i // NBV) & 1) ^ 1)
             for c in gl.static_range(D // KC):
-                y = v8.index(s).slice(c * KC, KC, dim=1).load(row_reg)
+                y = v8.index(sv).slice(c * KC, KC, dim=1).load(row_reg)
                 vb.index(bv).slice(c * KC, KC, dim=1).store(y.to(gl.bfloat16))
             # order the generic-proxy shared reads/writes with the TMA refill and the MMA reads
             fence_async_shared()
-            mbarrier.arrive(f8_empty.index(s))
+            mbarrier.arrive(v8_empty.index(sv))
             mbarrier.arrive(v_ready.index(bv))
 
     @gluon.jit
@@ -378,7 +403,8 @@ if _GLUON:
         NT: gl.constexpr,
         RESCALE: gl.constexpr,
         USE_PDL: gl.constexpr,
-        NS: gl.constexpr,  # FP8 K+V ring stages (64 KB each)
+        NSK: gl.constexpr,  # FP8 K ring stages (32 KB each)
+        NSV: gl.constexpr,  # FP8 V ring stages (32 KB each)
         NBV: gl.constexpr,  # BF16 V stages (64 KB each)
     ):
         BN: gl.constexpr = 128  # tokens per tile: the MMA's M
@@ -387,8 +413,8 @@ if _GLUON:
         OC: gl.constexpr = 16  # O^T columns per TMEM load in the rescale and epilogue
 
         # Shared and tensor memory and barriers first: none of it reads the previous kernels' outputs.
-        k8 = gl.allocate_shared_memory(gl.float8e4nv, [NS, BN, D], k_desc.layout)
-        v8 = gl.allocate_shared_memory(gl.float8e4nv, [NS, BN, D], k_desc.layout)
+        k8 = gl.allocate_shared_memory(gl.float8e4nv, [NSK, BN, D], k_desc.layout)
+        v8 = gl.allocate_shared_memory(gl.float8e4nv, [NSV, BN, D], k_desc.layout)
         vb = gl.allocate_shared_memory(gl.bfloat16, [NBV, BN, D], gl.NVMMASharedLayout.get_default_for([BN, D], gl.bfloat16))
         p_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, QP], gl.NVMMASharedLayout.get_default_for([BN, QP], gl.bfloat16))
         q_smem = gl.allocate_shared_memory(gl.bfloat16, [QP, D], gl.NVMMASharedLayout.get_default_for([QP, D], gl.bfloat16))
@@ -400,8 +426,10 @@ if _GLUON:
             gl.full([LM, BN], 1.0, gl.bfloat16, gl.BlockedLayout([1, 8], [2, 16], [gl.num_warps(), 1], [1, 0])),
         )
 
-        f8_ready = gl.allocate_shared_memory(gl.int64, [NS, 1], mbarrier.MBarrierLayout())
-        f8_empty = gl.allocate_shared_memory(gl.int64, [NS, 1], mbarrier.MBarrierLayout())
+        k8_ready = gl.allocate_shared_memory(gl.int64, [NSK, 1], mbarrier.MBarrierLayout())
+        k8_empty = gl.allocate_shared_memory(gl.int64, [NSK, 1], mbarrier.MBarrierLayout())
+        v8_ready = gl.allocate_shared_memory(gl.int64, [NSV, 1], mbarrier.MBarrierLayout())
+        v8_empty = gl.allocate_shared_memory(gl.int64, [NSV, 1], mbarrier.MBarrierLayout())
         v_ready = gl.allocate_shared_memory(gl.int64, [NBV, 1], mbarrier.MBarrierLayout())
         v_empty = gl.allocate_shared_memory(gl.int64, [NBV, 1], mbarrier.MBarrierLayout())
         k_ready = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
@@ -409,9 +437,12 @@ if _GLUON:
         p_ready = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
         p_free = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
         s_ready = gl.allocate_shared_memory(gl.int64, [2, 1], mbarrier.MBarrierLayout())
-        for i in gl.static_range(NS):
-            mbarrier.init(f8_ready.index(i), count=1)
-            mbarrier.init(f8_empty.index(i), count=1)
+        for i in gl.static_range(NSK):
+            mbarrier.init(k8_ready.index(i), count=1)
+            mbarrier.init(k8_empty.index(i), count=1)
+        for i in gl.static_range(NSV):
+            mbarrier.init(v8_ready.index(i), count=1)
+            mbarrier.init(v8_empty.index(i), count=1)
         for i in gl.static_range(NBV):
             mbarrier.init(v_ready.index(i), count=1)
             mbarrier.init(v_empty.index(i), count=1)
@@ -457,10 +488,10 @@ if _GLUON:
                 (_ws_softmax, (s_tmem, o_tmem, l_tmem, p_smem, a_smem, s_ready, p_ready, p_free, TM, NINV, M_OUT,
                                L_OUT, ACC_OUT, qk_scale, r, head, split, start, end, n_tiles, SPLITS, H, D, GQ, QP, W,
                                NT, BN, OC, LM, RESCALE)),
-                (_ws_convert, (k8, v8, k_tmem, vb, f8_ready, f8_empty, k_ready, k_empty, v_ready, v_empty, n_tiles,
-                               BN, D, NS, NBV, KC)),
-                (_ws_load, (k_desc, v_desc, TS, TM, k8, v8, f8_ready, f8_empty, r, head, start, end, n_tiles, NT,
-                            D, BN, NS)),
+                (_ws_convert, (k8, v8, k_tmem, vb, k8_ready, k8_empty, v8_ready, v8_empty, k_ready, k_empty, v_ready,
+                               v_empty, n_tiles, BN, D, NSK, NSV, NBV, KC)),
+                (_ws_load, (k_desc, v_desc, TS, TM, k8, v8, k8_ready, k8_empty, v8_ready, v8_empty, r, head, start,
+                            end, n_tiles, NT, D, BN, NSK, NSV)),
                 (_ws_mma, (k_tmem, q_smem, vb, p_smem, ones_smem, s_tmem, o_tmem, l_tmem, k_ready, k_empty, v_ready,
                            v_empty, s_ready, p_ready, p_free, n_tiles, NBV)),
             ],
@@ -500,7 +531,30 @@ def union_ws_attend(q3, k_cache, v_cache, tok_slots, tok_masks, ntok, ninv, out,
     m_buf = torch.empty(nparts * qp, dtype=torch.float32, device=dev)
     l_buf = torch.empty(nparts * qp, dtype=torch.float32, device=dev)
     acc_buf = torch.empty(nparts * qp * dim, dtype=torch.float32, device=dev)
-    LAST_KERNEL["union_ws"] = _qsa_pool_union_ws[(requests, kv_heads, splits)](
+    stages = ws_stages(dev)
+    try:
+        LAST_KERNEL["union_ws"] = _launch_ws(q3, k_cache, v_cache, tok_slots, tok_masks, ntok, ninv, m_buf, l_buf, acc_buf,
+                                             scale, splits, kv_heads, dim, gq, qp, width, nt, pdl, requests, stages)
+    except triton.runtime.errors.OutOfResources:
+        if STAGES is not None or stages == (1, 1, 1):
+            raise
+        # compile-time refusal (nothing launched): the auto ring overran shared memory with the compiler's scratch
+        _STAGES_REFUSED.setdefault(dev.index or 0, set()).add(stages)
+        logger.warning("SGLANG_QSA_FP8_POOL_VERIFY_WS: stages %s exceed shared memory; using %s", stages, ws_stages(dev))
+        LAST_KERNEL["union_ws"] = _launch_ws(q3, k_cache, v_cache, tok_slots, tok_masks, ntok, ninv, m_buf, l_buf, acc_buf,
+                                             scale, splits, kv_heads, dim, gq, qp, width, nt, pdl, requests,
+                                             ws_stages(dev))
+    sb = min(16, triton.next_power_of_2(splits))
+    union._qsa_pool_union_merge[(rows * qh,)](
+        m_buf, l_buf, acc_buf, out, out.stride(0), kv_heads, dim, gq, qp, width, splits, sb, True,
+        num_warps=2, launch_pdl=True,
+    )
+    return out
+
+
+def _launch_ws(q3, k_cache, v_cache, tok_slots, tok_masks, ntok, ninv, m_buf, l_buf, acc_buf, scale, splits, kv_heads,
+               dim, gq, qp, width, nt, pdl, requests, stages):
+    return _qsa_pool_union_ws[(requests, kv_heads, splits)](
         q3,
         _pool_desc(k_cache),
         _pool_desc(v_cache),
@@ -522,17 +576,11 @@ def union_ws_attend(q3, k_cache, v_cache, tok_slots, tok_masks, ntok, ninv, out,
         nt,
         RESCALE_LOG2,
         bool(pdl),
-        *ws_stages(dev),
+        *stages,
         num_warps=4,
         maxnreg=128,
         **({"launch_pdl": True} if pdl else {}),
     )
-    sb = min(16, triton.next_power_of_2(splits))
-    union._qsa_pool_union_merge[(rows * qh,)](
-        m_buf, l_buf, acc_buf, out, out.stride(0), kv_heads, dim, gq, qp, width, splits, sb, True,
-        num_warps=2, launch_pdl=True,
-    )
-    return out
 
 
 def qsa_pool_union_decode_ws(
