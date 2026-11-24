@@ -18,15 +18,16 @@ def _decline_text(reason):
 def _unexpected_decline(reason):
     if isinstance(reason, Decline):
         return not reason.expected
-    return reason is not None
+    return True
 
 
 def install_megakernels(runner):
-    cfg = resolved_view(runner.server_args)
     architecture = type(runner.model).__name__
     group = get_parallel().tp_group.cpu_group
     binding = error = decline = None
+    cfg = None
     try:
+        cfg = resolved_view(runner.server_args)
         spec = find_spec(architecture)
         if spec is None:
             decline = f"no megakernel spec for {architecture}"
@@ -55,8 +56,8 @@ def install_megakernels(runner):
         architecture,
         getattr(binding, "role", None),
         getattr(binding, "mode", None),
-        cfg.speculative_num_steps,
-        cfg.speculative_num_draft_tokens,
+        getattr(cfg, "speculative_num_steps", None),
+        getattr(cfg, "speculative_num_draft_tokens", None),
         error,
         decline,
     )

@@ -74,6 +74,12 @@ class TestInstallMegakernels(unittest.TestCase):
         self.assertIn("fused draft is off", logs.output[0])
         self.assertNotIn("draft mode is native", logs.output[0])
 
+    def test_non_binding_return_is_an_unexpected_decline(self):
+        with self.assertLogs(_LOG, level="WARNING") as logs:
+            result = self._install(self._runner(), lambda resources, cfg: object())
+        self.assertIsNone(result)
+        self.assertEqual(logs.records[0].levelno, logging.WARNING)
+
     def test_phrase_does_not_make_a_refusal_expected(self):
         declined = Decline("target: draft mode is native", expected=False)
         with self.assertLogs(_LOG, level="WARNING") as logs:
