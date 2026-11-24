@@ -26,7 +26,6 @@ import numpy as np
 import torch
 
 from sglang.srt.utils.device import (
-    async_h2d,
     async_h2d_tensor,
     get_compiler_backend,
     get_device_sm,
@@ -223,53 +222,65 @@ class PenaltyStatusPool:
                 )
             )
 
-        if self.pending_params:
-            self._write_params()
-        if self.pending_init:
-            self._replay_histories()
+        if self.pending_params or self.pending_init:
+            self._write_pending()
 
-    def _write_params(self) -> None:
+    def _write_pending(self) -> None:
+        """Write the queued params and history resets with one copy: the values go
+        into one int64 host array, split on the device into a view per segment."""
         tables = self.tables
-        indices = list(self.pending_params)
         params = list(self.pending_params.values())
-        self.pending_params.clear()
-        stop_width = tables.stop_token_ids.shape[1]
+        histories = list(self.pending_init.values())
+        lens_cpu = [len(h) for h in histories]
         values_cpu = np.empty((4, len(params)), dtype=np.int32)
         floats_cpu = values_cpu.view(np.float32)
         floats_cpu[_FREQUENCY_ROW] = [p.frequency for p in params]
         floats_cpu[_PRESENCE_ROW] = [p.presence for p in params]
         floats_cpu[_REPETITION_ROW] = [p.repetition for p in params]
         values_cpu[_MIN_NEW_TOKENS_ROW] = [p.min_new_tokens for p in params]
-        stop_token_ids_cpu = [
-            p.stop_token_ids + [self.vocab_size] * (stop_width - len(p.stop_token_ids))
-            for p in params
+        stop_token_ids_cpu = np.full(
+            (len(params), tables.stop_token_ids.shape[1]), self.vocab_size, np.int64
+        )
+        for row, p in zip(stop_token_ids_cpu, params):
+            row[: len(p.stop_token_ids)] = p.stop_token_ids
+        history_indices_cpu = np.fromiter(self.pending_init, np.int64, len(histories))
+        segments = [
+            np.fromiter(self.pending_params, np.int64, len(params)),
+            values_cpu,
+            stop_token_ids_cpu,
+            history_indices_cpu,
+            np.asarray(lens_cpu, dtype=np.int64),
+            np.repeat(history_indices_cpu, lens_cpu),
+            np.fromiter((t for h in histories for t in h), np.int64, sum(lens_cpu)),
         ]
-        indices_device = async_h2d(indices, dtype=torch.int64, device=self.device)
-        values = async_h2d_tensor(torch.from_numpy(values_cpu), self.device)
-        stop_token_ids = async_h2d(
-            stop_token_ids_cpu, dtype=torch.int64, device=self.device
-        )
-        tables.params.index_copy_(1, indices_device, values)
-        tables.stop_token_ids[indices_device] = stop_token_ids
-
-    def _replay_histories(self) -> None:
-        tables = self.tables
-        indices = list(self.pending_init)
-        histories = list(self.pending_init.values())
+        self.pending_params.clear()
         self.pending_init.clear()
-        indices_device = async_h2d(indices, dtype=torch.int64, device=self.device)
-        tables.counts[indices_device] = 0
-        tables.lens[indices_device] = async_h2d(
-            [len(h) for h in histories], dtype=torch.int32, device=self.device
+        block = async_h2d_tensor(
+            torch.from_numpy(np.concatenate([s.ravel() for s in segments])),
+            self.device,
         )
-        replay_indices = [index for index, h in zip(indices, histories) for _ in h]
-        if replay_indices:
-            replay_tokens = [token for h in histories for token in h]
+        (
+            param_indices,
+            values,
+            stop_token_ids,
+            history_indices,
+            lens,
+            replay_indices,
+            replay_tokens,
+        ) = (
+            part.view(s.shape)
+            for part, s in zip(block.split([s.size for s in segments]), segments)
+        )
+
+        if params:
+            tables.params.index_copy_(1, param_indices, values.to(torch.int32))
+            tables.stop_token_ids[param_indices] = stop_token_ids
+        if histories:
+            tables.counts.index_fill_(0, history_indices, 0)
+            tables.lens.index_copy_(0, history_indices, lens.to(torch.int32))
+        if replay_indices.numel():
             tables.counts.index_put_(
-                (
-                    async_h2d(replay_indices, dtype=torch.int64, device=self.device),
-                    async_h2d(replay_tokens, dtype=torch.int64, device=self.device),
-                ),
+                (replay_indices, replay_tokens),
                 torch.ones(len(replay_indices), dtype=torch.int32, device=self.device),
                 accumulate=True,
             )
