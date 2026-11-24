@@ -154,15 +154,6 @@ def _configure_target_hidden_projection(
     )
 
 
-def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> bool:
-    """SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD, only under simulated acceptance: with
-    real acceptance there is no draw, so the step order stays as it was."""
-    return (
-        envs.SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD.get()
-        and simulated_correct_len is not None
-    )
-
-
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
@@ -365,7 +356,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # The simulated acceptance draw (and sim bonus seed) before the draft launch,
         # where the host waits on the previous verify anyway; off with real acceptance.
-        self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
+        self._sim_draw_ahead = self._simulated_correct_len is not None
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         markov_head = self.draft_model.markov_head
