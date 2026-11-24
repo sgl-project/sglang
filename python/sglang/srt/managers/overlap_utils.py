@@ -237,7 +237,10 @@ class ConfidenceRelay(msgspec.Struct):
     def _lazy_init(self, confidence: torch.Tensor) -> None:
         self.initialized = True
         gamma = confidence.shape[-1]
-        self.confidence_buf = torch.empty(
+        # Newly admitted slots may be copied before their first publish.
+        # Unknown confidence must be deterministic across TP ranks and must
+        # not trim verification based on uninitialized device memory.
+        self.confidence_buf = torch.ones(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
         if _is_cuda:

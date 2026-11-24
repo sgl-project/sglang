@@ -504,6 +504,7 @@ def fused_dsa_target_verify_metadata(
         "real_page_table_stride_0",
         "total_len",
         "max_seqlen_k",
+        "max_splits",
         "bs",
     ]
 )
@@ -533,6 +534,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     bs,
     total_len,
     max_seqlen_k,
+    max_splits,
     dsa_index_topk: tl.constexpr,
     physical_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
@@ -542,6 +544,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    BLOCK_PREFIX: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -603,11 +606,12 @@ def _fused_dsa_draft_extend_metadata_kernel(
         tl.store(dsa_cu_seqlens_k + 1 + offs_e, dsa_cu, mask=mask_e)
         return
 
-    num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
+    # A bounded number of programs per request walks only its live KV prefix;
+    # one program per max-context block would launch millions of empty CTAs.
+    num_col_progs = tl.minimum(tl.cdiv(max_seqlen_k, BLOCK_N), max_splits)
     page_pid = pid - 1
-    req_row = page_pid // num_col_blocks
-    col_block = page_pid - req_row * num_col_blocks
-    offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    req_row = page_pid // num_col_progs
+    col_prog = page_pid - req_row * num_col_progs
 
     qo_len = tl.load(
         extend_seq_lens + req_row * extend_seq_lens_stride,
@@ -621,57 +625,67 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
-    if col_block * BLOCK_N >= kv_len:
+    if col_prog * BLOCK_N >= kv_len:
         return
     if STATIC_EXTEND_LEN:
         prefix = req_row * qo_len
     else:
+        # Rows of the requests before this one, summed a vector at a time.
         prefix = tl.full((), 0, tl.int32)
-        for i in tl.range(0, bs):
-            prev_qo_len = tl.load(extend_seq_lens + i * extend_seq_lens_stride).to(
-                tl.int32
-            )
-            prefix += tl.where(i < req_row, prev_qo_len, 0)
+        for start_b in tl.range(0, req_row, BLOCK_PREFIX):
+            offs_p = start_b + tl.arange(0, BLOCK_PREFIX)
+            prev_qo_lens = tl.load(
+                extend_seq_lens + offs_p * extend_seq_lens_stride,
+                mask=offs_p < req_row,
+                other=0,
+            ).to(tl.int32)
+            prefix += tl.sum(prev_qo_lens, axis=0)
     offs_r = tl.arange(0, BLOCK_ROWS)
     out_rows = prefix + offs_r
     row_mask = (req_row < bs) & (offs_r < qo_len) & (out_rows < total_len)
-    col_mask = offs_n < max_seqlen_k
     has_rows = (req_row < bs) & (qo_len > 0)
-    mask = row_mask[:, None] & col_mask[None, :]
 
     req_idx = tl.load(
         req_pool_indices + req_row * req_pool_indices_stride,
         mask=has_rows,
         other=0,
     )
-    vals = tl.load(
-        req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
-        mask=col_mask & has_rows,
-        other=0,
-    ).to(tl.int32)
-    if HAS_V2P:
-        vals = _physical_token_ids(vals, v2p, num_v_pages, physical_page_size)
-    # Write the wide page_size=1 table only when the caller provides it (see
-    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
-    if HAS_PAGE_TABLE_1:
-        tl.store(
-            page_table_1
-            + out_rows.to(tl.int64)[:, None] * page_table_stride_0
-            + offs_n[None, :] * page_table_stride_1,
-            vals[None, :],
-            mask=mask,
-        )
+    for start in range(
+        col_prog * BLOCK_N, tl.minimum(kv_len, max_seqlen_k), num_col_progs * BLOCK_N
+    ):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        col_mask = offs_n < max_seqlen_k
+        mask = row_mask[:, None] & col_mask[None, :]
+        vals = tl.load(
+            req_to_token
+            + req_idx * req_to_token_stride_0
+            + offs_n * req_to_token_stride_1,
+            mask=col_mask & has_rows,
+            other=0,
+        ).to(tl.int32)
+        if HAS_V2P:
+            vals = _physical_token_ids(vals, v2p, num_v_pages, physical_page_size)
+        # Write the wide page_size=1 table only when the caller provides it (see
+        # fused_dsa_decode_metadata for the optional-page_table_1 contract).
+        if HAS_PAGE_TABLE_1:
+            tl.store(
+                page_table_1
+                + out_rows.to(tl.int64)[:, None] * page_table_stride_0
+                + offs_n[None, :] * page_table_stride_1,
+                vals[None, :],
+                mask=mask,
+            )
 
-    if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n[None, :] % physical_page_size) == 0)
-        real_cols = offs_n // physical_page_size
-        tl.store(
-            real_page_table
-            + out_rows.to(tl.int64)[:, None] * real_page_table_stride_0
-            + real_cols[None, :] * real_page_table_stride_1,
-            (vals // physical_page_size)[None, :],
-            mask=real_mask,
-        )
+        if HAS_REAL_PAGE_TABLE:
+            real_mask = mask & ((offs_n[None, :] % physical_page_size) == 0)
+            real_cols = offs_n // physical_page_size
+            tl.store(
+                real_page_table
+                + out_rows.to(tl.int64)[:, None] * real_page_table_stride_0
+                + real_cols[None, :] * real_page_table_stride_1,
+                (vals // physical_page_size)[None, :],
+                mask=real_mask,
+            )
 
 
 def fused_dsa_draft_extend_metadata(
@@ -745,9 +759,11 @@ def fused_dsa_draft_extend_metadata(
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(max_total_len)
     block_rows = triton.next_power_of_2(max_extend_len)
-    block_n = 128
-    num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
-    grid = (1 + bs * num_col_blocks,)
+    # Same block width and program cap as the target-verify kernel above.
+    block_n = 512
+    max_splits = max(16, triton.cdiv(8192, bs))
+    num_col_progs = min(triton.cdiv(max_seqlen_k, block_n), max_splits)
+    grid = (1 + bs * num_col_progs,)
 
     _fused_dsa_draft_extend_metadata_kernel[grid](
         seq_lens,
@@ -775,6 +791,7 @@ def fused_dsa_draft_extend_metadata(
         bs,
         total_len,
         max_seqlen_k,
+        max_splits,
         dsa_index_topk,
         physical_page_size,
         has_real_page_table,
@@ -784,6 +801,8 @@ def fused_dsa_draft_extend_metadata(
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_ROWS=block_rows,
+        # Arbitrary width; more requests are summed in chunks of it.
+        BLOCK_PREFIX=min(max(block_bs, 16), 256),
         BLOCK_N=block_n,
     )
 

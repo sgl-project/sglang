@@ -471,6 +471,25 @@ def ragged_verify_dense_scatter_indices(
     ).clamp_(max=batch_size * draft_token_num)
 
 
+def mask_ragged_verify_output(
+    output: torch.Tensor,
+    dense_token_indices: torch.Tensor,
+    cache_indices: torch.Tensor,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Clear uncovered tokens and queries belonging to padded request slots.
+
+    A capped layout can assign graph padding to request rows whose state slot
+    is -1. Convolution skips those rows, leaving their temporary output
+    undefined; discard them before the attention output reaches projections.
+    """
+    batch_size = cache_indices.numel()
+    rows = torch.div(dense_token_indices, draft_token_num, rounding_mode="floor")
+    covered = rows < batch_size
+    valid = covered & (cache_indices[rows.clamp_max(batch_size - 1)] >= 0)
+    return torch.where(valid.view(1, -1, 1, 1), output, 0.0)
+
+
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -1558,11 +1577,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
         )
         if dense_token_indices is not None:
-            # Kernel output is empty-allocated and the capped qsl skips the
-            # uncovered tail rows; zero them so discarded pad hidden states
-            # stay finite. Uncovered == clamped-to-ghost.
-            covered = dense_token_indices < (batch_size * draft_token_num)
-            core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
+            core_attn_out = mask_ragged_verify_output(
+                core_attn_out,
+                dense_token_indices,
+                cache_indices[:batch_size],
+                draft_token_num,
+            )
         return core_attn_out
 
     def _can_run_fused_chain_verify(

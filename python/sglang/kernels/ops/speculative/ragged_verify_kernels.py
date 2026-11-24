@@ -123,12 +123,17 @@ class PadVerifyLayout:
         cap: Optional[int] = None,
         out: Optional[PaddedLayout] = None,
     ) -> PaddedLayout:
-        padded = pad_verify_lens_to_bucket(
-            verify_lens=verify_lens,
-            graph_num_tokens=graph_num_tokens,
-            bs=verify_lens.shape[0],
-            padded_bs=padded_bs,
-        )
+        if cap is not None and padded_bs == verify_lens.shape[0]:
+            # Dense consumers leave spare graph tokens uncovered. Extending a
+            # real row would turn those ghost tokens into recurrent state steps.
+            padded = verify_lens.to(torch.int32).clone()
+        else:
+            padded = pad_verify_lens_to_bucket(
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                bs=verify_lens.shape[0],
+                padded_bs=padded_bs,
+            )
         if cap is not None:
             padded = torch.clamp(padded, max=cap)
         indptr = build_qo_indptr(verify_lens=padded)
@@ -214,7 +219,8 @@ def _pad_verify_layout_kernel(
         vl = tl.load(verify_lens_ptr + idx, mask=is_real, other=0)
         pad_len = base + tl.where((idx - bs) < rem, 1, 0)
         lens = tl.where(is_real, vl, pad_len)
-        lens = lens + tl.where((num_pad == 0) & (idx == bs - 1), leftover, 0)
+        if not HAS_CAP:
+            lens = lens + tl.where((num_pad == 0) & (idx == bs - 1), leftover, 0)
         if HAS_CAP:
             lens = tl.minimum(lens, cap)
         lens = tl.where(valid, lens, 0)
