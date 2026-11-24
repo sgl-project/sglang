@@ -194,18 +194,28 @@ class RowBucketGraphRunner:
             context(step_batch),
         ):
             if (rows, graph_key) not in self._graphs:
-                # Only this step's bucket: a larger one is captured by the first step
-                # that needs it, so short tails never hold the large buckets' pool.
-                self._graphs[(rows, graph_key)] = self._capture(
-                    rows,
-                    num_rows,
-                    static,
-                    forward_batch,
-                    body,
-                    batch_scope,
-                    global_num_rows=global_num_rows,
-                    output_key=graph_key,
-                )
+                # Largest first, so smaller buckets reuse the pool memory the larger ones
+                # took; a bucket below this step's rows cannot be captured here (the breaks
+                # write every live row).
+                #
+                # Capturing only this step's bucket and leaving larger ones to whoever needs
+                # one first looks cheaper, and it does keep short tails from pinning the big
+                # buckets' pool, but it moves a whole capture onto a live request: the first
+                # prompt past a bucket boundary pays it inline. Measured on 4xB200, the first
+                # prompt over 8192 tokens waited 134 s for its first token against 403 ms
+                # here, reproducible across two services (sgl-project/sglang#51636).
+                for r in range(self.max_rows, rows - 1, -self.row_step):
+                    if (r, graph_key) not in self._graphs:
+                        self._graphs[(r, graph_key)] = self._capture(
+                            r,
+                            num_rows,
+                            static,
+                            forward_batch,
+                            body,
+                            batch_scope,
+                            global_num_rows=global_num_rows,
+                            output_key=graph_key,
+                        )
             graph = self._graphs[(rows, graph_key)]
             if graph.packed_token_counts is not None:
                 local_rows = compute_local_num_token_non_padded_cpu(
