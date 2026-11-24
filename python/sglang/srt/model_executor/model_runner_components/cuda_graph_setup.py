@@ -655,7 +655,7 @@ def capture_prefill_graph(
             context_length,
             model_runner.req_to_token_pool.size,
         )
-        return eager_runner
+        return result(eager_runner)
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
@@ -816,7 +816,6 @@ def capture_decode_graph(
         {
             "cuda": "CUDA graph",
             "musa": "CUDA graph",
-            "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
         },
@@ -845,7 +844,6 @@ def capture_decode_graph(
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
-                "cpu": CPUGraphRunner,
                 "xpu": XPUGraphRunner,
             },
         )

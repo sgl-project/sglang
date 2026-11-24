@@ -235,7 +235,7 @@ def _init_all_backends() -> None:
 
 
 @marker.parametrize("message_KB", MESSAGE_SIZES_KB)
-@marker.benchmark("provider", PROVIDERS)
+@marker.benchmark("provider", PROVIDERS, gate=["jit-eager", "jit-graph"])
 def benchmark(message_KB: int, provider: str):
     cpu_group = _init_cpu_group()
     gpu_group = _init_nccl_group()
