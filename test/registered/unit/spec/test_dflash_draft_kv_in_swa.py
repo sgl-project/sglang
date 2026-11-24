@@ -46,6 +46,9 @@ class TestDflashDraftKvFitsSwa(CustomTestCase):
         self.assertTrue(self.fits(_draft(sliding, 2048), 2047))
         self.assertTrue(self.fits(_draft(sliding, 1024), 2047))
         self.assertFalse(self.fits(_draft(sliding, 2049), 2047))
+        # window_left 0 is read as full attention (-1), so it must not qualify.
+        self.assertTrue(self.fits(_draft(sliding, 2), 2047))
+        self.assertFalse(self.fits(_draft(sliding, 1), 2047))
 
     def test_a_full_attention_layer_or_no_target_window_disqualifies(self):
         mixed = ["sliding_attention", "full_attention"]

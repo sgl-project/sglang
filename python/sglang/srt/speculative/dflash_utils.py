@@ -374,7 +374,9 @@ def dflash_draft_kv_fits_swa(
         bool(layer_types)
         and all(t == "sliding_attention" for t in layer_types)
         and window is not None
-        and 0 <= window <= target_window
+        # RadixAttention reads window 0 (HF sliding_window=1) as full attention,
+        # which would read this SWA sub-pool through full-pool ids.
+        and 0 < window <= target_window
         # The draft then lives in an MHA SWA sub-pool, which an MLA draft cannot use.
         and not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
     )
