@@ -797,8 +797,8 @@ def _fwd_kernel(
                 start_n + offs_n[None, :]
             )
             if USE_BLOCK_MASK:
-                # state keys are visible to every row; question rows see every
-                # key of the prompt, never a generated one
+                # state keys are visible to every row;
+                # question rows see every key of the prompt, never a generated one
                 q_abs = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
                 k_abs = cur_seq_len_prefix + start_n + offs_n[None, :]
                 mask_causual |= (block_boundary >= 0) & (
@@ -1012,6 +1012,9 @@ def extend_attention_fwd(
     ``bf16_dot``: with an FP8 cache and BF16 q, upcast the cached K/V and run the
     prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
     prefix or zero-prefix kernel). No effect on a BF16 cache.
+    ``block_boundaries``: [num_seqs, 2] int32 (state end, question end) positions,
+    absolute, with (-1, -1) for a causal sequence;
+    only the causal path applies it, not a custom mask or ``is_causal=False``.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],

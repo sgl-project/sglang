@@ -570,9 +570,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Setwise pooling readout positions (CPU tensors, one per request)
     token_indices_to_pool: Optional[List[torch.Tensor]] = None
-    # Per-request block-bidirectional (state end, question end) token indices;
-    # (-1, -1) = causal. The question block ends at the prompt, so a retracted
-    # request's re-prefilled outputs stay causal.
+    # Per-request (state end, question end) token indices, (-1, -1) for causal;
+    # the question block ends at the prompt, so re-prefilled outputs stay causal.
     bidir_blocks: Optional[List[Tuple[int, int]]] = None
 
     # Joint schema head decision layouts (one per request, None if absent)
@@ -1111,6 +1110,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
         ret._maybe_init_non_generation_fields(batch)
+        ret._maybe_init_bidir_blocks(batch)
 
         device = model_runner.device
 
@@ -1306,12 +1306,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return ret
 
-    def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
-        """Derive non-generation (max_new_tokens==0) forward fields from reqs.
-
-        token_type_ids gates on presence, not is_prefill_only: a missing
-        tensor makes bert/roberta silently fall back to zeros.
-        """
+    def _maybe_init_bidir_blocks(self, batch: ScheduleBatch):
         if self.forward_mode.is_extend() and any(
             r.bidir_prefix_len >= 0 for r in batch.reqs
         ):
@@ -1323,6 +1318,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for r in batch.reqs
             ]
+
+    def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
+        """Derive non-generation (max_new_tokens==0) forward fields from reqs.
+
+        token_type_ids gates on presence, not is_prefill_only: a missing
+        tensor makes bert/roberta silently fall back to zeros.
+        """
         if self.is_prefill_only:
             if batch.model_config.is_matryoshka and any(
                 r.dimensions is not None for r in batch.reqs

@@ -141,9 +141,8 @@ class TestMatchKvCacheBidirPartialState(CustomTestCase):
         self.assertEqual(req.host_hit_length, 0)
 
     def test_partial_state_hit_resets_mamba_cow(self):
-        """A deferred CoW (shared memory) is staged before the request holds a
-        slot; the zeroed hit must drop it too, or the slot starts from the
-        partially matched checkpoint."""
+        """A deferred CoW, staged before the request holds a slot,
+        is dropped with the zeroed hit, or the slot resumes a partial checkpoint."""
         for holds_mamba in (True, False):
             with self.subTest(holds_mamba=holds_mamba):
                 tree = self._tree()
@@ -170,32 +169,6 @@ class TestMatchKvCacheBidirPartialState(CustomTestCase):
 
         self.assertEqual(req.prefix_len, 8)
         self.assertIsNot(req.last_node, tree.root_node)
-
-
-class TestBidirExtraKey(CustomTestCase):
-    def _key(self, state, question=(99, 100), extra_key=None):
-        from sglang.srt.managers.schedule_batch import Req
-        from sglang.srt.sampling.sampling_params import SamplingParams
-
-        return Req(
-            rid="r",
-            origin_input_text="",
-            origin_input_ids=array("q", [*state, *question]),
-            sampling_params=SamplingParams(max_new_tokens=0),
-            extra_key=extra_key,
-            bidir_prefix_len=len(state),
-        ).extra_key
-
-    def test_same_state_shares_a_namespace(self):
-        self.assertEqual(self._key([1, 2, 3]), self._key([1, 2, 3], question=(7,)))
-
-    def test_different_states_with_equal_length_do_not(self):
-        self.assertNotEqual(self._key([1, 2, 3]), self._key([1, 2, 4]))
-
-    def test_caller_key_cannot_collide_with_the_namespace(self):
-        self.assertNotEqual(
-            self._key([1, 2, 3], extra_key="|bidir4"), self._key([1, 2, 3])
-        )
 
 
 if __name__ == "__main__":

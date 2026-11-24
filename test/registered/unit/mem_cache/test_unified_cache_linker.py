@@ -73,6 +73,9 @@ from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
+from sglang.test.kits.unified_radix_cache.core import (
+    MambaFinishedOvershootCheckpointFixtures,
+)
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     node_children,
@@ -80,6 +83,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_device_value,
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import FAMILY_OF, index_slots
 
@@ -2610,6 +2614,49 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestBidirStateBlockOffload(
+    MambaFinishedOvershootCheckpointFixtures, UnifiedRadixCacheFixtures, CustomTestCase
+):
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def test_delegated_prefix_is_not_uploaded_again(self):
+        """A prefix another writer (a PD prefill worker) stores is not uploaded again,
+        including a block-bidirectional state block kept past the checkpoint."""
+        for skip_len in (0, 16):
+            with self.subTest(skip_len=skip_len):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=4
+                )
+                linker = _InMemoryUnifiedCacheLinker()
+                cache.init_cache_linker(linker)
+                req, _ = self._build_req(
+                    allocator=allocator, pool=pool, previous_track_seqlen=None
+                )
+                tokens = list(range(16))
+                req.origin_input_ids = array("q", tokens)
+                req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+                pool.write(
+                    indices=(req.kv.req_pool_idx, slice(12, 16)),
+                    values=allocator.alloc(4),
+                )
+                # A checkpoint at 8 leaves the state block [8, 12) to a second insert.
+                req.kv.mamba_last_track_seqlen = 8
+                req.bidir_prefix_len = 12
+                req.linker_offload_skip_prefix_len = skip_len
+                req.last_node = cache.root_node_handle()
+
+                finish_req(cache=cache, req=req, up_to=len(tokens))
+
+                self.assertEqual(bool(linker.offload_calls), skip_len == 0)
 
 
 class TestTransferReadyEvents(CustomTestCase):

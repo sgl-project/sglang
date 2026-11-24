@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
@@ -16,6 +16,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+def _manager():
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.context_len = 128
+    manager.num_reserved_tokens = 0
+    manager.allow_auto_truncate = False
+    manager.validate_total_tokens = False
+    manager.is_generation = True
+    manager.model_config = SimpleNamespace(
+        joint_head_config=None, pointer_head=None, is_hybrid_swa=False
+    )
+    return manager
+
+
 class TestSamplingMaskValidation(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
@@ -23,15 +36,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
-        self.manager = TokenizerManager.__new__(TokenizerManager)
-        self.manager.context_len = 128
-        self.manager.num_reserved_tokens = 0
-        self.manager.allow_auto_truncate = False
-        self.manager.validate_total_tokens = False
-        self.manager.is_generation = True
-        self.manager.model_config = SimpleNamespace(
-            joint_head_config=None, pointer_head=None
-        )
+        self.manager = _manager()
 
     def _validate(
         self,
@@ -205,6 +210,99 @@ class TestSamplingMaskValidation(CustomTestCase):
             self._validate(
                 None, return_sampling_mask=False, return_flat_raw_sampling_mask=True
             )
+
+
+class TestBidirPrefixLenValidation(CustomTestCase):
+    def _bidir_manager(self, **server_args):
+        override = get_context().override_server_args(
+            **{"attention_backend": "triton", "page_size": 1, **server_args}
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        return _manager()
+
+    def _validate(self, manager, prompt_len=8, bidir_prefix_len=4, **fields):
+        req = GenerateReqInput(
+            input_ids=list(range(prompt_len)),
+            sampling_params={"max_new_tokens": 0},
+            bidir_prefix_len=bidir_prefix_len,
+            **fields,
+        )
+        manager._validate_one_request(obj=req, input_ids=req.input_ids)
+
+    def test_rejects_other_backends_and_page_sizes(self):
+        for server_args in (
+            {"attention_backend": "trtllm_mha"},
+            {"page_size": 64},
+            {"enable_deterministic_inference": True},
+            {"dcp_size": 2},
+            {"enable_two_batch_overlap": True},
+            # The load-scaled budget can cap every pass below the prompt.
+            {
+                "schedule_policy": "shortest-prefill-first",
+                "shortest_prefill_boundary_halving_chunks": 1,
+            },
+        ):
+            with self.subTest(**server_args):
+                with self.assertRaisesRegex(ValueError, "requires --attention-backend"):
+                    self._validate(manager=self._bidir_manager(**server_args))
+
+    def test_rejects_hybrid_swa_models(self):
+        # Window pools price a re-prefill by its chunk, which can cut inside the prompt;
+        # the target models keep no windows.
+        manager = self._bidir_manager()
+        manager.model_config.is_hybrid_swa = True
+        with self.assertRaisesRegex(ValueError, "sliding-window"):
+            self._validate(manager=manager)
+
+    def test_rejects_values_that_are_not_a_boundary(self):
+        """bidir_prefix_len is one integer >= -1 per prompt;
+        a list, a value below -1 or a bool is refused before scheduling."""
+        for bidir_prefix_len in ([4], -2, True, False):
+            with self.subTest(bidir_prefix_len=bidir_prefix_len):
+                with self.assertRaisesRegex(ValueError, "integer >= -1"):
+                    self._validate(
+                        manager=self._bidir_manager(), bidir_prefix_len=bidir_prefix_len
+                    )
+
+    def test_overlong_prompt_is_refused_not_truncated(self):
+        # Auto-truncation keeps the head and would cut a bidir prompt's question;
+        # a causal prompt is still truncated.
+        manager = self._bidir_manager()
+        manager.allow_auto_truncate = True
+        manager.context_len = 8
+        manager._embedding_preserve_last_token_id = None
+        with get_schedule().override(chunked_prefill_size=None):
+            for bidir_prefix_len, kept in ((4, 10), (-1, 8)):
+                with self.subTest(bidir_prefix_len=bidir_prefix_len):
+                    req = GenerateReqInput(
+                        input_ids=list(range(10)),
+                        sampling_params={"max_new_tokens": 0},
+                        bidir_prefix_len=bidir_prefix_len,
+                    )
+                    if bidir_prefix_len >= 0:
+                        with self.assertRaisesRegex(ValueError, "context length"):
+                            manager._validate_one_request(
+                                obj=req, input_ids=req.input_ids
+                            )
+                    else:
+                        manager._validate_one_request(obj=req, input_ids=req.input_ids)
+                    self.assertEqual(len(req.input_ids), kept)
+
+    def test_rejects_legacy_session_params(self):
+        with self.assertRaisesRegex(ValueError, "session_params"):
+            self._validate(
+                manager=self._bidir_manager(),
+                session_params={"id": "s", "rid": None, "offset": 0},
+            )
+
+    def test_prompt_must_fit_the_resolved_chunk(self):
+        # The raw flag is unset; the resolved schedule still has a chunk size.
+        manager = self._bidir_manager(chunked_prefill_size=None)
+        with get_schedule().override(chunked_prefill_size=6):
+            self._validate(manager=manager, prompt_len=6)
+            with self.assertRaisesRegex(ValueError, "chunked-prefill-size"):
+                self._validate(manager=manager, prompt_len=7)
 
 
 if __name__ == "__main__":

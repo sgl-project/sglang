@@ -640,21 +640,24 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 self.assertEqual(adder.can_run_list, [req])
 
     def test_bidir_prompt_the_pool_holds_only_in_chunks_is_refused(self):
-        """Admission never splits a block-bidirectional prompt, so one an empty
-        pool holds only in chunks is refused at intake, on a PD prefill server
-        too. Priced in chunks it got through, and then the budget cut it below
-        its end on every pass."""
+        """Admission never splits a block-bidirectional prompt,
+        so one the empty pool holds only in chunks is refused, on PD prefill too."""
         allocator = _shared_allocator(page_size=1, pool_tokens=32, window=4)
         clip = dict(
             token_capacity=allocator.size_full, sliding_window_size=4, **RETIRE_AT_ONCE
         )
-        # Whole, the 40-token prompt's window rows overflow the pool; in 64-token
-        # chunks, the smallest chunk admission may cut fits.
+        # Whole, the 40-token prompt's window rows overflow the pool;
+        # in 64-token chunks, the smallest chunk admission may cut fits.
         self.assertIsNone(
-            allocator.max_new_tokens_for_memory(40, 1, chunk_size=None, **clip)
+            allocator.max_new_tokens_for_memory(
+                input_tokens=40, max_new_tokens=1, chunk_size=None, **clip
+            )
         )
         self.assertEqual(
-            allocator.max_new_tokens_for_memory(40, 1, chunk_size=64, **clip), 1
+            allocator.max_new_tokens_for_memory(
+                input_tokens=40, max_new_tokens=1, chunk_size=64, **clip
+            ),
+            1,
         )
         # A PD prefill server keeps its one handoff token for a prompt that fits.
         for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
@@ -664,13 +667,17 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 (20, 0, 1),
             ):
                 with self.subTest(mode=mode, prompt_len=prompt_len, boundary=boundary):
-                    req = self._intake(allocator, mode, prompt_len, boundary)
-                    self._assert_granted(req, granted)
+                    req = self._intake(
+                        allocator=allocator,
+                        mode=mode,
+                        prompt_len=prompt_len,
+                        boundary=boundary,
+                    )
+                    self._assert_granted(req=req, max_new_tokens=granted)
 
     def test_pd_prefill_bidir_prompt_must_fit_beside_its_handoff_token(self):
-        """A PD prefill server decodes one handoff token beside the prompt, so a
-        block-bidirectional prompt the empty pool holds only without it is
-        refused, not handed the token and then cut below its end forever."""
+        """A PD prefill server decodes one handoff token beside the prompt;
+        a bidir prompt the empty pool holds only without it is refused at intake."""
         allocator = _shared_allocator(page_size=1, pool_tokens=32, window=4)
         clip = dict(
             token_capacity=allocator.size_full,
@@ -678,26 +685,29 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             chunk_size=None,
             **RETIRE_AT_ONCE,
         )
-        # The longest prompt the pool holds whole fits alone but not beside a
-        # decode token, which costs what one more prompt token does.
-        tight = max(
-            n
-            for n in range(1, 64)
-            if allocator.max_new_tokens_for_memory(n, 1, **clip) is not None
-        )
-        self.assertEqual(allocator.max_new_tokens_for_memory(tight, 1, **clip), 0)
+
+        def clip_one(input_tokens):
+            return allocator.max_new_tokens_for_memory(
+                input_tokens=input_tokens, max_new_tokens=1, **clip
+            )
+
+        # The longest prompt the pool holds whole fits alone, not beside a decode token,
+        # which costs what one more prompt token does.
+        tight = max(n for n in range(1, 64) if clip_one(n) is not None)
+        self.assertEqual(clip_one(tight), 0)
         for mode, prompt_len, granted in (
             (DisaggregationMode.PREFILL, tight, None),
             (DisaggregationMode.PREFILL, 20, 1),
-            # Without PD the same prompt runs prefill-only, as before.
+            # Without PD the same prompt runs prefill-only, with no abort.
             (DisaggregationMode.NULL, tight, 0),
         ):
             with self.subTest(mode=mode, prompt_len=prompt_len):
-                req = self._intake(allocator, mode, prompt_len, boundary=0)
-                self._assert_granted(req, granted)
+                req = self._intake(
+                    allocator=allocator, mode=mode, prompt_len=prompt_len, boundary=0
+                )
+                self._assert_granted(req=req, max_new_tokens=granted)
 
-    def _intake(self, allocator, mode, prompt_len, boundary):
-        """Scheduler intake of a request for one new token on an empty pool."""
+    def _intake(self, *, allocator, mode, prompt_len, boundary):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = mode
         scheduler.max_req_len = 128
@@ -724,9 +734,8 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             scheduler.init_req_max_new_tokens(req)
         return req
 
-    def _assert_granted(self, req, max_new_tokens):
-        """Intake granted `max_new_tokens`, or with None requested the abort
-        for the memory budget, which lands at the request's next commit."""
+    def _assert_granted(self, *, req, max_new_tokens):
+        # None: intake requested the memory-budget abort; it lands at the next commit.
         if max_new_tokens is None:
             self.assertIsInstance(req.to_finish, FINISH_ABORT)
             self.assertIn("KV memory budget", req.to_finish.message)

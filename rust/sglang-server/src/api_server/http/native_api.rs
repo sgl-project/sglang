@@ -716,6 +716,17 @@ fn sampling_logprobs_mode_set(mode: &serde_json::Value, batch: Option<usize>) ->
     }
 }
 
+// A top-level `null` or `-1` is unset; anything else is set,
+// including a batch's list unless it holds `n` entries that are all `-1`.
+fn bidir_prefix_len_set(len: &serde_json::Value, batch: Option<usize>) -> bool {
+    match (len, batch) {
+        (serde_json::Value::Array(lens), Some(n)) => {
+            lens.len() != n || lens.iter().any(|len| len.as_i64() != Some(-1))
+        }
+        _ => !len.is_null() && len.as_i64() != Some(-1),
+    }
+}
+
 /// Batch item `item`'s share of the `sampling_params` the client sent: the
 /// object itself, or the item's entry of a list.
 fn item_sampling_params(
@@ -781,8 +792,9 @@ pub(super) fn generate_requests(
     if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
     }
-    // Outside the schema, so decoding drops it; checked below.
+    // Outside the schema, so decoding drops them; checked below.
     let sampling_logprobs_mode = body.get("sampling_logprobs_mode").cloned();
+    let bidir_prefix_len = body.get("bidir_prefix_len").cloned();
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
     let body: api::GenerateRequest = match serde_json::from_value(body) {
@@ -802,6 +814,12 @@ pub(super) fn generate_requests(
     let batch = is_batch.then_some(requests.len());
     if sampling_logprobs_mode.is_some_and(|mode| sampling_logprobs_mode_set(&mode, batch)) {
         let message = "sampling_logprobs_mode can only be set when return_sampling_mask=true.";
+        tracing::warn!(error = %message, "rejected request");
+        return Err((StatusCode::BAD_REQUEST, message.into(), stream));
+    }
+    // Python acts on the boundary; dropped, the request would be served causally.
+    if bidir_prefix_len.is_some_and(|len| bidir_prefix_len_set(&len, batch)) {
+        let message = "bidir_prefix_len is not supported by the Rust server";
         tracing::warn!(error = %message, "rejected request");
         return Err((StatusCode::BAD_REQUEST, message.into(), stream));
     }
@@ -1766,6 +1784,34 @@ mod tests {
                 }),
                 "return_sampling_mask is not supported by the Rust server",
             ),
+            (
+                serde_json::json!({"text": "hi", "bidir_prefix_len": 0}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": "hi", "bidir_prefix_len": 5}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [-1, 3]}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": []}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [null, -1, 3]}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [null, -1]}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": "hi", "bidir_prefix_len": [-1]}),
+                "bidir_prefix_len is not supported by the Rust server",
+            ),
         ] {
             for stream in [false, true] {
                 let mut body = body.clone();
@@ -1812,10 +1858,13 @@ mod tests {
                 );
             }
         }
-        // A mode Python reads as unset passes.
+        // A body that asks Python for no mode and no boundary passes.
         for body in [
             serde_json::json!({"text": "hi", "sampling_logprobs_mode": null}),
             serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null, "support"]}),
+            serde_json::json!({"text": "hi", "bidir_prefix_len": null}),
+            serde_json::json!({"text": "hi", "bidir_prefix_len": -1}),
+            serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [-1, -1]}),
         ] {
             assert!(generate_requests(&state, body.clone()).is_ok(), "{body}");
         }

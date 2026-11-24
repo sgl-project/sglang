@@ -440,6 +440,14 @@ class ReqKvInfo:
         self.kv_committed_len = 0
 
 
+def _causal_extra_key(extra_key: Optional[str]) -> Optional[str]:
+    # A bidir namespace is "bidir" plus a hex digest;
+    # a causal key with that prefix moves behind a non-hex "-", one-to-one.
+    if extra_key is not None and extra_key.startswith("bidir"):
+        return f"bidir-{extra_key}"
+    return extra_key
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -596,14 +604,15 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         if bidir_prefix_len >= 0:
-            # State-token KV depends on the whole state block, so two states
-            # must never share radix nodes: key the namespace on the state's
-            # tokens, with the caller key as a length-delimited component.
+            # State KV depends on the whole state block: states never share radix nodes;
+            # the caller key is a length-delimited component.
             state_hash = hashlib.sha256(
                 array("q", origin_input_ids[:bidir_prefix_len]).tobytes()
             ).hexdigest()
             caller_key = extra_key or ""
             extra_key = f"bidir{state_hash}|{len(caller_key)}|{caller_key}"
+        else:
+            extra_key = _causal_extra_key(extra_key)
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
@@ -946,6 +955,8 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs is None
             and self.input_embeds is None
             and self.positional_embed_overrides is None
+            # The replayed payload has no block boundaries, so its KV would be causal.
+            and self.bidir_prefix_len < 0
         )
 
     @property
@@ -1729,9 +1740,9 @@ class Req(ReqDllmMixin):
             "q", [0]
         )  # set it to one token to skip the long prefill
         # The boundary indexed the dropped prompt; the one-token stub runs causal,
-        # so it goes back to the caller's key, the namespace's last component.
+        # under the key a causal request with the namespace's caller key gets.
         if self.bidir_prefix_len >= 0:
-            self.extra_key = self.extra_key.split("|", 2)[2] or None
+            self.extra_key = _causal_extra_key(self.extra_key.split("|", 2)[2] or None)
         self.bidir_prefix_len = -1
         self.return_logprob = False
         self.logprob_start_len = -1
@@ -1855,7 +1866,8 @@ def unresumable_abort_message() -> str:
     if get_disagg().disaggregation_mode == "decode":
         return (
             "Retracted request aborted: the rebootstrap recomputes the KV from "
-            "token ids, which cannot rebuild multimodal inputs or embeds. Retry later."
+            "token ids, which cannot rebuild multimodal inputs, embeds or "
+            "bidir_prefix_len attention. Retry later."
         )
     return (
         "Retracted request aborted: an input_embeds request that has sent output "

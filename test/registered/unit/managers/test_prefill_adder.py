@@ -474,12 +474,14 @@ class TestPrefillAdder(CustomTestCase):
         return req
 
     def test_bidir_prompt_waits_instead_of_being_split(self):
-        """On both admission paths a prompt over the chunk budget stays whole and
-        queued when it has a boundary; without one the same prompt is cut."""
+        """On both admission paths a bidir prompt over the chunk budget waits whole;
+        without a boundary the same prompt is cut."""
         for ignore_eos in (False, True):
             for boundary in (-1, 0):
                 with self.subTest(ignore_eos=ignore_eos, boundary=boundary):
-                    req = self._bidir_req(ignore_eos, boundary, prompt=128)
+                    req = self._bidir_req(
+                        ignore_eos=ignore_eos, boundary=boundary, prompt=128
+                    )
                     adder = self.create_adder(
                         self.create_running_batch(), rem_chunk_tokens=64
                     )
@@ -496,12 +498,13 @@ class TestPrefillAdder(CustomTestCase):
                         self.assertIsNone(req.extend_end)
 
     def test_retracted_bidir_request_is_cut_after_its_prompt(self):
-        """Only the prompt is indivisible: a retracted request replays its
-        output causally, so a re-prefill longer than the chunk is cut past the
-        prompt instead of waiting forever."""
+        """Only the prompt is indivisible, as replayed output attends causally,
+        so a re-prefill longer than the chunk is cut past the prompt, not held."""
         for ignore_eos in (False, True):
             with self.subTest(ignore_eos=ignore_eos):
-                req = self._bidir_req(ignore_eos, 0, prompt=4000, output=128)
+                req = self._bidir_req(
+                    ignore_eos=ignore_eos, boundary=0, prompt=4000, output=128
+                )
                 adder = self.create_adder(
                     self.create_running_batch(), rem_chunk_tokens=4096
                 )
@@ -512,13 +515,14 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(req.extend_end, 4096)
 
     def test_aligned_cut_bounds_a_retracted_bidir_prompt(self):
-        """On a 64-token grid a re-prefill is cut at chunk // 64 * 64 tokens on
-        both paths: a prompt up to that cut continues past it, while a longer
-        one waits on every pass, so the scheduler refuses it at intake."""
+        """On a 64-token grid both paths cut a re-prefill at chunk // 64 * 64 tokens;
+        a prompt up to that cut continues past it, and a longer one waits."""
         for ignore_eos in (False, True):
             for chunk, prompt in ((100, 64), (100, 100), (130, 128), (130, 129)):
                 with self.subTest(ignore_eos=ignore_eos, chunk=chunk, prompt=prompt):
-                    req = self._bidir_req(ignore_eos, 0, prompt=prompt, output=64)
+                    req = self._bidir_req(
+                        ignore_eos=ignore_eos, boundary=0, prompt=prompt, output=64
+                    )
                     adder = self.create_adder(
                         self.create_running_batch(), rem_chunk_tokens=chunk
                     )

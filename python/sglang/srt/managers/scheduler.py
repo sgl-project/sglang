@@ -1997,13 +1997,11 @@ class Scheduler(
             f"helps."
         )
 
-    def validate_bidir_prompt_cut(self, req: Req) -> Optional[str]:
-        """Admission waits rather than split a block-bidirectional prompt, so
-        refuse one it could come to cut only inside the prompt. Window pools,
-        a speculative draft's too, price a retracted request's re-prefill by its
-        chunk; and that re-prefill is cut on the chunk alignment."""
+    def _validate_bidir_prompt_cut(self, req: Req) -> Optional[str]:
         if req.bidir_prefix_len < 0:
             return None
+        # Window pools (a speculative draft's too) price a re-prefill by its chunk,
+        # so the largest cut that fits after a retraction can split the prompt.
         if self.token_to_kv_pool_allocator.window_pool_names():
             return (
                 "bidir_prefix_len cannot run with sliding-window KV pools "
@@ -2015,6 +2013,8 @@ class Scheduler(
         chunk = self.chunked_prefill_size
         if chunk is None:
             return None
+        # A retracted request re-prefills in chunks cut on the alignment,
+        # and admission waits rather than cut inside a block-bidirectional prompt.
         max_len = chunk // align * align
         if len(req.origin_input_ids) <= max_len:
             return None
@@ -3111,8 +3111,8 @@ class Scheduler(
             req.sampling_params.min_new_tokens = min(
                 req.sampling_params.min_new_tokens, 1
             )
-            # A block-bidirectional prompt is never split, so it and the handoff
-            # token must still fit the empty pool whole (priced below).
+            # A block-bidirectional prompt is never split,
+            # so it and its handoff token must fit the empty pool whole (priced below).
             if req.bidir_prefix_len < 0:
                 return
         input_len = len(req.origin_input_ids)
@@ -3738,7 +3738,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
-        if error_msg := self.validate_bidir_prompt_cut(req):
+        if error_msg := self._validate_bidir_prompt_cut(req):
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return

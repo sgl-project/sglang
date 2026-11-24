@@ -1343,9 +1343,8 @@ class PrefillAdder:
 
     @staticmethod
     def _cuts_bidir_prompt(req: Req, cut: int) -> bool:
-        """Whether a chunk ending at `cut` splits a block-bidirectional prompt.
-        Only the prompt is indivisible: a retracted request's re-prefilled
-        output attends causally, so it may continue in a later chunk."""
+        # Only the prompt is indivisible;
+        # replayed output attends causally, so a later chunk may continue it.
         return req.bidir_prefix_len >= 0 and cut < len(req.origin_input_ids)
 
     def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
@@ -1931,9 +1930,11 @@ class PrefillAdder:
             chunk_limit is not None
             and cand_extend_input_len > chunk_limit
             and self._cuts_bidir_prompt(
-                req,
-                req.prefix_len
-                + self.floor_chunked_tokens(chunk_limit, cand_extend_input_len),
+                req=req,
+                cut=req.prefix_len
+                + self.floor_chunked_tokens(
+                    trunc_len=chunk_limit, remaining=cand_extend_input_len
+                ),
             )
         ):
             return AddReqResult.OTHER
@@ -2400,7 +2401,9 @@ class PrefillAdder:
                     )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
-            if extend_len <= 0 or self._cuts_bidir_prompt(req, prefix_len + extend_len):
+            if extend_len <= 0 or self._cuts_bidir_prompt(
+                req=req, cut=prefix_len + extend_len
+            ):
                 return AddReqResult.OTHER
             is_chunked = True
             max_new_tokens = 0

@@ -1697,22 +1697,13 @@ class UnifiedRadixCache(BasePrefixCache):
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
         cleanup_params = insert_params
-        if (
-            is_finished
-            and effective_cache_len <= 0 < req.bidir_prefix_len <= len(token_ids)
-            and req.kv.cache_protected_len < req.bidir_prefix_len
-        ):
-            # No component checkpoint to donate (the Mamba state ran past the
-            # key after decoding); keep the state block on its own. Insert from
-            # a copy so cleanup still frees what the components prepared.
-            effective_cache_len = req.bidir_prefix_len
-            insert_params = replace(
-                insert_params,
-                mamba_value=None,
-                mamba_host_value=None,
-                mamba_host_src=None,
-                allow_missing_mamba=True,
-            )
+        effective_cache_len, insert_params = self._bidir_state_block_fallback(
+            req=req,
+            token_ids_len=len(token_ids),
+            is_finished=is_finished,
+            effective_cache_len=effective_cache_len,
+            insert_params=insert_params,
+        )
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -1783,35 +1774,16 @@ class UnifiedRadixCache(BasePrefixCache):
         last_node = result.last_device_node
 
         if is_finished and page_aligned_len < req.bidir_prefix_len <= len(token_ids):
-            # A block-bidirectional request reuses a cached state block only
-            # when all of it matched, so keep the state KV past the component
-            # checkpoint; the next hit recomputes from the checkpoint.
-            state_key = RadixKey(
-                token_ids[: req.bidir_prefix_len],
-                req.extra_key,
-                is_bigram=self.tree_core.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            with self._linker_offload_skip_prefix(req, token_ids):
-                state_result = self.insert(
-                    replace(
-                        insert_params,
-                        key=state_key,
-                        value=kv_indices_orig[: len(state_key)].to(
-                            dtype=torch.int64, copy=True
-                        ),
-                        mamba_value=None,
-                        mamba_host_value=None,
-                        mamba_host_src=None,
-                        allow_missing_mamba=True,
-                        prev_prefix_len=page_aligned_len,
-                        inserted_len=page_aligned_len,
-                    )
-                )
-            if not state_result.rotation_tail_declined:
-                page_aligned_len = len(state_key)
-                req.kv.record_insert(page_aligned_len)
-                last_node = state_result.last_device_node
+            # A bidir request reuses a state block only when all of it matched,
+            # so keep the state KV past the component checkpoint.
+            page_aligned_len, last_node = self._keep_bidir_state_block(
+                req=req,
+                token_ids=token_ids,
+                kv_indices=kv_indices_orig,
+                insert_params=insert_params,
+                page_aligned_len=page_aligned_len,
+                last_node=last_node,
+            )
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -1901,6 +1873,67 @@ class UnifiedRadixCache(BasePrefixCache):
             and up_to >= len(req.origin_input_ids)
         ):
             self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
+    def _bidir_state_block_fallback(
+        self,
+        *,
+        req: Req,
+        token_ids_len: int,
+        is_finished: bool,
+        effective_cache_len: int,
+        insert_params: InsertParams,
+    ) -> tuple[int, InsertParams]:
+        if not (
+            is_finished
+            and effective_cache_len <= 0 < req.bidir_prefix_len <= token_ids_len
+            and req.kv.cache_protected_len < req.bidir_prefix_len
+        ):
+            return effective_cache_len, insert_params
+        # No component checkpoint, as the state ran past the key while decoding;
+        # keep the state block via a copy, so cleanup still frees the staged state.
+        state_params = replace(
+            insert_params,
+            mamba_value=None,
+            mamba_host_value=None,
+            mamba_host_src=None,
+            allow_missing_mamba=True,
+        )
+        return req.bidir_prefix_len, state_params
+
+    def _keep_bidir_state_block(
+        self,
+        *,
+        req: Req,
+        token_ids,
+        kv_indices: torch.Tensor,
+        insert_params: InsertParams,
+        page_aligned_len: int,
+        last_node: Any,
+    ) -> tuple[int, Any]:
+        state_key = RadixKey(
+            token_ids=token_ids[: req.bidir_prefix_len],
+            extra_key=req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        with self._linker_offload_skip_prefix(req=req, token_ids=token_ids):
+            state_result = self.insert(
+                replace(
+                    insert_params,
+                    key=state_key,
+                    value=kv_indices[: len(state_key)].to(dtype=torch.int64, copy=True),
+                    mamba_value=None,
+                    mamba_host_value=None,
+                    mamba_host_src=None,
+                    allow_missing_mamba=True,
+                    prev_prefix_len=page_aligned_len,
+                    inserted_len=page_aligned_len,
+                )
+            )
+        if state_result.rotation_tail_declined:
+            return page_aligned_len, last_node
+        req.kv.record_insert(len(state_key))
+        return len(state_key), state_result.last_device_node
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
