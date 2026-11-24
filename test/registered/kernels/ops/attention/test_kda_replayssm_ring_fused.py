@@ -139,7 +139,8 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         rel = ((fold - base).abs().max() / base.abs().max().clamp_min(1e-6)).item()
         assert rel < 1e-3, f"row={j}: rel={rel:.3e}"
         # Production head dim; K=64 rounds slightly differently on main too.
-        if K == 128:
+        # Bit parity relies on the CUDA-only narrow-tile PTX add (_PTX_NARROW_KDA_ADD).
+        if K == 128 and not torch.version.hip:
             assert torch.equal(fold, base), f"row={j}: K=128 fold not bit-identical"
 
 
