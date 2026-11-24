@@ -1,260 +1,94 @@
 name: Build and Push Development Docker Images
 
+# Branch nvidia/qwen35-gb300-sub only: publish the Qwen3.5 GB300 submission image without the self-hosted
+# docker build runners. The 2026-11-20 nightly's arm64 image (SGLang 03fde9cc, sgl-nvidia-mega 7101de97,
+# Dynamo 1.8.0.dev20261119, FlashInfer 0.7.4) gets one appended layer that moves both editable checkouts to
+# SGLang 617bd6014a and sgl-nvidia-mega fe8163cc (docker/q35-gb300-sub-overlay-layer.sh); the base layers
+# stay in place on Docker Hub, so nothing large is pulled.
+
 on:
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: "PR number to build from (leave empty to use current branch)"
-        required: false
-        default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
+        description: "Image tag in lmsysorg/sglang"
         required: false
-        default: ""
-      image_repo:
-        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
-        required: false
-        default: "lmsysorg/sglang"
-      build_only:
-        description: "Build and validate one Linux AMD64 CUDA 13 image locally on the runner without logging in or pushing."
+        default: "qwen35-gb300-sub-617bd60"
+      push:
+        description: "Push to Docker Hub (false: build the layer only)"
         required: false
         type: boolean
-        default: false
-      overlay_dockerfile:
-        description: "Optional extra Dockerfile lines appended after FROM <base> to build a layered image (e.g. 'RUN pip install ...'). Note: this job has no repo checkout, so only FROM + RUN work — you cannot COPY files from this repo. Leave empty to skip overlay."
-        required: false
-        default: ""
-      overlay_cudas:
-        description: "Comma-separated cuda variants to overlay onto (cu13). Default 'cu13'."
-        required: false
-        default: "cu13"
-      overlay_tag_suffix:
-        description: "Overlay output suffix appended to the base tag. EMPTY = overwrite the base tag(s); non-empty = append (e.g. 'msa')."
-        required: false
-        default: ""
-  schedule:
-    - cron: "0 0 * * *"
+        default: true
 
 concurrency:
-  group: release-docker-dev-${{ inputs.tag || inputs.pr_number || 'nightly' }}
-  cancel-in-progress: true
+  group: q35-gb300-sub-image
+  cancel-in-progress: false
+
+env:
+  BASE_IMAGE: index.docker.io/lmsysorg/sglang@sha256:a6214cb2047c6494c60e33827cd66c1776ac6fe8cffa7ad0f3abdfff9e2ccc74
+  BASE_INDEX: lmsysorg/sglang:nightly-dev-cu13-20261120-03fde9cc@sha256:d6f6d9720febe26aad1e40649a401cddd8504feb1d70de6b7ea374ff71785931
+  SGLANG_COMMIT: 617bd6014ae3e2a2d234400d2c7371dcc9101796
+  MEGA_COMMIT: fe8163cc788817ab6dd0f9ea09add97d7ac59004
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
 
 jobs:
-  prepare:
+  append-layer:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
-    outputs:
-      checkout_ref: ${{ steps.config.outputs.checkout_ref }}
-      extra_build_args: ${{ steps.config.outputs.extra_build_args }}
-      tag_config: ${{ steps.config.outputs.tag_config }}
-      overlay_cudas_json: ${{ steps.config.outputs.overlay_cudas_json }}
-      overlay_tags_json: ${{ steps.config.outputs.overlay_tags_json }}
+    permissions:
+      contents: read
     steps:
-      - name: Compute build configuration
-        id: config
-        env:
-          # Inject multi-line/free-text inputs via env to avoid ${{ }} injection
-          # breaking the bash script on quotes or $ in the Dockerfile snippet.
-          OVERLAY_DOCKERFILE_INPUT: ${{ inputs.overlay_dockerfile }}
-          OVERLAY_CUDAS_INPUT: ${{ inputs.overlay_cudas }}
-          OVERLAY_SUFFIX_INPUT: ${{ inputs.overlay_tag_suffix }}
-        run: |
-          # Determine checkout ref
-          if [ -n "${{ inputs.pr_number }}" ]; then
-            echo "checkout_ref=refs/pull/${{ inputs.pr_number }}/head" >> $GITHUB_OUTPUT
-          else
-            echo "checkout_ref=" >> $GITHUB_OUTPUT
-          fi
-
-          # Determine extra build args
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
-          else
-            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
-          fi
-
-          # Determine tag suffix
-          SUFFIX=""
-          if [ -n "${{ inputs.tag }}" ]; then
-            SUFFIX="-${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            SUFFIX="-pr-${{ inputs.pr_number }}"
-          fi
-
-          # Build tag config. dev-cu13 / nightly-dev-cu13 are published as
-          # aliases on the cu130 image for backwards compatibility with
-          # consumers pinned to the pre-flip names.
-          if [ -z "${SUFFIX}" ]; then
-            # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
-          else
-            TAG_CONFIG="[{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
-          fi
-          echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
-
-          # Overlay configuration (optional). When overlay_dockerfile is set,
-          # build one or more layered images on top of the just-built base.
-          # SUFFIX was computed above from inputs.tag / inputs.pr_number.
-          if [ -n "${OVERLAY_DOCKERFILE_INPUT}" ]; then
-            # Refuse to overlay without a tag/pr_number: SUFFIX would be empty,
-            # so base would point at the moving 'dev'/'dev-cu13'
-            # latest tags and overwrite mode would clobber them.
-            if [ -z "${SUFFIX}" ]; then
-              echo "overlay_dockerfile is set but neither 'tag' nor 'pr_number' was given." >&2
-              echo "Set one so the overlay targets a specific tag, not the moving 'dev' latest." >&2
-              exit 1
-            fi
-            CUDAS_INPUT="${OVERLAY_CUDAS_INPUT}"
-            [ -z "${CUDAS_INPUT}" ] && CUDAS_INPUT="cu13"
-            OVERLAY_TAGS='{}'
-            IFS=',' read -ra CUDAS <<< "${CUDAS_INPUT}"
-            for C in "${CUDAS[@]}"; do
-              C="$(echo "${C}" | xargs)"
-              if [ "${C}" = "cu13" ]; then
-                BASES='["dev'"${SUFFIX}"'","dev-cu13'"${SUFFIX}"'"]'
-              else
-                echo "Unknown overlay cuda variant: ${C} (expected cu13)" >&2
-                exit 1
-              fi
-              if [ -n "${OVERLAY_SUFFIX_INPUT}" ]; then
-                # Append mode: primary base tag + suffix.
-                PRIMARY="$(echo "${BASES}" | jq -r '.[0]')"
-                OUTS='["'"${PRIMARY}-${OVERLAY_SUFFIX_INPUT}"'"]'
-              else
-                # Overwrite mode: replace every base alias.
-                OUTS="${BASES}"
-              fi
-              OVERLAY_TAGS="$(echo "${OVERLAY_TAGS}" | jq -c \
-                --arg c "${C}" --argjson b "${BASES}" --argjson o "${OUTS}" \
-                '.[$c] = {bases:$b, outs:$o}')"
-            done
-            CUDAS_JSON="$(echo "${CUDAS_INPUT}" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')"
-            echo "overlay_cudas_json=${CUDAS_JSON}" >> $GITHUB_OUTPUT
-            echo "overlay_tags_json=${OVERLAY_TAGS}" >> $GITHUB_OUTPUT
-          else
-            echo "overlay_cudas_json=[]" >> $GITHUB_OUTPUT
-            echo "overlay_tags_json={}" >> $GITHUB_OUTPUT
-          fi
-
-  build-and-publish:
-    needs: prepare
-    if: ${{ !inputs.build_only }}
-    uses: ./.github/workflows/_docker-build-and-publish.yml
-    with:
-      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
-      extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
-      tag_config: ${{ needs.prepare.outputs.tag_config }}
-      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
-      mega_use_release_pin: true
-    secrets: inherit
-
-  build-only:
-    needs: prepare
-    if: ${{ inputs.build_only && github.repository == 'sgl-project/sglang' }}
-    runs-on: x64-docker-build-node
-    env:
-      IMAGE: sglang-diffusion-build-only:${{ github.run_id }}-${{ github.run_attempt }}
-      SOURCE_DIR: source-${{ github.run_id }}-${{ github.run_attempt }}
-    steps:
-      - name: Checkout repository
+      - name: Checkout SGLang (base and submission commits)
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.checkout_ref || github.ref }}
-          path: ${{ env.SOURCE_DIR }}
+          fetch-depth: 50
+          persist-credentials: false
+          path: sglang
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build CUDA 13 diffusion image locally (no push)
-        run: |
-          cd "$SOURCE_DIR"
-          docker buildx build \
-            --target framework_final \
-            --platform linux/amd64 \
-            --load \
-            -t "$IMAGE" \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.3 \
-            --build-arg BUILD_TYPE=all \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            ${{ needs.prepare.outputs.extra_build_args }} \
-            --no-cache \
-            .
-
-      - name: Verify diffusion dependencies
-        run: |
-          docker run --rm "$IMAGE" python3 -c '
-          import importlib
-          modules = (
-              "av",
-              "cache_dit",
-              "cv2",
-              "diffusers",
-              "imageio_ffmpeg",
-              "moviepy",
-              "msgpack",
-              "sglang.multimodal_gen",
-              "soundfile",
-              "trimesh",
-          )
-          for module in modules:
-              importlib.import_module(module)
-          print("diffusion dependency smoke check passed")
-          '
-
-      - name: Remove local test image
-        if: always()
-        run: docker image rm "$IMAGE" || true
-
-  cleanup-nightly:
-    needs: build-and-publish
-    if: ${{ !inputs.build_only && !inputs.tag && !inputs.pr_number }}
-    uses: ./.github/workflows/_docker-cleanup-nightly.yml
-    with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
-      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
-    secrets: inherit
-
-  build-overlay:
-    needs: [prepare, build-and-publish]
-    if: ${{ !inputs.build_only && inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda: ${{ fromJson(needs.prepare.outputs.overlay_cudas_json) }}
-    steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push overlay image (amd64 + arm64)
-        env:
-          REPO: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
-          TAGS: ${{ needs.prepare.outputs.overlay_tags_json }}
-          CUDA: ${{ matrix.cuda }}
-          # Injected via env to keep Dockerfile quotes/$ verbatim.
-          SNIPPET: ${{ inputs.overlay_dockerfile }}
+      - name: Fetch sgl-nvidia-mega
         run: |
           set -euo pipefail
-          BASE="$(printf '%s' "$TAGS" | jq -r --arg c "$CUDA" '.[$c].bases[0]')"
-          mapfile -t OUTS < <(printf '%s' "$TAGS" | jq -r --arg c "$CUDA" '.[$c].outs[]')
-          {
-            printf 'FROM %s:%s\n' "$REPO" "$BASE"
-            printf '%s\n' "$SNIPPET"
-          } > Dockerfile.overlay
-          echo "::group::overlay Dockerfile ($CUDA)"
-          cat Dockerfile.overlay
-          echo "::endgroup::"
-          OUT_ARGS=""
-          for o in "${OUTS[@]}"; do OUT_ARGS="$OUT_ARGS -t $REPO:$o"; done
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            -f Dockerfile.overlay \
-            $OUT_ARGS \
-            --push .
+          git init -q mega
+          git -C mega fetch -q --depth 2 https://github.com/sgl-project/sgl-nvidia-mega.git "$MEGA_COMMIT"
+          git -C mega cat-file -e 7101de977e2c25686d79d472661bdf0d9e8324d6
+          git -C sglang cat-file -e 03fde9cc392a5f84a54a365635ffed0061cdf1b8
+          git -C sglang cat-file -e "$SGLANG_COMMIT"
+
+      - name: Build the layer
+        run: bash sglang/docker/q35-gb300-sub-overlay-layer.sh sglang mega layer.tar.gz
+
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          curl -fsSL -o crane.tgz "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  crane.tgz" | sha256sum -c -
+          tar -xzf crane.tgz crane && sudo install crane /usr/local/bin/crane && crane version
+
+      - name: Append, label and push
+        if: ${{ inputs.push }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "$DOCKERHUB_TOKEN" | crane auth login index.docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+          TMP="lmsysorg/sglang:${TAG}-unlabelled"
+          crane append -b "$BASE_IMAGE" -f layer.tar.gz -t "$TMP"
+          crane mutate "$TMP" -t "lmsysorg/sglang:${TAG}" \
+            -e SGLANG_BUILD_COMMIT="$SGLANG_COMMIT" \
+            -e SGLANG_IMAGE_TAG="lmsysorg/sglang:${TAG}" \
+            -e SGLANG_BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -l org.opencontainers.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -l org.opencontainers.image.revision="$SGLANG_COMMIT" \
+            -l org.opencontainers.image.version="lmsysorg/sglang:${TAG}" \
+            -l ai.sglang.build.commit="$SGLANG_COMMIT" \
+            -l ai.sglang.build.branch="${GITHUB_REF_NAME}" \
+            -l ai.sglang.build.workflow_commit="${GITHUB_SHA}" \
+            -l ai.sglang.build.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -l ai.sglang.image.tag="lmsysorg/sglang:${TAG}" \
+            -l ai.sglang.base.image="$BASE_INDEX" \
+            -l ai.sglang.nvidia_mega.commit="$MEGA_COMMIT"
+          DIGEST=$(crane digest "lmsysorg/sglang:${TAG}")
+          echo "lmsysorg/sglang:${TAG}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+          crane config "lmsysorg/sglang:${TAG}" | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c["architecture"], c["os"]); print({k: v for k, v in c["config"]["Labels"].items() if "sglang" in k or "opencontainers" in k})'
