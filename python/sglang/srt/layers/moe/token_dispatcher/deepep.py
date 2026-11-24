@@ -441,6 +441,17 @@ class _DeepEPDispatcherImplBase:
     def _get_buffer(self):
         raise NotImplementedError
 
+    def prebuild_buffer(self) -> None:
+        # Leaves the dispatch mode unset; the first dispatch selects it.
+        DeepEPBuffer.get_deepep_buffer(
+            group=self.group,
+            hidden_size=self.hidden_size,
+            param_bytes=self.params_bytes,
+            deepep_mode=self.deepep_mode,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_experts=self.num_experts,
+        )
+
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         self.set_deepep_dispatcher_dtype()
@@ -764,7 +775,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        if not (_is_npu and not _use_zbal):
+            # GPU DeepEP requires int64 expert ids. The NPU LL dispatch /
+            # combine kernels validate DT_INT32 natively, and their strategy
+            # layer already calls .int() — npu_moe_gating_top_k emits int32
+            # ids, so keep them as-is and skip the int32→int64→int32
+            # round-trip casts (3 aclnnInplaceCopy_Cast kernels per layer).
+            topk_ids = topk_ids.to(torch.int64)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
@@ -1093,6 +1110,17 @@ class DeepEPDispatcher(BaseDispatcher):
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
+
+    @property
+    def prebuild_pending(self) -> bool:
+        return DeepEPBuffer._state().buffer is None
+
+    def prebuild(self) -> None:
+        # Both impls size the process-wide buffer from the same deepep_mode.
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.prebuild_buffer()
+        else:
+            self._normal_dispatcher.prebuild_buffer()
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()

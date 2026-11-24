@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import CountedUploads
 from sglang.multimodal_gen.tools import build_minimax_h3_pdd_weights as build
 from sglang.test.test_utils import CustomTestCase
 
@@ -74,6 +75,42 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
                             torch.cat([output[i] for output in outputs], dim=-1),
                             expected,
                         )
+
+    def test_heads_are_uploaded_once_not_per_step(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "heads.safetensors"
+            heads = _make_heads()
+            save_file(heads, str(path))
+            arch = MiniMaxH3DiTArchConfig(
+                hidden_size=5, latents_dim=6, audio_latents_dim=4, patch_size=(1, 1, 1)
+            )
+            with patch(
+                "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                return_value=SimpleNamespace(world_size=1, rank_in_group=0),
+            ):
+                layer = MiniMaxH3FinalLayer(
+                    arch, None, prefix="final_layer", use_adaln_cache=True
+                )
+            layer.load_pdd_fused_heads(str(path))
+            # the loaded heads stay on the host; count their copies to the device
+            layer._pdd_heads = {
+                key: value.as_subclass(CountedUploads)
+                for key, value in layer._pdd_heads.items()
+            }
+            CountedUploads.uploads = 0
+            h = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+            for step in range(8):
+                with set_forward_context(step, None):
+                    outputs = layer._project(h)
+                expected = [
+                    torch.nn.functional.linear(
+                        h, heads[f"{name}.weight"][step], heads[f"{name}.bias"][step]
+                    )
+                    for name in ("video_out", "audio_out")
+                ]
+                torch.testing.assert_close(outputs, expected, rtol=0, atol=0)
+            # one weight and one bias stack per head for the whole loop
+            self.assertEqual(CountedUploads.uploads, 4)
 
     def test_schedule_validation_and_warmup(self):
         apply_schedule = partial(
@@ -162,6 +199,37 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
             self.assertEqual(
                 json.loads((transformer / "model.safetensors.index.json").read_text()),
                 index,
+            )
+
+    def test_fc1_delta_is_merged_into_native_gate_value_rows(self):
+        """The LoRA's fc1 delta comes in the Diffusers [value, gate] row order; merged
+        unswapped, the gate delta lands on the native value rows and vice versa."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base = root / "base"
+            base.mkdir()
+            weight_name = "blocks.0.mlp.fc1.weight"
+            save_file({weight_name: torch.zeros(4, 3)}, str(base / "model.safetensors"))
+            lora_up = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+            lora_down = torch.ones(1, 3)
+            lora = {
+                "transformer_blocks.0.ff.net.0.proj.lora_down": lora_down,
+                "transformer_blocks.0.ff.net.0.proj.lora_up": lora_up,
+            }
+            for key, value in _make_heads().items():
+                lora[
+                    key.replace("video_out", "proj_out").replace(
+                        "audio_out", "audio_proj_out"
+                    )
+                ] = value
+            lora_path = root / "lora.safetensors"
+            save_file(lora, str(lora_path), metadata={"lora_rank": "1"})
+            out = root / "out"
+            build.main([str(base), str(lora_path), str(out)])
+            value, gate = (lora_up @ lora_down).chunk(2)
+            torch.testing.assert_close(
+                load_file(str(out / "transformer" / "model.safetensors"))[weight_name],
+                torch.cat((gate, value)),
             )
 
 

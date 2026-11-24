@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism."""
 
+    # Its decode kernel takes the global causal bound and returns the
+    # rank-local LSE, so it verifies under DCP (`_run_decode_kernel`).
+    supports_dcp_target_verify = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -214,7 +218,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
 
         if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
-            self.token_to_kv_pool.set_mla_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store_mla(
                 layer,
                 KVWriteLoc.for_batch(forward_batch),
                 k,
@@ -237,7 +241,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if query.dim() == 3:
             query = query.unsqueeze(1)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         metadata = (
@@ -419,7 +423,7 @@ class CuteDslMLAPrefillBackend(TRTLLMMLABackend):
         # reproduces the original [tokens, 1, qk_rope] latent layout.
         kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
         k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
-        self.token_to_kv_pool.set_mla_kv_buffer(
+        self.kv_layers.layer(layer.attn_mha.layer_id).store_mla(
             layer.attn_mha,
             KVWriteLoc.for_batch(forward_batch),
             kv_a_fp8.unsqueeze(1),

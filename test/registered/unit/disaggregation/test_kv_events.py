@@ -9,8 +9,10 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import atexit
 import json
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import msgspec
 import zmq
@@ -21,6 +23,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     EventPublisherFactory,
     KVEventBatch,
+    NullEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
     kv_event_namespace_seed,
@@ -33,7 +36,7 @@ from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestLocalKvEventSource(CustomTestCase):
@@ -84,6 +87,36 @@ class TestLocalKvEventSource(CustomTestCase):
                     break
             else:
                 self.fail("No event received from the advertised local source")
+
+
+class TestNullPublisherConfig(CustomTestCase):
+    def test_config_without_a_real_publisher_builds_the_noop(self):
+        """A config that names the "null" publisher, or omits the key (the schema
+        default), builds the no-op publisher instead of failing at startup."""
+        for config in ({"publisher": "null"}, {"endpoint": "tcp://*:5557"}):
+            with self.subTest(config=config):
+                publisher = EventPublisherFactory.create(json.dumps(config))
+                self.assertIsInstance(publisher, NullEventPublisher)
+
+
+class TestOffsetEndpointPort(CustomTestCase):
+    def test_ipc_endpoint_gets_a_dp_suffix(self):
+        self.assertEqual(
+            ZmqEventPublisher.offset_endpoint_port("ipc:///tmp/kv_events", 2),
+            "ipc:///tmp/kv_events_dp2",
+        )
+
+
+class TestShutdown(CustomTestCase):
+    def test_full_queue_does_not_skip_socket_cleanup(self):
+        with patch.object(threading.Thread, "start"):
+            publisher = ZmqEventPublisher(
+                attn_dp_rank=0, endpoint="inproc://kv-shutdown-test", max_queue_size=1
+            )
+        atexit.unregister(publisher.shutdown)
+        publisher.publish(KVEventBatch(ts=1.0, events=[]))
+        publisher.shutdown()
+        self.assertTrue(publisher._pub.closed)
 
 
 class TestResolveLoadPubRange(CustomTestCase):

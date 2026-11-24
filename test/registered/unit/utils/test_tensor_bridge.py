@@ -21,7 +21,7 @@ from sglang.srt.utils.tensor_bridge import (
 )
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=2, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=2, suite="extra-unit-test-mlx")
 
 
 def _has_stable_version_at_least(distribution: str, minimum: Version) -> bool:

@@ -12,13 +12,23 @@ try:
 except ImportError:
     torch_varlen_attn = None
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -46,8 +56,6 @@ def torch_default_sdpa_backends():
 
 
 class SDPABackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
@@ -59,10 +67,6 @@ class SDPABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SDPAImpl"]:
         return SDPAImpl
-
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
 
 
 class SDPAImpl(AttentionImpl):
@@ -212,13 +216,14 @@ class SDPAImpl(AttentionImpl):
             if start == stop:
                 continue
             if query.device.type != "mps":
-                segment = self.forward(
-                    query[start:stop].unsqueeze(0),
-                    key[start:stop].unsqueeze(0),
-                    value[start:stop].unsqueeze(0),
-                    None,
+                q_seg, k_seg, v_seg = (
+                    t[start:stop].unsqueeze(0) for t in (query, key, value)
                 )
-                output[start:stop].copy_(segment[0])
+                # same call as forward, written in place instead of copied
+                if not self.forward_into(
+                    q_seg, k_seg, v_seg, output[start:stop].unsqueeze(0), None
+                ):
+                    output[start:stop].copy_(self.forward(q_seg, k_seg, v_seg, None)[0])
                 continue
 
             # mps SDPA materializes a quadratic temporary for a varlen segment
@@ -336,17 +341,26 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if query.shape[2] != key.shape[2]:
+        # sm_10x keeps GQA on cuDNN; CudnnSDPAImpl passes enable_gqa.
+        if query.shape[2] != key.shape[2] and (
+            not self._is_sm100 or query.shape[2] % key.shape[2]
+        ):
             return False
         if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
             return False
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
-            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len). A side
-            # shorter than one 128-row tile while the other is not drops cuDNN to
-            # an sm80 kernel that FA4 beats 2-3x (B300, 126 x 1536 tokens:
-            # 24.9 vs 12.1 us)
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
+            # FA4's faster sub-tile kernel pays off inside a graph: captured
+            # segments and the eager breaks of a replay. In plain eager its host
+            # dispatch loses to cuDNN.
+            # Keep exact requests on the reference route: cuDNN and FA4 differ
+            # in rounding. The BCG scope includes warmup, priming FA4 for capture.
+            if not is_in_breakable_cuda_graph() and get_current_replay_token() is None:
+                context = get_forward_context_or_none()
+                if context is not None and quality_allows(context.quality, "lossless"):
+                    return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:

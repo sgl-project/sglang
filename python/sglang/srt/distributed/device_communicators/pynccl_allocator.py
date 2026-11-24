@@ -352,24 +352,17 @@ class SymmetricMemoryContext:
 
         # Get comm ptr for tracking registrations
         # Use the comm pointer value as unique identifier
-        self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
+        self._comm_ptr = group_coordinator.require_pynccl_comm(
+            "Symmetric memory"
+        ).comm.value
 
     def __enter__(self):
-        assert self.group_coordinator.pynccl_comm is not None, (
-            f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
-        )
-
         if self.is_graph_capture:
             assert _graph_pool_id is not None, (
                 "graph_pool_id is not set under graph capture"
             )
             # Pause graph memory pool to use symmetric memory with cuda graph
-            if after_2_8_0:
-                torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
-            else:
-                torch._C._cuda_endAllocateCurrentStreamToPool(
-                    _cur_device, _graph_pool_id
-                )
+            torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
 
         torch._C._cuda_beginAllocateCurrentThreadToPool(
             self._device_index, self._pool_id
@@ -388,12 +381,7 @@ class SymmetricMemoryContext:
         self._register_segments_for_comm()
 
         if self.is_graph_capture:
-            if after_2_8_0:
-                torch._C._cuda_beginAllocateCurrentThreadToPool(
-                    _cur_device, _graph_pool_id
-                )
-            else:
-                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
+            torch._C._cuda_beginAllocateCurrentThreadToPool(_cur_device, _graph_pool_id)
 
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = None

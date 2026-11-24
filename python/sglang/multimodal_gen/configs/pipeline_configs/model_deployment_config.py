@@ -12,12 +12,20 @@ OffloadComponentName = Literal["dit", "text_encoder", "image_encoder", "vae"]
 @dataclass(frozen=True)
 class ModelDeploymentConfig:
     dit_layerwise_offload_modes: tuple[Literal["auto", "memory"], ...] = ()
+    # False: auto-tuning never selects layerwise offload for auxiliary components
+    # (encoders, VAE). Explicit choices still go through model validation.
+    auto_auxiliary_layerwise_offload: bool = True
     auto_dit_offload_prefetch_size: float | None = None
     keep_resident_min_available_gb: float | None = None
     # Per-model resident defaults. Auto mode additionally keeps an image DiT
     # resident above the image workload memory threshold; video DiT placement
     # stays with the model's FSDP/layerwise policy.
     keep_resident_components: tuple[OffloadComponentName, ...] = ("vae",)
+    # GiB of one DiT's weights as served, before tensor parallelism. Auto mode
+    # reserves it on top of keep_resident_min_available_gb for every DiT a
+    # deployment loads beyond the checkpoint's transformer
+    # (PipelineConfig.extra_dit_components).
+    dit_weight_gb: float | None = None
     fsdp_auto_min_available_memory_gb: float | None = None
     fsdp_auto_requires_cfg: bool = True
     fsdp_auto_requires_default_parallelism: bool = True

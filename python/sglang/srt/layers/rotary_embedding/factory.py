@@ -19,7 +19,6 @@ from sglang.srt.layers.rotary_embedding.mrope import (
 )
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
-    DualChunkRotaryEmbedding,
     DynamicNTKAlphaRotaryEmbedding,
     DynamicNTKScalingRotaryEmbedding,
     FourierRotaryEmbedding,
@@ -76,9 +75,10 @@ if _use_aiter:
 
 
 @functools.lru_cache(maxsize=1)
-def _aiter_rope_unsupported_arch() -> bool:
-    """aiter's rope kernels (csrc/kernels/rope/rope_common.h) depend on ck_tile
-    types that do not build on gfx1250; fall back to sglang's native rope there."""
+def _keeps_sglang_rope_modules() -> bool:
+    """gfx1250 keeps sglang's rope modules: its MLA paths read cos_sin_cache,
+    which aiter's rope modules do not have. DeepseekScalingRotaryEmbedding
+    calls the aiter rope kernel directly instead."""
     if not _is_hip:
         return False
     try:
@@ -131,7 +131,6 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
-    dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -143,16 +142,6 @@ def get_rope(
     else:
         rope_scaling_args = None
 
-    if dual_chunk_attention_config is not None:
-        dual_chunk_attention_tuple = {
-            k: tuple(v) if isinstance(v, list) else v
-            for k, v in dual_chunk_attention_config.items()
-            if k != "sparse_attention_config"
-        }
-        dual_chunk_attention_args = tuple(dual_chunk_attention_tuple.items())
-    else:
-        dual_chunk_attention_args = None
-
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
     key = (
@@ -162,29 +151,13 @@ def get_rope(
         base,
         is_neox_style,
         rope_scaling_args,
-        dual_chunk_attention_args,
         dtype,
     )
     cached = _get_live_rope_cache_entry(key)
     if cached is not None:
         return cached
 
-    if dual_chunk_attention_config is not None:
-        extra_kwargs = {
-            k: v
-            for k, v in dual_chunk_attention_config.items()
-            if k in ("chunk_size", "local_size")
-        }
-        rotary_emb = DualChunkRotaryEmbedding(
-            head_size,
-            rotary_dim,
-            max_position,
-            base,
-            is_neox_style,
-            dtype,
-            **extra_kwargs,
-        )
-    elif rope_scaling is None:
+    if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
@@ -525,7 +498,7 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        use_aiter_rope = _use_aiter and not _aiter_rope_unsupported_arch()
+        use_aiter_rope = _use_aiter and not _keeps_sglang_rope_modules()
         wrapper = aiter_get_rope if use_aiter_rope else get_rope
         return wrapper(
             head_size,

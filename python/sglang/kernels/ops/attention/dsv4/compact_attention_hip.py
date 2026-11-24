@@ -7,6 +7,7 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.sparse_decode_reduce_hip import (
     gfx_sparse_split_reduce,
@@ -399,7 +400,7 @@ def compact_attention_hip(
         ne = extra_indices.shape[1]
     if splits is None:
         # enough splits to fill the CUs, none past the slots a row has
-        num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_cus = current_arch().num_sms
         splits = min(
             MAX_SPLITS,
             triton.cdiv(indices.shape[1] + ne, TILE_SLOTS),

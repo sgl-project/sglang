@@ -1,53 +1,18 @@
 """Flatten ragged (nested, variable-length) structures into flat value buffers
 plus per-position length vectors — the columnar wire layout used by the embedded
-Rust server's egress path (see ``managers/rust_server.py``).
+Rust server's egress path (see ``rust_server/server.py``).
 
-The ``*Columns`` classes accumulate one batch column-family each: feed them one
-request cell at a time (``accept``), then read the header contribution (length
-vectors) and data contribution (raw ``array`` buffers).
+The ``*Columns`` classes flatten one batch column-family each: ``fill`` the
+batch, then read the header contribution (length vectors) and data contribution
+(raw ``array`` buffers). A family no request carries data for stays empty, the
+wire's "absent".
 """
 
 from __future__ import annotations
 
 from array import array
+from itertools import chain, compress
 from typing import List
-
-
-def flatten_ragged(per_pos_val, per_pos_idx):
-    """Flatten per-position ``list[Optional[list]]`` val/idx pairs into flat
-    buffers + a shared ``lens`` vector (falsy position -> len 0 -> Rust ``null``).
-    idx must mirror val exactly (asserted): the wire pairs both buffers by the
-    one ``lens`` vector, so divergence shifts or drops token ids downstream."""
-
-    flat_val: List[float] = []
-    flat_idx: List[int] = []
-    lens: List[int] = []
-    if not per_pos_val:
-        assert not per_pos_idx, (
-            f"ragged idx column has {len(per_pos_idx)} positions but the val "
-            "column is empty"
-        )
-        return flat_val, flat_idx, lens
-    assert per_pos_idx is not None and len(per_pos_idx) == len(per_pos_val), (
-        f"ragged idx column has {len(per_pos_idx) if per_pos_idx else 0} "
-        f"positions, val column has {len(per_pos_val)}"
-    )
-    for p, pv in enumerate(per_pos_val):
-        pi = per_pos_idx[p]
-        if pv:
-            # A truthy position holds only real logprobs; a `None`/empty position
-            # is the falsy branch below (len 0), so no per-value None check here.
-            assert pi is not None and len(pi) == len(pv), (
-                f"position {p}: idx len "
-                f"{len(pi) if pi is not None else None} != val len {len(pv)}"
-            )
-            flat_val.extend(pv)
-            flat_idx.extend(pi)
-            lens.append(len(pv))
-        else:
-            assert not pi, f"position {p}: idx has {len(pi)} entries but val is empty"
-            lens.append(0)
-    return flat_val, flat_idx, lens
 
 
 def flatten_hidden(hs):
@@ -79,6 +44,32 @@ def _flatten_floats(x):
     return out
 
 
+_NAN = float("nan")
+
+
+def _rows_with_data(cells, batch_size):
+    """The rows whose cell is non-empty. A falsy cell carries nothing: length 0,
+    no elements."""
+    if not any(cells):  # the common all-empty family, without a row index each
+        return []
+    return list(compress(range(batch_size), cells))
+
+
+def _scatter(rows, values, batch_size):
+    """``values[k]`` at position ``rows[k]`` of a ``batch_size`` list, 0 elsewhere."""
+    if len(rows) == batch_size:
+        return values
+    out = [0] * batch_size
+    for row, value in zip(rows, values):
+        out[row] = value
+    return out
+
+
+def _select(cells, rows, batch_size):
+    """The cells at ``rows`` (all of them when every row is selected)."""
+    return cells if len(rows) == batch_size else [cells[row] for row in rows]
+
+
 class FlatPairColumns:
     """A flat val/idx column pair (e.g. per-token logprob values + token ids):
     per-request element counts in the header, concatenated f32 + i32 buffers in
@@ -97,25 +88,44 @@ class FlatPairColumns:
     def columns(self):
         return ((f"{self.name}_val", self.vals), (f"{self.name}_idx", self.idxs))
 
-    def accept(self, j):
-        vv = (self.vals[j] if self.vals else None) or []
-        ii = (self.idxs[j] if self.idxs else None) or []
-        # Parity assert, the flat twin of `flatten_ragged`'s: only `len(vv)` is
-        # recorded in `lens`, but both buffers are extended, so a longer idx column
-        # silently pushes every LATER column's offset out by the difference. The
-        # decoder cannot catch it — the data buffer only grows, so the receiver's
-        # bounds check still passes and it hands the client another column's bytes
-        # reinterpreted as logprobs, with a 200.
-        assert len(ii) == len(vv), (
-            f"{self.name}: request {j} has {len(ii)} idx entries but {len(vv)} vals"
+    def fill(self, batch_size):
+        # Only the rows with data are visited; a family with none stays empty.
+        rows = _rows_with_data(self.vals, batch_size)
+        if not rows:
+            return
+        vals = _select(self.vals, rows, batch_size)
+        idxs = _select(self.idxs, rows, batch_size) if self.idxs else []
+        lens = list(map(len, vals))
+        # Parity assert: only the val lengths are recorded in `lens`, but both
+        # buffers are filled, so a longer idx cell silently pushes every LATER
+        # column's offset out by the difference. The decoder cannot catch it —
+        # the data buffer only grows, so the receiver's bounds check still
+        # passes and it hands the client another column's bytes reinterpreted
+        # as logprobs, with a 200.
+        assert list(map(len, idxs)) == lens, (
+            f"{self.name}: idx lengths {list(map(len, idxs))} != val lengths {lens}"
         )
-        if self.first_none_to_nan and vv and vv[0] is None:
-            self.v.append(float("nan"))
-            self.v.extend(vv[1:])
+        # `fromlist` sizes the buffer once; `extend` grows it per element.
+        if len(rows) == 1:
+            # One row, e.g. a prefill's input logprobs over a long prompt:
+            # skip the flattening copy.
+            vv = vals[0]
+            if self.first_none_to_nan and vv[0] is None:
+                self.v.append(_NAN)
+                vv = vv[1:]
+            self.v.fromlist(vv)
+            self.i.fromlist(idxs[0])
         else:
-            self.v.extend(vv)
-        self.i.extend(ii)
-        self.lens.append(len(vv))
+            flat = list(chain.from_iterable(vals))
+            if self.first_none_to_nan:
+                start = 0
+                for n in lens:
+                    if flat[start] is None:
+                        flat[start] = _NAN
+                    start += n
+            self.v.fromlist(flat)
+            self.i.fromlist(list(chain.from_iterable(idxs)))
+        self.lens = _scatter(rows, lens, batch_size)
 
     def header_cols(self):
         return [self.lens]
@@ -127,7 +137,8 @@ class FlatPairColumns:
 class RaggedPairColumns:
     """A per-position ragged val/idx column pair (e.g. top-k / token-ids
     logprobs): per-request position counts + a flat per-position length stream
-    in the header, concatenated f32/i32 buffers in the data."""
+    in the header, concatenated f32/i32 buffers in the data. A falsy position
+    (``None`` / empty) is a null position: length 0, no elements."""
 
     def __init__(self, name, vals, idxs):
         self.name = name
@@ -141,15 +152,30 @@ class RaggedPairColumns:
     def columns(self):
         return ((f"{self.name}_val", self.vals), (f"{self.name}_idx", self.idxs))
 
-    def accept(self, j):
-        fv, fi, lens = flatten_ragged(
-            self.vals[j] if self.vals else None,
-            self.idxs[j] if self.idxs else None,
+    def fill(self, batch_size):
+        # Only the rows with data are visited; a family with none stays empty.
+        rows = _rows_with_data(self.vals, batch_size)
+        if not rows:
+            return
+        vals = _select(self.vals, rows, batch_size)
+        idxs = _select(self.idxs, rows, batch_size) if self.idxs else []
+        req = list(map(len, vals))
+        # idx must mirror val exactly: the wire pairs both buffers by the one
+        # per-position length stream, so divergence shifts or drops token ids
+        # downstream.
+        assert list(map(len, idxs)) == req, (
+            f"{self.name}: idx positions {list(map(len, idxs))} != val positions {req}"
         )
-        self.v.extend(fv)
-        self.i.extend(fi)
-        self.pos.extend(lens)
-        self.req.append(len(lens))
+        pos_v = list(chain.from_iterable(vals))
+        pos_i = list(chain.from_iterable(idxs))
+        pos = [len(p) if p else 0 for p in pos_v]
+        assert [len(p) if p else 0 for p in pos_i] == pos, (
+            f"{self.name}: idx lengths differ from val lengths by position"
+        )
+        self.v.fromlist(list(chain.from_iterable(filter(None, pos_v))))
+        self.i.fromlist(list(chain.from_iterable(filter(None, pos_i))))
+        self.pos = pos
+        self.req = _scatter(rows, req, batch_size)
 
     def header_cols(self):
         return [self.req, self.pos]
@@ -173,11 +199,18 @@ class NestedRowColumns:
     def columns(self):
         return ((self.name, self.rows),)
 
-    def accept(self, j):
-        hv, hlens = flatten_hidden(self.rows[j] if self.rows else None)
-        self.v.extend(hv)
-        self.pos.extend(hlens)
-        self.req.append(len(hlens))
+    def fill(self, batch_size):
+        # Only the rows with data are visited; a family with none stays empty.
+        rows = _rows_with_data(self.rows, batch_size)
+        if not rows:
+            return
+        req = []
+        for row in rows:
+            hv, hlens = flatten_hidden(self.rows[row])
+            self.v.fromlist(hv)
+            self.pos.extend(hlens)
+            req.append(len(hlens))
+        self.req = _scatter(rows, req, batch_size)
 
     def header_cols(self):
         return [self.req, self.pos]

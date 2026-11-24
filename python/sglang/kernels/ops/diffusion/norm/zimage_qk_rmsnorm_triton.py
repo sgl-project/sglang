@@ -7,7 +7,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 
@@ -153,8 +153,7 @@ def zimage_qk_rmsnorm_native(
         return None
     nheads = x.shape[2]
     n_rows = x.shape[0] * x.shape[1] * nheads
-    arch = get_jit_cuda_arch()
-    is_sm103 = arch.major == 10 and arch.minor == 3
+    is_sm103 = current_arch().is_sm(10, 3)
     # The production Z-Image shape is launch-bound on B300. Grouping more rows
     # while using one warp group reduces latency without changing the launch
     # tuned for other architectures.

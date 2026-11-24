@@ -8,12 +8,13 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     RowBucketGraphRunner,
     _Graph,
@@ -21,11 +22,12 @@ from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.models.deepseek_v4_replay_tail import DecoderReplayTail
 from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 def _batch(count_shape=()):
