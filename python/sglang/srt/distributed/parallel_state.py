@@ -1544,41 +1544,6 @@ class GroupCoordinator:
 
             return output_list
 
-    def gather(
-        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
-    ) -> Optional[torch.Tensor]:
-        """
-        NOTE: We assume that the input tensor is on the same device across
-        all the ranks.
-        NOTE: `dst` is the local rank of the destination rank.
-        """
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-        if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
-            return self.xpu_communicator.gather(input_, self.rank_in_group, dst, dim)
-        # Allocate output tensor.
-        if self.rank_in_group == dst:
-            gather_list = [torch.empty_like(input_) for _ in range(world_size)]
-        else:
-            gather_list = None
-        # Gather.
-        torch.distributed.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
-        )
-        if self.rank_in_group == dst:
-            output_tensor = torch.cat(gather_list, dim=dim)
-        else:
-            output_tensor = None
-        return output_tensor
-
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """Broadcast the input tensor.
         NOTE: `src` is the local rank of the source rank.
@@ -2802,8 +2767,6 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
-
     global _ATTN_TP
     assert _ATTN_TP is None, (
         "attention tensor model parallel group is already initialized"
@@ -2829,7 +2792,6 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             # Attention TP can be a derived subgroup of the full TP group.
             # Inherit the global policy and let per-group capability detection
             # select a custom communicator or fall back.
