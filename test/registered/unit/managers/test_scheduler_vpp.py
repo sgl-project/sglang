@@ -124,9 +124,28 @@ class _SchedulingCore(SchedulingVPPCore):
         pass
 
 
+class _AdmissionCore(_SchedulingCore):
+    """Supply CPU batch construction and prefix storage at the adapter boundary."""
+
+    def _pp_vpp_prepare_wavefront_batch(
+        self, batch_seq, slot_batch_seqs, expected_manifest=None
+    ):
+        slot_id = batch_seq % len(slot_batch_seqs)
+        self.mbs[slot_id] = self.candidate_batch
+        slot_batch_seqs[slot_id] = batch_seq
+        return self.candidate_batch
+
+    def _pp_vpp_register_prefix_batch(self, batch):
+        for req, start, length in zip(batch.reqs, batch.prefix_lens, batch.extend_lens):
+            generation = int(req.session_generation or 0)
+            self._pp_vpp_prefix_registry.plan(
+                req.rid, generation, generation, start, start + length, range(4)
+            )
+
+
 class TestSchedulingVPPCore(CustomTestCase):
-    def _scheduler(self, *, rank=0, owner=0, retained=True):
-        scheduler = _SchedulingCore()
+    def _scheduler(self, *, rank=0, owner=0, retained=True, core_type=_SchedulingCore):
+        scheduler = core_type()
         scheduler.__dict__.update(
             _pp_vpp_runtime_epoch=3,
             _pp_vpp_control_layout_digest="layout",
@@ -167,8 +186,8 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler._pp_vpp_init_fixed_batch(2)
         return scheduler
 
-    def _remote_admission(self):
-        scheduler = self._scheduler()
+    def _remote_admission(self, *, core_type=_SchedulingCore):
+        scheduler = self._scheduler(core_type=core_type)
         scheduler.attn_tp_group = SimpleNamespace(
             world_size=1, rank_in_group=0, cpu_group=None
         )
@@ -196,6 +215,357 @@ class TestSchedulingVPPCore(CustomTestCase):
             payload={"manifest": manifest},
         )
         return scheduler, req, envelope
+
+    def _downstream_admission(self, *, batch_seq=0, owner=None):
+        scheduler, req, _ = self._remote_admission(core_type=_AdmissionCore)
+        scheduler.pp_group.rank_in_group = 1
+        scheduler.pp_group.is_first_rank = False
+        scheduler.pp_group.is_last_rank = True
+        scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
+        scheduler._pp_vpp_overlap_chunks = False
+        scheduler._pp_vpp_init_fixed_batch(2)
+        scheduler._pp_vpp_slot_batch_seqs = [owner, None]
+        scheduler.mbs = [None, None]
+        scheduler.candidate_batch = SimpleNamespace(
+            reqs=[req], prefix_lens=[4], extend_lens=[5]
+        )
+        wire = self._wire(batch_seq=batch_seq, stage=1)
+        wire["vpp_batch_manifest"] = scheduler._pp_vpp_batch_manifest(
+            batch_seq, batch_seq % 2, scheduler.candidate_batch
+        )
+        return scheduler, PipelineRankSchedule(1, 2, 2, 2), wire
+
+    def test_cpu_broadcast_reuses_buffers_and_validates_source_values(self):
+        scheduler = self._scheduler()
+        scheduler.attn_tp_group = SimpleNamespace(world_size=1, rank_in_group=0)
+        first = scheduler._pp_vpp_broadcast_cpu_state((3, 7), width=2)
+        self.assertEqual(first.tolist(), [3, 7])
+        self.assertEqual(first.device.type, "cpu")
+        self.assertEqual(first.dtype, torch.int64)
+        second = scheduler._pp_vpp_broadcast_cpu_state((4, 8), width=2)
+        self.assertIs(second, first)
+        self.assertEqual(first.tolist(), [4, 8])
+        narrow = scheduler._pp_vpp_broadcast_cpu_state((9,), width=1)
+        self.assertIsNot(narrow, first)
+        self.assertEqual(narrow.tolist(), [9])
+        for values in (None, (), (1,), (1, 2, 3)):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(RuntimeError, "invalid VPP TP broadcast"):
+                    scheduler._pp_vpp_broadcast_cpu_state(values, width=2)
+
+    def test_cpu_broadcast_maps_tp_source_to_its_global_rank(self):
+        cpu_group = object()
+        transmitted = []
+        for tp_rank in (1, 0):
+            scheduler = self._scheduler()
+            scheduler.attn_tp_group = SimpleNamespace(
+                world_size=2,
+                rank_in_group=tp_rank,
+                ranks=[4, 6],
+                cpu_group=cpu_group,
+            )
+
+            def broadcast(state, *, src, group):
+                self.assertEqual(src, 6)
+                self.assertIs(group, cpu_group)
+                if tp_rank == 1:
+                    transmitted.append(state.clone())
+                else:
+                    state.copy_(transmitted[0])
+
+            with patch("torch.distributed.broadcast", side_effect=broadcast):
+                state = scheduler._pp_vpp_broadcast_cpu_state(
+                    (5, 3) if tp_rank == 1 else None, width=2, src=1
+                )
+            self.assertEqual(state.tolist(), [5, 3])
+
+    def test_cancel_waits_for_admission_and_never_targets_a_reused_slot(self):
+        scheduler = self._fixed_scheduler()
+        req = SimpleNamespace(rid="request", session_generation=1, bootstrap_room=3)
+        scheduler.mbs[0] = SimpleNamespace(reqs=[req])
+        envelope = scheduler._pp_vpp_new_control(
+            PipelineControlKind.CANCEL,
+            batch_seq=0,
+            slot_id=0,
+            payload={
+                "rid": req.rid,
+                "request_generation": 1,
+                "bootstrap_room": 3,
+            },
+        )
+        self.assertEqual(scheduler._pp_vpp_cancel_target(envelope), (False, None))
+        scheduler._pp_vpp_highest_admitted_batch_seq = 0
+        handled, target = scheduler._pp_vpp_cancel_target(envelope)
+        self.assertTrue(handled)
+        self.assertIs(target, req)
+        for generation, room in ((2, 3), (1, 4)):
+            with self.subTest(generation=generation, room=room):
+                req.session_generation = generation
+                req.bootstrap_room = room
+                self.assertEqual(
+                    scheduler._pp_vpp_cancel_target(envelope), (True, None)
+                )
+        req.session_generation, req.bootstrap_room = 1, 3
+        for owner in (None, 2):
+            with self.subTest(owner=owner):
+                scheduler._pp_vpp_slot_batch_seqs[0] = owner
+                self.assertEqual(
+                    scheduler._pp_vpp_cancel_target(envelope), (True, None)
+                )
+        scheduler._pp_vpp_slot_batch_seqs[0] = 0
+        scheduler.mbs[0] = None
+        self.assertEqual(scheduler._pp_vpp_cancel_target(envelope), (True, None))
+
+    def test_unbatched_cancel_searches_all_live_request_locations(self):
+        scheduler = self._scheduler()
+        stale = SimpleNamespace(rid="request", session_generation=1, bootstrap_room=3)
+        current = SimpleNamespace(rid="request", session_generation=2, bootstrap_room=4)
+        envelope = scheduler._pp_vpp_new_control(
+            PipelineControlKind.CANCEL,
+            payload={
+                "rid": "request",
+                "request_generation": 2,
+                "bootstrap_room": 4,
+            },
+        )
+        for location in ("waiting", "bootstrap", "batch", "chunked"):
+            with self.subTest(location=location):
+                scheduler.waiting_queue = [stale]
+                scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+                scheduler.mbs = [None, None]
+                scheduler.chunked_req = None
+                if location == "waiting":
+                    scheduler.waiting_queue.append(current)
+                elif location == "bootstrap":
+                    scheduler.disagg_prefill_bootstrap_queue.queue.append(current)
+                elif location == "batch":
+                    scheduler.mbs[1] = SimpleNamespace(reqs=[current])
+                else:
+                    scheduler.chunked_req = current
+                handled, target = scheduler._pp_vpp_cancel_target(envelope)
+                self.assertTrue(handled)
+                self.assertIs(target, current)
+        scheduler.chunked_req = None
+        self.assertEqual(scheduler._pp_vpp_cancel_target(envelope), (True, None))
+
+    def test_find_request_prefers_current_batch_then_retained_batch_then_chunk(self):
+        scheduler = self._scheduler()
+        current, retained, chunked = (SimpleNamespace(rid="request") for _ in range(3))
+        scheduler.mbs = [None, SimpleNamespace(reqs=[current])]
+        scheduler.last_mbs = [SimpleNamespace(reqs=[retained]), None]
+        scheduler.chunked_req = chunked
+        self.assertIs(scheduler._pp_vpp_find_req("request"), current)
+        scheduler.mbs[1] = None
+        self.assertIs(scheduler._pp_vpp_find_req("request"), retained)
+        scheduler.last_mbs[0] = None
+        self.assertIs(scheduler._pp_vpp_find_req("request"), chunked)
+        self.assertIsNone(scheduler._pp_vpp_find_req("missing"))
+
+    def test_fixed_remote_admission_waits_for_capacity_then_promotes_once(self):
+        scheduler, schedule, wire = self._downstream_admission()
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        proxy = scheduler._pp_vpp_early_activations[(0, 1)]
+        scheduler.req_to_token_pool.available_size = lambda: 0
+        self.assertFalse(scheduler._pp_vpp_fixed_remote_admit(0, schedule))
+        self.assertEqual(schedule.inflight_count, 0)
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
+        self.assertIsNone(scheduler._pp_vpp_prefix_registry.get("request", 1))
+        scheduler.req_to_token_pool.available_size = lambda: 1
+        self.assertTrue(scheduler._pp_vpp_fixed_remote_admit(0, schedule))
+        self.assertEqual(schedule.slot_batch_seqs, (0, None))
+        self.assertEqual(scheduler._pp_vpp_highest_admitted_batch_seq, 0)
+        self.assertEqual(scheduler._pp_vpp_early_activations, {})
+        self.assertIs(scheduler._pp_vpp_ready_proxies[(0, 1)], proxy)
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [(0, 1)])
+        entry = scheduler._pp_vpp_prefix_registry.get("request", 1)
+        self.assertEqual((entry.committed_end, entry.planned_end), (4, 9))
+        self.assertTrue(entry.locked)
+        self.assertTrue(scheduler._pp_vpp_fixed_remote_admit(0, schedule))
+        self.assertIs(scheduler._pp_vpp_prefix_registry.get("request", 1), entry)
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [(0, 1)])
+        self.assertEqual(schedule.inflight_count, 1)
+
+    def test_fixed_remote_admission_requires_first_activation_and_retired_slot(self):
+        scheduler, schedule, _ = self._downstream_admission()
+        with self.assertRaisesRegex(RuntimeError, "missing its first activation"):
+            scheduler._pp_vpp_fixed_remote_admit(0, schedule)
+        scheduler, schedule, wire = self._downstream_admission(batch_seq=2, owner=0)
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        self.assertFalse(scheduler._pp_vpp_fixed_remote_admit(2, schedule))
+        self.assertEqual(schedule.inflight_count, 0)
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [0, None])
+        scheduler._pp_vpp_slot_batch_seqs[0] = None
+        self.assertTrue(scheduler._pp_vpp_fixed_remote_admit(2, schedule))
+        self.assertEqual(schedule.slot_batch_seqs, (2, None))
+        self.assertEqual(scheduler._pp_vpp_highest_admitted_batch_seq, 2)
+
+    def test_fixed_remote_admission_rejects_a_different_constructed_batch(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                scheduler, schedule, wire = self._downstream_admission()
+                scheduler._pp_vpp_accept_received_tensors(wire)
+                if missing:
+                    scheduler.candidate_batch = None
+                else:
+                    scheduler.candidate_batch.extend_lens = [4]
+                with self.assertRaisesRegex(RuntimeError, "batch manifest mismatch"):
+                    scheduler._pp_vpp_fixed_remote_admit(0, schedule)
+                self.assertEqual(schedule.inflight_count, 0)
+                self.assertEqual(scheduler._pp_vpp_highest_admitted_batch_seq, -1)
+                self.assertIsNone(scheduler._pp_vpp_prefix_registry.get("request", 1))
+                self.assertIn((0, 1), scheduler._pp_vpp_early_activations)
+
+    def test_fixed_task_selection_waits_for_send_credit_and_local_readiness(self):
+        scheduler = self._fixed_scheduler()
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        schedule = PipelineRankSchedule(0, 2, 2, 2)
+        schedule.admit(0)
+        completed = []
+        pending = deque(
+            [
+                [
+                    SimpleNamespace(
+                        payload=torch.ones(1),
+                        work=SimpleNamespace(wait=lambda: completed.append("oldest")),
+                    )
+                ],
+                [],
+            ]
+        )
+
+        def blocked(batch_seq, stage_id):
+            self.assertEqual((batch_seq, stage_id), (0, 0))
+            self.assertEqual(completed, ["oldest"])
+            self.assertEqual(len(pending), 1)
+            return False
+
+        self.assertIsNone(
+            scheduler._pp_vpp_fixed_select_tp_action(schedule, 5, blocked, pending)
+        )
+        self.assertIsNone(schedule.running)
+        self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
+        action = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 6, lambda batch, stage: True, pending
+        )
+        self.assertEqual(action, PipelineWavefrontAction(6, 0, 0, 0, 0))
+        self.assertIs(schedule.running, action)
+        self.assertEqual(scheduler._pp_vpp_fixed_wave, [0])
+
+    def test_fixed_task_selection_admits_downstream_input_and_preserves_receive_fifo(
+        self,
+    ):
+        scheduler, schedule, wire = self._downstream_admission()
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        scheduler.req_to_token_pool.available_size = lambda: 0
+        self.assertIsNone(
+            scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, 2, lambda batch, stage: True
+            )
+        )
+        self.assertEqual(schedule.inflight_count, 0)
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [(0, 1)])
+        scheduler.req_to_token_pool.available_size = lambda: 1
+        self.assertIsNone(
+            scheduler._pp_vpp_fixed_select_tp_action(
+                schedule, 3, lambda batch, stage: False
+            )
+        )
+        self.assertEqual(schedule.ready_tasks, ((0, 1),))
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [(0, 1)])
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [])
+        action = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 4, lambda batch, stage: True
+        )
+        self.assertEqual(action, PipelineWavefrontAction(4, 0, 0, 1, 1))
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
+        schedule.complete(action)
+        scheduler._pp_vpp_accept_received_tensors(self._wire(stage=3))
+        pending = deque([object(), object()])
+        final = scheduler._pp_vpp_fixed_select_tp_action(
+            schedule, 5, lambda batch, stage: True, pending
+        )
+        self.assertEqual(final, PipelineWavefrontAction(5, 0, 0, 3, 1))
+        self.assertEqual(len(pending), 2)
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
+
+    def test_collective_task_selection_requires_every_tp_lane_to_permit_dispatch(self):
+        scheduler = self._fixed_scheduler()
+        scheduler._pp_vpp_fixed_tp = False
+        cpu_group = object()
+        scheduler.attn_tp_group = SimpleNamespace(
+            world_size=2, rank_in_group=1, ranks=[4, 6], cpu_group=cpu_group
+        )
+        schedule = PipelineRankSchedule(0, 2, 2, 2)
+        schedule.admit(0)
+
+        def broadcast(state, *, src, group):
+            self.assertEqual(src, 4)
+            self.assertIs(group, cpu_group)
+            state.copy_(torch.tensor([0, 0]))
+
+        for remote_ready in (0, 1):
+
+            def gather(output, local, *, group):
+                self.assertIs(group, cpu_group)
+                self.assertEqual(local.tolist(), [1])
+                output.copy_(torch.cat((torch.tensor([remote_ready]), local)))
+
+            with (
+                patch("torch.distributed.broadcast", side_effect=broadcast),
+                patch("torch.distributed.all_gather_into_tensor", side_effect=gather),
+            ):
+                action = scheduler._pp_vpp_fixed_select_tp_action(
+                    schedule, 7, lambda batch, stage: True
+                )
+            if remote_ready:
+                self.assertEqual(action, PipelineWavefrontAction(7, 0, 0, 0, 0))
+                self.assertIs(schedule.running, action)
+            else:
+                self.assertIsNone(action)
+                self.assertIsNone(schedule.running)
+                self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
+
+    def test_collective_task_selection_waits_for_every_lanes_input(self):
+        scheduler, schedule, wire = self._downstream_admission()
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        scheduler._pp_vpp_fixed_tp = False
+        cpu_group = object()
+        scheduler.attn_tp_group = SimpleNamespace(
+            world_size=2, rank_in_group=0, ranks=[4, 6], cpu_group=cpu_group
+        )
+
+        def broadcast(state, *, src, group):
+            self.assertIs(group, cpu_group)
+            self.assertEqual(src, 4)
+            self.assertEqual(state.tolist(), [0, 1])
+
+        for remote_input in (0, 1):
+            gathers = []
+
+            def gather(output, local, *, group):
+                self.assertIs(group, cpu_group)
+                self.assertEqual(local.tolist(), [1])
+                other = remote_input if not gathers else 1
+                gathers.append(other)
+                output.copy_(torch.cat((local, torch.tensor([other]))))
+
+            with (
+                patch("torch.distributed.broadcast", side_effect=broadcast),
+                patch("torch.distributed.all_gather_into_tensor", side_effect=gather),
+            ):
+                action = scheduler._pp_vpp_fixed_select_tp_action(
+                    schedule, 8, lambda batch, stage: True
+                )
+            if remote_input:
+                self.assertEqual(action, PipelineWavefrontAction(8, 0, 0, 1, 1))
+                # Input presence, remote admission readiness, dispatch permission.
+                self.assertEqual(gathers, [1, 1, 1])
+            else:
+                self.assertIsNone(action)
+                self.assertEqual(gathers, [0])
+                self.assertEqual(schedule.inflight_count, 0)
+                self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
+                self.assertIn((0, 1), scheduler._pp_vpp_early_activations)
 
     def test_control_queue_has_one_tp_sender_and_rejects_device_payloads(self):
         scheduler = self._scheduler(rank=1)

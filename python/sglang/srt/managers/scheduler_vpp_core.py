@@ -16,7 +16,7 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineWavefrontAction,
 )
 from sglang.srt.distributed.vpp_transport import P2PWorkGroup
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -596,3 +596,196 @@ class SchedulingVPPCore:
             key: value.to("cpu") if isinstance(value, torch.Tensor) else value
             for key, value in output_proxy.tensors.items()
         }
+
+    def _pp_vpp_broadcast_cpu_state(
+        self: Scheduler,
+        values: Optional[Tuple[int, ...]],
+        width: int,
+        src: int = 0,
+    ) -> torch.Tensor:
+        buffers = getattr(self, "_pp_vpp_cpu_broadcast_buffers", None)
+        if buffers is None:
+            buffers = self._pp_vpp_cpu_broadcast_buffers = {}
+        if width not in buffers:
+            buffers[width] = torch.empty(width, dtype=torch.int64, device="cpu")
+        state = buffers[width]
+        if self.attn_tp_group.rank_in_group == src:
+            if values is None or len(values) != width:
+                raise RuntimeError("invalid VPP TP broadcast state")
+            for index, value in enumerate(values):
+                state[index] = int(value)
+        if self.attn_tp_group.world_size > 1:
+            torch.distributed.broadcast(
+                state,
+                src=self.attn_tp_group.ranks[src],
+                group=self.attn_tp_group.cpu_group,
+            )
+        return state
+
+    def _pp_vpp_cancel_target(
+        self: Scheduler,
+        envelope: PipelineControlEnvelope,
+    ) -> Tuple[bool, Optional[Req]]:
+        """Wait for admission, then match the exact request incarnation."""
+        payload = envelope.payload or {}
+        rid = str(payload["rid"])
+        generation = int(payload["request_generation"])
+        if envelope.batch_seq >= 0:
+            if envelope.batch_seq > self._pp_vpp_highest_admitted_batch_seq:
+                return False, None
+            slot_id = envelope.batch_seq % len(self._pp_vpp_slot_batch_seqs)
+            if self._pp_vpp_slot_batch_seqs[slot_id] != envelope.batch_seq:
+                return True, None
+            batch = self.mbs[slot_id]
+            candidates = [] if batch is None else batch.reqs
+        else:
+            candidates = list(self.waiting_queue)
+            candidates += list(self.disagg_prefill_bootstrap_queue.queue)
+            candidates += [
+                req for batch in self.mbs if batch is not None for req in batch.reqs
+            ]
+            if self.chunked_req is not None:
+                candidates.append(self.chunked_req)
+        for req in candidates:
+            if (
+                req.rid == rid
+                and int(getattr(req, "session_generation", None) or 0) == generation
+                and getattr(req, "bootstrap_room", None) == payload["bootstrap_room"]
+            ):
+                return True, req
+        return True, None
+
+    def _pp_vpp_fixed_remote_admit(
+        self: Scheduler,
+        batch_seq: int,
+        rank_schedule: PipelineRankSchedule,
+    ) -> bool:
+        """Build the downstream batch from its first activation's manifest."""
+        slot_id = batch_seq % len(self._pp_vpp_slot_batch_seqs)
+        if self._pp_vpp_slot_batch_seqs[slot_id] == batch_seq:
+            return True
+
+        key = (batch_seq, self.pp_group.rank_in_group)
+        proxy = self._pp_vpp_early_activations.get(key)
+        if proxy is None:
+            raise RuntimeError("fixed VPP batch is missing its first activation")
+        manifest = proxy.tensors.get("vpp_batch_manifest")
+        envelope = self._pp_vpp_new_control(
+            PipelineControlKind.ADMIT,
+            batch_seq=batch_seq,
+            slot_id=slot_id,
+            payload={"manifest": manifest},
+        )
+        if not self._pp_vpp_remote_admit_slot_available(
+            envelope, self._pp_vpp_slot_batch_seqs
+        ):
+            return False
+        if not self._pp_vpp_remote_manifest_ready(envelope):
+            return False
+
+        batch = self._pp_vpp_prepare_wavefront_batch(
+            batch_seq,
+            self._pp_vpp_slot_batch_seqs,
+            expected_manifest=manifest,
+        )
+        if (
+            batch is None
+            or self._pp_vpp_batch_manifest(batch_seq, slot_id, batch) != manifest
+        ):
+            raise RuntimeError("fixed VPP activation batch manifest mismatch")
+
+        self._pp_vpp_register_prefix_batch(batch)
+        rank_schedule.admit(batch_seq)
+        self._pp_vpp_highest_admitted_batch_seq = max(
+            self._pp_vpp_highest_admitted_batch_seq, batch_seq
+        )
+        self._pp_vpp_promote_early_activations(batch_seq)
+        return True
+
+    def _pp_vpp_fixed_select_tp_action(
+        self: Scheduler,
+        rank_schedule: PipelineRankSchedule,
+        tick: int,
+        is_ready,
+        pending_send_work: Optional[deque] = None,
+    ) -> Optional[PipelineWavefrontAction]:
+        if self._pp_vpp_fixed_tp:
+            target = self._pp_vpp_fixed_next_task(rank_schedule)
+            if target is None:
+                return None
+            batch_seq, stage_id = target
+            if stage_id > 0:
+                key = (batch_seq, stage_id)
+                while (
+                    key not in self._pp_vpp_ready_proxies
+                    and key not in self._pp_vpp_early_activations
+                ):
+                    self._pp_vpp_accept_received_tensors(
+                        self._pp_vpp_activation_receiver.take()
+                    )
+                if not self.pp_group.is_first_rank:
+                    if not self._pp_vpp_fixed_remote_admit(batch_seq, rank_schedule):
+                        return None
+
+            while self._pp_vpp_arrivals:
+                rank_schedule.mark_ready(*self._pp_vpp_arrivals.popleft())
+            if (
+                pending_send_work is not None
+                and stage_id < rank_schedule.logical_size - 1
+            ):
+                self._pp_vpp_fixed_wait_send_credit(
+                    pending_send_work, rank_schedule.max_inflight
+                )
+            if not is_ready(batch_seq, stage_id):
+                return None
+            action = rank_schedule.dispatch(tick, batch_seq, stage_id)
+            self._pp_vpp_fixed_record_dispatch(action, rank_schedule)
+            return action
+
+        values = None
+        if self.attn_tp_group.rank_in_group == 0:
+            target = self._pp_vpp_fixed_next_task(rank_schedule)
+            values = (-1, -1) if target is None else target
+
+        identity = self._pp_vpp_broadcast_cpu_state(values, width=2)
+        batch_seq, stage_id = map(int, identity)
+        if batch_seq < 0:
+            return None
+
+        key = (batch_seq, stage_id)
+        if stage_id > 0:
+            has_input = (
+                key in self._pp_vpp_ready_proxies
+                or key in self._pp_vpp_early_activations
+            )
+            input_states = self._pp_vpp_all_gather_cpu_state((int(has_input),))
+            if not bool(input_states[:, 0].all()):
+                return None
+
+            if not self.pp_group.is_first_rank:
+                if not self._pp_vpp_fixed_remote_admit(batch_seq, rank_schedule):
+                    return None
+
+        while self._pp_vpp_arrivals:
+            rank_schedule.mark_ready(*self._pp_vpp_arrivals.popleft())
+
+        permitted = self._pp_vpp_all_gather_cpu_state(
+            (int(is_ready(batch_seq, stage_id)),)
+        )
+        if not bool(permitted[:, 0].all()):
+            return None
+
+        action = rank_schedule.dispatch(tick, batch_seq, stage_id)
+        self._pp_vpp_fixed_record_dispatch(action, rank_schedule)
+        return action
+
+    def _pp_vpp_find_req(self: Scheduler, rid: str) -> Optional[Req]:
+        for batch in [*self.mbs, *self.last_mbs]:
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                if req.rid == rid:
+                    return req
+        if self.chunked_req is not None and self.chunked_req.rid == rid:
+            return self.chunked_req
+        return None
