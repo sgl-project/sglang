@@ -7,7 +7,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_gfx942_supported, is_hip, is_npu
+from sglang.srt.utils.device import (
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_hip,
+    is_npu,
+)
 
 _is_npu = is_npu()
 
@@ -333,6 +338,7 @@ if HAS_TILELANG:
         min_scored_len: int = 0,
         threads: int = 128,
         dtype: str = "bfloat16",
+        groups_per_cta: int = 0,
     ):
         # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
         # so pages are packed as sub-pages of one 64-row tile.
@@ -353,9 +359,16 @@ if HAS_TILELANG:
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
             Scale: T.float32,
         ):
-            # A fixed number of CTAs per row strides over that row's groups, so the
-            # grid no longer scales with the page-table width (the max context).
-            with T.Kernel(batch, ctas_per_row, threads=threads) as (bx, cta):
+            # groups_per_cta == 0: a fixed number of CTAs per row strides over that
+            # row's groups, so the grid does not scale with the page-table width.
+            # groups_per_cta > 0: each CTA scores that many consecutive groups and
+            # the grid spans the page table; CTAs past a row's context exit at once.
+            grid_y = (
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta)
+                if groups_per_cta > 0
+                else ctas_per_row
+            )
+            with T.Kernel(batch, grid_y, threads=threads) as (bx, cta):
                 q_shared = T.alloc_shared([heads, head_dim], dtype)
                 k_shared = T.alloc_shared([GROUP, head_dim], dtype)
                 scores = T.alloc_fragment([GROUP, heads], T.float32)
@@ -365,11 +378,24 @@ if HAS_TILELANG:
                 num_groups = T.ceildiv(context_len, GROUP)
 
                 # Rows at or below min_scored_len select every block, so their
-                # scores are never read.
-                if context_len > min_scored_len:
+                # scores are never read. Branches on groups_per_cta are trace-time,
+                # keeping ROCm-only terms out of the CUDA kernel.
+                if (
+                    context_len > min_scored_len and cta * groups_per_cta < num_groups
+                    if groups_per_cta > 0
+                    else context_len > min_scored_len
+                ):
                     T.copy(Q[bx, 0, :, :], q_shared)
-                    for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):
-                        group = step * ctas_per_row + cta
+                    for step in T.serial(
+                        groups_per_cta
+                        if groups_per_cta > 0
+                        else T.ceildiv(num_groups, ctas_per_row)
+                    ):
+                        group = (
+                            cta * groups_per_cta + step
+                            if groups_per_cta > 0
+                            else step * ctas_per_row + cta
+                        )
                         if group < num_groups:
                             # TileLang's pipeliner rejects dynamic loops around smem
                             # copies; unroll the sub-pages at the Python level.
@@ -617,7 +643,21 @@ def tilelang_qsa_mqa_decode(
             dtype=torch.float32,
             device=q.device,
         )
-    if not q.shape[0] or not max_model_len:
+    # MI355X: four wavefronts per CTA (about 1.5x) and consecutive groups per CTA over
+    # a page-table-wide grid (bit-exact); other devices keep the kernel defaults. Two
+    # groups per CTA up to 48 rows, four above: measured fastest at each row count
+    # (q.shape[0] is fixed per CUDA graph; the per-row context is not known here).
+    gfx95_launch = (
+        {"threads": 256, "groups_per_cta": 2 if q.shape[0] <= 48 else 4}
+        if is_gfx95_supported()
+        else {}
+    )
+    # An empty page table would give the page-table-wide grid zero CTAs.
+    if (
+        not q.shape[0]
+        or not max_model_len
+        or (gfx95_launch and not page_table.shape[1])
+    ):
         return logits
     # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
     # sixteen. Zero-padding preserves the weight-free head sum on both paths.
@@ -641,9 +681,14 @@ def tilelang_qsa_mqa_decode(
         heads=kernel_heads,
         head_dim=head_dim,
         page_size=page_size,
-        ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
+        # Unused with groups_per_cta (it sets the grid); fixed so it does not
+        # multiply the kernel specializations.
+        ctas_per_row=(
+            1 if gfx95_launch else _decode_ctas_per_row(q.shape[0], q.device)
+        ),
         min_scored_len=min_scored_len,
         dtype=_TILELANG_DTYPES[scoring_dtype],
+        **gfx95_launch,
     )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),

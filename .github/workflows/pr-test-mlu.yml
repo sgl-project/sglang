@@ -1,8 +1,9 @@
 name: PR Test (MLU)
 
 # Label-gated MLU CI workflow. The PR must carry BOTH `run-ci` (basic-CI
-# prerequisite) and `run-ci-mlu-extra` (explicit opt-in) for the MLU test job to
-# run. The shared gate reads current labels, including on explicit reruns.
+# prerequisite) and `run-ci-mlu-extra` (explicit opt-in), and its head commit a
+# run-ci approval unless its author may approve, for the MLU test job to run.
+# The shared gate reads current labels, including on explicit reruns.
 
 on:
   # Run the reviewed base-branch workflow, never workflow code from the PR.
@@ -20,6 +21,7 @@ permissions:
   actions: read
   contents: read
   pull-requests: read
+  statuses: read
 
 concurrency:
   group: pr-test-mlu-${{ github.event.pull_request.number || inputs.ref || github.ref }}-main
@@ -30,6 +32,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-label: run-ci-mlu-extra
+      approval-mode: commit
     secrets: inherit
 
   pr-test-mlu:
