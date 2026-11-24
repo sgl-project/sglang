@@ -28,6 +28,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -440,6 +441,13 @@ class SchedulerBatchResultProcessor:
                 batch,
             )
 
+            # Without prefix sharing, decode reads only the SWA window, so a
+            # completed prefill can return its out-of-window rows right away.
+            retire_swa_after_prefill = (
+                self.tree_cache.supports_swa()
+                and not self.tree_cache.supports_prefix_sharing()
+            )
+
             # Check finish conditions
             logprob_pt = 0
 
@@ -554,6 +562,8 @@ class SchedulerBatchResultProcessor:
                                     req,
                                 )
                             )
+                        if retire_swa_after_prefill:
+                            kv_ops.append(partial(self._retire_swa_after_prefill, req))
 
                     if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
@@ -1546,6 +1556,10 @@ class SchedulerBatchResultProcessor:
             HTTPStatus.INTERNAL_SERVER_ERROR,
             "InternalServerError",
         )
+
+    def _retire_swa_after_prefill(self, req: Req) -> None:
+        if req.kv.holds_kv:
+            retire_window(req, req.seqlen - 1, self.tree_cache)
 
     def _prepare_kv_cache_release(self, req: Req) -> None:
         # Only workers that keep KV outside the pool (MLX) define the hook.
