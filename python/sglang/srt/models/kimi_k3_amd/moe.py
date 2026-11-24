@@ -761,6 +761,7 @@ def link_hip_paths(model) -> None:
     """A KimiK3LinearModel's links between its layers' ROCm paths, once every
     layer is built."""
     link_column_tails_hip(model)
+    _init_dcp_ll_comm_for_model(model)
     link_row_sharded_stream_hip(model)
 
 
@@ -822,3 +823,34 @@ def link_column_tails_hip(model) -> None:
             comm=comm,
             max_tokens=max_tokens,
         )
+
+
+def _init_dcp_ll_comm_for_model(model) -> None:
+    """Pre-allocate the gfx950 DCP push-A2A scratch before KV pool sizing."""
+    parallel = get_parallel()
+    if parallel.attn_dcp_size <= 1 or parallel.dcp_comm_backend != "a2a":
+        return
+    dcp_group = parallel.dcp_group
+    if dcp_group is None:
+        return
+    from sglang.srt.layers.communication.dcp_a2a_lse_hip import (
+        init_dcp_ll_comm_hip,
+    )
+    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+        DeepseekMLARocmForwardMixin,
+    )
+
+    for layer in model.layers[model.start_layer : model.end_layer]:
+        attn = layer.self_attn
+        if isinstance(attn, DeepseekMLARocmForwardMixin):
+            head_dim = (
+                attn.v_head_dim
+                if attn._dcp_project_before_merge()
+                else attn.kv_lora_rank
+            )
+            init_dcp_ll_comm_hip(
+                dcp_group,
+                head_dim=head_dim,
+                num_local_heads=attn.num_local_heads,
+            )
+            return
