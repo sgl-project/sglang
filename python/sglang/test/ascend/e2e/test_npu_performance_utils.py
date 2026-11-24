@@ -35,6 +35,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     wait_for_prefill_decode_exit,
     wait_server_ready,
 )
+from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -406,6 +407,7 @@ def run_bench_serving(
       - cache_hit_rate_pct: overall KV hit rate across all tiers
       - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
       - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+      - storage_hit_rate_pct: L3 tier hit rate (HiCache storage backend)
     Thresholds for these tiers are declared on the test case as the
     min_hit_rate_pcts class attribute and enforced by assert_metrics,
     which requires cache_report=True to have any values to check.
@@ -632,6 +634,13 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
+                elif stripped_line.startswith("Storage:") and stripped_line.endswith(
+                    "%"
+                ):
+                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["storage_hit_rate_pct"] = parts[1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -1113,6 +1122,7 @@ def assert_metrics(self, metrics):
             "cache": "cache_hit_rate_pct",
             "device": "device_hit_rate_pct",
             "host": "host_hit_rate_pct",
+            "storage": "storage_hit_rate_pct",
         }
         unknown_tiers = sorted(set(min_hit_rate_pcts) - set(hit_rate_keys))
         if unknown_tiers:
@@ -1328,6 +1338,11 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     def setUpClass(cls):
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Start the storage service first: it may export MOONCAKE_* variables
+        # that the server environment copy below has to pick up.
+        other_args = list(cls.other_args)
+        cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
+
         env = os.environ.copy()
         for key, value in env.items():
             logger.info(f"ENV_VAR_SYS {key}:{value}")
@@ -1335,8 +1350,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             for key, value in cls.envs.items():
                 logger.info(f"ENV_VAR_CASE {key}:{value}")
                 env[key] = value
-
-        other_args = list(cls.other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -1353,6 +1366,12 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
@@ -1462,11 +1481,19 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        pass
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["master"])
     def start_pd_mix_master_node(cls):
+        cls.storage_service_process = maybe_start_hicache_storage_service(
+            cls.model_config.get("other_args")
+        )
         sglang_thread = threading.Thread(
             target=launch_pd_mix_node, args=(cls.model_config,)
         )
@@ -1630,6 +1657,12 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                     logger.warning("Process did NOT exit in time")
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
         logger.info("tearDownClass finished")
 
     @classmethod
@@ -1646,6 +1679,10 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
+        if cls.hostname.endswith("prefill-0"):
+            cls.storage_service_process = maybe_start_hicache_storage_service(
+                cls.model_config.get("prefill_args")
+            )
         logger.info(f"Starting pd separation node...")
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")
