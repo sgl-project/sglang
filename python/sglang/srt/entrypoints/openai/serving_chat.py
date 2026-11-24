@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
 from typing import (
@@ -1343,13 +1342,13 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
-            images_config=getattr(request, "images_config", None),
+            images_config=request.images_config,
             video_config=_build_video_config(request),
             mm_processor_kwargs=request.mm_processor_kwargs,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
-            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
-            use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            max_dynamic_patch=request.max_dynamic_patch,
+            use_audio_in_video=request.use_audio_in_video,
             return_prompt_token_ids=(
                 request.return_prompt_token_ids
                 or request.return_token_ids
@@ -2348,6 +2347,8 @@ class OpenAIServingChat(OpenAIServingBase):
         stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
 
         if request.stop:
+            # A template declares stop_str as a string, a tuple or a list.
+            stop = [stop] if isinstance(stop, str) else list(stop)
             if isinstance(request.stop, str):
                 stop.append(request.stop)
             else:
