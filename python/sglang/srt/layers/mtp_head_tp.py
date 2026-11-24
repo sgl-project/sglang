@@ -218,7 +218,6 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
 
 
 def configure_draft_head_tp(model, hot_token_id):
-    from sglang.srt.distributed.parallel_state import init_mtp_head_tp_group
     from sglang.srt.runtime_context import get_parallel, get_spec
 
     log = logging.getLogger(__name__)
@@ -255,6 +254,8 @@ def configure_draft_head_tp(model, hot_token_id):
             log.info("MTP draft head TP4 not enabled: a group of 4 spans several nodes")
         return
     if parallel.tp_size > 4:
+        from sglang.srt.distributed.parallel_state import init_mtp_head_tp_group
+
         group = init_mtp_head_tp_group(groups, group)
     weight = model.lm_head.weight
     model.draft_head_tp = DraftHeadTP(group, model.config.vocab_size)
