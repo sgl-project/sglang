@@ -162,19 +162,8 @@ mod tests {
     /// for its reasoning parser to split the thinking block from the text.
     #[tokio::test]
     async fn gemma4_messages_keep_reasoning_markers() {
-        use crate::api_server::http::openai::test_utils::{
-            answering_app_state_with_request, chatml_formatter, chunk,
-        };
-        use crate::message::config::{ModelConfig, ServerArgs};
-        use crate::message::request::RequestKind;
+        use crate::api_server::http::openai::test_utils::{GEMMA4_STRIPPED, gemma4_marker_state};
 
-        const MARKED: &str = "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
-        const STRIPPED: &str = "thought\nCheck the calculation.The answer is 4.";
-        let tokenizer = sglang_processor::dynamo_tokenizers::Tokenizer::from_file(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/testdata/special_token_tokenizer.json"
-        ))
-        .unwrap();
         for (model_type, expected) in [
             (
                 "gemma4",
@@ -185,39 +174,14 @@ mod tests {
             ),
             (
                 "llama",
-                serde_json::json!([{"type": "text", "text": STRIPPED}]),
+                serde_json::json!([{"type": "text", "text": GEMMA4_STRIPPED}]),
             ),
         ] {
-            let args = Arc::new(ServerArgs {
-                served_model_name: "m".into(),
-                reasoning_parser: Some("gemma4".into()),
-                model_config: ModelConfig {
-                    model_type: Some(model_type.into()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            let state = answering_app_state_with_request(
-                args,
-                chatml_formatter(),
-                Some(tokenizer.clone()),
-                |request| {
-                    let RequestKind::Generate(generate) = &request.kind else {
-                        panic!("expected generation");
-                    };
-                    // Replay the same output at the decoder boundary with the submitted flag.
-                    let text = if generate.sampling_params.skip_special_tokens {
-                        STRIPPED
-                    } else {
-                        MARKED
-                    };
-                    chunk(request.rid.as_str(), text, true)
-                },
-            );
+            let state = gemma4_marker_state(model_type, Some("gemma4"), |_| {});
             let (status, body) = post(
                 state,
                 "/v1/messages",
-                r#"{"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "What is 2 + 2?"}]}"#,
+                r#"{"model": "model", "max_tokens": 8, "messages": [{"role": "user", "content": "What is 2 + 2?"}]}"#,
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");

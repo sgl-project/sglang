@@ -1226,8 +1226,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
-/// Python's chat-layer facts for the served template and checkpoint, shared by
-/// the chat, lowered chat and Responses paths.
+/// Python's chat-layer facts for the served template and checkpoint.
 pub(crate) fn served_chat_model(
     formatter: Option<&super::ChatFormatter>,
     server_args: &ServerArgs,
@@ -1253,8 +1252,8 @@ mod tests {
 
     use super::super::ChatFormatter;
     use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, answering_app_state_with_request,
-        body_json, chat_submitted, chatml_formatter, chunk, post_json, with_cached_tokens,
+        GEMMA4_MARKED, GEMMA4_STRIPPED, answering_app_state_with, answering_app_state_with_item,
+        body_json, chat_submitted, chunk, gemma4_marker_state, post_json, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1529,50 +1528,15 @@ mod tests {
     /// Dropping Gemma 4's channel markers makes reasoning indistinguishable from content.
     #[tokio::test]
     async fn gemma4_chat_keeps_reasoning_markers() {
-        use crate::message::config::ModelConfig;
-        use crate::message::request::RequestKind;
-
-        const MARKED: &str = "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
-        const STRIPPED: &str = "thought\nCheck the calculation.The answer is 4.";
-        let tokenizer = Tokenizer::from_file(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/testdata/special_token_tokenizer.json"
-        ))
-        .unwrap();
-
         for (model_type, parser, stream, expected_content) in [
             ("gemma4", Some("gemma4"), false, "The answer is 4."),
             ("gemma4", Some("gemma4"), true, "The answer is 4."),
-            ("gemma4_unified", None, false, MARKED),
-            ("llama", None, false, STRIPPED),
+            ("gemma4_unified", None, false, GEMMA4_MARKED),
+            ("llama", None, false, GEMMA4_STRIPPED),
         ] {
-            let args = Arc::new(ServerArgs {
-                served_model_name: "model".into(),
-                reasoning_parser: parser.map(str::to_owned),
-                model_config: ModelConfig {
-                    model_type: Some(model_type.into()),
-                    ..Default::default()
-                },
-                ..Default::default()
+            let state = gemma4_marker_state(model_type, parser, move |generate| {
+                assert_eq!(generate.chat_prompt.is_some(), parser.is_some());
             });
-            let state = answering_app_state_with_request(
-                args,
-                chatml_formatter(),
-                Some(tokenizer.clone()),
-                move |request| {
-                    let RequestKind::Generate(generate) = &request.kind else {
-                        panic!("expected generation");
-                    };
-                    assert_eq!(generate.chat_prompt.is_some(), parser.is_some());
-                    // Replay the same output at the decoder boundary with the submitted flag.
-                    let text = if generate.sampling_params.skip_special_tokens {
-                        STRIPPED
-                    } else {
-                        MARKED
-                    };
-                    chunk(request.rid.as_str(), text, true)
-                },
-            );
             let response = post_json(
                 super::routes().with_state(state),
                 "/v1/chat/completions",
@@ -1618,48 +1582,13 @@ mod tests {
     #[tokio::test]
     async fn gemma4_grpc_responses_keeps_reasoning_markers() {
         use crate::api_server::responses::Responses;
-        use crate::message::config::ModelConfig;
-        use crate::message::request::RequestKind;
         use sglang_api_types::api::v1 as api;
-
-        const MARKED: &str = "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
-        const STRIPPED: &str = "thought\nCheck the calculation.The answer is 4.";
-        let tokenizer = Tokenizer::from_file(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/testdata/special_token_tokenizer.json"
-        ))
-        .unwrap();
 
         for (model_type, reasoning, answer) in [
             ("gemma4", Some("Check the calculation."), "The answer is 4."),
-            ("llama", None, STRIPPED),
+            ("llama", None, GEMMA4_STRIPPED),
         ] {
-            let args = Arc::new(ServerArgs {
-                served_model_name: "model".into(),
-                reasoning_parser: Some("gemma4".into()),
-                model_config: ModelConfig {
-                    model_type: Some(model_type.into()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            let state = answering_app_state_with_request(
-                args,
-                chatml_formatter(),
-                Some(tokenizer.clone()),
-                |request| {
-                    let RequestKind::Generate(generate) = &request.kind else {
-                        panic!("expected generation");
-                    };
-                    // Replay the same output at the decoder boundary with the submitted flag.
-                    let text = if generate.sampling_params.skip_special_tokens {
-                        STRIPPED
-                    } else {
-                        MARKED
-                    };
-                    chunk(request.rid.as_str(), text, true)
-                },
-            );
+            let state = gemma4_marker_state(model_type, Some("gemma4"), |_| {});
             let adapter = Responses {
                 core: &state.core,
                 chat_formatter: state.chat_formatter.as_ref(),

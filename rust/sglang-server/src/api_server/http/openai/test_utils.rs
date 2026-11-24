@@ -289,6 +289,52 @@ fn answering_app_state_built(
     })
 }
 
+/// Gemma 4 output with its channel markers, and the same tokens decoded with
+/// `skip_special_tokens`.
+pub(in crate::api_server::http) const GEMMA4_MARKED: &str =
+    "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
+pub(in crate::api_server::http) const GEMMA4_STRIPPED: &str =
+    "thought\nCheck the calculation.The answer is 4.";
+
+/// App state for `model_type` whose engine replays [`GEMMA4_MARKED`] at the
+/// decoder boundary, or [`GEMMA4_STRIPPED`] when the request skips special
+/// tokens. `inspect` sees each submitted generation.
+pub(in crate::api_server::http) fn gemma4_marker_state(
+    model_type: &str,
+    reasoning_parser: Option<&str>,
+    inspect: impl Fn(&crate::message::request::GenerateRequest) + Send + 'static,
+) -> Arc<super::AppState> {
+    use crate::message::config::ModelConfig;
+    use crate::message::request::RequestKind;
+
+    let tokenizer = sglang_processor::dynamo_tokenizers::Tokenizer::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/special_token_tokenizer.json"
+    ))
+    .unwrap();
+    let args = Arc::new(ServerArgs {
+        served_model_name: "model".into(),
+        reasoning_parser: reasoning_parser.map(str::to_owned),
+        model_config: ModelConfig {
+            model_type: Some(model_type.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    answering_app_state_with_request(args, chatml_formatter(), Some(tokenizer), move |request| {
+        let RequestKind::Generate(generate) = &request.kind else {
+            panic!("expected generation");
+        };
+        inspect(generate);
+        let text = if generate.sampling_params.skip_special_tokens {
+            GEMMA4_STRIPPED
+        } else {
+            GEMMA4_MARKED
+        };
+        chunk(request.rid.as_str(), text, true)
+    })
+}
+
 /// The built-in chatml template, for tests that render a chat prompt.
 pub(crate) fn chatml_formatter() -> super::ChatFormatter {
     sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap()
