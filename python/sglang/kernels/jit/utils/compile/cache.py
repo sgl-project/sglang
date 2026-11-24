@@ -497,6 +497,7 @@ def _to_entries(
     their paths are unstable, and their contents are already a function of
     inputs ``build_key`` covers.
     """
+    build_dir = build_dir.resolve()
     seen: Dict[Tuple[str, str], _DepEntry] = {}
     for candidate in dependencies:
         path = (
