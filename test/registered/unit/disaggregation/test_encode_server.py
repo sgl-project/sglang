@@ -753,10 +753,11 @@ class TestStagedNativeTransfer(CustomTestCase):
         from sglang.encoder.v1 import encoder_pb2 as pb
         from sglang.srt.disaggregation.encoder import nixl
 
-        async def run(model, images, videos):
-            with self.native_encoder("nixl", model, audio_processor=True) as (
+        async def run(model, images, videos, backend="nixl"):
+            with self.native_encoder(backend, model, audio_processor=True) as (
                 svc,
                 enc,
+                receivers,
                 *_,
             ):
                 info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
@@ -793,20 +794,37 @@ class TestStagedNativeTransfer(CustomTestCase):
                     )
                 visual_rows = (3 if images else 0) + (5 if videos else 0)
                 shape = (visual_rows * width + 4, 1) if images else (2, 2)
-                spec = await svc.Describe(pb.DescribeRequest(transfer=transfer), Mock())
-                self.assertEqual(tuple(spec.shape), shape)
-                with patch.object(
-                    nixl, "write_embedding", new_callable=AsyncMock
-                ) as write:
-                    await svc.Deliver(
-                        pb.DeliverRequest(transfer=transfer, nixl_target=b"dest"),
-                        Mock(),
+                if backend == "nixl":
+                    spec = await svc.Describe(
+                        pb.DescribeRequest(transfer=transfer), Mock()
                     )
-                    packed = write.await_args.args[0]
-                    self.assertEqual(tuple(packed.shape), shape)
-                    torch.testing.assert_close(
-                        packed.flatten()[-4:], torch.tensor([51.0, 52.0, 61.0, 62.0])
-                    )
+                    self.assertEqual(tuple(spec.shape), shape)
+                    with patch.object(
+                        nixl, "write_embedding", new_callable=AsyncMock
+                    ) as write:
+                        await svc.Deliver(
+                            pb.DeliverRequest(transfer=transfer, nixl_target=b"dest"),
+                            Mock(),
+                        )
+                        packed = write.await_args.args[0]
+                else:
+                    with receivers.socket(zmq.PULL) as sock:
+                        port = sock.bind_to_random_port("tcp://127.0.0.1")
+                        await svc.Deliver(
+                            pb.DeliverRequest(
+                                transfer=transfer, receive_url=f"127.0.0.1:{port}"
+                            ),
+                            Mock(),
+                        )
+                        header, data = await asyncio.wait_for(sock.recv_multipart(), 2)
+                    envelope = safe_pickle_loads(header)
+                    packed = torch.frombuffer(
+                        bytearray(data), dtype=envelope.dtype
+                    ).view(envelope.shape)
+                self.assertEqual(tuple(packed.shape), shape)
+                torch.testing.assert_close(
+                    packed.flatten()[-4:], torch.tensor([51.0, 52.0, 61.0, 62.0])
+                )
                 self.assertFalse(enc.req_states)
 
         for model, images, videos in (
@@ -819,6 +837,7 @@ class TestStagedNativeTransfer(CustomTestCase):
         ):
             with self.subTest(model=model):
                 asyncio.run(run(model, images, videos))
+        asyncio.run(run("qwen3_omni_moe", True, True, "zmq_to_scheduler"))
 
     def test_staged_native_model_layout(self):
         from sglang.encoder.v1 import encoder_pb2 as pb
