@@ -9,6 +9,7 @@ from sglang.srt.layers.mtp_head_tp import (
     _ineligible_reason,
     configure_draft_head_tp,
     head_tp4_rank_groups,
+    lm_head_shard_range,
     local_argmax_pair,
     merge_argmax_pairs,
 )
@@ -57,10 +58,46 @@ class TestMTPHeadTopology(unittest.TestCase):
                 configure_draft_head_tp(model, None)
             self.assertFalse(hasattr(model, "draft_head_tp"))
             self.assertIn("megakernel", logs.output[0])
+            self.assertEqual(logs.records[0].levelname, "INFO")
+
+    def test_explicit_on_warns_when_it_cannot_apply(self):
+        with (
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    pp_size=2,
+                    tp_size=4,
+                    tp_group=SimpleNamespace(cpu_group=None, rank=0),
+                ),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_spec",
+                return_value=SimpleNamespace(draft_head_tp="on"),
+            ),
+            mock.patch("torch.distributed.all_reduce"),
+            self.assertLogs("sglang.srt.layers.mtp_head_tp", "INFO") as logs,
+        ):
+            configure_draft_head_tp(SimpleNamespace(), None)
+        self.assertEqual(logs.records[0].levelname, "WARNING")
 
 
 class TestMTPHeadLayouts(unittest.TestCase):
-    def reason(self, enable_dp_lm_head, head_tp_size, attn_tp_size=1):
+    def reason(
+        self,
+        enable_dp_lm_head=False,
+        head_tp_size=4,
+        attn_tp_size=1,
+        mode="on",
+        name="Qwen3_5ForCausalLMMTP",
+        disagg="decode",
+        hot_token_id=None,
+        lora=False,
+        dtype=torch.bfloat16,
+        bias=None,
+        org_vocab_size=248320,
+        rows=62080,
+        hip=False,
+    ):
         parallel = SimpleNamespace(
             pp_size=1,
             tp_size=4,
@@ -69,16 +106,23 @@ class TestMTPHeadLayouts(unittest.TestCase):
             enable_dp_lm_head=enable_dp_lm_head,
         )
         spec = SimpleNamespace(
+            draft_head_tp=mode,
             speculative_eagle_topk=1,
             speculative_use_rejection_sampling=False,
             speculative_adaptive=False,
         )
         lm_head = SimpleNamespace(
             weight=SimpleNamespace(
-                is_cuda=True, dtype=torch.bfloat16, ndim=2, shape=(248320, 8)
+                is_cuda=True,
+                dtype=dtype,
+                ndim=2,
+                shape=(248320 if enable_dp_lm_head else rows, 8),
             ),
-            tp_size=head_tp_size,
+            tp_size=1 if enable_dp_lm_head and head_tp_size == 4 else head_tp_size,
             num_added_embeddings=0,
+            num_embeddings_per_partition=62080,
+            org_vocab_size=org_vocab_size,
+            bias=bias,
         )
         lp = SimpleNamespace(
             use_fp32_lm_head=False,
@@ -86,9 +130,15 @@ class TestMTPHeadLayouts(unittest.TestCase):
             final_logit_softcapping=None,
             return_full_logits=False,
         )
-        model = SimpleNamespace(
-            lm_head=lm_head, logits_processor=lp, config=SimpleNamespace(vocab_size=248320)
-        )
+        model = type(
+            name,
+            (),
+            dict(
+                lm_head=lm_head,
+                logits_processor=lp,
+                config=SimpleNamespace(vocab_size=248320),
+            ),
+        )()
         with (
             mock.patch(
                 "sglang.srt.speculative.eagle_megakernel._offers_eagle_entries",
@@ -100,23 +150,61 @@ class TestMTPHeadLayouts(unittest.TestCase):
             ),
             mock.patch(
                 "sglang.srt.runtime_context.get_disagg",
-                return_value=SimpleNamespace(disaggregation_mode="decode"),
+                return_value=SimpleNamespace(disaggregation_mode=disagg),
             ),
             mock.patch(
                 "sglang.srt.runtime_context.get_lora",
-                return_value=SimpleNamespace(enable_lora=False),
+                return_value=SimpleNamespace(enable_lora=lora),
             ),
+            mock.patch("sglang.srt.layers.mtp_head_tp.is_hip", return_value=hip),
         ):
-            return _ineligible_reason(model, None, parallel, spec)
+            return _ineligible_reason(model, hot_token_id, parallel, spec)
 
     def test_replicated_and_stock_sharded_heads_are_eligible(self):
-        self.assertIsNone(self.reason(enable_dp_lm_head=True, head_tp_size=1))
-        self.assertIsNone(self.reason(enable_dp_lm_head=False, head_tp_size=4))
+        self.assertIsNone(self.reason(enable_dp_lm_head=True))
+        self.assertIsNone(self.reason())
 
-    def test_other_layouts_decline(self):
-        self.assertIn("not replicated", self.reason(True, 4))
-        self.assertIn("not sharded", self.reason(False, 1))
-        self.assertIn("pure attention DP", self.reason(False, 4, attn_tp_size=2))
+    def test_declined_conditions(self):
+        cases = (
+            ("not replicated", dict(enable_dp_lm_head=True, head_tp_size=8)),
+            ("not sharded", dict(head_tp_size=1)),
+            ("not sharded", dict(rows=62079)),
+            ("pure attention DP", dict(attn_tp_size=2)),
+            ("not a decode worker", dict(disagg="null")),
+            ("token map", dict(hot_token_id=object())),
+            ("LoRA", dict(lora=True)),
+            ("plain bf16", dict(dtype=torch.float16)),
+            ("plain bf16", dict(bias=object())),
+            ("plain bf16", dict(org_vocab_size=248000)),
+        )
+        for reason, kwargs in cases:
+            with self.subTest(reason=reason, kwargs=list(kwargs)):
+                self.assertIn(reason, self.reason(**kwargs) or "")
+
+    def test_auto_only_for_validated_architectures_on_cuda(self):
+        self.assertIsNone(self.reason(mode="auto"))
+        self.assertIn(
+            "not validated for Qwen4ExpForCausalLMMTP",
+            self.reason(mode="auto", name="Qwen4ExpForCausalLMMTP"),
+        )
+        self.assertIn("ROCm", self.reason(mode="auto", hip=True))
+        # An explicit "on" forces any architecture that meets the conditions.
+        self.assertIsNone(self.reason(mode="on", name="Qwen4ExpForCausalLMMTP"))
+
+    def test_presharded_range_follows_shard_indices(self):
+        for start, end, expected in (
+            (0, 62080, (0, 62080)),
+            (186240, 248320, (186240, 62080)),
+            (186240, 200000, (186240, 13760)),  # short last shard
+            (248320, 248320, (248320, 0)),  # rank past the vocabulary
+        ):
+            lm_head = SimpleNamespace(
+                shard_indices=SimpleNamespace(
+                    org_vocab_start_index=start,
+                    num_org_elements=end - start,
+                )
+            )
+            self.assertEqual(lm_head_shard_range(lm_head), expected)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

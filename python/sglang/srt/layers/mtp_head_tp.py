@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from sglang.srt.utils.device import is_hip
+
 
 @triton.jit
 def _partial_max(
@@ -132,11 +134,11 @@ def merge_argmax_pairs(pairs):
 
 
 class DraftHeadTP(nn.Module):
-    def __init__(self, group, vocab_size, presharded=False):
+    def __init__(self, group, vocab_size, presharded=None):
         super().__init__()
         self.group = group
         self.vocab_size = vocab_size
-        # presharded: the weight is this rank's padded vocab shard (stock TP lm_head).
+        # presharded: (first token id, valid rows) of this rank's stock TP lm_head shard.
         self.presharded = presharded
 
     def forward(self, hidden, weight, draft_nan_sentinel=False):
@@ -144,9 +146,8 @@ class DraftHeadTP(nn.Module):
         rows = hidden.shape[0]
         gathered = self.group.all_gather(hidden.contiguous(), dim=0)
         if self.presharded:
-            start = rank * weight.shape[0]
+            start, width = self.presharded
             shard_weight = weight
-            width = max(min(weight.shape[0], self.vocab_size - start), 0)
         else:
             shard = triton.cdiv(self.vocab_size, size)
             start, end = (
@@ -160,6 +161,12 @@ class DraftHeadTP(nn.Module):
         gathered_pairs = self.group.all_gather(pairs, dim=0).view(size, size * rows, 2)
         selected = merge_argmax_pairs(gathered_pairs)
         return selected[rank * rows : (rank + 1) * rows]
+
+
+def lm_head_shard_range(lm_head):
+    """(first token id, number of real vocabulary rows) held by this rank's TP shard."""
+    indices = lm_head.shard_indices
+    return indices.org_vocab_start_index, indices.num_org_elements
 
 
 def draft_head_tp_of(model):
@@ -180,6 +187,11 @@ def head_tp4_rank_groups(rank_hosts):
     return groups
 
 
+# Architectures whose draft head sharding was validated end to end (accuracy + serving).
+# `--draft-head-tp on` forces any other architecture that satisfies the conditions below.
+VALIDATED_DRAFT_MODELS = frozenset({"Qwen3_5ForCausalLMMTP"})
+
+
 def _ineligible_reason(model, hot_token_id, parallel, spec):
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_entry
     from sglang.srt.runtime_context import get_disagg, get_lora
@@ -187,6 +199,14 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
 
     if parallel.pp_size != 1 or parallel.tp_size not in (4, 8, 16):
         return "needs pp_size 1 and tp_size 4, 8 or 16"
+    if spec.draft_head_tp == "auto":
+        if is_hip():
+            return "not validated on ROCm; use --draft-head-tp on to force it"
+        if type(model).__name__ not in VALIDATED_DRAFT_MODELS:
+            return (
+                f"not validated for {type(model).__name__}; "
+                "use --draft-head-tp on to force it"
+            )
     if _offers_eagle_entries(draft_model=model) or (
         megakernel_entry(model, "draft_step_fold") is not None
     ):
@@ -215,14 +235,20 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
         and weight.dtype == torch.bfloat16
         and weight.ndim == 2
         and model.config.vocab_size < 2**24 - 1
-        and getattr(lm_head, "num_added_embeddings", 0) == 0
+        and lm_head.num_added_embeddings == 0
+        # A tied head is the embedding module, which has no bias attribute.
+        and getattr(lm_head, "bias", None) is None
+        and lm_head.org_vocab_size == model.config.vocab_size
     ):
         return "the lm_head is not a plain bf16 CUDA matrix"
     if parallel.enable_dp_lm_head:
         # --enable-dp-lm-head: every rank holds the whole vocabulary.
         if lm_head.tp_size != 1 or weight.shape[0] < model.config.vocab_size:
             return "the lm_head is not replicated"
-    elif lm_head.tp_size != parallel.tp_size:
+    elif (
+        lm_head.tp_size != parallel.tp_size
+        or weight.shape[0] != lm_head.num_embeddings_per_partition
+    ):
         return "the lm_head is not sharded over the TP group"
     if (
         lp.use_fp32_lm_head
@@ -252,12 +278,15 @@ def configure_draft_head_tp(model, hot_token_id):
     if not agreement.item():
         if group.rank == 0:
             declined(
-                "Draft head TP not enabled: %s", reason or "another TP rank is ineligible"
+                "Draft head TP not enabled: %s",
+                reason or "another TP rank is ineligible",
             )
         return
     presharded = not parallel.enable_dp_lm_head
-    if not presharded and parallel.tp_size > 4 and group.ranks != list(
-        range(torch.distributed.get_world_size())
+    if (
+        not presharded
+        and parallel.tp_size > 4
+        and group.ranks != list(range(torch.distributed.get_world_size()))
     ):
         if group.rank == 0:
             declined("Draft head TP not enabled: the TP group is not the world")
@@ -271,7 +300,11 @@ def configure_draft_head_tp(model, hot_token_id):
     )
     if presharded:
         # The stock TP shard already splits the vocabulary over the whole TP group.
-        groups = [[rank for rank, _, _ in hosts]] if len({h for _, h, _ in hosts}) == 1 else None
+        groups = (
+            [[rank for rank, _, _ in hosts]]
+            if len({h for _, h, _ in hosts}) == 1
+            else None
+        )
     else:
         groups = head_tp4_rank_groups(hosts)
     if groups is None:
@@ -284,7 +317,9 @@ def configure_draft_head_tp(model, hot_token_id):
         group = init_mtp_head_tp_group(groups, group)
     weight = model.lm_head.weight
     model.logits_processor.draft_head_tp = DraftHeadTP(
-        group, model.config.vocab_size, presharded
+        group,
+        model.config.vocab_size,
+        lm_head_shard_range(model.lm_head) if presharded else None,
     )
     log.info(
         "Draft head TP enabled: rank=%d group=%s presharded=%s weight_shape=%s",

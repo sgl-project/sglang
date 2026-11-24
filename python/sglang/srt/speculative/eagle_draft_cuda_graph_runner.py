@@ -9,7 +9,6 @@ import torch
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_entry
-from sglang.srt.layers.mtp_head_tp import draft_head_tp_of
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -20,6 +19,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.mtp_head_tp import draft_head_tp_of
 from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -535,8 +535,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
-            mtp_draft_head_tp=draft_head_tp_of(self.model_runner.model)
-            is not None,
+            mtp_draft_head_tp=draft_head_tp_of(self.model_runner.model) is not None,
             batch_size=num_seqs,
             input_ids=None,
             req_pool_indices=req_pool_indices,

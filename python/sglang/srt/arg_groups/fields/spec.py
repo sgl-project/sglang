@@ -271,7 +271,7 @@ class Spec(msgspec.Struct):
     draft_head_tp: A[
         str,
         Arg(
-            help="Shard the greedy top-1 draft lm_head argmax over node-local TP ranks on decode workers with pure attention DP. 'auto' turns it on where it applies and logs why when it does not.",
+            help="Shard the greedy top-1 draft lm_head argmax over node-local TP ranks on decode workers with pure attention DP. 'auto' turns it on for validated draft architectures (currently Qwen3.5 MTP) and logs why when it does not; 'on' forces it for any architecture that meets the conditions; 'off' keeps the stock draft head.",
             choices=["auto", "on", "off"],
         ),
     ] = "auto"
