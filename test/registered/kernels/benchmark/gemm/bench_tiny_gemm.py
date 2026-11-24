@@ -20,6 +20,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+register_cuda_ci(
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 
 
 def _torch(x, w, out_dtype):
@@ -98,7 +101,9 @@ def _build_all():
 @marker.parametrize("out_dtype", OUT_DTYPES)
 @marker.parametrize("shape", SHAPES, CI_SHAPES)
 @marker.parametrize("num_tokens", [1, 2, 4, 8, 16, 32], [1, 8, 32])
-@marker.benchmark("provider", ["jit", "simt", "mma", "torch"])
+@marker.benchmark(
+    "provider", ["jit", "simt", "mma", "torch"], gate=["jit", "simt", "mma"]
+)
 def benchmark(shape, num_tokens, out_dtype, provider):
     n, k = shape
     x = create_random(num_tokens, k)
