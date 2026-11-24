@@ -9,13 +9,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.layers.communication import k3_sp_collective
+from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.communication.kda_tp import (
     all_gather_padded,
     group,
     width,
 )
 from sglang.srt.layers.dp_attention import _note_dp_gather_in_prefill_graph
+
+# Named symmetric buffers on the TP group (k3_ar_fusion.symm_buffer), one per role.
+_AG_BUFFER = "kda_tp_all_gather"
+_O_PROJ_BUFFER = "kda_tp_o_proj"
 
 
 class Source(msgspec.Struct):
@@ -147,10 +151,13 @@ class KdaTp:
         self.ctx: Optional[Context] = None
         # Never freed or rebound: CUDA-graph captures record their addresses.
         self._buffers: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
-        # Pre-create workspace and symmetric buffers at init, before KV pool sizing and graph capture.
-        self._comm = k3_sp_collective.GroupCollective(
-            group(), "kda_tp_all_gather", with_o_proj=True, require_a2a=False
-        )
+        # Rendezvous the TP workspace and buffers at init, before KV pool sizing and graph capture.
+        self._comm = k3_sp_collective.tp_state()
+        if self._comm is not None:
+            for name in (_AG_BUFFER, _O_PROJ_BUFFER):
+                k3_ar_fusion.symm_buffer(
+                    name, 1, k3_sp_collective._HIDDEN_SIZE, torch.bfloat16
+                )
 
     def context(self) -> Context:
         if self.ctx is None:
@@ -159,19 +166,57 @@ class KdaTp:
             )
         return self.ctx
 
+    def _state_for(self, total_rows: int):
+        # The symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
+        if total_rows == 0 or total_rows > k3_ar_fusion._max_buffer_rows():
+            return None
+        return self._comm
+
     def all_gather_rows(self, x: torch.Tensor, rows: int) -> torch.Tensor:
+        """Every TP rank's ``rows`` rows (``x`` zero-padded to them)."""
         # May return a persistent buffer that the next KDA TP all-gather overwrites.
         # A prefill graph holding this replays only when every DP rank runs its recorded bucket.
         _note_dp_gather_in_prefill_graph()
-        return self._comm.all_gather_rows(x, rows)
+        if x.shape[0] != rows:
+            x = torch.nn.functional.pad(x, (0, 0, 0, rows - x.shape[0]))
+        x = x.contiguous()
+        g = group()
+        state = self._state_for(g.world_size * rows)
+        if state is not None:
+            out = k3_sp_collective.all_gather(x, state=state, buffer_name=_AG_BUFFER)
+            if out is not None:
+                return out
+        out = x.new_empty((g.world_size * rows, *x.shape[1:]))
+        g.all_gather_into_tensor(out, x)
+        return out
 
     def o_proj_output(
         self, total_rows: int, width: int, dtype: torch.dtype
     ) -> Optional[torch.Tensor]:
-        return self._comm.o_proj_output(total_rows, width, dtype)
+        state = self._state_for(total_rows)
+        if state is None or not k3_sp_collective.requires_symmetric_rs(
+            total_rows,
+            torch.device("cuda"),
+            torch.empty((), dtype=dtype).element_size(),
+            state=state,
+            fused=False,
+        ):
+            return None
+        return k3_sp_collective.get_o_proj_output_buffer(
+            total_rows, dtype, width, state=state, name=_O_PROJ_BUFFER
+        )
 
     def reduce_scatter_rows(self, y: torch.Tensor, local_rows: int) -> torch.Tensor:
-        return self._comm.reduce_scatter_rows(y, local_rows)
+        """This rank's first ``local_rows`` rows of the TP-summed ``y``."""
+        g = group()
+        state = self._state_for(y.shape[0])
+        if state is not None:
+            out = k3_sp_collective.reduce_scatter_res(y, None, state=state)
+            if out is not None:
+                return out[:local_rows]
+        out = y.new_empty((y.shape[0] // g.world_size, *y.shape[1:]))
+        g.reduce_scatter_tensor(out, y.contiguous())
+        return out[:local_rows]
 
     def _buffer(self, name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
         buf = self._buffers.get((name, dtype))

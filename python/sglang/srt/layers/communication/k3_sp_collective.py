@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import logging
 from functools import cache
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communication import k3_ar_fusion
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -49,40 +49,17 @@ class _State:
         return self.lease.request.push_slot_bytes
 
 
+_STATE: Optional[_State] = None
+_INITIALIZED = False
 _O_PROJ_RESULT_BUFFERS: dict[int, torch.Tensor] = {}
 
 
-def _group_state(
-    group: GroupCoordinator,
-    buffer_names: Callable[[], Sequence[str]],
-    *,
-    require_a2a: bool = True,
-) -> Optional[_State]:
-    """The push/pull state over ``group``, created once per group with its named
-    buffers; None when NCCL runs instead."""
-    return get_buffer(
-        f"k3_sp_collective:{group.unique_name}",
-        lambda: [_create_state(group, buffer_names(), require_a2a=require_a2a)],
-    )[0]
-
-
-def _sp_buffer_names() -> Sequence[str]:
-    names = [_O_PROJ, _ALL_GATHER]
-    if envs.SGLANG_K3_SP_ATTN_RES.get():
-        names.append(_ATTN_RES_AG)
-    return names
-
-
 def _init_state() -> Optional[_State]:
-    return _group_state(get_parallel().attn_tp_group, _sp_buffer_names)
+    global _STATE, _INITIALIZED
+    if _INITIALIZED:
+        return _STATE
+    _INITIALIZED = True
 
-
-def _create_state(
-    group: GroupCoordinator,
-    buffers: Sequence[str],
-    *,
-    require_a2a: bool = True,
-) -> Optional[_State]:
     explicit = envs.SGLANG_K3_SP_COLLECTIVE.is_set()
     if explicit and not envs.SGLANG_K3_SP_COLLECTIVE.get():
         return None
@@ -95,12 +72,13 @@ def _create_state(
     from sglang.srt.utils.device import get_device_sm
 
     a2a = get_exec().moe.moe_a2a_backend
+    group = get_parallel().attn_tp_group
     device_sm = get_device_sm()
     lease = None
     if (
         device_sm in (100, 103)
         and group.world_size in _SUPPORTED_WORLD_SIZES
-        and (not require_a2a or a2a in ("megamoe", "deepep"))
+        and a2a in ("megamoe", "deepep")
     ):
         # pull barriers only; any request gets at least one semaphore per SM
         lease = request_group_workspace(
@@ -114,9 +92,8 @@ def _create_state(
         message = (
             "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
             "MegaMoE/DeepEP, and a multicast symmetric workspace; using NCCL "
-            "(group=%s, sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
+            "(sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
             % (
-                group.unique_name,
                 device_sm,
                 group.world_size,
                 a2a,
@@ -150,91 +127,51 @@ def _create_state(
     attn_res_collective.register_comm(
         lease.get_communicator, world_size=lease.world_size
     )
-    state = _State(group, lease)
+    _STATE = _State(group, lease)
     logger.info(
-        "K3 SP collective enabled (%s, TP%d, fused RS residual + AG)",
-        group.unique_name,
+        "K3 SP collective enabled (TP%d, fused RS residual + AG)",
         group.world_size,
     )
-    if _ATTN_RES_AG in buffers:
+    if envs.SGLANG_K3_SP_ATTN_RES.get():
         logger.info(
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"
         )
+    _create_sp_symm_buffers(_STATE)
+    return _STATE
+
+
+def _create_sp_symm_buffers(state: _State) -> None:
     # Rendezvous (a collective) runs here on every rank, not on a buffer's first
     # use inside a forward or CUDA graph capture.
-    for name in buffers:
+    names = [_O_PROJ, _ALL_GATHER]
+    if envs.SGLANG_K3_SP_ATTN_RES.get():
+        names.append(_ATTN_RES_AG)
+    for name in names:
         _symm_buffer(state, name, 1, _HIDDEN_SIZE, torch.bfloat16)
-    return state
 
 
 def enabled() -> bool:
     return _init_state() is not None
 
 
-class GroupCollective:
-    """K3 push/pull all-gather and reduce-scatter of equal row blocks over
-    ``group``, falling back to NCCL outside the symmetric buffer or tuning envelope."""
-
-    def __init__(
-        self,
-        group: GroupCoordinator,
-        all_gather_buffer: str,
-        *,
-        with_o_proj: bool = False,
-        require_a2a: bool = True,
-    ):
-        self.group = group
-        self._all_gather_buffer = all_gather_buffer
-        buffers = [all_gather_buffer, _O_PROJ] if with_o_proj else [all_gather_buffer]
-        # Created at init so the KV pool sizing accounts for it and rendezvous never runs in forward.
-        self._state = _group_state(group, lambda: buffers, require_a2a=require_a2a)
-
-    def _state_for(self, total_rows: int) -> Optional[_State]:
-        # The symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
-        if total_rows == 0 or total_rows > k3_ar_fusion._max_buffer_rows():
-            return None
-        return self._state
-
-    def all_gather_rows(self, x: torch.Tensor, rows: int) -> torch.Tensor:
-        """Every group rank's ``rows`` rows (``x`` zero-padded to them); NCCL fallback."""
-        if x.shape[0] != rows:
-            x = torch.nn.functional.pad(x, (0, 0, 0, rows - x.shape[0]))
-        x = x.contiguous()
-        state = self._state_for(self.group.world_size * rows)
-        if state is not None:
-            out = all_gather(x, state=state, buffer_name=self._all_gather_buffer)
-            if out is not None:
-                return out
-        out = x.new_empty((self.group.world_size * rows, *x.shape[1:]))
-        self.group.all_gather_into_tensor(out, x)
-        return out
-
-    def o_proj_output(
-        self, total_rows: int, width: int, dtype: torch.dtype
-    ) -> Optional[torch.Tensor]:
-        state = self._state_for(total_rows)
-        if state is None or not requires_symmetric_rs(
-            total_rows,
-            torch.device("cuda"),
-            torch.empty((), dtype=dtype).element_size(),
-            state=state,
-            fused=False,
-        ):
-            return None
-        return get_o_proj_output_buffer(total_rows, dtype, width, state=state)
-
-    def reduce_scatter_rows(self, y: torch.Tensor, local_rows: int) -> torch.Tensor:
-        """This rank's first ``local_rows`` rows of the group-summed ``y``; NCCL fallback."""
-        rows = y.shape[0] // self.group.world_size
-        state = self._state_for(y.shape[0])
-        if state is not None:
-            out = reduce_scatter_res(y, None, state=state)
-            if out is not None:
-                return out[:local_rows]
-        out = y.new_empty((rows, *y.shape[1:]))
-        self.group.reduce_scatter_tensor(out, y.contiguous())
-        return out[:local_rows]
+@cache
+def tp_state() -> Optional[_State]:
+    """This module's table-dispatched collectives over the TP group, on
+    k3_ar_fusion's TP workspace; None without it or when another communicator
+    already owns sp_collective at this TP size (NCCL then)."""
+    plane = k3_ar_fusion.tp_plane()
+    group = get_parallel().tp_group
+    ready = (
+        plane is not None
+        and group.world_size in _SUPPORTED_WORLD_SIZES
+        and k3_ar_fusion.register_sp_collective_comm()
+    )
+    logger.info(
+        "K3 KDA TP collectives: %s",
+        "push/pull on the TP multicast workspace" if ready else "NCCL",
+    )
+    return _State(group, plane.lease) if ready else None
 
 
 def _symm_buffer(
@@ -287,11 +224,12 @@ def get_o_proj_output_buffer(
     dtype: torch.dtype,
     hidden_size: int = _HIDDEN_SIZE,
     state: Optional[_State] = None,
+    name: str = _O_PROJ,
 ) -> torch.Tensor:
     """Persistent symmetric storage for a TP-partial o_proj output."""
     state = state or _init_state()
     assert state is not None, "K3 SP collective is not initialized"
-    return _symm_buffer(state, _O_PROJ, num_tokens, hidden_size, dtype)
+    return _symm_buffer(state, name, num_tokens, hidden_size, dtype)
 
 
 def register_o_proj_output(result: torch.Tensor, output: torch.Tensor) -> None:
