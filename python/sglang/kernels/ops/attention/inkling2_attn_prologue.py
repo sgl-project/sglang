@@ -3,15 +3,22 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.arch.triton_portability import IS_HIP, approx_f32
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.numerics import rsqrt_approx_f32
+from sglang.srt.utils import is_hip
 
 REL_WORKERS = 4
+
+_is_hip = is_hip()
+_IS_HIP = tl.constexpr(_is_hip)
 
 
 @triton.jit
 def _rsqrt_approx(x):
-    return approx_f32(x, "rsqrt.approx.f32")
+    if _IS_HIP:
+        return tl.math.rsqrt(x)
+    else:
+        return rsqrt_approx_f32(x)
 
 
 @triton.jit
@@ -674,7 +681,7 @@ def _cuda_prologue(
     (else decode, with track = (track_mask, track_indices) or None); False when
     unsupported. With shear = (seqlens_k, window_left, left_pad), verify writes
     the rel rows sheared as FA4's ShearingBias would."""
-    if IS_HIP:
+    if _is_hip:
         return False
     q, k, v, rel = outputs
     decode = windows is None
