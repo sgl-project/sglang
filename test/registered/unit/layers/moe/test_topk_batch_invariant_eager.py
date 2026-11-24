@@ -53,6 +53,26 @@ class TestTopkBatchInvariantEager(CustomTestCase):
         self.assertTrue(torch.equal(weights, eager_weights))
         self.assertTrue(torch.equal(ids, eager_ids))
 
+    def test_batch_invariant_mode_stays_out_of_an_outer_trace(self):
+        """--enable-torch-compile compiles the whole forward; the router must not be traced into it."""
+        traced = []
+
+        def record(gm, example_inputs):
+            traced.extend(str(node.target) for node in gm.graph.nodes)
+            return gm.forward
+
+        fn = topk_module.grouped_topk_gpu
+        outer = torch.compile(lambda h, g: fn(h, g, 6, True, 8, 3), backend=record)
+        torch._dynamo.reset()
+        try:
+            with patch.object(
+                topk_module, "is_batch_invariant_mode_enabled", lambda: True
+            ):
+                outer(torch.randn(5, 16), torch.randn(5, 64))
+        finally:
+            torch._dynamo.reset()
+        self.assertEqual([t for t in traced if "topk" in t], [])
+
     def test_normal_mode_uses_the_compiled_function(self):
         sentinel = object()
         fn = topk_module.grouped_topk_gpu

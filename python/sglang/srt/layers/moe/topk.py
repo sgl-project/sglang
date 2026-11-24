@@ -119,14 +119,18 @@ def _compile_unless_batch_invariant(**compile_kwargs):
 
     def decorator(fn):
         compiled = torch.compile(fn, **compile_kwargs)
+        # Also kept out of an outer trace (--enable-torch-compile compiles the whole
+        # forward), which would otherwise inline the eager function and generate kernels.
+        eager = torch.compiler.disable(fn)
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             if is_batch_invariant_mode_enabled():
-                return fn(*args, **kwargs)
+                return wrapper.eager(*args, **kwargs)
             return wrapper.compiled(*args, **kwargs)
 
         wrapper.compiled = compiled
+        wrapper.eager = eager
         return wrapper
 
     return decorator
