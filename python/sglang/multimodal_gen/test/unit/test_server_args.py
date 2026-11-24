@@ -2523,34 +2523,50 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertEqual(args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
 
     def test_offline_generate_plans_memory_with_the_requested_diffusion_decoder(self):
-        # `sglang generate --use-diffusion-decoder` loads the decoder as well
+        # `sglang generate` loads the decoder as well when the CLI flag or the
+        # config file asks for it
         def from_cli_args(args, unknown_args=None, default_args=None):
             return self._ltx25(**(default_args or {}))
 
-        cli_args = SimpleNamespace(
-            use_diffusion_decoder=True,
-            config=None,
-            diffusers_kwargs=None,
-            output_file_path=None,
-            perf_dump_path=None,
+        def planned_text_encoder_mode(config=None, **flags):
+            cli_args = SimpleNamespace(
+                config=config,
+                diffusers_kwargs=None,
+                output_file_path=None,
+                perf_dump_path=None,
+                **flags,
+            )
+            sampling_params_cls = Mock()
+            sampling_params_cls.supported_override_fields.return_value = {
+                "use_diffusion_decoder"
+            }
+            sampling_params_cls.get_cli_args.return_value = {
+                "prompt": "a cat",
+                **flags,
+            }
+            with (
+                patch.object(ServerArgs, "from_cli_args", side_effect=from_cli_args),
+                patch.object(
+                    cli_generate,
+                    "_resolve_cli_sampling_params_cls",
+                    return_value=sampling_params_cls,
+                ),
+                patch.object(cli_generate.DiffGenerator, "from_pretrained") as load,
+            ):
+                cli_generate.generate_cmd(cli_args)
+            server_args = load.call_args.kwargs["server_args"]
+            self.assertTrue(server_args.load_diffusion_decoder)
+            return server_args.residency_mode("text_encoder")
+
+        self.assertEqual(
+            planned_text_encoder_mode(use_diffusion_decoder=True), LAYERWISE_OFFLOAD
         )
-        sampling_params_cls = Mock()
-        sampling_params_cls.get_cli_args.return_value = {
-            "prompt": "a cat",
-            "use_diffusion_decoder": True,
-        }
-        with (
-            patch.object(ServerArgs, "from_cli_args", side_effect=from_cli_args),
-            patch.object(
-                cli_generate,
-                "_resolve_cli_sampling_params_cls",
-                return_value=sampling_params_cls,
-            ),
-            patch.object(cli_generate.DiffGenerator, "from_pretrained") as load,
-        ):
-            cli_generate.generate_cmd(cli_args)
-        server_args = load.call_args.kwargs["server_args"]
-        self.assertEqual(server_args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
+            config.write("use_diffusion_decoder: true\n")
+            config.flush()
+            self.assertEqual(
+                planned_text_encoder_mode(config=config.name), LAYERWISE_OFFLOAD
+            )
 
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(
