@@ -4323,7 +4323,7 @@ def get_model_loader(
 
     # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
     # caller explicitly requests ModelOpt calibration/checkpoint/export work.
-    # Explicit transport and processed-shard formats keep their own loaders.
+    # Non-local loaders still own their weight transport path.
     modelopt_fp4_online = (
         model_config
         and model_config.quantization == "modelopt_fp4"
@@ -4334,12 +4334,7 @@ def get_model_loader(
         model_config
         and not modelopt_fp4_online
         and load_config.load_format
-        not in (
-            LoadFormat.RUNAI_STREAMER,
-            LoadFormat.REMOTE_INSTANCE,
-            LoadFormat.SHARDED_STATE,
-            LoadFormat.PRESHARDED,
-        )
+        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
     )
 
     if model_optloader_allowed and (
@@ -4347,8 +4342,18 @@ def get_model_loader(
         or model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
-        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
+        # Only serialized checkpoints can bypass ModelOpt for a shard loader.
+        # Raw checkpoints still need calibration/checkpoint restore/export, even
+        # when the caller specifies a shard load format.
+        is_processed_shard = (
+            load_config.load_format in (LoadFormat.SHARDED_STATE, LoadFormat.PRESHARDED)
+            and model_config._is_already_quantized()
+        )
+        if not is_processed_shard:
+            logger.info(
+                "Using ModelOptModelLoader due to ModelOpt quantization config."
+            )
+            return ModelOptModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)

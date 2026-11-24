@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from contextlib import nullcontext
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -183,6 +184,49 @@ class TestModelOptLoaderSelection(CustomTestCase):
                         LoadConfig(load_format=load_format), model_config
                     )
                     self.assertIsInstance(loader, expected_loader)
+
+    def test_shard_selection_preserves_modelopt_workflows(self):
+        """Raw sources need calibration; processed shards do not, even with export."""
+        from transformers import PretrainedConfig
+
+        from sglang.srt.configs.model_config import ModelConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = ModelConfig.__new__(ModelConfig)
+            config.model_path = directory
+            config.quantization = "modelopt_fp8"
+            for serialized, workflow, (load_format, shard_loader) in product(
+                (False, True),
+                (
+                    None,
+                    "modelopt_export_path",
+                    "modelopt_checkpoint_restore_path",
+                    "modelopt_checkpoint_save_path",
+                ),
+                (
+                    (LoadFormat.SHARDED_STATE, loader_mod.ShardedStateLoader),
+                    (LoadFormat.PRESHARDED, loader_mod.PreshardedModelLoader),
+                ),
+            ):
+                with self.subTest(
+                    serialized=serialized, workflow=workflow, format=load_format
+                ):
+                    # Use the real checkpoint-metadata detector, not a boolean stub.
+                    config.hf_config = PretrainedConfig()
+                    if serialized:
+                        config.hf_config.quantization_config = {
+                            "quant_method": "modelopt",
+                            "quant_algo": "FP8",
+                        }
+                    kwargs = (
+                        {workflow: os.path.join(directory, "out")} if workflow else {}
+                    )
+                    loader = loader_mod.get_model_loader(
+                        LoadConfig(load_format=load_format, **kwargs), config
+                    )
+                    self.assertIsInstance(
+                        loader, shard_loader if serialized else ModelOptModelLoader
+                    )
 
     def test_every_modelopt_quantization_selects_the_modelopt_loader(self):
         """Without an explicit shard format, retain the ModelOpt loader."""
