@@ -1,6 +1,7 @@
 """Host reloads must preserve ID domains, allocation ownership, and stream order."""
 
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -123,6 +124,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = controller
         cache.ongoing_write_through = {1: None, 2: None}
+        cache._fenced_write_acks = deque()
         cache._finish_write_through_ack = cache.ongoing_write_through.pop
         cache.metrics_collector = None
         # Warm up temporary allocations so cudaMalloc cannot hide a missing fence.

@@ -3,7 +3,7 @@
 Post CUDA CI health cards to a Lark group via an incoming webhook.
 
 Used by .github/workflows/ci-lark-notify.yml; see scripts/ci_monitor/README.md.
-Needs GITHUB_TOKEN (an admin PAT for runner-health) and LARK_WEBHOOK, or
+Needs GITHUB_TOKEN and LARK_WEBHOOK, or
 --dry-run to print the card JSON instead of posting.
 """
 
@@ -16,8 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -28,7 +27,7 @@ UTILIZATION_WORKFLOW = "runner-utilization.yml"
 
 # Primary pool labels only; aliases (1-gpu-runner, 8-gpu-h200-deepep, ...) are
 # excluded so every runner is counted under exactly one label. a10 is left out
-# as well: it serves no per-commit test, so its transitions are noise.
+# as well: it serves no per-commit test.
 CUDA_LABEL_RE = re.compile(r"^\d+-gpu-(h100|h200|h20|5090|b200|b300|gb200|gb300)$")
 
 FAILED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
@@ -124,9 +123,6 @@ class GitHub:
         if runs:
             return runs[0]["html_url"]
         return f"https://github.com/{self.repo}/actions/workflows/{workflow_file}"
-
-    def runners(self) -> list:
-        return self.paginate(f"repos/{self.repo}/actions/runners", "runners")
 
 
 # --------------------------------------------------------------------------
@@ -252,42 +248,11 @@ def fmt_duration(seconds: Optional[float]) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
-def primary_cuda_label(labels: list) -> Optional[str]:
-    for name in labels:
-        if CUDA_LABEL_RE.match(name):
-            return name
-    return None
-
-
 def list_jobs_md(jobs: list, limit: int = MAX_LISTED_JOBS) -> str:
     lines = [f"- [{j['name']}]({j['html_url']})" for j in jobs[:limit]]
     if len(jobs) > limit:
         lines.append(f"- ... and {len(jobs) - limit} more")
     return "\n".join(lines)
-
-
-def compress_runner_names(names: list) -> str:
-    groups: dict = {}
-    for n in sorted(names):
-        m = re.match(r"^(.*?)(\d+)$", n)
-        if m:
-            groups.setdefault(m.group(1), []).append(int(m.group(2)))
-        else:
-            groups.setdefault(n, [])
-    parts = []
-    for prefix, nums in groups.items():
-        if not nums:
-            parts.append(prefix)
-        elif len(nums) == 1:
-            parts.append(f"{prefix}{nums[0]}")
-        else:
-            parts.append(prefix + "{" + ",".join(str(x) for x in sorted(nums)) + "}")
-    return ", ".join(parts)
-
-
-# --------------------------------------------------------------------------
-# ci-status
-# --------------------------------------------------------------------------
 
 
 def is_reportable_job(job: dict) -> bool:
@@ -409,132 +374,6 @@ def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
     if attempt > 1:
         prev_failed = failed_job_names(gh.run_attempt_jobs(run["id"], attempt - 1))
     post_card(render_ci_status(run, jobs, prev_failed), args.webhook, args.dry_run)
-
-
-# --------------------------------------------------------------------------
-# runner-health
-# --------------------------------------------------------------------------
-
-
-def summarize_pools(runners: list) -> dict:
-    pools: dict = {}
-    for r in runners:
-        pool_label = primary_cuda_label([lb["name"] for lb in r.get("labels", [])])
-        if pool_label is None:
-            continue
-        pool = pools.setdefault(
-            pool_label,
-            {"total": 0, "online": 0, "offline": 0, "busy": 0, "offline_names": []},
-        )
-        pool["total"] += 1
-        if r.get("status") == "online":
-            pool["online"] += 1
-            if r.get("busy"):
-                pool["busy"] += 1
-        else:
-            pool["offline"] += 1
-            pool["offline_names"].append(r["name"])
-    return pools
-
-
-def is_degraded(pool: dict, threshold: float) -> bool:
-    if pool["total"] < 2:
-        return pool["offline"] == pool["total"] and pool["total"] > 0
-    return pool["offline"] / pool["total"] >= threshold
-
-
-def plan_health_events(
-    pools: dict, state: dict, now: datetime, threshold: float, remind_hours: float
-) -> tuple:
-    events = []  # (kind, label, pool, since)
-    new_state: dict = {}
-    for pool_label, pool in sorted(pools.items()):
-        prev = state.get(pool_label)
-        degraded = is_degraded(pool, threshold)
-        if degraded:
-            since = parse_time(prev["degraded_since"]) if prev else now
-            last = parse_time(prev["last_notified"]) if prev else None
-            if prev is None:
-                events.append(("degraded", pool_label, pool, since))
-                last = now
-            elif last is None or (now - last) >= timedelta(hours=remind_hours):
-                events.append(("still_degraded", pool_label, pool, since))
-                last = now
-            new_state[pool_label] = {
-                "degraded_since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "last_notified": last.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "offline": pool["offline"],
-            }
-        elif prev is not None:
-            events.append(
-                ("recovered", pool_label, pool, parse_time(prev["degraded_since"]))
-            )
-    return events, new_state
-
-
-def render_health_event(
-    kind: str, pool_label: str, pool: dict, since: datetime, now: datetime, repo: str
-) -> dict:
-    runners_url = f"https://github.com/{repo}/settings/actions/runners"
-    elapsed = fmt_duration((now - since).total_seconds())
-    status = f"{pool['online']} online / {pool['offline']} offline of {pool['total']}"
-    all_down = pool["offline"] == pool["total"]
-    if kind == "recovered":
-        title = f"Runner pool recovered: {pool_label}"
-        color = "green"
-        elapsed_key = "Was degraded for"
-    else:
-        state_word = "DOWN" if all_down else "degraded"
-        if kind == "degraded":
-            title = f"Runner pool {state_word}: {pool_label}"
-        else:
-            title = f"Runner pool still {state_word}: {pool_label} ({elapsed})"
-        color = "red" if all_down else "orange"
-        elapsed_key = "Degraded for"
-    elements = [
-        kv_columns(
-            [
-                ("Pool", pool_label),
-                ("Status", status),
-                ("Busy", str(pool["busy"])),
-                (elapsed_key, elapsed),
-            ]
-        ),
-        md(f"{grey('Degraded since')}  {fmt_local(since)}"),
-    ]
-    if kind != "recovered":
-        elements += [
-            HR,
-            md(f"**Offline runners**\n{compress_runner_names(pool['offline_names'])}"),
-        ]
-    return build_card(title, color, elements, [("View runners on GitHub", runners_url)])
-
-
-def cmd_runner_health(args: argparse.Namespace, gh: GitHub) -> None:
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    state = {}
-    if os.path.exists(args.state_file):
-        with open(args.state_file) as f:
-            state = json.load(f)
-    pools = summarize_pools(gh.runners())
-    for pool_label, pool in sorted(pools.items()):
-        print(
-            f"{pool_label}: online {pool['online']} offline {pool['offline']} busy {pool['busy']}"
-        )
-    events, new_state = plan_health_events(
-        pools, state, now, args.threshold, args.remind_hours
-    )
-    for kind, pool_label, pool, since in events:
-        post_card(
-            render_health_event(kind, pool_label, pool, since, now, gh.repo),
-            args.webhook,
-            args.dry_run,
-        )
-    if not events:
-        print("no runner-health transitions")
-    if not args.dry_run:
-        with open(args.state_file, "w") as f:
-            json.dump(new_state, f, indent=2)
 
 
 # --------------------------------------------------------------------------
@@ -692,16 +531,6 @@ def main() -> int:
         "--any-event", action="store_true", help="also report non-schedule runs"
     )
 
-    p = sub.add_parser("runner-health", help="per-label online/offline transitions")
-    p.add_argument("--state-file", required=True)
-    p.add_argument(
-        "--threshold",
-        type=float,
-        default=0.5,
-        help="offline ratio that counts as degraded",
-    )
-    p.add_argument("--remind-hours", type=float, default=1.0)
-
     p = sub.add_parser("queue-timeline", help="daily queue backlog / wait chart")
     p.add_argument(
         "--series-file",
@@ -722,7 +551,6 @@ def main() -> int:
     gh = GitHub(args.token, args.repo)
     {
         "ci-status": cmd_ci_status,
-        "runner-health": cmd_runner_health,
         "queue-timeline": cmd_queue_timeline,
     }[args.command](args, gh)
     return 0
