@@ -525,6 +525,12 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
             with self.subTest(name=name):
                 self.assertIsNotNone(scheme(name))
 
+    def test_lfm2_moe_partial_qkv_regex_raises(self):
+        """LFM2-MoE stores split q/k/v, so `re:.*v_proj$` alone is a mixed scheme."""
+        scheme = self._lfm2_scheme(["re:.*v_proj$"])
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            scheme("model.layers.2.self_attn.qkv_proj")
+
     def test_lfm2_moe_fused_name_entry_still_wins_over_its_shards(self):
         """An entry naming the fused gate_up_proj keeps working once w1/w3 are declared."""
         scheme = self._lfm2_scheme(["layers.0.feed_forward.gate_up_proj"])

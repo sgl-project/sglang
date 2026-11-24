@@ -601,8 +601,12 @@ class Lfm2MoeForCausalLM(nn.Module):
 
     fall_back_to_pt_during_load = False
 
-    # Quantization ignore lists use the checkpoint's dense MLP names (w1/w3/w2).
-    packed_modules_mapping = {"gate_up_proj": ["w1", "w3"]}
+    # Checkpoint shard names of the fused layers, so ignore lists resolve (the
+    # dense MLP is w1/w3/w2). Split q/k/v keeps a partial qkv regex an error.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["w1", "w3"],
+    }
     # The second entry renames the escaped form inside `re:` ignore patterns.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
