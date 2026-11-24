@@ -245,6 +245,150 @@ class TestEngramHostTableBackend(unittest.TestCase):
                 {"placement": "cpu", "host_backend": "fake", "host_backend_config": 42}
             )
 
+    def test_hy4_flash_hook_and_four_layer_relay_schedule(self):
+        from sglang.srt.arg_groups import deepseek_v4_hook
+
+        def run_resolve(model_type, raw):
+            fake_args = SimpleNamespace(engram_config=raw)
+            fake_mc = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+            with (
+                patch.object(deepseek_v4_hook, "resolving_view", return_value=fake_args),
+                patch.object(deepseek_v4_hook, "model_config_of", return_value=fake_mc),
+                patch.object(deepseek_v4_hook, "declare_resolution") as declare,
+            ):
+                deepseek_v4_hook._resolve_engram_config(fake_args)
+                return declare
+
+        for model_type in ("hy_v4_flash", "hy_v4_flash_text"):
+            declare = run_resolve(model_type, {"placement": "cpu"})
+            declare.assert_called_once()
+        with self.assertRaisesRegex(ValueError, "DeepSeek-V4.1 and Hy4-Flash"):
+            run_resolve("llama", {"placement": "cpu"})
+        with self.assertRaisesRegex(ValueError, "requires replication 'none'"):
+            run_resolve("hy_v4_flash", {"placement": "cpu", "replication": "per_node"})
+
+        hashes = torch.arange(4 * 4 * 16).reshape(4, 4, 16)
+        layers = {}
+        for position, layer in enumerate((1, 11, 21, 31)):
+            emb = self.embedding(self.fake_config)
+            emb.host_issue = "relay"
+            emb._host_backend.begin_lookup = Mock()
+            emb._host_backend.finish_lookup = Mock()
+            layers[layer] = SimpleNamespace(embed=emb, layer_hash_index=position)
+        schedule = engram.host_lookup_schedule(layers.items())
+        self.assertEqual(
+            {k: tuple(t.layer_hash_index for t in v) for k, v in schedule.items()},
+            {None: (0,), 1: (1,), 11: (2,), 21: (3,)},
+        )
+        for after in (None, 1, 11, 21):
+            engram.begin_host_lookups(schedule, after, hashes)
+        for target in layers.values():
+            target.embed._host_backend.begin_lookup.assert_called_once()
+
+    def _hy4_embedding(self, config, *, fp8=False, sizes=(10, 10, 10, 10), dim=96):
+        from sglang.srt.models import hunyuan_v4_flash as hy4
+
+        parallel = SimpleNamespace(
+            tp_rank=0,
+            tp_size=2,
+            tp_group=None,
+            pp_size=1,
+            dp_size=1,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+        )
+        execution = SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=self.graph),
+            overlap=SimpleNamespace(enable_two_batch_overlap=False),
+            offload=SimpleNamespace(engram_config=config),
+        )
+        with (
+            patch.object(hy4, "get_parallel", return_value=parallel),
+            patch.object(hy4, "get_exec", return_value=execution),
+            patch.object(
+                hy4,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=None),
+            ),
+            patch.object(hy4, "get_schedule", return_value=self.schedule),
+            patch.object(hy4, "get_model", return_value=self.model),
+            patch.object(hy4, "max_prefill_buffer_tokens", return_value=16),
+            patch.object(hy4, "get_cuda_graph_max_batch_size", side_effect=lambda n: n),
+            patch.object(hy4, "get_eager_max_batch_size", side_effect=lambda n: n),
+            patch.object(hy4, "is_cuda", return_value=True),
+        ):
+            return hy4.FlashEngramEmbedding(sizes, dim, fp8, layer_id=1)
+
+    def test_hy4_flash_embedding_host_backend_and_abort(self):
+        cfg = EngramConfig.from_dict(
+            {
+                "placement": "cpu",
+                "host_backend": "fake",
+                "host_backend_config": {"rows": [0, 20]},
+            }
+        )
+        emb = self._hy4_embedding(cfg)
+        spec = emb._host_backend.spec
+        self.assertEqual(spec.layer_id, 1)
+        self.assertEqual(spec.num_embeddings, 40)
+        self.assertEqual(spec.dim, 96)
+        self.assertEqual(spec.block_size, 0)
+        self.assertEqual(spec.dtype, torch.bfloat16)
+        self.assertEqual(spec.head_range, (0, 2))
+        self.assertEqual(emb.weight.numel(), 0)
+        # Checkpoint loading is a no-op when backed by an external provider.
+        emb.load("weight", torch.zeros((40, 96), dtype=torch.bfloat16))
+        self.assertEqual(emb.weight.numel(), 0)
+        # Empty batches skip provider hooks; abort_lookup delegates when available.
+        emb.split_host_lookup = True
+        emb._host_backend.begin_lookup = Mock()
+        emb._host_backend.finish_lookup = Mock()
+        emb._host_backend.abort_lookup = Mock()
+        empty = torch.empty((0, 4), dtype=torch.int64)
+        emb.begin_lookup(empty)
+        self.assertEqual(emb.lookup_host_backend(empty).shape, (0, 2, 96))
+        emb._host_backend.begin_lookup.assert_not_called()
+        emb._host_backend.finish_lookup.assert_not_called()
+        emb.abort_lookup()
+        emb._host_backend.abort_lookup.assert_called_once()
+        with self.assertRaisesRegex(ValueError, "CUDA and BF16"):
+            self._hy4_embedding(cfg, fp8=True)
+
+    def test_hy4_flash_embedding_native_cpu_host_table_and_reload(self):
+        from sglang.srt.models import hunyuan_v4_flash as hy4
+
+        cfg = EngramConfig.from_dict({"placement": "cpu"})
+        with self.assertRaisesRegex(ValueError, "CUDA and BF16"):
+            self._hy4_embedding(cfg, fp8=True)
+
+        emb = self._hy4_embedding(cfg)
+        host = SimpleNamespace(
+            device_ptr=0x12340000,
+            bytes=torch.zeros(20 * 96 * 2, dtype=torch.uint8),
+            dirty=False,
+            finish_load=Mock(),
+        )
+        parallel = SimpleNamespace(tp_rank=0, tp_size=2, tp_group=None)
+        with (
+            patch.object(hy4, "_HostTable", return_value=host) as host_cls,
+            patch.object(hy4, "get_parallel", return_value=parallel),
+        ):
+            w1 = torch.arange(40 * 96, dtype=torch.float32).view(40, 96).to(torch.bfloat16)
+            emb.load("weight", w1)
+            host_cls.assert_called_once()
+            self.assertTrue(host.dirty)
+            torch.testing.assert_close(emb._host_weight, w1[:20])
+            # Reloading reuses the existing pinned host buffer instead of leaking.
+            w2 = w1 + 1.0
+            emb.load("weight", w2)
+            host_cls.assert_called_once()
+            torch.testing.assert_close(emb._host_weight, w2[:20])
+            with self.assertRaisesRegex(ValueError, "BF16 weight only"):
+                emb.load("weight_scale_inv", torch.ones((40,), dtype=torch.bfloat16))
+        emb.finish_load()
+        host.finish_load.assert_called_once_with("hy4-L1")
+
 
 if __name__ == "__main__":
     unittest.main()

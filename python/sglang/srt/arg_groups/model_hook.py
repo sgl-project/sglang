@@ -275,6 +275,11 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_deepseek_v4_defaults(server_args, model_arch)
 
+    if model_arch == "HYV4FlashForConditionalGeneration":
+        from sglang.srt.arg_groups.deepseek_v4_hook import _resolve_engram_config
+
+        _resolve_engram_config(server_args)
+
     if model_arch in [
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",

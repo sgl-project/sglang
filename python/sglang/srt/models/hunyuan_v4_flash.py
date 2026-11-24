@@ -12,6 +12,7 @@ adds:
 """
 
 import logging
+import weakref
 from copy import copy
 from typing import Iterable, Optional, Tuple
 
@@ -25,6 +26,11 @@ from sglang.kernels.ops.attention.dsa import hy4_flash_indexpool as indexpool_ke
 from sglang.kernels.ops.embeddings.hy4_flash_engram import (
     hy4_flash_engram_combine,
     hy4_flash_engram_lookup,
+    hy4_flash_engram_lookup_uva,
+)
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramPlacement,
 )
 from sglang.kernels.ops.layernorm.hy4_ihc import (
     fused_hy4_ihc_post,
@@ -38,7 +44,17 @@ from sglang.srt.configs.hy_v4_flash import (
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.layers.engram import EngramHasher
+from sglang.srt.layers.engram import (
+    EngramHasher,
+    _HostTable,
+    begin_host_lookups,
+    host_lookup_schedule,
+)
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+)
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs
 from sglang.srt.layers.layernorm import RMSNorm
@@ -78,7 +94,15 @@ from sglang.srt.models.hunyuan_v4 import (
 )
 from sglang.srt.models.hunyuan_v4_vl import HYV4VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    max_prefill_buffer_tokens,
+)
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
@@ -733,15 +757,25 @@ class FlashEngramHasher(EngramHasher):
 
 
 class FlashEngramEmbedding(nn.Module):
-    def __init__(self, sizes, dim: int, fp8: bool):
+    def __init__(self, sizes, dim: int, fp8: bool, layer_id: int):
         super().__init__()
-        tp, rank = get_parallel().tp_size, get_parallel().tp_rank
+        parallel = get_parallel()
+        tp, rank = parallel.tp_size, parallel.tp_rank
+        self.layer_id = layer_id
+        self.fp8 = fp8
         self.head_start, self.head_end = _engram_head_range(sizes, tp, rank)
+        self.local_heads = self.head_end - self.head_start
         self.vocab_start = sum(sizes[: self.head_start])
         self.vocab_end = sum(sizes[: self.head_end])
         self.num_embeddings = sum(sizes)
         self.dim = dim
         self.rows = self.vocab_end - self.vocab_start
+        self._host_backend = None
+        self._host_table: Optional[_HostTable] = None
+        self._host_weight: Optional[torch.Tensor] = None
+        self.host_issue = "inline"
+        self.split_host_lookup = False
+        self._engram_config = get_exec().offload.engram_config or EngramConfig()
         # The table dtype (bf16, or fp8 with per-row bf16 scales) is taken from
         # the checkpoint when it loads.
         self.weight = nn.Parameter(
@@ -750,18 +784,198 @@ class FlashEngramEmbedding(nn.Module):
         self.weight_scale_inv = nn.Parameter(
             torch.empty(0, dtype=torch.bfloat16), requires_grad=False
         )
+        if self._engram_config.host_backend:
+            self._init_host_backend(self._engram_config)
+        elif self._engram_config.placement == EngramPlacement.CPU:
+            if not is_cuda() or self.fp8:
+                raise ValueError(
+                    "Hy4-Flash CPU Engram host tables currently require CUDA and BF16 tables."
+                )
+
+    def _init_host_backend(self, config: EngramConfig) -> None:
+        from sglang.srt.layers.engram_host_table import (
+            EngramHostTableBackend,
+            EngramTableSpec,
+            load_backend,
+        )
+
+        parallel = get_parallel()
+        if not is_cuda() or self.fp8:
+            raise ValueError(
+                "Hy4-Flash Engram host table backends currently require CUDA and BF16 tables."
+            )
+        if (
+            parallel.pp_size,
+            parallel.dp_size,
+            parallel.attn_dp_size,
+            parallel.attn_cp_size,
+            parallel.dcp_size,
+        ) != (1, 1, 1, 1, 1):
+            raise ValueError("Engram host table backends currently support TP only.")
+        if (
+            get_exec().overlap.enable_two_batch_overlap
+            or get_spec().speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "Engram host table backends require two-batch overlap and "
+                "speculative decoding to be disabled."
+            )
+        model, schedule = get_model(), get_schedule()
+        if model.load_format not in ("auto", "safetensors"):
+            raise ValueError(
+                "Engram host table backends require --load-format auto or safetensors."
+            )
+        if (schedule.chunked_prefill_size or 0) <= 0:
+            raise ValueError(
+                "Engram host table backends require --chunked-prefill-size > 0 "
+                "to bound the eager prefill buffer."
+            )
+        graph = get_exec().graph.cuda_graph_config
+        capture_tokens = max(
+            (
+                max(phase.bs or (), default=phase.max_bs or 0)
+                for phase in (graph.prefill, graph.decode)
+                if phase.backend != Backend.DISABLED
+            ),
+            default=0,
+        )
+        eager_tokens = max(
+            max_prefill_buffer_tokens(), schedule.max_running_requests or 0
+        )
+        max_num_tokens = max(
+            get_eager_max_batch_size(eager_tokens),
+            get_cuda_graph_max_batch_size(capture_tokens),
+        )
+        spec = EngramTableSpec(
+            layer_id=self.layer_id,
+            num_embeddings=self.num_embeddings,
+            dim=self.dim,
+            block_size=0,
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            pp_size=parallel.pp_size,
+            dp_size=parallel.dp_size,
+            cp_size=parallel.attn_cp_size,
+            max_num_tokens=max_num_tokens,
+            model_path=model.model_path,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            dtype=torch.bfloat16,
+            head_range=(self.head_start, self.head_end),
+        )
+        provider = load_backend(config.host_backend)
+        options = config.host_backend_config or {}
+        begins = provider.begin_lookup is not EngramHostTableBackend.begin_lookup
+        finishes = provider.finish_lookup is not EngramHostTableBackend.finish_lookup
+        if begins != finishes:
+            raise ValueError(
+                "Engram host table backends using in-forward prefetch must "
+                "implement both begin_lookup and finish_lookup."
+            )
+        if begins:
+            self.host_issue = options.get("issue", "relay")
+            if self.host_issue not in ("early", "relay", "inline"):
+                raise ValueError(
+                    f"Unknown Engram host table issue mode {self.host_issue!r}; "
+                    "expected 'early', 'relay', or 'inline'."
+                )
+            if (
+                self.host_issue != "inline"
+                and graph.prefill.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "In-forward Engram host table prefetch requires prefill "
+                    "CUDA graphs to be disabled."
+                )
+        backend = provider(spec, options)
+        release = weakref.finalize(self, backend.close)
+        try:
+            expected = (self.vocab_start, self.vocab_end)
+            actual = backend.row_range
+            if (
+                not isinstance(actual, tuple)
+                or actual != expected
+                or not all(type(row) is int for row in actual)
+            ):
+                raise ValueError(
+                    f"Engram host table backend declared {actual!r}; "
+                    f"expected rank {parallel.tp_rank}'s rows {expected}."
+                )
+        except BaseException:
+            release()
+            raise
+        self._host_backend = backend
+        self._derived_weight_cache_error = _DIRECT_WEIGHT_UPDATE_ERROR
+
+    def begin_lookup(self, hashes: torch.Tensor) -> None:
+        if self.split_host_lookup and hashes.shape[0]:
+            self._host_backend.begin_lookup(hashes)
+
+    def abort_lookup(self) -> None:
+        if self._host_backend is not None:
+            abort = getattr(self._host_backend, "abort_lookup", None)
+            if abort is not None:
+                abort()
+
+    def lookup_host_backend(self, hashes: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(
+            (hashes.shape[0], self.local_heads, self.dim),
+            dtype=torch.bfloat16,
+            device=hashes.device,
+        )
+        if hashes.shape[0] == 0:
+            return out
+        if self.split_host_lookup:
+            self._host_backend.finish_lookup(hashes, out)
+        else:
+            self._host_backend.lookup(hashes, out)
+        return out
 
     def load(self, leaf: str, value: torch.Tensor) -> None:
         if value.shape[0] != self.num_embeddings:
             raise ValueError(f"Invalid Engram table rows: {tuple(value.shape)}")
+        if self._host_backend is not None:
+            return
+        if self._engram_config.placement == EngramPlacement.CPU:
+            if leaf != "weight":
+                raise ValueError(
+                    f"Hy4-Flash CPU host table supports BF16 weight only, got leaf {leaf!r}"
+                )
+            if value.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"Hy4-Flash CPU host table expects BF16 weights, got {value.dtype}"
+                )
+            if self._host_table is None:
+                nbytes = self.rows * self.dim * value.element_size()
+                host = _HostTable(
+                    self._engram_config.replication,
+                    nbytes,
+                    f"hy4_engram_L{self.layer_id}_R{get_parallel().tp_rank}",
+                    get_parallel().tp_group,
+                )
+                self._host_table = host
+                self._host_weight = host.bytes.view(torch.bfloat16).view(
+                    self.rows, self.dim
+                )
+            self._host_weight.copy_(value[self.vocab_start : self.vocab_end])
+            self._host_table.dirty = True
+            return
         param = getattr(self, leaf)
         param.data = torch.empty(
             (self.rows, *value.shape[1:]), dtype=value.dtype, device=param.device
         )
         param.data.copy_(value[self.vocab_start : self.vocab_end])
 
+    def finish_load(self) -> None:
+        if self._host_table is not None:
+            self._host_table.finish_load(f"hy4-L{self.layer_id}")
+
     def forward(self, hashes: torch.Tensor) -> torch.Tensor:
         local = hashes[:, self.head_start : self.head_end].to(torch.int64)
+        if self._host_backend is not None:
+            return self.lookup_host_backend(hashes).float()
+        if self._host_weight is not None:
+            rows = (local - self.vocab_start).clamp(0, self.rows - 1).cpu()
+            return self._host_weight[rows].to(hashes.device, dtype=torch.float32)
         if self.weight.numel() == 0:
             # Dummy weights never materialize the table.
             return hashes.new_zeros((*local.shape, self.dim), dtype=torch.float32)
@@ -773,7 +987,13 @@ class FlashEngramEmbedding(nn.Module):
 
 
 class FlashEngram(nn.Module):
-    def __init__(self, config: HYV4FlashTextConfig, layer_number: int, prefix: str):
+    def __init__(
+        self,
+        config: HYV4FlashTextConfig,
+        layer_number: int,
+        prefix: str,
+        layer_hash_index: int = 0,
+    ):
         super().__init__()
         groups = config.engram_layer_head_vocab_sizes
         group = groups.get(str(layer_number), groups.get(layer_number))
@@ -781,9 +1001,11 @@ class FlashEngram(nn.Module):
         heads = config.engram_n_head_per_ngram
         self.head_dim = config.engram_n_embed_per_ngram // heads
         self.hidden_size, self.hc_mult = config.hidden_size, config.hc_mult
+        self.layer_hash_index = layer_hash_index
         self.multi_head_embedding = FlashEngramEmbedding(
-            sizes, self.head_dim, config.engram_fp8_embedding
+            sizes, self.head_dim, config.engram_fp8_embedding, layer_id=layer_number - 1
         )
+        self.embed = self.multi_head_embedding
         local = (
             self.multi_head_embedding.head_end - self.multi_head_embedding.head_start
         )
@@ -792,6 +1014,14 @@ class FlashEngram(nn.Module):
         self.start = self.multi_head_embedding.head_start * self.head_dim
         self.stop = self.multi_head_embedding.head_end * self.head_dim
         self.rank = get_parallel().tp_rank
+        self._synthetic_ids: Optional[torch.Tensor] = None
+        if self.multi_head_embedding._host_backend is not None:
+            max_tokens = self.multi_head_embedding._host_backend.spec.max_num_tokens
+            self._synthetic_ids = torch.arange(
+                max_tokens * local,
+                device=self.multi_head_embedding._host_backend.spec.device,
+                dtype=torch.int32,
+            ).reshape(max_tokens, local)
         self.lookup_gamma = nn.Parameter(
             torch.ones(local, self.head_dim, dtype=torch.bfloat16)
         )
@@ -863,7 +1093,29 @@ class FlashEngram(nn.Module):
         if hidden.shape[0] == 0:
             return hidden
         table = self.multi_head_embedding
-        if table.weight.numel() and hidden.is_cuda:
+        if table._host_backend is not None and hidden.is_cuda:
+            rows_bf16 = table.lookup_host_backend(hashes)
+            x = hy4_flash_engram_lookup(
+                self._synthetic_ids[: hashes.shape[0]],
+                0,
+                self.local_heads,
+                0,
+                rows_bf16.view(-1, self.head_dim),
+                None,
+                self.lookup_gamma,
+            )
+        elif table._host_table is not None and hidden.is_cuda:
+            x = hy4_flash_engram_lookup_uva(
+                hashes,
+                table.head_start,
+                self.local_heads,
+                table.vocab_start,
+                table._host_table.device_ptr,
+                table.rows,
+                self.head_dim,
+                self.lookup_gamma,
+            )
+        elif table.weight.numel() and hidden.is_cuda:
             x = hy4_flash_engram_lookup(
                 hashes,
                 table.head_start,
@@ -1293,18 +1545,30 @@ class HYV4FlashModel(nn.Module):
         )
         self.engram_hasher = None
         self.engram_index = {}
+        self._host_lookup_schedule = None
         if config.engram_layer_ids:
             self.engram_hasher = FlashEngramHasher(config)
             if visual_token_ids is not None:
                 self.engram_hasher.visual_token_ids = visual_token_ids
+            scheduled_layers = []
             for index, layer_number in enumerate(config.engram_layer_ids):
                 layer = self.layers[layer_number - 1]
                 layer.engram_layer = FlashEngram(
                     config,
                     layer_number,
                     f"{prefix}.layers.{layer_number - 1}.engram_layer",
+                    layer_hash_index=index,
                 )
                 self.engram_index[layer_number - 1] = index
+                scheduled_layers.append((layer_number - 1, layer.engram_layer))
+            self._host_lookup_schedule = host_lookup_schedule(
+                sorted(scheduled_layers, key=lambda item: item[0])
+            )
+            self._scheduled_engram_layers = tuple(
+                layer for _, layer in sorted(scheduled_layers, key=lambda item: item[0])
+            )
+        else:
+            self._scheduled_engram_layers = ()
         self.hc_head = HYV4HCHeadLayer(config, f"{prefix}.hc_head")
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -1319,6 +1583,8 @@ class HYV4FlashModel(nn.Module):
         hashes = None
         if self.engram_hasher is not None:
             hashes = self.engram_hasher(input_ids, forward_batch, mm_pad_ids)
+            if self._host_lookup_schedule:
+                begin_host_lookups(self._host_lookup_schedule, None, hashes)
         forward_batch.hy4f_layouts = {}
         zero_allocator = BumpAllocator(
             buffer_size=2 * len(self.layers),
@@ -1326,18 +1592,25 @@ class HYV4FlashModel(nn.Module):
             device=hidden_states.device,
         )
         pending = None
-        for i, layer in enumerate(self.layers):
-            layer_hashes = None
-            if i in self.engram_index:
-                layer_hashes = hashes[:, self.engram_index[i]]
-            hidden_states, pending = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                zero_allocator,
-                layer_hashes,
-                pending,
-            )
+        try:
+            for i, layer in enumerate(self.layers):
+                layer_hashes = None
+                if i in self.engram_index:
+                    layer_hashes = hashes[:, self.engram_index[i]]
+                hidden_states, pending = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    layer_hashes,
+                    pending,
+                )
+                if self._host_lookup_schedule and i in self.engram_index:
+                    begin_host_lookups(self._host_lookup_schedule, i, hashes)
+        except BaseException:
+            for target in self._scheduled_engram_layers:
+                target.embed.abort_lookup()
+            raise
         hidden_states = HYV4FlashDecoderLayer._finish_post(hidden_states, pending)
         return self.hc_head(hidden_states, self.norm)
 
@@ -1498,6 +1771,8 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         for module in model.modules():
             if isinstance(module, (FlashIndexPool, FlashEngram)):
                 module.refresh_derived_weights()
+            if isinstance(module, FlashEngramEmbedding):
+                module.finish_load()
         if self.visual is not None:
             self.visual.load_weights(vision_weights)
         if model.engram_hasher is not None and not model.engram_hasher._loaded:

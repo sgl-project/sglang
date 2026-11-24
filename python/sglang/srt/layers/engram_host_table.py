@@ -24,6 +24,8 @@ class EngramTableSpec:
     max_num_tokens: int
     model_path: str
     device: torch.device
+    dtype: torch.dtype = torch.float8_e4m3fn
+    head_range: tuple[int, int] | None = None
 
 
 class EngramHostTableBackend(ABC):
