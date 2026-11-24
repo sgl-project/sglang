@@ -702,6 +702,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
+            auto_tuner.maybe_plan_extra_dit_residency()
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
@@ -2338,7 +2339,10 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Semantic checkpoint variant to serve. Models with partitioned "
                 "checkpoints use this value to select the compatible weights "
-                "without exposing repository subfolder layout."
+                "without exposing repository subfolder layout. MiniMax H3: "
+                "fl2va, ref2va, or fl2va+ref2va (both transformers in one "
+                "server, each request on its task's; the automatic memory "
+                "policy keeps both resident when they fit)."
             ),
         )
         parser.add_argument(

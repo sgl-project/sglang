@@ -117,6 +117,7 @@ class TestCustomLogitProcessorRows(CustomTestCase):
                         custom_logit_processor=(
                             processor_str if rid in opted_in else None
                         ),
+                        grammar=None,
                         sampling_params=SimpleNamespace(
                             custom_params={"row": rid}, logit_bias=None
                         ),
