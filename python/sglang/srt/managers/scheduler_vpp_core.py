@@ -3,26 +3,39 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
+import time
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.distributed.vpp_policy import (
     PipelineControlEnvelope,
     PipelineControlKind,
+    PipelinePrefixRegistry,
     PipelineRankSchedule,
+    PipelineReplicaIdentity,
+    PipelineReplicaRegistry,
+    PipelineResourceGate,
+    PipelineResourceSnapshot,
     PipelineWavefrontAction,
 )
-from sglang.srt.distributed.vpp_transport import P2PWorkGroup
+from sglang.srt.distributed.vpp_transport import (
+    P2PWorkGroup,
+    VPPSchedulerActivationReceiver,
+)
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.runtime_context import max_prefill_buffer_tokens
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 _VPP_PROTOCOL_VERSION = 1
+_VPP_ACTIVATION_TAG = 1
 logger = logging.getLogger(__name__)
 
 
@@ -789,3 +802,607 @@ class SchedulingVPPCore:
         if self.chunked_req is not None and self.chunked_req.rid == rid:
             return self.chunked_req
         return None
+
+    def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
+        self._init_scheduling_native_loop_state()
+        self._pp_vpp_overlap_chunks = False
+        self._pp_vpp_launched_prefix = {}
+        max_inflight = self._pp_vpp_max_inflight()
+        rank_schedule = PipelineRankSchedule(
+            physical_rank=self.pp_group.rank_in_group,
+            physical_size=self.pp_group.world_size,
+            virtual_stages=self._vpp_layout.virtual_stages,
+            max_inflight=max_inflight,
+            prefill_burst_size=1,
+        )
+        if self._pp_vpp_overlap_chunks and rank_schedule.prefill_burst_size != 1:
+            raise RuntimeError(
+                "SGLANG_VPP_OVERLAP_CHUNKS requires --pp-vpp-prefill-burst-size=1"
+            )
+        self._pp_vpp_init_fixed_batch(max_inflight)
+        slot_batch_seqs: List[Optional[int]] = [None] * max_inflight
+        self._pp_vpp_slot_batch_seqs = slot_batch_seqs
+        self._pp_vpp_ready_proxies = {}
+        self._pp_vpp_early_activations = {}
+        self._pp_vpp_arrivals = deque()
+        self._pp_vpp_pending_recv = None
+        self._pp_vpp_pending_control_recv = None
+        self._pp_vpp_control_outbox = deque()
+        self._pp_vpp_stage_events = {}
+        self._pp_vpp_pending_materialized = deque()
+        self._pp_vpp_pending_replica_updates = deque()
+        self._pp_vpp_batch_replicas = defaultdict(dict)
+        self._pp_vpp_prefix_registry = PipelinePrefixRegistry()
+        self._pp_vpp_replica_registry = PipelineReplicaRegistry()
+        self._pp_vpp_cpu_state_buffers = {}
+        self._pp_vpp_cpu_broadcast_buffers = {}
+        self._pp_vpp_control_layout_digest = self._pp_vpp_layout_digest()
+        is_epoch_source = self.world_group.rank_in_group == 0
+        self._pp_vpp_runtime_epoch = self.world_group.broadcast_object(
+            time.time_ns() if is_epoch_source else None,
+            src=0,
+        )
+        if self._pp_vpp_fixed_tp:
+            source_rank = (self.pp_group.rank_in_group - 1) % self.pp_group.world_size
+            self._pp_vpp_activation_receiver = VPPSchedulerActivationReceiver(
+                self._pp_vpp_activation_group(source_rank),
+                None,
+                max_inflight,
+                batch_p2p=self.pp_group.world_size == 2,
+                tag=_VPP_ACTIVATION_TAG,
+            )
+            self._pp_vpp_activation_receiver.start()
+        self._pp_vpp_start_receiver()
+        self._pp_vpp_start_control_receiver()
+
+        activation_send_work = deque()
+        control_send_work = deque()
+        max_control_sends = max_inflight * rank_schedule.logical_size
+        if self._pp_vpp_fixed_tp:
+            max_control_sends = max(64, max_control_sends)
+        token_budget = max(max_prefill_buffer_tokens(), 1)
+        hidden_size = int(self.model_config.hidden_size)
+        hc_mult = int(getattr(self.model_config.hf_config, "hc_mult", 1))
+        activation_high = max_inflight * token_budget * hidden_size * hc_mult * 2
+        resource_gate = PipelineResourceGate(
+            ranks=range(self.pp_group.world_size),
+            activation_low_watermark=activation_high // 2,
+            activation_high_watermark=activation_high,
+            max_pending_sends=max_inflight,
+        )
+        last_resource_snapshot = None
+        next_batch_seq = 0
+        pending_admits: set[int] = set()
+        pending_remote_admits = deque()
+        pending_bootstrap_applies = deque()
+        bootstrap_round_active = False
+        transfer_round_active = False
+        pending_first_pass: Dict[int, set[int]] = defaultdict(set)
+        pending_chunk_batches = set()
+        tick = 0
+        stall_last_progress_at = time.monotonic()
+        stall_last_progress_tick = 0
+        stall_last_progress_event = "init"
+        stall_last_log_at = 0.0
+
+        def mark_progress(event: str) -> None:
+            nonlocal stall_last_progress_at
+            nonlocal stall_last_progress_tick
+            nonlocal stall_last_progress_event
+            stall_last_progress_at = time.monotonic()
+            stall_last_progress_tick = tick
+            stall_last_progress_event = event
+
+        def control_extras(
+            envelope: PipelineControlEnvelope,
+            wire: Dict[str, object],
+        ) -> Dict[str, object]:
+            keys = envelope.to_dict().keys()
+            return {key: value for key, value in wire.items() if key not in keys}
+
+        def forward_control(
+            envelope: PipelineControlEnvelope,
+            wire: Dict[str, object],
+        ) -> None:
+            self._pp_vpp_queue_control(
+                envelope.forwarded(),
+                control_extras(envelope, wire),
+            )
+
+        def try_apply_bootstrap(
+            envelope: PipelineControlEnvelope,
+            wire: Dict[str, object],
+            remaining_good: set[str],
+            remaining_bad: set[str],
+        ) -> bool:
+            applied = self._pp_vpp_try_apply_bootstrap_status(
+                envelope.payload["prefix_boundaries"],
+                remaining_good,
+                remaining_bad,
+            )
+            if not applied:
+                return False
+            forward_control(envelope, wire)
+            return True
+
+        def replica_identity(payload: Dict[str, object]) -> PipelineReplicaIdentity:
+            return PipelineReplicaIdentity(
+                content_id=str(payload["content_id"]),
+                source_id=int(payload["source_id"]),
+                format_version=int(payload["format_version"]),
+                consumer_rank=int(payload["consumer_rank"]),
+            )
+
+        def apply_cache_update(payload: Dict[str, object]) -> None:
+            identity = replica_identity(payload)
+            generation = int(payload["residency_generation"])
+            start = int(payload["start"])
+            end = int(payload["end"])
+            state = self._pp_vpp_replica_registry.get(identity)
+            if (
+                state is not None
+                and state.residency_generation == generation
+                and state.valid_end >= end
+            ):
+                return
+            if (
+                state is not None
+                and state.residency_generation == generation
+                and start <= state.valid_end
+            ):
+                start = state.valid_end
+            self._pp_vpp_replica_registry.install(
+                identity,
+                generation,
+                start,
+                end,
+            )
+
+        def flush_replica_updates() -> None:
+            while self._pp_vpp_pending_replica_updates:
+                (
+                    batch_seq,
+                    stage_id,
+                    identity,
+                    generation,
+                    start,
+                    end,
+                ) = self._pp_vpp_pending_replica_updates[0]
+                event = self._pp_vpp_stage_events[(batch_seq, stage_id)]
+                query = getattr(event, "query", None)
+                if query is not None and not query():
+                    return
+                self._pp_vpp_pending_replica_updates.popleft()
+                payload = {
+                    "content_id": identity.content_id,
+                    "source_id": identity.source_id,
+                    "format_version": identity.format_version,
+                    "consumer_rank": identity.consumer_rank,
+                    "residency_generation": generation,
+                    "start": start,
+                    "end": end,
+                }
+                apply_cache_update(payload)
+                self._pp_vpp_replica_registry.lock(
+                    identity,
+                    end,
+                    owner_id=batch_seq,
+                )
+                self._pp_vpp_batch_replicas[batch_seq][identity] = (
+                    generation,
+                    end,
+                )
+                self._pp_vpp_queue_control(
+                    self._pp_vpp_new_control(
+                        PipelineControlKind.CACHE_UPDATE,
+                        batch_seq=batch_seq,
+                        payload=payload,
+                    ).forwarded()
+                )
+                if not any(
+                    pending[0] == batch_seq and pending[1] == stage_id
+                    for pending in self._pp_vpp_pending_replica_updates
+                ) and not any(
+                    pending[0] == batch_seq and pending[1] == stage_id
+                    for pending in self._pp_vpp_pending_materialized
+                ):
+                    self._pp_vpp_stage_events.pop((batch_seq, stage_id), None)
+
+        def evict_batch_replicas(batch_seq: int, batch: ScheduleBatch) -> None:
+            if not getattr(batch, "contains_last_prefill_chunk", False):
+                return
+            replicas = self._pp_vpp_batch_replicas.pop(batch_seq, {})
+            for identity, (generation, end) in replicas.items():
+                state = self._pp_vpp_replica_registry.get(identity)
+                if state is None or state.residency_generation != generation:
+                    continue
+                if state.locked_until:
+                    self._pp_vpp_replica_registry.unlock(
+                        identity,
+                        end,
+                        owner_id=batch_seq,
+                    )
+                if state.locked_until:
+                    continue
+                self._pp_vpp_replica_registry.evict(identity, generation)
+                for tracked in self._pp_vpp_batch_replicas.values():
+                    tracked.pop(identity, None)
+                self._pp_vpp_queue_control(
+                    self._pp_vpp_new_control(
+                        PipelineControlKind.EVICT_ACK,
+                        batch_seq=batch_seq,
+                        payload={
+                            "content_id": identity.content_id,
+                            "source_id": identity.source_id,
+                            "format_version": identity.format_version,
+                            "consumer_rank": identity.consumer_rank,
+                            "residency_generation": generation,
+                        },
+                    ).forwarded()
+                )
+
+        def flush_materialized() -> None:
+            while self._pp_vpp_pending_materialized:
+                (
+                    batch_seq,
+                    stage_id,
+                    rid,
+                    request_generation,
+                    end,
+                ) = self._pp_vpp_pending_materialized[0]
+                event = self._pp_vpp_stage_events[(batch_seq, stage_id)]
+                query = getattr(event, "query", None)
+                if query is not None and not query():
+                    return
+                self._pp_vpp_pending_materialized.popleft()
+                materialized = self._pp_vpp_new_control(
+                    PipelineControlKind.PREFIX_MATERIALIZED,
+                    batch_seq=batch_seq,
+                    payload={
+                        "rid": rid,
+                        "request_generation": request_generation,
+                        "stage_id": stage_id,
+                        "end": end,
+                    },
+                )
+                self._pp_vpp_apply_prefix_materialized(materialized)
+                self._pp_vpp_queue_control(materialized.forwarded())
+                if not any(
+                    pending[0] == batch_seq and pending[1] == stage_id
+                    for pending in self._pp_vpp_pending_materialized
+                ) and not any(
+                    pending[0] == batch_seq and pending[1] == stage_id
+                    for pending in self._pp_vpp_pending_replica_updates
+                ):
+                    self._pp_vpp_stage_events.pop((batch_seq, stage_id), None)
+
+        def handle_control(
+            envelope: PipelineControlEnvelope,
+            wire: Dict[str, object],
+        ) -> None:
+            nonlocal bootstrap_round_active, transfer_round_active
+            payload = envelope.payload or {}
+            returned_to_source = (
+                envelope.source_rank == self.pp_group.rank_in_group
+                and envelope.hops >= self.pp_group.world_size
+            )
+            if (
+                self._pp_vpp_fixed_batch
+                and envelope.batch_seq > self._pp_vpp_highest_admitted_batch_seq
+                and envelope.kind
+                in (
+                    PipelineControlKind.CANCEL,
+                    PipelineControlKind.COMPLETION,
+                    PipelineControlKind.PREFIX_MATERIALIZED,
+                    PipelineControlKind.PREFIX_COMMIT,
+                    PipelineControlKind.CACHE_UPDATE,
+                    PipelineControlKind.EVICT_ACK,
+                )
+            ):
+                # These messages may overtake the activation that admits their
+                # batch. Keep receiving so they cannot block its bootstrap.
+                self._pp_vpp_pending_batch_controls.append((envelope, wire))
+                return
+
+            if envelope.kind == PipelineControlKind.RESOURCE:
+                if self.pp_group.rank_in_group == 0:
+                    resource_gate.update(
+                        envelope.source_rank,
+                        PipelineResourceSnapshot(**payload),
+                    )
+                else:
+                    forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.REQUEST:
+                if returned_to_source:
+                    return
+                requests = payload.get("requests") or ()
+                if requests:
+                    self.process_input_requests(list(requests))
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.BOOTSTRAP_STATUS:
+                phase = str(payload["phase"])
+                if phase == "collect":
+                    if returned_to_source:
+                        final_status = self._pp_vpp_bootstrap_apply_status(payload)
+                        if not final_status[0] and not final_status[1]:
+                            bootstrap_round_active = False
+                            return
+                        apply_envelope = self._pp_vpp_new_control(
+                            PipelineControlKind.BOOTSTRAP_STATUS,
+                            payload={
+                                "phase": "apply",
+                                "good": final_status[0],
+                                "bad": final_status[1],
+                                "prefix_boundaries": {
+                                    rid: int(payload["prefix_boundaries"][rid])
+                                    for rid in final_status[0]
+                                },
+                            },
+                        )
+                        apply_wire = apply_envelope.to_dict()
+                        remaining_good = set(final_status[0])
+                        remaining_bad = set(final_status[1])
+                        if not try_apply_bootstrap(
+                            apply_envelope,
+                            apply_wire,
+                            remaining_good,
+                            remaining_bad,
+                        ):
+                            pending_bootstrap_applies.append(
+                                (
+                                    apply_envelope,
+                                    apply_wire,
+                                    remaining_good,
+                                    remaining_bad,
+                                )
+                            )
+                        return
+                    local_good, local_bad = self.get_rids(
+                        self.disagg_prefill_bootstrap_queue.queue,
+                        True,
+                        [KVPoll.WaitingForInput],
+                        [KVPoll.Failed],
+                    )
+                    aborted = {
+                        req.rid
+                        for req in self.disagg_prefill_bootstrap_queue.queue
+                        if isinstance(req.finished_reason, FINISH_ABORT)
+                    }
+                    local_good, local_bad = self._route_aborts_to_bad(
+                        local_good,
+                        local_bad,
+                        aborted,
+                    )
+                    self._pp_vpp_merge_bootstrap_status(
+                        payload,
+                        local_good,
+                        local_bad,
+                    )
+                    forward_control(envelope, wire)
+                    return
+                if phase != "apply":
+                    raise RuntimeError(f"invalid bootstrap phase {phase}")
+                if returned_to_source:
+                    bootstrap_round_active = False
+                    return
+                remaining_good = set(payload["good"])
+                remaining_bad = set(payload["bad"])
+                if not try_apply_bootstrap(
+                    envelope,
+                    wire,
+                    remaining_good,
+                    remaining_bad,
+                ):
+                    pending_bootstrap_applies.append(
+                        (
+                            envelope,
+                            wire,
+                            remaining_good,
+                            remaining_bad,
+                        )
+                    )
+                return
+
+            if envelope.kind == PipelineControlKind.TRANSFER_STATUS:
+                phase = str(payload["phase"])
+                if phase == "collect":
+                    if returned_to_source:
+                        final_outcomes = dict(payload["outcomes"])
+                        released = self.process_disagg_prefill_transfer_queue(
+                            final_outcomes
+                        )
+                        final_outcomes = {
+                            req.rid: final_outcomes[req.rid] for req in released
+                        }
+                        self._pp_vpp_queue_control(
+                            self._pp_vpp_new_control(
+                                PipelineControlKind.TRANSFER_STATUS,
+                                payload={"phase": "apply", "outcomes": final_outcomes},
+                            ).forwarded()
+                        )
+                        return
+                    local = self._vpp_transfer_outcomes()
+                    payload["outcomes"] = {
+                        rid: failed or local[rid]
+                        for rid, failed in payload["outcomes"].items()
+                        if rid in local
+                    }
+                    forward_control(envelope, wire)
+                    return
+                if phase != "apply":
+                    raise RuntimeError(f"invalid transfer phase {phase}")
+                if returned_to_source:
+                    transfer_round_active = False
+                    return
+                released = self.process_disagg_prefill_transfer_queue(
+                    payload["outcomes"]
+                )
+                payload["outcomes"] = {
+                    req.rid: payload["outcomes"][req.rid] for req in released
+                }
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.ADMIT:
+                if returned_to_source:
+                    if envelope.batch_seq not in pending_admits:
+                        raise RuntimeError(
+                            f"unexpected VPP admission response {envelope.batch_seq}"
+                        )
+                    errors = payload.get("errors") or ()
+                    if errors:
+                        raise RuntimeError(f"VPP admission failed: {errors}")
+                    pending_admits.remove(envelope.batch_seq)
+                    return
+                if not self._pp_vpp_remote_admit_slot_available(
+                    envelope, slot_batch_seqs
+                ):
+                    # Keep the admission pending until the old slot is retired.
+                    pending_remote_admits.appendleft((envelope, wire))
+                    return
+
+                if not self._pp_vpp_remote_manifest_ready(envelope):
+                    pending_remote_admits.appendleft((envelope, wire))
+                    return
+                batch = self._pp_vpp_prepare_wavefront_batch(
+                    envelope.batch_seq,
+                    slot_batch_seqs,
+                    expected_manifest=payload["manifest"],
+                )
+                local_manifest = (
+                    None
+                    if batch is None
+                    else self._pp_vpp_batch_manifest(
+                        envelope.batch_seq,
+                        envelope.slot_id,
+                        batch,
+                    )
+                )
+                expected_manifest = payload.get("manifest")
+                if batch is None:
+                    self.mbs[envelope.slot_id] = None
+                    self.mb_metadata[envelope.slot_id] = None
+                    slot_batch_seqs[envelope.slot_id] = None
+                    pending_remote_admits.appendleft((envelope, wire))
+                    return
+                if local_manifest != expected_manifest:
+                    raise RuntimeError(
+                        f"VPP admission manifest mismatch: expected "
+                        f"{expected_manifest}, got {local_manifest}"
+                    )
+                self._pp_vpp_register_prefix_batch(batch)
+                rank_schedule.admit(envelope.batch_seq)
+                self._pp_vpp_highest_admitted_batch_seq = max(
+                    self._pp_vpp_highest_admitted_batch_seq, envelope.batch_seq
+                )
+                if not payload.get("errors"):
+                    self._pp_vpp_promote_early_activations(envelope.batch_seq)
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.FIRST_PASS_DONE:
+                if self.pp_group.rank_in_group == 0:
+                    pending_first_pass[envelope.batch_seq].add(envelope.source_rank)
+                else:
+                    forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.PREFIX_COMMIT:
+                rid = str(payload["rid"])
+                request_generation = int(payload["request_generation"])
+                end = int(payload["end"])
+                if returned_to_source:
+                    pending_chunk_batches.discard(envelope.batch_seq)
+                    return
+                self._pp_vpp_advance_prefix_mapping(
+                    rid,
+                    request_generation,
+                    end,
+                )
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.PREFIX_MATERIALIZED:
+                if returned_to_source:
+                    return
+                self._pp_vpp_apply_prefix_materialized(envelope)
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.CACHE_UPDATE:
+                if returned_to_source:
+                    return
+                apply_cache_update(payload)
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.EVICT_ACK:
+                if returned_to_source:
+                    return
+                identity = replica_identity(payload)
+                state = self._pp_vpp_replica_registry.get(identity)
+                generation = int(payload["residency_generation"])
+                if (
+                    state is not None
+                    and state.residency_generation == generation
+                    and not state.locked_until
+                ):
+                    self._pp_vpp_replica_registry.evict(identity, generation)
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.CANCEL:
+                if returned_to_source:
+                    return
+                if self._pp_vpp_fixed_batch:
+                    _, req = self._pp_vpp_cancel_target(envelope)
+                else:
+                    req = self._pp_vpp_find_req(str(payload["rid"]))
+                if req is not None:
+                    if not self._pp_vpp_fixed_batch or self.chunked_req is req:
+                        self._pending_chunked_abort_req = req
+                        self.process_pending_chunked_abort()
+                    else:
+                        # Avoid the generic RID-based abort path, which may
+                        # target a newer incarnation in a different queue.
+                        req.to_finish = FINISH_ABORT()
+                if req is not None or not self._pp_vpp_fixed_batch:
+                    rank_schedule.cancel(envelope.batch_seq)
+                forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.COMPLETION:
+                if (
+                    slot_batch_seqs[envelope.batch_seq % max_inflight]
+                    != envelope.batch_seq
+                ):
+                    raise RuntimeError("VPP completion does not own its slot")
+                if returned_to_source:
+                    slot_id = envelope.batch_seq % max_inflight
+                    slot_batch_seqs[slot_id] = None
+                    rank_schedule.retire(envelope.batch_seq)
+                    pending_chunk_batches.discard(envelope.batch_seq)
+                    return
+                output_tensors = control_extras(envelope, wire)
+                rank_schedule.mark_completed(envelope.batch_seq)
+                batch = self.mbs[envelope.batch_seq % max_inflight]
+                if batch is not None:
+                    evict_batch_replicas(envelope.batch_seq, batch)
+                self._pp_vpp_finalize_rank_local_batch(
+                    envelope.batch_seq,
+                    slot_batch_seqs,
+                    output_tensors,
+                )
+                rank_schedule.retire(envelope.batch_seq)
+                pending_chunk_batches.discard(envelope.batch_seq)
+                forward_control(envelope, wire)
+                return
+
+            raise RuntimeError(f"unsupported VPP control kind {envelope.kind}")
+
+        # The next integration chunk replaces this checkpoint with the main loop.
+        return locals()

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.distributed.vpp_activation import VPPReceivedActivation
 from sglang.srt.distributed.vpp_batch import VPPBatchLedger, VPPBatchState
 from sglang.srt.distributed.vpp_layout import VPPLayout
@@ -19,16 +20,19 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineControlKind,
     PipelinePrefixRegistry,
     PipelineRankSchedule,
+    PipelineReplicaIdentity,
     PipelineWavefrontAction,
 )
 from sglang.srt.distributed.vpp_schedule import VPPFixedSchedule
 from sglang.srt.distributed.vpp_transport import P2PWorkGroup
 from sglang.srt.managers import scheduler_vpp_wave_mixin as vpp_mod
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
 from sglang.srt.managers.scheduler_vpp_wave_mixin import SchedulerVPPMixin
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner.vpp_stage import execute_vpp_stage
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -143,6 +147,45 @@ class _AdmissionCore(_SchedulingCore):
             )
 
 
+class _ControlCore(_AdmissionCore):
+    """Keep communication and request queues on CPU for control-loop tests."""
+
+    def _init_scheduling_native_loop_state(self):
+        self.mbs = [None, None]
+        self.last_mbs = [None, None]
+        self.mb_metadata = [None, None]
+        self.bootstrap_outcomes = {}
+
+    def _pp_vpp_max_inflight(self):
+        return 2
+
+    def _pp_vpp_layout_digest(self):
+        return "layout"
+
+    def _pp_vpp_activation_group(self, source_rank):
+        self.activation_source = source_rank
+        return self.activation_group
+
+    def _pp_vpp_start_control_receiver(self):
+        self.receive_tags.append(2)
+
+    def process_input_requests(self, requests):
+        self.waiting_queue.extend(requests)
+
+    def _pp_vpp_try_apply_bootstrap_status(self, boundaries, good, bad):
+        good.difference_update(
+            rid
+            for rid, status in self.bootstrap_outcomes.items()
+            if status == KVPoll.WaitingForInput
+        )
+        bad.difference_update(
+            rid
+            for rid, status in self.bootstrap_outcomes.items()
+            if status == KVPoll.Failed
+        )
+        return not good and not bad
+
+
 class TestSchedulingVPPCore(CustomTestCase):
     def _scheduler(self, *, rank=0, owner=0, retained=True, core_type=_SchedulingCore):
         scheduler = core_type()
@@ -234,6 +277,331 @@ class TestSchedulingVPPCore(CustomTestCase):
             batch_seq, batch_seq % 2, scheduler.candidate_batch
         )
         return scheduler, PipelineRankSchedule(1, 2, 2, 2), wire
+
+    def _control_loop(self, *, rank=1):
+        scheduler, _, _ = self._remote_admission(core_type=_ControlCore)
+        scheduler.pp_group.rank_in_group = rank
+        scheduler.pp_group.is_first_rank = rank == 0
+        scheduler.pp_group.is_last_rank = rank == 1
+        scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
+        scheduler.model_config = SimpleNamespace(
+            hidden_size=8, hf_config=SimpleNamespace(hc_mult=4)
+        )
+        scheduler.receive_tags = []
+        scheduler.activation_group = SimpleNamespace(
+            device="cpu",
+            recv_tensor_dict_async=lambda tag: scheduler.receive_tags.append(tag),
+        )
+        scheduler.world_group = SimpleNamespace(
+            rank_in_group=rank,
+            broadcast_object=lambda value, src: 3,
+        )
+        with get_context().override_server_args(
+            chunked_prefill_size=16, enable_dynamic_chunking=False
+        ):
+            context = scheduler._event_loop_pp_disagg_prefill_vpp_rank_local()
+        return scheduler, context
+
+    def _control_message(
+        self, scheduler, kind, *, payload=None, seq=-1, returned=False
+    ):
+        wire = scheduler._pp_vpp_new_control(
+            kind, batch_seq=seq, slot_id=seq % 2, payload=payload
+        ).to_dict()
+        wire["source_rank"] = (
+            scheduler.pp_group.rank_in_group
+            if returned
+            else 1 - scheduler.pp_group.rank_in_group
+        )
+        wire["hops"] = 2 if returned else 1
+        return PipelineControlEnvelope.from_dict(wire), wire
+
+    def test_control_loop_initializes_identity_receivers_and_resource_bounds(self):
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                scheduler, context = self._control_loop(rank=rank)
+                self.assertEqual(scheduler._pp_vpp_runtime_epoch, 3)
+                self.assertEqual(scheduler.activation_source, 1 - rank)
+                self.assertEqual(scheduler.receive_tags, [1, 2])
+                self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
+                self.assertIs(
+                    context["slot_batch_seqs"], scheduler._pp_vpp_slot_batch_seqs
+                )
+                self.assertEqual(context["rank_schedule"].inflight_count, 0)
+                self.assertEqual(context["max_control_sends"], 64)
+                self.assertEqual(
+                    context["resource_gate"].activation_high_watermark, 2048
+                )
+                self.assertEqual(
+                    context["resource_gate"].activation_low_watermark, 1024
+                )
+                self.assertFalse(scheduler._pp_vpp_resource_control_enabled)
+                self.assertEqual(scheduler._pp_vpp_pending_batch_controls, deque())
+
+    def test_control_publication_waits_for_fifo_events_and_keeps_shared_fences(self):
+        scheduler, context = self._control_loop()
+        registry = scheduler._pp_vpp_prefix_registry
+        entry = registry.plan("request", 1, 1, 0, 8, range(4))
+        identity = PipelineReplicaIdentity("content", 0, 1, 1)
+        ready = [False]
+        event = SimpleNamespace(query=lambda: ready[0])
+        scheduler._pp_vpp_stage_events = {
+            (0, 0): event,
+            (0, 1): SimpleNamespace(query=lambda: True),
+        }
+        scheduler._pp_vpp_pending_materialized.extend(
+            [(0, 0, "request", 1, 8), (0, 1, "request", 1, 8)]
+        )
+        scheduler._pp_vpp_pending_replica_updates.append((0, 0, identity, 1, 0, 8))
+        context["flush_materialized"]()
+        context["flush_replica_updates"]()
+        self.assertEqual(entry.materialized_by_stage[1], 0)
+        self.assertEqual(len(scheduler._pp_vpp_pending_materialized), 2)
+        self.assertEqual(len(scheduler._pp_vpp_pending_replica_updates), 1)
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+        ready[0] = True
+        context["flush_materialized"]()
+        self.assertIs(scheduler._pp_vpp_stage_events[(0, 0)], event)
+        self.assertNotIn((0, 1), scheduler._pp_vpp_stage_events)
+        self.assertEqual(entry.materialized_by_stage, {0: 8, 1: 8, 2: 0, 3: 0})
+        self.assertEqual(entry.committed_end, 0)
+        context["flush_replica_updates"]()
+        replica = scheduler._pp_vpp_replica_registry.get(identity)
+        self.assertEqual((replica.valid_end, replica.locked_until), (8, 8))
+        self.assertEqual(replica.lock_owners, {0: 8})
+        self.assertEqual(scheduler._pp_vpp_batch_replicas[0][identity], (1, 8))
+        self.assertEqual(scheduler._pp_vpp_stage_events, {})
+        messages = [
+            PipelineControlEnvelope.from_dict(wire)
+            for wire in scheduler._pp_vpp_control_outbox
+        ]
+        self.assertEqual(
+            [message.kind for message in messages],
+            [
+                PipelineControlKind.PREFIX_MATERIALIZED,
+                PipelineControlKind.PREFIX_MATERIALIZED,
+                PipelineControlKind.CACHE_UPDATE,
+            ],
+        )
+        self.assertEqual([message.hops for message in messages], [1, 1, 1])
+
+    def test_replica_updates_merge_overlap_and_reject_gaps_and_stale_generations(self):
+        scheduler, context = self._control_loop()
+        payload = {
+            "content_id": "content",
+            "source_id": 0,
+            "format_version": 1,
+            "consumer_rank": 1,
+            "residency_generation": 1,
+            "start": 0,
+            "end": 4,
+        }
+        identity = context["replica_identity"](payload)
+        context["apply_cache_update"](payload)
+        context["apply_cache_update"](payload)
+        context["apply_cache_update"]({**payload, "start": 2, "end": 8})
+        registry = scheduler._pp_vpp_replica_registry
+        self.assertEqual(registry.get(identity).valid_end, 8)
+        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
+            context["apply_cache_update"]({**payload, "start": 10, "end": 12})
+        with self.assertRaisesRegex(RuntimeError, "stale replica"):
+            context["apply_cache_update"]({**payload, "residency_generation": 2})
+        registry.lock(identity, 8, owner_id=0)
+        envelope, wire = self._control_message(
+            scheduler, PipelineControlKind.EVICT_ACK, payload=payload
+        )
+        context["handle_control"](envelope, wire)
+        self.assertEqual(registry.get(identity).residency_generation, 1)
+        registry.unlock(identity, 8, owner_id=0)
+        context["handle_control"](envelope, wire)
+        self.assertEqual(registry.get(identity).residency_generation, 2)
+        self.assertEqual(registry.get(identity).valid_end, 0)
+
+    def test_replica_eviction_waits_for_all_batch_owners_and_last_chunks(self):
+        scheduler, context = self._control_loop()
+        identity = PipelineReplicaIdentity("content", 0, 1, 1)
+        registry = scheduler._pp_vpp_replica_registry
+        registry.install(identity, 1, 0, 8)
+        for seq in (0, 1):
+            registry.lock(identity, 8, owner_id=seq)
+            scheduler._pp_vpp_batch_replicas[seq][identity] = (1, 8)
+        scheduler._pp_vpp_batch_replicas[2][identity] = (1, 8)
+        context["evict_batch_replicas"](
+            0, SimpleNamespace(contains_last_prefill_chunk=False)
+        )
+        self.assertEqual(registry.get(identity).lock_owners, {0: 8, 1: 8})
+        final_batch = SimpleNamespace(contains_last_prefill_chunk=True)
+        context["evict_batch_replicas"](0, final_batch)
+        self.assertEqual(registry.get(identity).lock_owners, {1: 8})
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+        context["evict_batch_replicas"](1, final_batch)
+        self.assertEqual(registry.get(identity).residency_generation, 2)
+        self.assertEqual(registry.get(identity).valid_end, 0)
+        self.assertEqual(scheduler._pp_vpp_batch_replicas[2], {})
+        ack = PipelineControlEnvelope.from_dict(
+            scheduler._pp_vpp_control_outbox.popleft()
+        )
+        self.assertEqual(ack.kind, PipelineControlKind.EVICT_ACK)
+        self.assertEqual(ack.payload["residency_generation"], 1)
+        self.assertEqual(ack.hops, 1)
+
+    def test_batch_controls_wait_for_activation_admission(self):
+        scheduler, context = self._control_loop()
+        kinds = (
+            PipelineControlKind.CANCEL,
+            PipelineControlKind.COMPLETION,
+            PipelineControlKind.PREFIX_MATERIALIZED,
+            PipelineControlKind.PREFIX_COMMIT,
+            PipelineControlKind.CACHE_UPDATE,
+            PipelineControlKind.EVICT_ACK,
+        )
+        for kind in kinds:
+            envelope, wire = self._control_message(scheduler, kind, seq=0)
+            context["handle_control"](envelope, wire)
+        self.assertEqual(
+            [envelope.kind for envelope, _ in scheduler._pp_vpp_pending_batch_controls],
+            list(kinds),
+        )
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+        self.assertEqual(context["rank_schedule"].inflight_count, 0)
+
+    def test_control_admission_retries_missing_batch_then_promotes_its_activation(self):
+        scheduler, context = self._control_loop()
+        req = scheduler.waiting_queue[0]
+        batch = SimpleNamespace(reqs=[req], prefix_lens=[4], extend_lens=[5])
+        manifest = scheduler._pp_vpp_batch_manifest(0, 0, batch)
+        activation = self._wire(stage=1)
+        activation["vpp_batch_manifest"] = manifest
+        scheduler._pp_vpp_accept_received_tensors(activation)
+        envelope, wire = self._control_message(
+            scheduler,
+            PipelineControlKind.ADMIT,
+            payload={"manifest": manifest},
+            seq=0,
+        )
+        scheduler.candidate_batch = None
+        context["handle_control"](envelope, wire)
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
+        self.assertEqual(scheduler.mb_metadata, [None, None])
+        self.assertEqual(context["rank_schedule"].inflight_count, 0)
+        scheduler.candidate_batch = batch
+        pending = context["pending_remote_admits"].popleft()
+        context["handle_control"](*pending)
+        self.assertEqual(context["rank_schedule"].slot_batch_seqs, (0, None))
+        self.assertEqual(scheduler._pp_vpp_highest_admitted_batch_seq, 0)
+        self.assertEqual(scheduler._pp_vpp_early_activations, {})
+        self.assertIn((0, 1), scheduler._pp_vpp_ready_proxies)
+        forwarded = PipelineControlEnvelope.from_dict(
+            scheduler._pp_vpp_control_outbox.popleft()
+        )
+        self.assertEqual(forwarded.hops, 2)
+
+    def test_control_cancel_preserves_newer_incarnations_and_marks_the_batch(self):
+        scheduler, context = self._control_loop()
+        req = scheduler.waiting_queue[0]
+        newer = SimpleNamespace(
+            rid=req.rid, session_generation=2, bootstrap_room=3, to_finish=None
+        )
+        scheduler.waiting_queue = [newer]
+        scheduler.mbs[0] = SimpleNamespace(reqs=[req])
+        scheduler._pp_vpp_slot_batch_seqs[0] = 0
+        scheduler._pp_vpp_highest_admitted_batch_seq = 0
+        schedule = context["rank_schedule"]
+        schedule.admit(0)
+        schedule.mark_ready(0, 1)
+        envelope, wire = self._control_message(
+            scheduler,
+            PipelineControlKind.CANCEL,
+            payload={
+                "rid": req.rid,
+                "request_generation": 1,
+                "bootstrap_room": 3,
+            },
+            seq=0,
+        )
+        context["handle_control"](envelope, wire)
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertIsNone(newer.to_finish)
+        action = schedule.dispatch(0, 0, 1)
+        self.assertTrue(schedule.complete(action).cancelled)
+
+    def test_returned_completion_retires_only_its_owned_slot(self):
+        scheduler, context = self._control_loop()
+        schedule = context["rank_schedule"]
+        schedule.admit(0)
+        schedule.mark_completed(0)
+        scheduler._pp_vpp_slot_batch_seqs[0] = 0
+        scheduler._pp_vpp_highest_admitted_batch_seq = 0
+        context["pending_chunk_batches"].add(0)
+        envelope, wire = self._control_message(
+            scheduler, PipelineControlKind.COMPLETION, seq=0, returned=True
+        )
+        context["handle_control"](envelope, wire)
+        self.assertEqual(schedule.inflight_count, 0)
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
+        self.assertEqual(context["pending_chunk_batches"], set())
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+        with self.assertRaisesRegex(RuntimeError, "does not own its slot"):
+            context["handle_control"](envelope, wire)
+
+    def test_request_ring_preserves_payload_and_stops_at_its_source(self):
+        scheduler, context = self._control_loop()
+        req = SimpleNamespace(rid="new")
+        envelope, wire = self._control_message(
+            scheduler, PipelineControlKind.REQUEST, payload={"requests": (req,)}
+        )
+        metadata = torch.tensor([9])
+        wire["metadata"] = metadata
+        context["handle_control"](envelope, wire)
+        self.assertIs(scheduler.waiting_queue[-1], req)
+        forwarded = scheduler._pp_vpp_control_outbox.popleft()
+        self.assertIs(forwarded["metadata"], metadata)
+        self.assertEqual(forwarded["hops"], 2)
+        returned, returned_wire = self._control_message(
+            scheduler,
+            PipelineControlKind.REQUEST,
+            payload={"requests": (req,)},
+            returned=True,
+        )
+        context["handle_control"](returned, returned_wire)
+        self.assertEqual(sum(item is req for item in scheduler.waiting_queue), 1)
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+
+    def test_bootstrap_apply_stays_pending_until_local_outcomes_are_available(self):
+        scheduler, context = self._control_loop()
+        envelope, wire = self._control_message(
+            scheduler,
+            PipelineControlKind.BOOTSTRAP_STATUS,
+            payload={
+                "phase": "apply",
+                "good": ["ready"],
+                "bad": ["failed"],
+                "prefix_boundaries": {"ready": 4},
+            },
+        )
+        context["handle_control"](envelope, wire)
+        pending = context["pending_bootstrap_applies"].popleft()
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+        scheduler.bootstrap_outcomes["ready"] = KVPoll.WaitingForInput
+        self.assertFalse(context["try_apply_bootstrap"](*pending))
+        self.assertEqual(pending[2], set())
+        self.assertEqual(pending[3], {"failed"})
+        scheduler.bootstrap_outcomes["failed"] = KVPoll.Failed
+        self.assertTrue(context["try_apply_bootstrap"](*pending))
+        self.assertEqual(pending[3], set())
+        forwarded = scheduler._pp_vpp_control_outbox.popleft()
+        self.assertEqual(forwarded["hops"], 2)
+        self.assertEqual(forwarded["payload"]["prefix_boundaries"], {"ready": 4})
+        for kind in (
+            PipelineControlKind.BOOTSTRAP_STATUS,
+            PipelineControlKind.TRANSFER_STATUS,
+        ):
+            with self.subTest(kind=kind):
+                invalid, invalid_wire = self._control_message(
+                    scheduler, kind, payload={"phase": "unknown"}
+                )
+                with self.assertRaisesRegex(RuntimeError, "invalid .* phase"):
+                    context["handle_control"](invalid, invalid_wire)
 
     def test_cpu_broadcast_reuses_buffers_and_validates_source_values(self):
         scheduler = self._scheduler()
