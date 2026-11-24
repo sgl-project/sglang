@@ -1443,12 +1443,7 @@ class TestEagleConfigurator(CustomTestCase):
                     top_k=2048,
                     kv_bytes_per_token=576 * 2,
                 )
-                request_bytes = plan.request_rows * plan.context_len * 4
-                return (
-                    plan.managed_hbm_bytes
-                    + request_bytes
-                    + (tokens + page_size) * native_bytes_per_token
-                )
+                return plan.managed_hbm_bytes + tokens * native_bytes_per_token
 
             for rows, tokens, cap in (
                 (requested_rows, token_limit, token_limit),
@@ -1483,8 +1478,25 @@ class TestEagleConfigurator(CustomTestCase):
 
             mr.sparse_kv_budget_plan = None
             mr.sparse_kv_budget_finalized = False
-            mr._profile_available_bytes.return_value = budget_for(1, min_tokens) - 1
+            mr._profile_available_bytes.return_value = budget_for(1, 0) - 1
             with self.assertRaisesRegex(RuntimeError, "one sparse KV resident row"):
+                KVCacheConfigurator._resolve_memory_pool_config(
+                    mr, pre_model_load_memory=0
+                )
+
+            mr.sparse_kv_budget_plan = None
+            mr.sparse_kv_budget_finalized = False
+            mr._profile_available_bytes.return_value = budget_for(
+                requested_rows, token_limit
+            )
+            with (
+                get_context().override_server_args(
+                    **server_args, max_total_tokens=min_tokens - 1
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, f"below the P/D Decode minimum of {min_tokens}"
+                ),
+            ):
                 KVCacheConfigurator._resolve_memory_pool_config(
                     mr, pre_model_load_memory=0
                 )

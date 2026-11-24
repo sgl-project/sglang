@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass
 from math import prod
@@ -9,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -302,3 +304,54 @@ def resolve_sparse_kv_budget(
             f"Sparse KV manager needs {result.managed_hbm_bytes} bytes, exceeding SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB ({hbm_budget_bytes} bytes)."
         )
     return result
+
+
+def fit_pd_sparse_budget(
+    requested: BudgetPlan,
+    available_bytes: int,
+    page_size: int,
+    *,
+    build_plan: Callable[..., BudgetPlan],
+    hbm_limit: int,
+    token_limit: int | None,
+    num_reserved_decode_tokens: int,
+) -> BudgetPlan:
+    """Select the largest P/D Decode resident pool within the HBM budget."""
+    requested_rows = requested.resident_rows - 1
+    extra_rows = requested.request_rows - requested.resident_rows
+    budget_bytes = min(available_bytes, hbm_limit) if hbm_limit else available_bytes
+    max_rows = requested_rows
+    if token_limit is not None:
+        aligned_limit = token_limit // page_size * page_size
+        min_tokens = ceil_align(page_size + num_reserved_decode_tokens, page_size)
+        if aligned_limit < min_tokens:
+            raise RuntimeError(
+                f"max_total_tokens={token_limit} provides {aligned_limit} page-aligned "
+                f"native tokens, below the P/D Decode minimum of {min_tokens}."
+            )
+        # The native scheduler caps requests at half the usable token capacity.
+        max_rows = min(max_rows, aligned_limit // 2)
+
+    def plan_for(rows: int) -> BudgetPlan:
+        if rows == requested_rows:
+            return requested
+        return build_plan(
+            request_rows=rows + extra_rows + 1,
+            resident_rows=rows + 1,
+        )
+
+    def exceeds_budget(rows: int) -> bool:
+        return plan_for(rows).managed_hbm_bytes > budget_bytes
+
+    # Buffer sizes are nondecreasing, including aligned graph and eager scratch.
+    fitting_rows = bisect_right(range(1, max_rows + 1), False, key=exceeds_budget)
+    if fitting_rows:
+        return plan_for(fitting_rows)
+
+    one_row = plan_for(1)
+    raise RuntimeError(
+        "Cannot fit one sparse KV resident row: "
+        f"manager needs {one_row.managed_hbm_bytes} bytes, have {available_bytes} bytes "
+        f"(manager HBM limit={hbm_limit or 'unset'}, "
+        f"max_total_tokens={token_limit})."
+    )

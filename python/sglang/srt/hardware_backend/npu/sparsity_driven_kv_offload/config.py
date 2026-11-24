@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence
+from functools import partial
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
@@ -15,12 +16,14 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     BudgetPlan,
+    fit_pd_sparse_budget,
     resolve_sparse_kv_budget,
 )
 from sglang.srt.layers.dp_attention import (
     get_cuda_graph_max_batch_size,
     get_eager_max_batch_size,
 )
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
@@ -174,6 +177,42 @@ def get_sparsity_driven_kv_offload_cell_size(
     return index_head_dim * element_size * num_indexer_layers
 
 
+def build_sparse_kv_budget_options(
+    *,
+    model_config: ModelConfig,
+    kv_dtype: torch.dtype,
+    num_layers: int,
+    attn_dp_size: int,
+    pd_sparse_decode: bool,
+) -> dict[str, Any]:
+    """Resolve the initial sparse budget inputs for this worker."""
+    disagg = get_disagg()
+    extra_rows = (
+        disagg.disaggregation_decode_extra_slots or 0
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        else 0
+    )
+    running_rows = max(1, get_schedule().max_running_requests // attn_dp_size)
+    request_rows = running_rows + extra_rows + 1
+    budget_options = dict(
+        model_config=model_config,
+        request_rows=request_rows,
+        resident_rows=running_rows + 1 if pd_sparse_decode else request_rows,
+        context_len=model_config.context_len + get_req_to_token_extra_context_len(),
+        top_k=get_sparsity_driven_kv_offload_sparse_context_len(
+            model_config=model_config
+        ),
+        kv_bytes_per_token=(model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+        * torch._utils._element_size(kv_dtype),
+        num_layers=num_layers,
+        kv_dtype=kv_dtype,
+    )
+    if pd_sparse_decode:
+        # Fit the manager HBM limit after building the initial candidate.
+        budget_options["hbm_budget_bytes"] = 0
+    return budget_options
+
+
 def get_sparse_kv_budget(
     *,
     model_config: ModelConfig,
@@ -232,6 +271,23 @@ def get_sparse_kv_budget(
             graph_batch_capacity,
             get_eager_max_batch_size(resident_rows - 1),
         ),
+    )
+
+
+def fit_pd_sparse_budget_from_config(
+    requested: BudgetPlan,
+    available_bytes: int,
+    page_size: int,
+    budget_options: dict[str, Any],
+) -> BudgetPlan:
+    return fit_pd_sparse_budget(
+        requested,
+        available_bytes,
+        page_size,
+        build_plan=partial(get_sparse_kv_budget, **budget_options),
+        hbm_limit=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
+        token_limit=get_schedule().max_total_tokens,
+        num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
     )
 
 
