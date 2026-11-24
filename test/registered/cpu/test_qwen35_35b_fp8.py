@@ -14,7 +14,7 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
-register_cpu_ci(est_time=3600, suite="nightly-test-cpu-intel")
+register_cpu_ci(est_time=3900, suite="nightly-test-cpu-intel")
 
 # export SGLANG_DEEPSEEK_FP8A8=1
 # build sgl-kernel using SGLANG_CPU_FP8_BRGEMM=1 on DMR
