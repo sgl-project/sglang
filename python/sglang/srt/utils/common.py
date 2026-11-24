@@ -458,10 +458,15 @@ def fast_topk(values, topk, dim):
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
 class BumpAllocator:
     def __init__(self, buffer_size: int, dtype, device):
-        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        # Zeroed on first allocate: a forward that draws nothing launches no fill.
+        self._buffer = None
+        self._spec = (buffer_size, dtype, device)
         self._pointer = 0
 
     def allocate(self, size: int):
+        if self._buffer is None:
+            buffer_size, dtype, device = self._spec
+            self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
         assert self._pointer + size <= len(self._buffer)
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size

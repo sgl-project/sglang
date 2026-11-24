@@ -1785,6 +1785,20 @@ def _gather_mamba_track_indices(
     """Each request's ping-pong slot id at its track position, read on the device.
     A negative position has no slot and gives the reserved slot 0, which a
     forward may write but nothing reads."""
+    if (
+        ping_pong_mapping.is_cuda
+        and ping_pong_mapping.stride(1) == 1
+        and req_pool_indices.is_contiguous()
+        and track_positions.is_contiguous()
+        and track_positions.numel() <= 4096
+    ):
+        from sglang.kernels.ops.mamba.mamba_track_gather import (
+            gather_mamba_track_indices,
+        )
+
+        return gather_mamba_track_indices(
+            ping_pong_mapping, req_pool_indices, track_positions
+        )
     slots = ping_pong_mapping[req_pool_indices, track_positions.clamp(min=0)]
     return torch.where(track_positions >= 0, slots, 0)
 

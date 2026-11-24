@@ -179,6 +179,9 @@ class EagleDraftInput(SpecInput):
     # Draft proposal q from draft-extend, only set under rejection sampling:
     # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
     draft_probs: torch.Tensor = None
+    # (b, num_steps, vocab) graph-runner buffer whose step 0 is ``draft_probs``;
+    # when set, the draft loop writes each step's q straight into it.
+    draft_probs_out: Optional[torch.Tensor] = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).

@@ -794,31 +794,35 @@ class FutureMap:
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         relay = self._relay
+        pairs = []
         if relay is not None and payload.bonus_tokens is relay.published_bonus:
             relay.published_bonus = None
         else:
-            self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-                self.output_tokens_buf.dtype
-            )
+            pairs.append((self.output_tokens_buf, payload.bonus_tokens))
 
         # Staging transitions refresh only the bonus token. Preserve top-k and
         # hidden state already published by the preceding target forward.
         if self.need_topk and payload.topk_p is not None:
             assert payload.topk_index is not None
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
-            )
+            pairs.append((self.topk_p_buf, payload.topk_p))
+            pairs.append((self.topk_index_buf, payload.topk_index))
         if self.need_hidden_states and payload.hidden_states is not None:
-            self.hidden_states_buf[indices] = payload.hidden_states.to(
-                self.hidden_states_buf.dtype
-            )
+            pairs.append((self.hidden_states_buf, payload.hidden_states))
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
-            self.draft_probs_buf[indices] = payload.draft_probs
+            pairs.append((self.draft_probs_buf, payload.draft_probs))
         if (
             self.dsa_topk_indices_buf is not None
             and payload.dsa_topk_indices is not None
         ):
-            self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
-                self.dsa_topk_indices_buf.dtype
-            )
+            pairs.append((self.dsa_topk_indices_buf, payload.dsa_topk_indices))
+        if not pairs:
+            return
+        if len(pairs) > 1:
+            from sglang.kernels.ops.memory.small_copy import try_scatter_rows
+
+            if try_scatter_rows(
+                [dst for dst, _ in pairs], [src for _, src in pairs], indices
+            ):
+                return
+        for dst, src in pairs:
+            dst[indices] = src.to(dst.dtype)

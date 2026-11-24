@@ -171,3 +171,79 @@ def write_host_ints(dsts, values):
     # 1, so one compiled kernel serves all values of a given shape.
     encoded = tuple(tuple(16 * int(v) + 3 for v in row) for row in values)
     _write_host_ints_kernel[(1,)](tuple(dsts), encoded, num_warps=1)
+
+
+@triton.jit(
+    do_not_specialize=["widths", "src_row_strides", "dst_row_strides"],
+    do_not_specialize_on_alignment=["widths", "src_row_strides", "dst_row_strides"],
+)
+def _scatter_rows_kernel(
+    sources,
+    destinations,
+    widths,
+    src_row_strides,
+    dst_row_strides,
+    indices,
+    NUM_FIELDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    field = tl.program_id(0)
+    row = tl.program_id(1).to(tl.int64)
+    offsets = (tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    dst_row = tl.load(indices + row).to(tl.int64)
+    for i in tl.static_range(NUM_FIELDS):
+        if field == i:
+            mask = offsets < widths[i]
+            values = tl.load(sources[i] + row * src_row_strides[i] + offsets, mask)
+            tl.store(
+                destinations[i] + dst_row * dst_row_strides[i] + offsets, values, mask
+            )
+
+
+def try_scatter_rows(dsts, srcs, indices) -> bool:
+    """``dst[indices] = src.to(dst.dtype)`` for every pair in one launch.
+
+    Each ``src`` holds ``len(indices)`` rows and each ``dst`` is a row buffer of the
+    same row shape; rows must be contiguous and ``indices`` unique. Returns False
+    (writing nothing) when a pair does not fit.
+    """
+    if not dsts or len(dsts) != len(srcs) or len(dsts) > 8:
+        return False
+    if indices.ndim != 1 or not indices.is_cuda or not indices.is_contiguous():
+        return False
+    n = indices.shape[0]
+    widths, src_strides, dst_strides, flat_srcs, flat_dsts = [], [], [], [], []
+    for dst, src in zip(dsts, srcs):
+        if (
+            not src.is_cuda
+            or src.device != indices.device
+            or dst.device != indices.device
+            or src.shape[0] != n
+            or tuple(src.shape[1:]) != tuple(dst.shape[1:])
+            or not src.is_contiguous()
+            or not dst.is_contiguous()
+            or src.dtype.is_complex
+            or dst.dtype.is_complex
+            or (src.dtype == torch.bool) != (dst.dtype == torch.bool)
+        ):
+            return False
+        width = src[0].numel() if n else 0
+        widths.append(width)
+        src_strides.append(max(width, 1))
+        dst_strides.append(max(width, 1))
+        flat_srcs.append(src)
+        flat_dsts.append(dst)
+    largest = max(widths)
+    if n and largest:
+        block = min(4096, max(128, triton.next_power_of_2(largest)))
+        _scatter_rows_kernel[(len(dsts), n, triton.cdiv(largest, block))](
+            tuple(flat_srcs),
+            tuple(flat_dsts),
+            tuple(widths),
+            tuple(src_strides),
+            tuple(dst_strides),
+            indices,
+            NUM_FIELDS=len(dsts),
+            BLOCK=block,
+        )
+    return True
