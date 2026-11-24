@@ -335,6 +335,49 @@ pub(in crate::api_server::http) fn gemma4_marker_state(
     })
 }
 
+/// App state for a Gemma 4 checkpoint whose template opens the thought channel
+/// after a tool reply when thinking is on. The engine replays `generated`,
+/// without `<channel|>` when the request skips special tokens, and the
+/// returned log records each submission's `require_reasoning`.
+pub(in crate::api_server::http) fn gemma4_tool_reply_state(
+    generated: &str,
+) -> (Arc<super::AppState>, Arc<std::sync::Mutex<Vec<bool>>>) {
+    use crate::message::config::ModelConfig;
+    use crate::message::request::RequestKind;
+
+    let args = Arc::new(ServerArgs {
+        served_model_name: "model".into(),
+        reasoning_parser: Some("gemma4".into()),
+        tool_call_parser: Some("gemma4".into()),
+        model_config: ModelConfig {
+            model_type: Some("gemma4".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let formatter = checkpoint_formatter(
+        &json!({"model_type": "gemma4"}),
+        "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
+         {% else %}<|turn>model\n{% endif %}",
+    );
+    let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = submitted.clone();
+    let generated = generated.to_owned();
+    let state = answering_app_state_with_request(args, formatter, None, move |request| {
+        let RequestKind::Generate(generate) = &request.kind else {
+            panic!("expected generation");
+        };
+        seen.lock().unwrap().push(generate.require_reasoning);
+        let text = if generate.sampling_params.skip_special_tokens {
+            generated.replace("<channel|>", "")
+        } else {
+            generated.clone()
+        };
+        chunk(request.rid.as_str(), &text, true)
+    });
+    (state, submitted)
+}
+
 /// The built-in chatml template, for tests that render a chat prompt.
 pub(crate) fn chatml_formatter() -> super::ChatFormatter {
     sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap()

@@ -1265,8 +1265,8 @@ mod tests {
     use super::super::ChatFormatter;
     use super::super::test_utils::{
         GEMMA4_MARKED, GEMMA4_STRIPPED, answering_app_state_with, answering_app_state_with_item,
-        answering_app_state_with_request, body_json, chat_submitted, chunk, gemma4_marker_state,
-        post_json, with_cached_tokens,
+        body_json, chat_submitted, chunk, gemma4_marker_state, gemma4_tool_reply_state, post_json,
+        with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1638,45 +1638,11 @@ mod tests {
     /// channel to close, as on the chat route.
     #[tokio::test]
     async fn gemma4_grpc_responses_waits_for_reasoning_after_tool_output() {
-        use std::sync::Mutex;
-
-        use super::super::test_utils::checkpoint_formatter;
         use crate::api_server::responses::Responses;
-        use crate::message::config::ModelConfig;
-        use crate::message::request::RequestKind;
         use sglang_api_types::api::v1 as api;
 
-        let args = Arc::new(ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("gemma4".into()),
-            tool_call_parser: Some("gemma4".into()),
-            model_config: ModelConfig {
-                model_type: Some("gemma4".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let formatter = checkpoint_formatter(
-            &serde_json::json!({"model_type": "gemma4"}),
-            "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
-             {% else %}<|turn>model\n{% endif %}",
-        );
         for thinking in [true, false] {
-            let submitted = Arc::new(Mutex::new(Vec::new()));
-            let seen = submitted.clone();
-            let state = answering_app_state_with_request(args.clone(), formatter.clone(), None, {
-                move |request| {
-                    let RequestKind::Generate(generate) = &request.kind else {
-                        panic!("expected generation");
-                    };
-                    seen.lock().unwrap().push(generate.require_reasoning);
-                    chunk(
-                        request.rid.as_str(),
-                        "Check the result.<channel|>Done.",
-                        true,
-                    )
-                }
-            });
+            let (state, submitted) = gemma4_tool_reply_state("Check the result.<channel|>Done.");
             let adapter = Responses {
                 core: &state.core,
                 chat_formatter: state.chat_formatter.as_ref(),
@@ -2003,27 +1969,6 @@ mod tests {
     /// The generated tokens then start with reasoning, without an opening marker.
     #[tokio::test]
     async fn gemma4_stream_separates_reasoning_after_tool_reply() {
-        use std::sync::Mutex;
-
-        use super::super::test_utils::checkpoint_formatter;
-        use crate::message::config::ModelConfig;
-        use crate::message::request::RequestKind;
-
-        let args = Arc::new(ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("gemma4".into()),
-            tool_call_parser: Some("gemma4".into()),
-            model_config: ModelConfig {
-                model_type: Some("gemma4".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let formatter = checkpoint_formatter(
-            &serde_json::json!({"model_type": "gemma4"}),
-            "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
-             {% else %}<|turn>model\n{% endif %}",
-        );
         let tools = serde_json::json!([{
             "type": "function",
             "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}},
@@ -2060,27 +2005,7 @@ mod tests {
                 Some("lookup"),
             ),
         ] {
-            let submitted = Arc::new(Mutex::new(Vec::new()));
-            let seen = submitted.clone();
-            let generated = generated.to_owned();
-            let state = answering_app_state_with_request(
-                args.clone(),
-                formatter.clone(),
-                None,
-                move |request| {
-                    let RequestKind::Generate(generate) = &request.kind else {
-                        panic!("expected generation");
-                    };
-                    seen.lock().unwrap().push(generate.require_reasoning);
-                    // Replay the same output at the decoder boundary with the submitted flag.
-                    let text = if generate.sampling_params.skip_special_tokens {
-                        generated.replace("<channel|>", "")
-                    } else {
-                        generated.clone()
-                    };
-                    chunk(request.rid.as_str(), &text, true)
-                },
-            );
+            let (state, submitted) = gemma4_tool_reply_state(generated);
             let mut body = serde_json::json!({
                 "model": "model", "stream": true,
                 "chat_template_kwargs": {"enable_thinking": thinking},

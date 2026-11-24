@@ -209,29 +209,8 @@ mod tests {
     /// and a forced tool call must wait for the channel to close.
     #[tokio::test]
     async fn gemma4_stream_separates_thinking_after_tool_result() {
-        use std::sync::Mutex;
+        use crate::api_server::http::openai::test_utils::gemma4_tool_reply_state;
 
-        use crate::api_server::http::openai::test_utils::{
-            answering_app_state_with_request, checkpoint_formatter, chunk,
-        };
-        use crate::message::config::{ModelConfig, ServerArgs};
-        use crate::message::request::RequestKind;
-
-        let args = Arc::new(ServerArgs {
-            served_model_name: "m".into(),
-            reasoning_parser: Some("gemma4".into()),
-            tool_call_parser: Some("gemma4".into()),
-            model_config: ModelConfig {
-                model_type: Some("gemma4".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let formatter = checkpoint_formatter(
-            &serde_json::json!({"model_type": "gemma4"}),
-            "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
-             {% else %}<|turn>model\n{% endif %}",
-        );
         let call = r#"[{"name": "lookup", "parameters": {}}]"#;
         // (tool_choice, generated, text, tool_use, stop_reason)
         for (tool_choice, generated, text, tool_use, stop_reason) in [
@@ -250,23 +229,9 @@ mod tests {
                 "tool_use",
             ),
         ] {
-            let submitted = Arc::new(Mutex::new(Vec::new()));
-            let seen = submitted.clone();
-            let generated = generated.to_owned();
-            let state = answering_app_state_with_request(
-                args.clone(),
-                formatter.clone(),
-                None,
-                move |request| {
-                    let RequestKind::Generate(generate) = &request.kind else {
-                        panic!("expected generation");
-                    };
-                    seen.lock().unwrap().push(generate.require_reasoning);
-                    chunk(request.rid.as_str(), &generated, true)
-                },
-            );
+            let (state, submitted) = gemma4_tool_reply_state(generated);
             let mut body = serde_json::json!({
-                "model": "m", "max_tokens": 8, "stream": true,
+                "model": "model", "max_tokens": 8, "stream": true,
                 "thinking": {"type": "enabled", "budget_tokens": 1024},
                 "messages": [
                     {"role": "user", "content": "Check my booking."},
