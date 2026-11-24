@@ -30,7 +30,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
 )
-from sglang.srt.disaggregation.mori.buffers import BufferKeys, BufferKind
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
 )
@@ -184,6 +183,9 @@ class TestReceiverControlMessages(CustomTestCase):
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
         )
+        # The mori package imports conn.py, so this needs the stub of setUpClass.
+        from sglang.srt.disaggregation.mori.buffers import BufferKeys, BufferKind
+
         manager._local_keys = BufferKeys.for_buffers([0x1000], [0x2000], [[0x3000]])
         mori_descs = {
             BufferKind.KV: b"kv-desc",
