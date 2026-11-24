@@ -47,6 +47,8 @@ from sglang.srt.configs.all_configs import (
     Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     HYV4Config,
+    HYV4FlashConfig,
+    HYV4FlashTextConfig,
     InklingAudioConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -157,6 +159,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         GigaChat35Config,
         GraniteMoeHybridConfig,
         HYV4Config,
+        HYV4FlashConfig,
+        HYV4FlashTextConfig,
         DotsVLMConfig,
         DotsOCRConfig,
         Dots3Config,
@@ -347,6 +351,7 @@ for _cosmos3_edge_config_cls in (
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -354,7 +359,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(
+        model_path, allow_patterns=allow_patterns, revision=revision
+    )
 
 
 def resolve_runai_obj_uri(model_name_or_path: str) -> str:
@@ -667,7 +674,7 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
 
 
 # ---------------------------------------------------------------------------
-# Context length / generation config / sparse attention
+# Context length / generation config
 # ---------------------------------------------------------------------------
 
 # Models don't use the same configuration key for determining the maximum
