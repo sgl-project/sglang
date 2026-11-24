@@ -7,7 +7,10 @@ it here instead of re-deriving it from model architectures themselves.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
@@ -15,6 +18,14 @@ def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
     V4.1 configs can also use the V4 architecture name.
     """
     return model_type == "deepseek_v41" or "DeepseekV41" in arch
+
+
+def _tml_renderers_available(spec: str) -> bool:
+    # Deferred: importing the renderer pulls the tokenizer bindings, which this
+    # config helper does not otherwise need when it is imported.
+    from sglang.srt.parser.inkling_renderer import tml_renderers_available
+
+    return tml_renderers_available(spec)
 
 
 def resolve_chat_encoding_spec(
@@ -49,13 +60,30 @@ def resolve_chat_encoding_spec(
     if "KimiK3" in arch:
         return "kimi_k3"
 
-    # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
-    # overlay + negative MM placeholders, so it can't go through apply_chat_template;
-    # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
+    # Inkling prompts are rendered through the Inkling renderer rather than
+    # apply_chat_template: a tiktoken base + a special-token overlay + negative MM
+    # placeholders (serving_chat._encode_messages). Checkpoints may still carry a Jinja
+    # template, which is the fallback when tml-renderers cannot bind this torch build.
     if arch in INKLING2_ARCHS:
-        return "inkling2"
-    if "InklingForConditionalGeneration" in arch:
-        return "inkling"
+        spec = "inkling2"
+    elif "InklingForConditionalGeneration" in arch:
+        spec = "inkling"
+    else:
+        spec = None
+    if spec is not None:
+        if (
+            tokenizer is not None
+            and tokenizer.chat_template is not None
+            and not _tml_renderers_available(spec)
+        ):
+            logger.warning(
+                "%s prompts render through tml-renderers, which does not bind this "
+                "torch build; falling back to the checkpoint's chat template. Reasoning "
+                "separation and Inkling tool-call parsing are unavailable.",
+                spec,
+            )
+            return None
+        return spec
 
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None
     if "DeepseekV3" in arch and not has_chat_template:
