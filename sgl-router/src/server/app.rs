@@ -131,8 +131,13 @@ async fn access_log_and_record(
     let resp = next.run(req).await;
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
-    ctx.metrics
-        .record_response(&route, method_label, status.as_u16());
+    let log_ctx = resp.extensions().get::<RequestLogContext>();
+    ctx.metrics.record_response_with_model(
+        &route,
+        method_label,
+        status.as_u16(),
+        log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
+    );
 
     // A healthy probe is noise; a failing one is an incident signal.
     if is_infra_path(&path) && status.is_success() {
@@ -148,7 +153,6 @@ async fn access_log_and_record(
         // request and attached them; anything rejected before dispatch logs
         // them empty and falls back to the status for its outcome, which is all
         // the status can say.
-        let log_ctx = resp.extensions().get::<RequestLogContext>();
         tracing::info!(
             pod_id = %pod_id(),
             request_id = %request_id,
@@ -524,7 +528,7 @@ mod tests {
         let m = ctx.metrics.render();
         assert!(
             m.contains(
-                r#"sgl_router_responses_total{route="/__test_panic",method="GET",status_code="500"} 1"#
+                r#"sgl_router_responses_total{route="/__test_panic",method="GET",model_id="",status_code="500"} 1"#
             ),
             "the middleware must observe and count the panic-500; got:\n{m}",
         );
@@ -673,7 +677,7 @@ mod tests {
         assert!(
             m.contains(r#"sgl_router_requests_total{route="/healthz",method="GET"} 1"#)
                 && m.contains(
-                    r#"sgl_router_responses_total{route="/healthz",method="GET",status_code="200"} 1"#
+                    r#"sgl_router_responses_total{route="/healthz",method="GET",model_id="",status_code="200"} 1"#
                 ),
             "infra probes must still be counted at the edge: {m}",
         );

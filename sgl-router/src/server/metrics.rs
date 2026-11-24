@@ -19,7 +19,7 @@
 //! | Metric | Type | Labels |
 //! |---|---|---|
 //! | `sgl_router_requests_total` | Counter | `route`, `method` |
-//! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
+//! | `sgl_router_responses_total` | Counter | `route`, `method`, `model_id`, `status_code` |
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
@@ -534,6 +534,7 @@ struct EdgeKey {
 struct EdgeResponseKey {
     route: String,
     method: String,
+    model_id: String,
     status_code: u16,
 }
 
@@ -762,13 +763,28 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Bump the edge counter `responses_total{route,method,status_code}`. Called
-    /// at the middleware, so it captures every response — including early-exit
-    /// 400/413/503s that never reach a handler.
+    /// Bump the edge counter `responses_total{route,method,model_id,status_code}`.
+    /// Called at the middleware, so it captures every response — including
+    /// early-exit 400/413/503s that never reach a handler. Such responses carry
+    /// an empty model_id unless a handler dispatched the request.
     pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
+        self.record_response_with_model(route, method, status_code, "");
+    }
+
+    /// Like `record_response`, but carries the dispatched request's model. An
+    /// empty model_id means the request was rejected before dispatch or belongs
+    /// to a route that does not dispatch to a model.
+    pub fn record_response_with_model(
+        &self,
+        route: &str,
+        method: &str,
+        status_code: u16,
+        model_id: &str,
+    ) {
         let key = EdgeResponseKey {
             route: route.to_owned(),
             method: method.to_owned(),
+            model_id: model_id.to_owned(),
             status_code,
         };
         let mut guard = self.responses_total.lock();
@@ -1132,7 +1148,7 @@ impl MetricsRegistry {
 
         // responses_total — edge, by route/method/status (incl. early-exit 400/413/503)
         out.push_str(
-            "# HELP sgl_router_responses_total Responses returned at the router HTTP edge, by route, method and HTTP status code.\n",
+            "# HELP sgl_router_responses_total Responses returned at the router HTTP edge, by route, method, model identifier and HTTP status code.\n",
         );
         out.push_str("# TYPE sgl_router_responses_total counter\n");
         let guard = self.responses_total.lock();
@@ -1141,17 +1157,19 @@ impl MetricsRegistry {
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
         entries.sort_by(|a, b| {
-            (&a.0.route, &a.0.method, a.0.status_code).cmp(&(
+            (&a.0.route, &a.0.method, &a.0.model_id, a.0.status_code).cmp(&(
                 &b.0.route,
                 &b.0.method,
+                &b.0.model_id,
                 b.0.status_code,
             ))
         });
         for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_responses_total{{route=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
+                "sgl_router_responses_total{{route=\"{}\",method=\"{}\",model_id=\"{}\",status_code=\"{}\"}} {}\n",
                 escape_label(&key.route),
                 escape_label(&key.method),
+                escape_label(&key.model_id),
                 key.status_code,
                 value,
             ));
@@ -1846,21 +1864,26 @@ mod tests {
     }
 
     #[test]
-    fn record_response_counts_by_route_method_status_code() {
+    fn record_response_counts_by_route_method_model_and_status_code() {
         let reg = MetricsRegistry::new();
         reg.record_response("/v1/chat/completions", "POST", 200);
         reg.record_response("/v1/chat/completions", "POST", 200);
-        reg.record_response("/v1/chat/completions", "POST", 502);
+        reg.record_response_with_model(
+            "/v1/chat/completions",
+            "POST",
+            502,
+            "moonshotai/Kimi-K3.1-Pro",
+        );
         reg.record_response("/v1/chat/completions", "POST", 504);
         let out = reg.render();
         assert!(out.contains(
-            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 2"#
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="",status_code="200"} 2"#
         ));
         assert!(out.contains(
-            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="502"} 1"#
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="moonshotai/Kimi-K3.1-Pro",status_code="502"} 1"#
         ));
         assert!(out.contains(
-            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="504"} 1"#
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",model_id="",status_code="504"} 1"#
         ));
     }
 
