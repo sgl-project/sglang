@@ -470,8 +470,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
+            # Locations need only the page indices, so resolving them overlaps
+            # the forward that may still use the slots.
+            if ready_event is not None:
+                ready_event.synchronize_indices()
+            for transfers in request_transfers:
+                for transfer in transfers:
+                    batches[transfer.name][1].extend(
+                        self.pools[transfer.name].prepare_locations(
+                            transfer.host_indices
+                        )
+                    )
             # Wait before opening sessions so the slot fence does not consume
-            # their leases. Key preparation above still overlaps the GPU work.
+            # their leases.
             if ready_event is not None:
                 ready_event.synchronize()
             # Track every submitted key: a failed batch can still open some sessions.
@@ -483,13 +494,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"Mooncake get session start failed: keys={len(session_keys)}, "
                         f"results={result}"
                     )
-            for transfers in request_transfers:
-                for transfer in transfers:
-                    batches[transfer.name][1].extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
-                    )
             batches = {
                 name: (keys, np.asarray(locations, dtype=np.int64))
                 for name, (keys, locations) in batches.items()
@@ -499,18 +503,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 range(start, min(start + self.load_layer_group, self.num_layers))
                 for start in range(0, self.num_layers, self.load_layer_group)
             ]
+            completed = 0
             for group in groups:
                 group_futures = []
                 futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
-                    meta = self._group_range_meta(name, locations, group)
+                    meta = self.pools[name].get_prepared_layers_range_meta(
+                        locations, group
+                    )
                     if meta is not None:
                         group_futures.extend(self._submit_range_gets(name, keys, *meta))
-            for group, group_futures in zip(groups, futures):
-                for future in group_futures:
-                    future.result()
-                for layer in group:
-                    self.layer_done_counter.complete(counter_index, layer)
+                # Publish groups that landed during this submit: the next submit
+                # can take longer than the earlier groups' reads.
+                completed = self._complete_groups(
+                    counter_index, groups, futures, completed, block=False
+                )
+            self._complete_groups(counter_index, groups, futures, completed, block=True)
         except BaseException as error:
             # Failure wakes consumers, which may release the destination rows.
             # Stop every submitted write before publishing it.
@@ -528,21 +536,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
-    def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
-        merged = None
-        for layer in group:
-            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
-            if meta is None:
-                continue
-            if merged is None:
-                # Pool metadata may share read-only size/offset rows.
-                # Grouping extends each row, so give it independent ownership.
-                merged = tuple([list(row) for row in rows] for rows in meta)
-                continue
-            for merged_rows, rows in zip(merged, meta):
-                for merged_row, row in zip(merged_rows, rows):
-                    merged_row.extend(row)
-        return merged
+    def _complete_groups(
+        self,
+        counter_index: int,
+        groups: list[range],
+        futures: list[list[Future]],
+        completed: int,
+        *,
+        block: bool,
+    ) -> int:
+        """Complete submitted groups in order, from ``completed``; return the next one.
+
+        Without ``block``, stop at the first group with a read still in flight.
+        Order matters: the MLA broadcast of the layers up to a waited one
+        assumes they all landed. A failed read raises from here.
+        """
+        for group_index in range(completed, len(futures)):
+            group_futures = futures[group_index]
+            if not block and not all(future.done() for future in group_futures):
+                return group_index
+            for future in group_futures:
+                future.result()
+            for layer in groups[group_index]:
+                self.layer_done_counter.complete(counter_index, layer)
+        return len(futures)
 
     def _submit_range_gets(
         self, name: PoolName, keys: list[str], ptrs, sizes, offsets
