@@ -37,6 +37,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
+    ragged_verify_token_rows,
     read_ragged_verify_mode,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -1848,9 +1849,15 @@ class LowRatioCompressAscendBackendMixin:
             return None
         seq_lens = seq_lens.reshape(-1)
         n = int(seq_lens.numel())
+        mode = getattr(forward_batch, "forward_mode", None)
+        layout = getattr(forward_batch, "ragged_verify_layout", None)
+        if layout is not None and mode is not None and mode.is_target_verify():
+            slots = LowRatioCompressAscendBackendMixin._dsv41_verify_cache_locs(
+                forward_batch, t
+            )
+            return (ragged_verify_token_rows(layout, t) < layout.bs) & (slots > 0)
         if n == t:
             return seq_lens > 0
-        mode = getattr(forward_batch, "forward_mode", None)
         if n > 0 and t % n == 0 and mode is not None and mode.is_target_verify():
             # Verify rows repeat each request's window in request-major order.
             w = getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
@@ -2194,10 +2201,10 @@ class LowRatioCompressAscendBackendMixin:
         setattr(fm, f"c{ratio}_index_page_table", index_page_table)
 
     def _init_dsv41_graph_metadata(
-        self, metadata, bs: int, tokens_per_req: int, device
+        self, metadata, bs: int, tokens_per_req: int, device, *, num_tokens=None
     ) -> None:
-        """Allocate the aclgraph-persistent low-ratio buffers for one bs bucket."""
-        t = bs * tokens_per_req
+        """Allocate low-ratio ACL Graph buffers for this capture shape."""
+        t = bs * tokens_per_req if num_tokens is None else num_tokens
         for ratio in self._dsv41_low_ratios():
             pad = min(t, t // ratio + bs)
             setattr(
@@ -2251,9 +2258,11 @@ class LowRatioCompressAscendBackendMixin:
             metadata.kernel_metadata = {}
         # Variable-size dispatch tables: probe one tensor per attention type.
         ds41 = _ds41_ops()
-        cu_seqlens_q = (
-            torch.arange(bs + 1, dtype=torch.int32, device=device) * tokens_per_req
-        )
+        cu_seqlens_q = getattr(metadata, "actual_seq_lengths_q_pa", None)
+        if cu_seqlens_q is None:
+            cu_seqlens_q = (
+                torch.arange(bs + 1, dtype=torch.int32, device=device) * tokens_per_req
+            )
         probe_cmp_lengths = torch.zeros((t, 1), dtype=torch.int32, device=device)
         for ratio in (0, *self._dsv41_low_ratios()):
             attention_type = "win" if ratio == 0 else f"c{ratio}a"
@@ -2443,33 +2452,32 @@ class LowRatioCompressAscendBackendMixin:
                 )
             )
 
-    def _refresh_graph_dsv41_verify_1d(self, ctx) -> None:
-        """Verify-shaped replay refresh for the V4.1 low-ratio metadata.
+    @staticmethod
+    def _dsv41_verify_cache_locs(forward_batch, num_tokens: int) -> torch.Tensor:
+        # Replay metadata can receive the original, unpadded slot map.
+        slots = forward_batch.out_cache_loc.reshape(-1)[:num_tokens]
+        if slots.numel() < num_tokens:
+            slots = F.pad(slots, (0, num_tokens - slots.numel()))
+        return slots
 
-        Decode's refresh hard-codes one row per request, which a request-major
-        verify window would truncate and misalign; this variant feeds the whole
-        window through the shared row formulas, matching the eager verify path
-        element for element.
-        """
+    def _refresh_graph_dsv41_verify_1d(self, ctx) -> None:
+        """Refresh low-ratio positions and slots for static or compact verify."""
         fm = ctx.fm
-        w = int(ctx.tokens_per_bs)
-        n = int(ctx.bs) * w
-        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64)
+        layout = ctx.ragged_layout
+        width = int(ctx.tokens_per_bs)
+        n = int(layout.graph_num_tokens) if layout is not None else int(ctx.bs) * width
         positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64)
         if positions.numel() != n:
             raise RuntimeError(
-                "V4.1 verify replay rows do not match the bucket width: "
-                f"positions={positions.numel()} vs bs*tokens_per_req={n}."
+                "V4.1 verify replay positions do not match the token capacity: "
+                f"{positions.numel()} vs {n}."
             )
-        # The replay view's out_cache_loc is UNPADDED: scatter it into the
-        # padded window; padding rows keep 0 and the slot filter drops them.
-        raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
-        out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
-        if raw_out_loc.numel() > 0:
-            m = min(int(raw_out_loc.numel()), n)
-            out_loc[:m] = raw_out_loc[:m]
-        # start_pos/seqused are written by _refresh_graph_verify_rows.
-        row_live = live.repeat_interleave(w)
+        out_loc = self._dsv41_verify_cache_locs(ctx.forward_batch, n).to(torch.int64)
+        row_live = (
+            fm.dsv41_live_mask_buf
+            if layout is not None
+            else ctx.live_seq_lens[: ctx.bs].repeat_interleave(width)
+        )
         for ratio in self._dsv41_low_ratios():
             keep, pos_values, slot_values = self._dsv41_ratio_row_values(
                 positions, out_loc, ratio, int(self.page_size), row_live=row_live
@@ -2675,10 +2683,8 @@ class DeepseekV4AscendAttnBackend(
     def _validate_spec_support(self, spec_algorithm) -> None:
         """The gate for every speculative-decoding constraint of this backend.
 
-        DeepSeek-V4.1 (ratios 1/2) runs DSpark on the STATIC verify layout only.
-        Its low-ratio rows assume the STATIC request-major rectangle, so another
-        spec algorithm, or a ragged mode (CAP_ACCEPT / COMPACT), would scatter
-        this step's compressed rows to stale slots; both are rejected at startup.
+        DeepSeek-V4.1 (ratios 1/2) supports DSpark static verify. On A5 the
+        low-ratio backend can also consume packed compact verify rows.
         The generation is read from ``_dsv4_is_v41_model`` rather than the ratio
         list, which a draft worker empties.
 
@@ -2695,15 +2701,18 @@ class DeepseekV4AscendAttnBackend(
         if not spec_algorithm.is_dspark():
             raise ValueError(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative "
-                f"decoding (static mode), got {spec_algorithm!r}."
+                f"decoding, got {spec_algorithm!r}."
             )
         ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
-            raise ValueError(
-                "DeepSeek-V4.1 on NPU supports only DSpark speculative "
-                "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
-                f"got SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value!r}."
-            )
+        if ragged_mode is RaggedVerifyMode.STATIC or (
+            ragged_mode is RaggedVerifyMode.COMPACT and is_npu_arch35()
+        ):
+            return
+        raise ValueError(
+            "DeepSeek-V4.1 DSpark supports SGLANG_RAGGED_VERIFY_MODE=static "
+            "and additionally compact on Ascend A5, "
+            f"got SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value!r}."
+        )
 
     def _validate_draft_window_rows(self) -> None:
         """A draft worker's window rows must match the V4 sparse-attention op.
@@ -3232,10 +3241,12 @@ class DeepseekV4AscendAttnBackend(
             # The live-row mask the captured graphs read; filled per replay by
             # _refresh_graph_seq_metadata (never traced inside the graph).
             metadata.dsv41_live_mask_buf = torch.zeros(
-                bs * tokens_per_req, dtype=torch.bool, device=device
+                n_tok, dtype=torch.bool, device=device
             )
-            # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
-            self._init_dsv41_graph_metadata(metadata, bs, tokens_per_req, device)
+            # V4.1: MQSMLA/QLI dispatch tables plus window/top-k-length buffers.
+            self._init_dsv41_graph_metadata(
+                metadata, bs, tokens_per_req, device, num_tokens=n_tok
+            )
 
         metadata.ori_sparse_indices = None
         metadata.ori_topk_length = None
@@ -3566,10 +3577,24 @@ class DeepseekV4AscendAttnBackend(
         mask_buf = getattr(fm, "dsv41_live_mask_buf", None)
         if mask_buf is not None:
             if ctx.graph_mode.is_target_verify():
-                per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
-                    torch.int64
-                ) > int(ctx.tokens_per_bs)
-                mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))
+                layout = ctx.ragged_layout
+                if layout is None:
+                    per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
+                        torch.int64
+                    ) > int(ctx.tokens_per_bs)
+                    mask = per_req.repeat_interleave(int(ctx.tokens_per_bs))
+                elif ctx.is_idle_replay or ctx.raw_bs == 0:
+                    mask = torch.zeros_like(mask_buf)
+                else:
+                    rows = ragged_verify_token_rows(layout, mask_buf.numel())
+                    slots = self._dsv41_verify_cache_locs(
+                        ctx.forward_batch, mask_buf.numel()
+                    )
+                    mask = (
+                        (rows < ctx.raw_bs)
+                        & (ctx.live_seq_lens[rows.clamp(max=ctx.bs - 1)] > 0)
+                        & (slots >= self.page_size)
+                    )
             else:
                 mask = ctx.live_seq_lens_cpu[: ctx.bs].to(torch.int64) > 0
             mask_buf.copy_(mask.to(mask_buf.dtype))

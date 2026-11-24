@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=8, suite="extra-a-test-npu")
 
@@ -28,7 +29,7 @@ import sglang.srt.hf_transformers  # noqa: F401
 
 # The backend imports ragged_verify at module level, so load the REAL module
 # before the stub block below shadows its package parent.
-from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 
 for mod in (
     "torch_npu",
@@ -1549,15 +1550,13 @@ class TestEagerGraphMetadataParity(unittest.TestCase):
         self.assertEqual(graph.c2_loc[:2].tolist(), eager.c2_loc.tolist())
 
 
-class TestVerifyGraphGuards(unittest.TestCase):
+class TestVerifyGraphGuards(CustomTestCase):
     """The verify replay seam and the startup spec gate.
 
     ``_refresh_graph_verify_rows`` owns the verify replay: a live window
     refreshes the low-ratio 1-D rows, an idle replay neutralizes them, and a
     stage without low ratios (V4 model or draft worker) keeps its silent
-    bypass. DeepSeek-V4.1 speculative decoding runs DSpark on the STATIC layout
-    only: every other algorithm and every ragged mode is rejected at startup by
-    ``_validate_spec_support``.
+    bypass. DeepSeek-V4.1 enables compact verify for DSpark on A5.
     """
 
     def _run_verify_rows(self, *, has_low_ratio=True, is_idle=False):
@@ -1637,14 +1636,23 @@ class TestVerifyGraphGuards(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DSpark"):
             self._gate(is_dflash=True)
 
-    def test_v41_rejects_every_ragged_mode_even_for_dspark(self):
-        # CAP_ACCEPT and COMPACT both leave the STATIC request-major rectangle.
-        # Match the env-var name, not "DSpark": both raises mention DSpark, so
-        # only this pins the mode check as the one that fired.
-        for mode in (RaggedVerifyMode.CAP_ACCEPT, RaggedVerifyMode.COMPACT):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"):
-                    self._gate(mode=mode, is_dspark=True)
+    def test_v41_accepts_compact_on_a5(self):
+        with patch.object(dsv4_backend, "is_npu_arch35", return_value=True):
+            self._gate(mode=RaggedVerifyMode.COMPACT, is_dspark=True)
+
+    def test_v41_rejects_compact_without_a5(self):
+        with (
+            patch.object(dsv4_backend, "is_npu_arch35", return_value=False),
+            self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"),
+        ):
+            self._gate(mode=RaggedVerifyMode.COMPACT, is_dspark=True)
+
+    def test_v41_rejects_cap_accept_on_a5(self):
+        with (
+            patch.object(dsv4_backend, "is_npu_arch35", return_value=True),
+            self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"),
+        ):
+            self._gate(mode=RaggedVerifyMode.CAP_ACCEPT, is_dspark=True)
 
     def test_no_spec_decoding_is_not_gated(self):
         # The constraints are about speculative decoding; a decode-only V4.1 run
@@ -2231,19 +2239,23 @@ class TestVerifyPaddingRows(unittest.TestCase):
         self.assertEqual(lengths[:, 0].tolist(), [1, 1])
 
 
-class TestVerifyGraphRefresh(unittest.TestCase):
+class TestVerifyGraphRefresh(CustomTestCase):
     """``_refresh_graph_verify_rows`` writes the captured buffers with the same
     values the eager builder derives -- element for element -- and the decode
     refresh touches only the rows it owns."""
 
-    def _graph_metadata(self, backend, bs, tokens_per_req):
+    def _graph_metadata(self, backend, bs, tokens_per_req, *, num_tokens=None):
         metadata = SimpleNamespace(
             block_tables=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)[:bs],
             kernel_metadata={},
         )
         _seed_graph_index_page_tables(backend, bs=bs, cols=2)
         backend._init_dsv41_graph_metadata(
-            metadata, bs=bs, tokens_per_req=tokens_per_req, device="cpu"
+            metadata,
+            bs=bs,
+            tokens_per_req=tokens_per_req,
+            device="cpu",
+            num_tokens=num_tokens,
         )
         # The backend class allocates these shared buffers for every bucket
         # (_init_dsv4_graph_metadata); mirror that here.
@@ -2272,6 +2284,52 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         )
 
     _WINDOW = ([6, 7, 8, 5, 6, 7], [300, 301, 302, 400, 401, 402])
+
+    def test_packed_replay_masks_tail_and_reuses_compressor_buffers(self):
+        backend = _low_ratio_backend()
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=4, num_tokens=6)
+        metadata.actual_seq_lengths_q_pa = torch.zeros(3, dtype=torch.int32)
+        metadata.actual_seq_lengths_kv = torch.zeros(2, dtype=torch.int32)
+        metadata.dsv41_live_mask_buf = torch.zeros(6, dtype=torch.bool)
+        ctx = self._ctx(
+            metadata,
+            bs=2,
+            live=[6, 9],
+            w=4,
+            positions=[6, 7, 9, 0, 0, 0],
+            out_cache_loc=[300, 301, 400],
+        )
+        ctx.graph_mode = _Mode("target_verify")
+        ctx.live_seq_lens_cpu = ctx.live_seq_lens
+        slots = metadata.c2_loc
+
+        def replay(lengths, final_lengths):
+            verify_lens = torch.tensor(lengths, dtype=torch.int32)
+            indptr = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32)
+            ctx.ragged_layout = RaggedVerifyLayout(
+                verify_lens=verify_lens,
+                graph_num_tokens=6,
+                extend_start_loc=indptr[:-1],
+                qo_indptr_device=indptr,
+            )
+            ctx.verify_lens = verify_lens
+            ctx.final_seq_lens_cpu = torch.tensor(final_lengths, dtype=torch.int32)
+            backend._refresh_graph_seq_metadata(ctx)
+            backend._refresh_graph_verify_rows(ctx)
+
+        replay([2, 1], [8, 10])
+        self.assertEqual(metadata.actual_seq_lengths_q_pa.tolist(), [0, 2, 3])
+        self.assertEqual(
+            metadata.dsv41_live_mask_buf.tolist(), [True] * 3 + [False] * 3
+        )
+        self.assertEqual(metadata.c1_loc.tolist(), [300, 301, 400, -1, -1, -1])
+        self.assertEqual(slots.tolist(), [150, 200, -1, -1, -1])
+
+        ctx.forward_batch.positions.copy_(torch.tensor([6, 9, 0, 0, 0, 0]))
+        ctx.forward_batch.out_cache_loc = torch.tensor([300, 400])
+        replay([1, 1], [7, 10])
+        self.assertIs(metadata.c2_loc, slots)
+        self.assertEqual(slots.tolist(), [200, -1, -1, -1, -1])
 
     def test_replay_matches_eager_elementwise(self):
         backend = _low_ratio_backend()
