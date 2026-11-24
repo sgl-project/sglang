@@ -149,6 +149,35 @@ class TestNorm:
         assert mid.data_ptr() != residual.data_ptr()
         assert output.data_ptr() != x.data_ptr()
 
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("shape", [(0, 33), (1, 33), (5, 2048)])
+    def test_gemma_dual_rmsnorm_residual_scalar(self, shape, dtype):
+        generator = torch.Generator().manual_seed(1234)
+        rows, hidden_size = shape
+        x1, x2, residual = (
+            torch.randn(
+                (rows, hidden_size + padding), dtype=dtype, generator=generator
+            )[:, :hidden_size]
+            for padding in (3, 5, 7)
+        )
+        w1, w2, w3 = (
+            torch.randn(hidden_size, dtype=dtype, generator=generator) for _ in range(3)
+        )
+        scalar = torch.tensor([0.625], dtype=dtype)
+        eps1, eps2, eps3 = 0.125, 0.25, 0.375
+        dense = self._norm(x1.float(), eps1) * w1.float()
+        moe = self._norm(x2.float(), eps2) * w2.float()
+        merged = dense + moe
+        post_norm = self._norm(merged, eps3) * w3.float()
+        expected = ((post_norm + residual.float()) * scalar.float()).to(dtype)
+
+        actual = torch.ops.sgl_kernel.gemma_dual_rmsnorm_residual_scalar_cpu(
+            x1, w1, x2, w2, w3, residual, scalar, eps1, eps2, eps3
+        )
+        torch.testing.assert_close(
+            actual, expected, atol=precision[dtype], rtol=precision[dtype]
+        )
+
     @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
     @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
     @pytest.mark.parametrize("batch_size", [32, 121])
