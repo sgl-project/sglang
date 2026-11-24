@@ -54,7 +54,7 @@ def _snapshot_tensors(tensors: dict) -> dict:
     }
 
 
-class SchedulerVPPMixin:
+class NativeVPPWaveMixin:
     def init_vpp_loop_state(self: Scheduler) -> None:
         layout = self.tp_worker.model_runner.model.vpp_layout
         parallel = get_parallel()

@@ -32,7 +32,8 @@ from sglang.srt.distributed.vpp_transport import P2PWorkGroup
 from sglang.srt.managers import scheduler_vpp_wave_mixin as vpp_mod
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
-from sglang.srt.managers.scheduler_vpp_wave_mixin import SchedulerVPPMixin
+from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin
+from sglang.srt.managers.scheduler_vpp_wave_mixin import NativeVPPWaveMixin
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner.vpp_stage import execute_vpp_stage
@@ -2045,7 +2046,7 @@ class TestSchedulerVPP(CustomTestCase):
         broadcast = [None]
         schedulers = []
         for rank in range(size):
-            scheduler = object.__new__(SchedulerVPPMixin)
+            scheduler = object.__new__(NativeVPPWaveMixin)
 
             def recv(rank=rank):
                 return channels[rank - 1].get(timeout=10)
@@ -2153,7 +2154,7 @@ class TestSchedulerVPP(CustomTestCase):
     def test_abort_inputs_are_not_dispatched_between_retained_admissions(self):
         """A later input poll could release the preceding unlaunched batch's KV."""
         layout = VPPLayout(12, 2, virtual_stages=3)
-        scheduler = object.__new__(SchedulerVPPMixin)
+        scheduler = object.__new__(NativeVPPWaveMixin)
         polls = []
         batches = [
             SimpleNamespace(
@@ -2336,7 +2337,7 @@ class TestSchedulerVPP(CustomTestCase):
         launches = [[], []]
         completions = [[], []]
         for rank in range(2):
-            scheduler = object.__new__(SchedulerVPPMixin)
+            scheduler = object.__new__(NativeVPPWaveMixin)
             scheduler.__dict__.update(
                 pp_group=SimpleNamespace(is_first_rank=rank == 0),
                 vpp_schedule=VPPFixedSchedule(layout, rank, 2),
@@ -2425,6 +2426,270 @@ class TestSchedulerVPP(CustomTestCase):
                     for seq in sequences
                 ],
             )
+
+
+class TestNativeVPPAdapter(CustomTestCase):
+    def test_control_identity_is_checked_before_reposting_receive(self):
+        """An old epoch/layout must not enter a newly reused control channel."""
+        for changed in (
+            {},
+            {"runtime_epoch": 2},
+            {"layout_digest": "old"},
+            {"protocol_version": 2},
+        ):
+            with self.subTest(changed=changed):
+                wire = PipelineControlEnvelope(
+                    1, 3, "layout", PipelineControlKind.RESOURCE, 1
+                ).to_dict()
+                wire.update(changed)
+                ready = [False]
+                received = []
+                handle = SimpleNamespace(
+                    poll_metadata_ready=lambda: ready[0],
+                    wait=lambda: wire,
+                )
+
+                def receive(*, tag):
+                    received.append(tag)
+                    return handle
+
+                scheduler = object.__new__(SchedulerVPPMixin)
+                scheduler.__dict__.update(
+                    attn_tp_group=SimpleNamespace(rank_in_group=0),
+                    pp_group=SimpleNamespace(recv_tensor_dict_async=receive),
+                    _pp_vpp_pending_control_recv=None,
+                    _pp_vpp_runtime_epoch=3,
+                    _pp_vpp_control_layout_digest="layout",
+                )
+                self.assertIsNone(scheduler._pp_vpp_poll_control_receiver())
+                self.assertEqual(received, [2])
+                ready[0] = True
+                if changed:
+                    with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                        scheduler._pp_vpp_poll_control_receiver()
+                    self.assertEqual(received, [2])
+                else:
+                    envelope, actual = scheduler._pp_vpp_poll_control_receiver()
+                    self.assertEqual(envelope.kind, PipelineControlKind.RESOURCE)
+                    self.assertIs(actual, wire)
+                    self.assertEqual(received, [2, 2])
+
+    def test_control_send_window_preserves_fifo_until_oldest_send_completes(self):
+        """A later completed send cannot free an earlier live FIFO owner."""
+        completed = [False, False, True]
+        sent = []
+        works = [SimpleNamespace(poll=lambda i=i: completed[i]) for i in range(3)]
+
+        def send(wire, *, async_send, tag):
+            self.assertTrue(async_send)
+            self.assertEqual(tag, 2)
+            sent.append(wire)
+            return works[wire]
+
+        scheduler = object.__new__(SchedulerVPPMixin)
+        scheduler.__dict__.update(
+            attn_tp_group=SimpleNamespace(rank_in_group=0),
+            pp_group=SimpleNamespace(send_tensor_dict=send),
+            pp_comm_stream_ctx=nullcontext(),
+            _pp_vpp_control_outbox=deque(range(3)),
+        )
+        pending = deque()
+        scheduler._pp_vpp_flush_control_outbox(pending, 2)
+        self.assertEqual(sent, [0, 1])
+        completed[1] = True
+        scheduler._pp_vpp_flush_control_outbox(pending, 2)
+        self.assertEqual(sent, [0, 1])
+        completed[0] = True
+        scheduler._pp_vpp_flush_control_outbox(pending, 2)
+        self.assertEqual(sent, [0, 1, 2])
+        scheduler._pp_vpp_flush_control_outbox(pending, 2)
+        self.assertFalse(pending)
+
+    def test_virtual_passes_retain_sampling_rows_and_snapshot_shared_outputs(self):
+        """Pool-row and model-workspace reuse must not alter an earlier batch."""
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.penalties import PenaltyStatusPool
+        from sglang.srt.sampling.sampler_params import SamplerParamsPool
+        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        class Event(_Event):
+            def synchronize(self):
+                if not self.recorded:
+                    raise AssertionError("Unrecorded forward fence")
+
+        class Stream(_Stream):
+            def wait_event(self, event):
+                if not event.recorded:
+                    raise AssertionError("Consumer preceded producer")
+
+        stream = Stream()
+        workspace = torch.empty(1)
+        sent, calls = [], []
+        batches = []
+        params = SamplerParamsPool(8, "cpu")
+        penalties = PenaltyStatusPool(10, "cpu")
+        for seq in range(2):
+            req = Req(
+                rid=str(seq),
+                origin_input_text="",
+                origin_input_ids=array("q", [1]),
+                sampling_params=SamplingParams(
+                    max_new_tokens=2,
+                    temperature=1.0 if seq == 0 else 0.7,
+                    top_k=1 if seq == 0 else 7,
+                    sampling_seed=123 + seq,
+                    logit_bias={str(seq): 0.5},
+                ),
+            )
+            req.kv.req_pool_idx = seq + 2
+            params.write([req])
+            batches.append(
+                SimpleNamespace(
+                    reqs=[req],
+                    seq=seq,
+                    device="cpu",
+                    hicache_consumer_index=0,
+                    extend_lens=[1],
+                    return_logprob=False,
+                    _vpp_fixed_manifest={"batch_seq": seq},
+                    req_pool_indices=torch.tensor([seq + 2]),
+                    req_pool_indices_cpu=torch.tensor([seq + 2]),
+                    sampling_info=SamplingBatchInfo(vocab_size=10, device="cpu"),
+                )
+            )
+
+        def forward(_, *, forward_batch, pp_proxy_tensors, vpp_stage_id):
+            seq = forward_batch.seq
+            calls.append((seq, vpp_stage_id, id(forward_batch)))
+            info = forward_batch.sampling_info
+            self.assertEqual(info.top_ks.tolist(), [1 if seq == 0 else 7])
+            self.assertEqual(info.is_all_greedy, seq == 0)
+            self.assertAlmostEqual(info.temperatures.item(), 1.0 if seq == 0 else 0.7)
+            if seq == 0:
+                self.assertIsNone(info.sampling_seed)
+            else:
+                self.assertEqual(info.sampling_seed.tolist(), [123 + seq])
+            self.assertEqual(info.logit_bias[0, seq].item(), 0.5)
+            workspace.fill_(seq + vpp_stage_id)
+            return SimpleNamespace(
+                pp_hidden_states_proxy_tensors=PPProxyTensors(
+                    {"hidden_states": workspace}
+                )
+            )
+
+        def send(tensors, *, async_send, tag):
+            self.assertTrue(async_send)
+            self.assertEqual(tag, 1)
+            sent.append(tensors)
+            return []
+
+        group = SimpleNamespace(send_tensor_dict=send)
+        scheduler = object.__new__(SchedulerVPPMixin)
+        scheduler.__dict__.update(
+            _vpp_layout=VPPLayout(8, 2),
+            _vpp_forward_batches={},
+            running_mbs=[None, None],
+            last_mbs=[None, None],
+            mbs=batches,
+            mb_metadata=[None, None],
+            _pp_vpp_stage_events={},
+            _pp_tensor_dict_inbox=defaultdict(deque),
+            pp_group=SimpleNamespace(rank_in_group=0, send_tensor_dict=send),
+            _pp_vpp_runtime_epoch=3,
+            _pp_vpp_control_layout_digest="layout",
+            forward_stream_ctx=nullcontext(),
+            pp_comm_stream_ctx=nullcontext(),
+            forward_stream=stream,
+            schedule_stream=stream,
+            future_map=None,
+            device_module=SimpleNamespace(Event=Event, current_stream=lambda: stream),
+            tp_worker=SimpleNamespace(
+                model_runner=object(),
+                set_hicache_consumer=lambda index: None,
+                forward_batch_generation=forward,
+            ),
+            _on_step_launch=lambda batch: None,
+            resolve_forward_inputs=lambda batch, future_map: None,
+            _on_step_forward_recorded=lambda event: None,
+            sampler_params_pool=params,
+            penalty_status_pool=penalties,
+        )
+        scheduler.pp_group.vpp_reverse_group = group
+        # Replace the model-input boundary; sampling, dispatch and tensor
+        # lifetime logic all execute their production implementations.
+        with (
+            get_context().override_server_args(enable_watermark=False),
+            patch(
+                "sglang.srt.managers.scheduler_vpp_mixin.ForwardBatch.init_new",
+                side_effect=lambda batch, runner, **kw: SimpleNamespace(
+                    seq=batch.seq, sampling_info=batch.sampling_info
+                ),
+            ) as build,
+        ):
+            for seq, stage in ((0, 0), (1, 0), (0, 2), (1, 2)):
+                if stage:
+                    scheduler._pp_tensor_dict_inbox["vpp_proxy"].append(
+                        {
+                            "hidden_states": torch.ones(1),
+                            "vpp_batch_seq": seq,
+                            "vpp_stage_id": stage,
+                        }
+                    )
+                action = PipelineWavefrontAction(0, seq, seq, stage, 0)
+                self.assertEqual(
+                    scheduler._pp_vpp_execute_wavefront_action(action, [0, 1]),
+                    (True, []),
+                )
+                if stage == 0:
+                    self.assertFalse(scheduler.mb_metadata[seq].forward_done.recorded)
+                    params.table[SamplerParamsPool.TOP_K, seq + 2] = 99
+            self.assertEqual(build.call_count, 2)
+        self.assertTrue(all(m.forward_done.recorded for m in scheduler.mb_metadata))
+        self.assertEqual([t["hidden_states"].item() for t in sent], [0, 1, 2, 3])
+        self.assertEqual(calls[0][2], calls[2][2])
+        self.assertEqual(calls[1][2], calls[3][2])
+        self.assertNotEqual(calls[0][2], calls[1][2])
+
+    def test_retained_chunk_blocks_admission_until_batch_is_released(self):
+        """Local first-pass completion cannot replan a still-owned chunk."""
+        scheduler = object.__new__(SchedulerVPPMixin)
+        req = object()
+        scheduler.chunked_req = req
+        scheduler.mbs = [SimpleNamespace(reqs=[req]), None]
+        schedule = PipelineRankSchedule(0, 2, 2, 2)
+        self.assertFalse(
+            scheduler._pp_vpp_can_queue_admit(1, set(), [0, None], schedule)
+        )
+        scheduler.mbs = [None, None]
+        self.assertTrue(
+            scheduler._pp_vpp_can_queue_admit(1, set(), [None, None], schedule)
+        )
+
+    def test_prefix_publication_preserves_span_until_native_result_processing(self):
+        """Publishing remote completion cannot erase the span just executed."""
+        scheduler = object.__new__(SchedulerVPPMixin)
+        req = SimpleNamespace(
+            prefix_len=4,
+            extend_end=8,
+            session_generation=0,
+            kv=SimpleNamespace(holds_kv=True, kv_allocated_len=8),
+        )
+        scheduler._pp_vpp_find_req = lambda rid: req
+        scheduler._pp_vpp_advance_prefix_mapping("request", 0, 8)
+        self.assertEqual(req.extend_end - req.prefix_len, 4)
+        with self.assertRaisesRegex(RuntimeError, "allocated request row"):
+            scheduler._pp_vpp_advance_prefix_mapping("request", 0, 9)
+
+    def test_scheduler_mro_resolves_native_adapter_hooks(self):
+        """An earlier PP mixin must not shadow the VPP runtime entry."""
+        from sglang.srt.managers.scheduler import Scheduler
+
+        self.assertIs(Scheduler.event_loop_vpp, SchedulerVPPMixin.event_loop_vpp)
+        self.assertIs(
+            Scheduler._init_scheduling_native_loop_state,
+            SchedulerVPPMixin._init_scheduling_native_loop_state,
+        )
 
 
 if __name__ == "__main__":
