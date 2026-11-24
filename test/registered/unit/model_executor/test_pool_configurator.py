@@ -2383,6 +2383,10 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(10, 0)),
             patch("torch.version.cuda", "13.0"),
+            patch(
+                "sglang.srt.mem_cache.deepseek_v4_memory_pool.current_arch",
+                return_value=SimpleNamespace(is_sm=lambda major: major == 10),
+            ),
             envs.SGLANG_DSV4_KV_LAYOUT.override("auto"),
             envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.override("auto"),
         ):
