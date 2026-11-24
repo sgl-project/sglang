@@ -25,6 +25,7 @@ use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_fil
 use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
+use crate::api_server::core::metrics::observe_fetch_slot_wait;
 use crate::message::request::{GenerateRequest, MmData, ProcessorFetch};
 use crate::multi_modality::encoded::MmModality;
 use crate::multi_modality::payload::io_sources;
@@ -220,15 +221,29 @@ async fn fetch_ordered(
     .await
 }
 
+/// A fetch waiting for a slot since its instant. The wait is observed when
+/// this drops: once the slot is taken, or when the fetch is dropped first (its
+/// deadline, a failed sibling, a gone client), so waits that end in a
+/// timeout count too.
+struct SlotWait(tokio::time::Instant);
+
+impl Drop for SlotWait {
+    fn drop(&mut self) {
+        observe_fetch_slot_wait(self.0.elapsed());
+    }
+}
+
 async fn run_blocking_bounded<F, T>(permits: Arc<Semaphore>, work: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let waiting = SlotWait(tokio::time::Instant::now());
     let permit = permits
         .acquire_owned()
         .await
         .expect("semaphore never closed");
+    drop(waiting);
     tokio::task::spawn_blocking(move || {
         // Keep the permit with the blocking operation: dropping the async
         // caller cannot make uncancellable work disappear from the bound.
@@ -794,5 +809,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    /// A fetch reports how long it waited for a slot, whether it then gets
+    /// one or is dropped while still waiting.
+    #[tokio::test(start_paused = true)]
+    async fn slot_waits_are_observed_even_when_cut_short() {
+        use crate::api_server::core::FrontendMetrics;
+        use crate::message::config::{DisaggregationMode, MetricsConfig};
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("prefetch-slot-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics =
+            FrontendMetrics::new(&MetricsConfig::for_dir(&dir), DisaggregationMode::Null).unwrap();
+        let waited = || {
+            metrics
+                .exported("sglang:frontend_media_fetch_slot_wait_seconds_sum ")
+                .unwrap()
+        };
+        // Every fetch in the process is observed here, other tests' too: the
+        // waits below are long enough that no other test's can stand in.
+        let permits = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&permits).acquire_owned().await.unwrap();
+
+        let before = waited();
+        let fetch = tokio::spawn(run_blocking_bounded(Arc::clone(&permits), || ()));
+        tokio::time::sleep(Duration::from_secs(1000)).await;
+        drop(held);
+        fetch.await.unwrap().unwrap();
+        let wait = waited() - before;
+        assert!((1000.0..2000.0).contains(&wait), "{wait}");
+
+        let _held = Arc::clone(&permits).acquire_owned().await.unwrap();
+        let before = waited();
+        let cut_short = tokio::time::timeout(
+            Duration::from_secs(3000),
+            run_blocking_bounded(Arc::clone(&permits), || ()),
+        )
+        .await;
+        assert!(cut_short.is_err());
+        let wait = waited() - before;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!((3000.0..4000.0).contains(&wait), "{wait}");
     }
 }

@@ -81,9 +81,17 @@ class SchedulerLogprobResultProcessor:
             req.logprob.input_top_logprobs_val.pop()
             req.logprob.input_top_logprobs_idx.pop()
 
+        if req.temp_input_top_logprobs_weights:
+            # The same rows as above: one per input position after the first,
+            # without the sampling token's.
+            req.logprob.input_top_logprobs_weights = torch.cat(
+                req.temp_input_top_logprobs_weights
+            )[:-1].numpy()
+
         # Clean up temp storage
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
+        req.temp_input_top_logprobs_weights = None
 
     def _flatten_input_top_logprobs(self, req: Req) -> None:
         """Replace the nested input top logprob rows with flat arrays for
@@ -116,7 +124,7 @@ class SchedulerLogprobResultProcessor:
 
     def _process_input_token_ids_logprobs(self, req: Req) -> None:
         """Process input token IDs logprobs."""
-        if req.logprob.token_ids_logprob is None:
+        if not req.logprob.scores_input_token_ids:
             return
 
         uses_scoring_positions = self._uses_scoring_positions(req)
@@ -246,6 +254,8 @@ class SchedulerLogprobResultProcessor:
             req.temp_input_top_logprobs_val = []
         if req.temp_input_top_logprobs_idx is None:
             req.temp_input_top_logprobs_idx = []
+        if req.temp_input_top_logprobs_weights is None:
+            req.temp_input_top_logprobs_weights = []
         if req.temp_input_token_ids_logprobs_val is None:
             req.temp_input_token_ids_logprobs_val = []
         if req.temp_input_token_ids_logprobs_idx is None:
@@ -269,8 +279,18 @@ class SchedulerLogprobResultProcessor:
         if req.logprob.top_logprobs_num > 0:
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
+            if req.logprob.input_candidate_selector is not None:
+                if output.input_top_logprobs_weights is None:
+                    # The forward lost the selectors: these rows are the top-k.
+                    raise RuntimeError(
+                        "The forward returned no candidate weights for a request "
+                        "with an input candidate selector"
+                    )
+                req.temp_input_top_logprobs_weights.extend(
+                    output.input_top_logprobs_weights[i]
+                )
 
-        if req.logprob.token_ids_logprob is not None:
+        if req.logprob.scores_input_token_ids:
             req.temp_input_token_ids_logprobs_val.append(
                 output.input_token_ids_logprobs_val[i]
             )
@@ -303,7 +323,10 @@ class SchedulerLogprobResultProcessor:
                     assert (
                         len(req.logprob.input_top_logprobs_idx) == relevant_tokens_len
                     )
-                if req.logprob.token_ids_logprob is not None:
+                    # A selector's weights have no entry for the leading None.
+                    weights = req.logprob.input_top_logprobs_weights
+                    assert weights is None or len(weights) == relevant_tokens_len - 1
+                if req.logprob.scores_input_token_ids:
                     assert (
                         len(req.logprob.input_token_ids_logprobs_val)
                         == relevant_tokens_len

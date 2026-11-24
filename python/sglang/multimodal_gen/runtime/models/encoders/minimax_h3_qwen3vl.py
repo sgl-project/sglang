@@ -37,6 +37,12 @@ _PARAM_NAMES_MAPPING = {
     r"^(model\.visual\.blocks\.\d+\.attn\.)qkv\.": r"\1qkv_proj.",
 }
 _MAP_CHECKPOINT_NAME = get_param_names_mapping(_PARAM_NAMES_MAPPING)
+# (t, h, w) patch grids whose lengths reach each cuDNN SDPA kernel the vision
+# tower's attention (head dim 72) picks on Blackwell. cuDNN generates and
+# compiles these at run time: one tile configuration for shorter images and
+# another from about 4k patches, each in a variant for lengths that are a
+# multiple of 64 (1024, 8192) and one for the rest (1020, 8280).
+_VISION_ATTENTION_KERNEL_GRIDS = ((1, 32, 32), (1, 34, 30), (1, 64, 128), (1, 90, 92))
 
 
 def _map_checkpoint_name(name: str) -> str:
@@ -208,6 +214,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     supports_dp_encode = True
     param_names_mapping = _PARAM_NAMES_MAPPING
+    _vision_attention_kernels_built = False
     # Comfy packs the vision tower across whole tensors rather than rows. Keep
     # its language/vocabulary matrices packed and restore this smaller tower.
     gguf_dequantize_prefixes = ("visual.", "model.visual.")
@@ -300,6 +307,25 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         built from it stay on CPU while the forward runs on the accelerator.
         """
         return get_local_torch_device()
+
+    @torch.no_grad()
+    def build_vision_attention_kernels(self) -> None:
+        """Run the vision tower once on a blank image per cuDNN attention kernel
+        it can pick, so that no request pays that kernel's run-time compile.
+        Every encoder rank calls it at the same point, since the tower's
+        projections are tensor parallel. Skipped while the tower's weights are
+        not on the compute device (CPU offload)."""
+        visual = self.model.visual
+        if self._vision_attention_kernels_built or visual.device != self.device:
+            return
+        self._vision_attention_kernels_built = True
+        embed = visual.patch_embed
+        width = embed.in_channels * embed.temporal_patch_size * embed.patch_size**2
+        for t, h, w in _VISION_ATTENTION_KERNEL_GRIDS:
+            pixels = torch.zeros(
+                (t * h * w, width), dtype=visual.dtype, device=self.device
+            )
+            visual(pixels, grid_thw=torch.tensor([[t, h, w]]))
 
     @torch.no_grad()
     def forward(

@@ -3,50 +3,28 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import os.path
 import re
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-
-def _json_safe(obj: Any):
-    """
-    Recursively convert objects to JSON-serializable forms.
-    - Enums -> their name
-    - Callables -> stable module-qualified name
-    - Sets/Tuples -> lists
-    - Dicts/Lists -> recursively processed
-    """
-    if isinstance(obj, Enum):
-        return obj.name
-    if callable(obj):
-        module = getattr(obj, "__module__", None)
-        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
-        return f"{module}.{qualname}" if module else qualname
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v) for v in obj]
-    return obj
 
 
 def generate_request_id() -> str:
@@ -485,36 +463,9 @@ class SamplingParams:
             )
 
     def _set_output_file_name(self):
-        # settle output_file_name
-        if (
-            self.output_file_name is None
-            and self.prompt
-            and isinstance(self.prompt, str)
-        ):
-            # generate a random filename
-            # get a hash of current params
-            params_dict = dataclasses.asdict(self)
-            # Avoid recursion
-            params_dict["output_file_name"] = ""
-
-            # Convert to a stable JSON string
-            params_str = json.dumps(_json_safe(params_dict), sort_keys=True)
-            # Create a hash
-            hasher = hashlib.sha256()
-            hasher.update(params_str.encode("utf-8"))
-            param_hash = hasher.hexdigest()[:8]
-
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            base = f"{self.prompt[:100]}_{timestamp}_{param_hash}"
-            self.output_file_name = base
-
         if self.output_file_name is None:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = f"output_{timestamp}"
-
+            self.output_file_name = f"output_{uuid.uuid4().hex}"
         self.output_file_name = _sanitize_filename(self.output_file_name)
-
-        # Ensure a proper extension is present
         self._set_output_file_ext()
 
     def __post_init__(self) -> None:
@@ -534,9 +485,9 @@ class SamplingParams:
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
-        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        env_steps = envs.SGLANG_TEST_NUM_INFERENCE_STEPS
         if env_steps is not None and self.num_inference_steps is not None:
-            self.num_inference_steps = int(env_steps)
+            self.num_inference_steps = env_steps
 
         if self.enable_spectrum and isinstance(self.spectrum_params, dict):
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
@@ -648,6 +599,11 @@ class SamplingParams:
         """Resolve model-specific facts for one synthetic warmup request."""
         del req, server_args
 
+    def request_task(self) -> str | None:
+        """Task name that ``--request-time-limit TASK=SECONDS`` matches, or None
+        for models without named tasks."""
+        return None
+
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
         del req
@@ -729,7 +685,7 @@ class SamplingParams:
                 f"got {self.x264_preset!r}"
             )
 
-        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        # Used by the video writer; fps <= 0 is always invalid.
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
@@ -1147,12 +1103,6 @@ class SamplingParams:
 
         return sampling_params
 
-    def output_size_str(self) -> str:
-        return f"{self.width}x{self.height}"
-
-    def seconds(self) -> float:
-        return self.num_frames / self.fps
-
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields.
@@ -1173,8 +1123,8 @@ class SamplingParams:
             type=str,
             help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
         )
-        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
+        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--auto-duration", action="store_true")
         add_argument("--auto-duration-min-seconds", type=float)
         add_argument("--auto-duration-max-seconds", type=float)
@@ -1572,9 +1522,10 @@ class SamplingParams:
         )
         add_argument(
             "--sr-num-steps",
+            action=DeprecatedAction,
+            nargs=None,
             type=int,
-            help="Kandinsky6 SR Euler grid points (>= 2, default: 5); ignored by "
-            "pi-Flow checkpoints.",
+            help="(Deprecated) No effect: Kandinsky6 SR reads --num-inference-steps.",
         )
         add_argument(
             "--sr-tiles-batch-size",
@@ -1658,8 +1609,10 @@ class SamplingParams:
         )
         add_argument(
             "--moba-config-path",
+            action=DeprecatedAction,
+            nargs=None,
             type=str,
-            help="Path to a JSON file containing V-MoBA specific configurations.",
+            help="(Deprecated) No effect: no sampling parameter reads this path.",
         )
         add_argument(
             "--return-trajectory-latents",
@@ -1879,20 +1832,6 @@ class SamplingParams:
         if explicit_fields is not None:
             self._explicit_fields = set(explicit_fields)
         self.__post_init__()
-
-    @property
-    def n_tokens(self) -> int:
-        # Calculate latent sizes
-        if self.height and self.width:
-            latents_size = [
-                (self.num_frames - 1) // 4 + 1,
-                self.height // 8,
-                self.width // 8,
-            ]
-            n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
-        else:
-            n_tokens = -1
-        return n_tokens
 
 
 @dataclass
