@@ -45,6 +45,14 @@ RING_SLOTS = 32
 _RING_MASK = RING_SLOTS - 1
 _MAX_WINDOW = 16
 _CURSOR_BLOCK = 256
+# Archs that run the vendored flush build (gdn_ucache_rubin), which takes the local launch
+# options (GdnUcacheFlushOptions, fp16 k ring, request rings): SM107, and SM103 on its sm_100a
+# build, since the image's FlashInfer (0.7.2) has no u-cache kernel for either.
+_VENDORED_FLUSH_CC = ((10, 3), (10, 7))
+
+
+def _vendored_flush(device) -> bool:
+    return torch.cuda.get_device_capability(device) in _VENDORED_FLUSH_CC
 
 
 class GdnUcacheBuffers(msgspec.Struct, frozen=True, kw_only=True):
@@ -80,7 +88,7 @@ class GdnUcacheRows(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class GdnUcacheFlushOptions(msgspec.Struct, frozen=True, kw_only=True):
-    """Launch options of the SM107 flush kernel; all off by default, none changes a result."""
+    """Launch options of the vendored flush kernel; all off by default, none changes a result."""
 
     # Read the packed post-conv q / k / v and the strided b / a views in place.
     strided_qkv: bool = False
@@ -104,14 +112,13 @@ def gdn_ucache_flush_options(device: torch.device) -> GdnUcacheFlushOptions:
         pdl=envs.SGLANG_ENABLE_GDN_UCACHE_PDL.get(),
         flush_first=envs.SGLANG_ENABLE_GDN_UCACHE_FLUSH_FIRST.get(),
     )
-    if opts != GdnUcacheFlushOptions():
+    if opts != GdnUcacheFlushOptions() and not _vendored_flush(device):
         # FlashInfer's SM100 kernel takes none of them.
         capability = torch.cuda.get_device_capability(device)
-        if capability != (10, 7):
-            raise ValueError(
-                f"GDN u-cache flush options {opts} need the SM107 u-cache kernel, "
-                f"got SM{capability[0]}{capability[1]}"
-            )
+        raise ValueError(
+            f"GDN u-cache flush options {opts} need the vendored SM103 / SM107 u-cache "
+            f"kernel, got SM{capability[0]}{capability[1]}"
+        )
     return opts
 
 
@@ -137,12 +144,12 @@ def gdn_ucache_ring_bytes_per_slot(
 def gdn_ucache_key_ring_dtype(device) -> torch.dtype:
     if not envs.SGLANG_ENABLE_GDN_UCACHE_FP16_KEY_RING.get():
         return torch.bfloat16
-    # Only the vendored SM107 kernel takes an fp16 k ring; FlashInfer's SM100 one asserts bf16.
-    capability = torch.cuda.get_device_capability(device)
-    if capability != (10, 7):
+    # Only the vendored kernel takes an fp16 k ring; FlashInfer's SM100 one asserts bf16.
+    if not _vendored_flush(device):
+        capability = torch.cuda.get_device_capability(device)
         raise ValueError(
-            "SGLANG_ENABLE_GDN_UCACHE_FP16_KEY_RING needs the SM107 u-cache kernel, "
-            f"got SM{capability[0]}{capability[1]}"
+            "SGLANG_ENABLE_GDN_UCACHE_FP16_KEY_RING needs the vendored SM103 / SM107 "
+            f"u-cache kernel, got SM{capability[0]}{capability[1]}"
         )
     return torch.float16
 
@@ -779,16 +786,18 @@ class GdnUcacheTrackMaterializer:
 
 def _load_flush_kernel(device: torch.device) -> Callable:
     capability = torch.cuda.get_device_capability(device)
-    if capability == (10, 7):
+    if _vendored_flush(device):
         # The vendored copy of flashinfer#6791 (gdn_ucache_rubin/__init__.py), not the
-        # image's FlashInfer: 0.7.2 has no Rubin build, and a later one may differ.
+        # image's FlashInfer: 0.7.2 has no Rubin build and no gdn_replay_mtp_umma for SM103
+        # (which runs the vendored sm_100a build), and a later one may differ.
         from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
             gated_delta_rule_mtp_ucache_flush_umma_rubin,
         )
 
         return gated_delta_rule_mtp_ucache_flush_umma_rubin
-    # SM103 shares SM100's tcgen05 path and runs the SM100 build.
-    if capability not in ((10, 0), (10, 3)):
+    # SM100 runs FlashInfer's build (SM103 the vendored one above, which takes the local
+    # launch options).
+    if capability != (10, 0):
         raise RuntimeError(
             f"GDN u-cache verify needs SM100, SM103 or SM107, got SM{capability[0]}{capability[1]}"
         )
@@ -857,22 +866,21 @@ class GdnUcacheVerifier:
 
         self._flush_kernel = _load_flush_kernel(device)
         self._options = gdn_ucache_flush_options(device)
-        # SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV: the vendored SM107 kernel's conv prologue, which
-        # its strided, dependent launch carries
+        # SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV / _NORM: the vendored kernel's conv prologue and
+        # norm epilogue, which its strided, dependent launch carries (the conv prologue only
+        # where fused_conv_unsupported_reason allows: SM107)
         self.fused_conv_capable = (
-            self._options.strided_qkv
-            and self._options.pdl
-            and torch.cuda.get_device_capability(device) == (10, 7)
+            self._options.strided_qkv and self._options.pdl and _vendored_flush(device)
         )
         self._kernel_kwargs = self._options.kernel_kwargs()
         self._by_request_row = by_request_row
         if by_request_row:
-            # Only the vendored SM107 kernel takes ring_indices; FlashInfer's SM100 one does not.
-            capability = torch.cuda.get_device_capability(device)
-            if capability != (10, 7):
+            # Only the vendored kernel takes ring_indices; FlashInfer's SM100 one does not.
+            if not _vendored_flush(device):
+                capability = torch.cuda.get_device_capability(device)
                 raise ValueError(
-                    "SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS needs the SM107 u-cache kernel, "
-                    f"got SM{capability[0]}{capability[1]}"
+                    "SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS needs the vendored SM103 / SM107 "
+                    f"u-cache kernel, got SM{capability[0]}{capability[1]}"
                 )
             logger.info(
                 "SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS: the u-cache rings and cursors are "

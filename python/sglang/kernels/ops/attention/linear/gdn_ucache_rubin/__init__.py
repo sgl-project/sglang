@@ -14,10 +14,13 @@ sha256:
 Local change on top of those: an fp16 k ring build (``k_f16``, chosen by the k ring's
 dtype; ``mma_f16_16816`` in the helpers). With a bf16 k ring the kernel is the one above.
 Also local: rings with rows of their own (``ring_indices``, a ``ring_rows`` build; without
-it the kernel takes the state indices in that parameter and never reads it).
+it the kernel takes the state indices in that parameter and never reads it); and sm_103a
+(GB300) in ``_SUPPORTED_CC``, where it runs the sm_100a build (none of the sm_107a-only
+sets: FHFMA2, persistent, Rubin-fitted heads per CTA, small-batch builds, uGPU).
 
 They are CuTe-DSL (nvidia-cutlass-dsl >= 4.8.0) and compile at first use; they import
 nothing from FlashInfer except, lazily on the uGPU path only, ``flashinfer.green_ctx``.
 ``gdn_replayssm_ucache`` loads them on SM107 for images whose FlashInfer predates the
-Rubin build (0.7.2). Drop this package once the image's FlashInfer ships #6791.
+Rubin build (0.7.2), and on SM103, which 0.7.2 has no u-cache build for either. Drop this
+package once the image's FlashInfer ships #6791.
 """

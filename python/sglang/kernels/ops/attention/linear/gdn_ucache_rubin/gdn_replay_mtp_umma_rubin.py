@@ -4870,8 +4870,9 @@ def _cached_f32(t: torch.Tensor) -> torch.Tensor:
 
 
 # archs this build was validated on (sm_107a: tuned and measured there; sm_100a: the same
-# tests); anything else raises
-_SUPPORTED_CC = ((10, 0), (10, 7))
+# tests; sm_103a, SGLang: the sm_100a build, none of the sm_107a-only sets below); anything
+# else raises
+_SUPPORTED_CC = ((10, 0), (10, 3), (10, 7))
 _CVT_RS_CC = (
     (10, 0),
     (10, 3),
@@ -5384,8 +5385,8 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     target = gdn_device_target(q.device)
     if (target.major, target.minor) not in _SUPPORTED_CC:
         raise NotImplementedError(
-            "gated_delta_rule_mtp_ucache_flush_umma_rubin: validated on sm_107a and sm_100a "
-            f"only (got {target.arch}); use gated_delta_rule_mtp_ucache_flush_umma"
+            "gated_delta_rule_mtp_ucache_flush_umma_rubin: validated on sm_107a, sm_100a and "
+            f"sm_103a only (got {target.arch}); use gated_delta_rule_mtp_ucache_flush_umma"
         )
     hpk = HV // H
     if heads_per_cta is not None and not (

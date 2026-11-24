@@ -755,7 +755,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ):
             logger.warning(
                 "SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM not taken: needs --enable-gdn-replayssm-ucache "
-                "and the SM107 flush with SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV=1 and _PDL=1"
+                "and the vendored SM103 / SM107 flush with SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV=1 and _PDL=1"
             )
         self._ucache_fused_norm_max_batch = (
             envs.SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH.get()
@@ -790,7 +790,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             reason = "needs Q38_GDN_FRONT=1 (the verify conv it replaces)"
         elif not self._gdn_ucache_verifier.fused_conv_capable:
             reason = (
-                "needs the SM107 flush with SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV=1 and "
+                "needs the vendored SM103 / SM107 flush with SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV=1 and "
                 "SGLANG_ENABLE_GDN_UCACHE_PDL=1"
             )
         if reason is not None:
