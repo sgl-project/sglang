@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-1-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
@@ -52,9 +52,7 @@ class TestAscendMhaHicache(CustomTestCase):
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     env={
                         **os.environ,
-                        "PYTORCH_NPU_ALLOC_CONF": (
-                            "expandable_segments:True,pin_memory_expandable_segments:True"
-                        ),
+                        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
                     },
                     other_args=[*self.common_args],
                 )

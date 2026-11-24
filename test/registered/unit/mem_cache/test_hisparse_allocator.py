@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -99,9 +100,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def test_free_returns_c4_slots(self):
-        """Freeing a request's logical row must return the C4 HiSparse slots its
-        compressed tokens were mapped to."""
+    def _one_page_request(self):
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
@@ -147,12 +146,37 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         slots = allocator.hisparse_attn_allocator.alloc(len(compressed))
         allocator.full_to_hisparse_device_index_mapping[compressed] = slots
 
-        allocator.free(locs)
+        return allocator, locs, compressed, c4_free
 
+    def _assert_c4_slots_returned(self, allocator, compressed, c4_free):
         self.assertEqual(allocator.hisparse_attn_allocator.available_size(), c4_free)
         self.assertFalse(
             allocator.full_to_hisparse_device_index_mapping[compressed].any()
         )
+
+    def test_free_returns_c4_slots(self):
+        """Freeing a request's logical row must return the C4 HiSparse slots its
+        compressed tokens were mapped to."""
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free(locs)
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
+
+    def test_free_full_returns_c4_slots(self):
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free_full(locs)
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
+
+    def test_free_full_segments_returns_c4_slots(self):
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free_full_segments([(locs, 0)])
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
+
+    def test_grouped_free_full_returns_c4_slots(self):
+        allocator, locs, compressed, c4_free = self._one_page_request()
+        allocator.free_group_begin()
+        allocator.free_full(locs)
+        allocator.free_group_end()
+        self._assert_c4_slots_returned(allocator, compressed, c4_free)
 
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
@@ -346,23 +370,29 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager.is_hybrid_mla_backend = False
         manager.enable_custom_mem_pool = False
         manager.max_transfer_batch_indices = 0
-        manager._transfer_data = MagicMock(return_value=0)
+        writes = MagicMock(return_value=0)
+        attach_mooncake_transport(
+            manager,
+            engine_writes(writes),
+            kv=[1000, 2000, 3000],
+            peer_kv=[10000, 20000, 30000],
+        )
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             ret = manager._send_kvcache_generic(
                 mooncake_session_id="session",
-                src_data_ptrs=[1000, 2000, 3000],
-                dst_data_ptrs=[10000, 20000, 30000],
                 item_lens=[100, 100, 100],
                 prefill_data_indices=np.array([1, 2], dtype=np.int32),
                 dst_data_indices=np.array([7, 8], dtype=np.int32),
                 executor=executor,
                 dst_device_data_indices=np.array([21, 22], dtype=np.int32),
-                dst_device_data_ptrs={20000, 30000},
+                dst_device_entries={1, 2},
+                src_keys=manager._local_keys.kv,
+                dst_keys=manager._peers["session"].keys.kv,
             )
 
         self.assertEqual(ret, 0)
-        manager._transfer_data.assert_called_once_with(
+        writes.assert_called_once_with(
             "session",
             [
                 (1100, 10700, 200),
@@ -384,6 +414,12 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             prefill_end_layer=2,
         )
         manager._send_kvcache_generic = MagicMock(return_value=0)
+        attach_mooncake_transport(
+            manager,
+            engine_writes(MagicMock(return_value=0)),
+            kv=manager.kv_args.kv_data_ptrs,
+            peer_kv=[10000, 20000, 30000],
+        )
         executor = MagicMock()
 
         # send_kvcache reads the memory bag (the unified-memory envelope-layout
@@ -400,7 +436,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             )
 
         kwargs = manager._send_kvcache_generic.call_args.kwargs
-        self.assertEqual(kwargs["dst_device_data_ptrs"], {20000, 30000})
+        self.assertEqual(kwargs["dst_device_entries"], {1, 2})
 
     def test_mooncake_transfer_metadata_carries_device_page_indices(self):
         from sglang.srt.disaggregation.mooncake.conn import TransferInfo
