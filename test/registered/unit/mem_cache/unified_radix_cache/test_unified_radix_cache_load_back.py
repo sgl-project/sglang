@@ -618,8 +618,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
         self._apply_match_to_req(req, match)
 
-        # Simulate a request without its own mamba slot so load-back allocates one
-        # (that allocation is what a called-off load-back must free + not publish).
+        # Simulate a request without its own mamba slot so load-back allocates one;
+        # a called-off load-back keeps that slot and copies the anchor's state into it.
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         loaded_len, new_node = cache.init_load_back(
@@ -639,7 +639,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self._assert_extends_from_anchor_state(req, cache, new_node, avail_before)
 
     @requires_full_mamba_ps1
-    def test_scheduler_hicache_load_back_rolls_back_mamba_on_load_failure(self):
+    def test_scheduler_hicache_load_back_load_failure_copies_anchor_state(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -672,7 +672,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self._assert_extends_from_anchor_state(req, cache, new_node, avail_before)
 
     @requires_full_mamba_ps1
-    def test_scheduler_hicache_load_back_rolls_back_mamba_on_capacity_failure(self):
+    def test_scheduler_hicache_load_back_capacity_failure_copies_anchor_state(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -692,7 +692,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # No device room and eviction frees nothing -> load-back bails after the
-        # mamba pre-alloc, which must still be freed.
+        # mamba pre-alloc; the request keeps that slot, and the anchor's state is
+        # copied into it.
         with (
             mock.patch.object(
                 cache.token_to_kv_pool_allocator, "available_size", return_value=0
