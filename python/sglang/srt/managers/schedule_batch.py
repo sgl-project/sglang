@@ -183,6 +183,24 @@ def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     return mode
 
 
+def media_spans_carry_identity(
+    mm_items: List[MultimodalDataItem], num_tokens: int
+) -> bool:
+    """Whether every in-prompt media span cycles all of its wide pad values.
+
+    Such a span spells out the item's full identity in the radix key, so the
+    key alone already keeps different media apart.
+    """
+    return all(
+        item.offsets
+        and all(
+            min(end, num_tokens - 1) - start + 1 >= len(item.padding_values())
+            for start, end in item.offsets
+        )
+        for item in mm_items
+    )
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -1049,14 +1067,21 @@ class Req(ReqDllmMixin):
         """Protect KV lookup with full identities, not partial pad-token matches.
 
         A media span can contain only one token, so even wide pad sentinels
-        cannot carry its entire digest. Scope both the radix tree and storage
-        to the ordered media identities. This deliberately gives up text-prefix
-        sharing across different media while preserving same-media reuse.
+        cannot carry its entire digest. When some span is that short, scope both
+        the radix tree and storage to the ordered media identities, giving up
+        text-prefix sharing across different media. When every span cycles all
+        of its pad values, the key already carries the identities, so requests
+        keep sharing the text before their first media span.
         """
         if self.multimodal_inputs is not None and self.multimodal_inputs.mm_items:
             identities = tuple(
                 item.cache_key for item in self.multimodal_inputs.mm_items
             )
+            if media_spans_carry_identity(
+                self.multimodal_inputs.mm_items, len(self.origin_input_ids)
+            ):
+                self.cache_salt = self._user_cache_salt
+                return
             self.cache_salt = (
                 "sglang-mm-v1:"
                 + structured_digest((self._user_cache_salt, identities)).hex()
