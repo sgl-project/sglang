@@ -176,6 +176,10 @@ class Serving(msgspec.Struct):
         bool,
         "Allow a request to override the server chat template via its chat_template_kwargs. Off by default for safety.",
     ] = False
+    trust_llm_d_prompt_token_ids: A[
+        bool,
+        "Accept kv_transfer_params.prompt_token_ids on text chat requests from a trusted llm-d gateway. Restrict worker access to that gateway.",
+    ] = False
     hf_chat_template_name: A[
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",

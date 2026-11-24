@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde_json::Value;
 use sglang_processor::dynamo_tokenizers::{DecodeStream, EncodeSegment};
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, DynamoTokenizer, OneOrMany, TemplateArgs, TemplateError,
-    TextTokenizer, select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, DynamoTokenizer, OneOrMany, TemplateArgs, TextTokenizer,
+    select_chat_formatter,
 };
 
 fn invalid(error: impl std::fmt::Display) -> PyErr {
@@ -15,13 +17,19 @@ fn invalid(error: impl std::fmt::Display) -> PyErr {
 struct ChatProcessor {
     formatter: ChatFormatter,
     tokenizer: DynamoTokenizer,
+    default_kwargs: HashMap<String, Value>,
 }
 
 #[pymethods]
 impl ChatProcessor {
     #[new]
-    #[pyo3(signature = (model_dir, chat_template=None))]
-    fn new(py: Python<'_>, model_dir: String, chat_template: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (model_dir, chat_template=None, *, default_kwargs_json=None))]
+    fn new(
+        py: Python<'_>,
+        model_dir: String,
+        chat_template: Option<String>,
+        default_kwargs_json: Option<&str>,
+    ) -> PyResult<Self> {
         py.detach(|| {
             let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
                 tokenizer_path: model_dir.clone(),
@@ -33,6 +41,11 @@ impl ChatProcessor {
                 formatter: formatter.ok_or_else(|| {
                     invalid(error.unwrap_or_else(|| "missing chat template".into()))
                 })?,
+                default_kwargs: default_kwargs_json
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(invalid)?
+                    .unwrap_or_default(),
                 tokenizer: DynamoTokenizer::load(&model_dir, None).map_err(invalid)?,
             })
         })
@@ -74,27 +87,34 @@ impl ChatProcessor {
     fn encode_chat(&self, py: Python<'_>, request_json: &[u8]) -> PyResult<Vec<u32>> {
         py.detach(|| {
             let body: Value = serde_json::from_slice(request_json).map_err(invalid)?;
-            let defaults = Default::default();
-            if let Some(ids) = self.formatter.encode_request(body.clone(), &defaults) {
+            let defaults = &self.default_kwargs;
+            if let Some(ids) = self.formatter.encode_request(body.clone(), defaults) {
                 return ids.map_err(invalid);
             }
-            let (prompt, continuation) =
-                match self.formatter.render_request(body.clone(), &defaults) {
-                    Err(TemplateError::NeedsRenderFallback { .. }) => {
-                        let args = TemplateArgs::new(&body, &defaults);
-                        let typed = serde_json::from_value(body).map_err(invalid)?;
-                        self.formatter.render_template(&typed, &args)
-                    }
-                    result => result,
+            // Only formatters without a model-specific request renderer use the
+            // generic template. A model-specific decline must reach the caller.
+            let (prompt, continuation) = match &self.formatter {
+                ChatFormatter::HuggingFace { .. }
+                | ChatFormatter::KimiK25 { .. }
+                | ChatFormatter::Legacy(_) => {
+                    let args = TemplateArgs::new(&body, defaults);
+                    let typed = serde_json::from_value(body).map_err(invalid)?;
+                    self.formatter.render_template(&typed, &args)
                 }
-                .map_err(invalid)?;
-            let segments = prompt
-                .encode_segments()
-                .unwrap_or_else(|| vec![EncodeSegment::new(prompt.as_str(), true)]);
-            self.tokenizer
-                .encode_chat(&segments, &continuation)
-                .map_err(invalid)?
-                .into_iter()
+                formatter => formatter.render_request(body, defaults),
+            }
+            .map_err(invalid)?;
+            let ids = if matches!(self.formatter, ChatFormatter::Legacy(_)) {
+                // _apply_conversation_template encodes the entire prompt with tokenizer defaults.
+                self.tokenizer.encode(prompt.as_str(), true)
+            } else {
+                let segments = prompt
+                    .encode_segments()
+                    .unwrap_or_else(|| vec![EncodeSegment::new(prompt.as_str(), true)]);
+                self.tokenizer.encode_chat(&segments, &continuation)
+            }
+            .map_err(invalid)?;
+            ids.into_iter()
                 .map(|id| u32::try_from(id).map_err(invalid))
                 .collect()
         })

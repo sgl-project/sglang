@@ -1126,6 +1126,9 @@ class ChatCompletionRequest(PDRoutingFields):
         ),
     )
 
+    # llm-d forwards rendered IDs alongside other opaque KV transfer metadata.
+    kv_transfer_params: Any = Field(default=None, exclude=True, repr=False)
+
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
     # and tool_call_constraint.
