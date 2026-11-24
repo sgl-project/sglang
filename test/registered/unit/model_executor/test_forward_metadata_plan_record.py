@@ -22,10 +22,11 @@ import torch
 import sglang.srt.model_executor.forward_batch_info as fbi
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 def _make_batch(bs: int = 2, num_tokens: int = 2) -> ForwardBatch:
@@ -108,8 +109,8 @@ def _mrope_batch(prefix, extend, *, mm=None, mirror=True, positions=None):
 class TestMropeTextDevicePositions(CustomTestCase):
     # text-only extend rows repeat self.positions; they must equal the host loop's
 
-    def _rows(self, *args, rl=None, **kwargs):
-        runner = SimpleNamespace(device="cpu")
+    def _rows(self, *args, rl=None, device="cpu", **kwargs):
+        runner = SimpleNamespace(device=device)
         exec_ = SimpleNamespace(deterministic=SimpleNamespace(rl_on_policy_target=rl))
         with mock.patch.object(fbi, "get_exec", lambda: exec_):
             fb, batch = _mrope_batch(*args, **kwargs)
@@ -157,6 +158,43 @@ class TestMropeTextDevicePositions(CustomTestCase):
             with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
                 device_rows, rows, loop = self._rows(**kwargs)
                 self.assertIsNone(device_rows)
+                self.assertTrue(torch.equal(rows, loop))
+
+    def test_dllm_and_device_lens_keep_the_host_loop(self):
+        exec_ = SimpleNamespace(deterministic=SimpleNamespace(rl_on_policy_target=None))
+        with mock.patch.object(fbi, "get_exec", lambda: exec_):
+            fb, batch = _mrope_batch([0, 3], [4, 2])
+            batch.dllm_config = SimpleNamespace()
+            self.assertIsNone(fb._text_only_mrope_positions(batch))
+            fb, batch = _mrope_batch([0, 3], [4, 2])
+            batch.extend_lens = torch.tensor(batch.extend_lens)
+            batch.prefix_lens = torch.tensor(batch.prefix_lens)
+            self.assertIsNone(fb._text_only_mrope_positions(batch))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_rows_from_gpu_positions_equal_the_host_loop(self):
+        """Positions from the production kernels on the GPU (Triton and torch) give
+        the host loop's rows."""
+        rng = random.Random(20261124)
+        layouts = [([0, 0, 0], [5, 3, 7]), ([5, 9, 0], [0, 4, 3])]
+        for _ in range(40):
+            bs = rng.randint(1, 64)
+            prefix = [rng.choice([0, rng.randint(1, 262000)]) for _ in range(bs)]
+            extend = [rng.randint(0, 64) for _ in range(bs)]
+            extend[0] = max(extend[0], 1)
+            layouts.append((prefix, extend))
+        for prefix, extend in layouts:
+            pre = torch.tensor(prefix, dtype=torch.int32, device="cuda")
+            ext = torch.tensor(extend, dtype=torch.int32, device="cuda")
+            for positions in (
+                fbi.compute_position_triton(pre, ext, sum(extend))[0],
+                fbi.compute_position_torch(pre, ext)[0],
+            ):
+                device_rows, rows, loop = self._rows(
+                    prefix, extend, positions=positions, device="cuda"
+                )
+                self.assertIsNotNone(device_rows)
+                self.assertEqual((rows.dtype, rows.shape), (loop.dtype, loop.shape))
                 self.assertTrue(torch.equal(rows, loop))
 
     def test_rows_come_from_the_batch_positions(self):
