@@ -1164,7 +1164,7 @@ class MqaAttentionBase(nn.Module):
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
+            # mxscale BMM on ROCm), both of which start from the plain row-major
             # [G, R, D] weight. Opt out of any backend-private weight layout the
             # linear method would otherwise install for its own GEMM -- on ROCm
             # that is aiter's B-preshuffle, which silently permutes the weight
@@ -2487,7 +2487,10 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 normalizes each query head before RoPE; V4.1 (q_head_norm
+            # False) does not -- its only q norm is the q_lora one above.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -2724,6 +2727,9 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            # V4.1 runs the compressor + indexer as one ordered call, which the
+            # NPU multi-stream split does not model.
+            and not self.is_dsv41
         )
 
         low_ratio_multi_stream = (
@@ -3100,7 +3106,7 @@ class MQALayer(MqaAttentionBase):
                     perm_y=(1, 0, 2),
                 )
             elif self.wo_a_fp8 and _wo_a_fp8_mxscale is not None:
-                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # ROCm gfx950/gfx1250: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
                 T, G, D = o.shape
@@ -4221,6 +4227,7 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4250,7 +4257,7 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    if _is_hip and source.hc_boundary_fused:
+                    if fused_step and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
                         source_x = fused_boundary_attn_input(source, state)
                     else:
@@ -4388,7 +4395,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
+                    if fused_step and self.layers[i].hc_boundary_fused:
                         state = forward_layer_fused_boundary(
                             self,
                             i,
@@ -5270,10 +5277,11 @@ class DeepseekV4ForCausalLM(
             if _wo_a_weight_scale_to_e8m0 is not None:
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
-                # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured keep_plain_weight_layout: a
-                # preshuffled weight has the same shape, dtype and strides and
-                # would only show up as garbage output.
+                # already powers of two. It starts from the row-major weight
+                # (and applies the layout its kernel reads itself), so check the
+                # linear method honoured keep_plain_weight_layout: a preshuffled
+                # weight has the same shape, dtype and strides and would only
+                # show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
                     "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
                     "aiter mxscale absorb GEMM needs the row-major weight"

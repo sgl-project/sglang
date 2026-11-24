@@ -214,11 +214,20 @@ export const AgentX = ({ data: input }) => {
       args: [["--model-id", served], ["--tokenizer-path", model], ["--worker-urls", ...urls], ...rest] };
     return blocks.map((x) => (x === b ? router : withKvEvents(x)));
   };
+  // SGLang 1.0 takes the linker's storage options only from --unified-cache-external-linker-config
+  // and refuses --hicache-storage-backend-extra-config, which older submissions and kv.py record.
+  const withLinkerConfig = (b) => {
+    const args = b.args || [];
+    if (!args.some((a) => a[0] === "--enable-unified-cache-external-linker")
+      || args.some((a) => a[0] === "--unified-cache-external-linker-config")) return b;
+    return { ...b, args: args.map((a) => (a[0] === "--hicache-storage-backend-extra-config"
+      ? ["--unified-cache-external-linker-config", ...a.slice(1)] : a)).sort(cmpArgs) };
+  };
   const blocksFor = (ci, pi, router, kv) => {
     const cell = data.cells[ci];
     const base = materialize(ci, router);
     const measured = pi === 0 ? base : applyPatch(base, ((cell.points[pi] || {}).patch || {})[router]);
-    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
+    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router).map(withLinkerConfig);
     return blocks.some((b) => b.kind === "sgl-router") ? toSglRouter(blocks) : blocks;
   };
 
@@ -258,7 +267,7 @@ export const AgentX = ({ data: input }) => {
     "sgl-router": "SGLang router (OpenAI API)",
     nginx: "nginx — optional frontend load balancer",
   };
-  const where = (b, router, workerCount) => {
+  const where = (b, router, workerCount, sidecars) => {
     if (b.kind === "worker") {
       const n = b.nodes_per_worker || 1;
       const parts = [];
@@ -267,8 +276,16 @@ export const AgentX = ({ data: input }) => {
       if (b.local_ranks) parts.push(`Workers share nodes: set LOCAL_WORKER_RANK per worker (${b.local_ranks.map((r, i) => `worker ${i}: ${r}`).join(" · ")}); the first lines pick its GPUs and ports.`);
       else if (b.gpu_pinning) parts.push(`Workers share nodes: pin GPUs per worker with CUDA_VISIBLE_DEVICES = ${b.gpu_pinning.map((w, i) => `worker ${i}: ${w.filter(Boolean).join(" / ") || "all"}`).join(" · ")}.`);
       if (router === "sglang" && workerCount === 1 && b.role === "agg" && n === 1) parts.push("Serves the OpenAI API on port 30000.");
-      if (router === "dynamo") parts.push("Workers register with Dynamo through etcd; start them after etcd/NATS.");
+      if (router === "dynamo") parts.push(sidecars
+        ? "Each worker is plain SGLang with its native gRPC server; its Dynamo sidecar (next tab) registers it with Dynamo. Start the workers after etcd/NATS."
+        : "Workers register with Dynamo through etcd; start them after etcd/NATS.");
       return parts.join(" ") || `Run on the ${b.role} node.`;
+    }
+    if (b.kind === "dynamo-sidecar") {
+      const n = b.workers || 1;
+      const parts = [`Run one per ${b.role} worker${n > 1 ? ` (${n})` : ""}, on the worker's first node, next to it: it waits for the worker's gRPC port, then registers the worker with Dynamo through etcd and serves its requests.`];
+      if (b.local_ranks) parts.push(`Set LOCAL_WORKER_RANK to its worker's (${b.local_ranks.map((r, i) => `worker ${i}: ${r}`).join(" · ")}).`);
+      return parts.join(" ");
     }
     if (b.kind === "etcd") return "Start once, before everything else, on $ETCD_IP.";
     if (b.kind === "nats") return (b.cmd || "").includes("nats.conf")
@@ -285,13 +302,13 @@ export const AgentX = ({ data: input }) => {
     return "";
   };
   const noteText = (S) => ({
-    "rename-dp-attention": <>Flags are mirrored from the submission image: <code style={S.code}>--enable-dp-attention</code> with <code style={S.code}>--dp-size</code> / <code style={S.code}>--data-parallel-size</code>. Newer SGLang deprecates them in favor of <code style={S.code}>--attn-dp-size</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/41818">#41818</a>).</>,
     "rename-mamba-strategy": <>Flags are mirrored from the submission image: <code style={S.code}>--mamba-scheduler-strategy</code> is the older spelling of <code style={S.code}>--mamba-radix-cache-strategy</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/28151">#28151</a>). Current SGLang accepts only the new name.</>,
     "hicache-size": <><code style={S.code}>--hicache-size</code> is host DRAM per rank in GB, sized to SemiAnalysis's nodes. Scale it to your host memory.</>,
     efa: <><code style={S.code}>MOONCAKE_PROTOCOL=efa</code> reflects SemiAnalysis's AWS-EFA B300 cluster. Use <code style={S.code}>rdma</code> on InfiniBand.</>,
     "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
+    "engram-group-store": <><code style={S.code}>group_store</code> in <code style={S.code}>--engram-config</code> must be an empty directory that every worker of the Engram group can see (a shared filesystem across nodes), new for each deployment. SemiAnalysis used a fresh directory under its job log mount; replace <code style={S.code}>/path/to/shared/engram-group-store</code>.</>,
     "sgl-router": <>The router command here is the recorded router flags translated to <code style={S.code}>sgl-router</code>, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
   });
   const notesFor = (blocks) => {
@@ -299,7 +316,6 @@ export const AgentX = ({ data: input }) => {
     const env = Object.assign({}, ...blocks.map((b) => b.env || {}));
     const text = JSON.stringify(blocks);
     return [
-      names.has("--enable-dp-attention") && "rename-dp-attention",
       names.has("--mamba-scheduler-strategy") && "rename-mamba-strategy",
       names.has("--hicache-size") && "hicache-size",
       env.MOONCAKE_PROTOCOL === "efa" && "efa",
@@ -307,6 +323,7 @@ export const AgentX = ({ data: input }) => {
       env.MOONCAKE_GLOBAL_SEGMENT_SIZE !== undefined && "mooncake-segment",
       text.includes("$IB_DEVICES") && "ib-devices",
       blocks.some((b) => b.kind === "sgl-router") && "sgl-router",
+      text.includes("/path/to/shared/engram-group-store") && "engram-group-store",
     ].filter(Boolean);
   };
   const PLACEHOLDERS = {
@@ -363,6 +380,7 @@ export const AgentX = ({ data: input }) => {
   const tabSlug = (t) => (t.id === "exports" ? "env"
     : t.file ? t.file.name
     : t.block.kind === "worker" ? (t.block.role === "agg" ? "worker" : t.block.role)
+    : t.block.kind === "dynamo-sidecar" ? (t.block.role === "agg" ? "sidecar" : `${t.block.role}-sidecar`)
     : { "dynamo-frontend": "frontend", "sgl-router": "router" }[t.block.kind] || t.block.kind);
 
   // Provenance: values shared by every point of a deployment live once in cell.prov, and GitHub
@@ -458,7 +476,10 @@ export const AgentX = ({ data: input }) => {
   const status = router === cell.submitted && kv === point.kv ? point.status : "derived";
   const workerCount = blocks.filter((b) => b.kind === "worker").reduce((n, b) => n + (b.workers || 1), 0);
   const blockText = blocks.map(formatBlock);
-  const blockTitle = (b) => (b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind);
+  const sidecars = blocks.some((b) => b.kind === "dynamo-sidecar");
+  const blockTitle = (b) => (b.kind === "worker" ? ROLE_TITLE[b.role]
+    : b.kind === "dynamo-sidecar" ? `${ROLE_TITLE[b.role]} — Dynamo sidecar`
+    : KIND_TITLE[b.kind] || b.kind);
   const allText = blocks.map((b, i) => `# ${blockTitle(b)}\n${blockText[i]}`).join("\n\n");
   const usedPlaceholders = [...new Set((allText + JSON.stringify(fileIds.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
     .map((p) => p.slice(1))
@@ -468,8 +489,9 @@ export const AgentX = ({ data: input }) => {
 
   const shortTitle = (b) => {
     const base = b.kind === "worker" ? { agg: "Worker", prefill: "Prefill", decode: "Decode" }[b.role]
+      : b.kind === "dynamo-sidecar" ? { agg: "Sidecar", prefill: "Prefill sidecar", decode: "Decode sidecar" }[b.role]
       : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sgl-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
-    const n = b.kind === "worker" ? b.workers : b.count;
+    const n = b.kind === "worker" || b.kind === "dynamo-sidecar" ? b.workers : b.count;
     return n > 1 ? `${base} ×${n}` : base;
   };
   // Config files sit in the tab of the process that reads them (nats.conf under NATS, ...).
@@ -740,7 +762,7 @@ export const AgentX = ({ data: input }) => {
             const split = envFirst || t.files.length > 0;
             body = (
               <>
-                <div style={S.comment}># {blockTitle(t.block)}{t.block.count > 1 ? ` ×${t.block.count}` : ""}<br /># {where(t.block, router, workerCount)}</div>
+                <div style={S.comment}># {blockTitle(t.block)}{t.block.count > 1 ? ` ×${t.block.count}` : ""}<br /># {where(t.block, router, workerCount, sidecars)}</div>
                 {envFirst && section("Env Vars — set first", exportText, "sg-agentx-exports", "exports", true)}
                 {split ? section("Command", t.text, "sg-agentx-block", `${t.id}:cmd`, !envFirst) : <pre style={S.pre} className="sg-agentx-block">{t.text}</pre>}
                 {t.files.map((f) => <div key={f.name}>{section(f.name, f.content, "sg-agentx-file", `${t.id}:${f.name}`, false)}</div>)}
