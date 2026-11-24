@@ -66,15 +66,21 @@ class SchedulerLoadInquirer:
             chunk_deduct: extra tokens to subtract from the chunked request's
                 remaining count. At batch-scheduling time the current chunk
                 has been planned but ``prefix_len`` does not yet include it,
-                so callers pass ``extend_input_len`` here. At load-reporting
-                time ``prefix_len`` is already up-to-date, so the default
-                0 is correct.
+                so callers pass ``extend_len`` here.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
         if self.get_chunked_req() is not None:
             req = self.get_chunked_req()
             num_pending_tokens += req.seqlen - req.prefix_len - chunk_deduct
         return num_pending_tokens
+
+    def _get_remaining_chunked_prefill_tokens(self) -> int:
+        """Get the number of unscheduled prompt tokens in the chunked request."""
+        if (req := self.get_chunked_req()) is None:
+            return 0
+        # KV allocation can include the current chunk before prefix_len advances.
+        covered = max(req.prefix_len, req.kv.kv_allocated_len)
+        return max(0, req.seqlen - covered)
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
@@ -98,10 +104,7 @@ class SchedulerLoadInquirer:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)
             num_tokens += uncached
-        cr = self.get_chunked_req()
-        if cr is not None:
-            num_tokens += max(0, cr.seqlen - cr.prefix_len)
-        return num_tokens
+        return num_tokens + self._get_remaining_chunked_prefill_tokens()
 
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
@@ -138,15 +141,12 @@ class SchedulerLoadInquirer:
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
         )
-        num_total_tokens = num_used_tokens + sum(
-            req.seqlen for queue in pending_token_queues for req in queue
+        # The chunked request is not in a waiting queue.
+        num_total_tokens = (
+            num_used_tokens
+            + sum(req.seqlen for queue in pending_token_queues for req in queue)
+            + self._get_remaining_chunked_prefill_tokens()
         )
-        # A chunked request is in no queue, so count the part of its prompt not yet
-        # in num_used_tokens; prefix_len lags the chunk just run until the next pass.
-        chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
-            held = max(chunked_req.prefix_len, chunked_req.kv.kv_allocated_len)
-            num_total_tokens += max(0, chunked_req.seqlen - held)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
