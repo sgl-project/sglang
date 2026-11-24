@@ -518,6 +518,44 @@ class TestRunSdpaForwardExtend(unittest.TestCase):
         )
         self.assertEqual(result.shape, (total_q, H, D))
 
+    def test_extend_window_moves_for_each_query(self):
+        for prefix, count, window in ((0, 9, 3), (7, 4, 3), (127, 2, 63)):
+            for cap in (0.0, 2.0):
+                with self.subTest(prefix=prefix, count=count, window=window, cap=cap):
+                    length = prefix + count
+                    query = torch.zeros(count, 2, 8)
+                    key = torch.zeros(length * 2, 1, 8)
+                    value = torch.full_like(key, -100)
+                    mapping = torch.arange(length) + length
+                    value[mapping] = torch.arange(length, dtype=value.dtype)[
+                        :, None, None
+                    ]
+                    result = self.backend.run_sdpa_forward_extend(
+                        query,
+                        torch.empty_like(query),
+                        key,
+                        value,
+                        torch.arange(length).unsqueeze(0),
+                        torch.tensor([0]),
+                        torch.tensor([length]),
+                        torch.tensor([prefix]),
+                        torch.tensor([count]),
+                        causal=True,
+                        enable_gqa=True,
+                        sliding_window_size=window,
+                        full_to_swa_mapping=mapping,
+                        logit_cap=cap,
+                    )
+                    # Uniform logits make each output the mean absolute position
+                    # in that query's own causal window.
+                    expected = torch.tensor(
+                        [
+                            (max(0, pos - window) + pos) / 2
+                            for pos in range(prefix, length)
+                        ]
+                    )[:, None, None].expand_as(result)
+                    torch.testing.assert_close(result, expected)
+
     def test_extend_dtype_casting(self):
         H, D = 2, 8
         extend_prefix_lens = torch.tensor([0], dtype=torch.int32)

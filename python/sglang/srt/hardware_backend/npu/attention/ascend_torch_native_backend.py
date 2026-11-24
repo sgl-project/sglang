@@ -142,25 +142,31 @@ class AscendTorchNativeAttnBackend:
 
             per_req_query = query[:, start_q:end_q, :]
 
-            # SWA crops the front of the KV window, so the redundant query
-            # tensor must match the cropped window to keep Q.len == K.len for
-            # the causal mask. In cross-attention (and non-SWA self-attention)
-            # the original sizing — text seq len — must be preserved, since Q
-            # (text) and KV (encoder) lengths legitimately differ there.
+            attn_mask = None
+            per_req_causal = causal
             if is_swa_self_attn:
-                redundant_len = atten_end_kv - atten_start_kv
-                query_start_idx = max(prefill_seq_len_q - atten_start_kv, 0)
+                # Each query has its own left boundary within the cropped KV.
+                q_positions = torch.arange(
+                    prefill_seq_len_q, seq_len_kv, device=query.device
+                ).unsqueeze(1)
+                k_positions = torch.arange(
+                    atten_start_kv, atten_end_kv, device=query.device
+                ).unsqueeze(0)
+                attn_mask = k_positions >= q_positions - sliding_window_size
+                if causal:
+                    attn_mask = attn_mask & (k_positions <= q_positions)
+                per_req_causal = False
+                query_start_idx = 0
+                per_req_query_redundant = per_req_query
             else:
                 redundant_len = int(seq_lens[seq_idx].item())
                 query_start_idx = prefill_seq_len_q
-
-            per_req_query_redundant = torch.zeros(
-                (per_req_query.shape[0], redundant_len, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redundant[:, query_start_idx:, :] = per_req_query
+                per_req_query_redundant = torch.zeros(
+                    (per_req_query.shape[0], redundant_len, per_req_query.shape[2]),
+                    dtype=per_req_query.dtype,
+                    device=per_req_query.device,
+                )
+                per_req_query_redundant[:, query_start_idx:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -186,7 +192,8 @@ class AscendTorchNativeAttnBackend:
                         per_req_value.unsqueeze(0),
                         enable_gqa=enable_gqa,
                         scale=scaling,
-                        is_causal=causal,
+                        is_causal=per_req_causal,
+                        attn_mask=attn_mask,
                         logit_cap=logit_cap,
                         logit_capping_method=logit_capping_method,
                     )
@@ -201,7 +208,8 @@ class AscendTorchNativeAttnBackend:
                         per_req_value.unsqueeze(0),
                         enable_gqa=enable_gqa,
                         scale=scaling,
-                        is_causal=causal,
+                        is_causal=per_req_causal,
+                        attn_mask=attn_mask,
                     )
                     .squeeze(0)
                     .movedim(query.dim() - 2, 0)
