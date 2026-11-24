@@ -104,18 +104,30 @@ def test_guarded_candidate_selector_rejects_ambiguous_rows():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("paged", [False, True])
-def test_kpool_mapping_keeps_tail_positions_with_request_row_indirection(paged):
-    groups = torch.arange(511, -1, -1, device="cuda", dtype=torch.int32).repeat(3, 1)
+@pytest.mark.parametrize("group_topk", [160, 512])
+def test_kpool_mapping_keeps_tail_positions_with_request_row_indirection(
+    paged, group_topk
+):
+    groups = torch.arange(
+        group_topk - 1, -1, -1, device="cuda", dtype=torch.int32
+    ).repeat(6, 1)
     groups[1, :3] = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32)
-    pool_lens = torch.tensor([520, 3, 513], device="cuda", dtype=torch.int32)
-    seq_lens = torch.tensor([2083, 13, 2054], device="cuda", dtype=torch.int32)
-    reject = torch.tensor([0, 0, 1], device="cuda", dtype=torch.int32)
-    page_width = 2100
+    groups[3, :2] = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    pool_lens = torch.tensor(
+        [group_topk + 8, 3, group_topk + 1, 2, group_topk, 0],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    seq_lens = pool_lens * 4 + torch.tensor(
+        [3, 1, 2, 3, 0, 2], device="cuda", dtype=torch.int32
+    )
+    reject = torch.tensor([0, 0, 1, 0, 0, 0], device="cuda", dtype=torch.int32)
+    page_width = 4 * group_topk + 64
     page_table = torch.arange(page_width * 4, device="cuda", dtype=torch.int32).reshape(
         4, page_width
     )
-    page_rows = torch.tensor([3, 1, 2], device="cuda", dtype=torch.int32)
-    offsets = torch.tensor([41, 18, 100], device="cuda", dtype=torch.int32)
+    page_rows = torch.tensor([3, 1, 2, 0, 2, 3], device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([41, 18, 100, 9, 53, 11], device="cuda", dtype=torch.int32)
     actual = map_kpool4_groups(
         groups,
         reject,
@@ -125,13 +137,23 @@ def test_kpool_mapping_keeps_tail_positions_with_request_row_indirection(paged):
         page_rows if paged else None,
         None if paged else offsets,
     )
-    long_history = [group * 4 + i for group in range(511, -1, -1) for i in range(4)]
-    short_history = [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7]
-    bases = [3 * page_width, page_width] if paged else [41, 18]
+    full_history = [
+        group * 4 + i for group in range(group_topk - 1, -1, -1) for i in range(4)
+    ]
+    tail_start = (group_topk + 8) * 4
+    visible_tokens = [
+        full_history + list(range(tail_start, tail_start + 3)),
+        [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 12],
+        [],
+        [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, 10],
+        full_history,
+        [0, 1],
+    ]
+    bases = (page_rows * page_width if paged else offsets).tolist()
+    width = 4 * group_topk + 3
     expected = [
-        [bases[0] + i for i in long_history + [2080, 2081, 2082]],
-        [bases[1] + i for i in short_history + [12]] + [-1] * (2051 - 13),
-        [-1] * 2051,
+        [base + token for token in tokens] + [-1] * (width - len(tokens))
+        for base, tokens in zip(bases, visible_tokens)
     ]
     assert actual.tolist() == expected
 

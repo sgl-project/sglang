@@ -87,36 +87,54 @@ def _map_groups(
     page_width,
     PAGED: tl.constexpr,
     GROUP_TOPK: tl.constexpr,
-    POOL_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
 ):
     row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    TOPK: tl.constexpr = GROUP_TOPK * POOL_SIZE
-    WIDTH: tl.constexpr = TOPK + POOL_SIZE - 1
+    rank = tl.arange(0, BLOCK_GROUPS)
+    lane = tl.arange(0, 4)
+    TOPK: tl.constexpr = GROUP_TOPK * 4
+    WIDTH: tl.constexpr = TOPK + 3
     live = tl.load(rejected + row) == 0
     pool_len = tl.load(pool_lens + row)
     seq_len = tl.load(seq_lens + row)
-    tail_start = pool_len * POOL_SIZE
-    history_len = tl.minimum(tail_start, TOPK)
-    history = live & (col < history_len)
-    group = tl.load(
-        groups + row * GROUP_TOPK + col // POOL_SIZE, mask=history, other=-1
+    history_len = tl.minimum(pool_len, GROUP_TOPK)
+    history = live & (rank < history_len)
+    group = tl.load(groups + row * GROUP_TOPK + rank, mask=history, other=-1)
+    valid_history = history & (group >= 0) & (group < pool_len)
+    tail_token = pool_len * 4 + lane
+    valid_tail = live & (lane < seq_len % 4)
+    # Short rows place the tail in the first unused group of the main output.
+    # Full rows use the extra columns at the end.
+    short_tail = (
+        (rank[:, None] == history_len)
+        & (rank[:, None] < GROUP_TOPK)
+        & valid_tail[None, :]
     )
-    tail_offset = col - history_len
-    tail = live & (tail_offset >= 0) & (tail_offset < seq_len % POOL_SIZE)
-    raw = tl.where(tail, tail_start + tail_offset, group * POOL_SIZE + col % POOL_SIZE)
-    valid = tail | (history & (group >= 0) & (group < pool_len))
+    end_tail = (history_len == GROUP_TOPK) & valid_tail
+    raw = tl.where(short_tail, tail_token[None, :], group[:, None] * 4 + lane[None, :])
+    valid = valid_history[:, None] | short_tail
     if PAGED:
         page_row = tl.load(page_rows + row).to(tl.int64)
+        page = page_table + page_row * page_stride
         slot = tl.load(
-            page_table + page_row * page_stride + raw,
+            page + raw,
             mask=valid & (raw < page_width),
             other=-1,
         )
+        tail_slot = tl.load(
+            page + tail_token, mask=end_tail & (tail_token < page_width), other=-1
+        )
     else:
-        slot = raw + tl.load(offsets + row)
-    tl.store(out + row * WIDTH + col, tl.where(valid, slot, -1), mask=col < WIDTH)
+        offset = tl.load(offsets + row)
+        slot = tl.where(valid, raw + offset, -1)
+        tail_slot = tl.where(end_tail, tail_token + offset, -1)
+    row_out = out + row * WIDTH
+    tl.store(
+        row_out + rank[:, None] * 4 + lane[None, :],
+        slot,
+        mask=rank[:, None] < GROUP_TOPK,
+    )
+    tl.store(row_out + TOPK + lane, tail_slot, mask=lane < 3)
 
 
 def map_kpool4_groups(
@@ -132,8 +150,7 @@ def map_kpool4_groups(
     group_topk = groups.shape[1]
     width = group_topk * 4 + 3
     out = groups.new_empty((groups.shape[0], width))
-    block = 512
-    _map_groups[(groups.shape[0], triton.cdiv(width, block))](
+    _map_groups[(groups.shape[0],)](
         groups,
         rejected,
         pool_lens.contiguous(),
@@ -146,7 +163,7 @@ def map_kpool4_groups(
         0 if page_table is None else page_table.shape[1],
         page_table is not None,
         group_topk,
-        4,
-        block,
+        triton.next_power_of_2(max(group_topk, 1)),
+        num_warps=8,
     )
     return out
