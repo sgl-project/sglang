@@ -1165,7 +1165,9 @@ def _host_snapshot(weight: torch.Tensor) -> torch.Tensor:
                 budget.track_storage(host.untyped_storage())
                 host.copy_(weight)
                 return host
-    return weight.to("cpu").clone()
+    # copy=True copies exactly once: a device weight is not duplicated on the
+    # host again, and a host weight still gets its own storage
+    return weight.to("cpu", copy=True)
 
 
 def _use_owned_base_snapshot(
