@@ -200,7 +200,10 @@ _BUFFERS = {}
 
 def tree_buffers(device, max_bs=None):
     """The device's TreeBuffers, created by the first call that gives ``max_bs``."""
-    index = torch.device(device).index
+    device = torch.device(device)
+    if device.type != "cuda":  # NVRTC kernels: other devices verify chains
+        return None
+    index = device.index
     index = torch.cuda.current_device() if index is None else index
     if index not in _BUFFERS and max_bs is not None:
         _BUFFERS[index] = TreeBuffers(max_bs, torch.device("cuda", index))
