@@ -9,6 +9,7 @@ from sglang.srt.sampling import penalties
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_pipeline import _adjust_before_watermark
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -127,7 +128,7 @@ def _decode_one_token_at_a_time(logits_row, req, path, device):
     )
     info.step_penalties = StepPenalties.build([decoded], pool)
     row = logits_row.to(device).clone()[None]
-    info.apply_logits_bias(row)
+    _adjust_before_watermark(row, info, observer=None)
     return row[0]
 
 
