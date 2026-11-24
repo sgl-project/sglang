@@ -572,7 +572,6 @@ class UnoWorkerV2(BaseSpecWorker):
             topk=self.candidate_top_k,
             num_draft_tokens=self.verify_width,
             device=self.device,
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             uno_target_max_top_k=draft_state.max_top_k,
         )
