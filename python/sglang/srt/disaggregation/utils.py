@@ -345,7 +345,8 @@ def pre_alloc_fill_len(req: Req) -> int:
 
 
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
-    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+    """Downgrade Success -> Transferring for requests whose metadata hasn't landed,
+    and Success -> Failed for requests whose slot holds another request's room.
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
     ranks naturally prevents any rank from committing before all ranks are ready.
@@ -360,6 +361,16 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            elif actual_room != decode_req.req.bootstrap_room:
+                # Failed (0) wins the MIN, so every TP rank aborts the request;
+                # a rank-local abort at commit would leave the peers' queues ahead.
+                logger.error(
+                    f"Metadata mismatch: request {decode_req.req.rid} "
+                    f"(bootstrap_room={decode_req.req.bootstrap_room}) found "
+                    f"bootstrap_room={actual_room} in metadata buffer slot "
+                    f"{decode_req.metadata_buffer_index}; failing it on every TP rank."
+                )
+                polls[i] = int(KVPoll.Failed)
 
 
 def kv_layout_signature(kv_args: KVArgs) -> int:

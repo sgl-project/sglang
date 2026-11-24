@@ -1401,7 +1401,7 @@ class TestPollCollectives(CustomTestCase):
         pollers = [Mock(poll=Mock(return_value=KVPoll.Success)) for _ in range(2)]
         requests = [
             SimpleNamespace(
-                req=SimpleNamespace(bootstrap_host="127.0.0.1"),
+                req=SimpleNamespace(bootstrap_host="127.0.0.1", bootstrap_room=42),
                 metadata_buffer_index=index,
             )
             for index in range(2)

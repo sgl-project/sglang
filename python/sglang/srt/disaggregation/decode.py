@@ -3455,8 +3455,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver = None
             return
         elif actual_room != expected_room:
-            # Real corruption detected (mismatch)
-            # Abort the request and remove from the queue
+            # Should never happen: _poll_with_metadata_gate already failed a
+            # mismatched room on all TP ranks; this rank-local abort is a backstop.
             error_msg = (
                 f"Context corruption detected: Request {decode_req.req.rid} "
                 f"(bootstrap_room={expected_room}) received metadata from "
