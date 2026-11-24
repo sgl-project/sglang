@@ -739,7 +739,7 @@ impl SglangService for GrpcService {
                     abort_all_requests: request.abort_all_requests,
                     weight_version: request.weight_version,
                     load_format: request.load_format,
-                    selector: request.selector.unwrap_or_else(|| "all".into()),
+                    selector: request.selector,
                     torch_empty_cache: request.torch_empty_cache,
                 })
                 .await,
@@ -761,7 +761,7 @@ impl SglangService for GrpcService {
                     flush_cache: request.flush_cache.unwrap_or(true),
                     abort_all_requests: request.abort_all_requests,
                     weight_version: request.weight_version,
-                    selector: request.selector.unwrap_or_else(|| "all".into()),
+                    selector: request.selector,
                     torch_empty_cache: request.torch_empty_cache,
                 })
                 .await,
@@ -819,7 +819,7 @@ impl SglangService for GrpcService {
                 flush_cache: request.flush_cache.unwrap_or(true),
                 abort_all_requests: request.abort_all_requests,
                 weight_version: request.weight_version,
-                selector: request.selector.unwrap_or_else(|| "all".into()),
+                selector: request.selector,
                 torch_empty_cache: request.torch_empty_cache,
             })
             .await

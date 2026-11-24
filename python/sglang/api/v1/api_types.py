@@ -3862,7 +3862,7 @@ class UpdateWeightsFromDistributedRequest(msgspec.Struct, kw_only=True, frozen=T
     abort_all_requests: bool = False
     weight_version: Optional[str] = None
     load_format: Optional[str] = None
-    selector: Optional[str] = "all"
+    selector: Optional[str] = None
     torch_empty_cache: bool = False
 
     @classmethod
@@ -3883,7 +3883,7 @@ class UpdateWeightsFromTensorRequest(msgspec.Struct, kw_only=True, frozen=True):
     flush_cache: Optional[bool] = True
     abort_all_requests: bool = False
     weight_version: Optional[str] = None
-    selector: Optional[str] = "all"
+    selector: Optional[str] = None
     torch_empty_cache: bool = False
 
     @classmethod
@@ -3950,7 +3950,7 @@ class PluginWeightUpdateRequest(msgspec.Struct, kw_only=True, frozen=True):
     flush_cache: Optional[bool] = True
     abort_all_requests: bool = False
     weight_version: Optional[str] = None
-    selector: Optional[str] = "all"
+    selector: Optional[str] = None
     torch_empty_cache: bool = False
 
     @classmethod
@@ -11582,7 +11582,7 @@ def decode_UpdateWeightsFromDistributedRequest(value: Any) -> UpdateWeightsFromD
         elif key == "load_format":
             kw["load_format"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "selector":
-            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+            kw["selector"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "torch_empty_cache":
             kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
     return UpdateWeightsFromDistributedRequest(**kw)
@@ -11626,7 +11626,7 @@ def decode_UpdateWeightsFromTensorRequest(value: Any) -> UpdateWeightsFromTensor
         elif key == "weight_version":
             kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "selector":
-            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+            kw["selector"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "torch_empty_cache":
             kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
     return UpdateWeightsFromTensorRequest(**kw)
@@ -11717,7 +11717,7 @@ def decode_PluginWeightUpdateRequest(value: Any) -> PluginWeightUpdateRequest:
         elif key == "weight_version":
             kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "selector":
-            kw["selector"] = "all" if x is None else _expect_str(x, expected="a string")
+            kw["selector"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "torch_empty_cache":
             kw["torch_empty_cache"] = _expect_bool(x, expected="a boolean")
     return PluginWeightUpdateRequest(**kw)

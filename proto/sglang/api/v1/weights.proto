@@ -152,11 +152,9 @@ message UpdateWeightsFromDistributedRequest {
   bool abort_all_requests = 6;
   optional string weight_version = 7;
   optional string load_format = 8;
-  // Which model runners the update loads into: "target", "draft" or "all".
-  optional string selector = 9 [
-    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
-    (sglang.json.v1.field_json).default_string = "all"
-  ];
+  // Which model runners the update loads into: "target", "draft" or "all";
+  // unset: those the session opened.
+  optional string selector = 9;
   bool torch_empty_cache = 10;
 }
 
@@ -173,11 +171,9 @@ message UpdateWeightsFromTensorRequest {
   ];
   bool abort_all_requests = 4;
   optional string weight_version = 5;
-  // Which model runners the update loads into: "target", "draft" or "all".
-  optional string selector = 6 [
-    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
-    (sglang.json.v1.field_json).default_string = "all"
-  ];
+  // Which model runners the update loads into: "target", "draft" or "all";
+  // unset: those the session opened.
+  optional string selector = 6;
   bool torch_empty_cache = 7;
 }
 
@@ -215,11 +211,9 @@ message PluginWeightUpdateRequest {
   ];
   bool abort_all_requests = 4;
   optional string weight_version = 5;
-  // Which model runners the update loads into: "target", "draft" or "all".
-  optional string selector = 6 [
-    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
-    (sglang.json.v1.field_json).default_string = "all"
-  ];
+  // Which model runners the update loads into: "target", "draft" or "all";
+  // unset: those the session opened.
+  optional string selector = 6;
   bool torch_empty_cache = 7;
 }
 

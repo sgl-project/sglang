@@ -1819,14 +1819,14 @@
     },
     {
       "type": "UpdateWeightsFromTensorRequest",
-      "name": "selector defaults to all and payloads stay base64 text",
+      "name": "a null selector stays unset and payloads stay base64 text",
       "input": {
         "serialized_named_tensors": [
           "gAU="
         ],
         "selector": null
       },
-      "canonical": "{\"serialized_named_tensors\":[\"gAU=\"],\"flush_cache\":true,\"abort_all_requests\":false,\"selector\":\"all\",\"torch_empty_cache\":false}"
+      "canonical": "{\"serialized_named_tensors\":[\"gAU=\"],\"flush_cache\":true,\"abort_all_requests\":false,\"torch_empty_cache\":false}"
     }
   ]
 }

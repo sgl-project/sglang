@@ -279,7 +279,7 @@ control_messages! {
         abort_all_requests: bool,
         weight_version: Option<String>,
         load_format: Option<String>,
-        selector: String,
+        selector: Option<String>,
         torch_empty_cache: bool,
     }
 
@@ -291,7 +291,7 @@ control_messages! {
         flush_cache: bool,
         abort_all_requests: bool,
         weight_version: Option<String>,
-        selector: String,
+        selector: Option<String>,
         torch_empty_cache: bool,
     }
 
@@ -318,7 +318,7 @@ control_messages! {
         flush_cache: bool,
         abort_all_requests: bool,
         weight_version: Option<String>,
-        selector: String,
+        selector: Option<String>,
         torch_empty_cache: bool,
     }
 
@@ -686,7 +686,7 @@ pub struct DistributedWeightUpdate {
     pub abort_all_requests: bool,
     pub weight_version: Option<String>,
     pub load_format: Option<String>,
-    pub selector: String,
+    pub selector: Option<String>,
     pub torch_empty_cache: bool,
 }
 
@@ -717,7 +717,7 @@ pub struct TensorWeightUpdate {
     pub flush_cache: bool,
     pub abort_all_requests: bool,
     pub weight_version: Option<String>,
-    pub selector: String,
+    pub selector: Option<String>,
     pub torch_empty_cache: bool,
 }
 
@@ -779,7 +779,7 @@ pub struct PluginWeightUpdate {
     pub flush_cache: bool,
     pub abort_all_requests: bool,
     pub weight_version: Option<String>,
-    pub selector: String,
+    pub selector: Option<String>,
     pub torch_empty_cache: bool,
 }
 

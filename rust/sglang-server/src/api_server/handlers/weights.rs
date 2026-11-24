@@ -211,7 +211,9 @@ impl CoreHandle {
         &self,
         update: DistributedWeightUpdate,
     ) -> Result<WeightUpdateOutcome, CoreError> {
-        check_selector(&update.selector)?;
+        if let Some(selector) = &update.selector {
+            check_selector(selector)?;
+        }
         self.single_rank_update(
             "update_weights_from_distributed",
             update.abort_all_requests,
@@ -232,7 +234,9 @@ impl CoreHandle {
         &self,
         update: TensorWeightUpdate,
     ) -> Result<WeightUpdateOutcome, CoreError> {
-        check_selector(&update.selector)?;
+        if let Some(selector) = &update.selector {
+            check_selector(selector)?;
+        }
         self.single_rank_update(
             "update_weights_from_tensor",
             update.abort_all_requests,
@@ -320,7 +324,9 @@ impl CoreHandle {
         if update.handler.is_empty() {
             return Err(CoreError::InvalidArgument("missing field `handler`".into()));
         }
-        check_selector(&update.selector)?;
+        if let Some(selector) = &update.selector {
+            check_selector(selector)?;
+        }
         self.require_single_rank("plugin_weight_update")?;
         let outcomes: Vec<PluginUpdateOutput> = self
             .weight_update("plugin-weight-update", update.abort_all_requests, &|| {
@@ -937,7 +943,6 @@ mod tests {
                     .as_object()
                     .cloned()
                     .unwrap(),
-                selector: "all".into(),
                 ..Default::default()
             }),
             async {
@@ -973,7 +978,7 @@ mod tests {
         let (outcome, ()) = tokio::join!(
             handle.update_weights_from_tensor(TensorWeightUpdate {
                 serialized_named_tensors: vec![WireBytes(vec![0x80, 0x05])],
-                selector: "draft".into(),
+                selector: Some("draft".into()),
                 weight_version: Some("v3".into()),
                 ..Default::default()
             }),
@@ -1036,10 +1041,7 @@ mod tests {
             },
         );
         let error = two_ranks
-            .update_weights_from_distributed(DistributedWeightUpdate {
-                selector: "all".into(),
-                ..Default::default()
-            })
+            .update_weights_from_distributed(DistributedWeightUpdate::default())
             .await
             .unwrap_err();
         assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);

@@ -22534,10 +22534,6 @@ impl UpdateWeightsFromDistributedRequest {
     pub fn flush_cache_or_default(&self) -> bool {
         self.flush_cache.clone().unwrap_or_else(|| true)
     }
-    /// The schema default when unset (protobuf arrival).
-    pub fn selector_or_default(&self) -> ::prost::alloc::string::String {
-        self.selector.clone().unwrap_or_else(|| "all".to_string())
-    }
     /// Protobuf arrival: unset defaulted fields become their schema
     /// defaults (JSON arrival already baked them at deserialization).
     pub fn apply_absent_defaults(&mut self) {
@@ -22546,9 +22542,6 @@ impl UpdateWeightsFromDistributedRequest {
         }
         if self.flush_cache.is_none() {
             self.flush_cache = Some(true);
-        }
-        if self.selector.is_none() {
-            self.selector = Some("all".to_string());
         }
     }
 }
@@ -22688,10 +22681,8 @@ impl<'de> ::serde::Deserialize<'de> for UpdateWeightsFromDistributedRequest {
                             if f_selector.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("selector"));
                             }
-                            f_selector = Some(Some(
-                                map.next_value::<Option<::prost::alloc::string::String>>()?
-                                    .unwrap_or_else(|| "all".to_string()),
-                            ));
+                            f_selector =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
                         "torch_empty_cache" => {
                             if f_torch_empty_cache.is_some() {
@@ -22716,7 +22707,7 @@ impl<'de> ::serde::Deserialize<'de> for UpdateWeightsFromDistributedRequest {
                     abort_all_requests: f_abort_all_requests.unwrap_or_default(),
                     weight_version: f_weight_version.flatten(),
                     load_format: f_load_format.flatten(),
-                    selector: f_selector.unwrap_or_else(|| Some("all".to_string())),
+                    selector: f_selector.flatten(),
                     torch_empty_cache: f_torch_empty_cache.unwrap_or_default(),
                 })
             }
@@ -22730,18 +22721,11 @@ impl UpdateWeightsFromTensorRequest {
     pub fn flush_cache_or_default(&self) -> bool {
         self.flush_cache.clone().unwrap_or_else(|| true)
     }
-    /// The schema default when unset (protobuf arrival).
-    pub fn selector_or_default(&self) -> ::prost::alloc::string::String {
-        self.selector.clone().unwrap_or_else(|| "all".to_string())
-    }
     /// Protobuf arrival: unset defaulted fields become their schema
     /// defaults (JSON arrival already baked them at deserialization).
     pub fn apply_absent_defaults(&mut self) {
         if self.flush_cache.is_none() {
             self.flush_cache = Some(true);
-        }
-        if self.selector.is_none() {
-            self.selector = Some("all".to_string());
         }
     }
 }
@@ -22848,10 +22832,8 @@ impl<'de> ::serde::Deserialize<'de> for UpdateWeightsFromTensorRequest {
                             if f_selector.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("selector"));
                             }
-                            f_selector = Some(Some(
-                                map.next_value::<Option<::prost::alloc::string::String>>()?
-                                    .unwrap_or_else(|| "all".to_string()),
-                            ));
+                            f_selector =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
                         "torch_empty_cache" => {
                             if f_torch_empty_cache.is_some() {
@@ -22872,7 +22854,7 @@ impl<'de> ::serde::Deserialize<'de> for UpdateWeightsFromTensorRequest {
                     flush_cache: f_flush_cache.unwrap_or_else(|| Some(true)),
                     abort_all_requests: f_abort_all_requests.unwrap_or_default(),
                     weight_version: f_weight_version.flatten(),
-                    selector: f_selector.unwrap_or_else(|| Some("all".to_string())),
+                    selector: f_selector.flatten(),
                     torch_empty_cache: f_torch_empty_cache.unwrap_or_default(),
                 })
             }
@@ -23092,18 +23074,11 @@ impl PluginWeightUpdateRequest {
     pub fn flush_cache_or_default(&self) -> bool {
         self.flush_cache.clone().unwrap_or_else(|| true)
     }
-    /// The schema default when unset (protobuf arrival).
-    pub fn selector_or_default(&self) -> ::prost::alloc::string::String {
-        self.selector.clone().unwrap_or_else(|| "all".to_string())
-    }
     /// Protobuf arrival: unset defaulted fields become their schema
     /// defaults (JSON arrival already baked them at deserialization).
     pub fn apply_absent_defaults(&mut self) {
         if self.flush_cache.is_none() {
             self.flush_cache = Some(true);
-        }
-        if self.selector.is_none() {
-            self.selector = Some("all".to_string());
         }
     }
 }
@@ -23206,10 +23181,8 @@ impl<'de> ::serde::Deserialize<'de> for PluginWeightUpdateRequest {
                             if f_selector.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("selector"));
                             }
-                            f_selector = Some(Some(
-                                map.next_value::<Option<::prost::alloc::string::String>>()?
-                                    .unwrap_or_else(|| "all".to_string()),
-                            ));
+                            f_selector =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
                         "torch_empty_cache" => {
                             if f_torch_empty_cache.is_some() {
@@ -23230,7 +23203,7 @@ impl<'de> ::serde::Deserialize<'de> for PluginWeightUpdateRequest {
                     flush_cache: f_flush_cache.unwrap_or_else(|| Some(true)),
                     abort_all_requests: f_abort_all_requests.unwrap_or_default(),
                     weight_version: f_weight_version.flatten(),
-                    selector: f_selector.unwrap_or_else(|| Some("all".to_string())),
+                    selector: f_selector.flatten(),
                     torch_empty_cache: f_torch_empty_cache.unwrap_or_default(),
                 })
             }

@@ -388,7 +388,7 @@ async fn update_weights_from_distributed(
                 abort_all_requests: request.abort_all_requests,
                 weight_version: request.weight_version,
                 load_format: request.load_format,
-                selector: request.selector.unwrap_or_else(|| "all".into()),
+                selector: request.selector,
                 torch_empty_cache: request.torch_empty_cache,
             })
             .await,
@@ -416,7 +416,7 @@ async fn update_weights_from_tensor(
                 flush_cache: request.flush_cache.unwrap_or(true),
                 abort_all_requests: request.abort_all_requests,
                 weight_version: request.weight_version,
-                selector: request.selector.unwrap_or_else(|| "all".into()),
+                selector: request.selector,
                 torch_empty_cache: request.torch_empty_cache,
             })
             .await,
@@ -488,7 +488,7 @@ async fn plugin_weight_update(
             flush_cache: request.flush_cache.unwrap_or(true),
             abort_all_requests: request.abort_all_requests,
             weight_version: request.weight_version,
-            selector: request.selector.unwrap_or_else(|| "all".into()),
+            selector: request.selector,
             torch_empty_cache: request.torch_empty_cache,
         })
         .await
@@ -806,11 +806,11 @@ mod tests {
             rmpv::Value::Array(vec![rmpv::Value::Binary(vec![0x80, 0x05])])
         );
         assert_eq!(items[4].as_str(), Some("flattened_bucket"));
-        assert_eq!(items[8].as_str(), Some("all"));
+        assert!(items[8].is_nil(), "an unset selector follows the session");
 
         let (status, body, items) = call(
             "/plugin_weight_update",
-            r#"{"handler": "h", "payload": {"k": 1}, "abort_all_requests": true}"#,
+            r#"{"handler": "h", "payload": {"k": 1}, "abort_all_requests": true, "selector": "target"}"#,
             serde_json::json!({"success": true, "message": "ok", "received_tensor_counts": [1]}),
         )
         .await;
@@ -820,6 +820,7 @@ mod tests {
             serde_json::json!({"success": true, "message": "ok", "received_tensor_counts": [1]})
         );
         assert_eq!(items[6].as_bool(), Some(true));
+        assert_eq!(items[8].as_str(), Some("target"));
 
         let (status, body, items) = call(
             "/update_weights_from_ipc",
@@ -847,6 +848,7 @@ mod tests {
             rmpv::Value::Array(vec![rmpv::Value::Array(vec![2.into(), 3.into()])])
         );
         assert_eq!(items[6].as_str(), Some("weight_update_group"));
+        assert!(items[11].is_nil(), "an unset selector follows the session");
     }
 
     /// A malformed body is refused before any scheduler sees it: bad base64,
@@ -864,6 +866,10 @@ mod tests {
             ),
             ("/update_weights_from_disk", r#"{"load_format": "auto"}"#),
             ("/begin_weight_update", r#"{"selector": "sideways"}"#),
+            (
+                "/update_weights_from_tensor",
+                r#"{"serialized_named_tensors": ["gAU="], "selector": "sideways"}"#,
+            ),
             ("/update_weights_from_ipc", r#"{}"#),
         ] {
             let (state, intake_rx) = test_state();

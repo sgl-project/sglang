@@ -3638,7 +3638,8 @@ pub struct UpdateWeightsFromDistributedRequest {
     pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "8")]
     pub load_format: ::core::option::Option<::prost::alloc::string::String>,
-    /// Which model runners the update loads into: "target", "draft" or "all".
+    /// Which model runners the update loads into: "target", "draft" or "all";
+    /// unset: those the session opened.
     #[prost(string, optional, tag = "9")]
     pub selector: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag = "10")]
@@ -3660,7 +3661,8 @@ pub struct UpdateWeightsFromTensorRequest {
     pub abort_all_requests: bool,
     #[prost(string, optional, tag = "5")]
     pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
-    /// Which model runners the update loads into: "target", "draft" or "all".
+    /// Which model runners the update loads into: "target", "draft" or "all";
+    /// unset: those the session opened.
     #[prost(string, optional, tag = "6")]
     pub selector: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag = "7")]
@@ -3704,7 +3706,8 @@ pub struct PluginWeightUpdateRequest {
     pub abort_all_requests: bool,
     #[prost(string, optional, tag = "5")]
     pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
-    /// Which model runners the update loads into: "target", "draft" or "all".
+    /// Which model runners the update loads into: "target", "draft" or "all";
+    /// unset: those the session opened.
     #[prost(string, optional, tag = "6")]
     pub selector: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag = "7")]
