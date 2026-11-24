@@ -1,5 +1,6 @@
 import math
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -338,12 +339,32 @@ class LTX2DenoisingStage(DenoisingStage):
         return step_index % (skip_step + 1) != 0
 
     @staticmethod
+    def _ltx2_sp_whole_latent_gathers(batch: Req, server_args: ServerArgs):
+        video_gather = audio_gather = None
+        if getattr(batch, "did_sp_shard_latents", False):
+            video_gather = lambda t: (
+                server_args.pipeline_config.gather_noise_pred_for_sp(batch, t)
+            )
+        if getattr(batch, "did_sp_shard_audio_latents", False):
+            audio_gather = lambda t: (
+                server_args.pipeline_config.gather_audio_latents_for_sp(t, batch)
+            )
+        return video_gather, audio_gather
+
+    @staticmethod
     def _ltx2_apply_rescale(
-        cond: torch.Tensor, pred: torch.Tensor, rescale_scale: float
+        cond: torch.Tensor,
+        pred: torch.Tensor,
+        rescale_scale: float,
+        gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if rescale_scale == 0.0:
             return pred
-        factor = cond.std() / pred.std()
+        # The std is over the whole latent; under SP each rank holds only a slice.
+        if gather is None:
+            factor = cond.std() / pred.std()
+        else:
+            factor = gather(cond).std() / gather(pred).std()
         factor = rescale_scale * factor + (1.0 - rescale_scale)
         return pred * factor
 
@@ -365,6 +386,8 @@ class LTX2DenoisingStage(DenoisingStage):
         audio_stg_scale: float,
         audio_rescale_scale: float,
         audio_modality_scale: float,
+        video_gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        audio_gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct CFG branches once for both modalities before guider math."""
         first_video_velocity = next(iter(local_video_velocities.values()))
@@ -406,6 +429,7 @@ class LTX2DenoisingStage(DenoisingStage):
             stg_scale=video_stg_scale,
             rescale_scale=video_rescale_scale,
             modality_scale=video_modality_scale,
+            gather=video_gather,
         )
         guided_audio = cls._ltx2_calculate_guided_x0(
             cond=branches["cond"][1],
@@ -416,6 +440,7 @@ class LTX2DenoisingStage(DenoisingStage):
             stg_scale=audio_stg_scale,
             rescale_scale=audio_rescale_scale,
             modality_scale=audio_modality_scale,
+            gather=audio_gather,
         )
         return guided_video, guided_audio
 
@@ -1049,6 +1074,7 @@ class LTX2DenoisingStage(DenoisingStage):
         stg_scale: float,
         rescale_scale: float,
         modality_scale: float,
+        gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         pred = (
             cond
@@ -1056,7 +1082,7 @@ class LTX2DenoisingStage(DenoisingStage):
             + stg_scale * (cond - uncond_perturbed)
             + (modality_scale - 1.0) * (cond - uncond_modality)
         )
-        return cls._ltx2_apply_rescale(cond, pred, rescale_scale)
+        return cls._ltx2_apply_rescale(cond, pred, rescale_scale, gather)
 
     @staticmethod
     def _should_pass_ltx2_text_attention_mask(
@@ -2124,6 +2150,9 @@ class LTX2DenoisingStage(DenoisingStage):
         stage1_cfg_world_size = (
             get_classifier_free_guidance_world_size() if stage1_cfg_parallel else 1
         )
+        video_gather, audio_gather = self._ltx2_sp_whole_latent_gathers(
+            batch, server_args
+        )
         # Legacy LTX-2.3 one-stage batches its guidance passes into one forward
         # (perturbation masks are exact per item; only GEMM/attention rounding
         # can move with the batch size). quality="exact" keeps the reference
@@ -2484,6 +2513,8 @@ class LTX2DenoisingStage(DenoisingStage):
                             audio_modality_scale=float(
                                 stage1_guider_params["audio_modality_scale"]
                             ),
+                            video_gather=video_gather,
+                            audio_gather=audio_gather,
                         )
                     )
                     if video_skip and ctx.last_denoised_video is not None:
@@ -2562,6 +2593,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         modality_scale=float(
                             stage1_guider_params["video_modality_scale"]
                         ),
+                        gather=video_gather,
                     )
                     if video_skip and ctx.last_denoised_video is not None:
                         denoised_video_local = ctx.last_denoised_video
@@ -2591,6 +2623,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         modality_scale=float(
                             stage1_guider_params["audio_modality_scale"]
                         ),
+                        gather=audio_gather,
                     )
                     if audio_skip and ctx.last_denoised_audio is not None:
                         denoised_audio_local = ctx.last_denoised_audio
