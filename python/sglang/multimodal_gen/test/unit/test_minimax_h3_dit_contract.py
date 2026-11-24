@@ -1639,3 +1639,45 @@ def test_npu_adaln_runs_and_modulation_parity():
         torch.testing.assert_close(got_gate_inplace, ref_gate, rtol=0, atol=0)
         torch.testing.assert_close(got_gate_preserve, ref_gate, rtol=0, atol=0)
         torch.testing.assert_close(x_preserved, x, rtol=0, atol=0)
+
+
+def test_npu_cross_block_add_rms_norm_and_qkv_pack_parity():
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        pytest.skip("requires Ascend NPU")
+    import torch_npu
+
+    device = torch.device("npu")
+    torch.manual_seed(11)
+    s_loc, h_glob, d, ws = 64, 8, 128, 2
+    h_loc = h_glob // ws
+    q = torch.randn(s_loc, h_glob, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(s_loc, h_glob, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn(s_loc, h_glob, d, device=device, dtype=torch.bfloat16)
+    ref_pack = torch.empty(
+        (ws, s_loc, h_loc, 3 * d), device=device, dtype=torch.bfloat16
+    )
+    for idx, t in enumerate((q, k, v)):
+        ref_pack[..., idx * d : (idx + 1) * d].copy_(
+            t.view(s_loc, ws, h_loc, d).permute(1, 0, 2, 3)
+        )
+    fast_pack = (
+        torch.cat((q, k, v), dim=-1)
+        .view(s_loc, ws, h_loc, 3 * d)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+    torch.testing.assert_close(fast_pack, ref_pack, rtol=0, atol=0)
+
+    # Verify cross-block fused npu_add_rms_norm parity against unfused add + rms_norm
+    res = torch.randn(s_loc, 256, device=device, dtype=torch.bfloat16)
+    mlp_out = torch.randn(s_loc, 256, device=device, dtype=torch.bfloat16)
+    w = torch.ones(256, device=device, dtype=torch.bfloat16)
+    eps = 1e-6
+    with torch.inference_mode():
+        fused_norm, _, fused_res = torch_npu.npu_add_rms_norm(
+            res.clone(), mlp_out, w, eps
+        )
+        ref_res = res + mlp_out
+        ref_norm, _ = torch_npu.npu_rms_norm(ref_res, w, eps)
+        torch.testing.assert_close(fused_res, ref_res, rtol=0, atol=0)
+        torch.testing.assert_close(fused_norm, ref_norm, rtol=1e-2, atol=1e-2)

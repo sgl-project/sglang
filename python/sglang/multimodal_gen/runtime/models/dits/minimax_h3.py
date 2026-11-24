@@ -999,6 +999,9 @@ def _minimax_h3_group_attend(
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
 # the full call (checked at H3's shapes on MI355X)
 _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+# Minimum global sequence length for NPU LaserAttention 2-group collective
+# pipelining (below this threshold the extra attention launch outweighs overlap).
+_NPU_LASER_PIPELINE_MIN_SEQ_LEN = 8192
 # packed kernels that return the softmax LSE the ring merge needs
 _RING_ATTENTION_BACKENDS = (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
 
@@ -1025,14 +1028,24 @@ def _minimax_h3_collective_pipelined_attention(
     if groups < 0:
         groups = 2
     world_size, _ = get_ulysses_ctx()
+    is_npu_laser = (
+        current_platform.is_npu()
+        and attention._attention_backend_enum is AttentionBackendEnum.LASER_ATTN
+        and q.shape[0] * world_size >= _NPU_LASER_PIPELINE_MIN_SEQ_LEN
+        and MINIMAX_H3_NORM_MODULATE.is_enabled(attention)
+        and not is_in_breakable_cuda_graph()
+    )
     if (
         envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
         or groups in (0, 1)
-        or attention._attention_backend_enum
-        not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+        or (
+            attention._attention_backend_enum
+            not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+            and not is_npu_laser
+        )
         or q.shape[1] % (world_size * groups)
         or torch.compiler.is_compiling()
-        or torch.cuda.is_current_stream_capturing()
+        or (not current_platform.is_npu() and torch.cuda.is_current_stream_capturing())
     ):
         return None
     impl = attention._attention_impl
@@ -1363,6 +1376,7 @@ class MiniMaxH3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.bcg_breakpoint = bcg_breakpoint
+        MINIMAX_H3_NORM_MODULATE.mark(self)
         self.tp_size = get_tp_world_size()
         if arch.num_attention_heads % self.tp_size:
             raise ValueError(
@@ -2132,7 +2146,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         adaln_params: tuple[torch.Tensor, ...] | None = None,
         block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
         combined_runs: tuple[tuple[int, int, int], ...] | None = None,
-    ) -> torch.Tensor:
+        pre_norm1_hidden: torch.Tensor | None = None,
+        next_norm1: RMSNorm | nn.RMSNorm | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
 
@@ -2171,6 +2187,15 @@ class MiniMaxH3DiTBlock(nn.Module):
                     dtype=_BF16_DTYPE,
                     runs=combined_runs,
                 )
+        elif pre_norm1_hidden is not None:
+            h = _modulate_scale_shift(
+                pre_norm1_hidden,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                dtype=_BF16_DTYPE,
+                runs=combined_runs,
+            )
         else:
             h = _modulate_rmsnorm_scale_shift(
                 x,
@@ -2255,14 +2280,36 @@ class MiniMaxH3DiTBlock(nn.Module):
                 dtype=_BF16_DTYPE,
                 runs=combined_runs,
             )
+            mlp_out = self.mlp(h)
+            if (
+                next_norm1 is not None
+                and mlp_out.dtype == gate_mlp.dtype == _BF16_DTYPE
+                and hasattr(next_norm1, "variance_epsilon")
+                and next_norm1.weight is not None
+                and next_norm1.weight.device == residual.device
+            ):
+                _apply_indexed_gate_npu_inplace(
+                    mlp_out, gate_mlp, combined_indices, runs=combined_runs
+                )
+                next_normed, _, residual = torch_npu.npu_add_rms_norm(
+                    residual,
+                    mlp_out,
+                    next_norm1.weight,
+                    next_norm1.variance_epsilon,
+                )
+                return residual, next_normed
+            gate_run_kwargs = (
+                {"runs": combined_runs} if combined_runs is not None else {}
+            )
             return _modulate_gate(
                 residual,
                 gate_mlp,
-                self.mlp(h),
+                mlp_out,
                 combined_indices,
                 dtype=_BF16_DTYPE,
-                runs=combined_runs,
+                **gate_run_kwargs,
             )
+        gate_run_kwargs = {"runs": combined_runs} if combined_runs is not None else {}
         if partials is not None and (
             self.preserve_input_for_cache_dit
             or not can_use_indexed_gate_bf16_sum2(
@@ -2280,7 +2327,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 combined_indices,
                 dtype=_BF16_DTYPE,
                 allow_inplace=not self.preserve_input_for_cache_dit,
-                runs=combined_runs,
+                **gate_run_kwargs,
             )
 
         residual = x
@@ -2315,7 +2362,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             # `residual` is block-local here (see above), so this stays
             # in-place even while Cache-DiT is attached.
             return self._mlp_gated_residual(
-                residual, gate_mlp, h, combined_indices, peer
+                residual, gate_mlp, h, combined_indices, peer, **gate_run_kwargs
             )
         return _modulate_gate(
             residual,
@@ -2323,7 +2370,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
-            runs=combined_runs,
+            **gate_run_kwargs,
         )
 
     def _takes_peer_partials(self, x: torch.Tensor) -> bool:
@@ -2349,11 +2396,19 @@ class MiniMaxH3DiTBlock(nn.Module):
         h: torch.Tensor,
         indices: torch.Tensor,
         peer: bool,
+        *,
+        runs: tuple[tuple[int, int, int], ...] | None = None,
     ) -> torch.Tensor:
         """``residual`` updated in place with ``gate[indices] * mlp(h)``."""
         if not peer:
+            gate_run_kwargs = {"runs": runs} if runs is not None else {}
             return _modulate_gate(
-                residual, gate, self.mlp(h), indices, dtype=_BF16_DTYPE
+                residual,
+                gate,
+                self.mlp(h),
+                indices,
+                dtype=_BF16_DTYPE,
+                **gate_run_kwargs,
             )
         hidden = self.mlp.fc2_input(h)
         partials = staged_partials(self.mlp.fc2, hidden, residual)
@@ -3857,8 +3912,31 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for block in self.blocks:
-                hidden = block(
+            fuse_cross_block_norm1 = (
+                current_platform.is_npu()
+                and not torch.is_grad_enabled()
+                and not spectrum_on
+                and not is_layerwise_offloaded_module(self)
+                and len(self.blocks) > 1
+                and all(
+                    isinstance(b, MiniMaxH3DiTBlock)
+                    and not b.preserve_input_for_cache_dit
+                    for b in self.blocks
+                )
+            )
+            pre_norm1_hidden: torch.Tensor | None = None
+            num_blocks = len(self.blocks)
+            for block_idx, block in enumerate(self.blocks):
+                next_block = (
+                    self.blocks[block_idx + 1]
+                    if fuse_cross_block_norm1 and block_idx + 1 < num_blocks
+                    else None
+                )
+                has_next = next_block is not None and not _accepts_mxfp8_input(
+                    next_block.attn.qkv_proj
+                )
+                next_norm1 = next_block.norm1 if has_next else None
+                block_out = block(
                     hidden,
                     adaln_input=adaln_input,
                     combined_indices=block_combined,
@@ -3871,7 +3949,14 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     ring_active=ring_ws > 1,
                     block_adaln_params=block_adaln_params,
                     combined_runs=block_combined_runs,
+                    pre_norm1_hidden=pre_norm1_hidden,
+                    next_norm1=next_norm1,
                 )
+                if isinstance(block_out, tuple):
+                    hidden, pre_norm1_hidden = block_out
+                else:
+                    hidden = block_out
+                    pre_norm1_hidden = None
             if spectrum_on:
                 self._h3_spectrum_record_targets(
                     hidden, audio_pos, infer_out_pos, row_start, row_stop
