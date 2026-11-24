@@ -399,8 +399,16 @@ class SPAllGatherMatmul:
 
 
 def prepare(group, device: torch.device, hidden: int) -> Optional[SPExpertBuffers]:
+    from sglang.srt.layers.muse_spark.muse_spark_dynamic_guests import (
+        tp_group_on_one_host,
+    )
+
     key = (group.device_group.group_name, device.index)
     if key not in _state:
+        if not tp_group_on_one_host(group):
+            logger.info("SP experts: the TP group spans hosts, NCCL gathers")
+            _state[key] = None
+            return None
         try:
             _state[key] = SPExpertBuffers(group, device, hidden)
         except Exception as e:
