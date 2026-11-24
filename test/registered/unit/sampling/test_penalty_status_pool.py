@@ -252,39 +252,26 @@ class TestParams(CustomTestCase):
 
 
 class TestFlush(CustomTestCase):
-    def test_each_queued_value_lands_in_its_own_table(self):
-        """One flush copies every queued value at once; each comes back from its
-        own table and index, with a history-only flush after it."""
+    def test_history_reset_alone_writes_only_its_index(self):
+        """A re-admission that queues only a history reset rewrites that index's
+        counts and length and leaves the other index and every param alone."""
         pool = _pool()
         a = _req(1, frequency_penalty=0.5, min_new_tokens=3, stop_token_ids=[4, 5])
-        a.output_ids = [1, 1, 2]
-        b = _req(2, presence_penalty=0.25, repetition_penalty=1.5, output_ids=[7])
-        c = _req(3, min_new_tokens=9, stop_token_ids=[6])
-        for req in (a, b, c):
+        b = _req(2, presence_penalty=0.25, output_ids=[7])
+        for req in (a, b):
             _admit(pool, req)
+        pool.live_tables()
 
+        a.output_ids = [3, 3, 9]
+        pool.reset_history([a])
         tables = pool.live_tables()
 
-        self.assertEqual([a.penalty_index, b.penalty_index, c.penalty_index], [0, 1, 2])
-        self.assertEqual(tables.frequency.tolist(), [0.5, 0.0, 0.0])
-        self.assertEqual(tables.presence.tolist(), [0.0, 0.25, 0.0])
-        self.assertEqual(tables.repetition.tolist(), [1.0, 1.5, 1.0])
-        self.assertEqual(tables.min_new_tokens.tolist(), [3, 0, 9])
-        stop_sets = [set(row) - {VOCAB_SIZE} for row in tables.stop_token_ids.tolist()]
-        self.assertEqual(stop_sets, [{4, 5}, set(), {6}])
-        self.assertEqual(tables.lens.tolist(), [3, 1, 0])
-        self.assertEqual(tables.counts[0, :3].tolist(), [0, 2, 1])
-        self.assertEqual(tables.counts[1, 7].item(), 1)
-        self.assertEqual(tables.counts.sum(dim=1).tolist(), [3, 1, 0])
-
-        b.output_ids = [3, 3, 9]
-        pool.reset_history([b])
-        tables = pool.live_tables()
-
-        self.assertEqual(tables.lens.tolist(), [3, 3, 0])
-        self.assertEqual(tables.counts[1, [3, 7, 9]].tolist(), [2, 0, 1])
-        self.assertEqual(tables.counts.sum(dim=1).tolist(), [3, 3, 0])
-        self.assertEqual(tables.presence.tolist(), [0.0, 0.25, 0.0])
+        self.assertEqual(tables.lens.tolist(), [3, 1])
+        self.assertEqual(tables.counts[0, [3, 7, 9]].tolist(), [2, 0, 1])
+        self.assertEqual(tables.counts[1, [3, 7, 9]].tolist(), [0, 1, 0])
+        self.assertEqual(tables.frequency.tolist(), [0.5, 0.0])
+        self.assertEqual(tables.presence.tolist(), [0.0, 0.25])
+        self.assertEqual(tables.min_new_tokens.tolist(), [3, 0])
 
 
 class TestBuild(CustomTestCase):

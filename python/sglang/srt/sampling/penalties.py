@@ -226,8 +226,9 @@ class PenaltyStatusPool:
             self._write_pending()
 
     def _write_pending(self) -> None:
-        """Write the queued params and history resets with one copy: the values go
-        into one int64 host array, split on the device into a view per segment."""
+        """Write the queued params and history resets with one copy: everything
+        queued goes into one int64 host array, split on the device into a view per
+        segment."""
         tables = self.tables
         params = list(self.pending_params.values())
         histories = list(self.pending_init.values())
@@ -267,18 +268,16 @@ class PenaltyStatusPool:
             lens,
             replay_indices,
             replay_tokens,
-        ) = (
-            part.view(s.shape)
-            for part, s in zip(block.split([s.size for s in segments]), segments)
-        )
+        ) = block.split([s.size for s in segments])
 
         if params:
-            tables.params.index_copy_(1, param_indices, values.to(torch.int32))
-            tables.stop_token_ids[param_indices] = stop_token_ids
+            values = values.view(4, -1).to(torch.int32)
+            tables.params.index_copy_(1, param_indices, values)
+            tables.stop_token_ids[param_indices] = stop_token_ids.view(len(params), -1)
         if histories:
             tables.counts.index_fill_(0, history_indices, 0)
             tables.lens.index_copy_(0, history_indices, lens.to(torch.int32))
-        if replay_indices.numel():
+        if sum(lens_cpu):
             tables.counts.index_put_(
                 (replay_indices, replay_tokens),
                 torch.ones(len(replay_indices), dtype=torch.int32, device=self.device),
