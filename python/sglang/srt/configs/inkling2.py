@@ -37,6 +37,9 @@ class Inkling2ModelConfig(InklingModelConfig):
         mlp_gate_softcap: float = 4.0,
         mlp_up_softcap: float = 25.0,
         loop_config: Inkling2LoopConfig | None = None,
+        # What the checkpoint writes between <|message_model|> and <|content_invoke_tool_json|>;
+        # the default of --inkling2-tool-call-author-name-mode.
+        tool_call_author_name_mode: str = "tool_name",
         **kwargs: Any,
     ) -> None:
         fixed = dict(
@@ -85,6 +88,12 @@ class Inkling2ModelConfig(InklingModelConfig):
         self.mlp_gate_softcap = mlp_gate_softcap
         self.mlp_up_softcap = mlp_up_softcap
         self.loop_config = loop_config
+        if tool_call_author_name_mode not in ("tool_name", "independent", "drop_name"):
+            raise ValueError(
+                "tool_call_author_name_mode must be 'tool_name', 'independent' or "
+                f"'drop_name', got {tool_call_author_name_mode!r}"
+            )
+        self.tool_call_author_name_mode = tool_call_author_name_mode
         if mlp_gate_softcap < 0 or mlp_up_softcap < 0:
             raise ValueError("MLP softcaps must be nonnegative")
         if not 0 < n_layers_per_attn_res_block <= self.num_hidden_layers:

@@ -175,6 +175,21 @@ class Model(msgspec.Struct):
         "cache, so later tokens read the last pass's K/V. By default each pass "
         "keeps its own cache.",
     ] = False
+    inkling2_tool_call_author_name_mode: A[
+        Optional[Literal["tool_name", "independent", "drop_name"]],
+        Arg(
+            help=(
+                "The tool-call header an inkling2 checkpoint writes, which chat "
+                "prompts render past tool calls with, between <|message_model|> and "
+                "<|content_invoke_tool_json|>. 'tool_name': the tool's name "
+                "(Inkling-2-Mini, Inkling-2-Small). 'independent': the assistant "
+                "message's own name, empty when it has none. 'drop_name': assistant "
+                "message names are dropped, so the header is always empty. Default: the "
+                "checkpoint's config.json text_config.tool_call_author_name_mode, else "
+                "'tool_name', as Inkling-2-Mini and Inkling-2-Small. Other models ignore it."
+            ),
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Quantization and data type
