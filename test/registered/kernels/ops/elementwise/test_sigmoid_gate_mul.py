@@ -6,7 +6,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=4, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=4, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=4, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
 
@@ -89,6 +89,24 @@ def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
     ref = x * torch.sigmoid(gate)
     assert torch.equal(fused_sigmoid_mul(x, gate, round_sigmoid=True), ref)
     assert torch.equal(fused_sigmoid_mul(x, gate.contiguous(), round_sigmoid=True), ref)
+
+
+def test_sigmoid_gate_mul_head_strided_gate_round_sigmoid_is_bit_exact():
+    # Qwen3-Next layout: per head [q | gate] from the QKV GEMM, chunked into a 3D view.
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    num_tokens, num_heads, head_dim = 300, 16, 256
+    torch.manual_seed(0)
+    q_gate = torch.randn(
+        num_tokens, num_heads, 2 * head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
+    _, gate = torch.chunk(q_gate, 2, dim=-1)
+    x = torch.randn(
+        num_tokens, num_heads * head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
+    ref = x * torch.sigmoid(gate.reshape(num_tokens, -1))
+    out = fused_sigmoid_mul(x.clone(), gate, inplace=True, round_sigmoid=True)
+    assert torch.equal(out, ref)
 
 
 if __name__ == "__main__":

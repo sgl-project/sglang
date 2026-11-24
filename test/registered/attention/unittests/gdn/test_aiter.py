@@ -22,7 +22,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
+register_amd_ci(est_time=20, suite="base-b-test-1-gpu-large-amd")
 
 _has_aiter_flydsl = is_hip() and (
     importlib.util.find_spec("aiter.ops.flydsl.linear_attention_kernels") is not None

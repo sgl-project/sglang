@@ -49,6 +49,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=2),
             ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_parallel",
+                return_value=SimpleNamespace(enable_dsa_cache_layer_split=False),
+            ),
             patch.object(
                 kcc,
                 "get_schedule",
@@ -78,6 +82,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         ):
             result = configurator._build_ascend_mla_kv_pool(
                 max_total_num_tokens=64,
+                max_running_requests=4,
                 is_dsa_model=True,
             )
 
@@ -96,18 +101,22 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
 
         configurator = pc.DefaultPoolConfigurator.__new__(pc.DefaultPoolConfigurator)
         cases = [
-            (None, torch.bfloat16, 256),
-            ("int8", torch.bfloat16, 130),
-            (None, torch.float8_e4m3fn, 132),
+            (None, torch.bfloat16, 1, 256),
+            (None, torch.bfloat16, 4, 64),
+            ("int8", torch.bfloat16, 1, 130),
+            (None, torch.float8_e4m3fn, 1, 132),
         ]
-        for indexer_dtype, kv_dtype, expected in cases:
-            with self.subTest(indexer_dtype=indexer_dtype, kv_dtype=kv_dtype):
+        for indexer_dtype, kv_dtype, kpool, expected in cases:
+            with self.subTest(
+                indexer_dtype=indexer_dtype, kv_dtype=kv_dtype, kpool=kpool
+            ):
                 kvc = SimpleNamespace(
                     model_config=SimpleNamespace(
                         hf_config=SimpleNamespace(
                             architectures=["DeepseekV32ForCausalLM"],
                             index_topk=2048,
                             index_head_dim=128,
+                            index_kpool=kpool,
                         )
                     ),
                     kv_cache_dtype=kv_dtype,
@@ -123,7 +132,9 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
                         pc,
                         "get_exec",
                         return_value=SimpleNamespace(
-                            kernel=SimpleNamespace(enable_fp4_indexer=False)
+                            kernel=SimpleNamespace(
+                                enable_fp4_indexer=False, enable_dsa_fp4_indexer=False
+                            )
                         ),
                     ),
                     patch.object(
