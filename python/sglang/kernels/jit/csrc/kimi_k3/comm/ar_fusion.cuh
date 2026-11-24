@@ -18,12 +18,9 @@
 //       * deep pipelining: the copy loop manually keeps `unroll` multimem
 //         loads in flight per thread before the first store, cascading
 //         through halving widths for mid-size tails.
-//       * multicast barriers on the CustomAllReduceV2 pull semaphores: the
-//         generic pull kernels' reservation protocol with each arrival sent
-//         as ONE `multimem.red.add` on the semaphore flag's multicast alias
-//         instead of per-peer unicast reds — identical memory effects, so
-//         both kernel families share the slots freely (single-stream calls
-//         are serialized).
+//       * multicast barriers (McBarrier) on the CustomAllReduceV2 pull
+//         semaphores, shared with the generic pull kernels (single-stream
+//         calls are serialized).
 //
 // Both families fuse either a residual add (`out = allreduce(x) + r`; the
 // residual must be identical on every rank — a fully reduced tensor such as
@@ -51,7 +48,7 @@ namespace sglang {
 // The shared vocabulary this file is written in, pulled in by name so the call
 // sites below stay unqualified: see include/sgl_kernel/distributed/ptx.cuh and
 // .../communicator.cuh.
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 using device::distributed::Semaphore;
 using host::distributed::CommunicatorRef;
 
@@ -64,7 +61,7 @@ struct FusionParams {
   const uint8_t* residual;     // may be null (compile-time kHasResidual selects)
   uint8_t* push_ws_mc;         // multicast VA of the push workspace base
   uint8_t* push_ws_local;      // local push workspace base (poll side)
-  Counter* push_counter;       // per-block phase counters (local memory)
+  EpochCounter* push_counter;  // the push plane's phase word (local memory)
   int64_t push_buffer_stride;  // per-buffer bytes (2 * world_size buffers)
   uint32_t rank;
   uint32_t num_vecs;  // 16B vectors
@@ -73,7 +70,6 @@ struct FusionParams {
   const uint8_t* norm_weight;
   float norm_eps;
   uint32_t num_norm_rows;
-  uint32_t num_push_counters;  // cluster variant only: full counter array size
   // finalize_push_norm only: trtllm-gen deferred-finalize inputs (kimi_k3.py
   // deferred finalize path); `input` is then output-only ([T, kNormDim])
   const uint8_t* fin_gemm2;    // [P, kNormDim] bf16, permuted rows
@@ -99,9 +95,9 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
   const auto num_threads = blockDim.x * gridDim.x;
   const auto num_vecs = params.num_vecs;
 
-  // prologue: the previous phase flip (counter inc) must be visible
+  // prologue: the previous phase commit must be visible
   device::PDLWaitPrimary<kUsePDL>();
-  const auto phase = params.push_counter[bx].get() & 1;
+  const auto phase = params.push_counter->load();
   const auto r = params.rank;
   const auto stride_bytes = params.push_buffer_stride;
   const auto phase_stride_bytes = (phase * kWorldSize) * stride_bytes;
@@ -146,9 +142,8 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
     }
   }
 
-  // epilogue: flip this block's phase
   __syncthreads();
-  if (tx == 0) params.push_counter[bx].set(phase ^ 1);
+  if (tx == 0) params.push_counter->commit();
 }
 
 // --- deferred-finalize staging (finalize_push_norm) ------------------------
@@ -262,32 +257,27 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   const auto num_rows = num_vecs / kNormRowVecs;
 
   const auto row_idx = bx / kClusterSize;
-  const auto num_row_clusters = gridDim.x / kClusterSize - 1;  // last one is the bumper
-  // stage-1 grid-stride is over the ROW clusters only: the bumper early-returns
-  // and never stages, so it must not be counted or its share of vids is dropped
-  const auto num_threads = kBlockSize * num_row_clusters * kClusterSize;
+  const auto num_row_clusters = gridDim.x / kClusterSize;
+  const auto num_threads = kBlockSize * gridDim.x;
 
   PDLWaitPrimary<kUsePDL>();
 
-  // special case: the bumper cluster flips every remaining counter so the
-  // whole array stays globally in phase. Only ONE block does it (threads
-  // grid-stride the counters) — each counter must be inc'd exactly once,
-  // independent of whether kClusterSize is odd or even.
-  if (row_idx == num_row_clusters) {
-    if (bx % kClusterSize == 0) {
-      for (uint32_t r = num_row_clusters + tx; r < params.num_push_counters; r += kBlockSize) {
-        params.push_counter[r].inc(1);
-      }
-    }
-    return PDLTriggerSecondary<kUsePDL>();
-  }
-
-  const auto phase = params.push_counter[row_idx].get() & 1;
+  const auto phase = params.push_counter->load();
   const auto r = params.rank;
   const auto stride_bytes = params.push_buffer_stride;
   const auto phase_stride_bytes = (phase * kWorldSize) * stride_bytes;
   const auto push_ptr = params.push_ws_mc + r * stride_bytes + phase_stride_bytes;
   const auto poll_ptr = params.push_ws_local + phase_stride_bytes;
+
+  // The leader commits for the whole cluster, so every CTA must have read the phase
+  // first. Rows ascend: a cluster whose first row is normed passes a cluster.sync in
+  // the row loop; the others arrive here (the asm waits for the phase load) and the
+  // leader waits right before its commit.
+  const bool order_phase_read = row_idx >= params.num_norm_rows;  // cluster-uniform
+  if (order_phase_read) {
+    asm volatile("" ::"r"(phase));
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+  }
 
   // stage 1: multicast staging (grid-stride); kFinalize computes each vector
   // in place of the load
@@ -302,7 +292,7 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
     ptx::st_multimem_16B(vec, push_ptr, vid);
   }
 
-  // stage 2: one row per cluster pass (the bumper cluster owns no rows)
+  // stage 2: one row per cluster pass
   const auto cluster = cg::this_cluster();
   const auto cluster_rank = bx % kClusterSize;
   vec_t w;
@@ -376,11 +366,8 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
     }
   }
 
-  // epilogue: each row cluster flips its own counter; the bumper cluster
-  // flips every remaining one so the whole array stays globally uniform
-  if (cluster_rank == 0 && tx == 0) {
-    params.push_counter[row_idx].set(phase ^ 1);
-  }
+  if (order_phase_read) asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+  if (cluster_rank == 0 && tx == 0) params.push_counter->commit(row_idx, num_row_clusters);
 }
 
 // Pull family: low-SM NVLS, reusing the CustomAllReduceV2 pull semaphores
@@ -401,15 +388,6 @@ struct PullParams {
   float norm_eps;
   uint32_t num_norm_rows;
 };
-
-// K3 pull barriers reuse the v2 pull-semaphore slots with EXACTLY the
-// generic kernels' reservation protocol — reserve a 2 * world_size flag
-// window on the local m_counter, signal arrival on m_flag, wait for the
-// window to fill — except that each arrival is ONE `multimem.red.add` on
-// the m_flag's multicast alias instead of world_size per-peer unicast reds
-// (same aggregate effect: every rank's flag gains world_size arrivals per
-// phase). Identical memory effects per call, so both kernel families share
-// the slots freely (single-stream calls are serialized).
 
 // One pipelined pass at width kWidth (kWidth multimem loads in flight per
 // thread), then recurse to kWidth/2 for the remainder, down to a plain
@@ -455,13 +433,10 @@ __launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const __gri
 
   const auto tx = threadIdx.x;
   const auto bx = blockIdx.x;
-  // Reserve the window before the PDL wait, signal after it: the reservation's
-  // RMW latency stays off the post-wait critical path, while the signal must
-  // follow the wait because it asserts the producer grid has flushed.
-  const auto barrier =
-      device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size, /*num_arrives=*/2);
+  // The arrival must follow the PDL wait: it asserts the producer grid has flushed.
+  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size);
   device::PDLWaitPrimary<kUsePDL>();
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_relaxed();
   __syncthreads();
 
   // this rank's shard of the 16B-vector range
@@ -485,7 +460,7 @@ __launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const __gri
   // its broadcast into it is visible) before my next kernel may touch it.
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);
+  barrier.arrive_rel_acq();
 }
 
 // Fused RMSNorm over the latent of the K3 latent|shared MoE buffer: the
@@ -505,13 +480,10 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
 
   const auto tx = threadIdx.x;
   const auto bx = blockIdx.x;
-  // Reserve the window before the PDL wait, signal after it: the reservation's
-  // RMW latency stays off the post-wait critical path, while the signal must
-  // follow the wait because it asserts the producer grid has flushed.
-  const auto barrier =
-      device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size, /*num_arrives=*/2);
+  // The arrival must follow the PDL wait: it asserts the producer grid has flushed.
+  const auto barrier = device::distributed::McBarrier(params.sem_local, params.sem_mc, params.world_size);
   device::PDLWaitPrimary<kUsePDL>();
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_relaxed();
   __syncthreads();
 
   // this rank's shard of the row range
@@ -582,7 +554,7 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
   // its broadcast into it is visible) before my next kernel may touch it.
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);
+  barrier.arrive_rel_acq();
 }
 
 inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
@@ -663,7 +635,6 @@ struct AllReduceFusionKernel {
     params.norm_weight = static_cast<const uint8_t*>(weight.data_ptr());
     params.norm_eps = static_cast<float>(eps);
     params.num_norm_rows = static_cast<uint32_t>(num_norm_rows);
-    params.num_push_counters = comm.get_push_obj().num_blocks;
     return params;
   }
 
@@ -755,7 +726,7 @@ struct AllReduceFusionKernel {
     const int64_t nbytes = int64_t(params.num_vecs) * 16;
     CHECK_HOST(nbytes <= push.slot_bytes) << "input size " << nbytes << " exceeds push slot size " << push.slot_bytes;
     const auto kernel = residual.has_value() ? res_push_kernel<true> : res_push_kernel<false>;
-    host::LaunchKernel(push.num_blocks, choose_block_size(params.num_vecs), input.device())
+    host::LaunchKernel(push.default_blocks, choose_block_size(params.num_vecs), input.device())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 
@@ -768,8 +739,7 @@ struct AllReduceFusionKernel {
     const auto num_rows = params.num_vecs / kNormRowVecs;
     constexpr uint32_t kMaxClusters = 96;
     const auto num_row_clusters = std::max<uint32_t>(std::min(num_rows, kMaxClusters), 1);
-    CHECK_HOST(num_row_clusters < push.num_blocks);
-    host::LaunchKernel((num_row_clusters + 1) * kClusterSize, kNormRowVecs / kClusterSize, input.device())
+    host::LaunchKernel(num_row_clusters * kClusterSize, kNormRowVecs / kClusterSize, input.device())
         .enable_pdl(kUsePDL)(all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL>, params);
   }
 
@@ -818,11 +788,10 @@ struct AllReduceFusionKernel {
 
     constexpr uint32_t kMaxClusters = 96;
     const auto num_row_clusters = std::max<uint32_t>(std::min(num_tokens, kMaxClusters), 1);
-    CHECK_HOST(num_row_clusters < push.num_blocks);
     const auto kernel = is_type<fp32_t>(expert_weights.dtype())
                             ? all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, fp32_t>
                             : all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, bf16_t>;
-    host::LaunchKernel((num_row_clusters + 1) * kClusterSize, kNormRowVecs / kClusterSize, out.device())
+    host::LaunchKernel(num_row_clusters * kClusterSize, kNormRowVecs / kClusterSize, out.device())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 

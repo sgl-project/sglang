@@ -4,10 +4,15 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 _TRITON_OK = torch.cuda.is_available() or os.environ.get("TRITON_INTERPRET") == "1"
 
@@ -118,6 +123,7 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         s.out = torch.zeros(max_bs * gamma, dtype=torch.int64)
         s.verify_ids = torch.full((max_bs, gamma + 1), -1, dtype=torch.int64)
         s.confidence_out = None
+        s.acceptance_estimator = None
         draft = torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma) + 100
 
         def step(model_hidden, anchor):

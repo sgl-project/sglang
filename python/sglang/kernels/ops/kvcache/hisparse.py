@@ -74,6 +74,11 @@ def _jit_spec_module(
     )
 
 
+# Mirrors the static_asserts in kvcacheio/hisparse_spec.cuh.
+SPEC_SWAP_MAX_STEPS = 8
+SPEC_SWAP_MAX_OCCURRENCES = 16384
+
+
 def load_cache_to_device_buffer_spec_mla(
     *,
     top_k_tokens: torch.Tensor,
@@ -104,9 +109,12 @@ def load_cache_to_device_buffer_spec_mla(
     [host base address, row stride in bytes] for the shared HiCache host pool.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if not 2 <= num_steps <= 4 and not (num_steps == 1 and device_locs is not None):
+    if not 2 <= num_steps <= SPEC_SWAP_MAX_STEPS and not (
+        num_steps == 1 and device_locs is not None
+    ):
         raise ValueError(
-            f"HiSparse speculative swap requires 2-4 steps, or one resident-device step; got {num_steps}."
+            f"HiSparse speculative swap requires 2-{SPEC_SWAP_MAX_STEPS} steps, "
+            f"or one resident-device step; got {num_steps}."
         )
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
@@ -186,7 +194,7 @@ def load_cache_to_device_buffer_spec_mla(
         device_locs is not None,
         host_binding is not None,
         # Draft and verification reuse metadata without changing its hash layout.
-        min(8192, state.scratch_state.size(1) // 5),
+        min(SPEC_SWAP_MAX_OCCURRENCES, state.scratch_state.size(1) // 5),
     )
     empty_device = torch.empty(0, device=device_buffer.device)
 

@@ -603,6 +603,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
         return None
 
+    def prepare_calculated_size(self, image):
+        # An image that needs no resize still sets the output size, as in diffusers.
+        return super().prepare_calculated_size(image) or (image.width, image.height)
+
     def preprocess_condition_image(
         self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
     ):

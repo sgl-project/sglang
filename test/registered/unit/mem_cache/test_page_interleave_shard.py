@@ -41,10 +41,10 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
 
-The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
-``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
-a newer NCCL than CI has, live in
-``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``. DSA indexer
+The real MLA/MHA/MTP gathers (multicast and NCCL) and their fallbacks live in
+``test_page_interleave_gather_multi_gpu.py``; ``MulticastAllGather`` itself is
+checked against NCCL in
+``test/registered/unit/distributed/test_multicast_all_gather.py``. DSA indexer
 and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
@@ -88,9 +88,11 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
+    MHATokenToKVPoolMXFP8,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
@@ -101,14 +103,14 @@ from sglang.srt.mem_cache.page_interleave import (
     get_kv_shard_group_info,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
-    _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+    _multicast_gather_supported,
     _symmetric_scratch_layout,
-    _symmetric_scratch_supported,
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -208,6 +210,7 @@ class TestPageShardScratchSizing(CustomTestCase):
                 get_num_kv_heads=lambda tp: num_kv_heads // tp,
             ),
         )
+        kvc.page_shard_scratch_row_bytes = lambda: page_shard_row_bytes(kvc)
         with (
             unittest.mock.patch.object(
                 page_interleave, "get_parallel", return_value=parallel
@@ -276,44 +279,15 @@ class TestPageShardScratchSizing(CustomTestCase):
                     math.prod(shape) * dtype.itemsize for shape, dtype in specs.values()
                 )
                 self.assertEqual(estimated, actual)
-                # The zero-SM buffer adds at most one window alignment per tensor.
+                # The symmetric buffer adds at most one alignment per tensor.
                 _, symmetric_bytes = _symmetric_scratch_layout(specs, num_slots=2)
                 self.assertGreaterEqual(symmetric_bytes, estimated)
                 self.assertLess(symmetric_bytes, estimated + 2 * len(specs) * 4096)
 
 
 class TestZeroSmScratchLayout(CustomTestCase):
-    def test_requires_nccl_with_copy_engine_race_fix(self):
-        self.assertEqual(_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION, 23102)
-        for version in (22902, 23007, 23101, 23102):
-            with (
-                self.subTest(version=version),
-                envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
-                unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
-                    return_value=True,
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
-                ) as library,
-                unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
-                    return_value=[True, True],
-                ) as same_node,
-            ):
-                library.return_value.ncclGetRawVersion.return_value = version
-                self.assertEqual(
-                    _symmetric_scratch_supported(
-                        memory_saver_enabled=False,
-                        custom_mem_pool=None,
-                        shard_group=SimpleNamespace(cpu_group=object()),
-                    ),
-                    version >= _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
-                )
-                if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
-                    same_node.assert_not_called()
-
-    def test_cross_node_group_keeps_sm_gather(self):
+    @contextmanager
+    def _support(self, *, multicast, same_node):
         with (
             envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
             unittest.mock.patch(
@@ -321,29 +295,67 @@ class TestZeroSmScratchLayout(CustomTestCase):
                 return_value=True,
             ),
             unittest.mock.patch(
-                "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
-            ) as library,
+                "sglang.srt.mem_cache.page_interleave_pool.has_multicast_support",
+                return_value=multicast,
+            ) as has_multicast,
             unittest.mock.patch(
                 "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
-                return_value=[True, False],
-            ) as same_node,
+                return_value=same_node,
+            ) as in_same_node,
         ):
-            library.return_value.ncclGetRawVersion.return_value = (
-                _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
-            )
-            cpu_group = object()
-            self.assertFalse(
-                _symmetric_scratch_supported(
-                    memory_saver_enabled=False,
-                    custom_mem_pool=None,
-                    shard_group=SimpleNamespace(cpu_group=cpu_group),
-                )
-            )
-            same_node.assert_called_once_with(cpu_group, source_rank=0)
+            yield has_multicast, in_same_node
+
+    @staticmethod
+    def _supported(cpu_group=None, **kwargs):
+        return _multicast_gather_supported(
+            **{
+                "memory_saver_enabled": False,
+                "custom_mem_pool": None,
+                "shard_group": SimpleNamespace(cpu_group=cpu_group),
+                "device": torch.device("cuda", 3),
+                **kwargs,
+            }
+        )
+
+    def test_requires_multicast_support(self):
+        for multicast in (False, True):
+            with (
+                self.subTest(multicast=multicast),
+                self._support(multicast=multicast, same_node=[True, True]) as (
+                    has_multicast,
+                    in_same_node,
+                ),
+            ):
+                self.assertEqual(self._supported(), multicast)
+                has_multicast.assert_called_once_with(torch.device("cuda", 3))
+                # The node check is collective; a local refusal skips it on
+                # every rank alike.
+                self.assertEqual(in_same_node.called, multicast)
+
+    def test_memory_saver_and_custom_pool_keep_torch_scratch(self):
+        for kwargs in ({"memory_saver_enabled": True}, {"custom_mem_pool": object()}):
+            with (
+                self.subTest(**kwargs),
+                self._support(multicast=True, same_node=[True, True]) as (
+                    _,
+                    in_same_node,
+                ),
+            ):
+                self.assertFalse(self._supported(**kwargs))
+                in_same_node.assert_not_called()
+
+    def test_cross_node_group_keeps_nccl_gather(self):
+        cpu_group = object()
+        with self._support(multicast=True, same_node=[True, False]) as (
+            _,
+            in_same_node,
+        ):
+            self.assertFalse(self._supported(cpu_group=cpu_group))
+            in_same_node.assert_called_once_with(cpu_group, source_rank=0)
 
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
-        """Both slots share one symmetric window: every tensor must start on
-        NCCL's 4 KiB window alignment and no two tensors may overlap."""
+        """Both slots share one symmetric buffer: every tensor must start on
+        a 4 KiB boundary and no two tensors may overlap."""
         rows = 13 * 16  # neither row width below fills a whole 4 KiB block
         specs = {
             "kv": ((rows, 1, 576), torch.bfloat16),
@@ -694,6 +706,72 @@ class TestMTPKVShardConfig(CustomTestCase):
                 self.assertRaisesRegex(ValueError, message),
             ):
                 _build_mtp_pool(kvc)
+
+
+class _PastShardGate(Exception):
+    pass
+
+
+class TestHybridLinearShardGate(CustomTestCase):
+    """The QSA hybrid builder swaps in the striped full-attention pool only
+    where the plain MHA pool would be built."""
+
+    @staticmethod
+    def _build(*, pool_class=MHATokenToKVPool, quant_method=None, qsa=True):
+        kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        kvc.is_draft_worker = False
+        kvc.use_mla_backend = False
+        kvc.kv_shard_rank = 0
+        kvc.kv_shard_spec = kvc.kv_shard_group = None
+        kvc.mambaish_config = SimpleNamespace(full_attention_layer_ids=[3])
+        kvc.layer_info = SimpleNamespace(start_layer=0, end_layer=4)
+        kvc.model_config = SimpleNamespace(hf_config=SimpleNamespace())
+        with (
+            unittest.mock.patch.object(
+                KVCacheConfigurator,
+                "_build_mha_quant_method",
+                return_value=quant_method,
+            ),
+            unittest.mock.patch.object(
+                KVCacheConfigurator,
+                "_hybrid_full_attention_pool_class",
+                return_value=pool_class,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.attention.qsa.config.parse_qsa_profile",
+                return_value=object() if qsa else None,
+            ),
+            # The first call after the gate.
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_model",
+                side_effect=_PastShardGate,
+            ),
+        ):
+            kvc._build_hybrid_linear_kv_pool(
+                max_total_num_tokens=128,
+                req_to_token_pool=None,
+                state_pool=None,
+                mha_pool_class=pool_class,
+                mla_pool_class=MLATokenToKVPool,
+                dsa_pool_class=None,
+            )
+
+    def test_plain_mha_pool_passes(self):
+        # BF16 and ordinary CUDA FP8 both build the plain pool, no quant method.
+        with self.assertRaises(_PastShardGate):
+            self._build()
+
+    def test_rejects_what_the_striped_pool_cannot_carry(self):
+        for options, message in (
+            ({"qsa": False}, "only with compressed QSA"),
+            ({"pool_class": MHATokenToKVPoolMXFP8}, "MHATokenToKVPoolMXFP8 pool"),
+            ({"quant_method": object()}, "ordinary CUDA FP8 is supported"),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self._build(**options)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -1127,9 +1205,9 @@ class TestShardedAllocationEviction(CustomTestCase):
         initial_available = allocator.available_size()
         self.assertEqual(initial_available, GS)
 
-        # The shortfall is smaller than the initial free capacity: treating
-        # it as the absolute target would incorrectly skip eviction.
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        # A demand one page past the free capacity: the min-class capacity
+        # rises only once the tight class gets a page back.
+        result = tree.evict_for_alloc(KVDemand(full_tokens=initial_available + PS))
 
         self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
         self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
@@ -1139,7 +1217,9 @@ class TestShardedAllocationEviction(CustomTestCase):
     def test_allocation_eviction_stops_when_tight_class_cannot_be_reclaimed(self):
         tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
 
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        result = tree.evict_for_alloc(
+            KVDemand(full_tokens=allocator.available_size() + PS)
+        )
 
         self.assertEqual(allocator.available_size(), GS)
         self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
@@ -1893,6 +1973,21 @@ class TestShardSendFilter(CustomTestCase):
     """P/D send side: rank r sends the pages with l % N == r, as its local page
     l // N, at their request-global send positions."""
 
+    def test_single_host_tensor_page_preserves_ownership_and_send_position(self):
+        # A short last chunk has one page. NumPy must treat its torch-derived
+        # mask as a boolean mask, not scalar index 0/1.
+        for rank in range(N):
+            with self.subTest(rank=rank):
+                local, positions = filter_kv_indices_for_shard_rank(
+                    kv_indices=torch.tensor([5], dtype=torch.int32),
+                    index_slice=slice(64, 65),
+                    shard_rank=rank,
+                    shard_size=N,
+                )
+                self.assertIsInstance(local, np.ndarray)
+                np.testing.assert_array_equal(local, [1] if rank == 1 else [])
+                np.testing.assert_array_equal(positions, [64] if rank == 1 else [])
+
     def test_ranks_partition_a_rotated_chunk(self):
         # A base-2 rotated chain: owners are not position-congruent.
         pages = np.array(_chain_pages(base=2, n_pages=9), dtype=np.int64)
@@ -2158,6 +2253,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         host = _host_pool(0).alloc(5 * PS, start_owner=2)
         controller = SimpleNamespace(
             mem_pool_device_allocator=_make_allocator(),
+            kv_storage=None,
             device="cpu",
             load_queue=[],
             _resolve_device_transfers=lambda *args, **kwargs: None,
@@ -2229,16 +2325,17 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
     """A HiCache load-back writes pool rows on its own stream; the gather
     reads them directly, not through the waiting getters, so it waits first."""
 
-    def _pool(self, events, counter):
+    def _pool(self, events, counter, multicast_gather=None):
         slot = SimpleNamespace(
             tensors={"k": torch.zeros(N * PS, 1)},
-            ready=SimpleNamespace(record=lambda stream: None),
+            ready=SimpleNamespace(record=lambda stream: events.append("ready")),
+            ticket=None,
             resident_key=None,
         )
 
         def gather_pairs(local_layer):
             events.append(("gather", local_layer))
-            return [(torch.zeros(4 * PS, 1), "k")]
+            return [(torch.arange(4 * PS, dtype=torch.float32)[:, None], "k")]
 
         return SimpleNamespace(
             start_layer=2,
@@ -2247,15 +2344,16 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             _epoch=1,
             _block_pages=1,
             shard_spec=SimpleNamespace(page_size=PS),
-            shard_rank=0,
+            shard_rank=1,
             shard_size=N,
             _send_rows=torch.arange(PS),
-            _gather_send_rows=lambda name: torch.arange(PS),
+            _gather_send_rows=lambda name: torch.arange(PS, 2 * PS),
             _gather_pairs=gather_pairs,
             kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
             device_module=SimpleNamespace(
                 stream=lambda stream: nullcontext(), current_stream=lambda: None
             ),
+            _multicast_gather=multicast_gather,
             kv_gather_comm=SimpleNamespace(
                 change_state=lambda enable: nullcontext(),
                 all_gather=lambda out, inp: events.append("all_gather"),
@@ -2267,12 +2365,52 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         events = []
         counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, counter), 3)
-        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather"])
+        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather", "ready"])
 
     def test_no_counter_no_wait(self):
         events = []
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
-        self.assertEqual(events, [("gather", 1), "all_gather"])
+        self.assertEqual(events, [("gather", 1), "all_gather", "ready"])
+
+    def test_multicast_gather_runs_after_the_pack(self):
+        events = []
+        counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
+
+        def run(send, *, output, after):
+            events.append("multicast")
+            self.assertIs(after, pool.kv_gather_stream)
+            # In place: the packed rows are this rank's block of the output.
+            self.assertEqual(output.shape[0], N * PS)
+            self.assertEqual(send.data_ptr(), output[PS:].data_ptr())
+            torch.testing.assert_close(
+                send[:, 0], torch.arange(PS, 2 * PS, dtype=torch.float32)
+            )
+            return 7
+
+        pool = self._pool(events, counter, SimpleNamespace(run=run))
+        PageInterleaveKVPoolMixin._prefetch_layer(pool, 3)
+        # The ticket, not an event on the side stream, marks the slot ready.
+        self.assertEqual(events, [("wait", 1), ("gather", 1), "multicast"])
+        self.assertEqual(pool._slots[1].ticket, 7)
+        self.assertEqual(pool._slots[1].resident_key, (3, 1))
+
+    def test_read_waits_for_the_multicast_ticket(self):
+        events, current = [], object()
+        slot = SimpleNamespace(ticket=7, resident_key=(3, 1))
+        chain = SimpleNamespace(
+            wait=lambda ticket, stream: events.append(("wait", ticket, stream))
+        )
+        pool = SimpleNamespace(
+            _shard_extend_active=True,
+            _slots=[None, slot],
+            _block_pages=1,
+            _epoch=1,
+            device_module=SimpleNamespace(current_stream=lambda: current),
+            _multicast_gather=SimpleNamespace(chain=chain),
+            _prefetch_layer=lambda layer_id: events.append(("prefetch", layer_id)),
+        )
+        self.assertIs(PageInterleaveKVPoolMixin._acquire_slot_for_read(pool, 3), slot)
+        self.assertEqual(events, [("wait", 7, current), ("prefetch", 4)])
 
 
 if __name__ == "__main__":

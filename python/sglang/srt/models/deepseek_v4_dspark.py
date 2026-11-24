@@ -70,20 +70,18 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
-)
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx1250_supported, is_npu
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def apply_rotary_emb(
@@ -289,10 +287,10 @@ class DSparkAttention(MqaAttentionBase):
             q_out = q_padded[:, : self.n_local_heads, :]
 
         if enable_multi_stream:
-            current_stream = torch.cuda.current_stream()
+            current_stream = torch.get_device_module().current_stream()
             stream_kv = self.alt_streams[0]
             stream_kv.wait_stream(current_stream)
-            with torch.cuda.stream(stream_kv):
+            with torch.get_device_module().stream(stream_kv):
                 kv = self.kv_proj_only(hidden_states)
                 self._store_block_kv(
                     kv=kv,
@@ -531,13 +529,8 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
 ) -> Optional[DSparkConfidenceHead]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     with_markov_cfg = getattr(config, "confidence_head_with_markov", None)
     with_markov = (
         (markov_rank > 0) if with_markov_cfg is None else bool(with_markov_cfg)
@@ -746,12 +739,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.start_layer = 0
         self.end_layer = self.num_stages
         use_multi_stream = (
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            (
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            )
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
-            and torch.cuda.is_available()
+            and (_is_npu or torch.cuda.is_available())
         )
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
-            [torch.cuda.Stream()] if use_multi_stream else None
+            [torch.get_device_module().Stream()] if use_multi_stream else None
         )
         self.moe_routed_quant_stream = (
             torch.cuda.Stream()
@@ -967,6 +963,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
             return x
         last = self.stages[-1]
+        if _is_gfx1250_supported and x.is_cuda and x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                last.hc_head_fn,
+                last.hc_head_scale,
+                last.hc_head_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         return hc_head_torch(
             x,
             last.hc_head_fn,
@@ -1121,7 +1128,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             raise ValueError(
                 f"DSpark V4 confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
