@@ -41,7 +41,7 @@ OTHER_ARGS = [
     "--deepep-mode",
     "auto",
     "--cuda-graph-bs-decode",
-    8,
+    16,
 ]
 
 
