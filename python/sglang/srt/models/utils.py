@@ -658,7 +658,11 @@ def apply_qk_norm(
         return q, k
 
     if (
-        (_is_cuda or _is_hip)  # TODO(dark): have not tested on other backends
+        (
+            _is_cuda
+            # The kernel takes norm weights only in the activation dtype.
+            or (_is_hip and q_norm.weight.dtype == k_norm.weight.dtype == q.dtype)
+        )  # TODO(dark): have not tested on other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
