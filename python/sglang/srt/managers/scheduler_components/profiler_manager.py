@@ -134,7 +134,7 @@ class SchedulerProfilerManager:
         self.merge_profiles = merge_profiles
 
         if output_dir is None:
-            output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            output_dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
         if activities is None:
             activities = ["CPU", "GPU"]
 
