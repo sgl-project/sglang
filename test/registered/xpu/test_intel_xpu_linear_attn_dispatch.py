@@ -633,11 +633,22 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
                 False,
             ),
         )
+        # The spy must run the real views function (split_fn returns its
+        # tuple), so pass through instead of substituting a bare Mock.
+        original_views = qwen3_5.qwen3_5_gdn_prefill_projection_views
+        view_calls = []
+
+        def spy_views(*args, **kwargs):
+            view_calls.append(True)
+            return original_views(*args, **kwargs)
+
         outputs = {}
-        with patch.object(qwen3_5, "qwen3_5_gdn_prefill_projection_views") as views:
+        with patch.object(
+            qwen3_5, "qwen3_5_gdn_prefill_projection_views", side_effect=spy_views
+        ):
             for name, base, prefill, mode, views_expected in cases:
                 with self.subTest(case=name):
-                    views.reset_mock()
+                    view_calls.clear()
                     record = []
                     layer = self._gated_delta_net_layer(record, qkvz, ba)
                     backend = SimpleNamespace(
@@ -652,7 +663,7 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
                     )
                     with forward_context(ForwardContext(attn_backend=backend)):
                         outputs[name] = layer.forward(torch.zeros(1, 1), batch)
-                    self.assertEqual(views.call_count, 1 if views_expected else 0)
+                    self.assertEqual(len(view_calls), 1 if views_expected else 0)
                     mixed_qkv, a, b = record[0]
                     # Zero-copy boundaries alias the packed GEMM output; the
                     # materialized boundaries leave it untouched.
@@ -711,6 +722,10 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
         z_before = packed[:, qkv_dim:].clone()
         gates_before = gates.clone()
         kernel = XpuGDNKernel()
+        # Both runs start from the same pools: side-specific draw order
+        # would differ in the slots no run writes.
+        seed_conv = torch.randn(4, qkv_dim, 3, device="xpu", dtype=torch.bfloat16) * 0.1
+        seed_ssm = torch.randn(4, v_heads, width, width, device="xpu") * 0.01
 
         def materialized_inputs():
             mixed = packed[:, :qkv_dim].contiguous()
@@ -720,10 +735,7 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
             return mixed, z, b, a
 
         def run_chain(mixed, b, a):
-            conv_pool = (
-                torch.randn(4, qkv_dim, 3, device="xpu", dtype=torch.bfloat16) * 0.1
-            )
-            ssm_pool = torch.randn(4, v_heads, width, width, device="xpu") * 0.01
+            conv_pool, ssm_pool = seed_conv.clone(), seed_ssm.clone()
             convolved = causal_conv1d_fn_xpu(
                 mixed.transpose(0, 1),
                 conv_weight,
