@@ -11,7 +11,10 @@ from transformers.masking_utils import (
     create_sliding_window_causal_mask,
 )
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
@@ -76,10 +79,6 @@ except ImportError:
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLCausalLMOutputWithPast,
-    Qwen2_5_VLModelOutputWithPast,
-)
 
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 
@@ -547,21 +546,19 @@ class Qwen2_5_VLTextModel(nn.Module):
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": text_position_ids,
-            }
+            mask_args = (self.config, inputs_embeds, attention_mask, past_key_values)
             # Create the masks
             causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
+                "full_attention": create_causal_mask(
+                    *mask_args, position_ids=text_position_ids
+                ),
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = (
-                    create_sliding_window_causal_mask(**mask_kwargs)
+                    create_sliding_window_causal_mask(
+                        *mask_args, position_ids=text_position_ids
+                    )
                 )
 
             # create_causal_mask returns None for this _attn_implementation, so
@@ -909,7 +906,7 @@ class Qwen2_5_VLModel(QwenVLModelBase):
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
+    ) -> Union[tuple, BaseModelOutputWithPast]:
         r"""
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
@@ -1010,12 +1007,11 @@ class Qwen2_5_VLModel(QwenVLModelBase):
             **kwargs,
         )
 
-        output = Qwen2_5_VLModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
         )
         return output if return_dict else output.to_tuple()
 
@@ -1120,13 +1116,12 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        return Qwen2_5_VLCausalLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
         )
 
     @torch.no_grad()

@@ -353,6 +353,7 @@ def _make_hf_processor(processor_class, patch_size, *, model_type="qwen3_vl"):
             "audio_eos_token": "<|vision_end|>",
         }.items():
             setattr(tokenizer, attr, value)
+            setattr(tokenizer, f"{attr}_id", vocab[value])
         processor_kwargs["feature_extractor"] = WhisperFeatureExtractor(
             feature_size=128
         )

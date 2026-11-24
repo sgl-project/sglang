@@ -242,6 +242,7 @@ def _normalize_tp_style(style: str) -> Style:
         "embedding_colwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
+        "local_params": "replicate",
         "replicated_with_grad_allreduce": "replicate",
         "moe_tp_experts": "replicate",
     }.get(style, style)

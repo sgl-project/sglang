@@ -40,18 +40,20 @@ def causal_mask_kwargs(
     """Build arguments accepted by the installed ``create_causal_mask``.
 
     Transformers 4.57 uses ``input_embeds`` and ``cache_position`` while newer
-    5.x releases use ``inputs_embeds`` and derive the cache position internally.
+    5.x releases use ``inputs_embeds`` and derive the cache position internally;
+    5.24 renames ``past_key_values`` to ``cache``.
     """
     parameters = _parameter_names(mask_factory)
     embedding_parameter = (
         "inputs_embeds" if "inputs_embeds" in parameters else "input_embeds"
     )
+    cache_parameter = "cache" if "cache" in parameters else "past_key_values"
     candidates = {
         "config": config,
         embedding_parameter: inputs_embeds,
         "attention_mask": attention_mask,
         "cache_position": cache_position,
-        "past_key_values": past_key_values,
+        cache_parameter: past_key_values,
         "position_ids": position_ids,
     }
     return {name: value for name, value in candidates.items() if name in parameters}

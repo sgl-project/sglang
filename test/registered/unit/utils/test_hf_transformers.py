@@ -1064,6 +1064,7 @@ class TestNormalizeTpStyle(CustomTestCase):
         # transformers injects `embed_tokens: embedding_rowwise` into every
         # model plan at init and names PLE tables `embedding_colwise`.
         styles = set(AutoConfig.for_model("llama").base_model_tp_plan.values())
+        styles |= set(AutoConfig.for_model("granite_swa").base_model_tp_plan.values())
         styles |= {"embedding_rowwise", "embedding_colwise"}
         for style in sorted(styles):
             with self.subTest(style=style):

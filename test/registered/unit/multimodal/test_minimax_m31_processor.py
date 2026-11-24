@@ -492,7 +492,12 @@ class TestMiniMaxM31EncoderPreprocessing(CustomTestCase):
                 self.assertEqual(
                     processor._video_placeholder_text(grid[0], timestamps),
                     hf_processor.replace_video_token(
-                        {"video_grid_thw": grid, "video_metadata": [metadata]}, 0
+                        {
+                            "video_grid_thw": grid,
+                            "video_metadata": [metadata],
+                            "num_chunks_per_video": [1],
+                        },
+                        0,
                     ),
                 )
 
@@ -508,6 +513,20 @@ class TestMiniMaxM31EncoderPreprocessing(CustomTestCase):
             mm_process_config={},
         )
         self.assertEqual(output["image_grid_thw"].tolist(), [[1, 32, 18], [1, 64, 36]])
+
+    def test_encoder_video_keeps_one_grid_row_per_video(self):
+        """A video longer than one vision attention segment must stay a single grid
+        row; its placeholder text and timestamps are built per row."""
+        output = preprocess_for_encoder(
+            [FakeDecoder(20, 1.0, 112, 112), FakeDecoder(6, 1.0, 112, 112)],
+            Modality.VIDEO,
+            processor=SimpleNamespace(
+                video_processor=MiniMaxM31VideoProcessor(max_size=(112, 112))
+            ),
+            mm_process_config={"video": {"fps": 1.0}},
+        )
+        self.assertEqual(output["video_grid_thw"].tolist(), [[10, 8, 8], [3, 8, 8]])
+        self.assertEqual([len(ts) for ts in output["video_timestamps"]], [10, 3])
 
 
 class TestMiniMaxM31Placeholders(CustomTestCase):

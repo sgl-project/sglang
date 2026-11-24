@@ -215,7 +215,7 @@ class TextEncoder(
     # Opt in per encoder to data-parallel batched encoding: the gather rebuilds a
     # BaseEncoderOutput, and subclasses are free to return their own output type
     # instead (Qwen2_5_VLForConditionalGeneration returns
-    # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
+    # CausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
     layerwise_offload_dit_group_enabled = False
