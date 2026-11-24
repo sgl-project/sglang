@@ -1,7 +1,74 @@
+#include <bit>
+
 #include "common.h"
 #include "vec.h"
 
 namespace {
+
+constexpr int64_t kMaxRoutingExperts = 1024;
+
+struct Entry {
+  float logit;
+  uint32_t sort_key;
+  int32_t expert_id;
+};
+
+template <typename scalar_t>
+void gemma4_fused_routing_kernel_impl(
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    const scalar_t* __restrict__ gating_output,
+    const scalar_t* __restrict__ per_expert_scale,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t logits_strideT,
+    int64_t topk) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = fVec::size();
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    Entry queue[kMaxRoutingExperts];
+    for (int64_t row = begin; row < end; ++row) {
+      const auto* logits = gating_output + row * logits_strideT;
+      for (int32_t expert = 0; expert < num_experts; ++expert) {
+        const float logit = static_cast<float>(logits[expert]);
+        const auto bits = std::bit_cast<uint32_t>(logit);
+        const uint32_t sign_mask = uint32_t{1} << 31;
+        const uint32_t sort_key = (bits & sign_mask) ? ~bits : (bits ^ sign_mask);
+        queue[expert] = {logit, sort_key, expert};
+      }
+      std::partial_sort(queue, queue + topk, queue + num_experts, [](const auto& lhs, const auto& rhs) {
+        return lhs.sort_key == rhs.sort_key ? lhs.expert_id < rhs.expert_id : lhs.sort_key > rhs.sort_key;
+      });
+
+      auto* weights = topk_weights + row * topk;
+      auto* ids = topk_ids + row * topk;
+      const float max_logit = queue[0].logit;
+      for (int64_t rank = 0; rank < topk; ++rank) {
+        weights[rank] = queue[rank].logit;
+        ids[rank] = queue[rank].expert_id;
+      }
+      const fVec max_fvec(max_logit), zero_fvec(0.f);
+      fVec sum_fvec(0.f);
+      int64_t rank = 0;
+      for (; rank <= topk - kVecSize; rank += kVecSize) {
+        const fVec exp_fvec = (fVec::loadu(weights + rank) - max_fvec).exp_u20();
+        exp_fvec.store(weights + rank);
+        sum_fvec += exp_fvec;
+      }
+      if (rank < topk) {
+        const int64_t count = topk - rank;
+        const fVec exp_fvec = (fVec::loadu(weights + rank, count) - max_fvec).exp_u20();
+        exp_fvec.store(weights + rank, count);
+        sum_fvec += fVec::set(zero_fvec, exp_fvec, count);
+      }
+      const float sum = vec_reduce_sum(sum_fvec);
+      const float denom = sum > 0.f ? sum : 1.f;
+      for (int64_t rank = 0; rank < topk; ++rank) {
+        weights[rank] = (weights[rank] / denom) * static_cast<float>(per_expert_scale[ids[rank]]);
+      }
+    }
+  });
+}
 
 template <typename scalar_t, bool has_weight>
 void qkv_rmsnorm_head(scalar_t* __restrict__ input, const scalar_t* __restrict__ weight, int size, float eps) {
@@ -275,6 +342,41 @@ void gemma_dual_rmsnorm_residual_scalar_kernel_impl(
 }
 
 }  // anonymous namespace
+
+// The kernel's bitwise ordering also ranks +0.0 before -0.0.
+// CUDA:
+// https://github.com/mingfeima/sglang/blob/38ec649048df9b7d4d2c3355a55d7eb724f572f3/python/sglang/kernels/ops/moe/gemma4_routing.py#L96
+//
+// gating_output    : [num_tokens, num_experts];
+// per_expert_scale : [num_experts]
+// topk_weights, topk_ids: [num_tokens, topk] (fp32 and int32)
+//
+std::tuple<at::Tensor, at::Tensor>
+gemma4_fused_routing_cpu(const at::Tensor& gating_output, const at::Tensor& per_expert_scale, int64_t topk) {
+  CHECK_DIM(2, gating_output);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(gating_output);
+  const int64_t num_tokens = gating_output.size(0);
+  const int64_t num_experts = gating_output.size(1);
+  TORCH_CHECK(topk > 0 && topk <= num_experts, "topk must satisfy 0 < topk <= num_experts");
+  TORCH_CHECK(num_experts <= kMaxRoutingExperts, "Expected at most ", kMaxRoutingExperts, " experts");
+  const auto st = gating_output.scalar_type();
+  CHECK_INPUT_SHAPE_DTYPE<false>(per_expert_scale, {num_experts}, st);
+
+  auto topk_weights = at::empty({num_tokens, topk}, gating_output.options().dtype(at::kFloat));
+  auto topk_ids = at::empty({num_tokens, topk}, gating_output.options().dtype(at::kInt));
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, st, "gemma4_fused_routing_cpu", [&] {
+    gemma4_fused_routing_kernel_impl(
+        topk_weights.data_ptr<float>(),
+        topk_ids.data_ptr<int32_t>(),
+        gating_output.data_ptr<scalar_t>(),
+        per_expert_scale.data_ptr<scalar_t>(),
+        num_tokens,
+        num_experts,
+        gating_output.stride(0),
+        topk);
+  });
+  return std::make_tuple(topk_weights, topk_ids);
+}
 
 // inplace update
 //   q = RMSNorm(q, q_weight, eps)

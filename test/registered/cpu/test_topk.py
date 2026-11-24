@@ -19,6 +19,25 @@ register_cpu_ci(est_time=30, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 
+class TestGemma4FusedRouting(CustomTestCase):
+    def test_topk_softmax_then_scale(self):
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                logits = torch.tensor(
+                    [[3, 5, 5, 5, 99], [-4, -2, -3, -1, 99]], dtype=dtype
+                )[:, :4]
+                scales = torch.tensor([16, 2, 4, 8], dtype=dtype)
+                expected_ids = torch.tensor([[1, 2], [3, 1]], dtype=torch.int32)
+                selected = logits.float().gather(-1, expected_ids.long())
+                expected_weights = selected.softmax(-1) * scales.float()[expected_ids]
+
+                weights, ids = torch.ops.sgl_kernel.gemma4_fused_routing_cpu(
+                    logits, scales, 2
+                )
+                torch.testing.assert_close(ids, expected_ids)
+                torch.testing.assert_close(weights, expected_weights)
+
+
 # This is used by the Deepseek-V2 model
 class TestGroupedTopK(CustomTestCase):
     def _run_single_test(self, M, E, G, topk, topk_group, renormalize, dtype):
