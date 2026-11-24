@@ -12,7 +12,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 # a different torch and kernel stack.
 ARG CU_VERSION=cu130
 # 1 for SM100+ (B200, B300, GB300), 0 for older GPUs; at job time the install
-# script detects the GPU, and a mismatch reinstalls the dependency set.
+# script detects the GPU and adds the extras gated on it (MSA on Blackwell,
+# lmms_eval otherwise) that the image lacks.
 ARG IS_BLACKWELL=1
 
 # A job container's HOME is per job (/github/home), so everything the install
@@ -40,6 +41,9 @@ RUN apt-get update \
 # The source is bind-mounted, not copied: each job installs its own checkout, so
 # baking one in would only go stale. The build has no GPU, so GDRCopy is forced
 # and a libcuda stub lets verify_imports load deep_ep.
+# Leftovers no job reuses are dropped: the downloaded FlashInfer wheels (already
+# installed), the cargo target dir (CI stages download prebuilt Rust extensions),
+# the GDRCopy build tree, and the apt lists the script's installs fetched.
 # The job user owns the environment, and group 0 gets the same rights for a
 # runner that picks another UID; done in the same step to avoid a second copy.
 RUN --mount=type=bind,source=.,target=/sgl-src,rw \
@@ -50,6 +54,8 @@ RUN --mount=type=bind,source=.,target=/sgl-src,rw \
         bash scripts/ci/cuda/ci_install_dependency.sh \
     && : > /opt/sglang-ci-py3.12/env.sh \
     && rm -rf /tmp/cuda-stub "${XDG_CACHE_HOME}/uv" /root/.cache "${SGLANG_CACHE_DIR}" \
+        "${XDG_CACHE_HOME}/flashinfer-wheels" "${XDG_CACHE_HOME}"/sglang-cargo-target* \
+        /opt/gdrcopy /var/lib/apt/lists/* \
     && mkdir -p "${SGLANG_CACHE_DIR}" \
     && chown -R 1001:0 /opt/sglang-ci /opt/sglang-ci-py3.12 \
     && chmod -R g=u /opt/sglang-ci /opt/sglang-ci-py3.12 \
