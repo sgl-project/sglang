@@ -531,6 +531,42 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "same scheme"):
             scheme("model.layers.2.self_attn.qkv_proj")
 
+    @staticmethod
+    def _lfm2_qkv_scheme(*groups):
+        """Scheme of layer 2's qkv_proj with per-shard exact targets."""
+        from sglang.srt.models.lfm2_moe import Lfm2MoeForCausalLM
+
+        quant_config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(*groups)
+        )
+        quant_config.update_packed_modules_mapping(
+            Lfm2MoeForCausalLM.packed_modules_mapping
+        )
+        return quant_config.get_scheme_dict(
+            torch.nn.Linear(1, 1), "model.layers.2.self_attn.qkv_proj"
+        )
+
+    def test_lfm2_moe_qkv_shards_with_different_schemes_raise(self):
+        """FP8 q/k with INT4 v is rejected instead of building v with q's scheme."""
+        attn = "model.layers.2.self_attn"
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            self._lfm2_qkv_scheme(
+                {**FP8_GROUP, "targets": [f"{attn}.q_proj", f"{attn}.k_proj"]},
+                {**WNA16_GROUP, "targets": [f"{attn}.v_proj"]},
+            )
+
+    def test_lfm2_moe_qkv_shards_listed_separately_share_a_scheme(self):
+        """One group naming q, k and v as three exact targets still resolves."""
+        attn = "model.layers.2.self_attn"
+        scheme = self._lfm2_qkv_scheme(
+            {
+                **WNA16_GROUP,
+                "targets": [f"{attn}.{p}" for p in ("q_proj", "k_proj", "v_proj")],
+            },
+            FP8_GROUP,
+        )
+        self.assertEqual(scheme["weights"].num_bits, 4)
+
     def test_lfm2_moe_fused_name_entry_still_wins_over_its_shards(self):
         """An entry naming the fused gate_up_proj keeps working once w1/w3 are declared."""
         scheme = self._lfm2_scheme(["layers.0.feed_forward.gate_up_proj"])

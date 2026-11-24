@@ -4,7 +4,7 @@
 
 import re
 from types import MappingProxyType
-from typing import Iterable, List, Mapping, Optional
+from typing import Any, Iterable, List, Mapping, Optional
 
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
@@ -116,6 +116,7 @@ def find_matched_target(
     module: Module,
     targets: Iterable[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
+    target_scheme_map: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """
     Helper function to look up which "target" in the compressed-tensors
@@ -138,6 +139,8 @@ def find_matched_target(
     :param module: torch.nn.Module
     :param targets: list of targets to match the layer against
     :param fused_mapping: map from fused layer names to its components
+    :param target_scheme_map: target -> scheme; when given, the components
+        of a fused layer must resolve to the same scheme
     :param fused_strategy: either "all" or "any". If using "all", fused
         layers match if "all" of its components match
     """
@@ -148,7 +151,7 @@ def find_matched_target(
     matched_target = (
         _find_first_match(layer_name, targets)
         or _find_first_match(module.__class__.__name__, targets, True)
-        or _match_fused_layer(layer_name, targets, fused_mapping)
+        or _match_fused_layer(layer_name, targets, fused_mapping, target_scheme_map)
     )
 
     if matched_target is None:
@@ -204,6 +207,7 @@ def _match_fused_layer(
     layer_name: str,
     target_layers: Iterable[str],
     fused_mapping: Mapping[str, List[str]],
+    target_scheme_map: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
     """
     Match a fused layer name to its corresponding individual layer in
@@ -242,4 +246,18 @@ def _match_fused_layer(
         else:
             unfused_matches.append(None)
 
-    return unfused_matches[0] if all(unfused_matches) else None
+    if not all(unfused_matches):
+        return None
+
+    # Exact per-shard targets can give the shards different schemes (FP8 q/k,
+    # INT4 v); taking the first one would build v with q's scheme.
+    if target_scheme_map is not None and any(
+        target_scheme_map[match] != target_scheme_map[unfused_matches[0]]
+        for match in unfused_matches[1:]
+    ):
+        raise ValueError(
+            f"Found different quantization schemes for "
+            f"{fused_mapping[fused]} in {layer_name}. SGLang "
+            "requires all to use the same scheme."
+        )
+    return unfused_matches[0]

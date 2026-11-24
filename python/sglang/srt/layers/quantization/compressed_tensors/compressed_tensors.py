@@ -1341,6 +1341,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     module=layer,
                     targets=self.target_scheme_map.keys(),
                     fused_mapping=self.packed_modules_mapping,
+                    target_scheme_map=self.target_scheme_map,
                 )
 
             return self.target_scheme_map[matched_target]
