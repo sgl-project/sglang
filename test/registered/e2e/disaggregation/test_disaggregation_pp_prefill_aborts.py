@@ -1,12 +1,14 @@
-"""PD disaggregation with a PP2 prefill server: PP0 releases a transfer only once
-every stage has concluded it.
+"""PD disaggregation with a PP2 prefill server: the end-to-end contract under
+aborts that land mid-transfer.
 
-Each prefill PP stage sends the KV of its own layers, so its transfer of a request
-can conclude at a different step than the other stage's. An abort also reaches
-PP0 before PP1, so for a while the request is Failed on one stage while the other
-stage is still transferring. PP0 decides the release for both stages; releasing
-before both have concluded would let a stage free KV pages and the metadata slot
-its transfer still reads.
+Each prefill PP stage sends the KV of its own layers, and an abort reaches PP0
+before PP1, so a request can be Failed on one stage while the other stage still
+transfers it. This test checks that, with such aborts, nothing hangs, no page or
+slot leaks, both servers stay healthy, and outputs stay stable. It does not check
+the release order itself (PP0 releasing only once every stage has concluded):
+with deferred decode KV release, an early release changes nothing a client sees.
+test/registered/unit/disaggregation/test_pp_prefill_release_consensus.py covers
+the release order.
 
 The stress mixes completed requests with requests aborted at spread-out delays,
 so aborts land during prefill, during the KV transfer and after it. Rounds repeat
@@ -73,8 +75,9 @@ def _generate(url, rid, text, timeout=180):
     )
 
 
-# decode.py logs this when a request in the decode transfer queue concludes
-# Failed; an abort there records "Aborted by AbortReq." on its receiver.
+# Matches the free-text line disaggregation/decode.py:3696 logs when a request in
+# the decode transfer queue concludes Failed; an abort there records "Aborted by
+# AbortReq." on its receiver. Keep the two in step.
 _TRANSFER_ABORT = re.compile(
     r"Decode transfer failed for request .*rid='([^']+)'.*Aborted by AbortReq"
 )
@@ -87,7 +90,7 @@ def _finish_type(response):
     return reason.get("type") if isinstance(reason, dict) else None
 
 
-class TestDisaggregationPPPrefillRelease(PDDisaggregationServerBase):
+class TestDisaggregationPPPrefillAborts(PDDisaggregationServerBase):
     capture_per_side_logs = True
     decode_tp_size = 1
     decode_base_gpu_id = 2
@@ -176,12 +179,13 @@ class TestDisaggregationPPPrefillRelease(PDDisaggregationServerBase):
         log = self._decode_stdout_buf.getvalue() + self._decode_stderr_buf.getvalue()
         return set(_TRANSFER_ABORT.findall(log))
 
-    def test_release_waits_for_every_stage_under_aborts(self):
+    def test_aborts_mid_transfer_keep_servers_healthy_and_outputs_stable(self):
         before = self._reference_outputs()
 
-        in_transfer = set()
+        all_aborted, in_transfer = set(), set()
         for round_idx in range(_MAX_ROUNDS):
             results, aborted = self._stress_round(round_idx)
+            all_aborted |= aborted
             for rid, response in results.items():
                 # An aborted request may end in any way, even a dropped connection.
                 if rid in aborted:
@@ -189,9 +193,14 @@ class TestDisaggregationPPPrefillRelease(PDDisaggregationServerBase):
                 self.assertNotIsInstance(response, Exception, f"{rid}: {response!r}")
                 self.assertEqual(response.status_code, 200, f"{rid}: {response.text}")
                 self.assertEqual(_finish_type(response), "length", response.text)
-            in_transfer |= aborted & self._aborted_in_transfer()
+            in_transfer = all_aborted & self._aborted_in_transfer()
             if round_idx + 1 >= _MIN_ROUNDS and in_transfer:
                 break
+        # A reader thread fills the captured log, so the last line can lag.
+        deadline = time.monotonic() + 5
+        while not in_transfer and time.monotonic() < deadline:
+            time.sleep(0.5)
+            in_transfer = all_aborted & self._aborted_in_transfer()
         print(f"{len(in_transfer)} requests aborted while decode received their KV")
         self.assertTrue(in_transfer, "no abort landed while decode received the KV")
 
