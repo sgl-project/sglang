@@ -66,12 +66,14 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
 
 
 class TestDsparkLmHeadDtype(CustomTestCase):
-    def _resolve(self, dtype, *, is_gfx95=False, is_blackwell=False):
+    def _resolve(self, dtype, *, is_gfx95=False, is_blackwell=False, is_cpu=False):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         server_args.speculative_dspark_lm_head_dtype = dtype
-        facts = SimpleNamespace(is_gfx95=is_gfx95, is_blackwell=is_blackwell)
+        facts = SimpleNamespace(
+            is_gfx95=is_gfx95, is_blackwell=is_blackwell, is_cpu=is_cpu
+        )
         with patch(f"{_HOOK}.get_platform", return_value=facts):
             _resolve_dspark_lm_head_dtype(server_args)
         return resolution_result(server_args, "speculative_dspark_lm_head_dtype")
@@ -84,6 +86,7 @@ class TestDsparkLmHeadDtype(CustomTestCase):
     def test_supported_platform_keeps_dtype(self):
         self.assertEqual(self._resolve("mxfp8", is_blackwell=True), "mxfp8")
         self.assertEqual(self._resolve("fp8", is_gfx95=True), "fp8")
+        self.assertEqual(self._resolve("fp8", is_cpu=True), "fp8")
 
     def test_unset_is_a_no_op(self):
         self.assertIsNone(self._resolve(None))

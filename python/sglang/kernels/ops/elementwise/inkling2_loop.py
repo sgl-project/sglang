@@ -1,3 +1,4 @@
+import contextlib
 import functools
 
 import torch
@@ -180,7 +181,9 @@ def _stacked(rows: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, int]:
     return torch.stack(rows), base.numel()
 
 
-def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
+def message_controllers(
+    dests, messages, down, gain, forget, eps=1e-6, packed_weights=None
+):
     """Mix messages[i] into dests[i] with controller i of the stacked weights into
     row i of the (len(dests), tokens, width) output:
     (1 - tanh(h @ forget.T)) * dest + tanh(h @ gain.T) * message, where h is the
@@ -194,10 +197,30 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
     message, message_stride = _stacked(tuple(messages))
     tokens, width = dests[0].shape
     assert width * 2 == k and messages[0].shape == dests[0].shape
-    out = torch.empty((num, tokens, width), dtype=torch.float32, device=dest.device)
-    if not tokens:
-        return out
     if not dest.is_cuda:
+        if not tokens:
+            return torch.empty(
+                (num, tokens, width), dtype=torch.float32, device=dest.device
+            )
+        with contextlib.suppress(ImportError):
+            import sgl_kernel  # noqa: F401
+        if (
+            rank % 32 == 0
+            and width % 16 == 0
+            and hasattr(torch.ops, "sgl_kernel")
+            and hasattr(torch.ops.sgl_kernel, "inkling2_message_controllers_cpu")
+        ):
+            if packed_weights is None:
+                down_packed = torch.ops.sgl_kernel.convert_weight_packed(down)
+                gain_forget_packed = torch.ops.sgl_kernel.convert_weight_packed(
+                    torch.cat([gain, forget], dim=1).contiguous()
+                )
+            else:
+                down_packed, gain_forget_packed = packed_weights
+            return torch.ops.sgl_kernel.inkling2_message_controllers_cpu(
+                list(dests), list(messages), down_packed, gain_forget_packed, float(eps)
+            )
+        out = torch.empty((num, tokens, width), dtype=torch.float32, device=dest.device)
         dest_s = torch.stack(tuple(dests), dim=0).float()
         msg_s = torch.stack(tuple(messages), dim=0).float()
         dest_rstd = torch.rsqrt(dest_s.pow(2).mean(dim=-1, keepdim=True) + eps)
@@ -213,6 +236,9 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
         g = torch.tanh(torch.bmm(hidden, gain.transpose(1, 2)).float())
         f = torch.tanh(torch.bmm(hidden, forget.transpose(1, 2)).float())
         out.copy_((1.0 - f) * dest_s + g * msg_s)
+        return out
+    out = torch.empty((num, tokens, width), dtype=torch.float32, device=dest.device)
+    if not tokens:
         return out
     pdl = is_arch_support_pdl()
     launch = {"launch_pdl": True} if pdl else {}

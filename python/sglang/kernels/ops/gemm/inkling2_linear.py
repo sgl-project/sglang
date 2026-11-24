@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -305,6 +307,28 @@ def linear(
         )
         return out.view(*x.shape[:-1], weight.shape[0])
     if not x.is_cuda:
+        with contextlib.suppress(ImportError):
+            import sgl_kernel  # noqa: F401
+        if (
+            x.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.shape[0] > 0
+            and weight.shape[1] == x.shape[-1]
+            and weight.shape[1] % 32 == 0
+            and out_dtype in (torch.bfloat16, torch.float32)
+            and hasattr(torch.ops, "sgl_kernel")
+            and hasattr(torch.ops.sgl_kernel, "inkling2_bf16_rowmajor_linear_cpu")
+        ):
+            w = weight if weight.is_contiguous() else weight.contiguous()
+            b = (
+                bias.contiguous()
+                if bias is not None and not bias.is_contiguous()
+                else bias
+            )
+            return torch.ops.sgl_kernel.inkling2_bf16_rowmajor_linear_cpu(
+                x, w, b, out_dtype
+            )
         if out_dtype == torch.float32 and x.dtype != torch.float32:
             flat = x.reshape(-1, x.shape[-1]).float()
             w = weight.float()

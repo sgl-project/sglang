@@ -1,3 +1,4 @@
+import contextlib
 from functools import partial
 from typing import NamedTuple
 
@@ -35,6 +36,7 @@ from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.runtime_context import get_model, get_parallel, get_platform
 from sglang.srt.utils import get_device_core_count
+from sglang.srt.utils.device import use_intel_amx_backend
 
 PADDED_DECODE_MIN_TOKENS = 8
 # linear() sums split-K partials up to this many rows (its tiles < 256 branch).
@@ -144,10 +146,11 @@ class Inkling2Attention(nn.Module):
             self.num_tp_heads * self.head_dim,
             self.num_tp_heads,
         ]
-        pad_align = 16 if getattr(get_platform(), "is_cpu", False) else 8
+        pad_align = 32 if getattr(get_platform(), "is_cpu", False) else 8
         qkvr_pad_size = -sum(self.split_sizes) % pad_align
         if qkvr_pad_size:
             self.split_sizes.append(qkvr_pad_size)
+        self._cpu_qkvr_slices = None
         self.qkvr = MergedColumnParallelLinear(
             config.hidden_size,
             [size * self.tp_size for size in self.split_sizes],
@@ -425,6 +428,61 @@ class Inkling2Attention(nn.Module):
 
     def _project_sources(self, sources):
         if len({id(sources.q), id(sources.k), id(sources.v)}) == 3:
+            if (
+                sources.q.shape[0] > 0
+                and use_intel_amx_backend(self.qkvr)
+                and self.qkvr.bias is None
+            ):
+                w = self.qkvr.weight
+                q_end = self.split_sizes[0]
+                k_end = q_end + self.split_sizes[1]
+                v_end = k_end + self.split_sizes[2]
+                if (
+                    w.ndim == 2
+                    and q_end % 32 == 0
+                    and k_end % 32 == 0
+                    and v_end % 32 == 0
+                    and w.shape[0] % 32 == 0
+                ):
+                    with contextlib.suppress(ImportError):
+                        import sgl_kernel  # noqa: F401
+                    slices = getattr(self, "_cpu_qkvr_slices", None)
+                    if slices is None:
+                        w_qrgs = torch.cat([w[:q_end], w[v_end:]], dim=0).contiguous()
+                        w_k = w[q_end:k_end].contiguous()
+                        w_v = w[k_end:v_end].contiguous()
+                        slices = (w_qrgs, w_k, w_v)
+                        self._cpu_qkvr_slices = slices
+                    w_qrgs, w_k, w_v = slices
+                    sq = (
+                        sources.q.to(w.dtype)
+                        if sources.q.dtype != w.dtype
+                        else sources.q
+                    )
+                    sk = (
+                        sources.k.to(w.dtype)
+                        if sources.k.dtype != w.dtype
+                        else sources.k
+                    )
+                    sv = (
+                        sources.v.to(w.dtype)
+                        if sources.v.dtype != w.dtype
+                        else sources.v
+                    )
+                    if not sq.is_contiguous():
+                        sq = sq.contiguous()
+                    if not sk.is_contiguous():
+                        sk = sk.contiguous()
+                    if not sv.is_contiguous():
+                        sv = sv.contiguous()
+                    qrgs = torch.ops.sgl_kernel.weight_packed_linear(
+                        sq, w_qrgs, None, True
+                    )
+                    k = torch.ops.sgl_kernel.weight_packed_linear(sk, w_k, None, True)
+                    v = torch.ops.sgl_kernel.weight_packed_linear(sv, w_v, None, True)
+                    qrgs_sizes = [self.split_sizes[0], *self.split_sizes[3:]]
+                    q, r, gate, sinks = qrgs.split(qrgs_sizes, dim=-1)[:4]
+                    return q, k, v, r, gate, sinks
             q_proj, k_proj, v_proj = (
                 projected.split(self.split_sizes, dim=-1)[:6]
                 for projected in self.qkvr(_stacked(sources))[0].chunk(3)

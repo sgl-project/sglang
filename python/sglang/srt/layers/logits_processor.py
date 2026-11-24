@@ -13,6 +13,7 @@
 # ==============================================================================
 """Logits processing."""
 
+import contextlib
 import dataclasses
 import logging
 import os
@@ -1311,7 +1312,24 @@ class LogitsProcessor(nn.Module):
         )
 
         if self.final_logit_softcapping and not fuse_cast_softcap:
-            if not (_is_npu or _is_cpu):
+            if not logits.is_cuda and not _is_npu:
+                with contextlib.suppress(ImportError):
+                    import sgl_kernel  # noqa: F401
+                if (
+                    logits.dtype in (torch.float32, torch.bfloat16)
+                    and hasattr(torch.ops, "sgl_kernel")
+                    and hasattr(torch.ops.sgl_kernel, "inkling2_logit_softcap_cpu")
+                ):
+                    if not logits.is_contiguous():
+                        logits = logits.contiguous()
+                    torch.ops.sgl_kernel.inkling2_logit_softcap_cpu(
+                        logits, float(self.final_logit_softcapping)
+                    )
+                else:
+                    logits = self.final_logit_softcapping * torch.tanh(
+                        logits / self.final_logit_softcapping
+                    )
+            elif not (_is_npu or _is_cpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(

@@ -129,7 +129,49 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     if use_intel_amx_backend(lm_head):
-        flat = hidden.reshape(-1, hidden.shape[-1]).to(lm_head.weight.dtype)
+        flat = (
+            hidden.reshape(-1, hidden.shape[-1]).to(lm_head.weight.dtype).contiguous()
+        )
+        dtype = get_spec().speculative_dspark_lm_head_dtype
+        if (
+            dtype == "fp8"
+            and flat.shape[0] > 0
+            and lm_head.weight.shape[1] % 128 == 0
+            and hasattr(torch.ops, "sgl_kernel")
+            and hasattr(torch.ops.sgl_kernel, "fp8_scaled_mm_cpu")
+            and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+        ):
+            n, k = lm_head.weight.shape
+            cache = getattr(lm_head, "_cpu_fp8_cache", None)
+            if cache is None or cache[2] != n or cache[0].shape[1] != k:
+                eye = torch.eye(
+                    k, dtype=lm_head.weight.dtype, device=lm_head.weight.device
+                )
+                w_bf16 = torch.ops.sgl_kernel.weight_packed_linear(
+                    eye, lm_head.weight, None, True
+                ).T.contiguous()
+                pad_n = (-n) % 128
+                if pad_n:
+                    w_bf16 = F.pad(w_bf16, (0, 0, 0, pad_n))
+                n_pad = n + pad_n
+                w_blocks = w_bf16.float().view(n_pad // 128, 128, k // 128, 128)
+                amax = w_blocks.abs().amax(dim=(1, 3))
+                scale = (amax / _FP8_MAX).clamp(min=1e-12)
+                w_q = (
+                    (w_blocks / scale[:, None, :, None])
+                    .clamp(-_FP8_MAX, _FP8_MAX)
+                    .to(_FP8_DTYPE)
+                    .reshape(n_pad, k)
+                    .contiguous()
+                )
+                w_q_packed = torch.ops.sgl_kernel.convert_weight_packed(w_q)
+                cache = (w_q_packed, scale.contiguous(), n)
+                lm_head._cpu_fp8_cache = cache
+            w_q_packed, scale, n = cache
+            out = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                flat, w_q_packed, scale, [128, 128], None, flat.dtype, True
+            )[:, :n]
+            return out.contiguous().view(*hidden.shape[:-1], n)
         out = torch.ops.sgl_kernel.weight_packed_linear(
             flat, lm_head.weight, None, True
         )

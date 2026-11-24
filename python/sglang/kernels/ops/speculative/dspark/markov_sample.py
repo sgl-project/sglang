@@ -1,6 +1,7 @@
 """One Markov draft step: add the step bias and pick one token per row, the
 argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
+import contextlib
 import functools
 from typing import Callable, Optional
 
@@ -417,7 +418,22 @@ class MarkovSampleStep:
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
         if softcap is not None:
-            value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
+            if not value.is_cuda:
+                with contextlib.suppress(ImportError):
+                    import sgl_kernel  # noqa: F401
+                if hasattr(torch.ops, "sgl_kernel") and hasattr(
+                    torch.ops.sgl_kernel, "inkling2_logit_softcap_cpu"
+                ):
+                    torch.ops.sgl_kernel.inkling2_logit_softcap_cpu(
+                        value, float(softcap)
+                    )
+                    value = value.to(step_dtype).float()
+                else:
+                    value = (
+                        (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
+                    )
+            else:
+                value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
         if vocab_limit is not None:
             columns = vocab_start + torch.arange(value.shape[1], device=value.device)
             value[:, columns >= vocab_limit] = float("-inf")

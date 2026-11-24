@@ -1,3 +1,4 @@
+import contextlib
 from array import array
 from collections.abc import Iterable
 
@@ -118,6 +119,35 @@ class Inkling2DecoderLayer(nn.Module):
             else None
         )
         self.controller_weights = None
+        self._cpu_controller_packed = None
+
+    def _get_cpu_controller_packed(self, device):
+        if device.type != "cpu" or self.controller_weights is None:
+            return None
+        if self._cpu_controller_packed is None:
+            with contextlib.suppress(ImportError):
+                import sgl_kernel  # noqa: F401
+            if not (
+                hasattr(torch.ops, "sgl_kernel")
+                and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+                and hasattr(torch.ops.sgl_kernel, "inkling2_message_controllers_cpu")
+            ):
+                return None
+            down, gain, forget = self.controller_weights
+            if (
+                down.dtype != torch.bfloat16
+                or gain.dtype != torch.bfloat16
+                or forget.dtype != torch.bfloat16
+                or down.shape[1] % 32 != 0
+                or gain.shape[1] % 16 != 0
+            ):
+                return None
+            down_packed = torch.ops.sgl_kernel.convert_weight_packed(down.contiguous())
+            gain_forget_packed = torch.ops.sgl_kernel.convert_weight_packed(
+                torch.cat([gain, forget], dim=1).contiguous()
+            )
+            self._cpu_controller_packed = (down_packed, gain_forget_packed)
+        return self._cpu_controller_packed
 
     def _attention_input(self, streams, messages):
         if messages is not None:
@@ -128,6 +158,7 @@ class Inkling2DecoderLayer(nn.Module):
                 streams * 3 if self.is_local else streams,
                 self.controller_weights,
                 "attn",
+                packed_weights=self._get_cpu_controller_packed(streams[0].device),
             )
             if self.is_local:
                 return AttentionSources(*self.attn_norm(mixed).unbind(0))
@@ -182,6 +213,7 @@ class Inkling2DecoderLayer(nn.Module):
                 (mlp_input,),
                 self.controller_weights,
                 "mlp",
+                packed_weights=self._get_cpu_controller_packed(mlp_input.device),
             )[0]
         mlp_input = self.mlp_norm(mlp_input)
         mlp = self.mlp(
@@ -253,9 +285,20 @@ class Inkling2LogitsProcessor(LogitsProcessor):
             if logits.is_cuda:
                 fused_softcap(logits, self.shard_softcap)
             else:
-                logits.copy_(
-                    self.shard_softcap * torch.tanh(logits / self.shard_softcap)
-                )
+                with contextlib.suppress(ImportError):
+                    import sgl_kernel  # noqa: F401
+                if (
+                    logits.dtype in (torch.float32, torch.bfloat16)
+                    and hasattr(torch.ops, "sgl_kernel")
+                    and hasattr(torch.ops.sgl_kernel, "inkling2_logit_softcap_cpu")
+                ):
+                    torch.ops.sgl_kernel.inkling2_logit_softcap_cpu(
+                        logits, float(self.shard_softcap)
+                    )
+                else:
+                    logits.copy_(
+                        self.shard_softcap * torch.tanh(logits / self.shard_softcap)
+                    )
         return logits
 
     def _get_logits(
@@ -380,8 +423,12 @@ class Inkling2CausalLLM(nn.Module):
         else:
             self.loop_scaled_queries.copy_(scaled)
         for layer in self.layers:
-            if layer.controllers is not None and layer.controller_weights is None:
-                layer.controller_weights = stack_controller_weights(layer.controllers)
+            if layer.controllers is not None:
+                layer._cpu_controller_packed = None
+                if layer.controller_weights is None:
+                    layer.controller_weights = stack_controller_weights(
+                        layer.controllers
+                    )
 
     def _capture(self, captures, visit, state):
         if captures is not None and visit in self.layers_to_capture:

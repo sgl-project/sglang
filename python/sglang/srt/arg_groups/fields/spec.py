@@ -169,9 +169,9 @@ class Spec(msgspec.Struct):
         Arg(
             help="DSPARK only. Quantized dtype for the draft's projection through the "
             "target lm_head; the weight is quantized once and cached (about one extra "
-            "byte per lm_head parameter). 'fp8' runs torch._scaled_mm and requires "
-            "gfx95x; 'mxfp8' runs FlashInfer's CuTe DSL mm_mxfp8 and requires "
-            "Blackwell. Target verify logits are unaffected. Default keeps the "
+            "byte per lm_head parameter). 'fp8' runs torch._scaled_mm on gfx95x or "
+            "fp8_scaled_mm_cpu on Intel AMX CPU; 'mxfp8' runs FlashInfer's CuTe DSL "
+            "mm_mxfp8 and requires Blackwell. Target verify logits are unaffected. Default keeps the "
             "lm_head's own dtype.",
             choices=["fp8", "mxfp8"],
             resolvable=True,

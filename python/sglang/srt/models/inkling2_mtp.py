@@ -1,6 +1,8 @@
+import contextlib
 from collections.abc import Iterable
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.inkling2_mtp import (
@@ -41,6 +43,10 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         self.dflare_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self._fold_weight = None
         self._fold_bias = None
+        self._fold_weight_packed_cpu = None
+        self._fold_bias_f32_cpu = None
+        self._rnn_proj_packed_cpu = None
+        self._rnn_proj_bias_f32_cpu = None
         self._gather_logits = None
         self._get_staged_f = None
 
@@ -66,12 +72,46 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
                 folded_bias /= multiplier
             self._fold_weight[rows].copy_(folded_weight)
             self._fold_bias[rows].copy_(folded_bias)
+        self._fold_weight_packed_cpu = None
+        self._fold_bias_f32_cpu = None
 
     def get_prev_embeddings(self, token_ids):
         return self.markov_w1(token_ids.long())
 
     def _rnn_step(self, state, prev_tokens, hidden, f_rnn):
         inputs = rnn_inputs(state, prev_tokens, self.markov_w1.weight, hidden, f_rnn)
+        if (
+            not inputs.is_cuda
+            and not self.rnn_proj.weight.is_cuda
+            and inputs.shape[0] > 0
+            and self.rnn_proj.weight.shape[0] % 32 == 0
+            and self.rnn_proj.weight.shape[1] % 2 == 0
+        ):
+            with contextlib.suppress(ImportError):
+                import sgl_kernel  # noqa: F401
+            if (
+                hasattr(torch.ops, "sgl_kernel")
+                and hasattr(torch.ops.sgl_kernel, "weight_packed_linear")
+                and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+            ):
+                if self._rnn_proj_packed_cpu is None:
+                    self._rnn_proj_packed_cpu = (
+                        torch.ops.sgl_kernel.convert_weight_packed(
+                            self.rnn_proj.weight.data.to(torch.bfloat16).contiguous()
+                        )
+                    )
+                    self._rnn_proj_bias_f32_cpu = (
+                        self.rnn_proj.bias.data.to(torch.float32).contiguous()
+                        if self.rnn_proj.bias is not None
+                        else None
+                    )
+                proj = torch.ops.sgl_kernel.weight_packed_linear(
+                    inputs.to(torch.bfloat16).contiguous(),
+                    self._rnn_proj_packed_cpu,
+                    self._rnn_proj_bias_f32_cpu,
+                    True,
+                )
+                return rnn_gates(proj, state)
         return rnn_gates(self.rnn_proj(inputs), state)
 
     def init_state(self, hidden_states):
@@ -90,9 +130,37 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         state, latent = self._rnn_step(state, prev_tokens, hidden_states, f_rnn)
         assert self._fold_weight is not None and self._fold_bias is not None
         assert self._gather_logits is not None
-        bias = torch.addmm(
-            self._fold_bias, latent.to(self._fold_weight.dtype), self._fold_weight.T
-        )
+        with contextlib.suppress(ImportError):
+            import sgl_kernel  # noqa: F401
+        if (
+            not self._fold_weight.is_cuda
+            and not latent.is_cuda
+            and self.markov_rank % 32 == 0
+            and hasattr(torch.ops, "sgl_kernel")
+            and hasattr(torch.ops.sgl_kernel, "inkling2_bf16_linear_fp32_cpu")
+            and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+        ):
+            n_rows = self._fold_weight.shape[0]
+            if self._fold_weight_packed_cpu is None:
+                pad_n = (-n_rows) % 32
+                w_bf16 = self._fold_weight.to(torch.bfloat16)
+                b_f32 = self._fold_bias.to(torch.float32)
+                if pad_n:
+                    w_bf16 = F.pad(w_bf16, (0, 0, 0, pad_n))
+                    b_f32 = F.pad(b_f32, (0, pad_n))
+                self._fold_weight_packed_cpu = (
+                    torch.ops.sgl_kernel.convert_weight_packed(w_bf16.contiguous())
+                )
+                self._fold_bias_f32_cpu = b_f32.contiguous()
+            bias = torch.ops.sgl_kernel.inkling2_bf16_linear_fp32_cpu(
+                latent.to(torch.bfloat16).contiguous(),
+                self._fold_weight_packed_cpu,
+                self._fold_bias_f32_cpu,
+            )[:, :n_rows].to(self.step_logits_dtype(latent.dtype))
+        else:
+            bias = torch.addmm(
+                self._fold_bias, latent.to(self._fold_weight.dtype), self._fold_weight.T
+            )
         if self.vocab_shard is None:
             bias = self._gather_logits(bias)
         return bias, (state, f_rnn)
@@ -426,6 +494,8 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             self._fuse_alpha = fuse_alpha
         else:
             self._fuse_alpha.copy_(fuse_alpha)
+        self.markov_head._rnn_proj_packed_cpu = None
+        self.markov_head._rnn_proj_bias_bf16_cpu = None
         return loaded
 
 

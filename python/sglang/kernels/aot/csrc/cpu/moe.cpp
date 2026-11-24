@@ -1113,7 +1113,7 @@ void inkling2_fused_experts_kernel_impl(
       }
     }
   };
-  if (M <= 4 && M * K <= 16384) {
+  if (M <= 12 && M * K <= 32768) {
     for (int64_t m = 0; m < M; ++m) {
       reduce_row(m);
     }
@@ -1292,19 +1292,23 @@ void inkling2_fused_experts_quant_kernel_impl(
                       int32_t& last_expert,
                       int32_t expert_id,
                       bool& used_brgemm) {
-    if (m_size <= 4) {
-      switch (m_size) {
+    if (m_size <= 12) {
+      int64_t done = 0;
+      int64_t rem = m_size;
+      while (rem >= 4) {
+        inkling2_quant_gemm_small_m<packed_t, GROUP_K, 4>(A_row + done * IC, B, Bs, C0 + done * BLOCK_N, IC);
+        done += 4;
+        rem -= 4;
+      }
+      switch (rem) {
         case 1:
-          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 1>(A_row, B, Bs, C0, IC);
+          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 1>(A_row + done * IC, B, Bs, C0 + done * BLOCK_N, IC);
           break;
         case 2:
-          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 2>(A_row, B, Bs, C0, IC);
+          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 2>(A_row + done * IC, B, Bs, C0 + done * BLOCK_N, IC);
           break;
         case 3:
-          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 3>(A_row, B, Bs, C0, IC);
-          break;
-        case 4:
-          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 4>(A_row, B, Bs, C0, IC);
+          inkling2_quant_gemm_small_m<packed_t, GROUP_K, 3>(A_row + done * IC, B, Bs, C0 + done * BLOCK_N, IC);
           break;
       }
       return;
@@ -1470,7 +1474,7 @@ void inkling2_fused_experts_quant_kernel_impl(
       }
     }
   };
-  if (M <= 4 && M * K <= 16384) {
+  if (M <= 12 && M * K <= 32768) {
     for (int64_t m = 0; m < M; ++m) {
       reduce_row(m);
     }

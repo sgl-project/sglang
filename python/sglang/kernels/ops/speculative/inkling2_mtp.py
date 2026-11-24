@@ -43,9 +43,10 @@ def mix_rmsnorm(
     if not targets.is_cuda:
         if rows == 0:
             return targets.new_empty((0, hidden))
-        mixed = (targets.float() * alpha.float().view(1, taps, 1)).sum(dim=1)
-        inv_rms = torch.rsqrt((mixed * mixed).sum(dim=-1, keepdim=True) / hidden + eps)
-        return (mixed * inv_rms * weight.float()).to(targets.dtype)
+        from sglang.kernels.ops.layernorm.inkling2_rms_norm import rms_norm
+
+        mixed = torch.einsum("rth,t->rh", targets.float(), alpha.float())
+        return rms_norm(mixed, weight.float(), eps, output_dtype=targets.dtype)
     out = targets.new_empty((rows, hidden))
     if rows:
         _mix_rmsnorm[(rows,)](

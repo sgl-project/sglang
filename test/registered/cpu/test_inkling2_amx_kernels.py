@@ -1530,3 +1530,572 @@ def test_inkling2_cpu_fused_auxiliary_ops():
             got = torch.ops.sgl_kernel.inkling2_bf16_linear_fp32_cpu(x_lin, packed_w, b)
             exp = F.linear(x_lin.float(), w_lin.float(), b)
             torch.testing.assert_close(got, exp, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num", [1, 3])
+@pytest.mark.parametrize("T", [1, 9])
+def test_inkling2_message_controllers_cpu_and_loop_bank(num: int, T: int):
+    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+    from sglang.kernels.ops.elementwise.inkling2_loop import message_controllers
+    from sglang.srt.models.inkling_common.inkling2_loop import LoopMessageBank
+
+    torch.manual_seed(101 + num * 10 + T)
+    width, rank, eps = 128, 64, 1e-6
+    dests = [torch.randn(T, width, dtype=torch.float32) * 0.4 for _ in range(num)]
+    messages = [torch.randn(T, width, dtype=torch.float32) * 0.4 for _ in range(num)]
+    down = torch.randn(num, rank, 2 * width, dtype=torch.bfloat16) * 0.2
+    gain = torch.randn(num, width, rank, dtype=torch.bfloat16) * 0.2
+    forget = torch.randn(num, width, rank, dtype=torch.bfloat16) * 0.2
+
+    down_packed = torch.ops.sgl_kernel.convert_weight_packed(down.contiguous())
+    gf_packed = torch.ops.sgl_kernel.convert_weight_packed(
+        torch.cat([gain, forget], dim=1).contiguous()
+    )
+    out = torch.ops.sgl_kernel.inkling2_message_controllers_cpu(
+        dests, messages, down_packed, gf_packed, eps
+    )
+
+    dest_s = torch.stack(dests, dim=0).float()
+    msg_s = torch.stack(messages, dim=0).float()
+    dest_rstd = torch.rsqrt(dest_s.pow(2).mean(dim=-1, keepdim=True) + eps)
+    msg_rstd = torch.rsqrt(msg_s.pow(2).mean(dim=-1, keepdim=True) + eps)
+    normed = torch.cat(
+        (
+            (dest_s * dest_rstd).to(torch.bfloat16),
+            (msg_s * msg_rstd).to(torch.bfloat16),
+        ),
+        dim=-1,
+    )
+    hidden = torch.bmm(normed, down.transpose(1, 2)).to(torch.bfloat16)
+    g = torch.tanh(torch.bmm(hidden, gain.transpose(1, 2)).float())
+    f = torch.tanh(torch.bmm(hidden, forget.transpose(1, 2)).float())
+    ref = (1.0 - f) * dest_s + g * msg_s
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    out_py = message_controllers(dests, messages, down, gain, forget, eps=eps)
+    torch.testing.assert_close(out_py, ref, atol=2e-2, rtol=2e-2)
+
+    blocks = tuple(torch.randn(T, width, dtype=torch.bfloat16) * 0.3 for _ in range(3))
+    scaled_queries = torch.randn(2, 4, width, dtype=torch.float32) * 0.25
+    full_down = torch.randn(4, rank, 2 * width, dtype=torch.bfloat16) * 0.2
+    full_gain = torch.randn(4, width, rank, dtype=torch.bfloat16) * 0.2
+    full_forget = torch.randn(4, width, rank, dtype=torch.bfloat16) * 0.2
+    bank = LoopMessageBank(blocks, scaled_queries)
+    side = "attn" if num == 3 else "mlp"
+    rows = slice(0, 3) if side == "attn" else slice(3, 4)
+    for layer_idx in (0, 1):
+        got_bank = bank.mix(
+            layer_idx,
+            tuple(dests),
+            (full_down, full_gain, full_forget),
+            side,
+        )
+        msgs_ref = attn_res(
+            blocks, None, scaled_queries[layer_idx, rows], normalize_values=True
+        )
+        ref_bank = message_controllers(
+            tuple(d.float() for d in dests),
+            msgs_ref,
+            full_down[rows],
+            full_gain[rows],
+            full_forget[rows],
+        )
+        torch.testing.assert_close(got_bank, ref_bank, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("M", [1, 7])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_inkling2_bf16_rowmajor_linear_cpu(
+    M: int, has_bias: bool, out_dtype: torch.dtype
+):
+    import torch.nn.functional as F
+
+    from sglang.kernels.ops.gemm.inkling2_linear import linear
+
+    torch.manual_seed(202 + M)
+    N, K = 8, 2304
+    x = torch.randn(M, K, dtype=torch.bfloat16) * 0.2
+    w = torch.randn(N, K, dtype=torch.bfloat16) * 0.2
+    b = torch.randn(N, dtype=torch.bfloat16) * 0.1 if has_bias else None
+
+    out_op = torch.ops.sgl_kernel.inkling2_bf16_rowmajor_linear_cpu(x, w, b, out_dtype)
+    out_lin = linear(x, w, b, out_dtype=out_dtype)
+    out_lin_3d = linear(x.view(1, M, K), w, b, out_dtype=out_dtype)
+    ref = F.linear(x.float(), w.float(), b.float() if b is not None else None).to(
+        out_dtype
+    )
+
+    atol = 2e-2 if out_dtype == torch.bfloat16 else 1e-2
+    rtol = 2e-2 if out_dtype == torch.bfloat16 else 1e-2
+    assert out_op.dtype == out_dtype
+    assert out_lin.dtype == out_dtype
+    torch.testing.assert_close(out_op, ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_lin, ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_lin_3d.view(M, N), ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_inkling2_logit_softcap_cpu(dtype: torch.dtype):
+    torch.manual_seed(303)
+    x = torch.randn(5, 1029, dtype=dtype) * 20.0
+    x_ref = x.clone()
+    cap = 30.0
+    out = torch.ops.sgl_kernel.inkling2_logit_softcap_cpu(x, cap)
+    assert out.data_ptr() == x.data_ptr()
+    ref = _softcap(x_ref.float(), cap).to(dtype)
+    atol = 1e-5 if dtype == torch.float32 else 2e-2
+    rtol = 1e-5 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("quant_kind", ["nvfp4", "mxfp8"])
+def test_inkling2_fused_experts_quant_m7(quant_kind: str):
+    import torch.nn.functional as F
+
+    from sglang.srt.models.inkling_common.inkling2_moe import Inkling2Experts
+
+    torch.manual_seed(404 if quant_kind == "nvfp4" else 405)
+    tokens, experts, hidden, inter, topk = 7, 2, 256, 128, 2
+    gate_cap, up_cap = 10.0, 10.0
+    x = (torch.randn(tokens, hidden, dtype=torch.bfloat16) * 0.1).contiguous()
+
+    if quant_kind == "nvfp4":
+        group_k = 16
+        w13_q = torch.randint(
+            0, 256, (experts, 2 * inter, hidden // 2), dtype=torch.uint8
+        )
+        w2_q = torch.randint(0, 256, (experts, hidden, inter // 2), dtype=torch.uint8)
+        w13_sc_fp8 = (
+            torch.rand(experts, 2 * inter, hidden // group_k) * 0.5 + 0.25
+        ).to(torch.float8_e4m3fn)
+        w2_sc_fp8 = (torch.rand(experts, hidden, inter // group_k) * 0.5 + 0.25).to(
+            torch.float8_e4m3fn
+        )
+        w13_amax = torch.tensor([1.5, 2.0], dtype=torch.float32)
+        w2_amax = torch.tensor([1.2, 1.8], dtype=torch.float32)
+        w13_denom = torch.tensor([6.0], dtype=torch.float32)
+        w2_denom = torch.tensor([6.0], dtype=torch.float32)
+        w13_ref = Inkling2Experts._dequantize_nvfp4(
+            w13_q, w13_sc_fp8, w13_amax, w13_denom
+        )
+        w2_ref = Inkling2Experts._dequantize_nvfp4(w2_q, w2_sc_fp8, w2_amax, w2_denom)
+        w13_eff = w13_sc_fp8.float() * (w13_amax / w13_denom)[:, None, None]
+        w2_eff = w2_sc_fp8.float() * (w2_amax / w2_denom)[:, None, None]
+    else:
+        group_k = 32
+        w13_q = (
+            torch.randn(experts, 2 * inter, hidden, dtype=torch.float32)
+            .clamp(-240, 240)
+            .to(torch.float8_e4m3fn)
+        )
+        w2_q = (
+            torch.randn(experts, hidden, inter, dtype=torch.float32)
+            .clamp(-240, 240)
+            .to(torch.float8_e4m3fn)
+        )
+        w13_sc_u8 = torch.randint(
+            123, 128, (experts, 2 * inter, hidden // group_k), dtype=torch.uint8
+        )
+        w2_sc_u8 = torch.randint(
+            123, 128, (experts, hidden, inter // group_k), dtype=torch.uint8
+        )
+        w13_ref = Inkling2Experts._dequantize_mxfp8(w13_q, w13_sc_u8)
+        w2_ref = Inkling2Experts._dequantize_mxfp8(w2_q, w2_sc_u8)
+        w13_eff = torch.exp2(w13_sc_u8.float() - 127.0)
+        w2_eff = torch.exp2(w2_sc_u8.float() - 127.0)
+
+    w13_packed = torch.ops.sgl_kernel.convert_weight_packed(w13_q.contiguous())
+    w2_packed = torch.ops.sgl_kernel.convert_weight_packed(w2_q.contiguous())
+    w13_sc_packed = (
+        w13_eff.view(experts, (2 * inter) // 32, 32, hidden // group_k)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+    w2_sc_packed = (
+        w2_eff.view(experts, hidden // 32, 32, inter // group_k)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+
+    # Expert 0 receives m_size=7, expert 1 receives m_size=5 (both in 5 <= m_size <= 12).
+    topk_ids = torch.tensor(
+        [[0, 1], [0, 1], [0, 1], [0, 1], [0, 1], [0, -1], [0, -1]],
+        dtype=torch.int32,
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32) * 0.5 + 0.1
+    topk_weights[topk_ids < 0] = 0.0
+
+    out = torch.ops.sgl_kernel.inkling2_fused_experts_cpu(
+        x,
+        w13_packed,
+        w2_packed,
+        topk_weights,
+        topk_ids,
+        gate_cap,
+        up_cap,
+        False,
+        True,
+        w13_sc_packed,
+        w2_sc_packed,
+    )
+
+    ref = torch.zeros((tokens, hidden), dtype=torch.float32)
+    for m in range(tokens):
+        for k in range(topk):
+            eid = int(topk_ids[m, k].item())
+            if eid < 0:
+                continue
+            gamma = float(topk_weights[m, k].item())
+            gu = F.linear(x[m : m + 1], w13_ref[eid]).float()
+            g, u = gu.unflatten(-1, (-1, 2)).unbind(-1)
+            act = (
+                _softcap(g, gate_cap) * torch.sigmoid(g) * _softcap(u, up_cap) * gamma
+            ).to(torch.bfloat16)
+            ref[m : m + 1] += F.linear(act, w2_ref[eid]).float()
+    torch.testing.assert_close(out, ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("D,n_heads", [(256, 4), (2304, 8)])
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("mode", ["decode", "verify"])
+def test_inkling2_short_convolution_cpu_wide_vectorized(
+    D: int, n_heads: int, dynamic: bool, mode: str
+):
+    torch.manual_seed(505 + D)
+    width = 4
+    num_slots = 10
+    decode = mode == "decode"
+    if decode:
+        B, T = 4, 4
+        cu = torch.arange(B + 1, dtype=torch.int32)
+        si = torch.arange(T, dtype=torch.int32)
+        safe_idx = torch.tensor([2, 0, 5, 7], dtype=torch.int32)
+        cache_mask = torch.tensor([1, 1, 0, 1], dtype=torch.uint8)
+        track_mask = torch.tensor([1, 0, 1, 1], dtype=torch.bool)
+        track_indices = torch.tensor([6, 8, 9, 4], dtype=torch.int32)
+        window = None
+    else:
+        lens = [4, 5]
+        B, T = len(lens), sum(lens)
+        cu = torch.tensor([0, 4, 9], dtype=torch.int32)
+        si = torch.cat(
+            [torch.full((l,), i, dtype=torch.int32) for i, l in enumerate(lens)]
+        )
+        safe_idx = torch.tensor([2, 5], dtype=torch.int32)
+        cache_mask = torch.tensor([1, 1], dtype=torch.uint8)
+        track_mask = None
+        track_indices = None
+        window = torch.zeros((B, max(lens), width - 1, D), dtype=torch.bfloat16)
+
+    x = torch.randn((T, D), dtype=torch.bfloat16) * 0.4
+    weight = (
+        torch.randn((width, D), dtype=torch.bfloat16) * 0.3
+        if dynamic
+        else torch.randn((D, width), dtype=torch.bfloat16) * 0.3
+    )
+    dyn_w = (
+        torch.randn((T, n_heads, width), dtype=torch.bfloat16) * 0.2
+        if dynamic
+        else None
+    )
+    cache = torch.randn((num_slots, width - 1, D), dtype=torch.bfloat16) * 0.4
+
+    cache_cpu = cache.clone()
+    win_cpu = window.clone() if window is not None else None
+    out = sgl_kernel.inkling2_short_convolution_cpu(
+        x,
+        weight,
+        cache_cpu,
+        safe_idx,
+        cache_mask,
+        cu,
+        si,
+        dyn_w,
+        decode,
+        True,
+        track_mask,
+        track_indices,
+        win_cpu,
+    )
+    ref, cache_ref, win_ref = _reference_short_conv(
+        x,
+        weight,
+        cache,
+        safe_idx,
+        cache_mask,
+        cu,
+        si,
+        dynamic_weights=dyn_w,
+        decode=decode,
+        use_residual=True,
+        track_mask=track_mask,
+        track_indices=track_indices,
+        window=window,
+    )
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(cache_cpu, cache_ref, atol=0.0, rtol=0.0)
+    if win_cpu is not None:
+        torch.testing.assert_close(win_cpu, win_ref, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("D", [256, 2304])
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("round_bf16", [False, True])
+def test_inkling2_routed_sconv_epilogue_cpu_wide(
+    D: int, decode: bool, round_bf16: bool
+):
+    torch.manual_seed(606 + D)
+    width, top_k, num_slots = 4, 2, 10
+    if decode:
+        B, T = 3, 3
+        cu = torch.arange(B + 1, dtype=torch.int32)
+        si = torch.arange(T, dtype=torch.int32)
+        window = None
+        track_mask = torch.tensor([1, 0, 1], dtype=torch.bool)
+        track_indices = torch.tensor([7, 8, 9], dtype=torch.int32)
+    else:
+        lens = [4, 5]
+        B, T = len(lens), sum(lens)
+        cu = torch.tensor([0, 4, 9], dtype=torch.int32)
+        si = torch.cat(
+            [torch.full((l,), i, dtype=torch.int32) for i, l in enumerate(lens)]
+        )
+        window = torch.zeros((B, max(lens), width - 1, D), dtype=torch.bfloat16)
+        track_mask = None
+        track_indices = None
+
+    down = torch.randn((T * top_k + 3, D), dtype=torch.bfloat16) * 0.3
+    src2dst = torch.randperm(T * top_k + 3, dtype=torch.int32)[: T * top_k].view(
+        T, top_k
+    )
+    comb = down[src2dst.long()].float().sum(dim=1).to(torch.bfloat16)
+    weight = torch.randn((D, width), dtype=torch.bfloat16) * 0.3
+    cache = torch.randn((num_slots, width - 1, D), dtype=torch.bfloat16) * 0.4
+    safe_idx = torch.tensor([3, 0, 5][:B], dtype=torch.int32)
+    cache_mask = torch.tensor([1, 1, 0][:B], dtype=torch.uint8)
+    attention = torch.randn((T, D), dtype=torch.float32) * 0.5
+    partial = torch.randn((T, D), dtype=torch.float32) * 0.3
+
+    cache_cpu = cache.clone()
+    win_cpu = window.clone() if window is not None else None
+    out = sgl_kernel.inkling2_routed_sconv_epilogue_cpu(
+        down,
+        src2dst,
+        top_k,
+        weight,
+        cache_cpu,
+        safe_idx,
+        cache_mask,
+        cu,
+        si,
+        attention,
+        partial,
+        track_mask,
+        track_indices,
+        win_cpu,
+        round_bf16,
+    )
+    conv_ref, cache_ref, win_ref = _reference_short_conv(
+        comb,
+        weight,
+        cache,
+        safe_idx,
+        cache_mask,
+        cu,
+        si,
+        decode=decode,
+        use_residual=True,
+        track_mask=track_mask,
+        track_indices=track_indices,
+        window=window,
+    )
+    out_ref = (partial.float() + attention.float() + conv_ref.float()).to(out.dtype)
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(cache_cpu, cache_ref, atol=0.0, rtol=0.0)
+    if win_cpu is not None:
+        torch.testing.assert_close(win_cpu, win_ref, atol=0.0, rtol=0.0)
+
+
+def test_dspark_fp8_lm_head_and_inkling2_mtp_head_cpu(monkeypatch):
+    import torch.nn.functional as F
+
+    import sglang.srt.models.dspark as dspark_mod
+    from sglang.kernels.ops.speculative.inkling2_mtp import (
+        mix_rmsnorm,
+        rnn_gates,
+        rnn_inputs,
+    )
+    from sglang.srt.models.inkling2_mtp import Inkling2MTPHead
+
+    torch.manual_seed(707)
+
+    # 1. CPU project_through_lm_head with speculative_dspark_lm_head_dtype="fp8"
+    monkeypatch.setattr(dspark_mod, "use_intel_amx_backend", lambda mod: True)
+    monkeypatch.setattr(
+        dspark_mod,
+        "get_spec",
+        lambda: SimpleNamespace(speculative_dspark_lm_head_dtype="fp8"),
+    )
+    n, k = 304, 256
+    w_bf16 = torch.randn(n, k, dtype=torch.bfloat16) * 0.2
+    w_packed = torch.ops.sgl_kernel.convert_weight_packed(w_bf16.contiguous())
+    lm_head = SimpleNamespace(weight=w_packed, quant_method=None)
+    hidden = torch.randn(3, k, dtype=torch.bfloat16) * 0.2
+
+    out1 = dspark_mod.project_through_lm_head(hidden, lm_head)
+    assert hasattr(lm_head, "_cpu_fp8_cache")
+    out2 = dspark_mod.project_through_lm_head(hidden, lm_head)
+    assert torch.equal(out1, out2)
+    ref_lm = (hidden.float() @ w_bf16.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out1, ref_lm, atol=8e-2, rtol=8e-2)
+
+    # 2. mix_rmsnorm CPU (einsum + rms_norm)
+    targets = torch.randn(5, 4, 256, dtype=torch.bfloat16) * 0.3
+    alpha = torch.softmax(torch.randn(4, dtype=torch.float32), dim=0).to(torch.bfloat16)
+    norm_w = torch.randn(256, dtype=torch.bfloat16)
+    got_mix = mix_rmsnorm(targets, alpha, norm_w, 1e-6)
+    mixed_ref = (targets.float() * alpha.float().view(1, 4, 1)).sum(dim=1)
+    ref_mix = (
+        mixed_ref
+        * torch.rsqrt(mixed_ref.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        * norm_w.float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(got_mix, ref_mix, atol=2e-2, rtol=2e-2)
+
+    # 3. Inkling2MTPHead (step_bias packed AMX, rnn_proj packed, refresh_fold invalidation)
+    head = Inkling2MTPHead(
+        vocab_size=300, markov_rank=64, hidden_size=128, rms_norm_eps=1e-6
+    ).to(torch.bfloat16)
+    lm_w = torch.randn(300, 128, dtype=torch.bfloat16) * 0.2
+    head.attach_fold(lm_w, multiplier=2.0)
+    f_rnn = torch.randn(4, 128, dtype=torch.bfloat16) * 0.2
+    head._gather_logits = lambda x: x
+    head._get_staged_f = lambda: f_rnn
+
+    hidden_st = torch.randn(3, 128, dtype=torch.bfloat16) * 0.2
+    prev_tokens = torch.tensor([1, 42, 299], dtype=torch.int64)
+    state = head.init_state(hidden_st)
+    bias, (new_state, _) = head.step_bias(
+        prev_tokens, hidden_states=hidden_st, state=state
+    )
+    assert head._fold_weight_packed_cpu is not None
+    assert head._rnn_proj_packed_cpu is not None
+
+    inputs_ref = rnn_inputs(
+        state[0], prev_tokens, head.markov_w1.weight, hidden_st, state[1]
+    )
+    proj_ref = F.linear(
+        inputs_ref.float(), head.rnn_proj.weight.float(), head.rnn_proj.bias.float()
+    ).to(torch.bfloat16)
+    state_ref, latent_ref = rnn_gates(proj_ref, state[0])
+    bias_ref = torch.addmm(
+        head._fold_bias.float(), latent_ref.float(), head._fold_weight.float().T
+    )
+    torch.testing.assert_close(new_state, state_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(bias.float(), bias_ref, atol=3e-2, rtol=3e-2)
+
+    head.refresh_fold(lm_w * 1.5, multiplier=2.0)
+    assert head._fold_weight_packed_cpu is None
+    bias2, _ = head.step_bias(prev_tokens, hidden_states=hidden_st, state=state)
+    assert head._fold_weight_packed_cpu is not None
+    assert bias2.shape == (3, 300)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_inkling2_logit_softcap_and_markov_sample_cpu(
+    dtype: torch.dtype, contiguous: bool
+):
+    from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+
+    torch.manual_seed(808)
+    base = torch.randn(3, 257, dtype=dtype) * 40.0
+    x = base if contiguous else base.t().contiguous().t()
+    cap = 30.0
+    ref = (cap * torch.tanh(x.float() / cap)).to(dtype)
+    got = x.clone()
+    out = torch.ops.sgl_kernel.inkling2_logit_softcap_cpu(got, cap)
+    assert out.data_ptr() == got.data_ptr()
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(got, ref, atol=atol, rtol=atol)
+
+    # MarkovSampleStep.torch with softcap on CPU (step_dtype=bfloat16)
+    base_logits = torch.randn(2, 128, dtype=torch.bfloat16) * 20.0
+    bias = torch.randn(2, 100, dtype=torch.bfloat16) * 5.0
+    temps = torch.tensor([0.0, 0.7], dtype=torch.float32)
+    offset = torch.tensor(0, dtype=torch.int64)
+    logits_out = torch.empty(2, 128, dtype=torch.bfloat16)
+    toks = MarkovSampleStep.execute(
+        base_logits=base_logits,
+        bias=bias,
+        temperatures=temps,
+        key=123,
+        offset=offset,
+        step=0,
+        step_dtype=torch.bfloat16,
+        logits_out=logits_out,
+        softcap=cap,
+    )
+    assert toks.shape == (2,)
+    v = base_logits.float().clone()
+    v[:, :100] += bias.float()
+    v = (torch.tanh(v.to(torch.bfloat16).float() / cap) * cap).to(torch.bfloat16)
+    torch.testing.assert_close(logits_out, v, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("tokens", [1, 7])
+def test_inkling2_attention_project_sources_cpu_vnni_slices(monkeypatch, tokens: int):
+    import sglang.srt.models.inkling_common.inkling2_attn as inkling2_attn_mod
+    from sglang.srt.models.inkling_common.inkling2_attn import (
+        AttentionSources,
+        Inkling2Attention,
+    )
+
+    torch.manual_seed(909 + tokens)
+    hidden_size = 256
+    split_sizes = [128, 64, 64, 32, 128, 4, 28]
+    out_dim = sum(split_sizes)
+    w_raw = torch.randn(out_dim, hidden_size, dtype=torch.bfloat16) * 0.2
+    w_packed = torch.ops.sgl_kernel.convert_weight_packed(w_raw.contiguous())
+
+    def make_attn():
+        qkvr = type(
+            "_DummyQKVR",
+            (),
+            {
+                "weight": w_packed,
+                "bias": None,
+                "__call__": staticmethod(
+                    lambda x: (
+                        torch.ops.sgl_kernel.weight_packed_linear(
+                            x, w_packed, None, True
+                        ),
+                        None,
+                    )
+                ),
+            },
+        )()
+        attn = object.__new__(Inkling2Attention)
+        torch.nn.Module.__init__(attn)
+        attn.split_sizes = split_sizes
+        attn._cpu_qkvr_slices = None
+        attn.qkvr = qkvr
+        return attn
+
+    q_src = torch.randn(tokens, hidden_size, dtype=torch.bfloat16) * 0.3
+    k_src = torch.randn(tokens, hidden_size, dtype=torch.bfloat16) * 0.3
+    v_src = torch.randn(tokens, hidden_size, dtype=torch.bfloat16) * 0.3
+    sources = AttentionSources(q_src, k_src, v_src)
+
+    attn_fast = make_attn()
+    monkeypatch.setattr(inkling2_attn_mod, "use_intel_amx_backend", lambda m: True)
+    fast_out = attn_fast._project_sources(sources)
+    assert attn_fast._cpu_qkvr_slices is not None
+
+    attn_ref = make_attn()
+    monkeypatch.setattr(inkling2_attn_mod, "use_intel_amx_backend", lambda m: False)
+    ref_out = attn_ref._project_sources(sources)
+
+    for got, exp in zip(fast_out, ref_out, strict=True):
+        torch.testing.assert_close(got, exp, atol=1e-2, rtol=1e-2)

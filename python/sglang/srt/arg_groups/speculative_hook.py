@@ -667,18 +667,23 @@ def _target_checkpoint_dspark_subfolder(
     return os.path.join(snapshot, _DSPARK_DRAFT_SUBFOLDER)
 
 
-_DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES = {"fp8": "is_gfx95", "mxfp8": "is_blackwell"}
+_DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES = {
+    "fp8": ("is_gfx95", "is_cpu"),
+    "mxfp8": ("is_blackwell",),
+}
 
 
 def _resolve_dspark_lm_head_dtype(server_args: ServerArgs) -> None:
     dtype = resolving_view(server_args).speculative_dspark_lm_head_dtype
     if dtype is None:
         return
-    probe = _DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES[dtype]
-    if not getattr(get_platform(), probe):
+    probes = _DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES[dtype]
+    platform = get_platform()
+    if not any(getattr(platform, p, False) for p in probes):
+        req = " or ".join(p.removeprefix("is_") for p in probes)
         raise ValueError(
             f"--speculative-dspark-lm-head-dtype {dtype} is not supported on this "
-            f"device (requires {probe.removeprefix('is_')})."
+            f"device (requires {req})."
         )
 
 

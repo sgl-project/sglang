@@ -51,6 +51,168 @@ inline void write_any_from_float(void* ptr, at::ScalarType st, int64_t idx, floa
   }
 }
 
+inline void load_64_as_float(
+    const void* ptr,
+    at::ScalarType st,
+    int64_t off,
+    at::vec::Vectorized<float>& v0,
+    at::vec::Vectorized<float>& v1,
+    at::vec::Vectorized<float>& v2,
+    at::vec::Vectorized<float>& v3) {
+  using fVec = at::vec::Vectorized<float>;
+  if (st == at::kFloat) {
+    const float* p = static_cast<const float*>(ptr) + off;
+    v0 = fVec::loadu(p + 0);
+    v1 = fVec::loadu(p + 16);
+    v2 = fVec::loadu(p + 32);
+    v3 = fVec::loadu(p + 48);
+  } else if (st == at::kBFloat16) {
+    const at::BFloat16* p = static_cast<const at::BFloat16*>(ptr) + off;
+    std::tie(v0, v1) = at::vec::convert_to_float<at::BFloat16>(at::vec::Vectorized<at::BFloat16>::loadu(p + 0));
+    std::tie(v2, v3) = at::vec::convert_to_float<at::BFloat16>(at::vec::Vectorized<at::BFloat16>::loadu(p + 32));
+  } else if (st == at::kHalf) {
+    const at::Half* p = static_cast<const at::Half*>(ptr) + off;
+    std::tie(v0, v1) = at::vec::convert_to_float<at::Half>(at::vec::Vectorized<at::Half>::loadu(p + 0));
+    std::tie(v2, v3) = at::vec::convert_to_float<at::Half>(at::vec::Vectorized<at::Half>::loadu(p + 32));
+  } else {
+    TORCH_CHECK(false, "Unsupported scalar type for Inkling2 CPU op: ", st);
+  }
+}
+
+inline void sconv_save_window_64_bf16(
+    void* win_ptr,
+    at::ScalarType win_st,
+    int64_t win_base,
+    int64_t win_s3,
+    int64_t c0,
+    const at::vec::Vectorized<at::BFloat16>& b0,
+    const at::vec::Vectorized<at::BFloat16>& b1,
+    const at::vec::Vectorized<float>& f0,
+    const at::vec::Vectorized<float>& f1,
+    const at::vec::Vectorized<float>& f2,
+    const at::vec::Vectorized<float>& f3) {
+  if (win_st == at::kBFloat16 && win_s3 == 1) {
+    at::BFloat16* w_dst = static_cast<at::BFloat16*>(win_ptr) + win_base + c0;
+    b0.store(w_dst);
+    b1.store(w_dst + 32);
+  } else {
+    float win_buf[64];
+    f0.store(win_buf + 0);
+    f1.store(win_buf + 16);
+    f2.store(win_buf + 32);
+    f3.store(win_buf + 48);
+    for (int64_t j = 0; j < 64; ++j) {
+      write_any_from_float(win_ptr, win_st, win_base + (c0 + j) * win_s3, win_buf[j]);
+    }
+  }
+}
+
+inline void sconv_load_tap_64_bf16(
+    const at::BFloat16* __restrict__ x_ptr,
+    int64_t x_s0,
+    const at::BFloat16* __restrict__ cache_ptr,
+    int64_t c_s0,
+    int64_t c_s1,
+    int64_t slot,
+    int64_t src,
+    int64_t cache_pos,
+    int64_t c0,
+    int64_t width,
+    bool from_x,
+    bool in_pool,
+    bool has_cache,
+    bool decode,
+    bool save_win,
+    void* win_ptr,
+    at::ScalarType win_st,
+    int64_t win_base,
+    int64_t win_s3,
+    float* hist_buf,
+    at::vec::Vectorized<float>& v0,
+    at::vec::Vectorized<float>& v1,
+    at::vec::Vectorized<float>& v2,
+    at::vec::Vectorized<float>& v3) {
+  using bVec = at::vec::Vectorized<at::BFloat16>;
+  using fVec = at::vec::Vectorized<float>;
+  if (from_x) {
+    const at::BFloat16* xr = x_ptr + src * x_s0 + c0;
+    bVec xb0 = bVec::loadu(xr);
+    bVec xb1 = bVec::loadu(xr + 32);
+    std::tie(v0, v1) = at::vec::convert_to_float<at::BFloat16>(xb0);
+    std::tie(v2, v3) = at::vec::convert_to_float<at::BFloat16>(xb1);
+    if (save_win) {
+      sconv_save_window_64_bf16(win_ptr, win_st, win_base, win_s3, c0, xb0, xb1, v0, v1, v2, v3);
+    }
+  } else {
+    fVec r0(0.0f), r1(0.0f), r2(0.0f), r3(0.0f);
+    if (in_pool) {
+      const at::BFloat16* cr = cache_ptr + slot * c_s0 + cache_pos * c_s1 + c0;
+      bVec rb0 = bVec::loadu(cr);
+      bVec rb1 = bVec::loadu(cr + 32);
+      std::tie(r0, r1) = at::vec::convert_to_float<at::BFloat16>(rb0);
+      std::tie(r2, r3) = at::vec::convert_to_float<at::BFloat16>(rb1);
+      if (save_win) {
+        sconv_save_window_64_bf16(win_ptr, win_st, win_base, win_s3, c0, rb0, rb1, r0, r1, r2, r3);
+      }
+    }
+    if (has_cache) {
+      v0 = r0;
+      v1 = r1;
+      v2 = r2;
+      v3 = r3;
+    } else {
+      v0 = fVec(0.0f);
+      v1 = fVec(0.0f);
+      v2 = fVec(0.0f);
+      v3 = fVec(0.0f);
+    }
+    if (decode && width > 1) {
+      float* hb = hist_buf + cache_pos * 64;
+      r0.store(hb + 0);
+      r1.store(hb + 16);
+      r2.store(hb + 32);
+      r3.store(hb + 48);
+    }
+  }
+}
+
+inline void sconv_update_cache_64_bf16(
+    const at::BFloat16* __restrict__ x_ptr,
+    int64_t x_s0,
+    at::BFloat16* __restrict__ cache_ptr,
+    int64_t c_s0,
+    int64_t c_s1,
+    int64_t slot,
+    int64_t track_slot,
+    bool do_track,
+    int64_t row,
+    int64_t c0,
+    int64_t width,
+    const float* hist_buf) {
+  using bVec = at::vec::Vectorized<at::BFloat16>;
+  using fVec = at::vec::Vectorized<float>;
+  for (int64_t tap = 0; tap < width - 1; ++tap) {
+    bVec c0_v, c1_v;
+    if (tap == width - 2) {
+      const at::BFloat16* xr = x_ptr + row * x_s0 + c0;
+      c0_v = bVec::loadu(xr);
+      c1_v = bVec::loadu(xr + 32);
+    } else {
+      const float* hb = hist_buf + (tap + 1) * 64;
+      c0_v = convert_from_float_ext<at::BFloat16>(fVec::loadu(hb + 0), fVec::loadu(hb + 16));
+      c1_v = convert_from_float_ext<at::BFloat16>(fVec::loadu(hb + 32), fVec::loadu(hb + 48));
+    }
+    at::BFloat16* dst_c = cache_ptr + slot * c_s0 + tap * c_s1 + c0;
+    c0_v.store(dst_c);
+    c1_v.store(dst_c + 32);
+    if (do_track) {
+      at::BFloat16* trk_c = cache_ptr + track_slot * c_s0 + tap * c_s1 + c0;
+      c0_v.store(trk_c);
+      c1_v.store(trk_c + 32);
+    }
+  }
+}
+
 template <typename scalar_t>
 void inkling2_short_convolution_impl(
     const at::Tensor& x,
@@ -79,9 +241,11 @@ void inkling2_short_convolution_impl(
   at::Tensor weight_f;
   at::Tensor dyn_f;
   at::Tensor weight_static;
+  at::Tensor weight_static_t;
   const float* weight_f_ptr = nullptr;
   const float* dyn_f_ptr = nullptr;
   const scalar_t* weight_s_ptr = nullptr;
+  const scalar_t* weight_s_t_ptr = nullptr;
   int64_t w_s0 = 0, w_s1 = 0;
   if (dynamic) {
     weight_f = weight.to(at::kFloat).contiguous();
@@ -93,6 +257,12 @@ void inkling2_short_convolution_impl(
     weight_s_ptr = weight_static.data_ptr<scalar_t>();
     w_s0 = weight_static.stride(0);
     w_s1 = weight_static.stride(1);
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      if (D >= 64) {
+        weight_static_t = weight_static.transpose(0, 1).contiguous();
+        weight_s_t_ptr = weight_static_t.data_ptr<scalar_t>();
+      }
+    }
   }
 
   const scalar_t* x_ptr = x.data_ptr<scalar_t>();
@@ -117,6 +287,10 @@ void inkling2_short_convolution_impl(
   constexpr int64_t COL_CHUNK = 64;
   const int64_t num_col_chunks = (D + COL_CHUNK - 1) / COL_CHUNK;
 
+  using bVec = at::vec::Vectorized<at::BFloat16>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr bool is_bf16_vec64 = std::is_same_v<scalar_t, at::BFloat16> && (bVec::size() == 32) && (fVec::size() == 16);
+
   const int64_t total_tasks1 = T * num_col_chunks;
   auto run_range1 = [&](int64_t begin, int64_t end) {
     float acc[COL_CHUNK];
@@ -137,6 +311,109 @@ void inkling2_short_convolution_impl(
       const bool has_cache = in_pool && (slot > 0);
       const bool do_track = decode && has_track && has_cache && (track_mask_ptr[seq] != 0);
       const int64_t track_slot = do_track ? track_indices_ptr[seq] : 0;
+
+      if constexpr (is_bf16_vec64) {
+        if (chunk_len == COL_CHUNK && c_s2 == 1) {
+          fVec acc0(0.0f), acc1(0.0f), acc2(0.0f), acc3(0.0f);
+          const bool const_head = !dynamic || ((c0 / head_dim) == ((c0 + COL_CHUNK - 1) / head_dim));
+          const int64_t head0 = dynamic ? (c0 / head_dim) : 0;
+
+          for (int64_t tap = 0; tap < width; ++tap) {
+            const int64_t lag = dynamic ? tap : (width - 1 - tap);
+            const int64_t src = row - lag;
+            const bool from_x = (src >= bos);
+            const int64_t cache_pos = src - bos + (width - 1);
+            const bool save_win = has_window && (lag < width - 1) && in_pool;
+            const int64_t win_base = save_win ? (seq * win_s0 + (row - bos) * win_s1 + (width - 2 - lag) * win_s2) : 0;
+
+            fVec v0, v1, v2, v3;
+            sconv_load_tap_64_bf16(
+                x_ptr,
+                x_s0,
+                cache_ptr,
+                c_s0,
+                c_s1,
+                slot,
+                src,
+                cache_pos,
+                c0,
+                width,
+                from_x,
+                in_pool,
+                has_cache,
+                decode,
+                save_win,
+                win_ptr,
+                win_st,
+                win_base,
+                win_s3,
+                hist_buf.data(),
+                v0,
+                v1,
+                v2,
+                v3);
+
+            fVec w0, w1, w2, w3;
+            if (dynamic) {
+              const float* wf_row = weight_f_ptr + lag * D + c0;
+              w0 = fVec::loadu(wf_row + 0);
+              w1 = fVec::loadu(wf_row + 16);
+              w2 = fVec::loadu(wf_row + 32);
+              w3 = fVec::loadu(wf_row + 48);
+              if (const_head) {
+                const fVec dw(dyn_f_ptr[(row * n_heads + head0) * width + lag]);
+                w0 += dw;
+                w1 += dw;
+                w2 += dw;
+                w3 += dw;
+              } else {
+                float dw_buf[COL_CHUNK];
+                for (int64_t j = 0; j < COL_CHUNK; ++j) {
+                  const int64_t head = (c0 + j) / head_dim;
+                  dw_buf[j] = dyn_f_ptr[(row * n_heads + head) * width + lag];
+                }
+                w0 += fVec::loadu(dw_buf + 0);
+                w1 += fVec::loadu(dw_buf + 16);
+                w2 += fVec::loadu(dw_buf + 32);
+                w3 += fVec::loadu(dw_buf + 48);
+              }
+            } else {
+              const at::BFloat16* wt_row = weight_s_t_ptr + tap * D + c0;
+              std::tie(w0, w1) = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(wt_row));
+              std::tie(w2, w3) = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(wt_row + 32));
+            }
+            acc0 += v0 * w0;
+            acc1 += v1 * w1;
+            acc2 += v2 * w2;
+            acc3 += v3 * w3;
+          }
+
+          const fVec scale_v(scale);
+          if (use_residual) {
+            const at::BFloat16* cur_row = x_ptr + row * x_s0 + c0;
+            auto [cur0, cur1] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(cur_row));
+            auto [cur2, cur3] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(cur_row + 32));
+            acc0 = (acc0 + cur0) * scale_v;
+            acc1 = (acc1 + cur1) * scale_v;
+            acc2 = (acc2 + cur2) * scale_v;
+            acc3 = (acc3 + cur3) * scale_v;
+          } else {
+            acc0 = acc0 * scale_v;
+            acc1 = acc1 * scale_v;
+            acc2 = acc2 * scale_v;
+            acc3 = acc3 * scale_v;
+          }
+          at::BFloat16* out_row = out_ptr + row * out_s0 + c0;
+          convert_from_float_ext<at::BFloat16>(acc0, acc1).store(out_row);
+          convert_from_float_ext<at::BFloat16>(acc2, acc3).store(out_row + 32);
+
+          if (decode && has_cache && width > 1) {
+            sconv_update_cache_64_bf16(
+                x_ptr, x_s0, cache_ptr, c_s0, c_s1, slot, track_slot, do_track, row, c0, width, hist_buf.data());
+          }
+          continue;
+        }
+      }
 
       for (int64_t j = 0; j < chunk_len; ++j) {
         acc[j] = 0.0f;
@@ -203,10 +480,10 @@ void inkling2_short_convolution_impl(
       }
     }
   };
-  if (total_tasks1 <= 64) {
+  if (total_tasks1 <= 96) {
     run_range1(0, total_tasks1);
   } else {
-    at::parallel_for(0, total_tasks1, 4, run_range1);
+    at::parallel_for(0, total_tasks1, 8, run_range1);
   }
 }
 
@@ -235,6 +512,14 @@ void inkling2_routed_sconv_epilogue_impl(
   const down_t* weight_ptr = weight_cast.data_ptr<down_t>();
   const int64_t w_s0 = weight_cast.stride(0);
   const int64_t w_s1 = weight_cast.stride(1);
+  at::Tensor weight_cast_t;
+  const down_t* weight_t_ptr = nullptr;
+  if constexpr (std::is_same_v<down_t, at::BFloat16>) {
+    if (D >= 64) {
+      weight_cast_t = weight_cast.transpose(0, 1).contiguous();
+      weight_t_ptr = weight_cast_t.data_ptr<down_t>();
+    }
+  }
 
   const down_t* x_ptr = x_src.data_ptr<down_t>();
   const int64_t x_s0 = x_src.stride(0);
@@ -273,6 +558,10 @@ void inkling2_routed_sconv_epilogue_impl(
   constexpr int64_t COL_CHUNK = 64;
   const int64_t num_col_chunks = (D + COL_CHUNK - 1) / COL_CHUNK;
 
+  using bVec = at::vec::Vectorized<at::BFloat16>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr bool is_bf16_vec64 = std::is_same_v<down_t, at::BFloat16> && (bVec::size() == 32) && (fVec::size() == 16);
+
   const int64_t total_tasks2 = rows * num_col_chunks;
   auto run_range2 = [&](int64_t begin, int64_t end) {
     float acc[COL_CHUNK];
@@ -293,6 +582,93 @@ void inkling2_routed_sconv_epilogue_impl(
       const bool has_cache = in_pool && (slot > 0);
       const bool do_track = decode && has_track && has_cache && (track_mask_ptr[seq] != 0);
       const int64_t track_slot = do_track ? track_indices_ptr[seq] : 0;
+
+      if constexpr (is_bf16_vec64) {
+        if (chunk_len == COL_CHUNK && c_s2 == 1 && out_st == at::kBFloat16) {
+          fVec acc0(0.0f), acc1(0.0f), acc2(0.0f), acc3(0.0f);
+          for (int64_t tap = 0; tap < width; ++tap) {
+            const int64_t lag = width - 1 - tap;
+            const int64_t src = row - lag;
+            const bool from_x = (src >= bos);
+            const int64_t cache_pos = src - bos + (width - 1);
+            const bool save_win = has_window && (lag < width - 1) && in_pool;
+            const int64_t win_base = save_win ? (seq * win_s0 + (row - bos) * win_s1 + (width - 2 - lag) * win_s2) : 0;
+
+            fVec v0, v1, v2, v3;
+            sconv_load_tap_64_bf16(
+                x_ptr,
+                x_s0,
+                cache_ptr,
+                c_s0,
+                c_s1,
+                slot,
+                src,
+                cache_pos,
+                c0,
+                width,
+                from_x,
+                in_pool,
+                has_cache,
+                decode,
+                save_win,
+                win_ptr,
+                win_st,
+                win_base,
+                win_s3,
+                hist_buf.data(),
+                v0,
+                v1,
+                v2,
+                v3);
+
+            const at::BFloat16* wt_row = weight_t_ptr + tap * D + c0;
+            auto [w0, w1] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(wt_row));
+            auto [w2, w3] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(wt_row + 32));
+            acc0 += v0 * w0;
+            acc1 += v1 * w1;
+            acc2 += v2 * w2;
+            acc3 += v3 * w3;
+          }
+
+          const fVec scale_v(scale);
+          const at::BFloat16* cur_row = x_ptr + row * x_s0 + c0;
+          auto [cur0, cur1] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(cur_row));
+          auto [cur2, cur3] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(cur_row + 32));
+          fVec yf0 = (acc0 + cur0) * scale_v;
+          fVec yf1 = (acc1 + cur1) * scale_v;
+          fVec yf2 = (acc2 + cur2) * scale_v;
+          fVec yf3 = (acc3 + cur3) * scale_v;
+          auto [y0, y1] = at::vec::convert_to_float<at::BFloat16>(convert_from_float_ext<at::BFloat16>(yf0, yf1));
+          auto [y2, y3] = at::vec::convert_to_float<at::BFloat16>(convert_from_float_ext<at::BFloat16>(yf2, yf3));
+
+          const int64_t off = row * D + c0;
+          fVec a0, a1, a2, a3;
+          load_64_as_float(attn_ptr, attn_st, off, a0, a1, a2, a3);
+          fVec t0, t1, t2, t3;
+          if (has_partial) {
+            fVec p0, p1, p2, p3;
+            load_64_as_float(partial_ptr, partial_st, off, p0, p1, p2, p3);
+            t0 = (p0 + a0) + y0;
+            t1 = (p1 + a1) + y1;
+            t2 = (p2 + a2) + y2;
+            t3 = (p3 + a3) + y3;
+          } else {
+            t0 = a0 + y0;
+            t1 = a1 + y1;
+            t2 = a2 + y2;
+            t3 = a3 + y3;
+          }
+          at::BFloat16* out_bf16 = static_cast<at::BFloat16*>(out_ptr) + off;
+          convert_from_float_ext<at::BFloat16>(t0, t1).store(out_bf16);
+          convert_from_float_ext<at::BFloat16>(t2, t3).store(out_bf16 + 32);
+
+          if (decode && has_cache && width > 1) {
+            sconv_update_cache_64_bf16(
+                x_ptr, x_s0, cache_ptr, c_s0, c_s1, slot, track_slot, do_track, row, c0, width, hist_buf.data());
+          }
+          continue;
+        }
+      }
 
       for (int64_t j = 0; j < chunk_len; ++j) {
         acc[j] = 0.0f;
@@ -358,10 +734,10 @@ void inkling2_routed_sconv_epilogue_impl(
       }
     }
   };
-  if (total_tasks2 <= 64) {
+  if (total_tasks2 <= 96) {
     run_range2(0, total_tasks2);
   } else {
-    at::parallel_for(0, total_tasks2, 4, run_range2);
+    at::parallel_for(0, total_tasks2, 8, run_range2);
   }
 }
 
@@ -521,11 +897,41 @@ at::Tensor inkling2_routed_sconv_epilogue_cpu(
     const int64_t num_chunks = (D + COL_CHUNK - 1) / COL_CHUNK;
     const int64_t total_tasks3 = rows * num_chunks;
     auto run_range3 = [&](int64_t begin, int64_t end) {
+      using bVec = at::vec::Vectorized<at::BFloat16>;
+      using fVec = at::vec::Vectorized<float>;
+      constexpr bool can_vec_bf16 = (bVec::size() == 32) && (fVec::size() == 16);
       for (int64_t task = begin; task < end; ++task) {
         const int64_t r = task / num_chunks;
         const int64_t c0 = (task % num_chunks) * COL_CHUNK;
         const int64_t c1 = std::min(D, c0 + COL_CHUNK);
         const int64_t r_base = r * top_k;
+        if constexpr (can_vec_bf16) {
+          if (down_st == at::kBFloat16 && (c1 - c0) >= 32) {
+            const at::BFloat16* down_bf16 = static_cast<const at::BFloat16*>(down_ptr);
+            at::BFloat16* xc_bf16 = static_cast<at::BFloat16*>(xc_ptr);
+            int64_t d = c0;
+            for (; d <= c1 - 32; d += 32) {
+              fVec sum0(0.0f);
+              fVec sum1(0.0f);
+              for (int64_t k = 0; k < top_k; ++k) {
+                const int64_t idx = s2d_ptr[r_base + k];
+                auto [v0, v1] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(down_bf16 + idx * D + d));
+                sum0 += v0;
+                sum1 += v1;
+              }
+              convert_from_float_ext<at::BFloat16>(sum0, sum1).store(xc_bf16 + r * D + d);
+            }
+            for (; d < c1; ++d) {
+              float sum = 0.0f;
+              for (int64_t k = 0; k < top_k; ++k) {
+                const int64_t idx = s2d_ptr[r_base + k];
+                sum += static_cast<float>(down_bf16[idx * D + d]);
+              }
+              xc_bf16[r * D + d] = static_cast<at::BFloat16>(sum);
+            }
+            continue;
+          }
+        }
         for (int64_t d = c0; d < c1; ++d) {
           float sum = 0.0f;
           for (int64_t k = 0; k < top_k; ++k) {
@@ -544,10 +950,10 @@ at::Tensor inkling2_routed_sconv_epilogue_cpu(
         }
       }
     };
-    if (total_tasks3 <= 64) {
+    if (total_tasks3 <= 96) {
       run_range3(0, total_tasks3);
     } else {
-      at::parallel_for(0, total_tasks3, 4, run_range3);
+      at::parallel_for(0, total_tasks3, 8, run_range3);
     }
   } else {
     TORCH_CHECK(down.dim() == 2 && down.size(0) == rows && down.size(1) == D, "down must be [rows, D] when top_k <= 0");
@@ -1536,4 +1942,549 @@ at::Tensor inkling2_bf16_linear_fp32_cpu(
   }
 #endif
   return out;
+}
+
+namespace {
+
+inline void rmsnorm_pair_to_bf16(
+    const float* __restrict__ dest,
+    const float* __restrict__ msg,
+    at::BFloat16* __restrict__ normed,
+    int64_t T,
+    int64_t width,
+    float eps) {
+  using fVec = at::vec::Vectorized<float>;
+  using bVec = at::vec::Vectorized<at::BFloat16>;
+  constexpr int64_t kFVec = fVec::size();
+  constexpr int64_t kBVec = bVec::size();
+  const int64_t two_width = 2 * width;
+
+  auto norm_one = [&](const float* __restrict__ src, at::BFloat16* __restrict__ dst) {
+    fVec s0(0.0f), s1(0.0f);
+    int64_t d = 0;
+    for (; d <= width - 2 * kFVec; d += 2 * kFVec) {
+      fVec v0 = fVec::loadu(src + d);
+      fVec v1 = fVec::loadu(src + d + kFVec);
+      s0 += v0 * v0;
+      s1 += v1 * v1;
+    }
+    float ss = vec_reduce_sum(s0 + s1);
+    for (; d < width; ++d) {
+      float v = src[d];
+      ss += v * v;
+    }
+    const float rstd = 1.0f / std::sqrt(ss / static_cast<float>(width) + eps);
+    const fVec rstd_v(rstd);
+    d = 0;
+    for (; d <= width - kBVec; d += kBVec) {
+      fVec v0 = fVec::loadu(src + d) * rstd_v;
+      fVec v1 = fVec::loadu(src + d + kFVec) * rstd_v;
+      convert_from_float_ext<at::BFloat16>(v0, v1).store(dst + d);
+    }
+    for (; d <= width - kFVec; d += kFVec) {
+      fVec v0 = fVec::loadu(src + d) * rstd_v;
+      store_from_float_ext<at::BFloat16>(dst + d, v0);
+    }
+    for (; d < width; ++d) {
+      dst[d] = static_cast<at::BFloat16>(src[d] * rstd);
+    }
+  };
+
+  auto run_rows = [&](int64_t begin, int64_t end) {
+    for (int64_t t = begin; t < end; ++t) {
+      norm_one(dest + t * width, normed + t * two_width);
+      norm_one(msg + t * width, normed + t * two_width + width);
+    }
+  };
+  if (T * width <= 16384) {
+    run_rows(0, T);
+  } else {
+    at::parallel_for(0, T, 1, run_rows);
+  }
+}
+
+template <typename out_t>
+inline void bf16_vnni_gemm_impl(
+    const at::BFloat16* __restrict__ A,
+    const at::BFloat16* __restrict__ B,
+    out_t* __restrict__ C,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+  constexpr int64_t BLOCK_N = 32;
+  const int64_t NB = N / BLOCK_N;
+
+#if defined(CPU_CAPABILITY_AVX512)
+  if (M <= 4) {
+    auto run_nb = [&](int64_t begin, int64_t end) {
+      const float* a_f32 = reinterpret_cast<const float*>(A);
+      const int64_t K2 = K >> 1;
+      for (int64_t nb = begin; nb < end; ++nb) {
+        const at::BFloat16* Bn = B + nb * BLOCK_N * K;
+        __m512 vc[4][2];
+        for (int64_t r = 0; r < M; ++r) {
+          vc[r][0] = _mm512_setzero_ps();
+          vc[r][1] = _mm512_setzero_ps();
+        }
+        for (int64_t k = 0; k < K2; ++k) {
+          const at::BFloat16* brow = Bn + k * (BLOCK_N * 2);
+          __m512bh vb0 = (__m512bh)(_mm512_loadu_si512(reinterpret_cast<const __m512i*>(brow)));
+          __m512bh vb1 = (__m512bh)(_mm512_loadu_si512(reinterpret_cast<const __m512i*>(brow + 32)));
+          for (int64_t r = 0; r < M; ++r) {
+            __m512bh va = (__m512bh)(_mm512_set1_ps(a_f32[r * K2 + k]));
+            vc[r][0] = _mm512_dpbf16_ps(vc[r][0], va, vb0);
+            vc[r][1] = _mm512_dpbf16_ps(vc[r][1], va, vb1);
+          }
+        }
+        for (int64_t r = 0; r < M; ++r) {
+          if constexpr (std::is_same_v<out_t, at::BFloat16>) {
+            __m512bh bh = (__m512bh)(_mm512_cvtne2ps_pbh(vc[r][1], vc[r][0]));
+            _mm512_storeu_si512(reinterpret_cast<__m512i*>(C + r * N + nb * BLOCK_N), (__m512i)bh);
+          } else {
+            _mm512_storeu_ps(C + r * N + nb * BLOCK_N, vc[r][0]);
+            _mm512_storeu_ps(C + r * N + nb * BLOCK_N + 16, vc[r][1]);
+          }
+        }
+      }
+    };
+    if (M * N * K <= 2097152) {
+      run_nb(0, NB);
+    } else {
+      at::parallel_for(0, NB, 1, run_nb);
+    }
+    return;
+  }
+#endif
+
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  constexpr int64_t BLOCK_M = 32;
+  const int64_t MB = (M + BLOCK_M - 1) / BLOCK_M;
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    float c_tile[BLOCK_M * BLOCK_N];
+    loop_2d<at::BFloat16>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t) {
+      const int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
+      const at::BFloat16* Am = A + mb * BLOCK_M * K;
+      const at::BFloat16* Bn = B + nb * BLOCK_N * K;
+      if constexpr (std::is_same_v<out_t, at::BFloat16>) {
+        at::native::cpublas::brgemm(m_size, BLOCK_N, K, K, BLOCK_N, BLOCK_N, false, Am, Bn, c_tile);
+        using fVec = at::vec::Vectorized<float>;
+        constexpr int64_t kStep = 2 * fVec::size();
+        for (int64_t r = 0; r < m_size; ++r) {
+          at::BFloat16* dst = C + (mb * BLOCK_M + r) * N + nb * BLOCK_N;
+          const float* src = c_tile + r * BLOCK_N;
+          for (int64_t j = 0; j < BLOCK_N; j += kStep) {
+            fVec v0 = fVec::loadu(src + j);
+            fVec v1 = fVec::loadu(src + j + fVec::size());
+            convert_from_float_ext<at::BFloat16>(v0, v1).store(dst + j);
+          }
+        }
+      } else {
+        float* Cm = C + mb * BLOCK_M * N + nb * BLOCK_N;
+        at::native::cpublas::brgemm(m_size, BLOCK_N, K, K, BLOCK_N, N, false, Am, Bn, Cm);
+      }
+    });
+    at::native::cpublas::brgemm_release();
+  });
+#else
+  for (int64_t r = 0; r < M; ++r) {
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      const at::BFloat16* Bn = B + nb * BLOCK_N * K;
+      for (int64_t j = 0; j < BLOCK_N; ++j) {
+        float acc = 0.0f;
+        for (int64_t k = 0; k < K / 2; ++k) {
+          acc += static_cast<float>(A[r * K + k * 2 + 0]) * static_cast<float>(Bn[k * BLOCK_N * 2 + j * 2 + 0]);
+          acc += static_cast<float>(A[r * K + k * 2 + 1]) * static_cast<float>(Bn[k * BLOCK_N * 2 + j * 2 + 1]);
+        }
+        C[r * N + nb * BLOCK_N + j] = static_cast<out_t>(acc);
+      }
+    }
+  }
+#endif
+}
+
+inline void controller_mix_epilogue(
+    const float* __restrict__ gf,
+    const float* __restrict__ dest,
+    const float* __restrict__ msg,
+    float* __restrict__ out,
+    int64_t T,
+    int64_t width) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kFVec = fVec::size();
+  const int64_t two_width = 2 * width;
+
+  auto run_rows = [&](int64_t begin, int64_t end) {
+    const fVec one(1.0f);
+    for (int64_t t = begin; t < end; ++t) {
+      const float* g_row = gf + t * two_width;
+      const float* f_row = g_row + width;
+      const float* d_row = dest + t * width;
+      const float* m_row = msg + t * width;
+      float* o_row = out + t * width;
+      int64_t d = 0;
+      for (; d <= width - kFVec; d += kFVec) {
+        fVec gv = fVec::loadu(g_row + d).tanh();
+        fVec fv = fVec::loadu(f_row + d).tanh();
+        fVec dv = fVec::loadu(d_row + d);
+        fVec mv = fVec::loadu(m_row + d);
+        ((one - fv) * dv + gv * mv).store(o_row + d);
+      }
+      for (; d < width; ++d) {
+        float gv = std::tanh(g_row[d]);
+        float fv = std::tanh(f_row[d]);
+        o_row[d] = (1.0f - fv) * d_row[d] + gv * m_row[d];
+      }
+    }
+  };
+  if (T * width <= 16384) {
+    run_rows(0, T);
+  } else {
+    at::parallel_for(0, T, 1, run_rows);
+  }
+}
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int MR, int NR, typename out_t>
+inline void rowmajor_dpbf16_tile(
+    const at::BFloat16* __restrict__ A,
+    int64_t lda,
+    const at::BFloat16* __restrict__ B,
+    int64_t ldb,
+    const float* __restrict__ bias,
+    out_t* __restrict__ C,
+    int64_t ldc,
+    int64_t K) {
+  __m512 acc[MR][NR];
+  for (int mr = 0; mr < MR; ++mr) {
+    for (int nr = 0; nr < NR; ++nr) {
+      acc[mr][nr] = _mm512_setzero_ps();
+    }
+  }
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512bh va[MR];
+    for (int mr = 0; mr < MR; ++mr) {
+      va[mr] = (__m512bh)(_mm512_loadu_si512(reinterpret_cast<const __m512i*>(A + mr * lda + k)));
+    }
+    for (int nr = 0; nr < NR; ++nr) {
+      __m512bh vb = (__m512bh)(_mm512_loadu_si512(reinterpret_cast<const __m512i*>(B + nr * ldb + k)));
+      for (int mr = 0; mr < MR; ++mr) {
+        acc[mr][nr] = _mm512_dpbf16_ps(acc[mr][nr], va[mr], vb);
+      }
+    }
+  }
+  for (int mr = 0; mr < MR; ++mr) {
+    for (int nr = 0; nr < NR; ++nr) {
+      float sum = _mm512_reduce_add_ps(acc[mr][nr]);
+      if (bias != nullptr) {
+        sum += bias[nr];
+      }
+      C[mr * ldc + nr] = static_cast<out_t>(sum);
+    }
+  }
+}
+#endif
+
+template <typename out_t>
+inline void bf16_rowmajor_linear_impl(
+    const at::BFloat16* __restrict__ A,
+    int64_t lda,
+    const at::BFloat16* __restrict__ B,
+    const float* __restrict__ bias,
+    out_t* __restrict__ C,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+#if defined(CPU_CAPABILITY_AVX512)
+  constexpr int64_t BM = 4;
+  constexpr int64_t BN = 4;
+  const int64_t m_blocks = (M + BM - 1) / BM;
+  const int64_t n_blocks = (N + BN - 1) / BN;
+  const int64_t total_tiles = m_blocks * n_blocks;
+
+  auto run_tiles = [&](int64_t begin, int64_t end) {
+    for (int64_t tile = begin; tile < end; ++tile) {
+      const int64_t mb = tile / n_blocks;
+      const int64_t nb = tile % n_blocks;
+      const int64_t m0 = mb * BM;
+      const int64_t n0 = nb * BN;
+      const int64_t msize = std::min(BM, M - m0);
+      const int64_t nsize = std::min(BN, N - n0);
+      const at::BFloat16* Am = A + m0 * lda;
+      const at::BFloat16* Bn = B + n0 * K;
+      const float* bias_n = (bias != nullptr) ? (bias + n0) : nullptr;
+      out_t* Cm = C + m0 * N + n0;
+
+      if (nsize == 4) {
+        switch (msize) {
+          case 4:
+            rowmajor_dpbf16_tile<4, 4, out_t>(Am, lda, Bn, K, bias_n, Cm, N, K);
+            break;
+          case 3:
+            rowmajor_dpbf16_tile<3, 4, out_t>(Am, lda, Bn, K, bias_n, Cm, N, K);
+            break;
+          case 2:
+            rowmajor_dpbf16_tile<2, 4, out_t>(Am, lda, Bn, K, bias_n, Cm, N, K);
+            break;
+          case 1:
+            rowmajor_dpbf16_tile<1, 4, out_t>(Am, lda, Bn, K, bias_n, Cm, N, K);
+            break;
+        }
+      } else {
+        for (int64_t mr = 0; mr < msize; ++mr) {
+          const at::BFloat16* a_row = Am + mr * lda;
+          for (int64_t nr = 0; nr < nsize; ++nr) {
+            const at::BFloat16* b_row = Bn + nr * K;
+            __m512 acc = _mm512_setzero_ps();
+            for (int64_t k = 0; k < K; k += 32) {
+              __m512bh va = (__m512bh)(_mm512_loadu_si512(reinterpret_cast<const __m512i*>(a_row + k)));
+              __m512bh vb = (__m512bh)(_mm512_loadu_si512(reinterpret_cast<const __m512i*>(b_row + k)));
+              acc = _mm512_dpbf16_ps(acc, va, vb);
+            }
+            float sum = _mm512_reduce_add_ps(acc);
+            if (bias_n != nullptr) {
+              sum += bias_n[nr];
+            }
+            Cm[mr * N + nr] = static_cast<out_t>(sum);
+          }
+        }
+      }
+    }
+  };
+
+  if (M * N * K <= 262144) {
+    run_tiles(0, total_tiles);
+  } else {
+    at::parallel_for(0, total_tiles, 1, run_tiles);
+  }
+#else
+  auto run_rows = [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      const at::BFloat16* a_row = A + m * lda;
+      for (int64_t n = 0; n < N; ++n) {
+        const at::BFloat16* b_row = B + n * K;
+        float acc = (bias != nullptr) ? bias[n] : 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+          acc += static_cast<float>(a_row[k]) * static_cast<float>(b_row[k]);
+        }
+        C[m * N + n] = static_cast<out_t>(acc);
+      }
+    }
+  };
+  if (M * N * K <= 262144) {
+    run_rows(0, M);
+  } else {
+    at::parallel_for(0, M, 1, run_rows);
+  }
+#endif
+}
+
+}  // namespace
+
+at::Tensor inkling2_message_controllers_cpu(
+    at::TensorList dests,
+    at::TensorList messages,
+    const at::Tensor& down_packed,
+    const at::Tensor& gain_forget_packed,
+    double eps) {
+  const int64_t num = static_cast<int64_t>(dests.size());
+  TORCH_CHECK(
+      num > 0 && static_cast<int64_t>(messages.size()) == num,
+      "inkling2_message_controllers_cpu requires non-empty equal-length dests and messages");
+  CHECK_CPU(down_packed);
+  CHECK_CPU(gain_forget_packed);
+  TORCH_CHECK(
+      down_packed.scalar_type() == at::kBFloat16 && gain_forget_packed.scalar_type() == at::kBFloat16,
+      "inkling2_message_controllers_cpu requires bfloat16 packed weights");
+  TORCH_CHECK(
+      down_packed.is_contiguous() && gain_forget_packed.is_contiguous(),
+      "inkling2_message_controllers_cpu requires contiguous packed weights");
+  TORCH_CHECK(down_packed.dim() == 3 && gain_forget_packed.dim() == 3, "Packed weights must be 3D");
+
+  const int64_t T = dests[0].size(0);
+  const int64_t width = dests[0].size(1);
+  const int64_t rank = down_packed.size(1);
+  const int64_t two_width = down_packed.size(2);
+  TORCH_CHECK(down_packed.size(0) == num && two_width == 2 * width, "down_packed shape mismatch with dests");
+  TORCH_CHECK(
+      gain_forget_packed.size(0) == num && gain_forget_packed.size(1) == two_width &&
+          gain_forget_packed.size(2) == rank,
+      "gain_forget_packed shape mismatch with down_packed");
+  TORCH_CHECK(
+      rank > 0 && rank % 32 == 0 && two_width > 0 && two_width % 32 == 0,
+      "rank and 2*width must be positive multiples of 32");
+
+  std::vector<at::Tensor> keep_alive;
+  std::vector<const float*> dest_ptrs(static_cast<size_t>(num));
+  std::vector<const float*> msg_ptrs(static_cast<size_t>(num));
+  for (int64_t m = 0; m < num; ++m) {
+    const auto& d = dests[static_cast<size_t>(m)];
+    const auto& msg = messages[static_cast<size_t>(m)];
+    CHECK_CPU(d);
+    CHECK_CPU(msg);
+    TORCH_CHECK(
+        d.dim() == 2 && msg.dim() == 2 && d.size(0) == T && d.size(1) == width && msg.size(0) == T &&
+            msg.size(1) == width,
+        "dests and messages tensors must all have shape [tokens, width]");
+    if (d.scalar_type() == at::kFloat && d.is_contiguous()) {
+      dest_ptrs[static_cast<size_t>(m)] = d.data_ptr<float>();
+    } else {
+      keep_alive.push_back(d.to(at::kFloat).contiguous());
+      dest_ptrs[static_cast<size_t>(m)] = keep_alive.back().data_ptr<float>();
+    }
+    if (msg.scalar_type() == at::kFloat && msg.is_contiguous()) {
+      msg_ptrs[static_cast<size_t>(m)] = msg.data_ptr<float>();
+    } else {
+      keep_alive.push_back(msg.to(at::kFloat).contiguous());
+      msg_ptrs[static_cast<size_t>(m)] = keep_alive.back().data_ptr<float>();
+    }
+  }
+
+  auto out = at::empty({num, T, width}, dests[0].options().dtype(at::kFloat));
+  if (T == 0) {
+    return out;
+  }
+
+  auto normed = at::empty({T, two_width}, down_packed.options());
+  auto hidden = at::empty({T, rank}, down_packed.options());
+  auto gf = at::empty({T, two_width}, out.options());
+
+  at::BFloat16* normed_ptr = normed.data_ptr<at::BFloat16>();
+  at::BFloat16* hidden_ptr = hidden.data_ptr<at::BFloat16>();
+  float* gf_ptr = gf.data_ptr<float>();
+  const at::BFloat16* down_base = down_packed.data_ptr<at::BFloat16>();
+  const at::BFloat16* gf_w_base = gain_forget_packed.data_ptr<at::BFloat16>();
+  float* out_base = out.data_ptr<float>();
+  const float eps_f = static_cast<float>(eps);
+
+  for (int64_t m = 0; m < num; ++m) {
+    const float* d_ptr = dest_ptrs[static_cast<size_t>(m)];
+    const float* m_ptr = msg_ptrs[static_cast<size_t>(m)];
+    rmsnorm_pair_to_bf16(d_ptr, m_ptr, normed_ptr, T, width, eps_f);
+    bf16_vnni_gemm_impl<at::BFloat16>(normed_ptr, down_base + m * rank * two_width, hidden_ptr, T, rank, two_width);
+    bf16_vnni_gemm_impl<float>(hidden_ptr, gf_w_base + m * two_width * rank, gf_ptr, T, two_width, rank);
+    controller_mix_epilogue(gf_ptr, d_ptr, m_ptr, out_base + m * T * width, T, width);
+  }
+  return out;
+}
+
+at::Tensor inkling2_bf16_rowmajor_linear_cpu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_opt,
+    at::ScalarType out_dtype) {
+  CHECK_CPU(x);
+  CHECK_CPU(weight);
+  TORCH_CHECK(
+      x.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
+      "inkling2_bf16_rowmajor_linear_cpu requires bfloat16 x and weight");
+  TORCH_CHECK(x.dim() >= 1 && weight.dim() == 2 && weight.is_contiguous(), "weight must be 2D contiguous");
+  const int64_t K = x.size(-1);
+  const int64_t M = x.numel() / K;
+  const int64_t N = weight.size(0);
+  TORCH_CHECK(
+      weight.size(1) == K && K > 0 && K % 32 == 0 && N >= 1,
+      "inkling2_bf16_rowmajor_linear_cpu requires K > 0, K % 32 == 0, N >= 1");
+  TORCH_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat, "out_dtype must be BFloat16 or Float");
+
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  out_sizes.back() = N;
+  auto out = at::empty(out_sizes, x.options().dtype(out_dtype));
+  if (M == 0) {
+    return out;
+  }
+
+  at::Tensor x_c;
+  const at::BFloat16* A = nullptr;
+  int64_t lda = K;
+  if (x.dim() == 2 && x.stride(1) == 1) {
+    A = x.data_ptr<at::BFloat16>();
+    lda = (M > 1) ? x.stride(0) : K;
+  } else {
+    x_c = x.contiguous();
+    A = x_c.data_ptr<at::BFloat16>();
+  }
+
+  at::Tensor bias_f;
+  const float* bias_ptr = nullptr;
+  if (bias_opt.has_value()) {
+    const auto& b = bias_opt.value();
+    CHECK_CPU(b);
+    TORCH_CHECK(b.dim() == 1 && b.size(0) == N, "bias must be 1D [N]");
+    bias_f = (b.scalar_type() == at::kFloat && b.is_contiguous()) ? b : b.to(at::kFloat).contiguous();
+    bias_ptr = bias_f.data_ptr<float>();
+  }
+
+  const at::BFloat16* B = weight.data_ptr<at::BFloat16>();
+  if (out_dtype == at::kFloat) {
+    bf16_rowmajor_linear_impl<float>(A, lda, B, bias_ptr, out.data_ptr<float>(), M, N, K);
+  } else {
+    bf16_rowmajor_linear_impl<at::BFloat16>(A, lda, B, bias_ptr, out.data_ptr<at::BFloat16>(), M, N, K);
+  }
+  return out;
+}
+
+at::Tensor inkling2_logit_softcap_cpu(at::Tensor logits, double cap) {
+  CHECK_CPU(logits);
+  const int64_t n = logits.numel();
+  if (n == 0 || cap <= 0.0) {
+    return logits;
+  }
+  const float cap_f = static_cast<float>(cap);
+  const float inv_cap = 1.0f / cap_f;
+  const bool is_cont = logits.is_contiguous();
+  at::Tensor buf = is_cont ? logits : logits.contiguous();
+
+  if (buf.scalar_type() == at::kFloat) {
+    float* ptr = buf.data_ptr<float>();
+    auto run = [&](int64_t begin, int64_t end) {
+      using fVec = at::vec::Vectorized<float>;
+      constexpr int64_t kFVec = fVec::size();
+      const fVec cap_v(cap_f);
+      const fVec inv_cap_v(inv_cap);
+      int64_t i = begin;
+      for (; i <= end - kFVec; i += kFVec) {
+        fVec v = fVec::loadu(ptr + i);
+        (cap_v * (v * inv_cap_v).tanh()).store(ptr + i);
+      }
+      for (; i < end; ++i) {
+        ptr[i] = cap_f * std::tanh(ptr[i] * inv_cap);
+      }
+    };
+    if (n <= 32768) {
+      run(0, n);
+    } else {
+      at::parallel_for(0, n, 4096, run);
+    }
+  } else if (buf.scalar_type() == at::kBFloat16) {
+    at::BFloat16* ptr = buf.data_ptr<at::BFloat16>();
+    auto run = [&](int64_t begin, int64_t end) {
+      using bVec = at::vec::Vectorized<at::BFloat16>;
+      using fVec = at::vec::Vectorized<float>;
+      constexpr int64_t kBVec = bVec::size();
+      const fVec cap_v(cap_f);
+      const fVec inv_cap_v(inv_cap);
+      int64_t i = begin;
+      for (; i <= end - kBVec; i += kBVec) {
+        auto [v0, v1] = at::vec::convert_to_float<at::BFloat16>(bVec::loadu(ptr + i));
+        v0 = cap_v * (v0 * inv_cap_v).tanh();
+        v1 = cap_v * (v1 * inv_cap_v).tanh();
+        convert_from_float_ext<at::BFloat16>(v0, v1).store(ptr + i);
+      }
+      for (; i < end; ++i) {
+        ptr[i] = static_cast<at::BFloat16>(cap_f * std::tanh(static_cast<float>(ptr[i]) * inv_cap));
+      }
+    };
+    if (n <= 32768) {
+      run(0, n);
+    } else {
+      at::parallel_for(0, n, 4096, run);
+    }
+  } else {
+    TORCH_CHECK(false, "inkling2_logit_softcap_cpu supports Float and BFloat16, got ", logits.scalar_type());
+  }
+
+  if (!is_cont) {
+    logits.copy_(buf);
+  }
+  return logits;
 }

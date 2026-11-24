@@ -539,6 +539,18 @@ void inkling2_route_topk_cpu(
 at::Tensor inkling2_bf16_linear_fp32_cpu(
     const at::Tensor& x, const at::Tensor& packed_weight, const std::optional<at::Tensor>& bias_opt = std::nullopt);
 
+at::Tensor inkling2_message_controllers_cpu(
+    at::TensorList dests,
+    at::TensorList messages,
+    const at::Tensor& down_packed,
+    const at::Tensor& gain_forget_packed,
+    double eps);
+
+at::Tensor inkling2_bf16_rowmajor_linear_cpu(
+    const at::Tensor& x, const at::Tensor& weight, const std::optional<at::Tensor>& bias_opt, at::ScalarType out_dtype);
+
+at::Tensor inkling2_logit_softcap_cpu(at::Tensor logits, double cap);
+
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
@@ -1099,6 +1111,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("inkling2_bf16_linear_fp32_cpu(Tensor x, Tensor packed_weight, Tensor? bias=None) -> Tensor");
   m.impl("inkling2_bf16_linear_fp32_cpu", torch::kCPU, &inkling2_bf16_linear_fp32_cpu);
+
+  m.def(
+      "inkling2_message_controllers_cpu(Tensor[] dests, Tensor[] messages, Tensor down_packed, "
+      "Tensor gain_forget_packed, float eps) -> Tensor");
+  m.impl("inkling2_message_controllers_cpu", torch::kCPU, &inkling2_message_controllers_cpu);
+
+  m.def("inkling2_bf16_rowmajor_linear_cpu(Tensor x, Tensor weight, Tensor? bias, ScalarType out_dtype) -> Tensor");
+  m.impl("inkling2_bf16_rowmajor_linear_cpu", torch::kCPU, &inkling2_bf16_rowmajor_linear_cpu);
+
+  m.def("inkling2_logit_softcap_cpu(Tensor(a!) logits, float cap) -> Tensor");
+  m.impl("inkling2_logit_softcap_cpu", torch::kCPU, &inkling2_logit_softcap_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption

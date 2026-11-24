@@ -47,6 +47,17 @@ class LoopMessageBank:
         assert blocks and scaled_queries.dtype == torch.float32
         self.blocks = [x.contiguous() for x in blocks]
         self.scaled_queries = scaled_queries
+        self._all_messages = None
+        if scaled_queries.ndim == 3:
+            from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+
+            self._total_rows = scaled_queries.shape[1]
+            self._all_messages = attn_res(
+                self.blocks,
+                None,
+                scaled_queries.reshape(-1, scaled_queries.shape[-1]).contiguous(),
+                normalize_values=True,
+            )
 
     def mix(
         self,
@@ -54,15 +65,32 @@ class LoopMessageBank:
         destinations: tuple[torch.Tensor, ...],
         weights: tuple[torch.Tensor, ...],
         side: Literal["attn", "mlp"],
+        packed_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
-
         rows = _SIDE_ROWS[side]
-        messages = attn_res(
-            self.blocks, None, self.scaled_queries[layer, rows], normalize_values=True
+        if self._all_messages is not None:
+            base = layer * self._total_rows
+            start, stop, step = rows.indices(self._total_rows)
+            messages = tuple(
+                self._all_messages[base + idx] for idx in range(start, stop, step)
+            )
+        else:
+            from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+
+            messages = attn_res(
+                self.blocks,
+                None,
+                self.scaled_queries[layer, rows],
+                normalize_values=True,
+            )
+        packed = (
+            (packed_weights[0][rows], packed_weights[1][rows])
+            if packed_weights is not None
+            else None
         )
         return message_controllers(
             tuple(d.float() for d in destinations),
             messages,
             *(w[rows] for w in weights),
+            packed_weights=packed,
         )
