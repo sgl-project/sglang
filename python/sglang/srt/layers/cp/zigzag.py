@@ -59,6 +59,7 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.runtime_context import attention_backends, get_device, get_parallel
+from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +72,9 @@ def _lists_to_device(
 ) -> dict[str, torch.Tensor]:
     """Upload int32 host lists as 16-byte-aligned views of one device buffer.
 
-    A pageable ``torch.tensor(..., device=cuda)`` is a synchronous copy that
-    waits for queued work on the stream; one pinned non-blocking copy is ordered
-    on the current stream without blocking the host.
+    A pageable ``torch.tensor(..., device=...)`` is a synchronous copy that
+    waits for queued work on the stream; ``async_h2d`` stages in pinned memory
+    so the copy is ordered on the current stream without blocking the host.
     """
     flat: list[int] = []
     starts: list[int] = []
@@ -81,8 +82,7 @@ def _lists_to_device(
         starts.append(len(flat))
         flat.extend(values)
         flat.extend([0] * (-len(flat) % _SEGMENT_ALIGN))
-    host = torch.tensor(flat, dtype=torch.int32, pin_memory=device.type == "cuda")
-    buffer = host.to(device, non_blocking=True)
+    buffer = async_h2d(flat, dtype=torch.int32, device=device)
     return {
         name: buffer[start : start + len(values)]
         for (name, values), start in zip(lists.items(), starts)
