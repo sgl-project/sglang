@@ -255,13 +255,14 @@ def _padded_batch_layout(
     """
     if bsz <= 1 or cu_seqlens.numel() != bsz + 1:
         return None
+    padded_cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
     # Identity check against the cached tensor, without a host sync. Callers
     # pass `device=` by keyword, so they share this lru_cache entry; a miss only
     # costs the zeroed output below, the result is the same.
-    if cu_seqlens is _get_cu_seqlens_for_shape(bsz, seq_len, device=device):
+    if cu_seqlens is padded_cu_seqlens:
         return None
     seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=device, dtype=torch.int32)
-    return _get_cu_seqlens_for_shape(bsz, seq_len, device=device), seq_lens
+    return padded_cu_seqlens, seq_lens
 
 
 def resolve_seqlens(
