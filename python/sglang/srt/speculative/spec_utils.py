@@ -58,7 +58,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -958,8 +958,6 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 
@@ -1024,10 +1022,11 @@ def _draft_without_cp(tp_context):
 
 
 def spec_stage_span(name: str):
-    """Profiler span for a coarse speculative-decoding stage (``draft`` /
-    ``draft_extend`` / ``verify``).
+    """Profiler span for a coarse speculative-decoding draft stage (``draft`` /
+    ``draft_extend``). The target verify forward is covered by the ``step[VERIFY ...]``
+    span in ``ModelRunner.forward``.
     """
-    return profile_range(name)
+    return forward_nvtx_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
