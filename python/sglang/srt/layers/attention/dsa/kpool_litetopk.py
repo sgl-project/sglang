@@ -5,6 +5,8 @@ import logging
 from subprocess import CalledProcessError
 
 import torch
+from triton.compiler.errors import CompilationError
+from triton.runtime.errors import PTXASError
 
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention.dsa.kpool_topk_transform import map_kpool4_groups
@@ -103,7 +105,13 @@ def try_kpool4_lite_topk(
     fallback_rows = rejected.nonzero().flatten()
     if fallback_rows.numel() == rows:
         return None
-    mapped = map_kpool4_groups(
-        groups, rejected, pool_lens, seq_lens, page_table, page_rows, offsets
-    )
+    try:
+        mapped = map_kpool4_groups(
+            groups, rejected, pool_lens, seq_lens, page_table, page_rows, offsets
+        )
+    except (CompilationError, PTXASError) as exc:
+        logger.warning(
+            "KPool LiteTopK mapping failed to compile. Using dense prefill (%s)", exc
+        )
+        return None
     return mapped, fallback_rows

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the guarded KPool4 prefill path."""
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
+from triton.compiler.errors import CompilationError
+from triton.runtime.errors import PTXASError
 
 from sglang.kernels.ops.attention.dsa.kpool_topk_transform import map_kpool4_groups
 from sglang.kernels.ops.attention.dsa.litetopk_prefill.fp8_indexer import (
@@ -250,3 +253,157 @@ def test_dense_fallback_routes_rejected_rows_and_keeps_padding(monkeypatch):
         [-1, -1, -1],
         [-1, -1, -1],
     ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        CompilationError(None, None, "mapper compilation failed"),
+        PTXASError("mapper assembly failed"),
+        RuntimeError("mapper launch failed"),
+    ],
+    ids=["compile", "ptxas", "launch"],
+)
+def test_mapper_falls_back_only_on_compilation_errors(monkeypatch, error):
+    from sglang.srt.layers.attention.dsa import kpool_litetopk
+
+    monkeypatch.setenv("SGLANG_OPT_USE_KPOOL4_LITE_TOPK_NATIVE", "0")
+    rows = kpool_litetopk._MIN_ROWS
+    keys = kpool_litetopk._MIN_KEYS
+    q = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn)
+    k = torch.empty((keys, 128), dtype=torch.float8_e4m3fn)
+    weights = torch.empty((rows, 32), dtype=torch.float32)
+    scale = torch.empty(keys, dtype=torch.float32)
+    metadata = torch.zeros(rows, dtype=torch.int32)
+    slab = SimpleNamespace(
+        scores=None, indices=None, counts=None, thresholds=None, overflow=metadata
+    )
+
+    def fail_mapper(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(kpool_litetopk, "is_fp8_indexer_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(kpool_litetopk, "_jit_available", lambda native: True)
+    monkeypatch.setattr(kpool_litetopk, "fp8_indexer_candidates", lambda *a, **kw: slab)
+    monkeypatch.setattr(kpool_litetopk, "topk_candidates", lambda *a, **kw: None)
+    monkeypatch.setattr(kpool_litetopk, "map_kpool4_groups", fail_mapper)
+
+    args = (
+        q,
+        weights,
+        k,
+        scale,
+        metadata,
+        metadata,
+        metadata,
+        metadata,
+        None,
+        None,
+        metadata,
+    )
+    if isinstance(error, RuntimeError):
+        with pytest.raises(RuntimeError) as exc:
+            kpool_litetopk.try_kpool4_lite_topk(*args, num_sms=1)
+        assert exc.value is error
+    else:
+        assert kpool_litetopk.try_kpool4_lite_topk(*args, num_sms=1) is None
+
+
+@pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 required")
+@pytest.mark.parametrize("paged", [False, True])
+@torch.inference_mode()
+def test_exact_indexer_matches_dense_after_partial_recovery(monkeypatch, paged):
+    from sglang.srt.layers.attention.dsa import dsa_indexer_kpool, kpool_litetopk
+
+    monkeypatch.setenv("SGLANG_OPT_USE_KPOOL4_LITE_TOPK_NATIVE", "0")
+    rows, keys_per_request = 4096, 24576
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(52591)
+    q = torch.randn(rows, 32, 128, generator=generator, device=device).to(
+        torch.float8_e4m3fn
+    )
+    k = torch.randn(2 * keys_per_request, 128, generator=generator, device=device).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(rows, 32, generator=generator, device=device)
+    scale = torch.rand(2 * keys_per_request, generator=generator, device=device).add_(
+        0.125
+    )
+    starts = torch.tensor([0, keys_per_request], device=device, dtype=torch.int32)
+    starts = starts.repeat_interleave(rows // 2)
+    pool_lens = torch.arange(
+        keys_per_request - rows // 2 + 1,
+        keys_per_request + 1,
+        device=device,
+        dtype=torch.int32,
+    ).repeat(2)
+    pool_lens[0] = 256  # This row cannot fill the candidate top-k.
+    seq_lens = 4 * pool_lens + torch.arange(rows, device=device, dtype=torch.int32) % 4
+    seq_lens[0] += 2
+    if paged:
+        width = 4 * keys_per_request + 3
+        page_table = torch.arange(3 * width, device=device, dtype=torch.int32).reshape(
+            3, width
+        )
+        page_rows = torch.tensor([2, 0], device=device, dtype=torch.int32)
+        page_rows = page_rows.repeat_interleave(rows // 2)
+        offsets = None
+    else:
+        page_table = page_rows = None
+        offsets = torch.tensor([137, 100203], device=device, dtype=torch.int32)
+        offsets = offsets.repeat_interleave(rows // 2)
+
+    cls = dsa_indexer_kpool.IndexerKPool
+    indexer = SimpleNamespace(
+        index_kpool=4, index_topk=2048, _fp8_mqa_logits=cls._fp8_mqa_logits
+    )
+    indexer._topk_from_kpool_logits = partial(cls._topk_from_kpool_logits, indexer)
+    run = partial(
+        cls._kpool_topk_by_row_chunks,
+        indexer,
+        q_fp8=q,
+        weights=weights,
+        kv_fp8=(k, scale),
+        logits_starts=starts,
+        logits_ends=starts + pool_lens,
+        pool_lens=pool_lens,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        page_table_row_index=page_rows,
+        topk_offsets=offsets,
+        topk_row_starts=starts,
+        row_chunks=(slice(0, rows),),
+        out_rows=rows + 2,
+    )
+    original = kpool_litetopk.try_kpool4_lite_topk
+    recovered = []
+
+    def record_rejected_rows(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert result is not None
+        recovered.extend(result[1].tolist())
+        return result
+
+    monkeypatch.setattr(kpool_litetopk, "try_kpool4_lite_topk", record_rejected_rows)
+    dense = run(use_lite_topk=False)
+    candidate = run(use_lite_topk=True)
+    assert 0 in recovered and len(recovered) < rows
+    assert torch.equal(candidate[rows:], dense[rows:])
+    assert (candidate[rows:] == -1).all()
+    dense, candidate = dense[:rows], candidate[:rows]
+    end = (pool_lens * 4).clamp(max=2048)
+    history = torch.arange(dense.shape[1], device=device)[None, :] < end[:, None]
+    assert torch.equal(
+        torch.where(history, candidate, -1).sort(dim=1).values,
+        torch.where(history, dense, -1).sort(dim=1).values,
+    )
+    assert torch.equal(
+        torch.where(history, -1, candidate), torch.where(history, -1, dense)
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
