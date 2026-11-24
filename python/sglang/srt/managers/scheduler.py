@@ -4243,6 +4243,8 @@ class Scheduler(
     @property
     def chunked_req(self) -> Optional[Req]:
         """The request between two chunks of its prefill, or None."""
+        if getattr(self, "_vpp_chunk_selection", None) is not None:
+            return self._pp_vpp_selected_chunk()
         return next(iter(self.chunked_reqs), None)
 
     def stash_chunked_request(self, req: Req):
@@ -4266,10 +4268,22 @@ class Scheduler(
         its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        if hasattr(self, "_vpp_layout") and self._pending_chunked_abort_req is None:
+            self._pending_chunked_abort_req = next(
+                (
+                    req
+                    for req in self.chunked_reqs
+                    if getattr(req, "_vpp_pending_chunked_abort", False)
+                    and not self._pp_vpp_req_retained(req)
+                ),
+                None,
+            )
         req = self._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        if hasattr(self, "_vpp_layout") and self._pp_vpp_req_retained(req):
+            return
+        if req not in self.chunked_reqs:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
@@ -4293,6 +4307,8 @@ class Scheduler(
         )
 
         self._pending_chunked_abort_req = None
+        if hasattr(req, "_vpp_pending_chunked_abort"):
+            req._vpp_pending_chunked_abort = False
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -6659,6 +6675,11 @@ class Scheduler(
     def _abort_chunked(self, recv_req: AbortReq) -> None:
         """Mark the chunked request; `process_pending_chunked_abort` aborts it at
         the next schedule."""
+        if hasattr(self, "_vpp_layout"):
+            for req in self.chunked_reqs:
+                if recv_req.matches(req.rid):
+                    req._vpp_pending_chunked_abort = True
+            return
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req

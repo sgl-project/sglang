@@ -469,10 +469,11 @@ class SchedulingVPPCore:
         ):
             if batches and batches[slot_id] is not None:
                 candidates.update((req.rid, req) for req in batches[slot_id].reqs)
-        if self.chunked_req is not None:
-            candidates[self.chunked_req.rid] = self.chunked_req
+        for req in getattr(self, "chunked_reqs", (self.chunked_req,)):
+            if req is not None:
+                candidates[req.rid] = req
 
-        ready = self.chunked_req is None or self.chunked_req.rid in generations
+        ready = True
         new_requests = 0
         tokens = 0
         for rid, start, end in requests:
@@ -481,6 +482,12 @@ class SchedulingVPPCore:
 
             req = candidates.get(rid)
             if req is None:
+                ready = False
+                continue
+            if any(
+                batch is not None and any(row is req for row in batch.reqs)
+                for batch in self.mbs
+            ):
                 ready = False
                 continue
             generation = int(getattr(req, "session_generation", None) or 0)
@@ -826,8 +833,9 @@ class SchedulingVPPCore:
             for req in batch.reqs:
                 if req.rid == rid:
                     return req
-        if self.chunked_req is not None and self.chunked_req.rid == rid:
-            return self.chunked_req
+        for req in getattr(self, "chunked_reqs", (self.chunked_req,)):
+            if req is not None and req.rid == rid:
+                return req
         return None
 
     def _event_loop_vpp_rank_local(self: Scheduler):
@@ -1459,7 +1467,9 @@ class SchedulingVPPCore:
                 else:
                     req = self._pp_vpp_find_req(str(payload["rid"]))
                 if req is not None:
-                    if not self._pp_vpp_fixed_batch or self.chunked_req is req:
+                    if not self._pp_vpp_fixed_batch or req in getattr(
+                        self, "chunked_reqs", (self.chunked_req,)
+                    ):
                         self._pending_chunked_abort_req = req
                         self.process_pending_chunked_abort()
                     else:
@@ -1753,7 +1763,6 @@ class SchedulingVPPCore:
                         or continuation
                         or bool(self.waiting_queue)
                     )
-                    and (self._pp_vpp_overlap_chunks or not pending_chunk_batches)
                     and self.pause_state.may_launch()
                     and not decode_round_active
                     and self._pp_vpp_can_queue_admit(

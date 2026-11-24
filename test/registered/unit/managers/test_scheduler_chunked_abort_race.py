@@ -101,6 +101,34 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
 
+    def test_vpp_abort_all_waits_for_each_retained_chunk(self):
+        """Two chunk owners must retire independently after their batches drain."""
+        first, second = _FakeReq("first"), _FakeReq("second")
+        sched = _make_scheduler(None, chunked_req=first, running_reqs=[])
+        move([second], sched.chunked_reqs)
+        sched._vpp_layout = object()
+        sched.mbs = [
+            SimpleNamespace(reqs=[first]),
+            SimpleNamespace(reqs=[second]),
+        ]
+        sched._abort_chunked(AbortReq(abort_all=True))
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache") as release,
+        ):
+            sched.process_pending_chunked_abort()
+            release.assert_not_called()
+            sched.mbs[1] = None
+            sched.process_pending_chunked_abort()
+            self.assertEqual(list(sched.chunked_reqs), [first])
+            self.assertEqual(release.call_args.args[0], second)
+            sched.mbs[0] = None
+            sched.process_pending_chunked_abort()
+            self.assertEqual(list(sched.chunked_reqs), [])
+            self.assertEqual(
+                [call.args[0] for call in release.call_args_list], [second, first]
+            )
+
     def test_req_left_chunked_slot_is_aborted(self):
         req = _FakeReq("zombie_rid")
         sched = _make_scheduler(req, chunked_req=None, running_reqs=[req])

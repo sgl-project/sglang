@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+from contextlib import contextmanager
 
 import torch
 
@@ -74,18 +75,33 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             ]
         )
 
-    def _pp_vpp_can_queue_admit(
-        self, batch_seq, pending_admits, slot_batch_seqs, rank_schedule
-    ):
-        # Main's chunk bookkeeping advances through the completed batch.
-        # A still-retained request cannot be planned for another chunk.
-        if self.chunked_req is not None and any(
-            batch is not None and any(req is self.chunked_req for req in batch.reqs)
+    def _pp_vpp_req_retained(self, req):
+        return any(
+            batch is not None and any(row is req for row in batch.reqs)
             for batch in self.mbs
-        ):
-            return False
-        return super()._pp_vpp_can_queue_admit(
-            batch_seq, pending_admits, slot_batch_seqs, rank_schedule
+        )
+
+    @contextmanager
+    def _pp_vpp_select_chunk(self, request_ids=None, *, include_retained=False):
+        # Keep ownership in chunked_reqs. Only the planning/result-processing
+        # view changes, and a newly admitted chunk is visible within the scope.
+        previous = getattr(self, "_vpp_chunk_selection", None)
+        self._vpp_chunk_selection = (request_ids, include_retained)
+        try:
+            yield
+        finally:
+            self._vpp_chunk_selection = previous
+
+    def _pp_vpp_selected_chunk(self):
+        request_ids, include_retained = self._vpp_chunk_selection
+        return next(
+            (
+                req
+                for req in self.chunked_reqs
+                if (request_ids is None or req.rid in request_ids)
+                and (include_retained or not self._pp_vpp_req_retained(req))
+            ),
+            None,
         )
 
     def _init_scheduling_native_loop_state(self):
@@ -311,13 +327,11 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         slot_id = batch_seq % len(self.mbs)
         if slot_batch_seqs[slot_id] is not None:
             raise RuntimeError("VPP admission slot still owned")
-        if expected_manifest is not None and self.chunked_req is not None:
-            if self.chunked_req.rid not in {
-                rid for rid, _, _ in expected_manifest["requests"]
-            }:
-                # Main owns the continuation in chunked_reqs. It cannot be
-                # hidden by assigning the read-only chunked_req property.
-                return None
+        request_ids = (
+            None
+            if expected_manifest is None
+            else {rid for rid, _, _ in expected_manifest["requests"]}
+        )
         self.running_batch = self.running_mbs[slot_id]
         self.last_batch = self.last_mbs[slot_id]
         if (
@@ -332,28 +346,29 @@ class SchedulerVPPMixin(SchedulingVPPCore):
                     req.vpp_prefix_limit = spans[req.rid][0]
         self._vpp_admit_manifest = expected_manifest
         try:
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_pending_chunked_abort()
-                self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
-                )
-                plan = self.get_new_batch_prefill(self.running_batch)
-            elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                plan = self.get_next_disagg_decode_batch_to_run(
-                    running_batch=self.running_batch
-                )
-                self._flush_staging_scatters()
-            else:
-                plan = self.get_next_batch_to_run(
-                    running_batch=self.running_batch, last_batch=self.last_batch
-                )
+            with self._pp_vpp_select_chunk(request_ids):
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.process_pending_chunked_abort()
+                    self.process_prefill_chunk(
+                        last_batch=self.last_batch, running_batch=self.running_batch
+                    )
+                    plan = self.get_new_batch_prefill(self.running_batch)
+                elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                    plan = self.get_next_disagg_decode_batch_to_run(
+                        running_batch=self.running_batch
+                    )
+                    self._flush_staging_scatters()
+                else:
+                    plan = self.get_next_batch_to_run(
+                        running_batch=self.running_batch, last_batch=self.last_batch
+                    )
         finally:
             self._vpp_admit_manifest = None
         batch = plan.batch_to_run
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
             batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
+                batch, chunked_req=batch.chunked_req if batch is not None else None
             )
         if batch is not None:
             if batch.return_hidden_states or any(
@@ -541,7 +556,10 @@ class SchedulerVPPMixin(SchedulingVPPCore):
                 return_logprob=batch.return_logprob, return_hidden_states=False
             )
         result.copy_done.synchronize()
-        self._pp_process_batch_result(batch, result)
+        with self._pp_vpp_select_chunk(
+            {req.rid for req in batch.reqs}, include_retained=True
+        ):
+            self._pp_process_batch_result(batch, result)
         if getattr(batch, "contains_last_prefill_chunk", False):
             for req in batch.reqs:
                 if req is not batch.chunked_req:

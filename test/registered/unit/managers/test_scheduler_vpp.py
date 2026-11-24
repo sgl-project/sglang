@@ -335,6 +335,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         )
         scheduler.waiting_queue = [req]
         scheduler.chunked_req = None
+        scheduler.mbs = [None, None]
         scheduler._pp_vpp_prefix_registry = PipelinePrefixRegistry()
         scheduler.page_size = 4
         scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
@@ -487,6 +488,21 @@ class TestSchedulingVPPCore(CustomTestCase):
             set(scheduler.actions),
         )
         self.assertTrue(all(wire["payload"]["end"] == 8 for wire in materialized))
+
+    def test_native_ticks_admit_unrelated_batch_while_chunk_is_pending(self):
+        def before_tick(scheduler, context):
+            if context["tick"] == 0:
+                self._tick_batches(scheduler, 2)
+                batch = scheduler.batches[0]
+                batch.chunked_req = batch.reqs[0]
+                batch.contains_last_prefill_chunk = False
+
+        scheduler, context = self._control_loop(
+            rank=0, core_type=_TickCore, ticks=2, before_tick=before_tick
+        )
+        self.assertEqual(scheduler.actions, [(0, 0), (1, 0)])
+        self.assertEqual(context["pending_chunk_batches"], {0})
+        self.assertEqual(scheduler.finalized, [])
 
     def test_native_ticks_quarantine_next_generation_until_completion_returns(self):
         snapshots = {}
@@ -1336,7 +1352,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
         scheduler.waiting_queue = [req]
         scheduler.chunked_req = SimpleNamespace(rid="other")
-        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
         scheduler.chunked_req = req
         scheduler.waiting_queue = []
         self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
@@ -1346,6 +1362,19 @@ class TestSchedulingVPPCore(CustomTestCase):
         registry.plan("request", 1, 1, 4, 8, range(4))
         with self.assertRaisesRegex(RuntimeError, "prefix order mismatch"):
             scheduler._pp_vpp_remote_manifest_ready(envelope)
+
+    def test_remote_manifest_can_select_a_different_chunked_request(self):
+        scheduler, req, envelope = self._remote_admission()
+        first = SimpleNamespace(rid="first")
+        scheduler.chunked_req = first
+        scheduler.chunked_reqs = [first, req]
+        scheduler.waiting_queue = []
+        scheduler.mbs = [None, SimpleNamespace(reqs=[first])]
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        scheduler.mbs[0] = SimpleNamespace(reqs=[req])
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        scheduler.mbs[0] = None
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
 
     def test_decode_manifest_uses_running_slot_and_current_sequence_length(self):
         scheduler, req, _ = self._remote_admission()
@@ -2375,20 +2404,50 @@ class TestNativeVPPAdapter(CustomTestCase):
         self.assertEqual(calls[1][2], calls[3][2])
         self.assertNotEqual(calls[0][2], calls[1][2])
 
-    def test_retained_chunk_blocks_admission_until_batch_is_released(self):
-        """Local first-pass completion cannot replan a still-owned chunk."""
-        scheduler = object.__new__(SchedulerVPPMixin)
-        req = object()
-        scheduler.chunked_req = req
-        scheduler.mbs = [SimpleNamespace(reqs=[req]), None]
+    def test_retained_chunk_only_blocks_its_own_continuation(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = object.__new__(Scheduler)
+        first = SimpleNamespace(rid="first")
+        second = SimpleNamespace(rid="second")
+        scheduler.chunked_reqs = [first]
+        scheduler.mbs = [SimpleNamespace(reqs=[first]), None]
         schedule = PipelineRankSchedule(0, 2, 2, 2)
-        self.assertFalse(
+        self.assertTrue(
             scheduler._pp_vpp_can_queue_admit(1, set(), [0, None], schedule)
         )
-        scheduler.mbs = [None, None]
-        self.assertTrue(
-            scheduler._pp_vpp_can_queue_admit(1, set(), [None, None], schedule)
-        )
+        with scheduler._pp_vpp_select_chunk():
+            self.assertIsNone(scheduler.chunked_req)
+            scheduler.chunked_reqs.append(second)
+            self.assertIs(scheduler.chunked_req, second)
+        self.assertIs(scheduler.chunked_req, first)
+        scheduler.mbs[1] = SimpleNamespace(reqs=[second])
+        with scheduler._pp_vpp_select_chunk():
+            self.assertIsNone(scheduler.chunked_req)
+        with scheduler._pp_vpp_select_chunk({"second"}, include_retained=True):
+            self.assertIs(scheduler.chunked_req, second)
+        scheduler.mbs[0] = None
+        with scheduler._pp_vpp_select_chunk():
+            self.assertIs(scheduler.chunked_req, first)
+        with scheduler._pp_vpp_select_chunk({"second"}):
+            self.assertIsNone(scheduler.chunked_req)
+        scheduler.mbs[1] = None
+        with scheduler._pp_vpp_select_chunk({"second"}):
+            self.assertIs(scheduler.chunked_req, second)
+        self.assertEqual(scheduler.chunked_reqs, [first, second])
+
+    def test_chunk_selection_restores_after_planning_failure(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = object.__new__(Scheduler)
+        req = SimpleNamespace(rid="request")
+        scheduler.chunked_reqs = [req]
+        scheduler.mbs = [SimpleNamespace(reqs=[req]), None]
+        with self.assertRaisesRegex(RuntimeError, "planning failed"):
+            with scheduler._pp_vpp_select_chunk():
+                self.assertIsNone(scheduler.chunked_req)
+                raise RuntimeError("planning failed")
+        self.assertIs(scheduler.chunked_req, req)
 
     def test_prefix_publication_preserves_span_until_native_result_processing(self):
         """Publishing remote completion cannot erase the span just executed."""
