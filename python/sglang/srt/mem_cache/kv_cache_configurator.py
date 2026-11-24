@@ -2583,9 +2583,6 @@ class KVCacheConfigurator:
         else:
             PoolCls = dsa_pool_class
         if envs.SGLANG_GLM_DSA_FIXED_FABRIC_POOL.get():
-            # Checked after the class is chosen: sharding, HiSparse and CP swap it.
-            if PoolCls is not DSATokenToKVPool:
-                raise ValueError("fixed FABRIC backing requires the built-in DSA pool")
             pool_kwargs["fixed_fabric_pool"] = True
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True

@@ -69,8 +69,6 @@ class IndexKeyCache:
 
     def clear(self) -> None:
         del self.buffer
-        if self._fixed_fabric_owner is not None:
-            self._fixed_fabric_owner.close()
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:

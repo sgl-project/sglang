@@ -5020,8 +5020,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
 
     def _clear_buffers(self):
         del self.kv_buffer
-        if self._fixed_fabric_owner is not None:
-            self._fixed_fabric_owner.close()
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -5554,7 +5552,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 dcp_replicated=dcp_replicated,
                 enable_memory_saver=enable_memory_saver,
                 use_fp4_indexer=use_fp4_indexer,
-                kv_scale_ue8m0=kv_scale_ue8m0,
             )
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
