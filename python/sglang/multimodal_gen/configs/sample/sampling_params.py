@@ -1100,17 +1100,19 @@ class SamplingParams:
         sampling_params._adjust(server_args)
         # __post_init__ maps the default output_quality before _adjust knows the
         # data type, so an image got the video default and its PNG the slow
-        # compressed encode instead of the stored one
-        quality = sampling_params.output_quality
+        # compressed encode instead of the stored one. Only image requests are
+        # touched: action sampling params carry no output quality at all.
         if (
-            user_kwargs.get("output_compression") is None
-            and quality is not None
-            and sampling_params.data_type != DataType.VIDEO
+            sampling_params.data_type == DataType.IMAGE
+            and user_kwargs.get("output_compression") is None
+            and sampling_params.output_quality is not None
             and sampling_params.output_compression
-            == sampling_params._adjust_output_quality(quality, DataType.VIDEO)
+            == sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.VIDEO
+            )
         ):
             sampling_params.output_compression = sampling_params._adjust_output_quality(
-                quality, sampling_params.data_type
+                sampling_params.output_quality, DataType.IMAGE
             )
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
