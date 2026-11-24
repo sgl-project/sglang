@@ -1,5 +1,6 @@
 import sys
 from collections.abc import Iterator
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -117,52 +118,43 @@ def test_qsa_fp8_chunk_prefill_batch_invariance(
 
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
     torch.manual_seed(42)
-    long_q, short_q = 4096, 1024
-    long_kv, short_kv = 16384, 4096
+    q_lens = (4096, 1024)
+    kv_lens = (16384, 4096)
     heads, dim, topk = 3, 256, 1024
-    q = torch.randn(long_q + short_q, heads, dim, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(sum(q_lens), heads, dim, dtype=torch.bfloat16, device="cuda")
     k, v = [
-        torch.randn(long_kv + short_kv, 1, dim, dtype=torch.bfloat16, device="cuda").to(
+        torch.randn(sum(kv_lens), 1, dim, dtype=torch.bfloat16, device="cuda").to(
             torch.float8_e4m3fn
         )
         for _ in range(2)
     ]
     indices = torch.cat(
-        (
-            torch.randint(0, long_kv, (long_q, topk), dtype=torch.int32, device="cuda"),
-            torch.randint(
-                0, short_kv, (short_q, topk), dtype=torch.int32, device="cuda"
-            ),
+        [
+            torch.randint(0, kv_len, (q_len, topk), dtype=torch.int32, device="cuda")
+            for q_len, kv_len in zip(q_lens, kv_lens)
+        ]
+    )
+    cu_q = torch.tensor([0, *accumulate(q_lens)], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, *accumulate(kv_lens)], dtype=torch.int32, device="cuda")
+
+    def run(num_requests):
+        total_q = sum(q_lens[:num_requests])
+        total_k = sum(kv_lens[:num_requests])
+        return sparse_gqa_fwd_interface_triton_ck(
+            q[:total_q],
+            k[:total_k],
+            v[:total_k],
+            indices[:total_q],
+            cu_q[: num_requests + 1],
+            cu_k[: num_requests + 1],
+            torch.tensor(kv_lens[:num_requests], dtype=torch.int32, device="cuda"),
+            dim**-0.5,
+            max_q=q_lens[0],
         )
-    )
-    scale = dim**-0.5
 
-    reference = sparse_gqa_fwd_interface_triton_ck(
-        q[:long_q],
-        k[:long_kv],
-        v[:long_kv],
-        indices[:long_q],
-        torch.tensor([0, long_q], dtype=torch.int32, device="cuda"),
-        torch.tensor([0, long_kv], dtype=torch.int32, device="cuda"),
-        torch.tensor([long_kv], dtype=torch.int32, device="cuda"),
-        scale,
-        max_q=long_q,
-    )
-    actual = sparse_gqa_fwd_interface_triton_ck(
-        q,
-        k,
-        v,
-        indices,
-        torch.tensor([0, long_q, long_q + short_q], dtype=torch.int32, device="cuda"),
-        torch.tensor(
-            [0, long_kv, long_kv + short_kv], dtype=torch.int32, device="cuda"
-        ),
-        torch.tensor([long_kv, short_kv], dtype=torch.int32, device="cuda"),
-        scale,
-        max_q=long_q,
-    )
-
-    torch.testing.assert_close(actual[:long_q], reference, rtol=0, atol=0)
+    reference = run(1)
+    actual = run(2)
+    torch.testing.assert_close(actual[: q_lens[0]], reference, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

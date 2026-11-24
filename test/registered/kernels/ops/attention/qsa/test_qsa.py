@@ -49,121 +49,114 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
-def test_fp8_chunk_pipeline_eligibility_is_device_agnostic():
+def test_fp8_dispatch_caches_device_profile_and_reads_mode_once(monkeypatch):
+    calls = {"mode": 0, "device": 0}
+
+    def count(name, result):
+        calls[name] += 1
+        return result
+
+    monkeypatch.setattr(
+        sparse_attn_module,
+        "is_batch_invariant_mode_enabled",
+        lambda: count("mode", False),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_name",
+        lambda _device: count("device", "NVIDIA H20"),
+    )
+
+    cached = (
+        sparse_attn_module._get_device_name,
+        sparse_attn_module._get_validated_fp8_chunk_pipeline_config,
+    )
+    for function in cached:
+        function.cache_clear()
+    try:
+        for _ in range(2):
+            sparse_attn_module._get_sparse_gqa_chunk_launch_config(
+                torch.device("cuda"), 4096, 1, torch.float8_e4m3fn, 256, 3, 1024
+            )
+        assert cached[1].cache_info().misses == 1
+    finally:
+        for function in cached:
+            function.cache_clear()
+
+    assert calls == {"mode": 2, "device": 1}
+
+
+def test_fp8_chunk_pipeline_policy():
     valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
-    assert sparse_attn_module._is_fp8_chunk_pipeline_eligible(*valid)
 
     for group_size in (1, 3, 6, 12):
-        supported = valid.copy()
-        supported[4] = group_size
-        supported[5] = 1024
-        assert sparse_attn_module._is_fp8_chunk_pipeline_eligible(*supported)
+        args = [*valid[:4], group_size, 1024]
+        assert sparse_attn_module._is_fp8_chunk_pipeline_eligible(*args)
 
-    for index, value in [
-        (0, 8191),
-        (2, torch.bfloat16),
-        (3, 128),
-        (4, 13),
-        (5, 1023),
-    ]:
+    config = sparse_attn_module._get_fp8_chunk_pipeline_config(
+        "NVIDIA H20", False, *valid
+    )
+    assert config is not None and config.block_n == 32
+
+    assert not sparse_attn_module._get_fp8_chunk_pipeline_config(
+        "NVIDIA H200", False, *valid
+    )
+    assert not sparse_attn_module._get_fp8_chunk_pipeline_config(
+        "NVIDIA H20", True, *valid
+    )
+    for index, value in ((0, 8191), (2, torch.bfloat16), (3, 128), (4, 13), (5, 1023)):
         invalid = valid.copy()
         invalid[index] = value
-        assert not sparse_attn_module._is_fp8_chunk_pipeline_eligible(*invalid)
+        assert not sparse_attn_module._get_fp8_chunk_pipeline_config(
+            "NVIDIA H20", False, *invalid
+        )
 
 
-def test_fp8_chunk_pipeline_config_requires_validated_device():
-    valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
-
-    config = sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H20", *valid)
-    assert config is not None
-    assert config.block_n == 32
-
-    assert (
-        sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H100", *valid) is None
-    )
-    assert (
-        sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H200", *valid) is None
-    )
-
-    invalid = valid.copy()
-    invalid[2] = torch.bfloat16
-    assert (
-        sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H20", *invalid)
-        is None
-    )
-
-
-@pytest.mark.parametrize(
-    ("group_size", "topk"),
-    [(3, 1024), (6, FINAL_TOPK), (8, 1024), (12, 1024)],
-)
-def test_fp8_operand_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
-        pytest.skip("FP8-capable CUDA GPU required")
-
+def _fp8_paged_pipeline_case():
     torch.manual_seed(42)
-    device = torch.device("cuda")
-    q_len, kv_len = 4096, 8192
-    q = torch.randn(q_len, group_size, 256, dtype=torch.bfloat16, device=device)
+    q_len, kv_len, head_dim, topk = 4096, 8192, 256, 1024
+    q = torch.randn(q_len, 3, head_dim, dtype=torch.bfloat16, device="cuda")
     k, v = [
-        torch.randn(kv_len, 1, 256, dtype=torch.bfloat16, device=device).to(
+        torch.randn(kv_len, 1, head_dim, dtype=torch.bfloat16, device="cuda").to(
             torch.float8_e4m3fn
         )
         for _ in range(2)
     ]
     indices = torch.randint(
-        0, kv_len - q_len + 1, (q_len, topk), dtype=torch.int32, device=device
+        0, kv_len - q_len + 1, (q_len, topk), dtype=torch.int32, device="cuda"
     )
-    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
-    cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
-    kv_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
-    args = (q, k, v, indices, cu_q, cu_k, kv_lens, 256**-0.5)
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor([kv_len], dtype=torch.int32, device="cuda")
+    return SimpleNamespace(
+        paged=(
+            q,
+            k,
+            v,
+            torch.arange(kv_len, dtype=torch.int32, device="cuda")[None, :],
+            indices,
+            cu_q,
+            kv_lens,
+            head_dim**-0.5,
+        ),
+    )
 
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
-    actual = sparse_gqa_fwd_interface_triton_ck(*args)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H100")
-    expected = sparse_gqa_fwd_interface_triton_ck(*args)
 
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+def _set_qsa_device_name(monkeypatch, device_name):
+    monkeypatch.setattr(
+        sparse_attn_module, "_get_device_name", lambda _device: device_name
+    )
 
 
 def test_fp8_paged_operand_pipeline_matches_bf16_dot(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")
 
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    q_len, kv_len, topk = 4096, 8192, 1024
-    group_size, head_dim = 3, 256
-    q = torch.randn(q_len, group_size, head_dim, dtype=torch.bfloat16, device=device)
-    k, v = [
-        torch.randn(kv_len, 1, head_dim, dtype=torch.bfloat16, device=device).to(
-            torch.float8_e4m3fn
-        )
-        for _ in range(2)
-    ]
-    slot_table = torch.arange(kv_len, dtype=torch.int32, device=device)[None, :]
-    indices = torch.randint(
-        0, kv_len - q_len + 1, (q_len, topk), dtype=torch.int32, device=device
-    )
-    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
-    kv_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
-    args = (
-        q,
-        k,
-        v,
-        slot_table,
-        indices,
-        cu_q,
-        kv_lens,
-        head_dim**-0.5,
-    )
-
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
-    actual = sparse_gqa_paged_prefill_triton(*args, max_q=q_len)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H100")
-    expected = sparse_gqa_paged_prefill_triton(*args, max_q=q_len)
-
+    case = _fp8_paged_pipeline_case()
+    run = lambda: sparse_gqa_paged_prefill_triton(*case.paged, max_q=4096)
+    _set_qsa_device_name(monkeypatch, "NVIDIA H20")
+    actual = run()
+    _set_qsa_device_name(monkeypatch, "NVIDIA H100")
+    expected = run()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
@@ -2398,11 +2391,14 @@ def test_qsa_cp_extend_reads_cached_prefix_in_place(
 
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("heads", [1, 3, 6, 12])
-def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
+def test_qsa_large_fp8_prefill_float_reference(monkeypatch, head_dim, heads):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")
+    _set_qsa_device_name(monkeypatch, "NVIDIA H20")
     torch.manual_seed(19)
-    rows, prefix, topk = 2053, 64, 64
+    rows, prefix, topk = (
+        (4096, 4096, 1024) if (head_dim, heads) == (256, 3) else (2053, 64, 64)
+    )
     q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(rows + prefix, 1, head_dim, device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn

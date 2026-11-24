@@ -1,6 +1,7 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
 import re
+from functools import cache
 from typing import NamedTuple, Optional
 
 import torch
@@ -33,10 +34,40 @@ _VALIDATED_FP8_CHUNK_PIPELINE_CONFIGS = {
 }
 
 
-def _get_best_config(total_q: int):
-    if is_batch_invariant_mode_enabled():
+@cache
+def _get_device_name(device: torch.device) -> str:
+    return torch.cuda.get_device_name(device)
+
+
+@cache
+def _get_validated_fp8_chunk_pipeline_config(
+    device_name: str,
+) -> _FP8ChunkPipelineConfig | None:
+    return next(
+        (
+            config
+            for device, config in _VALIDATED_FP8_CHUNK_PIPELINE_CONFIGS.items()
+            if re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(device)}(?![A-Za-z0-9])",
+                device_name,
+            )
+        ),
+        None,
+    )
+
+
+def _get_best_config(
+    total_q: int,
+    batch_invariant_mode: bool | None = None,
+    device_name: str | None = None,
+):
+    if batch_invariant_mode is None:
+        batch_invariant_mode = is_batch_invariant_mode_enabled()
+    if batch_invariant_mode:
         return (32, 4, 2)
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    if device_name is None:
+        device_name = _get_device_name(torch.device("cuda", 0))
+    table = _H20_CONFIGS if "H20" in device_name else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
@@ -60,6 +91,7 @@ def _is_fp8_chunk_pipeline_eligible(
 
 def _get_fp8_chunk_pipeline_config(
     device_name: str,
+    batch_invariant_mode: bool,
     total_q: int,
     num_requests: int,
     kv_dtype: torch.dtype,
@@ -67,23 +99,42 @@ def _get_fp8_chunk_pipeline_config(
     group_size: int,
     topk: int,
 ) -> _FP8ChunkPipelineConfig | None:
-    if is_batch_invariant_mode_enabled():
+    if batch_invariant_mode:
         return None
     if not _is_fp8_chunk_pipeline_eligible(
         total_q, num_requests, kv_dtype, head_dim, group_size, topk
     ):
         return None
-    return next(
-        (
-            config
-            for device, config in _VALIDATED_FP8_CHUNK_PIPELINE_CONFIGS.items()
-            if re.search(
-                rf"(?<![A-Za-z0-9]){re.escape(device)}(?![A-Za-z0-9])",
-                device_name,
-            )
-        ),
-        None,
+    return _get_validated_fp8_chunk_pipeline_config(device_name)
+
+
+def _get_sparse_gqa_chunk_launch_config(
+    device: torch.device,
+    total_q: int,
+    num_requests: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    group_size: int,
+    topk: int,
+) -> tuple[int, int, int, bool]:
+    batch_invariant_mode = is_batch_invariant_mode_enabled()
+    device_name = _get_device_name(device)
+    block_n, warps, stages = _get_best_config(
+        total_q, batch_invariant_mode, device_name
     )
+    fp8_pipeline_config = _get_fp8_chunk_pipeline_config(
+        device_name,
+        batch_invariant_mode,
+        total_q,
+        num_requests,
+        kv_dtype,
+        head_dim,
+        group_size,
+        topk,
+    )
+    if fp8_pipeline_config is not None:
+        block_n = fp8_pipeline_config.block_n
+    return block_n, warps, stages, fp8_pipeline_config is not None
 
 
 @triton.jit
@@ -463,9 +514,8 @@ def sparse_gqa_fwd_interface_triton_ck(
         # Host sync; callers that know the longest entry pass it instead.
         max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
-    fp8_pipeline_config = _get_fp8_chunk_pipeline_config(
-        torch.cuda.get_device_name(q.device),
+    block_n, warps, stages, use_fp8_pipeline = _get_sparse_gqa_chunk_launch_config(
+        q.device,
         total_q,
         cu_q.shape[0] - 1,
         k.dtype,
@@ -473,9 +523,6 @@ def sparse_gqa_fwd_interface_triton_ck(
         group_size,
         indices.shape[-1],
     )
-    use_fp8_pipeline = fp8_pipeline_config is not None
-    if fp8_pipeline_config is not None:
-        block_n = fp8_pipeline_config.block_n
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -643,9 +690,8 @@ def sparse_gqa_paged_prefill_triton(
         num_warps=4,
     )
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
-    fp8_pipeline_config = _get_fp8_chunk_pipeline_config(
-        torch.cuda.get_device_name(q.device),
+    block_n, warps, stages, use_fp8_pipeline = _get_sparse_gqa_chunk_launch_config(
+        q.device,
         total_q,
         num_entries,
         k_cache.dtype,
@@ -653,9 +699,6 @@ def sparse_gqa_paged_prefill_triton(
         group_size,
         topk,
     )
-    use_fp8_pipeline = fp8_pipeline_config is not None
-    if fp8_pipeline_config is not None:
-        block_n = fp8_pipeline_config.block_n
     _sparse_gqa_chunk_prefill[(max_q, num_entries * num_kv_heads)](
         q,
         k_cache,
