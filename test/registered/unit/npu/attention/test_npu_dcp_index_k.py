@@ -51,7 +51,6 @@ class TestNpuDcpIndexK(unittest.TestCase):
         kwargs = scored_indexer.call_args.kwargs
         self.assertIs(kwargs["seqused_k"], seq_lens)
         self.assertEqual(kwargs["cu_seqlens_q"].tolist(), [0, 1, 2, 3])
-        self.assertEqual(kwargs["mask_mode"], 0)
         self.assertEqual(kwargs["return_value"], 1)
 
 

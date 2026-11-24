@@ -11,19 +11,17 @@ def get_scored_indexer():
         from sgl_kernel_npu.operators.utils.generation import Generation, get_hardware
 
         if (
-            detect_cann_version() == "9.2.0"
-            and get_hardware().generation is Generation.ARCH22
+            detect_cann_version() != "9.2.0"
+            or get_hardware().generation is not Generation.ARCH22
         ):
-            # The Python wrapper can be present without the bundled CANN op.
-            from sgl_kernel_npu._third_party.sgl_ops_transformer.ops import (
-                lightning_indexer,
-            )
-
-            if callable(lightning_indexer):
-                return lightning_indexer_v2
+            return None
+        # The public wrapper can be installed without its CANN binding.
+        from sgl_kernel_npu._third_party.sgl_ops_transformer.ops import (
+            lightning_indexer,
+        )
     except (ImportError, OSError, RuntimeError):
         return None
-    return None
+    return lightning_indexer_v2 if callable(lightning_indexer) else None
 
 
 def plan_index_k_prefill_gather(
@@ -36,10 +34,9 @@ def plan_index_k_prefill_gather(
     span = page_size * dcp_size
     cycles = (seq_lens_cpu + span - 1) // span
     cycle_ids = torch.arange(local_block_table.shape[1], device=seq_lens_cpu.device)
-    valid = cycle_ids < cycles[:, None]
-    req_rows, req_cycles = valid.nonzero(as_tuple=True)
     device = local_block_table.device
-    pages = local_block_table[req_rows.to(device), req_cycles.to(device)]
+    req_rows, req_cycles = (cycle_ids < cycles[:, None]).nonzero().to(device).unbind(1)
+    pages = local_block_table[req_rows, req_cycles]
 
     first = cycles.cumsum(0) - cycles
     logical_pages = torch.arange(
@@ -48,27 +45,6 @@ def plan_index_k_prefill_gather(
     block_table = first[:, None] * dcp_size + logical_pages
     block_table.masked_fill_(logical_pages * page_size >= seq_lens_cpu[:, None], 0)
     return pages, block_table.to(device=device, dtype=torch.int32)
-
-
-def merge_index_k_topk(
-    indices: torch.Tensor,
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_size: int,
-    group,
-) -> torch.Tensor:
-    """Merge local candidates into request-relative global token positions."""
-    valid = (indices >= 0) & (indices < seq_lens[:, None])
-    global_indices = (
-        (indices // page_size * group.world_size + group.rank_in_group) * page_size
-        + indices % page_size
-    ).masked_fill_(~valid, -1)
-    scores = scores.masked_fill(~valid, -torch.inf)
-    # One HCCL gather preserves the FP32 score bits and int32 positions.
-    candidates = torch.stack((scores.view(torch.int32), global_indices), dim=1)
-    candidates = group.all_gather(candidates, dim=-1)
-    best = candidates[:, 0].view(torch.float32).topk(indices.shape[-1], dim=-1).indices
-    return candidates[:, 1].gather(-1, best)
 
 
 def score_sharded_index_k(
@@ -97,9 +73,19 @@ def score_sharded_index_k(
         block_table=block_table.contiguous(),
         layout_q="TND",
         layout_k="PA_BBND",
-        mask_mode=0,
         return_value=1,
     )
-    return merge_index_k_topk(
-        indices.squeeze(1), scores.squeeze(1), seq_lens, key.shape[1], group
+    indices, scores = indices.squeeze(1), scores.squeeze(1)
+    page_size = key.shape[1]
+    valid = (indices >= 0) & (indices < seq_lens[:, None])
+    global_indices = (
+        (indices // page_size * group.world_size + group.rank_in_group) * page_size
+        + indices % page_size
+    ).masked_fill_(~valid, -1)
+    # One HCCL gather preserves the FP32 score bits and int32 positions.
+    scores = scores.masked_fill(~valid, -torch.inf)
+    candidates = group.all_gather(
+        torch.stack((scores.view(torch.int32), global_indices), dim=1), dim=-1
     )
+    best = candidates[:, 0].view(torch.float32).topk(topk, dim=-1).indices
+    return candidates[:, 1].gather(-1, best)

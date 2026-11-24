@@ -462,7 +462,6 @@ class KVCacheConfigurator:
             or self.modelslim_cache_layout is not None
             or get_parallel().attn_cp_size > 1
             or get_disagg().disaggregation_mode != "null"
-            or get_disagg().enable_pd_role_switch
             or get_memory().enable_hierarchical_cache
             or get_memory().enable_hisparse
         ):

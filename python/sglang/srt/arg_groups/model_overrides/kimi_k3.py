@@ -179,15 +179,16 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
+    if get_platform().is_npu:
+        return {"decode_state_free_radix_default": True}
     cfg = resolving_view(server_args)
-    platform = get_platform()
-    overrides = {"decode_state_free_radix_default": True}
-    if cfg.dcp_size > 1 and not platform.is_npu:
+    overrides = {}
+    if cfg.dcp_size > 1:
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
                 "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
-        pd_backends = ("mooncake", "mori") if platform.is_gfx95 else ("mooncake",)
+        pd_backends = ("mooncake", "mori") if get_platform().is_gfx95 else ("mooncake",)
         if (
             cfg.disaggregation_mode != "null"
             and cfg.disaggregation_transfer_backend not in pd_backends
@@ -243,9 +244,10 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
-    if not platform.is_npu and cfg.enable_flashmla_prefill_token_packing is None:
+    if cfg.enable_flashmla_prefill_token_packing is None:
         logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
         overrides["enable_flashmla_prefill_token_packing"] = True
+    overrides["decode_state_free_radix_default"] = True
     return overrides
 
 
