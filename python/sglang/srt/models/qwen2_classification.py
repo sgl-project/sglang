@@ -25,9 +25,9 @@ from sglang.srt.layers.pooler import (
     score_and_pool,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
-from sglang.srt.utils import add_prefix
 
 
 class Qwen2ForSequenceClassification(nn.Module):
@@ -43,7 +43,8 @@ class Qwen2ForSequenceClassification(nn.Module):
         self.model = Qwen2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
+        # Matches HF GenericForSequenceClassification, whose score head has no bias.
+        self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
         self.eos_token_id = config.eos_token_id
@@ -68,9 +69,15 @@ class Qwen2ForSequenceClassification(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Filter out lm_head weights of Qwen2ForCausalLM
-        filtered_weights = [
-            (name, w) for name, w in weights if not name.startswith("lm_head")
-        ]
+        filtered_weights = []
+        for name, w in weights:
+            if name == "score.bias":
+                raise ValueError(
+                    "Checkpoint has score.bias, but the sequence-classification "
+                    "score head is bias-free (as in HF transformers)."
+                )
+            if not name.startswith("lm_head"):
+                filtered_weights.append((name, w))
         return Qwen2ForCausalLM._legacy_load_weights(self, filtered_weights)
 
 

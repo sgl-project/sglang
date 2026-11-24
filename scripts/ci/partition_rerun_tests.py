@@ -1,4 +1,3 @@
-import ast
 import functools
 import importlib.util
 import json
@@ -18,6 +17,17 @@ UBUNTU_CPU_SUITES = {"base-a-test-cpu"}
 B200_RERUN_RUNNER = "4-gpu-b200"
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# ci_register.py imports nothing from sglang, so it loads without the package.
+sys.path.insert(0, str(_REPO_ROOT / "python/sglang/test/ci"))
+import ci_register  # noqa: E402
+
+_BACKENDS = {
+    "cuda": ci_register.HWBackend.CUDA,
+    "cpu": ci_register.HWBackend.CPU,
+    "npu": ci_register.HWBackend.NPU,
+    "amd": ci_register.HWBackend.AMD,
+}
 
 
 @functools.cache
@@ -46,39 +56,16 @@ def _runner_config_labels():
     return {name: resolve_runs_on(cfg) for name, cfg in runner_configs.load().items()}
 
 
-def _registrations(path, register_name):
-    """Return [(est_time, runner_config, suite)] or None if any estimate is unusable."""
+def _registrations(path, backend):
+    """The file's registrations for `backend`, or None if any estimate is
+    unusable."""
     try:
-        tree = ast.parse(path.read_text())
-    except (OSError, SyntaxError):
+        registrations, _ = ci_register.ut_parse_one_file(str(path))
+    except (OSError, SyntaxError, ValueError):
         return None
-    found = []
-    for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == register_name
-        ):
-            continue
-        kwargs = {kw.arg: kw.value for kw in node.keywords}
-        value = kwargs.get("est_time", node.args[0] if node.args else None)
-        try:
-            estimate = ast.literal_eval(value)
-        except (ValueError, TypeError):
-            return None
-        if (
-            type(estimate) not in (int, float)
-            or not math.isfinite(estimate)
-            or estimate <= 0
-        ):
-            return None
-        tags = []
-        for key in ("runner_config", "suite"):
-            try:
-                tags.append(ast.literal_eval(kwargs[key]))
-            except (KeyError, ValueError, TypeError):
-                tags.append(None)
-        found.append((estimate, *tags))
+    found = [r for r in registrations if r.backend == backend]
+    if any(not math.isfinite(r.est_time) or r.est_time <= 0 for r in found):
+        return None
     return found
 
 
@@ -104,7 +91,7 @@ def _multimodal_estimates(root):
     return cases, standalone
 
 
-def estimate_seconds(command, root, mode, runs_on=""):
+def estimate_seconds(command, root, mode, runs_on="", suite=""):
     if mode == "multimodal_gen":
         filename, _, selector = command.split()[0].partition("::")
         cases, standalone = _multimodal_estimates(root)
@@ -113,20 +100,27 @@ def estimate_seconds(command, root, mode, runs_on=""):
             return cases.get(case.group(1))
         return standalone.get(filename, standalone.get(Path(filename).name))
 
-    register_name = {"cuda": "register_cuda_ci", "cpu": "register_cpu_ci"}.get(mode)
-    if register_name is None:
+    backend = _BACKENDS.get(mode)
+    if backend is None:
         return None
     filename = command.split()[0].split("::", 1)[0]
-    found = _registrations(root / "test" / filename, register_name)
+    found = _registrations(root / "test" / filename, backend)
     if not found:
         return None
     if mode == "cuda":
         labels = _runner_config_labels()
-        matching = [est for est, rc, _ in found if rc and labels.get(rc) == runs_on]
+        matching = [
+            r.est_time
+            for r in found
+            if r.runner_config and labels.get(r.runner_config) == runs_on
+        ]
+    elif mode == "cpu":
+        matching = [r.est_time for r in found if r.effective_suite in UBUNTU_CPU_SUITES]
     else:
-        matching = [est for est, _, suite in found if suite in UBUNTU_CPU_SUITES]
+        # An npu or amd dispatch names the suite it runs.
+        matching = [r.est_time for r in found if r.effective_suite == suite]
     # A file may register on multiple pools; without a match, stay conservative.
-    return max(matching or [est for est, _, _ in found])
+    return max(matching or [r.est_time for r in found])
 
 
 def _pack(items):
@@ -138,13 +132,13 @@ def _pack(items):
         count += 1
 
 
-def partition_commands(commands, root, mode, runs_on=""):
+def partition_commands(commands, root, mode, runs_on="", suite=""):
     order = [c.strip() for c in commands.splitlines() if c.strip()]
     if not order:
         raise ValueError("No test commands supplied")
     alone, items = [], []
     for idx, command in enumerate(order):
-        estimate = estimate_seconds(command, root, mode, runs_on)
+        estimate = estimate_seconds(command, root, mode, runs_on, suite)
         if estimate is None or estimate > PARTITION_SECONDS:
             alone.append([idx])
         else:
@@ -169,8 +163,17 @@ if __name__ == "__main__":
         Path(os.environ["TEST_ROOT"]),
         os.environ["MODE"],
         os.environ.get("RUNS_ON", ""),
+        os.environ.get("SUITE", ""),
     )
     for partition in matrix["include"]:
         print(f"Partition {partition['partition']}:\n{partition['test_command']}")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+        if os.environ["MODE"] == "npu":
+            # The NPU stage takes every file in one list and splits it itself.
+            size = len(matrix["include"])
+            partitions = {"size": size, "arr": list(range(size))}
+            files = "\n".join(f"test/{c}" for c in os.environ["TEST_COMMAND"].split())
+            output.write(f"partitions={json.dumps(partitions)}\n")
+            # JSON-encoded so the multi-line list fits one output line.
+            output.write(f"only_tests={json.dumps(files)}\n")

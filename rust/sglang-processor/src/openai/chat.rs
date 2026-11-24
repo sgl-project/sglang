@@ -358,7 +358,6 @@ struct ChatRequest {
     extra_key: Option<OneOrList<String>>,
     cache_salt: Option<OneOrList<String>>,
     priority: Option<i64>,
-    data_parallel_rank: Option<i64>,
     bootstrap_host: Option<OneOrList<String>>,
     bootstrap_port: Option<OneOrList<Option<i64>>>,
     bootstrap_room: Option<OneOrList<i64>>,
@@ -380,6 +379,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
     "return_output_ids_in_sglext",
     "return_sampling_mask",
     "return_flat_raw_output_top_logprobs",
+    "return_flat_raw_sampling_mask",
     "sampling_logprobs_mode",
     "video_config",
     "max_dynamic_patch",
@@ -844,11 +844,9 @@ fn valid_message(message: &Value) -> bool {
         return false;
     };
     let role = message.get("role").and_then(Value::as_str);
-    // Thinking parts are valid only in assistant messages.
-    let assistant = role.is_some_and(|r| r.eq_ignore_ascii_case("assistant"));
     let text_content = |content: &Value| match content {
         Value::String(_) => true,
-        Value::Array(parts) => parts.iter().all(|part| text_part(part, assistant)),
+        Value::Array(parts) => parts.iter().all(text_part),
         _ => false,
     };
     match role {
@@ -876,17 +874,11 @@ fn valid_message(message: &Value) -> bool {
     }
 }
 
-/// A text, `tool_reference` or (in assistant messages) thinking content part.
-fn text_part(part: &Value, assistant: bool) -> bool {
+/// A text or `tool_reference` content part.
+fn text_part(part: &Value) -> bool {
     match part["type"].as_str() {
         Some("text") => part["text"].is_string(),
         Some("tool_reference") => part["name"].is_string(),
-        // `ChatCompletionMessageContentThinkingPart`: exactly one of `thinking` and `text`.
-        Some("thinking" | "reasoning") if assistant => {
-            let set = |key: &str| !part[key].is_null();
-            let string = |key: &str| part[key].is_null() || part[key].is_string();
-            set("thinking") != set("text") && string("thinking") && string("text")
-        }
         _ => false,
     }
 }
@@ -1012,7 +1004,7 @@ fn generate_body(
         bootstrap_host: request.bootstrap_host.clone().map(Into::into),
         bootstrap_port: request.bootstrap_port.clone().map(Into::into),
         bootstrap_room: request.bootstrap_room.clone().map(Into::into),
-        routed_dp_rank: request.routed_dp_rank.or(request.data_parallel_rank),
+        routed_dp_rank: request.routed_dp_rank,
         disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
         rid: request.rid.clone().map(Into::into),
         session_id: request.session_id.clone(),
@@ -1420,10 +1412,14 @@ impl ChatResponder {
         events
     }
 
-    /// `_reported_prompt_tokens`.
+    /// `_reported_prompt_tokens` and `_reported_cached_tokens`.
     fn report_prompt_tokens(&self, meta: &mut GenerateMetaInfo) {
         meta.prompt_tokens =
             u64::from(meta.prompt_tokens).saturating_sub(self.unreported_prompt_tokens) as u32;
+        if self.unreported_prompt_tokens > 0 {
+            // A full-prompt cache hit also covers the prompt tokens left out above.
+            meta.cached_tokens = meta.cached_tokens.min(meta.prompt_tokens);
+        }
     }
 
     /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
@@ -1590,9 +1586,7 @@ mod tests {
             json!([{"role": "USER", "content": "hi"}]),
             json!([{"role": "bot", "content": "hi"}]),
             json!([{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]),
-            json!([{"role": "user", "content": [{"type": "thinking", "thinking": "t"}]}]),
-            json!([{"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "text": "x"}]}]),
-            json!([{"role": "assistant", "content": [{"type": "thinking"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking", "thinking": "t"}]}]),
             json!([{"role": "user", "content": [{"type": "tool_reference"}]}]),
             json!([{"role": "user", "content": [{"type": "text"}]}]),
             json!([{"role": "user", "content": 1}]),
@@ -1617,7 +1611,7 @@ mod tests {
         let messages = json!([
             {"role": "System", "content": "be brief", "tools": []},
             {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "tool_reference", "name": "f"}], "name": 1},
-            {"role": "Assistant", "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "a"}]},
+            {"role": "Assistant", "content": [{"type": "text", "text": "a"}]},
             {"role": "assistant", "content": null, "phase": null, "tool_calls": [
                 {"id": "c", "index": 0, "type": "function", "function": {"name": "f", "arguments": {}}}
             ]},
@@ -1667,5 +1661,95 @@ mod tests {
             .collect();
         assert!(created.len() > 1, "{events:?}");
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
+
+    /// A K3 cache hit reaching the generation stub left out of `prompt_tokens`
+    /// is capped at `prompt_tokens`; one ending before the stub, and other
+    /// models, keep the engine's count. Unary, final-usage and continuous-usage
+    /// replies agree.
+    #[test]
+    fn kimi_k3_cached_tokens_exclude_the_generation_stub() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let other = ChatModel::default();
+        // (model, engine prompt, engine cached, reported prompt, reported cached)
+        let cases = [
+            (&k3, 2075, 2073, 2072, 2072),
+            (&k3, 2075, 2000, 2072, 2000),
+            (&other, 2075, 2073, 2075, 2073),
+        ];
+        let stream_options = [
+            None,
+            Some(json!({"include_usage": true})),
+            Some(json!({"continuous_usage_stats": true})),
+        ];
+        for (model, prompt, cached, want_prompt, want_cached) in cases {
+            for options in &stream_options {
+                let usage = one_frame_usage(model, options.as_ref(), prompt, cached);
+                assert_eq!(
+                    usage["prompt_tokens"],
+                    json!(want_prompt),
+                    "{options:?} {usage}"
+                );
+                assert_eq!(
+                    usage["prompt_tokens_details"]["cached_tokens"],
+                    json!(want_cached),
+                    "{options:?} {usage}"
+                );
+            }
+        }
+    }
+
+    /// The usage of a one-frame chat reply with cache reporting on: unary
+    /// without `stream_options`, streamed with them.
+    fn one_frame_usage(
+        model: &ChatModel,
+        stream_options: Option<&Value>,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+    ) -> Value {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        if let Some(options) = stream_options {
+            body["stream"] = json!(true);
+            body["stream_options"] = options.clone();
+        }
+        let settings = OpenAiSettings {
+            enable_cache_report: true,
+            ..OpenAiSettings::default()
+        };
+        let (_, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            model,
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        let frame: GenerateResponse = serde_json::from_value(json!({
+            "text": "a",
+            "output_ids": [2],
+            "meta_info": {
+                "id": "r",
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,
+                "cached_tokens": cached_tokens,
+            },
+        }))
+        .unwrap();
+        if stream_options.is_none() {
+            let reply = responder.unary(vec![frame]).expect("unary reply");
+            return serde_json::from_str::<Value>(&reply.body).unwrap()["usage"].clone();
+        }
+        let mut events = responder.stream_data(Ok(frame)).unwrap();
+        events.extend(responder.stream_end());
+        events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .find_map(|chunk| chunk.get("usage").filter(|u| !u.is_null()).cloned())
+            .expect("usage chunk")
     }
 }

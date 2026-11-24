@@ -6,7 +6,7 @@ from sglang.kernels.ops.activation.bias_gelu import bias_gelu_tanh
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 
@@ -22,10 +22,10 @@ FN_MAP = {
 
 @marker.parametrize(
     "rows,hidden_dim",
-    [(32760, 5120), (32760, 13824)],
+    [(4096, 13824), (32760, 5120), (32760, 13824)],
     [(4096, 13824)],
 )
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark(rows: int, hidden_dim: int, impl: str):
     input = torch.randn(rows, hidden_dim, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(hidden_dim, dtype=torch.bfloat16, device="cuda")

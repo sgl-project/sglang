@@ -51,14 +51,6 @@ INTERNAL_TEMPLATE_DIR="/root/.cache/.cache/aisbench_auto_tools_prefix-master"
 REQUEST_RATE=0
 REPEAT_RATE=0
 DP=1
-# API_TYPE raw = /v1/completions with the prompt sent verbatim (no chat
-# template); default chat keeps the VLLMCustomAPIChatStream behaviour.
-API_TYPE="chat"
-# Unscored warmup passes: WARMUP_DP requests at batch 1 fill the shared
-# prefix on every DP rank (round-robin); WARMUP_SHAPE=1 adds one
-# full-shape unscored pass. Both are disabled by default.
-WARMUP_DP=0
-WARMUP_SHAPE=0
 
 GENERATION_KWARGS=""
 
@@ -136,18 +128,6 @@ while [[ $# -gt 0 ]]; do
             DP="$2"
             shift 2
             ;;
-        --api-type)
-            API_TYPE="$2"
-            shift 2
-            ;;
-        --warmup-dp)
-            WARMUP_DP="$2"
-            shift 2
-            ;;
-        --warmup-shape)
-            WARMUP_SHAPE="$2"
-            shift 2
-            ;;
         -h|--help)
             show_usage
             ;;
@@ -183,11 +163,37 @@ install_aisbench() {
     echo "===== Install aisbench in virtual env - Begin ====="
     PYTHON_ENV_FOR_AISBENCH=test_env_aisbench
     PIP_FOR_AISBENCH=${PYTHON_ENV_FOR_AISBENCH}/bin/pip
+    pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+    # Checkpoints exported by transformers v5 declare
+    # tokenizer_class=TokenizersBackend, a class the transformers 4.x pinned by
+    # ais_bench does not define. Exit 1 only when the model needs transformers>=5
+    # but the venv has an older one; the caller then upgrades.
+    ensure_tokenizer_compatible() {
+        if "${PYTHON_ENV_FOR_AISBENCH}/bin/python" - "${MODEL_PATH}" <<'PY'
+import json, os, sys
+try:
+    with open(os.path.join(sys.argv[1], "tokenizer_config.json")) as f:
+        need = json.load(f).get("tokenizer_class") == "TokenizersBackend"
+except Exception:
+    need = False
+if need:
+    import transformers
+    sys.exit(1 if int(transformers.__version__.split(".")[0]) < 5 else 0)
+PY
+        then
+            return 0
+        fi
+        echo "Model tokenizer needs transformers>=5, upgrading in the aisbench venv."
+        ${PIP_FOR_AISBENCH} install "transformers>=5,<6" -i ${pip_mirror_source}
+    }
+
     # Reuse the venv when it already imports cleanly; this keeps benchmark
     # retry attempts fast and surfaces broken installs immediately.
     if [ -x "${PYTHON_ENV_FOR_AISBENCH}/bin/python" ] && \
        "${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c "import ais_bench, datasets, pyarrow" >/dev/null 2>&1; then
         echo "aisbench venv already usable, skip installation."
+        ensure_tokenizer_compatible
         echo "===== Install aisbench in virtual env - End ====="
         return
     fi
@@ -200,7 +206,6 @@ install_aisbench() {
         git clone https://github.com/AISBench/benchmark.git
         AISBENCH_SOURCE_PATH="./benchmark/"
     fi
-    pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
     if [ ! -d "${AISBENCH_PKG_PATH}" ]; then
         echo "The dependent aisbench package does not exist: ${AISBENCH_PKG_PATH}."
         echo "Install aisbench online."
@@ -234,6 +239,7 @@ install_aisbench() {
     # "ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4".
     # Cap pyarrow to a numpy-1.x-compatible release.
     ${PIP_FOR_AISBENCH} install "pyarrow<16" -i ${pip_mirror_source}
+    ensure_tokenizer_compatible
     echo "===== Install aisbench in virtual env - End ====="
 }
 
@@ -288,50 +294,6 @@ models = [
         trust_remote_code=True,
         generation_kwargs=${final_generation_kwargs},
         pred_postprocessor=dict(type=extract_non_reasoning_content),
-    )
-]
-EOF
-  echo "============== ${model_config_file} - Begin =============="
-  echo "$(cat ${model_config_file})"
-  echo "============== ${model_config_file} - End ================"
-}
-
-# $1 = config file name (default ${TMP_CFG}); $2 = batch size (default
-# ${BATCH_SIZE}). The PyPI ais_bench CLI has no --batch-size argument, so
-# per-invocation concurrency comes from the model config's batch_size field.
-function gen_model_config_file_vllm_api_raw() {
-  local raw_cfg_name=${1:-${TMP_CFG}}
-  local raw_cfg_batch=${2:-${BATCH_SIZE}}
-  # Raw /v1/completions model config: the prompt row is sent verbatim with
-  # no chat template. The chat-template variant turns a natural-text
-  # continuation into an assistant QA task whose digit-heavy output
-  # collapses the DSPARK draft acceptance.
-  model_config_file=${MODEL_CONFIG_PATH}/${raw_cfg_name}.py
-  echo "Writing raw-completions model config into file: ${model_config_file}"
-
-  final_generation_kwargs=$(get_generation_kwargs)
-
-  cat > "${model_config_file}" << EOF
-from ais_bench.benchmark.models import VLLMCustomAPI
-models = [
-    dict(
-        attr="service",
-        type=VLLMCustomAPI,
-        abbr='vllm-api-general-stream',
-        path="$MODEL_PATH",
-        model="$MODEL",
-        stream=True,
-        request_rate=${REQUEST_RATE},
-        use_timestamp=False,
-        retry=2,
-        api_key="",
-        host_ip="$IP",
-        host_port=$PORT,
-        url="",
-        max_out_len=${OUTPUT_LEN},
-        batch_size=$raw_cfg_batch,
-        trust_remote_code=True,
-        generation_kwargs=${final_generation_kwargs},
     )
 ]
 EOF
@@ -585,11 +547,7 @@ if [ "$MODE" == "perf" ];then
 
         DATASET_NAME=gsm8k_custom_${MODEL}
         gen_dataset_gsm8k_config_file "${dataset_dir}"
-        if [ "$API_TYPE" == "raw" ];then
-            gen_model_config_file_vllm_api_raw
-        else
-            gen_model_config_file_vllm_api_stream_chat
-        fi
+        gen_model_config_file_vllm_api_stream_chat
 
         if awk "BEGIN{exit !(${REPEAT_RATE:-0} > 0)}"; then
             echo "===== [Step 2/4] Prefix Mode Detected: Updating temporary config file ====="
@@ -669,20 +627,7 @@ EOF
             echo "IP: $IP | Port: $PORT | Model: $MODEL | Model Path: $MODEL_PATH"
             echo "Input tokens: ${INPUT_LEN} | Output tokens: ${OUTPUT_LEN} | Batch size: ${BATCH_SIZE} | Prompts num: ${NUM_PROMPTS}"
 
-            if [ "$API_TYPE" == "raw" ];then
-                # Disable the built-in warmup (defaults to 1 request, which
-                # would leak into the measured window); the unscored warmup
-                # passes run at the tail of this script instead. Concurrency
-                # lives in each model config's batch_size field; every
-                # invocation selects its config via --models.
-                if [ "${WARMUP_DP:-0}" -gt 0 ];then
-                    gen_model_config_file_vllm_api_raw "${TMP_CFG}_warm" 1
-                fi
-                CMD_BASE="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --debug --summarizer default_perf --mode perf --num-warmups 0"
-                CMD="${CMD_BASE} --models $TMP_CFG --datasets ${DATASET_NAME} --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
-            else
-                CMD="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
-            fi
+            CMD="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
         fi
     else
         echo "The dataset type $DATASET_TYPE is not supported."
@@ -709,21 +654,5 @@ else
 fi
 
 source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
-if [ -n "${CMD_BASE:-}" ];then
-    # Unscored warmup passes before the measured run: cache_fill sends
-    # WARMUP_DP requests at batch 1 so round-robin routing materializes
-    # the shared prefix on every DP rank; shape_warm runs one full-shape
-    # pass so the hybrid-cache state settles before scoring. Each writes
-    # its own work-dir, so the formal summarizer output below remains the
-    # only parsed result.
-    if [ "${WARMUP_DP:-0}" -gt 0 ];then
-        echo "===== Warmup cache-fill: ${WARMUP_DP} request(s) x batch 1 (one per DP rank) ====="
-        eval "${CMD_BASE} --models ${TMP_CFG}_warm --datasets ${DATASET_NAME} --num-prompts ${WARMUP_DP} --work-dir ${OUTPUT_PATH}/warmup_cache_fill"
-    fi
-    if [ "${WARMUP_SHAPE:-0}" == "1" ];then
-        echo "===== Warmup shape: N=${NUM_PROMPTS} C=${BATCH_SIZE} ====="
-        eval "${CMD_BASE} --models ${TMP_CFG} --datasets ${DATASET_NAME} --num-prompts ${NUM_PROMPTS} --work-dir ${OUTPUT_PATH}/warmup_shape"
-    fi
-fi
 echo "Run command: ${CMD}"
 eval "${CMD}"

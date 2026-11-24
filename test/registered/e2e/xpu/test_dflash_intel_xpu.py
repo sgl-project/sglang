@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.device import is_xpu
 
 # Put the `test/` root on sys.path so `registered.<...>` resolves regardless of
 # cwd: CI runs each file as `python3 <full_path>` (only the file's own dir is on
@@ -22,7 +22,7 @@ from registered.spec.dflash import test_dflash as _dflash_base
 
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=600, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+register_xpu_ci(est_time=600, suite="nightly-kernel-main-test-1-gpu-xpu", nightly=True)
 
 # Appended after the base launch_args by setUpClass: the trailing
 # --mem-fraction-static overrides the base 0.7, and --device selects the Intel
@@ -129,7 +129,10 @@ class TestDFlashIntelXPUBackendNoCudaGraph(_dflash_base.TestDFlashServerNoCudaGr
 
     max_running_requests = 8
     attention_backend = "intel_xpu"
-    other_launch_args = _XPU_LAUNCH_ARGS + ["--disable-cuda-graph"]
+    other_launch_args = _XPU_LAUNCH_ARGS + [
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
+    ]
 
 
 @unittest.skipUnless(is_xpu(), "Intel XPU not available")

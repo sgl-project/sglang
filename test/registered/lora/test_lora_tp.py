@@ -31,7 +31,7 @@ register_cuda_ci(est_time=115, stage="base-b", runner_config="2-gpu-large")
 # TP-sharded adapter weights.
 register_amd_ci(
     est_time=58,
-    suite="stage-b-test-2-gpu-large-amd",
+    suite="base-b-test-2-gpu-large-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/13107; until 2026-12-31",
 )
 
