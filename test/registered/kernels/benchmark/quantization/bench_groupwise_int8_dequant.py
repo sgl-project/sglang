@@ -17,7 +17,7 @@ def _torch_dequant(weight, scales, output):
 
 
 @marker.parametrize("shape", [(2048, 2048), (8192, 2048), (2048, 8192), (12288, 2048)])
-@marker.benchmark("impl", ["torch", "fused"])
+@marker.benchmark("impl", ["torch", "fused"], gate=["fused"])
 def benchmark(shape, impl):
     rows, width = shape
     weight = torch.randint(-128, 128, shape, dtype=torch.int8, device="cuda")
