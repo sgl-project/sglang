@@ -40,6 +40,7 @@ from sglang.srt.model_executor.forward_mode import (
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.utils.tensor_bridge import MlxTensorView, _export_evaluated_mlx
 
 logger = logging.getLogger(__name__)
@@ -102,16 +103,7 @@ def _plain_greedy(info):
     return (
         info is not None
         and info.is_all_greedy
-        and not info.grammars
-        and info.grammar_mask is None
-        and not info.has_custom_logit_processor
-        and info.logit_bias is None
-        and info.acc_additive_penalties is None
-        and info.acc_scaling_penalties is None
-        and (
-            info.penalizer_orchestrator is None
-            or not info.penalizer_orchestrator.is_required
-        )
+        and not adjusts_logits(info, has_grammar=bool(info.grammars))
     )
 
 

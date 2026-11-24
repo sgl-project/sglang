@@ -191,21 +191,26 @@ class TestServerArgsPositionalOrder(CustomTestCase):
         """Adding the MPS backend must not reinterpret pre-existing positional calls."""
         fields = msgspec.structs.fields(ServerArgs)
         for index, name in (
-            (564, "enable_dsa_fp4_indexer"),
-            (565, "kda_dwdp_size"),
-            (566, "weight_cache_transport"),
+            (563, "disable_multimodal"),
+            (565, "enable_dsa_fp4_indexer"),
+            (566, "kda_dwdp_size"),
+            (567, "weight_cache_transport"),
+            (581, "shortest_prefill_budget_doubling_chunks"),
+            (582, "mps_execution_backend"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
-        positional = [getattr(defaults, field.name) for field in fields[:567]]
-        positional[564:567] = [True, 2, "shm"]
+        positional = [getattr(defaults, field.name) for field in fields[:582]]
+        positional[565:568] = [True, 2, "shm"]
+        positional[581] = 4.0
 
         args = ServerArgs(*positional)
 
         self.assertTrue(args.enable_dsa_fp4_indexer)
         self.assertEqual(args.kda_dwdp_size, 2)
         self.assertEqual(args.weight_cache_transport, "shm")
+        self.assertEqual(args.shortest_prefill_budget_doubling_chunks, 4.0)
         self.assertEqual(args.mps_execution_backend, "eager")
 
 

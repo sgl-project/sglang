@@ -1021,8 +1021,10 @@ class TestCompiledGraph(CustomTestCase):
             graph.launch(())
 
     def test_enqueue_precedes_current_wait_and_stale_results_are_discarded(self):
+        """Only unmodified greedy sampling may enqueue read-only lookahead."""
         import mlx.core as mx
 
+        from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
         from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
         from sglang.srt.hardware_backend.mps.compiled_runner import (
             CompiledMlxRunner,
@@ -1030,6 +1032,8 @@ class TestCompiledGraph(CustomTestCase):
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
         class Decoder(torch.nn.Module):
             def __init__(self):
@@ -1054,15 +1058,8 @@ class TestCompiledGraph(CustomTestCase):
             seq_lens_sum=2,
             out_cache_loc=torch.tensor([5], device="mps"),
         )
-        batch.sampling_info = SimpleNamespace(
-            is_all_greedy=True,
-            grammars=None,
-            grammar_mask=None,
-            has_custom_logit_processor=False,
-            logit_bias=None,
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
-            penalizer_orchestrator=None,
+        batch.sampling_info = SamplingBatchInfo(
+            vocab_size=4, is_all_greedy=True, device="mps"
         )
         graph = CompiledMlxGraph(model=model, example_inputs=_batch_inputs(batch))
         self.addCleanup(graph.close)
@@ -1115,6 +1112,42 @@ class TestCompiledGraph(CustomTestCase):
             self.assertFalse(runner._async)
         with get_context().override_server_args(disable_overlap_schedule=True):
             runner.enable_lookahead()
+
+        indices = torch.tensor([0], device="mps")
+        penalties = StepPenalties(
+            pool=PenaltyStatusPool(vocab_size=4, device="mps"),
+            batch_size=1,
+            batch_indices=indices,
+            penalty_indices=indices,
+            kinds=1,
+        )
+        for sampling_options in (
+            {"is_all_greedy": False},
+            {"grammars": [BaseGrammarObject()]},
+            {"logit_bias": torch.ones(1, 4, device="mps")},
+            {"step_penalties": penalties},
+            {"has_custom_logit_processor": True},
+            {"watermark": object()},
+        ):
+            with self.subTest(sampling_options=tuple(sampling_options)):
+                batch.sampling_info = SamplingBatchInfo(
+                    vocab_size=4,
+                    device="mps",
+                    **{"is_all_greedy": True, **sampling_options},
+                )
+                runner._prefetch(
+                    graph=graph,
+                    arrays=graph.bind(_batch_inputs(batch)),
+                    outputs=synchronous,
+                    batch=batch,
+                    metadata=runner._metadata(batch),
+                    weights=runner._weights(),
+                )
+                self.assertIsNone(runner._pending)
+                self.assertEqual(runner.prefetch_count, 0)
+        batch.sampling_info = SamplingBatchInfo(
+            vocab_size=4, is_all_greedy=True, device="mps"
+        )
 
         def record_launch(*args, **kwargs):
             events.append("launch")
