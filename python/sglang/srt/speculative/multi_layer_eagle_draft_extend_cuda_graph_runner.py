@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax_sample as sampling_softmax_sample
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -128,6 +129,8 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     temperatures: Optional[torch.Tensor]
     draft_probs: Optional[torch.Tensor]
     sampling_seed: Optional[torch.Tensor]
+    # Only with the fused proposal (the worker's use_fused_draft_sample), else None.
+    top_ks: Optional[torch.Tensor]
 
 
 class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -380,6 +383,14 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         q is exactly the distribution X was drawn from -- q here IS the
         stashed tensor."""
         buffers = self.buffers
+        if self.eagle_worker.use_fused_draft_sample:
+            _, ret.topk_p, ret.topk_index = sampling_softmax_sample(
+                self._select_step_logits(ret, bs),
+                buffers.temperatures[:bs],
+                top_ks=buffers.top_ks[:bs],
+                out=buffers.draft_probs[:bs, self.step],
+            )
+            return
         probs = wide_row_softmax_triton(
             self._select_step_logits(ret, bs),
             buffers.temperatures[:bs],
@@ -701,10 +712,16 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                     if get_exec().deterministic.enable_deterministic_inference
                     else None
                 )
+                top_ks = (
+                    torch.ones((max_bs,), dtype=torch.int32)
+                    if self.eagle_worker.use_fused_draft_sample
+                    else None
+                )
             else:
                 temperatures = None
                 draft_probs = None
                 sampling_seed = None
+                top_ks = None
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -749,6 +766,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             temperatures=temperatures,
             draft_probs=draft_probs,
             sampling_seed=sampling_seed,
+            top_ks=top_ks,
         )
 
     def _prepare_extra(self, forward_batch: ForwardBatch) -> None:
@@ -882,6 +900,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             buffers.sampling_seed[:raw_bs].copy_(
                 forward_batch.sampling_info.sampling_seed[:raw_bs]
             )
+        if buffers.top_ks is not None:
+            buffers.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # Refresh the host mirror only when published; hand replay None
         # otherwise so no consumer reads a stale buffer.
