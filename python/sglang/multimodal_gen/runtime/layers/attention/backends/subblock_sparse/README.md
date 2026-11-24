@@ -4,7 +4,7 @@ Routes a SubBlock plan to SGLang's CuTe-DSL block-sparse FlashAttention kernel
 on SM90 or FlashInfer's architecture-specific blk64 kernels on SM100 and SM120.
 The architecture-neutral `"compute_mode": "sage_fp8"` selects online Sage-style
 FP8 compute; its current SM90 implementation uses the native SageAttention2
-INT8-QK/FP8-PV Hopper kernel. SM120 uses FlashInfer's CuTe-DSL Sage kernel
+INT8-QK/FP8-PV Hopper kernel. SM120 uses FlashInfer's Cake Sage kernel
 with Q64 x K64 blocks. SM100 supports BF16 only.
 Nothing is trained and no weights change: a cheap estimator runs before
 attention and hands the selected kernel a `q2k_block_index`.
@@ -106,10 +106,8 @@ the normal router's 16-token key pooling cells. Install the optional dependency:
 pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
 ```
 
-SM120 requires FlashInfer's CuTe-DSL SM120 Sage backend and
-`quantize_sage_qkv_sm120`, added in
-[FlashInfer #4691](https://github.com/flashinfer-ai/flashinfer/pull/4691),
-which the default FlashInfer install includes.
+SM120 requires FlashInfer's Cake SM120 Sage backend and
+`quantize_sage_qkv_sm120`. SGLang's FlashInfer dependency includes both.
 
 Enable it on SM90 or SM120 with:
 

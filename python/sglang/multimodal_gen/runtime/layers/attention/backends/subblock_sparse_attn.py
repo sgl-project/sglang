@@ -21,7 +21,7 @@ individual keys of the defaults below::
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
 10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
 block-sparse FlashAttention kernel by default; ``compute_mode="sage_fp8"``
-selects native SageAttention2 on SM90 and FlashInfer's CuTe-DSL Sage kernel
+selects native SageAttention2 on SM90 and FlashInfer's Cake Sage kernel
 on SM120, both using INT8 QK and FP8 PV. SM100 uses the BF16 kernel because
 its Sage path does not support SubBlock's variable counts and partial blocks.
 Inside the DiT, unsupported calls run dense instead; unsupported GPU
@@ -266,7 +266,7 @@ def _load_sm120_sage_ops():
         )
     except (ImportError, OSError) as exc:
         raise ImportError(
-            "SM120 SubBlock sage_fp8 requires FlashInfer with the CuTe-DSL "
+            "SM120 SubBlock sage_fp8 requires FlashInfer with the Cake "
             "SM120 Sage backend and quantize_sage_qkv_sm120."
         ) from exc
     return quantize_sage_qkv_sm120, bsa_attn_sm120_blk64_sage_fwd
@@ -285,6 +285,7 @@ def _sm120_sage_fp8_sparse_attention(
     quantize, attention = _load_sm120_sage_ops()
     q_hnd, k_hnd, v_hnd = (x.transpose(1, 2).contiguous() for x in (q, k, v))
     quantized = quantize(q_hnd, k_hnd, v_hnd)
+    output_buffer = torch.empty_like(q_hnd)
     out = attention(
         *quantized,
         q2k_block_index.contiguous(),
@@ -294,7 +295,8 @@ def _sm120_sage_fp8_sparse_attention(
             block_counts.contiguous() if block_counts is not None else None
         ),
         softmax_scale=softmax_scale,
-        backend="cute_dsl",
+        out=output_buffer,
+        backend="cake",
     )
     return out.transpose(1, 2).contiguous()
 
