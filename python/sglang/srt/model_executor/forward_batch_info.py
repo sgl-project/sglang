@@ -37,6 +37,10 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.kernels.ops.elementwise.local_token_count import (
+    local_token_count,
+    local_token_count_cpu,
+)
 from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
@@ -291,11 +295,15 @@ def compute_local_num_token_non_padded(
     num_tokens_per_dp: int,
     *,
     sharded: bool,
+    global_num_token_non_padded_cpu: int | None = None,
 ) -> torch.Tensor:
     """Compute local non-padded token count for this attention-TP rank.
 
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
+
+    When provided, ``global_num_token_non_padded_cpu`` must mirror the global
+    count so platform implementations can compute the result on the host.
 
     ``num_tokens_per_dp`` is the padded bucket width for the DP group, so each rank
     owns a contiguous ``chunk = num_tokens_per_dp // attn_tp_size`` slice: the local
@@ -307,10 +315,11 @@ def compute_local_num_token_non_padded(
     tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(
         num_tokens_per_dp, sharded=sharded
     )
-    return torch.clamp(
-        global_num_token_non_padded - rank_offset,
-        0,
-        tokens_per_rank,
+    return local_token_count(
+        global_count=global_num_token_non_padded,
+        rank_offset=rank_offset,
+        tokens_per_rank=tokens_per_rank,
+        global_count_cpu=global_num_token_non_padded_cpu,
     )
 
 
@@ -325,7 +334,11 @@ def compute_local_num_token_non_padded_cpu(
     tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(
         num_tokens_per_dp, sharded=sharded
     )
-    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
+    return local_token_count_cpu(
+        global_count=global_num_token_non_padded,
+        rank_offset=rank_offset,
+        tokens_per_rank=tokens_per_rank,
+    )
 
 
 def prefill_graph_tolerates_sum_len() -> bool:
@@ -1409,6 +1422,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_token_non_padded=self.global_num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
             sharded=sharded,
+            global_num_token_non_padded_cpu=self.global_num_token_non_padded_cpu,
         )
 
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
