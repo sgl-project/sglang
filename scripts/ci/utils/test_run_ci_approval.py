@@ -1,4 +1,5 @@
-"""Unit tests for run_ci_approval.py, with fake GitHub objects and no network."""
+"""Unit tests for run_ci_approval.py and the approval commands of
+slash_command_handler.py, with fake GitHub objects and no network."""
 
 import os
 import sys
@@ -10,6 +11,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import run_ci_approval as rca  # noqa: E402
+import slash_command_handler as sch  # noqa: E402
 from github import GithubException  # noqa: E402
 
 PR_TEST = ".github/workflows/pr-test.yml"
@@ -163,6 +165,59 @@ class TestRerunGatedRuns(unittest.TestCase):
         [(acted, _)] = rca.rerun_gated_runs(FakeRepo(runs=[run]), PR, HEAD, [PR_TEST])
         self.assertFalse(acted)
         self.assertEqual(run.reruns, 0)
+
+
+def _command(handler, labels=("run-ci",), allowed=True, author_ok=False, seen=True):
+    """Run handler on a fake PR; returns (result, replies, labels added, approved SHAs)."""
+    replies, added, approved = [], [], []
+    pr = NS(
+        head=NS(sha=HEAD),
+        user=NS(login="author"),
+        get_labels=lambda: [NS(name=name) for name in labels],
+        create_issue_comment=replies.append,
+        add_to_labels=added.append,
+    )
+    comment = NS(
+        user=NS(login="maint"), created_at=_at(12), create_reaction=lambda _: None
+    )
+    with mock.patch.multiple(
+        sch,
+        can_approve=lambda *_: (allowed, "no access"),
+        author_may_approve=lambda *_: author_ok,
+        head_seen_by=lambda *_: seen,
+        record_approval=lambda _, sha, __: approved.append(sha),
+    ):
+        result = handler(FakeRepo(), pr, comment, {})
+    return result, replies, added, approved
+
+
+class TestApprovalCommands(unittest.TestCase):
+    def test_approve_ci_approves_the_head_without_labels(self):
+        result, replies, added, approved = _command(sch.handle_approve_ci)
+        self.assertEqual((result, added, approved), (True, [], [HEAD]))
+        self.assertEqual(replies, [f"✅ Approved by maint: CI runs on {HEAD}."])
+
+    def test_approve_ci_without_run_ci_approves_but_reruns_nothing(self):
+        result, replies, _, approved = _command(sch.handle_approve_ci, labels=())
+        self.assertEqual((result, approved), (False, [HEAD]))
+        self.assertIn("CI stays skipped until the PR has `run-ci`", replies[0])
+
+    def test_approve_ci_records_nothing_when_the_author_may_approve(self):
+        result, replies, _, approved = _command(sch.handle_approve_ci, author_ok=True)
+        self.assertEqual((result, approved), (False, []))
+        self.assertIn("Nothing to approve", replies[0])
+
+    def test_refusals_add_no_labels_and_approve_nothing(self):
+        cases = [
+            (sch.handle_approve_ci, "No commit was approved for CI: "),
+            (sch.handle_tag_run_ci, "`run-ci` was not added and no commit was "),
+        ]
+        for handler, prefix in cases:
+            for check in ({"allowed": False}, {"seen": False}):
+                with self.subTest(handler=handler.__name__, check=check):
+                    result, replies, added, approved = _command(handler, **check)
+                    self.assertEqual((result, added, approved), (False, [], []))
+                    self.assertTrue(replies[0].startswith(prefix))
 
 
 if __name__ == "__main__":
