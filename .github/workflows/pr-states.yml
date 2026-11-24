@@ -7,8 +7,7 @@ name: PR States
 #   - pull_request_target: push / open / label change (all PRs incl forks).
 #   - workflow_run: pr-test* requested / completed events (incl fork PRs).
 #     `requested` is absent on reruns, but `completed` still fires.
-#   - workflow_dispatch: explicit refreshes for a provided PR number. This
-#     is the only event here that GITHUB_TOKEN can cascade-create.
+#   - workflow_dispatch: manual refresh for a given PR number.
 
 on:
   pull_request_target:
