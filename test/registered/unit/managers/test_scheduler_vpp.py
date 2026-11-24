@@ -6,7 +6,7 @@ import sys
 import textwrap
 import unittest
 from array import array
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -54,11 +54,7 @@ class _Event:
         self.recorded = True
 
 
-class _SchedulingCore(SchedulingVPPCore):
-    pass
-
-
-class _AdmissionCore(_SchedulingCore):
+class _AdmissionCore(SchedulingVPPCore):
     """Supply CPU batch construction and prefix storage at the adapter boundary."""
 
     def _pp_vpp_prepare_wavefront_batch(
@@ -190,7 +186,6 @@ class _TickCore(_ControlCore):
             available_size=lambda: 2
         )
         self._pending_chunked_abort_req = None
-        self._pp_tensor_dict_inbox = defaultdict(deque)
         self.last_rank_comm_queue = deque()
         self.controls = deque()
         self.published = []
@@ -272,7 +267,9 @@ class _TickCore(_ControlCore):
 
 
 class TestSchedulingVPPCore(CustomTestCase):
-    def _scheduler(self, *, rank=0, owner=0, retained=True, core_type=_SchedulingCore):
+    def _scheduler(
+        self, *, rank=0, owner=0, retained=True, core_type=SchedulingVPPCore
+    ):
         scheduler = core_type()
         scheduler.__dict__.update(
             disaggregation_mode=DisaggregationMode.PREFILL,
@@ -284,7 +281,6 @@ class TestSchedulingVPPCore(CustomTestCase):
             _pp_vpp_early_activations={},
             _pp_vpp_fixed_received=deque(),
             _pp_vpp_arrivals=deque(),
-            _pp_vpp_pending_recv=object(),
             pp_group=SimpleNamespace(
                 world_size=2,
                 rank_in_group=rank,
@@ -314,8 +310,8 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler._pp_vpp_init_fixed_batch(2)
         return scheduler
 
-    def _remote_admission(self, *, core_type=_SchedulingCore):
-        scheduler = self._scheduler(core_type=core_type)
+    def _remote_admission(self, *, rank=0, core_type=SchedulingVPPCore):
+        scheduler = self._scheduler(rank=rank, core_type=core_type)
         scheduler.attn_tp_group = SimpleNamespace(
             world_size=1, rank_in_group=0, cpu_group=None
         )
@@ -346,14 +342,10 @@ class TestSchedulingVPPCore(CustomTestCase):
         return scheduler, req, envelope
 
     def _downstream_admission(self, *, batch_seq=0, owner=None):
-        scheduler, req, _ = self._remote_admission(core_type=_AdmissionCore)
-        scheduler.pp_group.rank_in_group = 1
-        scheduler.pp_group.is_first_rank = False
-        scheduler.pp_group.is_last_rank = True
+        scheduler, req, _ = self._remote_admission(rank=1, core_type=_AdmissionCore)
         scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
         scheduler._pp_vpp_init_fixed_batch(2)
         scheduler._pp_vpp_slot_batch_seqs = [owner, None]
-        scheduler.mbs = [None, None]
         scheduler.candidate_batch = SimpleNamespace(
             reqs=[req], prefix_lens=[4], extend_lens=[5]
         )
@@ -372,15 +364,9 @@ class TestSchedulingVPPCore(CustomTestCase):
         before_tick=None,
         mode=DisaggregationMode.PREFILL,
     ):
-        scheduler, _, _ = self._remote_admission(core_type=core_type)
+        scheduler, _, _ = self._remote_admission(rank=rank, core_type=core_type)
         scheduler.disaggregation_mode = mode
-        scheduler.pp_group.rank_in_group = rank
-        scheduler.pp_group.is_first_rank = rank == 0
-        scheduler.pp_group.is_last_rank = rank == 1
         scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
-        scheduler.model_config = SimpleNamespace(
-            hidden_size=8, hf_config=SimpleNamespace(hc_mult=4)
-        )
         scheduler.receive_tags = []
         scheduler.pp_group.vpp_activation_tp_group = scheduler.attn_tp_group
         scheduler.activation_group = SimpleNamespace(
@@ -393,11 +379,7 @@ class TestSchedulingVPPCore(CustomTestCase):
             rank_in_group=rank,
             broadcast_object=lambda value, src: 3,
         )
-        with get_context().override_server_args(
-            chunked_prefill_size=16, enable_dynamic_chunking=False
-        ):
-            context = _run_native_ticks(scheduler, ticks, before_tick)
-        return scheduler, context
+        return scheduler, _run_native_ticks(scheduler, ticks, before_tick)
 
     def _tick_batches(self, scheduler, count):
         scheduler.batches = {}
@@ -418,7 +400,6 @@ class TestSchedulingVPPCore(CustomTestCase):
                 prefix_lens=[0],
                 extend_lens=[8],
                 chunked_req=None,
-                contains_last_prefill_chunk=True,
                 disagg_prefill_chunk_end_by_rid={req.rid: 8},
             )
         scheduler._pp_vpp_activation_receiver = _ActivationFIFO()
@@ -430,8 +411,6 @@ class TestSchedulingVPPCore(CustomTestCase):
             wire["vpp_batch_manifest"] = scheduler._pp_vpp_batch_manifest(
                 seq, seq % 2, scheduler.batches[seq]
             )
-        if stage == 3:
-            wire["vpp_source_layer"] = 0
         scheduler._pp_vpp_activation_receiver.queue.append(wire)
 
     def test_native_ticks_run_two_batch_waves_and_reuse_retired_slots(self):
@@ -491,7 +470,6 @@ class TestSchedulingVPPCore(CustomTestCase):
                 self._tick_batches(scheduler, 2)
                 batch = scheduler.batches[0]
                 batch.chunked_req = batch.reqs[0]
-                batch.contains_last_prefill_chunk = False
 
         scheduler, context = self._control_loop(
             rank=0, core_type=_TickCore, ticks=2, before_tick=before_tick
@@ -1711,7 +1689,6 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertEqual(list(scheduler._pp_vpp_fixed_received), [(0, 2)])
         self.assertEqual(scheduler._pp_vpp_ready_proxies, {})
         self.assertEqual(list(scheduler._pp_vpp_arrivals), [])
-        self.assertIsNone(scheduler._pp_vpp_pending_recv)
         with self.assertRaisesRegex(RuntimeError, "before admitting"):
             scheduler._pp_vpp_promote_early_activations(0)
         scheduler._pp_vpp_slot_batch_seqs[0] = 0
@@ -1865,21 +1842,10 @@ class TestSchedulerVPP(CustomTestCase):
 class TestNativeVPPAdapter(CustomTestCase):
     def test_completion_fences_copy_before_retiring_batch(self):
         order = []
-
-        class Event:
-            def record(self, stream):
-                order.append("record")
-
-            def synchronize(self):
-                order.append("copy_ready")
-
-        class Stream:
-            def wait_stream(self, stream):
-                order.append("wait_schedule")
-
-            def wait_event(self, event):
-                order.append("wait_forward")
-
+        event = SimpleNamespace(
+            record=lambda stream: order.append("record"),
+            synchronize=lambda: order.append("copy_ready"),
+        )
         batch = SimpleNamespace(reqs=[], contains_last_prefill_chunk=False)
         launch = object()
         metadata = SimpleNamespace(forward_launch=launch, forward_done=object())
@@ -1891,10 +1857,13 @@ class TestNativeVPPAdapter(CustomTestCase):
             last_mbs=[None, None],
             _vpp_forward_batches={0: object()},
             copy_stream_ctx=nullcontext(),
-            copy_stream=Stream(),
+            copy_stream=SimpleNamespace(
+                wait_stream=lambda stream: order.append("wait_schedule"),
+                wait_event=lambda event: order.append("wait_forward"),
+            ),
             schedule_stream=object(),
             device="cpu",
-            device_module=SimpleNamespace(Event=Event),
+            device_module=SimpleNamespace(Event=lambda: event),
             disaggregation_mode=DisaggregationMode.PREFILL,
             _pp_prep_batch_result=lambda *args: result,
             _pp_process_batch_result=lambda batch, result: order.append("processed"),
@@ -2012,11 +1981,7 @@ class TestNativeVPPAdapter(CustomTestCase):
         )
         batches = [
             SimpleNamespace(
-                forward_mode=SimpleNamespace(
-                    is_decode=lambda: True,
-                    is_extend=lambda: False,
-                    is_mixed=lambda: False,
-                ),
+                forward_mode=ForwardMode.DECODE,
                 global_num_tokens_cpu=None,
                 input_ids=torch.tensor([i, i + 1]),
                 positions=torch.tensor([7, 8]),
@@ -2214,7 +2179,6 @@ class TestNativeVPPAdapter(CustomTestCase):
             mbs=batches,
             mb_metadata=[None, None],
             _pp_vpp_stage_events={},
-            _pp_tensor_dict_inbox=defaultdict(deque),
             pp_group=SimpleNamespace(rank_in_group=0, send_tensor_dict=send),
             _pp_vpp_runtime_epoch=3,
             _pp_vpp_control_layout_digest="layout",
