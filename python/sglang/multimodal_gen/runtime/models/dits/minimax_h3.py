@@ -117,6 +117,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
     _usp_all_gather,
+    _usp_exchange_prepacked_qkv,
     _usp_input_all_to_all_packed_qkv,
     _usp_output_all_to_all,
     ulysses_head_group_pipelined_attention,
@@ -141,6 +142,14 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_npu_triton import (
+    can_use_npu_triton_indexed_gate_rms_norm_scale_shift,
+    can_use_npu_triton_rms_norm_indexed_scale_shift,
+    can_use_npu_triton_split_qkv_norm_rope_pack,
+    npu_triton_indexed_gate_rms_norm_scale_shift,
+    npu_triton_rms_norm_indexed_scale_shift,
+    npu_triton_split_qkv_norm_rope_pack,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
     MiniMaxH3VDNHybridAttention,
@@ -1695,6 +1704,122 @@ class MiniMaxH3Attention(nn.Module):
         torch.mps.empty_cache()
         return out
 
+    def _forward_npu_triton_laser_attention(
+        self,
+        qkv: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+        ulysses_active: bool,
+        ring_active: bool,
+        project_out: bool = True,
+    ) -> torch.Tensor | None:
+        """Fused NPU Triton QKV-norm-RoPE-pack + Ulysses LaserAttention path."""
+        if not (
+            current_platform.is_npu()
+            and ulysses_active
+            and not ring_active
+            and rope_cache is not None
+            and self.hybrid is None
+            and self.to_gate_compress is None
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not is_in_breakable_cuda_graph()
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+        ):
+            return None
+        cos_sin_cache, positions = rope_cache
+        if not can_use_npu_triton_split_qkv_norm_rope_pack(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            positions,
+            head_dim=self.head_dim,
+        ):
+            return None
+        _minimax_h3_bind_attention_backend(self, qkv.dtype)
+        q_eps = getattr(
+            self.q_norm, "variance_epsilon", getattr(self.q_norm, "eps", None)
+        )
+        k_eps = getattr(
+            self.k_norm, "variance_epsilon", getattr(self.k_norm, "eps", None)
+        )
+        world_size, _ = get_ulysses_ctx()
+        if not (
+            self._attention_backend_enum is AttentionBackendEnum.LASER_ATTN
+            and q_eps is not None
+            and q_eps == k_eps
+            and self.num_heads % world_size == 0
+        ):
+            return None
+
+        total = qkv.shape[0]
+        pipe_groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+        if pipe_groups < 0:
+            pipe_groups = 2
+        groups = (
+            pipe_groups
+            if (
+                pipe_groups > 1
+                and total * world_size >= _NPU_LASER_PIPELINE_MIN_SEQ_LEN
+                and self.num_heads % (world_size * pipe_groups) == 0
+            )
+            else 1
+        )
+        packed = npu_triton_split_qkv_norm_rope_pack(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            positions,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            world_size=world_size,
+            groups=groups,
+            eps=float(q_eps),
+        )
+        impl = self._attention_impl
+        if groups > 1:
+
+            def _attend_group(q_g, k_g, v_g):
+                return impl.forward_varlen(
+                    q_g,
+                    k_g,
+                    v_g,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_host=cu_seqlens_host,
+                )
+
+            out = ulysses_head_group_pipelined_attention(
+                None,
+                None,
+                None,
+                _attend_group,
+                groups,
+                prepacked_qkv=packed,
+            )
+        else:
+            q_g, k_g, v_g = _usp_exchange_prepacked_qkv(packed[0])
+            out = impl.forward_varlen(
+                q_g,
+                k_g,
+                v_g,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+            )
+            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        out = out.reshape(total, self.num_heads * self.head_dim)
+        if not project_out:
+            return out
+        out, _ = self.out_proj(out)
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1735,6 +1860,18 @@ class MiniMaxH3Attention(nn.Module):
 
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
+        npu_out = self._forward_npu_triton_laser_attention(
+            qkv,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+            project_out=project_out,
+        )
+        if npu_out is not None:
+            return npu_out
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
@@ -2147,8 +2284,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
         combined_runs: tuple[tuple[int, int, int], ...] | None = None,
         pre_norm1_hidden: torch.Tensor | None = None,
+        pre_msa_hidden: torch.Tensor | None = None,
         next_norm1: RMSNorm | nn.RMSNorm | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        next_msa_adaln: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, bool]:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
 
@@ -2187,6 +2326,8 @@ class MiniMaxH3DiTBlock(nn.Module):
                     dtype=_BF16_DTYPE,
                     runs=combined_runs,
                 )
+        elif pre_msa_hidden is not None:
+            h = pre_msa_hidden
         elif pre_norm1_hidden is not None:
             h = _modulate_scale_shift(
                 pre_norm1_hidden,
@@ -2195,6 +2336,23 @@ class MiniMaxH3DiTBlock(nn.Module):
                 combined_indices,
                 dtype=_BF16_DTYPE,
                 runs=combined_runs,
+            )
+        elif (
+            current_platform.is_npu()
+            and not torch.is_grad_enabled()
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and hasattr(self.norm1, "variance_epsilon")
+            and can_use_npu_triton_rms_norm_indexed_scale_shift(
+                x, self.norm1.weight, shift_msa, scale_msa
+            )
+        ):
+            h = npu_triton_rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                float(self.norm1.variance_epsilon),
             )
         else:
             h = _modulate_rmsnorm_scale_shift(
@@ -2252,34 +2410,41 @@ class MiniMaxH3DiTBlock(nn.Module):
             return self._mlp_gated_residual(
                 residual, gate_mlp, h, combined_indices, peer
             )
-        if (
-            current_platform.is_npu()
-            and partials is None
-            and not torch.is_grad_enabled()
-            and not self.preserve_input_for_cache_dit
-            and not _accepts_mxfp8_input(self.mlp.fc1)
-            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
-            and residual.device.type == "npu"
-            and residual.dtype == h.dtype == gate_msa.dtype == _BF16_DTYPE
-            and hasattr(self.norm2, "variance_epsilon")
-            and self.norm2.weight is not None
+        if partials is None and self._uses_npu_fused_gate_norm2(
+            residual, h, gate_msa, shift_mlp, scale_mlp
         ):
-            import torch_npu
+            use_triton_mod = can_use_npu_triton_indexed_gate_rms_norm_scale_shift(
+                residual, h, gate_msa, self.norm2.weight, shift_mlp, scale_mlp
+            )
+            if use_triton_mod:
+                residual, h = npu_triton_indexed_gate_rms_norm_scale_shift(
+                    residual,
+                    h,
+                    gate_msa,
+                    self.norm2.weight,
+                    shift_mlp,
+                    scale_mlp,
+                    combined_indices,
+                    float(self.norm2.variance_epsilon),
+                    inplace_residual=True,
+                )
+            else:
+                import torch_npu
 
-            _apply_indexed_gate_npu_inplace(
-                h, gate_msa, combined_indices, runs=combined_runs
-            )
-            normed_h, _, residual = torch_npu.npu_add_rms_norm(
-                residual, h, self.norm2.weight, self.norm2.variance_epsilon
-            )
-            h = _modulate_scale_shift(
-                normed_h,
-                shift_mlp,
-                scale_mlp,
-                combined_indices,
-                dtype=_BF16_DTYPE,
-                runs=combined_runs,
-            )
+                _apply_indexed_gate_npu_inplace(
+                    h, gate_msa, combined_indices, runs=combined_runs
+                )
+                normed_h, _, residual = torch_npu.npu_add_rms_norm(
+                    residual, h, self.norm2.weight, self.norm2.variance_epsilon
+                )
+                h = _modulate_scale_shift(
+                    normed_h,
+                    shift_mlp,
+                    scale_mlp,
+                    combined_indices,
+                    dtype=_BF16_DTYPE,
+                    runs=combined_runs,
+                )
             mlp_out = self.mlp(h)
             if (
                 next_norm1 is not None
@@ -2288,6 +2453,32 @@ class MiniMaxH3DiTBlock(nn.Module):
                 and next_norm1.weight is not None
                 and next_norm1.weight.device == residual.device
             ):
+                if (
+                    use_triton_mod
+                    and next_msa_adaln is not None
+                    and can_use_npu_triton_indexed_gate_rms_norm_scale_shift(
+                        residual,
+                        mlp_out,
+                        gate_mlp,
+                        next_norm1.weight,
+                        next_msa_adaln[0],
+                        next_msa_adaln[1],
+                    )
+                ):
+                    residual, next_msa = npu_triton_indexed_gate_rms_norm_scale_shift(
+                        residual,
+                        mlp_out,
+                        gate_mlp,
+                        next_norm1.weight,
+                        next_msa_adaln[0],
+                        next_msa_adaln[1],
+                        combined_indices,
+                        float(next_norm1.variance_epsilon),
+                        inplace_residual=True,
+                    )
+                    return residual, next_msa, True
+                import torch_npu
+
                 _apply_indexed_gate_npu_inplace(
                     mlp_out, gate_mlp, combined_indices, runs=combined_runs
                 )
@@ -2297,7 +2488,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                     next_norm1.weight,
                     next_norm1.variance_epsilon,
                 )
-                return residual, next_normed
+                return residual, next_normed, False
             gate_run_kwargs = (
                 {"runs": combined_runs} if combined_runs is not None else {}
             )
@@ -2443,6 +2634,32 @@ class MiniMaxH3DiTBlock(nn.Module):
             and can_use_indexed_gate_rmsnorm_scale_shift(
                 x, gate, other, self.norm2.weight, shift, scale, indices
             )
+        )
+
+    def _uses_npu_fused_gate_norm2(
+        self,
+        residual: torch.Tensor,
+        branch: torch.Tensor,
+        gate: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> bool:
+        """Whether attention's gated residual + norm2 runs via the NPU fused path."""
+        return (
+            current_platform.is_npu()
+            and not torch.is_grad_enabled()
+            and not self.preserve_input_for_cache_dit
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and residual.device.type == "npu"
+            and residual.dtype
+            == branch.dtype
+            == gate.dtype
+            == shift.dtype
+            == scale.dtype
+            == _BF16_DTYPE
+            and hasattr(self.norm2, "variance_epsilon")
+            and self.norm2.weight is not None
         )
 
 
@@ -3925,6 +4142,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 )
             )
             pre_norm1_hidden: torch.Tensor | None = None
+            pre_msa_hidden: torch.Tensor | None = None
             num_blocks = len(self.blocks)
             for block_idx, block in enumerate(self.blocks):
                 next_block = (
@@ -3936,6 +4154,14 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     next_block.attn.qkv_proj
                 )
                 next_norm1 = next_block.norm1 if has_next else None
+                next_msa_adaln = (
+                    (
+                        block_adaln_params[next_block.layer_index][0],
+                        block_adaln_params[next_block.layer_index][1],
+                    )
+                    if has_next and block_adaln_params is not None
+                    else None
+                )
                 block_out = block(
                     hidden,
                     adaln_input=adaln_input,
@@ -3950,13 +4176,22 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     block_adaln_params=block_adaln_params,
                     combined_runs=block_combined_runs,
                     pre_norm1_hidden=pre_norm1_hidden,
+                    pre_msa_hidden=pre_msa_hidden,
                     next_norm1=next_norm1,
+                    next_msa_adaln=next_msa_adaln,
                 )
                 if isinstance(block_out, tuple):
-                    hidden, pre_norm1_hidden = block_out
+                    hidden, next_hidden, is_modulated = block_out
+                    if is_modulated:
+                        pre_msa_hidden = next_hidden
+                        pre_norm1_hidden = None
+                    else:
+                        pre_norm1_hidden = next_hidden
+                        pre_msa_hidden = None
                 else:
                     hidden = block_out
                     pre_norm1_hidden = None
+                    pre_msa_hidden = None
             if spectrum_on:
                 self._h3_spectrum_record_targets(
                     hidden, audio_pos, infer_out_pos, row_start, row_stop

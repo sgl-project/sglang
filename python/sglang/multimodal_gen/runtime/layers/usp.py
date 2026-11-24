@@ -473,12 +473,25 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def _usp_exchange_prepacked_qkv(
+    packed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange pre-packed ``[world_size, s_local, h_local, 3 * head_size]`` QKV."""
+    world_size, s_local, h_local, width = packed.shape
+    head_size = width // 3
+    received = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    received = received.reshape(s_local * world_size, h_local, width)
+    return received.split(head_size, dim=-1)
+
+
 def ulysses_head_group_pipelined_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    q: torch.Tensor | None,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
     attend,
     groups: int,
+    *,
+    prepacked_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Ulysses attention with the collective exchange pipelined over head groups.
 
@@ -490,15 +503,30 @@ def ulysses_head_group_pipelined_attention(
     """
     group = get_sp_group().ulysses_group
     world_size = get_ulysses_parallel_world_size()
-    rows, heads, head_size = q.shape
-    group_heads = heads // (world_size * groups)
-    if q.device.type == "npu":
-        packed = (
-            torch.cat((q, k, v), dim=-1)
-            .view(rows, world_size, groups, group_heads, 3 * head_size)
-            .permute(2, 1, 0, 3, 4)
-            .contiguous()
-        )
+    if prepacked_qkv is not None:
+        if prepacked_qkv.device.type != "npu":
+            raise ValueError("prepacked_qkv is only supported on NPU")
+        _, _, rows, group_heads, width = prepacked_qkv.shape
+        head_size = width // 3
+        heads = world_size * groups * group_heads
+        device = prepacked_qkv.device
+        dtype = prepacked_qkv.dtype
+    else:
+        assert q is not None and k is not None and v is not None
+        rows, heads, head_size = q.shape
+        group_heads = heads // (world_size * groups)
+        device = q.device
+        dtype = q.dtype
+    if device.type == "npu":
+        if prepacked_qkv is not None:
+            packed = prepacked_qkv
+        else:
+            packed = (
+                torch.cat((q, k, v), dim=-1)
+                .view(rows, world_size, groups, group_heads, 3 * head_size)
+                .permute(2, 1, 0, 3, 4)
+                .contiguous()
+            )
         received = torch.empty_like(packed)
         exchanges = [
             dist.all_to_all_single(received[g], packed[g], group=group, async_op=True)
@@ -506,8 +534,8 @@ def ulysses_head_group_pipelined_attention(
         ]
         out = torch.empty(
             (groups, world_size, rows, group_heads, head_size),
-            dtype=q.dtype,
-            device=q.device,
+            dtype=dtype,
+            device=device,
         )
         for g in range(groups):
             exchanges[g].wait()

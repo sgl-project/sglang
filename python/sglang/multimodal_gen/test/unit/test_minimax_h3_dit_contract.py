@@ -1681,3 +1681,182 @@ def test_npu_cross_block_add_rms_norm_and_qkv_pack_parity():
         ref_norm, _ = torch_npu.npu_rms_norm(ref_res, w, eps)
         torch.testing.assert_close(fused_res, ref_res, rtol=0, atol=0)
         torch.testing.assert_close(fused_norm, ref_norm, rtol=1e-2, atol=1e-2)
+
+
+def test_npu_triton_fused_kernels_parity():
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        pytest.skip("requires Ascend NPU")
+    from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn_triton import (
+        can_use_npu_triton,
+        npu_triton_la_postprocess,
+        npu_triton_la_preprocess_qkv,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_npu_triton import (
+        npu_triton_indexed_gate_rms_norm_scale_shift,
+        npu_triton_rms_norm_indexed_scale_shift,
+        npu_triton_split_qkv_norm_rope_pack,
+    )
+
+    device = torch.device("npu")
+    if not can_use_npu_triton(device):
+        pytest.skip("requires triton-ascend")
+
+    torch.manual_seed(17)
+    with torch.inference_mode():
+        # 1. LA preprocess + postprocess (bit-exact)
+        s_total, s_real, s_pad, h, d = 320, 300, 512, 6, 128
+        packed_recv = torch.randn(
+            s_total, h, 3 * d, device=device, dtype=torch.bfloat16
+        )
+        q, k, v = packed_recv.split(d, dim=-1)
+        tq, tk, tv = npu_triton_la_preprocess_qkv(
+            q, k, v, s_real=s_real, s_pad=s_pad, inv_scale=1.0 / 256.0
+        )
+        for src, got in ((q, tq), (k, tk), (v, tv)):
+            ref = torch.nn.functional.pad(
+                src[:s_real]
+                .unsqueeze(0)
+                .transpose(1, 2)
+                .mul(1.0 / 256.0)
+                .to(torch.float16),
+                (0, 0, 0, s_pad - s_real),
+            )
+            torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+        for la_dtype in (torch.float16, torch.float32):
+            la_out = torch.randn(1, h, s_pad, d, device=device, dtype=la_dtype) * 0.1
+            for cur_s_total in (s_total, s_real):
+                got_post = npu_triton_la_postprocess(
+                    la_out, s_real=s_real, s_total=cur_s_total, scale=256.0
+                )
+                ref_post = torch.zeros(
+                    (cur_s_total, h, d), device=device, dtype=torch.bfloat16
+                )
+                ref_post[:s_real].copy_(
+                    (la_out[0, :, :s_real, :d].float() * 256.0)
+                    .to(torch.bfloat16)
+                    .transpose(0, 1)
+                )
+                torch.testing.assert_close(got_post, ref_post, rtol=0, atol=0)
+
+        # 2. RMSNorm + indexed scale/shift & IndexedGate + RMSNorm + scale/shift
+        rows, hidden = 128, 5376
+        res = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+        branch = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+        gate = torch.randn(3, hidden, device=device, dtype=torch.bfloat16) * 0.1
+        weight = torch.randn(hidden, device=device, dtype=torch.bfloat16)
+        shift = torch.randn(3, hidden, device=device, dtype=torch.bfloat16) * 0.1
+        scale = torch.randn(3, hidden, device=device, dtype=torch.bfloat16) * 0.1
+        indices = torch.zeros(rows, device=device, dtype=torch.long)
+        indices[:16] = 1
+        indices[16:32] = 2
+
+        got_norm = npu_triton_rms_norm_indexed_scale_shift(
+            res, weight, shift, scale, indices, 1e-5
+        )
+        ref_norm = (
+            res.float()
+            * torch.rsqrt(res.float().pow(2).mean(-1, keepdim=True) + 1e-5)
+            * weight.float()
+            * (1.0 + scale.float()[indices])
+            + shift.float()[indices]
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(got_norm, ref_norm, rtol=2e-2, atol=2e-2)
+
+        got_res, got_mod = npu_triton_indexed_gate_rms_norm_scale_shift(
+            res.clone(), branch, gate, weight, shift, scale, indices, 1e-5
+        )
+        ref_res_f = res.float() + gate.float()[indices] * branch.float()
+        ref_mod = (
+            ref_res_f
+            * torch.rsqrt(ref_res_f.pow(2).mean(-1, keepdim=True) + 1e-5)
+            * weight.float()
+            * (1.0 + scale.float()[indices])
+            + shift.float()[indices]
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(
+            got_res, ref_res_f.to(torch.bfloat16), rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(got_mod, ref_mod, rtol=2e-2, atol=2e-2)
+
+        # Verify non-contiguous residual slice with inplace_residual=True preserves
+        # surrounding columns using stride_res_out_row.
+        wide_buf = torch.randn(rows, hidden + 64, device=device, dtype=torch.bfloat16)
+        wide_buf[:, :hidden].copy_(res)
+        canary = wide_buf[:, hidden:].clone()
+        strided_res = wide_buf[:, :hidden]
+        got_strided_res, got_strided_mod = npu_triton_indexed_gate_rms_norm_scale_shift(
+            strided_res,
+            branch,
+            gate,
+            weight,
+            shift,
+            scale,
+            indices,
+            1e-5,
+            inplace_residual=True,
+        )
+        assert got_strided_res.data_ptr() == strided_res.data_ptr()
+        torch.testing.assert_close(wide_buf[:, hidden:], canary, rtol=0, atol=0)
+        torch.testing.assert_close(
+            got_strided_res, ref_res_f.to(torch.bfloat16), rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(got_strided_mod, ref_mod, rtol=2e-2, atol=2e-2)
+
+        # 3. Split QKV + Q/K RMSNorm + partial NeoX RoPE + Ulysses pack
+        t, nh, ws, groups = 64, 24, 2, 2
+        qkv = torch.randn(t, 3 * nh * d, device=device, dtype=torch.bfloat16)
+        qw = torch.randn(d, device=device, dtype=torch.bfloat16)
+        kw = torch.randn(d, device=device, dtype=torch.bfloat16)
+        cos_sin = torch.randn(t, 96, device=device, dtype=torch.bfloat16)
+        positions = torch.arange(t, device=device, dtype=torch.long)
+        got_pack = npu_triton_split_qkv_norm_rope_pack(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_heads=nh,
+            head_dim=d,
+            rope_dim=96,
+            world_size=ws,
+            groups=groups,
+            eps=1e-5,
+        )
+        q_raw, k_raw, v_raw = [x.view(t, nh, d) for x in qkv.split(nh * d, dim=-1)]
+        cos_h, sin_h = (
+            cos_sin[:, :48].float().unsqueeze(1),
+            cos_sin[:, 48:].float().unsqueeze(1),
+        )
+
+        def _ref_nr(x, w):
+            xf = x.float()
+            xn = (
+                xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-5) * w.float()
+            ).to(torch.bfloat16)
+            x1, x2, xt = xn[..., :48].float(), xn[..., 48:96].float(), xn[..., 96:]
+            r1 = (x1 * cos_h - x2 * sin_h).to(torch.bfloat16)
+            r2 = (x2 * cos_h + x1 * sin_h).to(torch.bfloat16)
+            return torch.cat((r1, r2, xt), dim=-1)
+
+        ref_pack = (
+            torch.cat((_ref_nr(q_raw, qw), _ref_nr(k_raw, kw), v_raw), dim=-1)
+            .view(t, ws, groups, nh // (ws * groups), 3 * d)
+            .permute(2, 1, 0, 3, 4)
+            .contiguous()
+        )
+        torch.testing.assert_close(got_pack, ref_pack, rtol=2e-2, atol=2e-2)
+
+
+def test_npu_usp_prepacked_qkv_rejects_non_npu(monkeypatch):
+    from sglang.multimodal_gen.runtime.layers import usp
+
+    monkeypatch.setattr(
+        usp, "get_sp_group", lambda: SimpleNamespace(ulysses_group=None)
+    )
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: 2)
+    packed_cpu = torch.zeros(2, 2, 4, 2, 12, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only supported on NPU"):
+        usp.ulysses_head_group_pipelined_attention(
+            None, None, None, lambda q, k, v: q, groups=2, prepacked_qkv=packed_cpu
+        )
