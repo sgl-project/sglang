@@ -493,12 +493,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             #
             # The mxfp4 weight loader (FusedMoE.weight_loader fast path) does
             # a NAIVE copy of HF's ``[2*intermediate_size, hidden_packed]``
-            # tensor into the buffer's ``[:dim1, :dim2]`` slice. Padding the
-            # buffer here would push the gate/up boundary, so HF's "up"
+            # tensor into the buffer's ``[:dim1, :dim2]`` slice. Padding each
+            # half to 128 here would push the gate/up boundary, so HF's "up"
             # rows would land in the buffer's "gate" half and vice versa.
-            # Marlin sidesteps this by not padding; we do the same and
-            # rebuild a properly-padded buffer in the architecture-specific
-            # CUTLASS post-load processor after the load completes.
+            # So the buffer is padded only to the mxfp4 block (below) and the
+            # architecture-specific CUTLASS post-load processor rebuilds the
+            # 128-aligned buffer after the load completes.
             self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
             self._padded_hidden = round_up(hidden_size, 128)
             # `hidden_size` here may ALREADY be FusedMoE's rounded value (GPT-OSS
@@ -506,9 +506,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # processor can exclude the never-written tail from Humming's
             # per-expert scale range.
             self._unpadded_hidden = getattr(layer, "hidden_size_unpadded", hidden_size)
-            # create_weights below uses the *unpadded* sizes so the loader's
-            # naive-copy fast path is correct.
-            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+            # create_weights below aligns only to the mxfp4 block: gpt_oss.py
+            # shards by whole blocks, so a rank's slice can exceed
+            # intermediate_size / tp (736 vs 720 at tp=4). The extra rows have zero
+            # weights and bias and trail the interleaved pairs.
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
+            )
         elif self.use_aiter_moe:
             # Expert intermediate is padded to 128 or 256. On K3 (TP8) the 256
             # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
