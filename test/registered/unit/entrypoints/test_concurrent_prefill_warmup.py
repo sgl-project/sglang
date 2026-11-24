@@ -29,6 +29,7 @@ def _limits(**overrides):
         num_reserved_tokens=0,
         kv_pool_tokens=1888043,
         page_size=1,
+        serves_input_logprobs=True,
     )
     fields.update(overrides)
     return ConcurrentPrefillLimits(**fields)
@@ -41,6 +42,8 @@ def _internal_state(**overrides):
         "chunked_prefill_size": 16384,
         "page_size": 1,
         "memory_usage": {"token_capacity": 1888043},
+        "speculative_algorithm": None,
+        "mlx_enable_sampling": False,
     }
     state.update(overrides)
     return state
@@ -143,6 +146,21 @@ class TestConcurrentPrefillPlan(CustomTestCase):
         longest = max(max(r) for r in concurrent_prefill_plan(limits).rounds)
         charged = -(-longest // page) * page + page + 8
         self.assertLessEqual(charged, 32768)
+
+    def test_skips_logprob_probes_the_server_refuses(self):
+        for overrides in (
+            {"speculative_algorithm": "UNO"},
+            {"mlx_enable_sampling": True},
+        ):
+            limits = concurrent_prefill_limits(
+                [_internal_state(**overrides)],
+                context_len=131072,
+                max_req_input_len=131066,
+                num_reserved_tokens=0,
+            )
+            plan = concurrent_prefill_plan(limits)
+            self.assertEqual(plan.logprob_sizes, [], overrides)
+            self.assertNotEqual(plan.rounds, [], overrides)
 
 
 class TestConcurrentPrefillRequests(CustomTestCase):

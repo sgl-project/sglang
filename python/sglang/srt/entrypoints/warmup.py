@@ -11,6 +11,7 @@ import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -195,6 +196,7 @@ class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
     # Smallest full-attention KV pool over DP ranks, in tokens.
     kv_pool_tokens: int
     page_size: int
+    serves_input_logprobs: bool
 
 
 class ConcurrentPrefillPlan(msgspec.Struct, frozen=True, kw_only=True):
@@ -212,6 +214,7 @@ def concurrent_prefill_limits(
     """Collect the limits from the schedulers' `get_internal_state` readback
     (one dict per DP rank)."""
     state = internal_states[0]
+    spec_algorithm = SpeculativeAlgorithm.from_string(state["speculative_algorithm"])
     return ConcurrentPrefillLimits(
         max_running_requests=sum(
             s["effective_max_running_requests_per_dp"] for s in internal_states
@@ -225,6 +228,10 @@ def concurrent_prefill_limits(
             s["memory_usage"]["token_capacity"] for s in internal_states
         ),
         page_size=state["page_size"] or 1,
+        # UNO refuses logprob requests; the MLX sampling path refuses prompt logprobs.
+        serves_input_logprobs=not (
+            spec_algorithm.is_uno() or state["mlx_enable_sampling"]
+        ),
     )
 
 
@@ -262,7 +269,9 @@ def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefil
     for n in sorted({1, slots // 8 or 1, slots}):
         share = max(1, budget // n)
         rounds.append([min(max_prompt, share + 37 * i % share + 1) for i in range(n)])
-    logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
+    logprob_sizes = []
+    if limits.serves_input_logprobs:
+        logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
     return ConcurrentPrefillPlan(rounds=rounds, logprob_sizes=logprob_sizes)
 
 
@@ -295,17 +304,22 @@ async def concurrent_prefill(
             req.bootstrap_room = next(bootstrap_rooms)
         await tokenizer_manager.generate_request(req, None).__anext__()
 
-    limits = concurrent_prefill_limits(
-        await tokenizer_manager.get_internal_state(),
-        context_len=tokenizer_manager.context_len,
-        max_req_input_len=tokenizer_manager.max_req_input_len,
-        num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
-    )
-    plan = concurrent_prefill_plan(limits)
-    logger.info(
-        f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
-    )
-    for sizes in plan.rounds:
-        await asyncio.gather(*(one(size) for size in sizes))
-    for size in plan.logprob_sizes:
-        await one(size, return_logprob=True, logprob_start_len=0)
+    # An opt-in warmup must not stop the server from starting; the default
+    # warmup that follows still checks that the server serves.
+    try:
+        limits = concurrent_prefill_limits(
+            await tokenizer_manager.get_internal_state(),
+            context_len=tokenizer_manager.context_len,
+            max_req_input_len=tokenizer_manager.max_req_input_len,
+            num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+        )
+        plan = concurrent_prefill_plan(limits)
+        logger.info(
+            f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
+        )
+        for sizes in plan.rounds:
+            await asyncio.gather(*(one(size) for size in sizes))
+        for size in plan.logprob_sizes:
+            await one(size, return_logprob=True, logprob_start_len=0)
+    except Exception as e:
+        logger.warning(f"concurrent_prefill warmup stopped early: {e!r}")
