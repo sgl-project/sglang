@@ -156,15 +156,25 @@ class LayerWiseLoadCounter:
 
 
 class TransferReady(NamedTuple):
-    events: list[torch.cuda.Event]
+    """What a transfer waits on: the page indices, then the forward using the pages."""
+
+    indices_ready: torch.cuda.Event
+    # None when the current stream is the only one using the pages.
+    forward_done: Optional[torch.cuda.Event] = None
+
+    def synchronize_indices(self) -> None:
+        """Wait only until the page indices exist; the pages may still be in use."""
+        self.indices_ready.synchronize()
 
     def synchronize(self) -> None:
-        for event in self.events:
-            event.synchronize()
+        self.indices_ready.synchronize()
+        if self.forward_done is not None:
+            self.forward_done.synchronize()
 
     def wait(self, stream: torch.cuda.Stream) -> None:
-        for event in self.events:
-            stream.wait_event(event)
+        stream.wait_event(self.indices_ready)
+        if self.forward_done is not None:
+            stream.wait_event(self.forward_done)
 
 
 class UnifiedCacheLinker(ABC):
@@ -192,12 +202,11 @@ class UnifiedCacheLinker(ABC):
         """
         indices_ready = device_module.Event()
         indices_ready.record()
-        events = [indices_ready]
-        if self.forward_stream is not None:
-            forward_done = device_module.Event()
-            forward_done.record(self.forward_stream)
-            events.append(forward_done)
-        return TransferReady(events)
+        if self.forward_stream is None:
+            return TransferReady(indices_ready)
+        forward_done = device_module.Event()
+        forward_done.record(self.forward_stream)
+        return TransferReady(indices_ready, forward_done)
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
@@ -281,6 +290,7 @@ class _ExternalCachePrefetch:
     key: RadixKey
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
+    req: Req
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
     future: Future[bool] | None = None
     timeout_s: float = 0.0
@@ -473,6 +483,7 @@ class UnifiedCacheLinkerWrapper:
             key[:end],
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            req,
             [],
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
@@ -625,6 +636,11 @@ class UnifiedCacheLinkerWrapper:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
+            # Otherwise the published KV holds no session ref until the request
+            # finishes, and session-aware eviction drops it first while queued.
+            self.cache.session_refs.register_session_ref(
+                state.req, inserted.last_device_node
+            )
             if self.metrics is not None:
                 self.metrics.increment_linker_load_tokens(len(full), "prefetch")
         finally:
