@@ -440,6 +440,7 @@ pub struct BufferBackupSnapshot {
     pub token_ids: Vec<i64>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub user_cache_salt: Option<Option<String>>,
     pub is_bigram: bool,
     pub hash_values: Vec<String>,
     pub prefix_keys: Option<Vec<String>>,
@@ -3975,6 +3976,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     block_size: tail_block_size,
                     medium: tail_medium,
                     cache_salt: tail_cache_salt,
+                    user_cache_salt: tail_user_cache_salt,
                     session_id: tail_session_id,
                     extra_key: tail_extra_key,
                     ..
@@ -3986,12 +3988,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    user_cache_salt,
                     session_id,
                     extra_key,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
                 && *tail_cache_salt == cache_salt
+                && *tail_user_cache_salt == user_cache_salt
                 && *tail_session_id == session_id
                 && *tail_extra_key == extra_key
                 && !tail_hashes.is_empty()
@@ -4074,6 +4078,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
+        let user_cache_salt = self.arena.node(node_id).namespace.user_cache_salt();
         let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
@@ -4110,6 +4115,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     block_size: page.len(),
                     medium,
                     cache_salt: cache_salt.clone(),
+                    user_cache_salt: user_cache_salt.clone(),
                     session_id: session_id.clone(),
                     extra_key: extra_key.clone(),
                 });
@@ -4718,6 +4724,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             token_ids: K::raw_token_ids(node.key.as_ref()).into_owned(),
             extra_key: node.namespace.extra_key().map(str::to_string),
             cache_salt: node.namespace.cache_salt().map(str::to_string),
+            user_cache_salt: node
+                .namespace
+                .user_cache_salt()
+                .map(|salt| salt.map(|salt| salt.to_string())),
             is_bigram: K::IS_BIGRAM,
             hash_values,
             prefix_keys: pass_prefix_keys.then(|| self.arena.prefix_hash_values(node.parent)),
@@ -6697,6 +6707,8 @@ pub enum KvCacheEvent<A> {
         block_size: usize,
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
+        /// Caller namespace for routing; None means unknown, Some(None) unsalted.
+        user_cache_salt: Option<Option<Arc<str>>>,
         session_id: Option<Arc<str>>,
         /// Not published; Python maps it to the LoRA name that namespaces the hashes.
         extra_key: Option<Arc<str>>,

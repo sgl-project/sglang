@@ -29,6 +29,7 @@ from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
+import msgspec
 import torch
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,14 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "cache_salt", "is_bigram", "limit")
+    __slots__ = (
+        "token_ids",
+        "extra_key",
+        "cache_salt",
+        "user_cache_salt",
+        "is_bigram",
+        "limit",
+    )
 
     def __init__(
         self,
@@ -69,6 +77,7 @@ class RadixKey:
         is_bigram: bool = False,
         limit: Optional[int] = None,
         cache_salt: Optional[str] = None,
+        user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
@@ -76,11 +85,31 @@ class RadixKey:
         self.extra_key = extra_key
         # Namespaces the tree, storage and KV events.
         self.cache_salt = cache_salt or None
+        # Event metadata only; deliberately excluded from matching/storage keys.
+        self.user_cache_salt = (
+            None
+            if user_cache_salt == ""
+            or (user_cache_salt is msgspec.UNSET and self.cache_salt is None)
+            else user_cache_salt
+        )
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
         # Optional cap on raw tokens: behave as if token_ids were sliced to
         # token_ids[:limit], without the O(n) copy. None = use all tokens.
         self.limit = limit
+
+    @classmethod
+    def from_req(
+        cls, req: Req, token_ids: array[int], *, is_bigram=False, limit=None
+    ) -> RadixKey:
+        return cls(
+            token_ids,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            user_cache_salt=getattr(req, "_user_cache_salt", msgspec.UNSET),
+            is_bigram=is_bigram,
+            limit=limit,
+        )
 
     def _raw_len(self) -> int:
         n = len(self.token_ids)
@@ -134,11 +163,13 @@ class RadixKey:
                 self.extra_key,
                 is_bigram=True,
                 cache_salt=self.cache_salt,
+                user_cache_salt=self.user_cache_salt,
             )
         return RadixKey(
             self.token_ids[start:stop],
             self.extra_key,
             cache_salt=self.cache_salt,
+            user_cache_salt=self.user_cache_salt,
         )
 
     def __repr__(self) -> str:
@@ -465,11 +496,10 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
-        radix_key = RadixKey(
+        radix_key = RadixKey.from_req(
+            req,
             token_ids,
-            req.extra_key,
             is_bigram=self.is_eagle,
-            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         if key_limit is not None:
             radix_key = radix_key[:key_limit]
@@ -490,11 +520,10 @@ class RadixCache(BasePrefixCache):
         if split_prompt:
             # Split the leaf at the prompt boundary so eviction can drop the
             # output KV without the prompt; a prefix re-insert only changes topology.
-            prompt_key = RadixKey(
+            prompt_key = RadixKey.from_req(
+                req,
                 token_ids[: len(req.origin_input_ids)],
-                req.extra_key,
                 is_bigram=self.is_eagle,
-                cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             if 0 < len(prompt_key) < key_len:
                 self.insert(

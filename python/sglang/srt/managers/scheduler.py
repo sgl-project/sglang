@@ -64,6 +64,7 @@ from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 suppress_noisy_warnings()
 
 import psutil  # isort: skip
+import msgspec
 import setproctitle
 import torch
 import torch.distributed
@@ -3867,6 +3868,7 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
                     kv_hints=req.kv_hints,
+                    user_cache_salt=getattr(req, "_user_cache_salt", msgspec.UNSET),
                 )
 
     def _process_storage_prefetch_retries(self):

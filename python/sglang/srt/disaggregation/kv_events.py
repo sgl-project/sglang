@@ -250,10 +250,14 @@ class KVCacheEvent(
     """Base class for all KV cache-related events.
 
     Events are tagged msgpack maps: ``type`` carries the class name and every
-    other key is a field name. Optional fields left at ``None`` are omitted, so
-    adding an optional field never changes the shape an older consumer sees.
+    other key is a field name. Fields left at their defaults are omitted;
+    an ``UNSET`` default distinguishes omission from an explicit ``None``.
     This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
     such as Dynamo decodes both engines with one code path.
+
+    Dynamo routing consumers prefer ``user_cache_salt`` by field presence:
+    explicit null means unsalted; only an omitted field permits legacy fallback
+    to ``cache_salt``. Do not use ``user_cache_salt or cache_salt``.
 
     ``EventBatch`` stays a positional array ``[ts, events, attn_dp_rank]``.
     """
@@ -275,9 +279,8 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
-    # Salt of the request that stored these blocks. Block hashes are already
-    # namespaced by it; consumers index the emitted hashes rather than
-    # recompute them.
+    # Engine cache namespace, including multimodal identities when applicable.
+    # Block hashes are already namespaced by it and remain opaque cache IDs.
     cache_salt: Optional[str] = None
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
@@ -289,6 +292,10 @@ class BlockStored(KVCacheEvent):
     # label] runs of multimodal tokens whose item carried a caller routing
     # label. Labels are routing metadata only and never affect hashes or reuse.
     mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
+    # Dynamo format: the original caller salt, before media identities are
+    # mixed into cache_salt. UNSET means unknown; None explicitly means unsalted.
+    # Routing metadata only: cache identity and emitted block hashes are unchanged.
+    user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET
 
 
 class BlockRemoved(KVCacheEvent):

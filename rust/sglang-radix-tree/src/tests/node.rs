@@ -1117,6 +1117,29 @@ fn cache_salt_is_a_distinct_child_namespace_dimension() -> Result<(), TreeCoreRu
 }
 
 #[test]
+fn user_cache_salt_is_metadata_not_cache_identity() {
+    let internal = KeyNamespaceRef::new(None, Some("sglang-mm-v1:internal"));
+    assert_eq!(internal.to_owned().user_cache_salt(), None);
+    for user_salt in [None, Some("tenant-a")] {
+        let labeled = internal.with_user_cache_salt(Some(user_salt));
+        assert_eq!(labeled, internal);
+        let owned = labeled.to_owned();
+        assert_eq!(owned, internal.to_owned());
+        assert_eq!(owned.user_cache_salt(), Some(user_salt.map(Arc::from)));
+        let mut plain_hash = DefaultHasher::new();
+        let mut labeled_hash = DefaultHasher::new();
+        internal.hash(&mut plain_hash);
+        owned.hash(&mut labeled_hash);
+        assert_eq!(plain_hash.finish(), labeled_hash.finish());
+        assert_eq!(
+            owned.as_ref().to_owned().user_cache_salt(),
+            owned.user_cache_salt()
+        );
+    }
+    assert_eq!(KeyNamespace::default().user_cache_salt(), Some(None));
+}
+
+#[test]
 fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     let long_extra_key = "x".repeat(64 * 1024);
     let long_cache_salt = "y".repeat(64 * 1024);
@@ -1133,11 +1156,13 @@ fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     let first = KeyNamespaceRef {
         extra_key: Some("adapter-a"),
         cache_salt: Some("tenant-a"),
+        user_cache_salt: None,
         hash: 7,
     };
     let second = KeyNamespaceRef {
         extra_key: Some("adapter-b"),
         cache_salt: Some("tenant-b"),
+        user_cache_salt: None,
         hash: 7,
     };
     assert_ne!(first, second);

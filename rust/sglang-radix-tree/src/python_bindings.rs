@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pyo3::IntoPyObjectExt;
 use pyo3::buffer::PyBuffer;
@@ -514,6 +514,32 @@ impl MatchParamsBinding {
     }
 }
 
+/// Nullable caller salt, wrapped so omission remains distinct from known None.
+#[pyclass(get_all, frozen, from_py_object)]
+#[derive(Clone)]
+pub struct UserCacheSaltBinding {
+    pub value: Option<String>,
+}
+
+#[pymethods]
+impl UserCacheSaltBinding {
+    #[new]
+    #[pyo3(signature = (value = None))]
+    fn new(value: Option<String>) -> Self {
+        Self {
+            value: value.filter(|salt| !salt.is_empty()),
+        }
+    }
+}
+
+impl UserCacheSaltBinding {
+    fn from_metadata(value: Option<Option<Arc<str>>>) -> Option<Self> {
+        value.map(|value| Self {
+            value: value.map(|salt| salt.to_string()),
+        })
+    }
+}
+
 /// Python-visible insert params; converts into InsertParams. The value tensor
 /// stays a Python-held reference until the insert call unwraps it.
 #[pyclass(get_all, set_all)]
@@ -523,6 +549,7 @@ pub struct InsertParamsBinding {
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub user_cache_salt: Option<UserCacheSaltBinding>,
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub mamba_host_value: Option<Py<PyAny>>,
@@ -538,7 +565,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false, user_cache_salt = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -556,6 +583,7 @@ impl InsertParamsBinding {
         rotation_base: Option<i64>,
         mamba_host_value: Option<Py<PyAny>>,
         allow_missing_mamba: bool,
+        user_cache_salt: Option<UserCacheSaltBinding>,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             rotation_base,
@@ -563,6 +591,7 @@ impl InsertParamsBinding {
             value,
             extra_key,
             cache_salt,
+            user_cache_salt,
             session_id,
             mamba_value,
             mamba_host_value,
@@ -574,6 +603,17 @@ impl InsertParamsBinding {
             priority,
             track_adopted_ranges,
         })
+    }
+}
+
+impl InsertParamsBinding {
+    fn namespace(&self) -> KeyNamespaceRef<'_> {
+        KeyNamespaceRef::new(self.extra_key.as_deref(), self.cache_salt.as_deref())
+            .with_user_cache_salt(
+                self.user_cache_salt
+                    .as_ref()
+                    .map(|salt| salt.value.as_deref()),
+            )
     }
 }
 
@@ -869,6 +909,7 @@ pub struct BufferBackupSnapshotBinding {
     key_token_ids: Py<PyBytes>,
     extra_key: Option<String>,
     cache_salt: Option<String>,
+    user_cache_salt: Option<UserCacheSaltBinding>,
     is_bigram: bool,
     hash_values: Vec<String>,
     prefix_keys: Option<Vec<String>>,
@@ -888,6 +929,9 @@ impl BufferBackupSnapshotBinding {
             key_token_ids: PyBytes::new(py, &token_bytes).unbind(),
             extra_key: snapshot.extra_key,
             cache_salt: snapshot.cache_salt,
+            user_cache_salt: snapshot
+                .user_cache_salt
+                .map(|value| UserCacheSaltBinding { value }),
             is_bigram: snapshot.is_bigram,
             hash_values: snapshot.hash_values,
             prefix_keys: snapshot.prefix_keys,
@@ -1128,10 +1172,7 @@ macro_rules! tree_core_methods {
                 let params = InsertParams {
                     rotation_base: params.rotation_base,
                     key,
-                    namespace: KeyNamespaceRef::new(
-                        params.extra_key.as_deref(),
-                        params.cache_salt.as_deref(),
-                    ),
+                    namespace: params.namespace(),
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
@@ -1174,10 +1215,7 @@ macro_rules! tree_core_methods {
                 let params = InsertParams {
                     rotation_base: params.rotation_base,
                     key,
-                    namespace: KeyNamespaceRef::new(
-                        params.extra_key.as_deref(),
-                        params.cache_salt.as_deref(),
-                    ),
+                    namespace: params.namespace(),
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
@@ -1685,6 +1723,7 @@ macro_rules! tree_core_methods {
                 host_value: PyTensor,
                 hash_value: Vec<String>,
                 cache_salt: Option<String>,
+                user_cache_salt: Option<UserCacheSaltBinding>,
             ) -> PyResult<InsertResultBinding> {
                 let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
                 let host_value = host_value.0;
@@ -1698,7 +1737,8 @@ macro_rules! tree_core_methods {
                     .detach(move || {
                         self.core().insert_host_in_namespace(
                             node_id,
-                            KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                            KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref())
+                                .with_user_cache_salt(user_cache_salt.as_ref().map(|salt| salt.value.as_deref())),
                             key,
                             host_value,
                             hash_value,
@@ -2158,6 +2198,7 @@ macro_rules! tree_core_methods {
                             block_size,
                             medium,
                             cache_salt,
+                            user_cache_salt,
                             session_id,
                             extra_key,
                         } => {
@@ -2171,6 +2212,7 @@ macro_rules! tree_core_methods {
                                 cache_salt.map(|salt| salt.to_string()),
                                 session_id.map(|session_id| session_id.to_string()),
                                 extra_key.map(|extra_key| extra_key.to_string()),
+                                UserCacheSaltBinding::from_metadata(user_cache_salt),
                             )
                                 .into_py_any(py)?;
                             list.append(item)?;
@@ -3164,7 +3206,7 @@ macro_rules! tree_core_binding {
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
-            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None))]
+            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None, user_cache_salt = None))]
             fn insert_host(
                 &self,
                 py: Python<'_>,
@@ -3174,10 +3216,11 @@ macro_rules! tree_core_binding {
                 host_value: PyTensor,
                 hash_value: Vec<String>,
                 cache_salt: Option<String>,
+                user_cache_salt: Option<UserCacheSaltBinding>,
             ) -> PyResult<InsertResultBinding> {
                 catch_native_panic(|| {
                     self.inner.insert_host(
-                        py, node_id, extra_key, key, host_value, hash_value, cache_salt,
+                        py, node_id, extra_key, key, host_value, hash_value, cache_salt, user_cache_salt,
                     )
                 })
             }
@@ -4106,6 +4149,7 @@ fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TreeCoreInitParamsBinding>()?;
     m.add_class::<MatchParamsBinding>()?;
     m.add_class::<InsertParamsBinding>()?;
+    m.add_class::<UserCacheSaltBinding>()?;
     m.add_class::<MatchResultBinding>()?;
     m.add_class::<InsertResultBinding>()?;
     m.add_class::<IncLockRefResultBinding>()?;

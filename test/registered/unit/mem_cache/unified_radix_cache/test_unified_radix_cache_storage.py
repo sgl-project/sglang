@@ -1715,6 +1715,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             None,
             extra_key=extra_key,
             cache_salt=cache_salt,
+            user_cache_salt="client-a",
         )
         self._pump_hicache_until(
             cons,
@@ -1726,6 +1727,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         held = cons.buffer_pipeline.staged_prefetches[root_req]
         self.assertEqual((held.extra_key, held.cache_salt), (extra_key, cache_salt))
+        self.assertEqual(held.user_cache_salt, "client-a")
         self.assertNotIn(root_req, cons.buffer_pipeline.anchor_locks)
         loaded = self._consume_staged_prefetch(
             cons,
@@ -1738,6 +1740,10 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(
             cons.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, len(seq)
         )
+        leaf = cons.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        snapshot = cons.tree_core.snapshot_buffer_backup(leaf, pass_prefix_keys=False)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.key.user_cache_salt, "client-a")
         for miss in (
             RadixKey(array("q", seq)),
             RadixKey(array("q", seq), extra_key=extra_key, cache_salt="tenant-b"),

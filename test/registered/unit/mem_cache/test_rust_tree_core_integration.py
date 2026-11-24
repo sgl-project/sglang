@@ -2301,6 +2301,7 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
             lora_id=None,
             medium=StorageMedium.GPU,
             lora_name="adapter-a",
+            user_cache_salt=None,
         )
     ]
 
@@ -4418,10 +4419,16 @@ def test_swa_host_only_prefix_matches_with_a_request_window(backend, request_win
     assert matched.host_hit_length == (8 if request_window else 0)
 
 
-def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
+@pytest.mark.parametrize("user_salt", [msgspec.UNSET, None, "caller-a"])
+def test_buffer_backup_snapshot_round_trips_and_detects_a_split(user_salt):
     core = _tree_core()
     core.enable_storage = True
-    key = RadixKey(array("q", [1, 2]), extra_key="adapter-a", cache_salt="tenant-a")
+    key = RadixKey(
+        array("q", [1, 2]),
+        extra_key="adapter-a",
+        cache_salt="tenant-a",
+        user_cache_salt=user_salt,
+    )
     inserted = _pump_insert(
         core,
         InsertParams(key=key, value=torch.tensor([10, 11], dtype=torch.int64)),
@@ -4437,6 +4444,7 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     assert snapshot.key.token_ids == array("q", [1, 2])
     assert snapshot.key.extra_key == "adapter-a"
     assert snapshot.key.cache_salt == "tenant-a"
+    assert snapshot.key.user_cache_salt == user_salt
     assert not snapshot.key.is_bigram
     assert snapshot.prefix_keys == []
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is not None

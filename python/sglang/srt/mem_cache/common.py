@@ -143,11 +143,10 @@ def _req_radix_key(
         key_limit = (
             max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
         )
-    return RadixKey(
-        token_ids=token_ids,
-        extra_key=req.extra_key,
+    return RadixKey.from_req(
+        req,
+        token_ids,
         limit=key_limit,
-        cache_salt=req.cache_salt,
     )
 
 

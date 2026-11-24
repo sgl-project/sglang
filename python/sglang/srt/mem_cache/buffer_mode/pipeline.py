@@ -146,6 +146,7 @@ class _StagedPrefetch(msgspec.Struct):
     aux_xfers: list[PoolTransfer]
     hash_values: list[str]
     operation_id: int
+    user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET
 
 
 class _OngoingBufferLoadBack(msgspec.Struct):
@@ -1578,6 +1579,7 @@ class BufferModePipeline:
             extra_key=f.extra_key,
             is_bigram=self._cache.tree_core.is_eagle,
             cache_salt=f.cache_salt,
+            user_cache_salt=f.user_cache_salt,
         )
         matched_len, node_id = self._match_full_device_anchor(key)
         if matched_len < f.matched_len:
@@ -1838,6 +1840,7 @@ class BufferModePipeline:
             ),
             extra_key=key.extra_key,
             cache_salt=key.cache_salt,
+            user_cache_salt=key.user_cache_salt,
             matched_len=len(prefix_tokens),
             num_tokens=num_tokens,
             occupied_tokens=occupied_tokens,

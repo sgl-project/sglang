@@ -153,6 +153,23 @@ class TestResolveLoadPubRange(CustomTestCase):
 
 
 class TestBlockStoredWireFormat(CustomTestCase):
+    def test_user_cache_salt_distinguishes_unknown_from_unsalted(self):
+        for salt in (msgspec.UNSET, None, "tenant-a"):
+            with self.subTest(salt=salt):
+                event = self._event()
+                event.user_cache_salt = salt
+                payload = msgspec.msgpack.encode(event)
+                decoded = msgspec.msgpack.decode(payload)
+                self.assertEqual(
+                    "user_cache_salt" in decoded, salt is not msgspec.UNSET
+                )
+                if salt is not msgspec.UNSET:
+                    self.assertEqual(decoded["user_cache_salt"], salt)
+                self.assertEqual(
+                    msgspec.msgpack.decode(payload, type=BlockStored).user_cache_salt,
+                    salt,
+                )
+
     def _event(self, **extra):
         return BlockStored(
             block_hashes=[123],

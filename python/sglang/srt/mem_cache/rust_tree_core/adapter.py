@@ -7,6 +7,7 @@ import sys
 from array import array
 from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
@@ -117,6 +118,12 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
+def _user_cache_salt_to_binding(bindings_module, key: RadixKey):
+    if key.user_cache_salt is msgspec.UNSET:
+        return None
+    return bindings_module.UserCacheSaltBinding(key.user_cache_salt)
+
+
 def _kv_event_from_tagged(
     event: tuple, lora_names: KvEventLoraNames, dynamo_format: bool = False
 ):
@@ -150,6 +157,12 @@ def _kv_event_from_tagged(
             lora_id=None,
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
+            # The nullable wrapper preserves unknown versus explicitly unsalted.
+            user_cache_salt=(
+                event[9].value
+                if dynamo_format and len(event) > 9 and event[9] is not None
+                else msgspec.UNSET
+            ),
             session_id=event[7],
             lora_name=lora_name,
             mm_routing_spans=(
@@ -975,6 +988,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                user_cache_salt=_user_cache_salt_to_binding(self._bindings, key),
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 mamba_host_value=params.mamba_host_value,
@@ -1106,6 +1120,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             host_value,
             list(hash_value),
             key.cache_salt,
+            _user_cache_salt_to_binding(self._bindings, key),
         )
         return InsertResult(
             prefix_len=result.prefix_len,
@@ -1267,6 +1282,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 extra_key=snapshot.extra_key,
                 is_bigram=snapshot.is_bigram,
                 cache_salt=snapshot.cache_salt,
+                user_cache_salt=(
+                    snapshot.user_cache_salt.value
+                    if snapshot.user_cache_salt is not None
+                    else msgspec.UNSET
+                ),
             ),
             prefix_keys=snapshot.prefix_keys,
         )

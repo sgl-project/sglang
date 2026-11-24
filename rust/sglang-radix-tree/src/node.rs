@@ -19,6 +19,9 @@ use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
 struct KeyNamespaceData {
     extra_key: Option<Arc<str>>,
     cache_salt: Option<Arc<str>>,
+    // Event metadata, not part of namespace equality or hashing. The outer
+    // Option distinguishes unknown from an explicitly unsalted request.
+    user_cache_salt: Option<Option<Arc<str>>>,
     hash: u64,
 }
 
@@ -34,6 +37,7 @@ pub struct KeyNamespace(Option<Arc<KeyNamespaceData>>);
 pub struct KeyNamespaceRef<'a> {
     pub extra_key: Option<&'a str>,
     pub cache_salt: Option<&'a str>,
+    user_cache_salt: Option<Option<&'a str>>,
     hash: u64,
 }
 
@@ -53,17 +57,29 @@ impl<'a> KeyNamespaceRef<'a> {
         Self {
             extra_key,
             cache_salt,
+            user_cache_salt: cache_salt.is_none().then_some(None),
             hash: key_namespace_hash(extra_key, cache_salt),
         }
     }
 
+    pub fn with_user_cache_salt(mut self, value: Option<Option<&'a str>>) -> Self {
+        if let Some(value) = value {
+            self.user_cache_salt = Some(value.filter(|salt| !salt.is_empty()));
+        }
+        self
+    }
+
     pub fn to_owned(self) -> KeyNamespace {
-        if self.extra_key.is_none() && self.cache_salt.is_none() {
+        if self.extra_key.is_none()
+            && self.cache_salt.is_none()
+            && !matches!(self.user_cache_salt, Some(Some(_)))
+        {
             return KeyNamespace::default();
         }
         KeyNamespace(Some(Arc::new(KeyNamespaceData {
             extra_key: self.extra_key.map(Into::into),
             cache_salt: self.cache_salt.map(Into::into),
+            user_cache_salt: self.user_cache_salt.map(|salt| salt.map(Into::into)),
             hash: self.hash,
         })))
     }
@@ -93,6 +109,10 @@ impl KeyNamespace {
             Some(namespace) => KeyNamespaceRef {
                 extra_key: namespace.extra_key.as_deref(),
                 cache_salt: namespace.cache_salt.as_deref(),
+                user_cache_salt: namespace
+                    .user_cache_salt
+                    .as_ref()
+                    .map(|salt| salt.as_deref()),
                 hash: namespace.hash,
             },
             None => KeyNamespaceRef::default(),
@@ -111,6 +131,13 @@ impl KeyNamespace {
         self.0
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
+    }
+
+    pub fn user_cache_salt(&self) -> Option<Option<Arc<str>>> {
+        match self.0.as_deref() {
+            Some(namespace) => namespace.user_cache_salt.clone(),
+            None => Some(None),
+        }
     }
 
     pub fn extra_key_arc(&self) -> Option<Arc<str>> {

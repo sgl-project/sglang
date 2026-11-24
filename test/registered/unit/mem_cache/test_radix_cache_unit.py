@@ -29,6 +29,7 @@ import unittest.mock
 from array import array
 from types import SimpleNamespace
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
@@ -56,6 +57,15 @@ DEFAULT_PAGE_SIZE = 4
 
 
 class TestKVCacheEventQueue(unittest.TestCase):
+    def test_coalescing_preserves_user_salt_presence(self):
+        for first, second in ((msgspec.UNSET, None), (None, "tenant-a")):
+            queue = KVCacheEventRecorder(enabled=True, page_size=2)
+            a, b = self._store(1, None), self._store(2, 1)
+            a.user_cache_salt, b.user_cache_salt = first, second
+            queue.enqueue(a)
+            queue.enqueue(b)
+            self.assertEqual(len(queue.take()), 2)
+
     @staticmethod
     def _store(
         block_hash: int,
@@ -148,6 +158,31 @@ class TestLoRANameTable(unittest.TestCase):
 
 class TestRadixKey(unittest.TestCase):
     """Test cases for RadixKey class."""
+
+    def test_request_user_salt_survives_key_views_without_changing_matching(self):
+        for salt in (None, "tenant-a"):
+            for bigram in (False, True):
+                with self.subTest(salt=salt, bigram=bigram):
+                    req = SimpleNamespace(
+                        extra_key=None,
+                        cache_salt="sglang-mm-v1:internal",
+                        _user_cache_salt=salt,
+                    )
+                    key = RadixKey.from_req(req, array("q", range(7)), is_bigram=bigram)
+                    query = RadixKey(
+                        key.token_ids,
+                        cache_salt=req.cache_salt,
+                        is_bigram=bigram,
+                    )
+                    self.assertEqual(key.match(query), len(key))
+                    for view in (key, key[1:], key[:0], key.page_aligned(2)):
+                        self.assertEqual(view.user_cache_salt, salt)
+                        self.assertEqual(view.cache_salt, req.cache_salt)
+                    del req._user_cache_salt
+                    self.assertIs(
+                        RadixKey.from_req(req, key.token_ids).user_cache_salt,
+                        msgspec.UNSET,
+                    )
 
     def test_init_with_extra_key(self):
         """Test initialization with extra_key."""
@@ -307,6 +342,49 @@ class TestTreeNode(unittest.TestCase):
 
 class TestRadixCache(CustomTestCase):
     """Test cases for RadixCache class."""
+
+    def test_user_salt_survives_split_and_delayed_store_only_in_dynamo_format(self):
+        for dynamo_format in (False, True):
+            for user_salt in (None, "tenant-a"):
+                with self.subTest(dynamo_format=dynamo_format, user_salt=user_salt):
+                    cache = RadixCache.create_simulated(
+                        page_size=2,
+                        enable_kv_cache_events=True,
+                        dynamo_kv_event_format=dynamo_format,
+                    )
+                    cache.take_events()
+                    internal_salt = "sglang-mm-v1:internal"
+                    req = SimpleNamespace(
+                        extra_key=None,
+                        cache_salt=internal_salt,
+                        _user_cache_salt=user_salt,
+                    )
+                    first = cache.insert(
+                        InsertParams(
+                            key=RadixKey.from_req(req, array("q", [1, 2, 3, 4]))
+                        )
+                    )
+                    cache.insert(
+                        InsertParams(
+                            key=RadixKey.from_req(req, array("q", [1, 2, 5, 6]))
+                        )
+                    )
+                    del req
+                    initial = [
+                        e for e in cache.take_events() if isinstance(e, BlockStored)
+                    ]
+                    cache.kv_events.record_store(
+                        first.last_device_node, medium=StorageMedium.CPU
+                    )
+                    delayed = cache.take_events()
+                    self.assertTrue(initial)
+                    self.assertTrue(delayed)
+                    for event in initial + delayed:
+                        self.assertEqual(event.cache_salt, internal_salt)
+                        self.assertEqual(
+                            event.user_cache_salt,
+                            user_salt if dynamo_format else msgspec.UNSET,
+                        )
 
     def setUp(self):
         """Set up test fixtures."""
