@@ -25,7 +25,9 @@ def _rank_sum(X, Y, N: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
 
 
 def _device():
-    return torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 def _symm(group, numel, dtype, device, flags=False):
@@ -66,8 +68,10 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
         return x
     if world not in _RANK_ORDER_MAX_BYTES:
         raise ValueError("Inkling2 tensor parallelism requires 2, 4, 8, or 16 ranks")
-    if not x.is_cuda or x.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("Inkling2 collectives require BF16 or FP32 CUDA tensors")
+    if not x.is_cuda:
+        return group.all_reduce(x)
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("Inkling2 collectives require BF16 or FP32 tensors")
     if x.nbytes % 4:
         raise ValueError("Inkling2 collective payloads must be 4-byte aligned")
     x = x.contiguous()
@@ -95,10 +99,14 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
 def multicast_all_reduce_input(group, shape, dtype):
     """A view of the symmetric multicast buffer for a producer to write an all-reduce
     input into; multicast_all_reduce reduces it in place."""
+    if group.world_size == 1:
+        return torch.empty(shape, dtype=dtype, device=_device())
     return _multicast_view(group, _device(), dtype, shape[0] * shape[1]).view(shape)
 
 
 def multicast_all_reduce(x, group):
+    if group.world_size == 1:
+        return x
     torch.ops.symm_mem.multimem_all_reduce_(
         x.view(-1), "sum", group.device_group.group_name
     )
@@ -106,13 +114,16 @@ def multicast_all_reduce(x, group):
 
 
 ONESHOT_MAX_TOKENS = 64
+FP32_ONESHOT_MAX_TOKENS = 8
 # Larger reductions run the in-place multimem kernel with entry/exit barriers.
 INPLACE_MAX_TOKENS = 512
 PREFILL_INPLACE_MAX_TOKENS = 32768
 
 
-def _oneshot_blocks(tokens):
-    # Tuned on GB300 TP4 inside CUDA graphs.
+def _oneshot_blocks(tokens, dtype):
+    # Tuned on GB300 TP4 (BF16) and H200 TP4 (FP32) inside CUDA graphs.
+    if dtype == torch.float32:
+        return 1 if tokens <= 2 else 8
     return 1 if tokens == 1 else 4 if tokens <= 4 else 8 if tokens <= 8 else 32
 
 
@@ -181,7 +192,7 @@ class _OneShotAllReduce:
             self.handle.rank,
             self.world,
             n,
-            _oneshot_blocks(x.shape[0]),
+            _oneshot_blocks(x.shape[0], x.dtype),
             1024,
         )
         self.current = 1 - self.current
@@ -194,12 +205,13 @@ _ONESHOT: dict = {}
 def oneshot_all_reduce_input(group, rows, cols, dtype, tag=""):
     """A view of the next one-shot all-reduce input region for a producer to write
     into, or None when the one-shot path does not apply (including when NVLink
-    multicast is unavailable)."""
-    if (
+    multicast is unavailable). FP32 inputs take only the full one-shot sizes."""
+    if not torch.cuda.is_available() or (
         group.world_size not in (4, 8)
-        or dtype != torch.bfloat16
+        or dtype not in (torch.bfloat16, torch.float32)
         or rows <= 0
         or (rows * cols) % 8
+        or (dtype == torch.float32 and rows > FP32_ONESHOT_MAX_TOKENS)
     ):
         return None
     key = (group.device_group.group_name, cols, tag)
@@ -208,9 +220,13 @@ def oneshot_all_reduce_input(group, rows, cols, dtype, tag=""):
             return None
         from sglang.srt.runtime_context import cutedsl_moe_max_num_tokens
 
-        inplace_tokens = min(
-            max(INPLACE_MAX_TOKENS, cutedsl_moe_max_num_tokens()),
-            PREFILL_INPLACE_MAX_TOKENS,
+        inplace_tokens = (
+            FP32_ONESHOT_MAX_TOKENS
+            if dtype == torch.float32
+            else min(
+                max(INPLACE_MAX_TOKENS, cutedsl_moe_max_num_tokens()),
+                PREFILL_INPLACE_MAX_TOKENS,
+            )
         )
         reducer = _OneShotAllReduce(group, cols, dtype, _device(), inplace_tokens)
         _ONESHOT[key] = reducer if reducer.handle.multicast_ptr else None
@@ -294,6 +310,8 @@ _ROUTED_EXCHANGE: dict = {}
 
 def prepare_routed_exchange(group, max_rows, hidden):
     """Allocate the routed exchange (collective; call outside graph capture)."""
+    if not torch.cuda.is_available():
+        return
     key = (group.device_group.group_name, hidden)
     if key not in _ROUTED_EXCHANGE and group.world_size > 1:
         _ROUTED_EXCHANGE[key] = RoutedExchange(group, max_rows, hidden, _device())
@@ -435,6 +453,8 @@ _PREFILL_EXCHANGE: dict = {}
 
 def prepare_prefill_exchange(group, max_tokens, top_k, hidden):
     """Allocate the prefill exchange (collective; call outside graph capture)."""
+    if not torch.cuda.is_available():
+        return
     key = (group.device_group.group_name, hidden)
     if key not in _PREFILL_EXCHANGE and group.world_size > 1 and max_tokens > 0:
         _PREFILL_EXCHANGE[key] = PrefillExchange(

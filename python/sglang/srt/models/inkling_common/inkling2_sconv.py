@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import torch
 from torch import nn
 
@@ -52,6 +54,15 @@ class ShortConvolution(InklingShortConvolution):
             )
             set_weight_attrs(self.static_w, {"weight_loader": self.static_w_loader})
 
+    @contextmanager
+    def state_layer_override(self, layer_id: int):
+        """Read and write the conv state of cache layer layer_id instead of our own."""
+        previous, self.layer_id = self.layer_id, layer_id
+        try:
+            yield
+        finally:
+            self.layer_id = previous
+
     def weight_proj_loader(self, param, loaded_weight):
         if loaded_weight.shape != param.shape:
             assert loaded_weight.shape[0] % self.tp_size == 0
@@ -60,6 +71,7 @@ class ShortConvolution(InklingShortConvolution):
             )
         assert loaded_weight.shape == param.shape
         param.data.copy_(loaded_weight)
+        self._weight_proj_cache = None
 
     def static_w_loader(self, param, loaded_weight):
         if loaded_weight.shape != param.shape:
@@ -68,6 +80,15 @@ class ShortConvolution(InklingShortConvolution):
             )
         assert loaded_weight.shape == param.shape
         param.data.copy_(loaded_weight)
+
+    def _weight_proj_for(self, dtype: torch.dtype) -> torch.Tensor:
+        if self.weight_proj.dtype == dtype:
+            return self.weight_proj
+        cache = getattr(self, "_weight_proj_cache", None)
+        if cache is None or cache[0] != dtype:
+            cache = (dtype, self.weight_proj.to(dtype).contiguous())
+            self._weight_proj_cache = cache
+        return cache[1]
 
     def forward(self, hidden_states, positions, forward_batch, *, dynamic_input=None):
         mode = forward_batch.forward_mode
@@ -82,7 +103,7 @@ class ShortConvolution(InklingShortConvolution):
             weight = self.static_w
             dynamic_weights = linear(
                 dynamic_input.to(hidden_states.dtype),
-                self.weight_proj.to(hidden_states.dtype),
+                self._weight_proj_for(hidden_states.dtype),
             ).view(hidden_states.shape[0], self.n_heads, self.kernel_size[0])
         else:
             assert dynamic_input is None

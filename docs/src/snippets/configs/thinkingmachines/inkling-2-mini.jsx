@@ -4,12 +4,13 @@
 export const config = {
   modelName: "Inkling-2-Mini",
 
-  supportedHardware: ["h200", "gb300", "rtx6000", "rtx5090", "dgx-spark", "mi350x", "mi355x", "tpu7x"],
+  supportedHardware: ["h200", "gb300", "rtx6000", "rtx5090", "dgx-spark", "mi350x", "mi355x", "tpu7x", "xeon"],
 
   hardware: [
     { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
     { id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" },
+    { id: "xeon", label: "Xeon", vram: "CPU", vendor: "cpu" },
   ],
 
   dockerHostNetworkWhen: (s) => s.hw === "tpu7x",
@@ -50,6 +51,8 @@ export const config = {
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
+
+  runModes: (s) => (s.hw === "xeon" ? ["python"] : ["python", "docker"]),
 
   dockerImages: {
     h200:  "lmsysorg/sglang:inkling-2-mini",
@@ -134,17 +137,20 @@ sgl-eval run gsm8k \\
             disable: [
               { when: { strategy: ["dspark"] }, reason: "DSpark drafts read fixed layer visits; serve them at the checkpoint's 3 passes." },
               { when: { hw: ["tpu7x"] }, reason: "Not yet run on TPU7x; the TPU7x recipes use the checkpoint's 3 passes." },
+              { when: { hw: ["xeon"] }, reason: "Not yet run on Xeon; the Xeon recipes use the checkpoint's 3 passes." },
               { when: { hw: ["mi350x", "mi355x"] }, reason: "Not yet run on AMD; 2, 3 and 4 passes were." },
             ] },
           { id: "p2", label: "2", flags: ["--inkling2-loop-num-passes 2"],
             disable: [
               { when: { strategy: ["dspark"] }, reason: "DSpark drafts read fixed layer visits; serve them at the checkpoint's 3 passes." },
               { when: { hw: ["tpu7x"] }, reason: "Not yet run on TPU7x; the TPU7x recipes use the checkpoint's 3 passes." },
+              { when: { hw: ["xeon"] }, reason: "Not yet run on Xeon; the Xeon recipes use the checkpoint's 3 passes." },
             ] },
           { id: "p4", label: "4", flags: ["--inkling2-loop-num-passes 4"],
             disable: [
               { when: { strategy: ["dspark"] }, reason: "DSpark drafts read fixed layer visits; serve them at the checkpoint's 3 passes." },
               { when: { hw: ["tpu7x"] }, reason: "Not yet run on TPU7x; the TPU7x recipes use the checkpoint's 3 passes." },
+              { when: { hw: ["xeon"] }, reason: "Not yet run on Xeon; the Xeon recipes use the checkpoint's 3 passes." },
             ] },
         ],
       },
@@ -156,8 +162,8 @@ sgl-eval run gsm8k \\
         options: [
           { id: "perPass", label: "Per pass (default)", flags: [] },
           { id: "shared",  label: "Shared across passes", flags: ["--inkling2-loop-share-cache"],
-            disable: { hw: ["tpu7x"] },
-            disableReason: "Not yet run on TPU7x; the TPU7x recipes keep one KV cache per pass." },
+            disable: { hw: ["tpu7x", "xeon"] },
+            disableReason: "Not yet run on TPU7x or Xeon; these recipes keep one KV cache per pass." },
         ],
       },
     ],
@@ -169,8 +175,8 @@ sgl-eval run gsm8k \\
     pdDisagg: {
       modes: [
         { id: "off",     label: "Off" },
-        { id: "prefill", label: "Prefill role", hide: { hw: ["h200", "tpu7x"] } },
-        { id: "decode",  label: "Decode role",  hide: { hw: ["h200", "tpu7x"] } },
+        { id: "prefill", label: "Prefill role", hide: { hw: ["h200", "tpu7x", "xeon"] } },
+        { id: "decode",  label: "Decode role",  hide: { hw: ["h200", "tpu7x", "xeon"] } },
       ],
       transferBackends: [
         { id: "mooncake", label: "Mooncake",
@@ -185,7 +191,7 @@ sgl-eval run gsm8k \\
           // colocated server; NiXL matched it token for token.
           hide: { hw: ["mi350x", "mi355x"] } },
         { id: "nixl", label: "NiXL",
-          hide: { hw: ["h200", "gb300", "rtx6000", "rtx5090", "dgx-spark", "tpu7x"] } },
+          hide: { hw: ["h200", "gb300", "rtx6000", "rtx5090", "dgx-spark", "tpu7x", "xeon"] } },
       ],
       router: {
         port: 8000,
@@ -202,7 +208,7 @@ sgl-eval run gsm8k \\
     // The host tier was validated on GB300 (TP2) and MI350X (TP4); storage
     // backends were not run. Hidden on TPU7x: host offload has not been run there.
     hicache: {
-      excludesHw: ["tpu7x"],
+      excludesHw: ["tpu7x", "xeon"],
       backends: [
         { id: null,       label: "Auto" },
         { id: "file",     label: "File" },
@@ -592,6 +598,51 @@ sgl-eval run gsm8k \\
         "--enable-multimodal",
         "--reasoning-parser inkling",
         "--tool-call-parser inkling",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Intel Xeon CPU (Intel AMX): NVFP4 / MXFP8 routed experts packed to AMX BF16 on load.
+    {
+      match: { hw: "xeon", quant: "nvfp4", strategy: "balanced" },
+      nnodes: 1,
+      verified: true,
+      warn: "Requires the CPU engine build on Intel Xeon with AMX; see [Intel Xeon deployment](#xeon).",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--tp 4",
+        "--attention-backend intel_amx",
+        "--mem-fraction-static 0.35",
+        "--enable-multimodal",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", quant: "nvfp4", strategy: "dspark" },
+      nnodes: 1,
+      verified: true,
+      warn: "Requires the CPU engine build on Intel Xeon with AMX; see [Intel Xeon deployment](#xeon).",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--tp 4",
+        "--attention-backend intel_amx",
+        "--mem-fraction-static 0.35",
+        "--speculative-algorithm DSPARK",
+        "--speculative-num-draft-tokens 8",
+        "--enable-multimodal",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling2",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

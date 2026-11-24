@@ -240,3 +240,31 @@ def fused_qk_norm_rope(
         attention_factor,
         rotary_dim if rotary_dim is not None else head_dim,
     )
+
+
+def inkling2_fused_experts_cpu(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_softcap: float,
+    up_softcap: float,
+    inplace: bool = False,
+    is_vnni: bool = False,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.inkling2_fused_experts_cpu(
+        hidden_states,
+        w13,
+        w2,
+        topk_weights,
+        topk_ids,
+        gate_softcap,
+        up_softcap,
+        inplace,
+        is_vnni,
+        w13_scale,
+        w2_scale,
+    )

@@ -160,6 +160,7 @@ if is_mps():
 
 # subset of above quant methods, supported on CPU
 CPU_QUANTIZATION_METHODS = {
+    "inkling2": Inkling2QuantConfig,
     "fp8": Fp8Config,
     "w8a8_int8": W8A8Int8Config,
     "compressed-tensors": CompressedTensorsConfig,

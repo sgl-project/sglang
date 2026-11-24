@@ -1,6 +1,6 @@
 ---
 title: Inkling-2-Mini
-description: "Deploy Inkling-2-Mini with SGLang — verified launch commands, with and without DSpark speculative decoding, for Thinking Machines' looped NVFP4 / MXFP8 Mixture-of-Experts model on GB300, H200, RTX PRO 6000, RTX 5090, DGX Spark, AMD MI350X / MI355X, and TPU7x."
+description: "Deploy Inkling-2-Mini with SGLang — verified launch commands, with and without DSpark speculative decoding, for Thinking Machines' looped NVFP4 / MXFP8 Mixture-of-Experts model on GB300, H200, RTX PRO 6000, RTX 5090, DGX Spark, AMD MI350X / MI355X, TPU7x, and Intel Xeon CPUs."
 tag: NEW
 ---
 
@@ -18,6 +18,7 @@ SGLang supports Inkling-2-Mini from day 0. See the launch blog post: [SGLang and
 | DGX Spark | Yes | `lmsysorg/sglang:inkling-2-mini` |
 | MI350X / MI355X | Yes | `lmsysorg/sglang:inkling-2-mini-mi35x` |
 | TPU7x | Yes | `lmsysorg/sglang:inkling-2-mini-tpu` |
+| Intel Xeon | Yes | Source build on `lmsysorg/sglang:v0.5.18-xeon` (see [Intel Xeon deployment](#xeon)) |
 
 ## Deployment
 
@@ -78,7 +79,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Inkling-2-Mini** is a looped Mixture-of-Experts model from Thinking Machines with **26B total and 5.4B active parameters** per token. It takes text and image input. Its 24 layers each have 128 routed experts (top-8, no shared experts), and layers 6–17 run three passes per token. A 3-layer DSpark draft head is bundled for speculative decoding. The weights take about 18 GB, so SGLang serves it on a single GPU, including desktop and workstation GPUs, or across several GPUs or TPU cores with tensor and expert parallelism.
+**Inkling-2-Mini** is a looped Mixture-of-Experts model from Thinking Machines with **26B total and 5.4B active parameters** per token. It takes text and image input. Its 24 layers each have 128 routed experts (top-8, no shared experts), and layers 6–17 run three passes per token. A 3-layer DSpark draft head is bundled for speculative decoding. The weights take about 18 GB, so SGLang serves it on a single GPU, including desktop and workstation GPUs, or across several GPUs, TPU cores, or Intel Xeon CPU sockets with tensor and expert parallelism.
 
 **Resources:** HuggingFace — [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini).
 
@@ -110,6 +111,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **TPU7x.** One TPU7x host (4 chips, 8 TensorCores) runs TP8 / EP8 on sglang-torchtpu. The first start compiles the serving shapes (about 10 minutes); later starts reuse the compilation cache.
 
+**Intel Xeon.** Dual-socket Intel Xeon processors with AMX (such as Xeon 6767P) run TP4 across NUMA nodes with `--device cpu --attention-backend intel_amx`; routed NVFP4 and MXFP8 experts are packed into AMX VNNI BF16 layout automatically, and both `DSPARK` and `NGRAM` speculative decoding are supported.
+
 <a id="tpu" />
 
 ## 3. TPU7x deployment
@@ -121,3 +124,13 @@ Inkling-2-Mini runs on a 4-chip TPU7x slice (one host, 8 TensorCores) as one TP8
 Select **TPU7x** and **DSpark** above for the command. It sets only what Inkling-2-Mini needs; everything else is left at its default. The DSpark draft is bundled in the checkpoint.
 
 The DSpark command was verified with GSM8K and an image-input check; AIME26 and GPQA Diamond were also run with the tuned flags of the Inkling-2-Small recipe `recipe/configs/inkling2/server.py`. The **Balanced** recipe, the same command without speculative decoding, has not been run end to end. Not yet run on TPU7x: contexts above 131072 tokens, the **Loop Passes** and **Loop KV Cache** options, PD disaggregation, and HiCache.
+
+<a id="xeon" />
+
+## 4. Intel Xeon CPU deployment
+
+Inkling-2-Mini runs on 4th Gen or newer Intel Xeon processors with Intel AMX via the SGLang CPU engine (`SGLANG_USE_CPU_ENGINE=1`, `--device cpu --attention-backend intel_amx`). Select **Xeon** and **Balanced** or **DSpark** above for the launch command.
+
+- **NUMA & thread binding.** By default `--tp 4` binds one rank per NUMA / L3 group. To pin explicit physical cores per rank across two sockets on an Intel Xeon 6767P, export `SGLANG_CPU_OMP_THREADS_BIND="0-31|32-63|64-95|96-127"` before launching; for single-socket deployment (64 cores), `--tp 2` with `SGLANG_CPU_OMP_THREADS_BIND="0-31|32-63"` reaches `27.2` tokens/s with DSpark (`31.1` tokens/s across two sockets with `0-63|64-127`). See the [CPU server guide](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine).
+- **Speculative decoding.** The **DSpark** recipe loads the bundled `mtp.safetensors` draft head (`--speculative-algorithm DSPARK --speculative-num-draft-tokens 8`), reaching ~2.9x greedy code-generation decode throughput over plain decode on dual-socket Xeon 6767P at `--tp 4` with native NVFP4/MXFP8 AMX/AVX-512 MoE and fused CPU kernels (`32.4` vs `11.2` tokens/s, mean accept length `5.71`). Draft-free N-gram speculation (`--speculative-algorithm NGRAM --speculative-num-draft-tokens 4`) is also supported on `intel_amx`.
+- **Capabilities verified on Xeon.** Text reasoning (`--reasoning-parser inkling`), tool calling (`--tool-call-parser inkling2`), multimodal image inputs (`--enable-multimodal`), and multi-turn radix prefix caching (`UnifiedRadixCache` across full, SWA, and short-conv states). Loop-pass overrides, PD disaggregation, and HiCache have not been validated on Xeon.

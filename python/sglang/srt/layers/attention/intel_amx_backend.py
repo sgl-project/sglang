@@ -108,13 +108,23 @@ class IntelAMXAttnBackend(AttentionBackend):
             # mask lets extend_attention_cpu take its faster mask-free path. EAGLE
             # has tree_topk == topk (> 1 for real trees); NGRAM has tree_topk == -1
             # (irregular tree); both need the mask.
-            if spec_info.tree_topk != 1:
-                custom_mask = spec_info.custom_mask
+            if getattr(spec_info, "tree_topk", 1) != 1:
+                custom_mask = getattr(spec_info, "custom_mask", None)
                 if custom_mask is not None and custom_mask.numel() > 0:
                     tree_mask = custom_mask
         else:
             extend_seq_lens = forward_batch.extend_seq_lens
             extend_start_loc = forward_batch.extend_start_loc
+            if extend_seq_lens is None and forward_batch.spec_info is not None:
+                spec_info = forward_batch.spec_info
+                num_draft = getattr(spec_info, "draft_token_num", self.num_draft_tokens)
+                extend_seq_lens = torch.full(
+                    (bs,), num_draft, dtype=torch.int32, device=self.device
+                )
+                extend_start_loc = (
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+                    - extend_seq_lens
+                )
 
         return seq_lens, extend_seq_lens, extend_start_loc, tree_mask
 
@@ -136,7 +146,11 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len = None
             self.extend_metadata = None
         elif forward_batch.forward_mode.is_target_verify():
-            max_extend_len = self.num_draft_tokens
+            max_extend_len = (
+                forward_batch.spec_info.draft_token_num
+                if forward_batch.spec_info is not None
+                else self.num_draft_tokens
+            )
             self.extend_metadata = self._build_extend_metadata(forward_batch)
         else:
             # Pass -1 to let C++ kernel compute max_len_extend dynamically on C++ side.
@@ -185,6 +199,8 @@ class IntelAMXAttnBackend(AttentionBackend):
         if cached is not None and cached[0] is req_to_token:
             return cached[1], cached[2]
 
+        if seq_lens.numel() == 0:
+            return req_to_token.new_empty((0, 0)), req_pool_indices
         rows = req_to_token[req_pool_indices, : int(seq_lens.max())]
         translated = self.runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, rows).to(
             req_to_token.dtype
@@ -237,11 +253,25 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        rel_bias=None,
+        return_lse: bool = False,
     ):
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        out_dtype = getattr(layer, "out_dtype", None) or q.dtype
+        o = q.new_empty(
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+        )
+        return_lse = bool(return_lse or forward_batch.mha_return_lse)
+        lse_out = (
+            torch.empty(
+                (q.shape[0], layer.tp_q_head_num),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if return_lse
+            else None
+        )
+        if q.shape[0] == 0:
+            return (o, lse_out) if return_lse else o
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -290,6 +320,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             req_to_token, req_pool_indices = self._swa_kv_indices(
                 req_to_token, req_pool_indices, seq_lens
             )
+        window_size = (
+            layer.sliding_window_size + 1
+            if layer.sliding_window_size is not None and layer.sliding_window_size >= 0
+            else 0
+        )
+        window_anchor_at_start = bool(getattr(layer, "window_anchor_at_start", False))
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -308,13 +344,17 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
-            layer.sliding_window_size + 1,
+            window_size,
             forward_batch.encoder_lens,
             sinks,
             tree_mask,
             is_causal,
+            rel_bias,
+            lse_out,
+            window_anchor_at_start,
         )
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return (out, lse_out) if return_lse else out
 
     def forward_decode(
         self,
@@ -325,7 +365,11 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        rel_bias=None,
+        return_lse: bool = False,
     ):
+        if getattr(layer, "window_anchor_at_start", False):
+            raise NotImplementedError("Block-anchored windows are extend-only")
         if self.draft_decode_metadata is not None:
             req_to_token, seq_lens, req_pool_indices = self.draft_decode_metadata
         else:
@@ -346,10 +390,22 @@ class IntelAMXAttnBackend(AttentionBackend):
                 seq_lens.shape[0], layer.tp_q_head_num, layer.v_head_dim
             )
 
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        out_dtype = getattr(layer, "out_dtype", None) or q.dtype
+        o = q.new_empty(
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+        )
+        return_lse = bool(return_lse or forward_batch.mha_return_lse)
+        lse_out = (
+            torch.empty(
+                (q.shape[0], layer.tp_q_head_num),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if return_lse
+            else None
+        )
+        if q.shape[0] == 0:
+            return (o, lse_out) if return_lse else o
         key_buffer = self.kv_layers.read(layer.layer_id).key()
         value_buffer = self.kv_layers.read(layer.layer_id).value()
         key_scale = layer.k_scale_float or 1.0
@@ -385,6 +441,11 @@ class IntelAMXAttnBackend(AttentionBackend):
             req_to_token, req_pool_indices = self._swa_kv_indices(
                 req_to_token, req_pool_indices, seq_lens
             )
+        window_size = (
+            layer.sliding_window_size + 1
+            if layer.sliding_window_size is not None and layer.sliding_window_size >= 0
+            else 0
+        )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             key_buffer,
@@ -392,8 +453,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             key_scale,
             value_scale,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            k,
-            v,
+            k if save_kv_cache else None,
+            v if save_kv_cache else None,
             cache_loc,
             attn_logits,
             req_to_token,
@@ -402,11 +463,14 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
-            layer.sliding_window_size + 1,
+            window_size,
             forward_batch.encoder_lens,
             sinks,
+            rel_bias,
+            lse_out,
         )
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return (out, lse_out) if return_lse else out
 
     def _get_attn_logits_buffer(
         self, num_seqs: int, num_heads: int, v_head_dim: int

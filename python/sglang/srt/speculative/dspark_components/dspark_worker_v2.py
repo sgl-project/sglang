@@ -103,6 +103,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_cuda_alike,
     is_hip,
@@ -214,6 +215,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
+            and not is_cpu()
         )
         if (
             get_parallel().attn_dp_enabled
@@ -409,7 +411,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         # so no accept broadcast is needed.
         self._rejection_noise = (
             make_rejection_noise(self.target_worker.random_seed, self.device)
-            if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
+            if (is_cuda() or is_cpu())
+            and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
             else None
         )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
@@ -672,13 +675,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         capture_decode_cuda_graph = self._decode_graph_allowed
-        available_mem = self._tp_sync.available_memory_gb(
-            SpecTpSyncSite.DSPARK_MEM,
-            self.device,
-            self.gpu_id,
-            group=self._draft_graph_group,
-        )
         if is_cuda_alike() and capture_decode_cuda_graph:
+            available_mem = self._tp_sync.available_memory_gb(
+                SpecTpSyncSite.DSPARK_MEM,
+                self.device,
+                self.gpu_id,
+                group=self._draft_graph_group,
+            )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -1023,9 +1026,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        if batch.seq_lens.is_cuda or batch.seq_lens.is_xpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -1497,7 +1501,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             seq_lens_cpu = batch.seq_lens_cpu
             if (
-                _is_npu
+                (_is_npu or is_cpu())
                 and seq_lens_cpu is not None
                 and seq_lens_cpu.device.type == "cpu"
                 and seq_lens_cpu.ndim == 1

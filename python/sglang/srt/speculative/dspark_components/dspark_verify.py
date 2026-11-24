@@ -1015,7 +1015,11 @@ class DsparkVerifyEpilogue:
             and buf.shape[1] == compact.shape[1]
         ):
             return buf
-        assert not torch.get_device_module().is_current_stream_capturing(), (
+        dev_mod = torch.get_device_module()
+        assert not (
+            hasattr(dev_mod, "is_current_stream_capturing")
+            and dev_mod.is_current_stream_capturing()
+        ), (
             "DsparkVerifyEpilogue output buffers must be allocated during "
             "warmup, not inside graph capture (pool memory is unreadable "
             "post-replay)."
@@ -1342,6 +1346,84 @@ def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Ten
     return draft_probs
 
 
+def _accept_sampling_torch(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_probs: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch chain speculative sampling fallback for CPU."""
+    from sglang.kernels.ops.speculative.dspark.dspark_accept import CapCorrectLen
+    from sglang.srt.speculative.dflash_utils import (
+        build_speculative_verify_target_probs,
+    )
+
+    bs = candidates.shape[0]
+    device = candidates.device
+    vocab = target_logits.shape[-1]
+    if bs == 0:
+        return (
+            torch.empty((0,), dtype=torch.int32, device=device),
+            torch.empty((0,), dtype=torch.int64, device=device),
+            torch.empty((0,), dtype=torch.int32, device=device),
+        )
+    if not need_truncated_sampling(sampling_info):
+        target_probs = SoftmaxTemp.execute(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        ).view(bs, verify_num_draft_tokens, vocab)
+    else:
+        target_probs = build_speculative_verify_target_probs(
+            next_token_logits=target_logits,
+            sampling_info=sampling_info,
+            draft_token_num=verify_num_draft_tokens,
+            bs=bs,
+            max_top_k=draft_input.max_top_k,
+            uniform_top_k_value=draft_input.uniform_top_k_value,
+        ).view(bs, verify_num_draft_tokens, vocab)
+
+    tokens = candidates[:, 1:].long()
+    p_tok = target_probs[:, :gamma].gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+    q_tok = draft_probs[:, :gamma].gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+    coins = torch.rand((bs, gamma), device=device, dtype=torch.float32)
+    accepted = (q_tok > 0) & (coins < (p_tok / q_tok.clamp_min(1e-30)).clamp_max(1.0))
+    raw_len = torch.cumprod(accepted.int(), dim=-1).sum(dim=-1).to(torch.int32)
+
+    rows = torch.arange(bs, device=device)
+    pos = raw_len.long().clamp_max(gamma)
+    p_rej = target_probs[rows, pos].float()
+    q_padded = torch.zeros((bs, gamma + 1, vocab), dtype=torch.float32, device=device)
+    q_padded[:, :gamma] = draft_probs[:, :gamma].float()
+    q_rej = q_padded[rows, pos]
+    residual = torch.where(
+        (raw_len == gamma).unsqueeze(-1),
+        p_rej,
+        (p_rej - q_rej).clamp_min(0.0),
+    )
+    res_sum = residual.sum(dim=-1, keepdim=True)
+    probs = torch.where(res_sum > 0, residual / res_sum.clamp_min(1e-30), p_rej)
+    bonus = torch.multinomial(probs, 1).squeeze(-1).to(torch.int64)
+
+    if cutoff_verify_lens is not None:
+        correct_len, cap_trim_lens = CapCorrectLen.execute(
+            correct_len=raw_len, verify_lens=cutoff_verify_lens
+        )
+        capped_bonus = candidates.gather(
+            1, (correct_len.long() + 1).clamp_max(gamma).unsqueeze(-1)
+        ).squeeze(-1)
+        bonus = torch.where(correct_len < raw_len, capped_bonus, bonus)
+    else:
+        correct_len = raw_len
+        cap_trim_lens = torch.zeros_like(raw_len)
+    return correct_len, bonus, cap_trim_lens
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -1396,6 +1478,21 @@ def accept_draft_tokens(
             target_temperatures=sampling_info.temperatures,
             draft_temperatures=draft_block.temperatures,
             noise=rejection_noise,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+    elif (
+        not target_logits.is_cuda and not _is_npu and target_logits.device.type == "cpu"
+    ):
+        sampled = _accept_sampling_torch(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=_draft_probs(
+                draft_block, target_logits.shape[-1], target_logits.device
+            ),
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
     else:

@@ -195,9 +195,10 @@ class DsparkInfoDumper:
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
 
+        self._is_cpu = torch.device(device).type == "cpu"
         self._device_module = torch.get_device_module(device)
         self._d2h_stream = None
-        if self.enabled and InfoComponent.REQS in self._components:
+        if self.enabled and InfoComponent.REQS in self._components and not self._is_cpu:
             self._d2h_stream = self._device_module.Stream(device=device)
 
         self._current_segments: dict[
@@ -306,6 +307,9 @@ class DsparkInfoDumper:
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
+        if self._is_cpu:
+            self._open_segments[segment] = self._clock()
+            return
         start = self._device_module.Event(enable_timing=True)
         start.record()
         self._open_segments[segment] = start
@@ -313,6 +317,9 @@ class DsparkInfoDumper:
     def _close_segment(self, segment: InfoSegment) -> None:
         start = self._open_segments.pop(segment, None)
         if start is None:
+            return
+        if self._is_cpu:
+            self._current_segments[segment] = (start, self._clock())
             return
         end = self._device_module.Event(enable_timing=True)
         end.record()
@@ -332,6 +339,14 @@ class DsparkInfoDumper:
             tensors["verify_lens"] = obs.verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
+        if self._is_cpu:
+            host_tensors = {k: v.detach().clone() for k, v in tensors.items()}
+
+            class _ImmediateFuture:
+                def wait(self_inner):
+                    return host_tensors
+
+            return _ImmediateFuture()
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -429,8 +444,11 @@ class DsparkInfoDumper:
         if events is None:
             return None
         start, end = events
-        end.synchronize()
-        elapsed_ms = start.elapsed_time(end)
+        if self._is_cpu:
+            elapsed_ms = (end - start) * 1000.0
+        else:
+            end.synchronize()
+            elapsed_ms = start.elapsed_time(end)
         if elapsed_ms > self._max_step_cpu_seconds * 1000.0:
             return None
         return round(elapsed_ms, 4)

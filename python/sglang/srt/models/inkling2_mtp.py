@@ -26,6 +26,7 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.utils.device import use_intel_amx_backend
 
 
 class Inkling2MTPHead(BaseDSparkMarkovHead):
@@ -146,7 +147,9 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             attn.attn.window_anchor_at_start = layer_id in config.local_layer_ids
             attn.attn.num_splits = (
                 0
-                if get_platform().is_sm90 or layer_id not in config.local_layer_ids
+                if get_platform().is_sm90
+                or get_platform().is_cpu
+                or layer_id not in config.local_layer_ids
                 else 1
             )
             attn.attn.pack_gqa = True
@@ -168,7 +171,15 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         if should_apply_lm_head_quant_method(lm_head, lm_head.quant_method):
             raise ValueError("Inkling2 MTP requires an unquantized target LM head")
         self.embed_tokens, self.lm_head = embed_tokens, lm_head
-        self.markov_head.attach_fold(lm_head.weight, self.logits_mup_width_multiplier)
+        fold_weight = lm_head.weight
+        if use_intel_amx_backend(lm_head):
+            eye = torch.eye(
+                fold_weight.shape[1], dtype=fold_weight.dtype, device=fold_weight.device
+            )
+            fold_weight = torch.ops.sgl_kernel.weight_packed_linear(
+                eye, fold_weight, None, True
+            ).T.contiguous()
+        self.markov_head.attach_fold(fold_weight, self.logits_mup_width_multiplier)
         self.markov_head._gather_logits = self._gather_logits
         self.markov_head._get_staged_f = lambda: self._f_rnn_rows
         if lm_head.tp_size > 1:

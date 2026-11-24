@@ -544,6 +544,13 @@ def fused_gather_scatter_to_sconv_cache(
     BLOCK_D = min(triton.next_power_of_2(D), 1024)
     B = mask.shape[0]
 
+    if not sconv_cache.is_cuda:
+        rows = mask[:B].nonzero(as_tuple=True)[0]
+        if rows.numel() > 0:
+            src_t = track_conv_indices[rows].long()
+            dst_s = dst_indices[rows].long()
+            sconv_cache[dst_s] = hidden_states[src_t].to(sconv_cache.dtype)
+        return
     if (
         is_cuda()
         and hidden_states.dtype == torch.bfloat16
@@ -717,6 +724,26 @@ def fused_draft_extend_sconv_cache(
     D = sconv_cache.shape[2]
     W_minus_1 = sconv_cache.shape[1]
 
+    if not sconv_cache.is_cuda:
+        hs = (
+            hidden_states.view(B, draft_token_num, D)
+            if hidden_states.ndim == 2
+            else hidden_states
+        )
+        ci = cache_indices[:B].long()
+        n_acc = num_accept_tokens[:B].long()
+        for b in range(B):
+            acc_n = int(n_acc[b].item())
+            if acc_n < 0:
+                continue
+            slot = int(ci[b].item())
+            padded = torch.cat((sconv_cache[slot], hs[b].to(sconv_cache.dtype)), dim=0)
+            if do_tracking and bool(crossed[b].item()):
+                step = int(track_step[b].item())
+                dst_slot = int(mamba_track_indices[b].item())
+                sconv_cache[dst_slot] = padded[step : step + W_minus_1]
+            sconv_cache[slot] = padded[acc_n : acc_n + W_minus_1]
+        return
     if (
         is_cuda()
         and hidden_states.ndim == 2

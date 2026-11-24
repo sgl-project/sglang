@@ -232,10 +232,12 @@ def make_vocab_gather(
     the NCCL ring otherwise. ``symm_rows`` is the row capacity of the NVLink
     gather's symmetric-memory output for slices past the push slot; None sizes
     it for the server's largest batch, 0 leaves those slices to NCCL."""
+    from sglang.srt.utils import is_cuda
+
     if group is None or group.world_size == 1:
         return LocalVocabGather()
     nccl = NcclVocabGather(group)
-    if not prefer_nvlink:
+    if not is_cuda() or not prefer_nvlink:
         return nccl
     if symm_rows is None:
         symm_rows = _default_symm_rows()

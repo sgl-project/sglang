@@ -114,6 +114,7 @@ def _platform_supports_mamba_cache_extra_buffer() -> bool:
         or platform.is_npu
         or platform.is_hip
         or platform.is_xpu
+        or platform.is_cpu
     )
 
 

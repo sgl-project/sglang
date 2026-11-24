@@ -74,6 +74,9 @@ else:
         causal_conv1d_update,
         causal_conv1d_update_cpu,
         chunk_gated_delta_rule_cpu,
+        inkling2_routed_sconv_epilogue_cpu,
+        inkling2_short_convolution_cpu,
+        inkling2_update_sconv_cache_cpu,
     )
     from sgl_kernel.memory import weak_ref_tensor
     from sgl_kernel.moe import (
@@ -81,6 +84,7 @@ else:
         apply_shuffle_mul_sum,
         fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
+        inkling2_fused_experts_cpu,
         moe_align_block_size,
         moe_sum,
         moe_sum_reduce,

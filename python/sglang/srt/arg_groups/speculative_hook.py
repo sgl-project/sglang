@@ -685,9 +685,9 @@ def _resolve_dspark_lm_head_dtype(server_args: ServerArgs) -> None:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu", "xpu")):
+    if not cfg.device.startswith(("cuda", "cpu", "npu", "xpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA, NPU or XPU device."
+            "DSpark speculative decoding only supports CUDA, CPU, NPU or XPU device."
         )
     _resolve_dspark_lm_head_dtype(server_args)
 

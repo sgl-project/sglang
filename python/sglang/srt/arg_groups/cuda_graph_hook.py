@@ -413,19 +413,26 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     auto-disabled for this multimodal arch, and declarative model overrides
     materialize too late to steer cuda-graph resolution. Honors an explicit
     --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+    from sglang.srt.runtime_context import get_platform
 
     cfg = resolving_view(server_args)
     if (
-        cfg.cuda_graph_backend_prefill is not None
+        getattr(cfg, "device", None) == "cpu"
+        or get_platform().is_cpu
+        or not get_platform().is_cuda
+        or cfg.disable_cuda_graph
+        or cfg.cuda_graph_backend_prefill is not None
         or cfg.disable_prefill_cuda_graph
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
     arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     ):
         declare_resolution(
             server_args,

@@ -159,6 +159,22 @@ class Model(msgspec.Struct):
         str,
         "A dictionary in JSON string format used to override default model configurations.",
     ] = "{}"
+    inkling2_loop_num_passes: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Number of loop passes for an inkling2_loop checkpoint with "
+                "loop_config.is_varloop=true. Default: the checkpoint's num_passes."
+            ),
+        ),
+    ] = None
+    inkling2_loop_share_cache: A[
+        bool,
+        "Share one K/V cache per loop core layer across passes for an inkling2_loop "
+        "checkpoint with loop_config.is_varloop=true. Every pass writes the shared "
+        "cache, so later tokens read the last pass's K/V. By default each pass "
+        "keeps its own cache.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Quantization and data type

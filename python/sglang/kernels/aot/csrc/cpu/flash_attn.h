@@ -57,6 +57,22 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
+template <>
+inline void copy_stub<float>(float* __restrict__ out, const float* __restrict__ acc, float s, int size) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = fVec::size();
+  const fVec s_fvec = fVec(s);
+  int d = 0;
+#pragma GCC unroll 4
+  for (; d <= size - kVecSize; d += kVecSize) {
+    fVec a_fvec = fVec::loadu(acc + d) * s_fvec;
+    a_fvec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = acc[d] * s;
+  }
+}
+
 #if defined(CPU_CAPABILITY_AVX512)
 template <>
 inline void copy_stub<at::BFloat16>(at::BFloat16* __restrict__ out, const float* __restrict__ acc, float s, int size) {
