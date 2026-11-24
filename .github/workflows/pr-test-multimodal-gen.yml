@@ -54,7 +54,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -217,7 +218,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -389,7 +389,7 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 #### Device Operations (from DeviceMixin)
 
 > Methods annotated **[Active]** are called by SGLang core through `current_platform` — OOT implementations take effect immediately.
-> Methods annotated **[Planned]** are reserved interfaces — SGLang core still uses hardcoded calls (e.g. `torch.cuda.empty_cache()`). OOT implementations will NOT take effect until the core is migrated in a future PR.
+> Methods annotated **[Planned]** are reserved interfaces — SGLang core does not call them yet, so OOT implementations will NOT take effect until the core is migrated.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -410,13 +410,13 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     <tr>
       <td><code>get_device(local_rank)</code></td>
       <td><code>raise NotImplementedError</code></td>
-      <td>Planned</td>
+      <td><strong>Active</strong></td>
       <td>Return <code>torch.device</code> for a given local rank</td>
     </tr>
     <tr>
       <td><code>set_device(device)</code></td>
       <td><code>raise NotImplementedError</code></td>
-      <td>Planned</td>
+      <td><strong>Active</strong></td>
       <td>Set the current device</td>
     </tr>
     <tr>
@@ -428,25 +428,25 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     <tr>
       <td><code>get_device_uuid(device_id)</code></td>
       <td><code>raise NotImplementedError</code></td>
-      <td>Planned</td>
+      <td><strong>Active</strong></td>
       <td>Get unique device identifier</td>
     </tr>
     <tr>
       <td><code>get_device_capability(device_id)</code></td>
       <td><code>raise NotImplementedError</code></td>
-      <td>Planned</td>
+      <td><strong>Active</strong></td>
       <td>Get <code>DeviceCapability(major, minor)</code>. None if N/A</td>
     </tr>
     <tr>
       <td><code>empty_cache()</code></td>
       <td><code>pass</code></td>
-      <td>Planned</td>
+      <td><strong>Active</strong></td>
       <td>Release cached device memory</td>
     </tr>
     <tr>
       <td><code>synchronize()</code></td>
       <td><code>pass</code></td>
-      <td>Planned</td>
+      <td><strong>Active</strong></td>
       <td>Synchronize device operations</td>
     </tr>
     <tr>
@@ -475,8 +475,8 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     </tr>
     <tr>
       <td><code>get_torch_distributed_backend_str()</code></td>
-      <td><code>raise NotImplementedError</code></td>
-      <td>Planned</td>
+      <td>Lookup by device type, <code>"gloo"</code> otherwise</td>
+      <td><strong>Active</strong></td>
       <td>Distributed backend string (e.g. "nccl", "hccl")</td>
     </tr>
     <tr>
