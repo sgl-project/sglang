@@ -77,6 +77,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.device import (
     async_d2h,
     is_cpu,
+    is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     is_npu,
@@ -90,9 +91,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 _is_cpu = is_cpu()
-# On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
-_use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
+_is_gfx95 = _is_hip and is_gfx95_supported()
+# On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM. On gfx950
+# hipBLASLt's pick at decode widths runs at 3.7-4.4 TB/s (GLM-5.3-Flash TP4,
+# 38720 x 4096) where a tuned FlyDSL hgemm runs at 6.3-6.9; untuned shapes fall
+# back to torch inside tgemm.
+_use_aiter_lm_head = (
+    is_hip()
+    and envs.SGLANG_USE_AITER.get()
+    and (is_gfx1250_supported() or is_gfx95_supported())
+)
 if _use_aiter_lm_head:
     from aiter.tuned_gemm import tgemm
 
@@ -102,6 +112,52 @@ def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool
         _use_aiter_lm_head
         and hidden_states.dim() == 2
         and hidden_states.dtype == weight.dtype == torch.bfloat16
+    )
+
+
+_FP8_LM_HEAD_MAX_ROWS = 48
+
+
+def _fp8_lm_head_weight(weight: torch.Tensor):
+    """Per-row FP8 copy of a bf16 lm_head weight, preshuffled for aiter's a8w8
+    GEMM; built once per weight, outside graph capture."""
+    cached = _FP8_LM_HEAD_WEIGHTS.get(weight.data_ptr())
+    if cached is not None or torch.cuda.is_current_stream_capturing():
+        return cached
+    from aiter import dtypes
+    from aiter.ops.shuffle import shuffle_weight
+
+    fp8_max = torch.finfo(dtypes.fp8).max
+    scale = weight.abs().amax(dim=-1, keepdim=True).float().clamp_(min=1e-12) / fp8_max
+    q = torch.empty(weight.shape, dtype=dtypes.fp8, device=weight.device)
+    # Row chunks keep the fp32 temporary small next to a full KV pool.
+    for i in range(0, weight.shape[0], 4096):
+        q[i : i + 4096] = (
+            (weight[i : i + 4096].float() / scale[i : i + 4096])
+            .clamp_(-fp8_max, fp8_max)
+            .to(dtypes.fp8)
+        )
+    cached = (shuffle_weight(q, layout=(16, 16)), scale)
+    _FP8_LM_HEAD_WEIGHTS[weight.data_ptr()] = cached
+    return cached
+
+
+_FP8_LM_HEAD_WEIGHTS: dict = {}
+
+
+def _fp8_lm_head(hidden_states: torch.Tensor, weight: torch.Tensor):
+    cached = _fp8_lm_head_weight(weight)
+    if cached is None:
+        return None
+    import aiter
+    from aiter import dtypes
+
+    rows = hidden_states.shape[0]
+    x_q = torch.empty(hidden_states.shape, dtype=dtypes.fp8, device=weight.device)
+    x_scale = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
+    aiter.dynamic_per_token_scaled_quant(x_q, hidden_states, x_scale)
+    return aiter.gemm_a8w8_bpreshuffle(
+        x_q, cached[0], x_scale, cached[1], dtype=torch.bfloat16
     )
 
 
@@ -557,6 +613,9 @@ class LogitsProcessor(nn.Module):
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
         self.defer_plain_gather = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
+        # Set by an EAGLE draft model (GLM-5.3-Flash NextN). Draft logits only
+        # propose tokens; the target's bf16 head still decides what is accepted.
+        self.draft_fp8_lm_head = False
         self._sharded_verify_eligible = (
             _runtime_optimized_vocab_shards_enabled()
             and self.do_tensor_parallel_all_gather
@@ -1327,14 +1386,24 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
     ) -> bool:
+        softcap = bool(self.final_logit_softcapping)
+        # Without multimem the plain gather is all-gather + movedim copy + fp32
+        # cast; the fused kernel does the last two in one pass.
+        plain_fused = (
+            not softcap
+            and _is_hip
+            and not self.defer_verify_gather
+            and self._logits_gatherer._state is None
+            and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        )
         return (
             self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
             and not self.do_tensor_parallel_all_gather_dp_attn
-            and bool(self.final_logit_softcapping)
+            and (softcap or plain_fused)
             and logits.is_cuda
             and not (_is_npu or _is_cpu)
-            and logits.dtype == torch.float32
+            and (logits.dtype == torch.float32 or plain_fused)
             and logits.dim() == 2
             and logits.is_contiguous()
             and not self._can_use_tp_lm_head_all_to_all(
@@ -1422,7 +1491,9 @@ class LogitsProcessor(nn.Module):
                 (num_tokens, width), dtype=torch.float32, device=logits.device
             )
         assert output.dtype == torch.float32
-        return gathered_softcap_logits(gathered, self.final_logit_softcapping, output)
+        return gathered_softcap_logits(
+            gathered, self.final_logit_softcapping or None, output
+        )
 
     def _compute_lm_head(
         self,
@@ -1490,7 +1561,16 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
-                logits = tgemm.mm(hidden_states, lm_head.weight)
+                logits = None
+                if (
+                    self.draft_fp8_lm_head
+                    and _is_gfx95
+                    and 0 < hidden_states.shape[0] <= _FP8_LM_HEAD_MAX_ROWS
+                    and hidden_states.is_contiguous()
+                ):
+                    logits = _fp8_lm_head(hidden_states, lm_head.weight)
+                if logits is None:
+                    logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:
