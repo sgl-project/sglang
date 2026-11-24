@@ -2923,9 +2923,12 @@ class TestPrefillAdder(CustomTestCase):
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
-        adder.can_run_list = [
-            SimpleNamespace(extend_input_len=length) for length in extend_lens
-        ]
+        adder.can_run_list = []
+        for i, length in enumerate(extend_lens):
+            req = Req(str(i), "", array("q", range(8 + length)), SamplingParams())
+            req.prefix_len = 8
+            req.extend_end = req.prefix_len + length
+            adder.can_run_list.append(req)
         # BLOCK_M is auto-detected from the attention backend in production; the
         # __new__ helper bypasses __init__, so set it explicitly. 64 matches the
         # block_m the tile-count assertions below are computed against.
@@ -2959,6 +2962,18 @@ class TestPrefillAdder(CustomTestCase):
             patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
         ):
             self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+
+    def test_prefill_tile_budget_counts_admitted_requests(self):
+        """The budget is charged for the requests already admitted in this pass,
+        not only for the candidate."""
+        adder = self._adder_with_extend_lens([129, 129])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"),
+        ):
+            self.assertEqual(adder._check_prefill_tile_budget(1), AddReqResult.OTHER)
 
     def test_prefill_tile_budget_always_allows_first_request(self):
         adder = self._adder_with_extend_lens([])
