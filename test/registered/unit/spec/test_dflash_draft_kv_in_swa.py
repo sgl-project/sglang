@@ -23,17 +23,31 @@ def _draft(layer_types, sliding_window=None, **dflash_config):
 
 
 class TestDflashDraftKvFitsSwa(CustomTestCase):
-    def fits(self, draft, target_window, *, draft_window_size=None, disagg="null"):
+    def fits(
+        self,
+        draft,
+        target_window,
+        *,
+        draft_window_size=None,
+        disagg="null",
+        cuda=True,
+        backend="fa4",
+    ):
         with (
             patch(
                 "sglang.srt.speculative.dflash_utils.get_spec",
                 return_value=SimpleNamespace(
-                    speculative_draft_window_size=draft_window_size
+                    speculative_draft_window_size=draft_window_size,
+                    speculative_draft_attention_backend=backend,
                 ),
             ),
             patch(
                 "sglang.srt.runtime_context.get_disagg",
                 return_value=SimpleNamespace(disaggregation_mode=disagg),
+            ),
+            patch(
+                "sglang.srt.platforms.current_platform",
+                SimpleNamespace(is_cuda=lambda: cuda),
             ),
         ):
             return dflash_draft_kv_fits_swa(
@@ -61,6 +75,16 @@ class TestDflashDraftKvFitsSwa(CustomTestCase):
         self.assertFalse(self.fits(_draft(sliding, 1024, attention_mode="mla"), 2047))
         self.assertFalse(self.fits(_draft(sliding, 1024), 2047, draft_window_size=512))
         self.assertFalse(self.fits(_draft(sliding, 1024), 2047, disagg="prefill"))
+
+    def test_only_cuda_backends_that_map_into_the_swa_sub_pool_qualify(self):
+        """Ascend builds a plain NPU pool with no register_mapping, which would
+        fail the draft's startup; other platforms and backends never take it."""
+        sliding = _draft(["sliding_attention"] * 2, 1024)
+        self.assertTrue(self.fits(sliding, 2047, backend="trtllm_mha"))
+        self.assertFalse(self.fits(sliding, 2047, cuda=False, backend="ascend"))
+        self.assertFalse(self.fits(sliding, 2047, cuda=False, backend="triton"))
+        self.assertFalse(self.fits(sliding, 2047, backend="torch_native"))
+        self.assertFalse(self.fits(sliding, 2047, backend=None))
 
 
 if __name__ == "__main__":

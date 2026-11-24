@@ -355,17 +355,29 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
+# Draft backends on the CUDA platform that read a sliding layer of an SWAKVPool
+# through its registered full -> SWA mapping. Other platforms build their own
+# pools (Ascend: an NPU pool without register_mapping) or read rows differently.
+_SWA_SUB_POOL_DRAFT_BACKENDS = frozenset(
+    {"fa3", "fa4", "flashinfer", "triton", "trtllm_mha"}
+)
+
+
 def dflash_draft_kv_fits_swa(
     *, draft_hf_config: Any, target_window: Optional[int]
 ) -> bool:
     """Every draft layer slides within the target's SWA window."""
+    from sglang.srt.platforms import current_platform
     from sglang.srt.runtime_context import get_disagg
 
+    spec = get_spec()
     # PD transfer registers only a pool's full sub-pool
     if (
         target_window is None
-        or get_spec().speculative_draft_window_size is not None
+        or spec.speculative_draft_window_size is not None
         or get_disagg().disaggregation_mode != "null"
+        or not current_platform.is_cuda()
+        or spec.speculative_draft_attention_backend not in _SWA_SUB_POOL_DRAFT_BACKENDS
     ):
         return False
     layer_types = get_dflash_layer_types(draft_hf_config)
