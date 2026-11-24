@@ -24,6 +24,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
+
 MINIMAX_H3_MATERIAL_CACHE_EXTRA_KEY = "minimax_h3_material_localization"
 MINIMAX_H3_MATERIAL_PROBE_EXTRA_KEY = "minimax_h3_material_probe_facts"
 MINIMAX_H3_TEMP_DIRS_EXTRA_KEY = "minimax_h3_request_temp_dirs"
@@ -340,6 +342,7 @@ def _ffprobe_media(path: str) -> dict[str, Any]:
                     "-i",
                     path,
                 ],
+                env=local_media_subprocess_env(),
                 check=True,
                 capture_output=True,
                 text=True,
