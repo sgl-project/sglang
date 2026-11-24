@@ -316,6 +316,7 @@ def _maybe_precompute_flashmla_sched_meta(
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
+        sched_meta_fits,
     )
 
     b, s_q = q.shape[0], q.shape[1]
@@ -327,7 +328,7 @@ def _maybe_precompute_flashmla_sched_meta(
         )
     else:
         num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
-    if 4 * (5 * b + 1 + num_sm_parts * META_INTS) > 48 * 1024:
+    if not sched_meta_fits(batch_size=b, num_sm_parts=num_sm_parts):
         return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
@@ -1199,6 +1200,8 @@ class DSV4Metadata:
     # the metadata then covers only the leading real rows.
     real_num_tokens: Optional[int] = None
 
+    sparse_prefill_direct: bool = False
+
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
@@ -1314,6 +1317,38 @@ class _GraphBucket(enum.Enum):
         if forward_mode.is_draft_extend_v2():
             return cls.DRAFT_EXTEND
         raise NotImplementedError(f"unsupported {forward_mode=}")
+
+
+_SM100_DIRECT_PREFIX_PER_ROW = 5
+_SM100_DIRECT_PREFIX_PER_ROW_GRAPH = 8
+
+
+def _direct_prefix_per_row(*, in_prefill_graph: bool) -> int:
+    per_row = (
+        envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH
+        if in_prefill_graph
+        else envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW
+    ).get()
+    if per_row is not None:
+        return per_row
+    if not get_platform().is_sm100:
+        return 0
+    if in_prefill_graph:
+        return _SM100_DIRECT_PREFIX_PER_ROW_GRAPH
+    return _SM100_DIRECT_PREFIX_PER_ROW
+
+
+def _prefill_reads_fp8_direct(
+    forward_batch: ForwardBatch, *, in_prefill_graph: bool
+) -> bool:
+    if not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get():
+        return True
+    per_row = _direct_prefix_per_row(in_prefill_graph=in_prefill_graph)
+    prefix = forward_batch.extend_prefix_lens_cpu
+    if per_row <= 0 or prefix is None:
+        return False
+    # Workspace cost grows with cached tokens, direct-read cost with query rows.
+    return sum(prefix) >= per_row * sum(forward_batch.extend_seq_lens_cpu)
 
 
 class DeepseekV4AttnBackend(
@@ -3033,6 +3068,10 @@ class DeepseekV4AttnBackend(
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 else None
             )
+            if self.tail_forward_metadata is not None:
+                self.tail_forward_metadata.sparse_prefill_direct = (
+                    self.forward_metadata.sparse_prefill_direct
+                )
 
         self._activate_request_window()
 
@@ -3102,7 +3141,7 @@ class DeepseekV4AttnBackend(
             and (
                 cp_sparse_prefill
                 or num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                or not self.forward_metadata.sparse_prefill_direct
             )
         )
 
@@ -3347,6 +3386,9 @@ class DeepseekV4AttnBackend(
             self._snapshot_low_ratio_k_slots(
                 forward_batch, metadata, publish_rows=not use_prefill_cuda_graph
             )
+            metadata.sparse_prefill_direct = _prefill_reads_fp8_direct(
+                forward_batch, in_prefill_graph=use_prefill_cuda_graph
+            )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
@@ -3482,6 +3524,9 @@ class DeepseekV4AttnBackend(
                 )
             )
         self.prefill_graph_replay_batch = forward_batch
+        capture_metadata.sparse_prefill_direct = _prefill_reads_fp8_direct(
+            forward_batch, in_prefill_graph=True
+        )
         self.forward_metadata = capture_metadata
         self._activate_request_window()
         self.tail_forward_metadata = (
@@ -4276,6 +4321,10 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
+
         # The negation of the sparse-prefill gate in forward(), which reads only
         # raw_indices; num_qo_tokens=0 drops the query-count clause, so this errs
         # to True. Paged attention under active CP needs the page indices.
@@ -4283,6 +4332,11 @@ class DeepseekV4AttnBackend(
             self.mega_attn
             or self.tail_forward_metadata is not None
             or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
+            # A captured indexer keeps this choice, so any replay may still read direct.
+            or (
+                is_in_breakable_cuda_graph()
+                and _direct_prefix_per_row(in_prefill_graph=True) > 0
+            )
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
