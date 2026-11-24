@@ -8,13 +8,13 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.sam import make_windows, window_unpartition_add_reference
 
 register_cuda_ci(
-    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 
 @marker.parametrize("batch", [1, 2, 4, 8], [1, 8])
 @marker.parametrize("height,width", [(40, 40), (64, 64)], [(40, 40)])
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark(batch: int, height: int, width: int, impl: str):
     shortcut = torch.randn(
         batch, height, width, 768, device="cuda", dtype=torch.bfloat16

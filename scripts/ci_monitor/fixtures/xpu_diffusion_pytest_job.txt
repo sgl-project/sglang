@@ -1,0 +1,124 @@
+2026-11-19T17:23:04.9540430Z Starting pytest attempt 1/7: initial pass for 1 assigned item(s)
+2026-11-19T17:28:03.0252058Z -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2026-11-19T17:28:03.0255199Z - generated xml file: /opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/junit_results_1-gpu-xpu_0.xml -
+2026-11-19T17:28:03.0257352Z =========================== short test summary info ============================
+2026-11-19T17:28:03.0260228Z FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:28:03.0264433Z FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:28:03.0267334Z ====== 2 failed, 2 passed, 46 deselected, 2 warnings in 297.09s (0:04:57) ======
+2026-11-19T17:28:03.2594936Z sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+2026-11-19T17:28:04.8722261Z Retryable failure detected on attempt 1. Retrying only previously failed items.
+2026-11-19T17:28:04.8724261Z Starting pytest attempt 2/7: retry failed items for 1 assigned item(s)
+2026-11-19T17:38:52.2625401Z Starting pytest attempt 7/7: retry failed items for 1 assigned item(s)
+2026-11-19T17:40:59.7177603Z
+2026-11-19T17:40:59.7178052Z =================================== FAILURES ===================================
+2026-11-19T17:40:59.7179569Z _ TestDiffusionServerOneGpu.test_diffusion_generation[flux_2_klein_image_t2i] __
+2026-11-19T17:40:59.7181392Z sglang/multimodal_gen/test/server/test_server_common.py:1844: in run_case_check
+2026-11-19T17:40:59.7182685Z     fn()
+2026-11-19T17:40:59.7183660Z sglang/multimodal_gen/test/server/test_server_common.py:1868: in <lambda>
+2026-11-19T17:40:59.7185011Z     lambda: self._validate_and_record(
+2026-11-19T17:40:59.7186414Z sglang/multimodal_gen/test/server/test_server_common.py:510: in _validate_and_record
+2026-11-19T17:40:59.7187383Z     validator.validate(perf_record, case.sampling_params.num_frames)
+2026-11-19T17:40:59.7187935Z sglang/multimodal_gen/test/server/test_server_utils.py:740: in validate
+2026-11-19T17:40:59.7188382Z     self._validate_stages(summary)
+2026-11-19T17:40:59.7188831Z sglang/multimodal_gen/test/server/test_server_utils.py:864: in _validate_stages
+2026-11-19T17:40:59.7189283Z     self._assert_le(
+2026-11-19T17:40:59.7189662Z sglang/multimodal_gen/test/server/test_server_utils.py:597: in _assert_le
+2026-11-19T17:40:59.7190109Z     assert actual <= upper_bound, (
+2026-11-19T17:40:59.7190528Z E   AssertionError: Validation failed for 'Stage 'DecodingStage''.
+2026-11-19T17:40:59.7191023Z E       Actual:   1261.4802ms
+2026-11-19T17:40:59.7191314Z E       Expected: 292.4400ms
+2026-11-19T17:40:59.7191661Z E       Limit:    742.4400ms (rel_tol: 90.0%, abs_pad: 450.0ms)
+2026-11-19T17:40:59.7192051Z E   assert 1261.4801712334156 <= 742.44
+2026-11-19T17:40:59.7192249Z
+2026-11-19T17:40:59.7192472Z The above exception was the direct cause of the following exception:
+2026-11-19T17:40:59.7193119Z sglang/multimodal_gen/test/server/test_server_common.py:1775: in _test_diffusion_generation_impl
+2026-11-19T17:40:59.7210022Z     "expected_median_denoise_ms": 365.11
+2026-11-19T17:40:59.7210224Z }
+2026-11-19T17:41:00.2308909Z _ TestDiffusionServerOneGpu.test_diffusion_generation[flux_2_klein_base_image_t2i] _
+2026-11-19T17:41:00.2311086Z sglang/multimodal_gen/test/server/test_server_common.py:1844: in run_case_check
+2026-11-19T17:41:00.2312402Z     fn()
+2026-11-19T17:41:00.2313415Z sglang/multimodal_gen/test/server/test_server_common.py:1868: in <lambda>
+2026-11-19T17:41:00.2315070Z     lambda: self._validate_and_record(
+2026-11-19T17:41:00.2317218Z sglang/multimodal_gen/test/server/test_server_common.py:510: in _validate_and_record
+2026-11-19T17:41:00.2318990Z     validator.validate(perf_record, case.sampling_params.num_frames)
+2026-11-19T17:41:00.2320594Z sglang/multimodal_gen/test/server/test_server_utils.py:740: in validate
+2026-11-19T17:41:00.2321963Z     self._validate_stages(summary)
+2026-11-19T17:41:00.2323257Z sglang/multimodal_gen/test/server/test_server_utils.py:864: in _validate_stages
+2026-11-19T17:41:00.2324639Z     self._assert_le(
+2026-11-19T17:41:00.2325715Z sglang/multimodal_gen/test/server/test_server_utils.py:597: in _assert_le
+2026-11-19T17:41:00.2326971Z     assert actual <= upper_bound, (
+2026-11-19T17:41:00.2328125Z E   AssertionError: Validation failed for 'Stage 'DecodingStage''.
+2026-11-19T17:41:00.2329324Z E       Actual:   1278.1074ms
+2026-11-19T17:41:00.2330140Z E       Expected: 287.6600ms
+2026-11-19T17:41:00.2331119Z E       Limit:    737.6600ms (rel_tol: 90.0%, abs_pad: 450.0ms)
+2026-11-19T17:41:00.2332357Z E   assert 1278.1074470840394 <= 737.6600000000001
+2026-11-19T17:41:00.2333048Z
+2026-11-19T17:41:00.2333695Z The above exception was the direct cause of the following exception:
+2026-11-19T17:41:00.2398220Z
+2026-11-19T17:41:00.2398589Z -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2026-11-19T17:41:00.2399732Z - generated xml file: /opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/junit_results_1-gpu-xpu_0.xml -
+2026-11-19T17:41:00.2400756Z =========================== short test summary info ============================
+2026-11-19T17:41:00.2402142Z FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:00.2404281Z FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:00.2405702Z =========== 2 failed, 48 deselected, 2 warnings in 127.28s (0:02:07) ===========
+2026-11-19T17:41:02.0814024Z Max retry exceeded (6)
+2026-11-19T17:41:02.0815762Z
+2026-11-19T17:41:02.0816614Z ================================ Pytest Tail Summary ================================
+2026-11-19T17:41:02.0817805Z Assigned 1 test item(s)
+2026-11-19T17:41:02.0823262Z +-----------+--------------------+-------------------+-------------------------------------------------+
+2026-11-19T17:41:02.0826113Z |   Attempt | Mode               | Result            | Collection                                      |
+2026-11-19T17:41:02.0827965Z |-----------+--------------------+-------------------+-------------------------------------------------|
+2026-11-19T17:41:02.0829880Z |         1 | initial pass       | retryable failure | collected 50 items / 46 deselected / 4 selected |
+2026-11-19T17:41:02.0831860Z |         2 | retry failed items | retryable failure | collected 50 items / 48 deselected / 2 selected |
+2026-11-19T17:41:02.0833966Z |         3 | retry failed items | retryable failure | collected 50 items / 48 deselected / 2 selected |
+2026-11-19T17:41:02.0836013Z |         4 | retry failed items | retryable failure | collected 50 items / 48 deselected / 2 selected |
+2026-11-19T17:41:02.0838032Z |         5 | retry failed items | retryable failure | collected 50 items / 48 deselected / 2 selected |
+2026-11-19T17:41:02.0840000Z |         6 | retry failed items | retryable failure | collected 50 items / 48 deselected / 2 selected |
+2026-11-19T17:41:02.0842086Z |         7 | retry failed items | retryable failure | collected 50 items / 48 deselected / 2 selected |
+2026-11-19T17:41:02.0844027Z +-----------+--------------------+-------------------+-------------------------------------------------+
+2026-11-19T17:41:02.0845081Z
+2026-11-19T17:41:02.0845448Z Attempt 1 failure summary:
+2026-11-19T17:41:02.0848193Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0852409Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0855288Z
+2026-11-19T17:41:02.0855639Z Attempt 2 failure summary:
+2026-11-19T17:41:02.0858044Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0862329Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0864618Z
+2026-11-19T17:41:02.0864933Z Attempt 3 failure summary:
+2026-11-19T17:41:02.0867555Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0871741Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0874089Z
+2026-11-19T17:41:02.0874391Z Attempt 4 failure summary:
+2026-11-19T17:41:02.0876726Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0880802Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0883115Z
+2026-11-19T17:41:02.0883432Z Attempt 5 failure summary:
+2026-11-19T17:41:02.0885828Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0889852Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0892041Z
+2026-11-19T17:41:02.0892341Z Attempt 6 failure summary:
+2026-11-19T17:41:02.0894041Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0895458Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0896233Z
+2026-11-19T17:41:02.0896340Z Attempt 7 failure summary:
+2026-11-19T17:41:02.0897161Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0898579Z   FAILED ../../opt/venv/lib/python3.12/site-packages/sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0899505Z ====================================================================================
+2026-11-19T17:41:02.0899921Z Partition estimated total time: 606.7s
+2026-11-19T17:41:02.0900142Z
+2026-11-19T17:41:02.0900310Z ======================== Failed cases and reasons ========================
+2026-11-19T17:41:02.0900920Z test_server_1_gpu.TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]
+2026-11-19T17:41:02.0901939Z sglang.multimodal_gen.test.server.test_server_common.PerformanceValidationError: [request 1/1] [performance] Validation failed for 'Stage 'DecodingStage''.
+2026-11-19T17:41:02.0902740Z     Actual:   1261.4802ms
+2026-11-19T17:41:02.0903017Z     Expected: 292.4400ms
+2026-11-19T17:41:02.0903361Z     Limit:    742.4400ms (rel_tol: 90.0%, abs_pad: 450.0ms)
+2026-11-19T17:41:02.0903818Z assert 1261.4801712334156 <= 742.44
+2026-11-19T17:41:02.0904390Z test_server_1_gpu.TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_base_image_t2i]
+2026-11-19T17:41:02.0905432Z sglang.multimodal_gen.test.server.test_server_common.PerformanceValidationError: [request 1/1] [performance] Validation failed for 'Stage 'DecodingStage''.
+2026-11-19T17:41:02.0906214Z     Actual:   1278.1074ms
+2026-11-19T17:41:02.0906486Z     Expected: 287.6600ms
+2026-11-19T17:41:02.0906821Z     Limit:    737.6600ms (rel_tol: 90.0%, abs_pad: 450.0ms)
+2026-11-19T17:41:02.0907220Z assert 1278.1074470840394 <= 737.6600000000001
+2026-11-19T17:41:02.0907588Z ==========================================================================
+2026-11-19T17:41:04.0669436Z ##[error]Process completed with exit code 1.
