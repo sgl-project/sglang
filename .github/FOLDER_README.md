@@ -4,9 +4,9 @@ This folder contains tools and workflows for automating maintenance tasks.
 
 ## CI Permissions
 
-`CI_PERMISSIONS.json` defines the CI permissions granted to each user.
-Maintainers can directly edit the file to add entries with `"reason": "custom override"`.
-Maintainers can also run `update_ci_permission.py` to update it with some auto rules (e.g., top contributors in the last 90 days get full permissions).
+`CI_PERMISSIONS.json` defines the CI permissions of users without write access; write access grants every CI permission, so those users are not listed.
+Maintainers add entries by hand and run `update_ci_permission.py` to clean the file: it drops write-access users and entries whose user has had no commit on `main` for 90 days. An entry is kept through inactivity only if its `reason` names why (anything other than `"top contributor"` or `"custom override"`).
+`update_ci_permission.py --check` lists the entries the rules would change; the `CI Permissions Check` workflow runs it weekly and on PRs that edit the file, and only warns.
 
 Recognized permission keys:
 

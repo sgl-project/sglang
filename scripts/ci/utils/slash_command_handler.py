@@ -40,6 +40,11 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+WRITE_ACCESS_CI_PERMISSIONS = {
+    "can_tag_run_ci_label": True,
+    "can_rerun_failed_ci": True,
+    "cooldown_interval_minutes": 0,
+}
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
@@ -2068,6 +2073,12 @@ def main():
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
+
+    # Write access grants every CI permission; CI_PERMISSIONS.json lists only
+    # users without it (update_ci_permission.py drops write-access users).
+    if repo.get_collaborator_permission(user_login) in ("admin", "maintain", "write"):
+        print(f"User {user_login} has write access. Granting all CI permissions.")
+        user_perms = dict(WRITE_ACCESS_CI_PERMISSIONS)
 
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
