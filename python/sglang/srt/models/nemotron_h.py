@@ -92,6 +92,7 @@ from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_sc
 from sglang.srt.utils import (
     LazyValue,
     get_current_device_stream_fast,
+    is_cpu,
     is_cuda,
     is_sm100_supported,
     is_sm120,
@@ -100,6 +101,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 
 if _is_cuda:
@@ -510,6 +512,13 @@ class NemotronHMoE(nn.Module):
             hidden_states,
             forward_batch=forward_batch,
         )
+        # TODO: fuse routed factor scaling into kernel
+        if (
+            _is_cpu
+            and self.routed_scaling_factor is not None
+            and not self.experts.should_fuse_routed_scaling_factor_in_topk
+        ):
+            final_hidden_states *= self.routed_scaling_factor
 
         if self.use_latent_moe:
             final_hidden_states = self._apply_latent_projection(
