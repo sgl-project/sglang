@@ -275,6 +275,20 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
+    def test_a_new_key_past_the_graph_key_bound_runs_eagerly(self):
+        """SGLANG_POST_VERIFY_MAX_GRAPH_KEYS bounds the graph sets; a new key past it
+        gets no graph set and leaves the forced-length stream alone."""
+        with envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.override(3):
+            graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+                body=None, commit=None, sim_rng=torch.Generator()
+            )
+        graphs._states = {key: SimpleNamespace(turn=0) for key in range(3)}
+        with patch.object(graphs, "_draw_sim_len", side_effect=AssertionError):
+            self.assertIsNone(
+                graphs.run(key=3, inputs={}, make_slot=None, sim_max_len=1)
+            )
+        self.assertEqual(set(graphs._states), {0, 1, 2})
+
     def test_the_pool_is_presized_for_the_largest_batch_when_memory_allows(self):
         """Two fp32 sampling buffers of the largest batch plus the margin, and only with
         that much plus the spare free: otherwise 0 and the pool grows per key as on main."""
