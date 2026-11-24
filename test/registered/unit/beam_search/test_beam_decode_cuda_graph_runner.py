@@ -180,6 +180,29 @@ class TestBeamGraphInputs(CustomTestCase):
 
 
 class TestFixedWidthAttentionInput(CustomTestCase):
+    def test_a_smaller_graph_captures_on_its_own_values(self):
+        """Graphs of every size share the buffers, and a graph of fewer groups
+        reads them at other offsets. What a larger graph's batch left there is
+        no valid input: a length past the capacity reads outside the buffers."""
+        attention_input = FixedWidthAttentionInput(
+            max_rows=8, device="cpu", capacity=CAPACITY
+        )
+        attention_input.prepare_capture_inputs(8)
+        attention_input.load_replay_inputs(
+            _metadata(
+                prompt_lens=[CAPACITY.max_context_len] * 4,
+                decode_lens=[CAPACITY.max_decode_len] * 4,
+            )
+        )
+        bucket = attention_input.prepare_capture_inputs(4).buckets[0]
+        self.assertEqual(sorted(bucket.row_indices.flatten().tolist()), [0, 1, 2, 3])
+        prompt_offsets = bucket.context_cu_seqlens.tolist()
+        self.assertEqual(prompt_offsets[0], 0)
+        self.assertEqual(prompt_offsets, sorted(prompt_offsets))
+        self.assertLessEqual(prompt_offsets[-1], bucket.context_slots.numel())
+        for decode_len in bucket.decode_lens.tolist():
+            self.assertIn(decode_len, range(1, CAPACITY.max_decode_len + 1))
+
     def test_graphs_need_a_width_and_a_token_budget(self):
         """The graph is captured for one beam width and a fixed number of decode
         steps. Nothing but the operator knows the width, and without a trie

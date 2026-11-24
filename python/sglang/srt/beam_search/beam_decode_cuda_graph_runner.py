@@ -102,28 +102,22 @@ class FixedWidthAttentionInput:
     - Only a graph size that is a multiple of the beam width gets a beam graph.
     - A batch replays only the graph of exactly its own row count.
 
-    All graph sizes share one bucket, sized for the largest graph; a smaller
-    graph reads its leading groups.
+    All graph sizes share two buffers, sized for the largest graph:
+
+    - _packed_buffer holds row_indices, context_cu_seqlens, decode_lens and
+      context_slots back to back, so that one torch.cat loads a batch's four
+      tensors. Where each starts depends on the graph's number of groups.
+    - _decode_slots_buffer holds one row per group; a smaller graph reads its
+      leading rows.
     """
 
     def __init__(self, *, max_rows: int, device, capacity: FixedWidthCapacity):
         self.capacity = capacity
-        width = capacity.beam_width
-        num_groups = max_rows // width
+        max_groups = max_rows // capacity.beam_width
         int32 = {"dtype": torch.int32, "device": device}
-        # Capture-time values: per group, one prompt token and max_decode_len
-        # generated tokens on KV slot 0. Every replay loads the batch's values first.
-        self._graph_bucket = BeamAttentionBucket(
-            row_indices=torch.arange(num_groups * width, **int32).view(
-                num_groups, width
-            ),
-            context_slots=torch.zeros(num_groups * capacity.max_context_len, **int32),
-            context_cu_seqlens=torch.arange(num_groups + 1, **int32),
-            decode_slots=torch.zeros(
-                (num_groups, width * capacity.max_decode_len), **int32
-            ),
-            beam_width=width,
-            decode_lens=torch.full((num_groups,), capacity.max_decode_len, **int32),
+        self._packed_buffer = torch.zeros(sum(self._packed_sizes(max_groups)), **int32)
+        self._decode_slots_buffer = torch.zeros(
+            (max_groups, capacity.beam_width * capacity.max_decode_len), **int32
         )
 
     @classmethod
@@ -197,21 +191,48 @@ class FixedWidthAttentionInput:
             "decode together."
         )
 
+    def _packed_sizes(self, num_groups: int) -> tuple[int, int, int, int]:
+        """Element counts of row_indices, context_cu_seqlens, decode_lens and
+        context_slots, in buffer order, for a graph of num_groups groups."""
+        return (
+            num_groups * self.capacity.beam_width,
+            num_groups + 1,
+            num_groups,
+            num_groups * self.capacity.max_context_len,
+        )
+
+    def _graph_bucket(self, num_groups: int) -> BeamAttentionBucket:
+        """Views of the buffers that a graph of num_groups groups reads."""
+        sizes = self._packed_sizes(num_groups)
+        packed = self._packed_buffer[: sum(sizes)]
+        row_indices, context_cu_seqlens, decode_lens, context_slots = packed.split(
+            sizes
+        )
+        return BeamAttentionBucket(
+            row_indices=row_indices.view(num_groups, self.capacity.beam_width),
+            context_slots=context_slots,
+            context_cu_seqlens=context_cu_seqlens,
+            decode_slots=self._decode_slots_buffer[:num_groups],
+            beam_width=self.capacity.beam_width,
+            decode_lens=decode_lens,
+        )
+
     def can_capture(self, graph_size: int) -> bool:
         return graph_size % self.capacity.beam_width == 0
 
     def prepare_capture_inputs(self, graph_size: int) -> BeamAttentionMetadata:
         num_groups = graph_size // self.capacity.beam_width
-        graph_bucket = self._graph_bucket
-        leading_groups = BeamAttentionBucket(
-            row_indices=graph_bucket.row_indices[:num_groups],
-            context_slots=graph_bucket.context_slots,
-            context_cu_seqlens=graph_bucket.context_cu_seqlens[: num_groups + 1],
-            decode_slots=graph_bucket.decode_slots[:num_groups],
-            beam_width=graph_bucket.beam_width,
-            decode_lens=graph_bucket.decode_lens[:num_groups],
-        )
-        return BeamAttentionMetadata(buckets=[leading_groups], num_rows=graph_size)
+        graph_bucket = self._graph_bucket(num_groups)
+        # Capture-time values: per group, one prompt token and max_decode_len
+        # generated tokens on KV slot 0. Each size writes its own, because a
+        # smaller graph reads the packed buffer at other offsets.
+        rows = torch.arange(graph_size, device=self._packed_buffer.device)
+        graph_bucket.row_indices.copy_(rows.view_as(graph_bucket.row_indices))
+        graph_bucket.context_cu_seqlens.copy_(rows[: num_groups + 1])
+        graph_bucket.decode_lens.fill_(self.capacity.max_decode_len)
+        graph_bucket.context_slots.zero_()
+        graph_bucket.decode_slots.zero_()
+        return BeamAttentionMetadata(buckets=[graph_bucket], num_rows=graph_size)
 
     def can_replay(
         self, metadata: Optional[BeamAttentionMetadata], *, graph_size: int
@@ -232,19 +253,20 @@ class FixedWidthAttentionInput:
     def load_replay_inputs(self, metadata: BeamAttentionMetadata) -> None:
         # Slots past the batch's lengths keep an earlier batch's values; the kernel
         # reads no slot past a length.
-        batch_bucket, graph_bucket = metadata.buckets[0], self._graph_bucket
-        num_groups = batch_bucket.row_indices.shape[0]
-        graph_bucket.row_indices[:num_groups].copy_(batch_bucket.row_indices)
-        graph_bucket.context_slots[: batch_bucket.context_slots.numel()].copy_(
-            batch_bucket.context_slots
+        batch_bucket = metadata.buckets[0]
+        # The order of _packed_sizes; context_slots is last because its length varies.
+        packed = (
+            batch_bucket.row_indices.reshape(-1),
+            batch_bucket.context_cu_seqlens,
+            batch_bucket.decode_lens,
+            batch_bucket.context_slots,
         )
-        graph_bucket.context_cu_seqlens[: num_groups + 1].copy_(
-            batch_bucket.context_cu_seqlens
+        packed_len = sum(tensor.numel() for tensor in packed)
+        torch.cat(packed, out=self._packed_buffer[:packed_len])
+        num_groups, decode_width = batch_bucket.decode_slots.shape
+        self._decode_slots_buffer[:num_groups, :decode_width].copy_(
+            batch_bucket.decode_slots
         )
-        graph_bucket.decode_slots[
-            :num_groups, : batch_bucket.decode_slots.shape[1]
-        ].copy_(batch_bucket.decode_slots)
-        graph_bucket.decode_lens[:num_groups].copy_(batch_bucket.decode_lens)
 
 
 class BeamGraphInputs:

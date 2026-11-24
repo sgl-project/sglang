@@ -99,7 +99,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 output = _attention(q[:rows], k, v, graph_bucket)
-            graphs[rows] = (graph, output)
+            graphs[rows] = (graph, output, graph_bucket)
 
         batches = (
             _batch(2, list(range(8)), [0, 5, 8], [1, 2], flip=False),
@@ -107,14 +107,12 @@ class TestSharedContextGraphReplay(CustomTestCase):
             _batch(2, [7, 6, 5], [0, 2, 3], [2, 1], flip=True),
             _batch(1, [1, 2], [0, 2], [1], flip=False),
         )
-        largest = inputs.prepare_capture_inputs(2 * WIDTH)
-        graph_bucket = largest.attention_metadata.buckets[0]
         for metadata in batches:
+            rows = metadata.num_rows
+            graph, output, graph_bucket = graphs[rows]
             graph_bucket.context_slots.fill_(STALE_SLOT)
             graph_bucket.decode_slots.fill_(STALE_SLOT)
-            rows = metadata.num_rows
             inputs.load_replay_inputs(BeamForwardInputs(None, metadata))
-            graph, output = graphs[rows]
             graph.replay()
             torch.testing.assert_close(
                 output.float(),
