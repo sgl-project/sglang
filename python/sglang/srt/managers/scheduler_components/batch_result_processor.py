@@ -603,13 +603,6 @@ class SchedulerBatchResultProcessor:
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-            if auxiliary_output is not None:
-                self.consume_auxiliary_output(
-                    batch,
-                    auxiliary_output,
-                    auxiliary_output_starts,
-                )
-
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
@@ -662,6 +655,13 @@ class SchedulerBatchResultProcessor:
 
         # The state slots the queued checkpoints take, taken in one take.
         with self.tree_cache.lease_checkpoint_state_slots(checkpoint_reqs):
+            if self.is_generation and auxiliary_output is not None:
+                # Observers can defer finished responses only after release and before send.
+                commits = self._build_auxiliary_commits(batch, auxiliary_output_starts)
+                for op in kv_ops:
+                    op()
+                kv_ops.clear()
+                auxiliary_output.consume(batch, commits)
             self._flush_prefill(
                 batch,
                 self._reqs_still_in_batch(batch, still_in_batch_rows),

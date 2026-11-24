@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 from sglang.srt.utils.common import human_readable_int
 
 
@@ -233,9 +234,14 @@ class Schedule(msgspec.Struct):
         ),
     ] = False
     num_continuous_decode_steps: A[
-        int,
-        "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",
-    ] = 1
+        Optional[int],
+        Arg(
+            help="Deprecated. Has no effect.",
+            action=DeprecatedAction,
+            action_kwargs={"nargs": None, "type": int},
+            resolvable=True,
+        ),
+    ] = None
     scheduler_recv_interval: A[
         int,
         "The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
