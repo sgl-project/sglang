@@ -41,7 +41,7 @@ def _decode_batch():
     sampling = Mock()
     sampling.is_all_greedy = True
     sampling.logit_bias = None
-    sampling.grammar_mask = None
+    sampling.grammars = None
     sampling.has_custom_logit_processor = False
     sampling.step_penalties = None
     sampling.watermark = None
@@ -106,6 +106,9 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         sampling.watermark = object()
         self.assertFalse(graph_io.can_defer(batch))
         sampling.watermark = None
+        sampling.grammars = [object()]
+        self.assertFalse(graph_io.can_defer(batch))
+        sampling.grammars = None
         batch.return_logprob = True
         self.assertFalse(graph_io.can_defer(batch))
 
@@ -229,6 +232,15 @@ class TestUocrGreedyGraph(CustomTestCase):
         graph.before_forward(eager, replays_graph=False, decode_graph_runner=None)
         self.assertIsNone(graph.recorded_ids(logits, eager))
         self.assertIsNone(graph.recorded_ids(logits, replayed))
+
+    def test_a_grammar_step_samples_instead_of_taking_the_graph_argmax(self):
+        """The in-graph argmax ran before the grammar mask, so it cannot stand in."""
+        graph = UocrGreedyGraph(max_bs=4, device="cpu")
+        logits = Mock(next_token_logits=torch.zeros(2, 5))
+        batch = _decode_batch()
+        batch.sampling_info.grammars = [object(), None]
+        graph.before_forward(batch, replays_graph=True, decode_graph_runner=None)
+        self.assertIsNone(graph.recorded_ids(logits, batch))
 
 
 def _scheduler_for(architecture, training_stage):
