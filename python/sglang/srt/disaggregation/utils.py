@@ -1245,6 +1245,14 @@ def draft_kv_ring_row_pairs(
     return [a for a, _ in pairs], [b for _, b in pairs]
 
 
+def draft_kv_ring_row_pairs_np(
+    src_rows: np.ndarray, dst_rows: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """``draft_kv_ring_row_pairs`` for equal-length row arrays."""
+    owned = (src_rows != 0) & (dst_rows != 0)
+    return src_rows[owned], dst_rows[owned]
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,

@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    draft_kv_ring_row_pairs_np,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
 )
@@ -64,6 +65,22 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
+
+# Position- or request-indexed state: prefill and decode index lists must have
+# the same length.
+_EXACT_INDEX_STATE_TYPES = frozenset(
+    {
+        "qsa_pending",
+        "qsa_compressed",
+        "swa_ring",
+        "draft_ring",
+        "c128_state",
+        "request_row",
+        "minimax_dense_kv",
+    }
+)
+# Every state type sent by index; the paged ones tolerate a length drift.
+_INDEXED_STATE_TYPES = _EXACT_INDEX_STATE_TYPES | {"swa", "dsa", "minimax_index_k"}
 
 
 def _normalize_state_indices_per_component(
@@ -1733,18 +1750,7 @@ class MoriKVManager(CommonKVManager):
                         dst_layer_ids,
                     )
                 )
-            elif st in (
-                "swa",
-                "dsa",
-                "qsa_pending",
-                "qsa_compressed",
-                "swa_ring",
-                "draft_ring",
-                "c128_state",
-                "request_row",
-                "minimax_index_k",
-                "minimax_dense_kv",
-            ):
+            elif st in _INDEXED_STATE_TYPES:
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1939,15 +1945,7 @@ class MoriKVManager(CommonKVManager):
             # These components are position- or request-indexed: truncating
             # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
             # a 1-page drift -> keep truncation.
-            if state_type in (
-                "qsa_pending",
-                "qsa_compressed",
-                "swa_ring",
-                "draft_ring",
-                "c128_state",
-                "request_row",
-                "minimax_dense_kv",
-            ):
+            if state_type in _EXACT_INDEX_STATE_TYPES:
                 raise RuntimeError(
                     f"{state_type.upper()} state index length mismatch: "
                     f"src={src_state_indices.size}, dst={dst_state_indices.size}"
@@ -1962,10 +1960,11 @@ class MoriKVManager(CommonKVManager):
             src_state_indices = src_state_indices[:common_len]
             dst_state_indices = dst_state_indices[:common_len]
         if state_type == "draft_ring":
-            # Row 0 marks a position one side's DCP rank does not own.
-            owned = (src_state_indices != 0) & (dst_state_indices != 0)
-            src_state_indices = src_state_indices[owned]
-            dst_state_indices = dst_state_indices[owned]
+            # Registration admits a peer only at the same DCP size and rank, or
+            # from a DCP-1 prefill, so the prefill owns every row the decode owns.
+            src_state_indices, dst_state_indices = draft_kv_ring_row_pairs_np(
+                src_state_indices, dst_state_indices
+            )
 
         # Group contiguous indices and issue per-tensor transfers
         grouped_plan = GroupedIndexPlan.from_groups(

@@ -287,6 +287,29 @@ class TestMoriDraftRingState(unittest.TestCase):
         plan = mori_conn.BatchTransferPlan([5 * 64, 9 * 64], [3 * 64, 8 * 64], [64, 64])
         manager._submit_batch_transfer_plan.assert_called_once_with("src", "dst", plan)
 
+    def test_registration_rejects_peers_owning_other_positions(self):
+        for dcp, dst_dcp, dst_rank, error in (
+            ((8, 2), 4, 2, "Unsupported PD DCP topology: 8 -> 4"),
+            ((4, 2), 4, 1, "matching DCP ranks"),
+        ):
+            with self.subTest(dcp=dcp, dst_dcp=dst_dcp, dst_rank=dst_rank):
+                manager = object.__new__(mori_conn.MoriKVManager)
+                manager.dcp_size, manager.dcp_rank = dcp
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.kv_args = SimpleNamespace(state_types=["draft_ring"])
+                manager.engine = Mock()
+                manager.decode_kv_args_table = {}
+                peer = SimpleNamespace(
+                    engine_key="peer", dst_dcp_size=dst_dcp, dst_dcp_rank=dst_rank
+                )
+
+                with self.assertRaisesRegex(RuntimeError, error):
+                    manager._add_remote_peer(peer)
+
+                manager.engine.register_remote_engine.assert_not_called()
+                self.assertEqual(manager.decode_kv_args_table, {})
+
 
 if __name__ == "__main__":
     unittest.main()
