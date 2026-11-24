@@ -371,12 +371,19 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         self.assertTrue(
             done.wait(timeout=5), "PP1 blocked draining acks it has not received"
         )
-        # Let PP1's latest totals reach PP0 before PP0's next round.
+        # Let PP1's latest totals (one per storage queue) reach PP0.
+        keys = [follower._storage_ready_key(index) for index in range(4)]
+        self._wait_until(
+            lambda: all(
+                leader._pp_ready_store.collect(key)[1]
+                == follower._pp_ready_store.get(key)
+                for key in keys
+            )
+        )
+
+    def _wait_until(self, condition):
         deadline = time.monotonic() + 5
-        while (
-            leader._pp_ready_store._peer_map.get(1, {})
-            != follower._pp_ready_store._local_map
-        ):
+        while not condition():
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.01)
 
@@ -400,6 +407,58 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         self.assertEqual(relayed, [0, 1, 0, 0, 1])
         for cache in (leader, follower):
             self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_detach_drain_starts_a_new_epoch(self):
+        """The detach drain consumes each stage's queues rank-locally, so the
+        totals PP1 reported before it are no longer a lower bound. PP0, running
+        ahead, must ignore them, relay 0 until PP1 reports again, then resume."""
+        group = _StoreGroup()
+        leader = self._storage_stage(0, group, backups=1)
+        follower = self._storage_stage(1, group, backups=2)
+        for _ in range(2):
+            counts, _ = self._leader_round(leader)
+            self._follower_round(follower, leader, counts)
+        old_key = follower._storage_ready_key(2)
+        self.assertEqual(leader._pp_ready_store.collect(old_key)[1], 2)
+
+        # PP0 drains and decides its next round before PP1 reaches its drain,
+        # while PP1's pre-detach total of 2 is still in PP0's view.
+        leader.drain_storage_control_queues_local()
+        self._ack_backup(leader)
+        counts, n_backup = self._leader_round(leader)
+        relayed = [n_backup]
+        follower.drain_storage_control_queues_local()
+        self._follower_round(follower, leader, counts)
+        self._wait_until(lambda: leader._pp_ready_store.collect(old_key)[1] is None)
+        self.assertEqual(follower._storage_epoch, leader._storage_epoch)
+
+        self._ack_backup(follower)
+        for _ in range(2):
+            counts, n_backup = self._leader_round(leader)
+            relayed.append(n_backup)
+            self._follower_round(follower, leader, counts)
+        # PP1's new ack is reported in round 2 and drained in round 3.
+        self.assertEqual(relayed, [0, 0, 1])
+        for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_pp0_warns_once_when_a_stage_never_reports(self):
+        """A stage whose epoch is out of step never reports; PP0 relays 0 and
+        must say so once instead of stalling silently."""
+        leader = self._storage_stage(0, _StoreGroup(), backups=1)
+        with (
+            patch(
+                "sglang.srt.mem_cache.unified_radix_cache._STORAGE_UNREPORTED_WARN_ROUNDS",
+                2,
+            ),
+            self.assertLogs(
+                "sglang.srt.mem_cache.unified_radix_cache", level="WARNING"
+            ) as logs,
+        ):
+            relayed = [self._leader_round(leader)[1] for _ in range(3)]
+        self.assertEqual(relayed, [0, 0, 0])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("PP ranks [1]", logs.output[0])
 
 
 if __name__ == "__main__":

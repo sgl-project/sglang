@@ -188,6 +188,9 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# Arbitrary; far above the few rounds a stage takes to report in a new epoch.
+_STORAGE_UNREPORTED_WARN_ROUNDS = 1000
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -234,6 +237,7 @@ class UnifiedRadixCache(BasePrefixCache):
     _pp_ready_store: Optional[PPConsensusStore] = None
     _storage_drained: tuple[int, ...] = ()
     _storage_epoch: int = 0
+    _storage_unreported_rounds: int = 0
 
     def __init__(
         self,
@@ -669,11 +673,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
-        if self.pp_size > 1 and self.host_memory_mode == "cache":
-            self._pp_ready_store = PPConsensusStore(
-                self.pp_size, self.pp_rank, get_parallel().pp_group
-            )
-
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
 
@@ -703,9 +702,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
-        if self._pp_ready_store is not None:
-            self._pp_ready_store.close()
-            self._pp_ready_store = None
+        self._close_pp_ready_store()
 
     @rank_consensus(
         same_params=["params"],
@@ -4187,6 +4184,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
     def drain_storage_control_queues(self) -> None:
+        """PP=1 only (test kits): under PP, check_hicache_events drains only what
+        every stage has received."""
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
@@ -4313,34 +4312,80 @@ class UnifiedRadixCache(BasePrefixCache):
             *(cc.extra_host_mem_release_queues[n].qsize() for n in extra_pool_names),
         )
 
+    def _open_pp_ready_store(self) -> None:
+        # Collective over the PP group; storage turns on at the same point on
+        # every stage (startup or an attach that every stage runs).
+        if (
+            self.pp_size > 1
+            and self.host_memory_mode == "cache"
+            and self._pp_ready_store is None
+        ):
+            self._pp_ready_store = PPConsensusStore(
+                self.pp_size, self.pp_rank, get_parallel().pp_group
+            )
+
+    def _close_pp_ready_store(self) -> None:
+        if self._pp_ready_store is not None:
+            self._pp_ready_store.close()
+            self._pp_ready_store = None
+
     def _storage_ready_key(self, index: int) -> str:
         return f"hicache_storage:{self._storage_epoch}:{index}"
+
+    def _storage_drained_counts(self, num_queues: int) -> tuple[int, ...]:
+        # Sized on the first report of an epoch; the extra host pools are fixed by then.
+        if not self._storage_drained:
+            self._storage_drained = (0,) * num_queues
+        return self._storage_drained
 
     def _report_storage_totals(self, sizes: tuple[int, ...]) -> None:
         # Items received so far (drained + queued) only grow, so PP0 may read
         # a stale total and still never ask a stage for more than it holds.
-        drained = self._storage_drained = self._storage_drained or (0,) * len(sizes)
+        drained = self._storage_drained_counts(len(sizes))
         for index, (done, size) in enumerate(zip(drained, sizes)):
             key = self._storage_ready_key(index)
             if self._pp_ready_store.get(key) != done + size:
                 self._pp_ready_store[key] = done + size
 
     def _min_storage_totals(self, sizes: tuple[int, ...]) -> tuple[int, ...]:
+        drained = self._storage_drained_counts(len(sizes))
+        peer_totals = [
+            self._pp_ready_store.collect(self._storage_ready_key(index))[1:]
+            for index in range(len(sizes))
+        ]
+        self._warn_on_unreported_stages(sizes=sizes, peer_totals=peer_totals)
         # A stage that has not reported in this epoch holds nothing undrained.
-        drained = self._storage_drained = self._storage_drained or (0,) * len(sizes)
         return tuple(
-            min(
-                done + size,
-                *(
-                    done if total is None else total
-                    for total in self._pp_ready_store.collect(
-                        self._storage_ready_key(index)
-                    )[1:]
-                ),
-            )
-            - done
-            for index, (done, size) in enumerate(zip(drained, sizes))
+            min(done + size, *(done if t is None else t for t in totals)) - done
+            for done, size, totals in zip(drained, sizes, peer_totals)
         )
+
+    def _warn_on_unreported_stages(
+        self, *, sizes: tuple[int, ...], peer_totals: list[list[Optional[int]]]
+    ) -> None:
+        # Epochs out of step (unequal resets or detaches across stages) look like
+        # a stage that never reports: PP0 relays 0 and the queues only grow.
+        unreported = any(sizes) and any(None in totals for totals in peer_totals)
+        self._storage_unreported_rounds = (
+            self._storage_unreported_rounds + 1 if unreported else 0
+        )
+        if self._storage_unreported_rounds == _STORAGE_UNREPORTED_WARN_ROUNDS:
+            missing = sorted(
+                {
+                    rank
+                    for totals in peer_totals
+                    for rank, total in enumerate(totals, start=1)
+                    if total is None
+                }
+            )
+            logger.warning(
+                "HiCache PP storage drain: PP ranks %s sent no queue totals for "
+                "storage epoch %d in %d rounds while PP0 has items queued; nothing "
+                "is drained until they do (epochs out of step across stages?).",
+                missing,
+                self._storage_epoch,
+                self._storage_unreported_rounds,
+            )
 
     def _restart_storage_totals(self) -> None:
         # A rank-local drain or clear desyncs the drained counts; a new epoch
@@ -4350,6 +4395,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._pp_ready_store.pop(self._storage_ready_key(index))
         self._storage_epoch += 1
         self._storage_drained = ()
+        self._storage_unreported_rounds = 0
 
     def _sync_hicache_ready_counts(
         self,
