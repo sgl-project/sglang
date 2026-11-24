@@ -37,7 +37,7 @@ class TraceReplayPool:
         self.capacity = req_pool.req_generation.numel()
         self.max_width = req_pool.max_context_len
         self.tokens: Optional[torch.Tensor] = None
-        self._residents: dict[int, tuple[int, int]] = {}
+        self._residents: dict[int, tuple[int, list[int], int]] = {}
         self._stream = None
         self.revision = 0
 
@@ -79,8 +79,13 @@ class TraceReplayPool:
         for slot in batch.slots:
             if slot is None:
                 continue
-            generation, length = self._residents.get(slot.index, (-1, 0))
-            if generation != slot.generation or length < slot.length:
+            resident = self._residents.get(slot.index)
+            if (
+                resident is None
+                or resident[0] != slot.generation
+                or resident[1] is not slot.token_ids
+                or resident[2] < slot.length
+            ):
                 pending.append(slot)
 
         if pending:
@@ -91,7 +96,11 @@ class TraceReplayPool:
                     slot.token_ids[: slot.length], dtype=torch.int32, pin_memory=pin
                 )
                 self.tokens[slot.index, : slot.length].copy_(host, non_blocking=pin)
-                self._residents[slot.index] = (slot.generation, slot.length)
+                self._residents[slot.index] = (
+                    slot.generation,
+                    slot.token_ids,
+                    slot.length,
+                )
             self.revision += 1
         batch._prepared_revision = self.revision
         return self.tokens

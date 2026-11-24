@@ -59,6 +59,7 @@ print("output_token_logprobs:", result["meta_info"]["output_token_logprobs"])
 
 Trace replay currently targets **normal (non-speculative) decoding** and rejects requests that combine `trace_decode_token_ids` with:
 - Speculative decoding (`--speculative-algorithm` enabled)
+- PD disaggregation (`--disaggregation-mode` != `null`) or HiSparse (`--enable-hisparse`)
 - `n != 1` or `beam_width > 1`
 - Structured outputs (`json_schema`, `regex`, `ebnf`, `structural_tag`)
 - `custom_logit_processor`, `watermark`, `return_sampling_mask`

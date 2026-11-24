@@ -518,6 +518,16 @@ def check_server_args(server_args: Any):
 
     run_post_process_pass(server_args, _hisparse_validation)
 
+    if cfg.enable_trace_replay:
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-trace-replay is not supported with PD disaggregation."
+            )
+        if cfg.enable_hisparse:
+            raise ValueError(
+                "--enable-trace-replay is not supported with --enable-hisparse."
+            )
+
     assert cfg.schedule_conservativeness >= 0, (
         "schedule_conservativeness must be non-negative"
     )

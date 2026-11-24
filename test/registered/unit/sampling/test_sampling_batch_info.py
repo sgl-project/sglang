@@ -589,6 +589,28 @@ class TestTraceReplayBatch(CustomTestCase):
         self.assertEqual(apply_trace_decode_tokens(sampled, old).tolist(), [7])
         self.assertEqual(apply_trace_decode_tokens(sampled, new).tolist(), [16])
 
+    def test_trace_streaming_session_reuses_slot_without_generation_bump(self):
+        # Streaming session turns reuse the same KV slot without incrementing
+        # req_generation. A new turn with a different equal/shorter trace must
+        # overwrite the resident row instead of replaying the previous turn.
+        turn1_req = self._make_req(trace=[7, 8, 9])
+        slot = turn1_req.kv.req_pool_idx
+        turn1 = self._make_trace_info([turn1_req])
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30]), turn1).tolist(), [7]
+        )
+
+        turn2_req = self._make_req(trace=[21, 22])
+        turn2_req.kv.req_pool_idx = slot
+        turn2 = self._make_trace_info([turn2_req])
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30]), turn2).tolist(), [21]
+        )
+        turn2.advance_trace_decode_steps()
+        self.assertEqual(
+            apply_trace_decode_tokens(torch.tensor([30]), turn2).tolist(), [22]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
