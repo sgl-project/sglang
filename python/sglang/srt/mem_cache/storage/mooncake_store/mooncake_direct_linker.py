@@ -511,6 +511,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"Mooncake get session start failed: keys={len(session_keys)}, "
                         f"results={result}"
                     )
+            completed = 0
             for group_reads in reads:
                 group_futures = []
                 futures.append(group_futures)
@@ -519,11 +520,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     group_futures.append(
                         self.load_io_executor.submit(self._range_get, *read)
                     )
-            for group, group_futures in zip(groups, futures):
-                for future in group_futures:
-                    future.result()
-                for layer in group:
-                    self.layer_done_counter.complete(counter_index, layer)
+                # Publish groups that landed during this submit: the next submit
+                # can take longer than the earlier groups' reads.
+                completed = self._complete_groups(
+                    counter_index, groups, futures, completed, block=False
+                )
+            self._complete_groups(counter_index, groups, futures, completed, block=True)
         except BaseException as error:
             # Failure wakes consumers, which may release the destination rows.
             # Stop every submitted write before publishing it.
@@ -540,6 +542,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _complete_groups(
+        self,
+        counter_index: int,
+        groups: list[range],
+        futures: list[list[Future]],
+        completed: int,
+        *,
+        block: bool,
+    ) -> int:
+        """Complete submitted groups in order, from ``completed``; return the next one.
+
+        Without ``block``, stop at the first group with a read still in flight.
+        Order matters: the MLA broadcast of the layers up to a waited one
+        assumes they all landed. A failed read raises from here.
+        """
+        for group_index in range(completed, len(futures)):
+            group_futures = futures[group_index]
+            if not block and not all(future.done() for future in group_futures):
+                return group_index
+            for future in group_futures:
+                future.result()
+            for layer in groups[group_index]:
+                self.layer_done_counter.complete(counter_index, layer)
+        return len(futures)
 
     def _range_get_reads(
         self, name: PoolName, keys: list[str], locations: np.ndarray, group: range
