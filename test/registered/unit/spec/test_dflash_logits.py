@@ -567,6 +567,7 @@ def _verify_target_probs(backend, logits, top_ks, top_ps):
         top_ps=top_ps.to(device),
         need_top_k_sampling=bool((top_ks < logits.shape[-1]).any()),
         need_top_p_sampling=bool((top_ps < 1.0).any()),
+        need_min_p_sampling=False,
     )
     with get_context().override_server_args(sampling_backend=backend):
         return (

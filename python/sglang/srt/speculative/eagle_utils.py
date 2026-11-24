@@ -709,10 +709,9 @@ def _build_verify_target_probs(
     need_min_p = sampling_info.need_min_p_sampling
     if not (need_top_k or need_top_p or need_min_p):
         return target_probs
-    top_ks = torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
-    top_ps = torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
-
     if get_exec().kernel.sampling_backend == "pytorch":
+        top_ks = torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
+        top_ps = torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
         # Rejection sampling is lossless only against the distribution the
         # non-speculative sampler draws from, so filter with the same kernel.
         # The renorm kernels keep every tie at the top-p pivot instead.
