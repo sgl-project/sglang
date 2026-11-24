@@ -111,7 +111,15 @@ pub(crate) fn render(
     {
         return Err("tool_choice required needs tools".into());
     }
-    if has_tools && matches!(request["tool_choice"].as_str(), Some("required" | "none")) {
+    // The encoder renders tool_choice="none" with or without tools, so a
+    // client's explicit "none" reaches it either way. The "none" SGLang fills
+    // in for a request without tools is never in the body, so it does not.
+    let passes_tool_choice = match request["tool_choice"].as_str() {
+        Some("required") => has_tools,
+        Some("none") => true,
+        _ => false,
+    };
+    if passes_tool_choice {
         kwargs
             .entry("tool_choice")
             .or_insert_with(|| request["tool_choice"].clone());

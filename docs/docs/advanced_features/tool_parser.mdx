@@ -44,7 +44,7 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`ernie55`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ERNIE-5.5-Flash (`baidu/ERNIE-5.5-Flash`, coming soon)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ERNIE-5.5-Flash (`baidu/ERNIE-5.5-Flash-Preview`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted as `<ernie:tool_call><invoke name="..."><parameter name="...">...</parameter></invoke></ernie:tool_call>`.</td>
     </tr>
     <tr>
