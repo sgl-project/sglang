@@ -749,6 +749,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
         modelslim_cache_layout=None,
+        shard_index_k: bool = False,
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
@@ -858,16 +859,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        self.shard_index_k = shard_index_k
         if index_size is None:
-            # Index-K uses global slots. Draft capacity already spans those slots.
             index_size = size
-            if index_head_dim is not None and not is_draft_worker:
+            if index_head_dim is not None and not (is_draft_worker or shard_index_k):
                 index_size *= self.dcp_size
         self.index_size = index_size
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
-        index_page_padding = global_page_padding if index_head_dim is not None else 1
+        index_page_padding = (
+            global_page_padding
+            if index_head_dim is not None and not shard_index_k
+            else 1
+        )
         if kv_page_padding < 1 or index_page_padding < 1:
             raise ValueError("NPU MLA page padding must be positive")
         self.kv_page_padding = kv_page_padding
@@ -968,7 +973,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                # index_size, not self.size: the indexer is replicated.
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
@@ -1259,9 +1263,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if not getattr(self, "dsa_kv_cache_store_fp8", False):
             entries += [(buffer, global_kv) for buffer in self.v_buffer]
         if self.index_head_dim is not None:
-            entries += [(buffer, True) for buffer in self.index_k_buffer]
+            index_is_global = not self.shard_index_k
+            entries += [(buffer, index_is_global) for buffer in self.index_k_buffer]
             if self.index_k_scale_buffer is not None:
-                entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
+                entries += [
+                    (buffer, index_is_global) for buffer in self.index_k_scale_buffer
+                ]
         return entries
 
     # for disagg
@@ -1444,14 +1451,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        # The indexer writes at the raw, untranslated loc.
         maybe_detect_oob(
             loc,
-            0,
-            # Virtual pages start at 1 and span attn_dcp_size index pages, so the
-            # top is index_size plus one virtual page (index_page_padding pages).
+            -1 if self.shard_index_k else 0,
             self.index_size + self.index_page_size * self.index_page_padding,
-            "set_index_k_buffer (NPU MLA, raw virtual loc)",
+            "set_index_k_buffer (NPU MLA)",
         )
 
         if self.indexer_kv_store_int8:
@@ -1586,6 +1590,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_index_cache_cpu_copy(self, indices):
         index_indices = torch.unique_consecutive(indices // self.index_kpool)
+        index_indices = self._copy_indices_for_buffer(
+            index_indices, not self.shard_index_k
+        )
         chunk_size = self.cpu_offloading_chunk_size
         index_cpu = []
         for local_layer_id in range(self.layer_num):  # each layer
@@ -1602,6 +1609,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _load_index_cache_cpu_copy(self, index_cpu, indices):
         index_indices = torch.unique_consecutive(indices // self.index_kpool)
+        index_indices = self._copy_indices_for_buffer(
+            index_indices, not self.shard_index_k
+        )
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):  # each layer
             buffers = self._get_index_cache_layer_buffers(local_layer_id)
@@ -1687,6 +1697,7 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
         use_fp4_indexer: bool = False,
         is_draft_worker: bool = False,
         modelslim_cache_layout=None,
+        shard_index_k: bool = False,
     ):
         # Accepted for signature compatibility with the in-tree DSATokenToKVPool
         # contract; the NPU indexer kernels manage fp8 latent + fp32 per-tile
@@ -1722,4 +1733,5 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             is_draft_worker=is_draft_worker,
             modelslim_cache_layout=modelslim_cache_layout,
+            shard_index_k=shard_index_k,
         )

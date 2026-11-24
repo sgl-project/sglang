@@ -27,6 +27,10 @@ if is_npu():
     import torch_npu
     from sgl_kernel_npu.operators.indexer import mlp_lightning_indexer
 
+    from sglang.srt.hardware_backend.npu.attention.dsa_index_k import (
+        plan_index_k_prefill_gather,
+        score_sharded_index_k,
+    )
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -482,12 +486,20 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
+        pool = get_token_to_kv_pool()
+        # The NPU hybrid full-attention pool uses compact layer IDs.
+        if hasattr(pool, "full_kv_pool"):
+            pool._wait_for_layer(layer_id)
+            layer_id = pool._transfer_full_attention_id(layer_id)
+            pool = pool.full_kv_pool
+        shard_index_k = getattr(pool, "shard_index_k", False)
         indexer_cache_loc = forward_batch.out_cache_loc
         parallel = get_parallel()
         if (
             parallel.dcp_enabled
             and parallel.attn_dcp_size > 1
             and not attn_backend.is_draft_worker
+            and not shard_index_k
         ):
             indexer_cache_loc = attn_backend.forward_metadata.dcp_origin_out_cache_loc
             assert indexer_cache_loc is not None, (
@@ -497,14 +509,6 @@ class DSANPUIndexerMixin:
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
-        pool = get_token_to_kv_pool()
-        # Hybrid pools (Kimi K2/K3) keep the index buffers on the inner
-        # full-attn pool, which is keyed by compact (dense) layer ids;
-        # translate the global layer id before unwrapping the wrapper.
-        if hasattr(pool, "full_kv_pool"):
-            pool._wait_for_layer(layer_id)
-            layer_id = pool._transfer_full_attention_id(layer_id)
-            pool = pool.full_kv_pool
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(
@@ -599,6 +603,36 @@ class DSANPUIndexerMixin:
         # Kimi K2/K3 wrap full-attn + linear backends and the metadata lives
         # on the full-attn side (see the unwrap at the top of forward_npu).
         block_table = attn_backend.forward_metadata.block_tables
+        if shard_index_k:
+            metadata = attn_backend.forward_metadata
+            if not is_prefill:
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens = metadata.dcp_spec_seq_lens
+                    local_block_table = metadata.dcp_spec_block_tables
+                else:
+                    seq_lens = metadata.dcp_seq_lens
+                    local_block_table = metadata.dcp_block_tables
+                forward_batch.npu_indexer_topk_is_local = False
+                return score_sharded_index_k(
+                    q.view(-1, self.n_heads, self.head_dim),
+                    past_key_states,
+                    weights,
+                    self.index_topk,
+                    seq_lens,
+                    local_block_table,
+                    parallel.dcp_group,
+                )
+            if not hasattr(forward_batch, "npu_index_k_gather_plan"):
+                forward_batch.npu_index_k_gather_plan = plan_index_k_prefill_gather(
+                    metadata.dcp_block_tables,
+                    forward_batch.seq_lens_cpu,
+                    pool.index_page_size,
+                    parallel.attn_dcp_size,
+                )
+            pages, block_table = forward_batch.npu_index_k_gather_plan
+            past_key_states = parallel.dcp_group.all_gather(
+                past_key_states.index_select(0, pages), dim=1
+            ).reshape(-1, *past_key_states.shape[1:])
         if self.num_init_tokens or self.num_local_tokens:
             return self._forward_npu_lsa_indexer(
                 q.view(-1, self.n_heads, self.head_dim),

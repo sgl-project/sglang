@@ -451,6 +451,30 @@ class KVCacheConfigurator:
     _unified_sized: Any = field(init=False, default=None)
 
     @property
+    def npu_dsa_shards_index_k(self) -> bool:
+        # The Ascend PD, host-cache, and prefill-CP paths use global Index-K.
+        if (
+            not _is_npu
+            or self.is_draft_worker
+            or get_parallel().attn_dcp_size <= 1
+            or not is_kimi_k31(self.model_config.hf_config)
+            or self.kv_cache_dtype != torch.bfloat16
+            or self.modelslim_cache_layout is not None
+            or get_parallel().attn_cp_size > 1
+            or get_disagg().disaggregation_mode != "null"
+            or get_disagg().enable_pd_role_switch
+            or get_memory().enable_hierarchical_cache
+            or get_memory().enable_hisparse
+        ):
+            return False
+
+        from sglang.srt.hardware_backend.npu.attention.dsa_index_k import (
+            get_scored_indexer,
+        )
+
+        return get_scored_indexer() is not None
+
+    @property
     def use_combined_kv_buffer(self) -> bool:
         return (
             get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
@@ -3016,7 +3040,9 @@ class KVCacheConfigurator:
                 )
 
                 return partial(
-                    NPUDSATokenToKVPool, is_draft_worker=self.is_draft_worker
+                    NPUDSATokenToKVPool,
+                    is_draft_worker=self.is_draft_worker,
+                    shard_index_k=self.npu_dsa_shards_index_k,
                 )
             return dsa_pool_class
         if _is_npu:

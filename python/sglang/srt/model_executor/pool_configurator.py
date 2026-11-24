@@ -366,7 +366,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    if not dsa_shards_index_k():
+                    if dcp_size > 1 and not (
+                        dsa_shards_index_k() or kvc.npu_dsa_shards_index_k
+                    ):
                         target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
@@ -505,13 +507,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                # The index-K buffer is replicated under DCP while the latent KV
-                # shards, so this term is short by dcp_size without the scale.
+                # A replicated Index-K spans the allocator-global slots.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
                 )
-                if not kvc.is_draft_worker and not dsa_shards_index_k():
+                if (
+                    dcp_size > 1
+                    and not kvc.is_draft_worker
+                    and not (dsa_shards_index_k() or kvc.npu_dsa_shards_index_k)
+                ):
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
