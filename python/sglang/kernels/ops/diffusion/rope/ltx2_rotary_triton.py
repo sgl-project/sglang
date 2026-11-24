@@ -3,22 +3,25 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# The sequence length and the cos/sin strides change with the resolution and the
+# frame count, so they stay out of the constexprs: one compile per model, not one
+# per token count. The strides keep Triton's divisibility hint.
+@triton.jit(do_not_specialize=["seq_len"])
 def _ltx2_split_rotary_kernel(
     out_ptr,
     x_ptr,
     cos_ptr,
     sin_ptr,
-    seq_len: tl.constexpr,
+    seq_len,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     half_dim: tl.constexpr,
-    stride_cos_b: tl.constexpr,
-    stride_cos_h: tl.constexpr,
-    stride_cos_t: tl.constexpr,
-    stride_sin_b: tl.constexpr,
-    stride_sin_h: tl.constexpr,
-    stride_sin_t: tl.constexpr,
+    stride_cos_b,
+    stride_cos_h,
+    stride_cos_t,
+    stride_sin_b,
+    stride_sin_h,
+    stride_sin_t,
     BLOCK_HEADS: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
 ):

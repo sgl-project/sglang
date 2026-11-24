@@ -12,7 +12,10 @@ from sglang.kernels.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 
-@triton.jit
+# The element count, token count and strides change with the resolution, so
+# they stay out of the constexprs. N and the strides keep Triton's divisibility
+# hint.
+@triton.jit(do_not_specialize=["TOKENS"])
 def _qk_norm_mrope_kernel(
     X,
     MT,
@@ -22,12 +25,12 @@ def _qk_norm_mrope_kernel(
     COS,
     SIN,
     OUT,
-    N: tl.constexpr,
-    TOKENS: tl.constexpr,
+    N,
+    TOKENS,
     HEADS: tl.constexpr,
-    BS: tl.constexpr,
-    TS: tl.constexpr,
-    HS: tl.constexpr,
+    BS,
+    TS,
+    HS,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):

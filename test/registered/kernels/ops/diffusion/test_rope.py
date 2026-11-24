@@ -24,6 +24,7 @@ import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
+    apply_ltx2_split_rotary_emb,
     can_use_fused_inplace_qknorm_rope,
     can_use_fused_rope_rotate_half_fp32,
     fused_inplace_qknorm_rope,
@@ -641,6 +642,44 @@ def test_anima_rope_input_guards():
     ]
     for inputs in unsupported:
         assert not can_use_fused_rope_rotate_half_fp32(*inputs)
+
+
+def _ltx2_split_rope_inputs(batch, seq_len, layout, heads=4, half=64):
+    generator = torch.Generator(device="cuda").manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(
+            shape, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+
+    def table():
+        if layout == "batch_broadcast":
+            return randn(1, heads, seq_len, half).expand(batch, -1, -1, -1)
+        if layout == "tokens_major":
+            return randn(batch, seq_len, heads, half).permute(0, 2, 1, 3)
+        return randn(batch, heads, seq_len, half)
+
+    return randn(batch, seq_len, heads * 2 * half), table(), table()
+
+
+def _ltx2_split_rope_reference(x, cos, sin):
+    """The eager path of ``apply_split_rotary_emb`` in ``dits/ltx_2.py``."""
+    batch, seq_len, _ = x.shape
+    heads, half = cos.shape[1], cos.shape[-1]
+    split_x = x.reshape(batch, seq_len, heads, 2, half).swapaxes(1, 2)
+    out = split_x * cos.unsqueeze(-2)
+    out[..., :1, :].addcmul_(-sin.unsqueeze(-2), split_x[..., 1:, :])
+    out[..., 1:, :].addcmul_(sin.unsqueeze(-2), split_x[..., :1, :])
+    return out.swapaxes(1, 2).reshape(batch, seq_len, -1)
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "batch_broadcast", "tokens_major"])
+@pytest.mark.parametrize("seq_len", [1, 57, 64])
+def test_ltx2_split_rotary_matches_eager(seq_len, layout):
+    """Sequence lengths and cos/sin strides are runtime arguments of the kernel."""
+    x, cos, sin = _ltx2_split_rope_inputs(2, seq_len, layout)
+    out = apply_ltx2_split_rotary_emb(x, cos, sin)
+    torch.testing.assert_close(out, _ltx2_split_rope_reference(x, cos, sin))
 
 
 if __name__ == "__main__":

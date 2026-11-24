@@ -40,6 +40,15 @@ from sglang.kernels.ops.diffusion.layout.wan_causal_cache_triton import (
 from sglang.kernels.ops.diffusion.modulate.wan_temb_table_slices_triton import (
     fused_temb_table_slices,
 )
+from sglang.kernels.ops.diffusion.rope.ltx2_rotary_triton import (
+    apply_ltx2_split_rotary_emb,
+)
+from sglang.kernels.ops.diffusion.rope.nomas_qk_norm_mrope_triton import (
+    fused_nomas_qk_norm_mrope,
+)
+from sglang.kernels.ops.diffusion.rope.rope_rotate_half_fp32 import (
+    fused_rope_rotate_half_fp32,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -176,6 +185,35 @@ def _wan_dup_up3d_layouts(n, main_layout, src_layout):
     dup_up3d_add(main, src, 2, 2, 8, False)
 
 
+def _ltx2_split_rotary(seq_len):
+    x = _bf16(1, seq_len, 4 * 128)
+    cos = _bf16(1, 4, seq_len, 64)
+    apply_ltx2_split_rotary_emb(x, cos, torch.randn_like(cos))
+
+
+def _anima_rope(seq_len):
+    q = _bf16(1, seq_len, 2, 128)
+    cos = torch.randn(seq_len, 128, device=DEVICE, dtype=torch.float32)
+    fused_rope_rotate_half_fp32(q, torch.randn_like(q), cos, torch.randn_like(cos))
+
+
+def _nomas_qk_norm_mrope(seq_len):
+    x = _bf16(1, seq_len, 2, 128)
+    mean = torch.rand(1, seq_len, 2, 1, device=DEVICE, dtype=torch.float32)
+    weight = _bf16(64)
+    table = torch.randn(1, seq_len, 1, 128, device=DEVICE, dtype=torch.float32)
+    fused_nomas_qk_norm_mrope(
+        x,
+        mean,
+        torch.rand_like(mean),
+        1e-6,
+        weight,
+        torch.randn_like(weight),
+        table,
+        torch.randn_like(table),
+    )
+
+
 LAUNCHES = {
     "select01": lambda n: _select01(n, residual=False),
     "residual_select01": lambda n: _select01(n, residual=True),
@@ -192,6 +230,9 @@ LAUNCHES = {
     "wan_dup_up3d_cf_cf": lambda n: _wan_dup_up3d_layouts(n, "cf", "cf"),
     "wan_dup_up3d_cf_cl": lambda n: _wan_dup_up3d_layouts(n, "cf", "cl"),
     "wan_dup_up3d_cl_cf": lambda n: _wan_dup_up3d_layouts(n, "cl", "cf"),
+    "ltx2_split_rotary": _ltx2_split_rotary,
+    "anima_rope_rotate_half_fp32": _anima_rope,
+    "nomas_qk_norm_mrope": _nomas_qk_norm_mrope,
 }
 
 
