@@ -22,18 +22,10 @@ from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     save_jsonl,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    ACTIVE_TEST_CLASS,
-    CONFIGMAP_NAME,
-    NAMESPACE,
-    SERVICE_PORT,
+    PdMixNodeMixin,
+    PdSepNodeMixin,
     check_role,
     kill_process_group,
-    launch_pd_mix_node,
-    launch_pd_separation_node,
-    query_configmap,
-    start_router_thread,
-    wait_for_prefill_decode_exit,
-    wait_server_ready,
 )
 from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
@@ -634,13 +626,15 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
-                elif stripped_line.startswith("Storage:") and stripped_line.endswith(
-                    "%"
-                ):
-                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%"
+                elif stripped_line.startswith(
+                    ("Storage:", "Storage (")
+                ) and stripped_line.endswith("%"):
+                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%" or
+                    # "Storage (MooncakeStore): 19.7%" when the engine that
+                    # served the request has a storage backend configured.
                     parts = stripped_line.split()
                     if len(parts) >= 2:
-                        metrics["storage_hit_rate_pct"] = parts[1].rstrip("%")
+                        metrics["storage_hit_rate_pct"] = parts[-1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -1435,8 +1429,10 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
+class TestNpuPerfMultiNodePdMixTestCaseBase(PdMixNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
+    keep_alive_time = MAX_SERVER_KEEP_ALIVE_TIME
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     dataset_name = "random"
@@ -1465,73 +1461,6 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
-
-    @classmethod
-    def setUpClass(cls):
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_mix_master_node()
-        cls.start_pd_mix_worker_node()
-
-    @classmethod
-    def tearDownClass(cls):
-        storage_service_process = getattr(cls, "storage_service_process", None)
-        if storage_service_process:
-            try:
-                kill_process_tree(storage_service_process.pid)
-            except Exception as e:
-                logger.error(f"Error during storage service teardown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def start_pd_mix_master_node(cls):
-        cls.storage_service_process = maybe_start_hicache_storage_service(
-            cls.model_config.get("other_args")
-        )
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        # Poll in slices so a dead launcher fails fast. When a rank is killed
-        # during distributed init, the launch thread raises and the plain
-        # wait_server_ready below would keep polling /health for the full
-        # 3600 s timeout before the job fails.
-        while sglang_thread.is_alive():
-            try:
-                wait_server_ready(f"{cls.base_url}/health", timeout=60)
-                break
-            except RuntimeError:
-                continue
-        else:
-            raise RuntimeError(
-                "sglang launch thread exited before the server became ready; "
-                "check the server logs for the first rank that died"
-            )
-
-        logger.info(
-            f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def start_pd_mix_worker_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
-        )
-        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
     @retry()
     @check_role(allowed_roles=["master", "worker"])
@@ -1591,8 +1520,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
+class TestNpuPerfMultiNodePdSepTestCaseBase(PdSepNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     dataset_name = "random"
@@ -1621,90 +1551,6 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_server()
-        cls.start_router_server()
-
-    @classmethod
-    def tearDownClass(cls):
-        logger.info("Start exec tearDownClass")
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-                for _ in range(60):
-                    if cls.process.poll() is not None:
-                        logger.info("Process fully exited")
-                        break
-                    time.sleep(1)
-                else:
-                    logger.warning("Process did NOT exit in time")
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-        storage_service_process = getattr(cls, "storage_service_process", None)
-        if storage_service_process:
-            try:
-                kill_process_tree(storage_service_process.pid)
-            except Exception as e:
-                logger.error(f"Error during storage service teardown: {e}")
-        logger.info("tearDownClass finished")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
-        start_router_thread(cls.model_config, cls.base_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        if cls.hostname.endswith("prefill-0"):
-            cls.storage_service_process = maybe_start_hicache_storage_service(
-                cls.model_config.get("prefill_args")
-            )
-        logger.info(f"Starting pd separation node...")
-        cls.process = launch_pd_separation_node(cls.model_config)
-        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
-
-        # Loop to check if the process is still running
-        while True:
-            configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
-            if configmap and configmap.data:
-                executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
-                if executing_class and executing_class != cls.__name__:
-                    logger.info(f"Retrieved ConfigMap data: {configmap.data}")
-                    logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
-                    return
-            if cls.process.poll() is None:
-                # Process is still running
-                time.sleep(30)
-            else:
-                # Process has exited
-                exit_code = cls.process.poll()
-                raise Exception(
-                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
-                )
 
     @retry()
     @check_role(allowed_roles=["router"])
