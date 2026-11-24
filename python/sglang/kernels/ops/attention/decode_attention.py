@@ -28,7 +28,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.ops.attention.score_mod import score_mod_band, unpack_aux_tensors
+from sglang.kernels.ops.attention.score_mod import (
+    relative_bias_score_mod,
+    unpack_aux_tensors,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_core_count,
@@ -753,6 +756,7 @@ def _fwd_grouped_kernel_stage1(
                 if xai_temperature_len > 0:
                     qk *= xai_temperature_reg[:, None]
 
+                # the relative bias is zero from aux0_len on: skip tiles past it
                 in_band = True
                 if SCORE_MOD_BAND:
                     in_band = cur_batch_seq_len - 1 - (start_n + BLOCK_N - 1) < aux0_len
@@ -972,7 +976,7 @@ def _decode_grouped_att_m_fwd(
         IS_GFX1250=_is_gfx1250,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
-        SCORE_MOD_BAND=_is_hip and score_mod_band(score_mod),
+        SCORE_MOD_BAND=_is_hip and score_mod is relative_bias_score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
@@ -1110,6 +1114,12 @@ def _fwd_kernel_stage2(
         lse = tl.where(e_sum > 0, e_max + tl.log(e_sum), float("-inf"))
     if Lse_Out is not None:
         tl.store(Lse_Out + cur_batch * stride_lse_b + cur_head, lse)
+
+    if HAS_SINK:
+        cur_sink = tl.load(sink_ptr + cur_head)
+        e_sum += tl.exp(cur_sink - e_max)
+
+    out = acc / e_sum * v_scale
     if Gate is not None:
         # Inkling2's output gate and query sink: o * sigmoid(gate) * sigmoid(lse - sink).
         gate = tl.load(
@@ -1118,24 +1128,13 @@ def _fwd_kernel_stage2(
             other=0,
         ).to(tl.float32)
         sink = tl.load(GateSink + cur_batch * stride_sink_b + cur_head).to(tl.float32)
-        out = acc / e_sum * v_scale
         out = out * (1.0 / (1.0 + tl.exp(-gate)))
         out = out * (1.0 / (1.0 + tl.exp(sink - lse)))
-        tl.store(
-            O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-            out.to(O.dtype.element_ty),
-            mask=mask_d,
-        )
-    else:
-        if HAS_SINK:
-            cur_sink = tl.load(sink_ptr + cur_head)
-            e_sum += tl.exp(cur_sink - e_max)
-
-        tl.store(
-            O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-            acc / e_sum * v_scale,
-            mask=mask_d,
-        )
+    tl.store(
+        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        out,
+        mask=mask_d,
+    )
 
 
 def _decode_softmax_reducev_fwd(
