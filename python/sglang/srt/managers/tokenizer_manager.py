@@ -136,6 +136,7 @@ from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -1439,12 +1440,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 attach_mm_routing_labels(
                     mm_inputs.mm_items, obj.mm_routing_labels_by_modality()
                 )
-            if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
-                and mm_inputs
-                and mm_inputs.mm_items
-            ):
-                await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+            if mm_inputs and mm_inputs.mm_items:
+                if self.model_config.dtype == torch.bfloat16:
+                    for index, item in enumerate(mm_inputs.mm_items):
+                        if (
+                            not isinstance(item, MultimodalDataItem)
+                            or not item.is_image()
+                            or item.identity is not None
+                        ):
+                            continue
+
+                        feature = item.feature
+                        if (
+                            isinstance(feature, torch.Tensor)
+                            and feature.device.type == "cpu"
+                            and feature.dtype == torch.float32
+                        ):
+                            item = copy.copy(item)
+                            item.feature = feature.to(dtype=torch.bfloat16)
+                            mm_inputs.mm_items[index] = item
+                if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+                    await self.mm_processor.hash_executor.set_pad_values(
+                        mm_inputs.mm_items
+                    )
         else:
             mm_inputs = None
 
