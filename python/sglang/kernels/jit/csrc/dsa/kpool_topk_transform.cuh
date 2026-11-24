@@ -59,6 +59,29 @@ __device__ __forceinline__ auto make_topk_key(float score, int index) -> uint64_
   return (static_cast<uint64_t>(convert_to_uint32(score)) << 32) | ~static_cast<uint32_t>(index);
 }
 
+// Issue kUnroll loads per thread before consuming them so row scans are not
+// serialized on one global-load latency per element. Only measured on gfx950.
+template <typename F>
+__device__ __forceinline__ void for_each_row_element(const float* __restrict__ row, int length, F&& f) {
+#ifdef USE_ROCM
+  constexpr int kUnroll = 4;
+#else
+  constexpr int kUnroll = 1;
+#endif
+  int idx = threadIdx.x;
+  for (; idx + (kUnroll - 1) * kThreadsPerBlock < length; idx += kUnroll * kThreadsPerBlock) {
+    float v[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u)
+      v[u] = row[idx + u * kThreadsPerBlock];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u)
+      f(idx + u * kThreadsPerBlock, v[u]);
+  }
+  for (; idx < length; idx += kThreadsPerBlock)
+    f(idx, row[idx]);
+}
+
 template <int K>
 __device__ void
 fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
@@ -78,14 +101,12 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
 
   const int tx = threadIdx.x;
+  const float* __restrict__ row = input + row_start;
 
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
 
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    ::atomicAdd(&s_histogram[bin], 1);
-  }
+  for_each_row_element(row, length, [&](int, float x) { ::atomicAdd(&s_histogram[convert_to_uint8(x)], 1); });
   __syncthreads();
 
   const auto run_cumsum = [&] {
@@ -118,13 +139,12 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   const auto num_threshold_candidates = s_histogram[threshold_bin] - s_histogram[threshold_bin + 1];
 
   if (topk == 0) {
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      if (bin > threshold_bin) {
+    for_each_row_element(row, length, [&](int idx, float x) {
+      if (static_cast<int>(convert_to_uint8(x)) > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
       }
-    }
+    });
     __syncthreads();
     return;
   } else if (num_threshold_candidates > int(SMEM_INPUT_SIZE)) {
@@ -191,8 +211,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
     }
     __syncthreads();
 
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
+    for_each_row_element(row, length, [&](int idx, float raw_input) {
       const auto bin = static_cast<int>(convert_to_uint8(raw_input));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
@@ -206,7 +225,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
           ::atomicAdd(&s_histogram[sub_bin], 1);
         }
       }
-    }
+    });
     __syncthreads();
   }
 
