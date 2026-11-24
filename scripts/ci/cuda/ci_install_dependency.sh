@@ -5,6 +5,20 @@
 # index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
+# Hugging Face tokens on self-hosted runners come from the runner environment,
+# not from GitHub secrets, so GitHub does not mask them. Register them as
+# masks so later steps print *** instead. Tracing is off here: with -x on,
+# the echo line itself would print the token before GitHub masks it.
+{ set +x; } 2>/dev/null
+for _hf_token in "${HF_TOKEN:-}" "${HUGGING_FACE_HUB_TOKEN:-}" \
+    "$(cat "${HF_HOME:-${HOME}/.cache/huggingface}/token" 2>/dev/null || true)"; do
+    if [ -n "${_hf_token}" ]; then
+        echo "::add-mask::${_hf_token}"
+    fi
+done
+unset _hf_token
+set -x
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
@@ -220,6 +234,10 @@ install_apt_packages() {
         libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        # gpu worker NUMA discovery needs the numactl executable, not just libnuma
+        CI_APT_PACKAGES+=(numactl)
+    fi
 
     # The images bake these in, so the usual run pays apt-get update's round
     # trips to install nothing. Skipping it costs no currency either: apt-get
@@ -620,7 +638,13 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    # editable checkout paths are identical across runner containers; keep
+    # distribution locks separate while reusing each runner's warm cache
+    local editable_cache_dir="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+    if [ -n "${RUNNER_NAME:-}" ]; then
+        editable_cache_dir="${editable_cache_dir}/runners/${RUNNER_NAME}"
+    fi
+    UV_CACHE_DIR="$editable_cache_dir" $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -636,9 +660,9 @@ install_sglang() {
 }
 
 install_nccl() {
-    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # DeepEP needs NCCL 2.31.2 whatever torch pins, so this must run
     # after every command that resolves Python dependencies (including lmms-eval).
-    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+    $PIP_CMD install "nvidia-nccl-cu13==2.31.2" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
@@ -727,12 +751,6 @@ install_sglang_kernel() {
     else
         $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
     fi
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
-install_sglang_router() {
-    $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -844,9 +862,9 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
-        # drop the cap once lmms_eval allows NumPy 2.
-        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" $PIP_INSTALL_SUFFIX
+        # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
+        # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
+        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
@@ -858,6 +876,10 @@ install_extra_deps() {
 }
 
 install_msa() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
     # MiniMax MSA sparse-attention kernels: MiniMax-M3.1 imports them at startup on
     # Blackwell. Same commit and layout as docker/Dockerfile.cu134; editable because
     # prefill JIT-compiles against its CUTLASS submodule.
@@ -931,17 +953,17 @@ import ctypes
 import importlib.metadata
 import os
 
-if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.31.2":
     raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
 nccl = ctypes.CDLL("libnccl.so.2")
 nccl_version = ctypes.c_int()
 status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
-if status != 0 or nccl_version.value != 23007:
+if status != 0 or nccl_version.value != 23102:
     raise SystemExit(
-        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"expected NCCL runtime 2.31.2, got status={status}, "
         f"raw_version={nccl_version.value}"
     )
-print("NCCL package and runtime versions are 2.30.7")
+print("NCCL package and runtime versions are 2.31.2")
 
 import torch
 print(torch.version.cuda)
@@ -1003,13 +1025,7 @@ main() {
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock
-    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
-    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
-    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
-        setup_ld_library_path
-    fi
     install_sglang_kernel
-    install_sglang_router
     install_flashinfer_cubin
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths

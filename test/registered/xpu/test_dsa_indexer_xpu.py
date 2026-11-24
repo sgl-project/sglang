@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 # Configuration matching GLM5.1 index head dimensions on XPU
 DEFAULT_CONFIG = {
@@ -225,6 +225,8 @@ class MockModelRunner:
             },
         )()
         self.hisparse_coordinator = None
+        # A static pool: page tables hold the ids req_to_token holds.
+        self.runner_ids = None
 
 
 @unittest.skipIf(not torch.xpu.is_available(), "XPU is required")

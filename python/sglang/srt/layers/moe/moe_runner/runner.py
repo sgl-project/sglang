@@ -13,7 +13,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore, TritonRunnerInput
-from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     get_moe_a2a_backend,
@@ -103,8 +102,6 @@ class MoeRunner:
             from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
 
             self.runner_core = AscendRunnerCore(config)
-        elif runner_backend.is_triton_kernels():
-            self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_humming():

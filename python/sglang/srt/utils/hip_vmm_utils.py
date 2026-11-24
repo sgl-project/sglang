@@ -1,10 +1,15 @@
-"""HIP virtual-memory (VMM) buffers shared across the ranks of one host.
+"""HIP virtual-memory (VMM) buffers shared across one host or fabric clique.
 
 Every rank allocates one VMM allocation with ``hipMemCreate``, exports it as a
-POSIX fd, exchanges the fds over UNIX sockets (``SCM_RIGHTS``), and maps every
-peer's allocation into its own address space. This is the ROCm counterpart of
-torch symmetric memory for the JIT custom all-reduce: it needs only the HIP
-runtime already loaded by torch, no FABRIC handle and no multicast object.
+shareable handle, and maps every peer's allocation into its own address space.
+This is the ROCm counterpart of torch symmetric memory for the JIT custom
+all-reduce: it needs only the HIP runtime already loaded by torch and no
+multicast object.
+
+Two handle types are supported. A FABRIC handle is a 64-byte value exchanged
+with ``all_gather_object``; a POSIX fd is exchanged over UNIX sockets
+(``SCM_RIGHTS``). ``SGLANG_HIP_VMM_HANDLE_TYPE`` picks one (``auto``, the
+default, uses FABRIC when the device supports it).
 """
 
 from __future__ import annotations
@@ -12,12 +17,14 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+from datetime import timedelta
 from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.cuda_vmm_utils import exchange_posix_fds
 
 logger = logging.getLogger(__name__)
@@ -28,11 +35,28 @@ hipError_t = ctypes.c_int
 _HIP_MEM_ALLOCATION_TYPE_PINNED = 0x1
 _HIP_MEM_ALLOCATION_TYPE_UNCACHED = 0x40000000
 _HIP_MEM_HANDLE_TYPE_POSIX_FD = 0x1
+_HIP_MEM_HANDLE_TYPE_FABRIC = 0x8
+_HIP_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 95
+_HIP_FABRIC_HANDLE_BYTES = 64
 _HIP_MEM_LOCATION_TYPE_DEVICE = 1
 _HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE = 3
 _HIP_MEM_ALLOC_GRANULARITY_RECOMMENDED = 0x1
 _HIP_ERROR_OUT_OF_MEMORY = 2
 _MIN_CHUNK_BYTES = 2 << 20
+_TEARDOWN_BARRIER_TIMEOUT = timedelta(seconds=60)
+
+
+def teardown_barrier(group: ProcessGroup) -> bool:
+    """Barrier that returns False instead of hanging when a peer never arrives."""
+    try:
+        if dist.get_backend(group) == dist.Backend.GLOO:
+            dist.monitored_barrier(group=group, timeout=_TEARDOWN_BARRIER_TIMEOUT)
+        else:
+            dist.barrier(group=group)
+        return True
+    except Exception as e:
+        logger.warning("VMM teardown barrier failed, continuing without it: %s", e)
+        return False
 
 
 class _HipMemLocation(ctypes.Structure):
@@ -61,10 +85,18 @@ class _HipMemAccessDesc(ctypes.Structure):
     _fields_ = [("location", _HipMemLocation), ("flags", ctypes.c_int)]
 
 
+class _HipMemFabricHandle(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_ubyte * _HIP_FABRIC_HANDLE_BYTES)]
+
+
 _PROTOTYPES = {
     "hipGetErrorString": (ctypes.c_char_p, [hipError_t]),
     "hipGetLastError": (hipError_t, []),
     "hipRuntimeGetVersion": (hipError_t, [ctypes.POINTER(ctypes.c_int)]),
+    "hipDeviceGetAttribute": (
+        hipError_t,
+        [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int],
+    ),
     "hipMemGetAllocationGranularity": (
         hipError_t,
         [
@@ -170,6 +202,34 @@ def is_hip_runtime_supported() -> bool:
     return hip_runtime_version()[:2] >= MIN_HIP_VERSION
 
 
+def is_fabric_handle_supported(device_index: int) -> bool:
+    supported = ctypes.c_int(0)
+    err = _hip().hipDeviceGetAttribute(
+        ctypes.byref(supported),
+        _HIP_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+        device_index,
+    )
+    if err != 0:
+        _hip().hipGetLastError()
+        return False
+    return supported.value != 0
+
+
+def _resolve_handle_type(device_index: int) -> int:
+    choice = envs.SGLANG_HIP_VMM_HANDLE_TYPE.get().lower()
+    if choice == "posix_fd":
+        return _HIP_MEM_HANDLE_TYPE_POSIX_FD
+    if choice == "fabric":
+        return _HIP_MEM_HANDLE_TYPE_FABRIC
+    if choice != "auto":
+        raise ValueError(
+            f"SGLANG_HIP_VMM_HANDLE_TYPE={choice!r}; expected auto, fabric or posix_fd"
+        )
+    if is_fabric_handle_supported(device_index):
+        return _HIP_MEM_HANDLE_TYPE_FABRIC
+    return _HIP_MEM_HANDLE_TYPE_POSIX_FD
+
+
 class _DeviceArray:
     """`__cuda_array_interface__` over a mapped range; keeps its buffer alive."""
 
@@ -192,6 +252,9 @@ class HipSymmetricBuffer:
     Uncached (``hipMemAllocationTypeUncached``) memory is the default because
     kernels poll it for peer writes within a launch, which the non-coherent L2
     would otherwise hide; RCCL allocates its VMM transport buffers the same way.
+
+    ``require_fabric`` forces FABRIC handles regardless of
+    ``SGLANG_HIP_VMM_HANDLE_TYPE``: a group spanning hosts cannot pass POSIX fds.
     """
 
     def __init__(
@@ -201,6 +264,7 @@ class HipSymmetricBuffer:
         group: ProcessGroup,
         *,
         uncached: bool = True,
+        require_fabric: bool = False,
     ) -> None:
         if not is_hip_runtime_supported():
             raise RuntimeError(
@@ -210,7 +274,8 @@ class HipSymmetricBuffer:
         self.device = torch.device(device)
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self._handles: List[ctypes.c_void_p] = []
+        self._handles: List[ctypes.c_void_p] = []  # this rank's first, then imports
+        self._num_local_handles = 0
         # (reserved VA, [(mapped address, bytes), ...]) per rank
         self._mapped: List[Tuple[int, List[Tuple[int, int]]]] = []
         self._closed = False
@@ -221,7 +286,13 @@ class HipSymmetricBuffer:
             if uncached
             else _HIP_MEM_ALLOCATION_TYPE_PINNED
         )
-        prop.requestedHandleTypes = _HIP_MEM_HANDLE_TYPE_POSIX_FD
+        self.handle_type = (
+            _HIP_MEM_HANDLE_TYPE_FABRIC
+            if require_fabric
+            else _resolve_handle_type(self.device.index)
+        )
+        use_fabric = self.handle_type == _HIP_MEM_HANDLE_TYPE_FABRIC
+        prop.requestedHandleTypes = self.handle_type
         prop.location.type = _HIP_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self.device.index
         granularity = ctypes.c_size_t()
@@ -236,76 +307,116 @@ class HipSymmetricBuffer:
         gran = granularity.value
         self.size = (nbytes + gran - 1) // gran * gran
 
-        # Every rank learns every rank's outcome before the fd exchange, so a
-        # failure raises everywhere instead of leaving the peers blocked in it.
+        # Every rank learns every rank's outcome before the handle exchange, so
+        # a failure raises everywhere instead of leaving the peers blocked in it.
         local_fds: List[int] = []
+        local_fabric: List[bytes] = []
         try:
             local, chunk_sizes = self._create(prop, gran)
             for handle in local:
-                fd = ctypes.c_int(-1)
-                _check(
-                    lib.hipMemExportToShareableHandle(
-                        ctypes.byref(fd), handle, _HIP_MEM_HANDLE_TYPE_POSIX_FD, 0
-                    ),
-                    "hipMemExportToShareableHandle(POSIX_FD)",
-                )
-                local_fds.append(fd.value)
-            outcome = chunk_sizes
+                if use_fabric:
+                    fabric = _HipMemFabricHandle()
+                    _check(
+                        lib.hipMemExportToShareableHandle(
+                            ctypes.byref(fabric), handle, self.handle_type, 0
+                        ),
+                        "hipMemExportToShareableHandle(FABRIC)",
+                    )
+                    local_fabric.append(bytes(fabric.data))
+                else:
+                    fd = ctypes.c_int(-1)
+                    _check(
+                        lib.hipMemExportToShareableHandle(
+                            ctypes.byref(fd), handle, self.handle_type, 0
+                        ),
+                        "hipMemExportToShareableHandle(POSIX_FD)",
+                    )
+                    local_fds.append(fd.value)
+            outcome = (self.handle_type, chunk_sizes, local_fabric)
         except RuntimeError as e:
             outcome = str(e)
         outcomes: List[object] = [None] * self.world_size
         dist.all_gather_object(outcomes, outcome, group=group)
         errors = {r: o for r, o in enumerate(outcomes) if isinstance(o, str)}
-        totals = {sum(o) for o in outcomes if not isinstance(o, str)}
-        if errors or len(totals) != 1:
+        ok = [o for o in outcomes if not isinstance(o, str)]
+        if errors or len({sum(o[1]) for o in ok}) != 1 or len({o[0] for o in ok}) != 1:
             for fd in local_fds:
                 os.close(fd)
             self.close()
             raise RuntimeError(
-                f"VMM allocation of {self.size} bytes failed: {errors or outcomes}"
+                f"VMM allocation of {self.size} bytes failed: "
+                f"{errors or [o[:2] for o in ok]}"
             )
+        peer_sizes = [o[1] for o in outcomes]
 
-        try:
-            peer_fds = exchange_posix_fds(
-                group,
-                self.rank,
-                self.world_size,
-                local_fds,
-                [len(o) for o in outcomes],
-            )
-        finally:
-            for fd in local_fds:
-                os.close(fd)
+        peer_fds = {}
+        if not use_fabric:
+            try:
+                peer_fds = exchange_posix_fds(
+                    group,
+                    self.rank,
+                    self.world_size,
+                    local_fds,
+                    [len(s) for s in peer_sizes],
+                )
+            finally:
+                for fd in local_fds:
+                    os.close(fd)
 
         ptrs: List[int] = []
+        map_error: Optional[str] = None
         try:
             for peer in range(self.world_size):
                 if peer == self.rank:
                     ptrs.append(self._map(local, chunk_sizes))
                     continue
                 handles = []
-                for idx in range(len(outcomes[peer])):
+                for idx in range(len(peer_sizes[peer])):
                     handle = ctypes.c_void_p()
-                    peer_fd = peer_fds.pop((peer, idx))
-                    try:
+                    if use_fabric:
+                        fabric = _HipMemFabricHandle.from_buffer_copy(
+                            outcomes[peer][2][idx]
+                        )
                         _check(
                             lib.hipMemImportFromShareableHandle(
                                 ctypes.byref(handle),
-                                ctypes.c_void_p(peer_fd),
-                                _HIP_MEM_HANDLE_TYPE_POSIX_FD,
+                                ctypes.cast(ctypes.byref(fabric), ctypes.c_void_p),
+                                self.handle_type,
                             ),
-                            f"hipMemImportFromShareableHandle(rank={peer})",
+                            f"hipMemImportFromShareableHandle(FABRIC, rank={peer})",
                         )
-                    finally:
-                        os.close(peer_fd)
+                    else:
+                        peer_fd = peer_fds.pop((peer, idx))
+                        try:
+                            _check(
+                                lib.hipMemImportFromShareableHandle(
+                                    ctypes.byref(handle),
+                                    ctypes.c_void_p(peer_fd),
+                                    self.handle_type,
+                                ),
+                                f"hipMemImportFromShareableHandle(rank={peer})",
+                            )
+                        finally:
+                            os.close(peer_fd)
                     self._handles.append(handle)
                     handles.append(handle)
-                ptrs.append(self._map(handles, outcomes[peer]))
-        except BaseException:
+                ptrs.append(self._map(handles, peer_sizes[peer]))
+        except BaseException as e:
             for leftover in peer_fds.values():
                 os.close(leftover)
-            self.close()
-            raise
+            if not (require_fabric and isinstance(e, RuntimeError)):
+                self.close()
+                raise
+            map_error = str(e)
+        if require_fabric:
+            # An import can fail on some ranks only (a peer outside this rank's
+            # fabric clique); agree so no rank waits on a torn-down peer.
+            map_errors: List[Optional[str]] = [None] * self.world_size
+            dist.all_gather_object(map_errors, map_error, group=group)
+            if any(error is not None for error in map_errors):
+                self.close(group=group)
+                failed = {r: e for r, e in enumerate(map_errors) if e is not None}
+                raise RuntimeError(f"VMM peer mapping failed: {failed}")
 
         self.buffers: List[torch.Tensor] = []
         for ptr in ptrs:
@@ -318,6 +429,13 @@ class HipSymmetricBuffer:
                     f"expected {self.device} @ {ptr:#x}"
                 )
             self.buffers.append(view[:nbytes])
+        if self.rank == 0:
+            logger.info(
+                "HIP VMM symmetric buffer: %d bytes x %d ranks, %s handles",
+                self.size,
+                self.world_size,
+                "FABRIC" if use_fabric else "POSIX_FD",
+            )
 
     def _create(
         self, prop: _HipMemAllocationProp, gran: int
@@ -346,6 +464,7 @@ class HipSymmetricBuffer:
                 sizes.append(n)
             if err == 0:
                 self._handles.extend(handles)
+                self._num_local_handles = len(handles)
                 if len(handles) > 1:
                     logger.info(
                         "VMM buffer of %d bytes split into %d chunks of <= %d bytes",
@@ -387,7 +506,13 @@ class HipSymmetricBuffer:
             offset += n
         return va.value
 
-    def close(self) -> None:
+    def close(self, group: Optional[ProcessGroup] = None) -> None:
+        """Unmap every view and release every handle.
+
+        With ``group``, every rank releases its imports before any rank releases
+        its own allocation, so no exporter revokes a FABRIC handle a peer still
+        maps. If a peer never arrives, the own allocation is left to process exit.
+        """
         if self._closed:
             return
         self._closed = True
@@ -400,7 +525,14 @@ class HipSymmetricBuffer:
             err = lib.hipMemAddressFree(va, self.size)
             if err != 0:
                 logger.warning("hipMemAddressFree(%#x) -> %d", va, err)
-        for handle in self._handles:
+        local = self._handles[: self._num_local_handles]
+        for handle in self._handles[self._num_local_handles :]:
+            err = lib.hipMemRelease(handle)
+            if err != 0:
+                logger.warning("hipMemRelease -> %d", err)
+        if group is not None and not teardown_barrier(group):
+            return
+        for handle in local:
             err = lib.hipMemRelease(handle)
             if err != 0:
                 logger.warning("hipMemRelease -> %d", err)
