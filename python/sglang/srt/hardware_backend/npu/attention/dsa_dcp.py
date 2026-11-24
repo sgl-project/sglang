@@ -26,7 +26,7 @@ def forward_dcp_sparse_attention(
     forward_batch: ForwardBatch,
     speculative_num_draft_tokens: int | None,
     scaling: float,
-    quantized_attention: Callable | None = None,
+    fp8_attention: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one rank's sparse partial attention and natural-log LSE."""
 
@@ -71,7 +71,7 @@ def forward_dcp_sparse_attention(
         actual_seq_lengths_kv=local_lens,
         block_table=block_tables,
     )
-    if quantized_attention is None:
+    if fp8_attention is None:
         attn_out, softmax_max, softmax_sum = sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -89,10 +89,10 @@ def forward_dcp_sparse_attention(
             **kwargs,
         )
     else:
-        attn_out, softmax_max, softmax_sum = quantized_attention(
+        attn_out, softmax_max, softmax_sum = fp8_attention(
             query=q_nope,
             query_rope=q_rope,
-            packed_kv=k_nope if k_nope.dtype == torch.int8 else k_nope.view(torch.uint8),
+            packed_kv=k_nope.view(torch.uint8),
             **kwargs,
         )
     lse = softmax_max.float() + torch.log(softmax_sum.float())

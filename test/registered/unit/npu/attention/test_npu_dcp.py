@@ -339,7 +339,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                 scaling=1.0,
             )
 
-    def test_packed_kv_uses_native_kernel_for_prefill_decode_and_verify(self):
+    def test_packed_fp8_uses_native_kernel_for_prefill_decode_and_verify(self):
         q = torch.ones(2, 2, 512, dtype=torch.bfloat16)
         rope = torch.zeros(2, 2, 64, dtype=torch.bfloat16)
         packed = torch.zeros(3, 128, 1, 656, dtype=torch.float8_e4m3fn)
@@ -354,15 +354,8 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                 torch.tensor([[[2.0, 2.0], [0.0, 0.0]]]),
             )
         )
-        cases = (
-            ("prefill", packed),
-            ("decode", packed),
-            ("verify", packed),
-            ("decode", torch.zeros(3, 128, 1, 528, dtype=torch.int8)),
-        )
-        for mode, packed in cases:
-            with self.subTest(mode=mode, dtype=packed.dtype):
-                query_rope = rope if packed.shape[-1] == 656 else rope[..., :0]
+        for mode in ("prefill", "decode", "verify"):
+            with self.subTest(mode=mode):
                 mock_op.reset_mock()
                 metadata = SimpleNamespace(
                     dcp_block_tables=torch.tensor([[1], [2]], dtype=torch.int32),
@@ -382,7 +375,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                     metadata.dcp_seq_lens = torch.tensor([128], dtype=torch.int32)
                 out, lse = forward_dcp_sparse_attention(
                     q_nope=q,
-                    q_rope=query_rope,
+                    q_rope=rope,
                     k_nope=packed,
                     k_rope=packed[..., :0],
                     topk_indices=topk,
@@ -391,17 +384,14 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                     forward_batch=SimpleNamespace(forward_mode=_Mode(verify)),
                     speculative_num_draft_tokens=2 if verify else None,
                     scaling=0.25,
-                    quantized_attention=mock_op,
+                    fp8_attention=mock_op,
                 )
                 mock_op.assert_called_once()
                 call = mock_op.call_args.kwargs
                 self.assertIs(call["query"], q)
-                self.assertIs(call["query_rope"], query_rope)
+                self.assertIs(call["query_rope"], rope)
                 self.assertEqual(call["packed_kv"].data_ptr(), packed.data_ptr())
-                expected_dtype = (
-                    torch.int8 if packed.dtype == torch.int8 else torch.uint8
-                )
-                self.assertEqual(call["packed_kv"].dtype, expected_dtype)
+                self.assertEqual(call["packed_kv"].dtype, torch.uint8)
                 self.assertEqual(call["packed_kv"].shape, packed.shape)
                 self.assertIs(call["sparse_indices"], topk)
                 self.assertEqual(call["scale_value"], 0.25)

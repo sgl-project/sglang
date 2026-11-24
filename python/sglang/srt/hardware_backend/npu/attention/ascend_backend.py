@@ -428,23 +428,17 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.dcp_quantized_sparse_attention = None
-        if self.dsa_dcp_target and self.kv_cache_dtype in (
-            torch.float8_e4m3fn,
-            torch.int8,
-        ):
-            if not (
-                self.token_to_kv_pool.dsa_kv_cache_store_fp8
-                or getattr(self.token_to_kv_pool, "dsa_kv_cache_store_int8", False)
-            ):
+        self.dcp_fp8_sparse_attention = None
+        if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 raise ValueError(
-                    "Ascend DSA DCP with quantized KV requires a packed KV pool."
+                    "Ascend DSA DCP with FP8 KV requires the A5 packed KV pool."
                 )
             from sgl_kernel_npu.operators.attention import (
                 kv_quant_sparse_flash_attention,
             )
 
-            self.dcp_quantized_sparse_attention = kv_quant_sparse_flash_attention
+            self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -1968,10 +1962,8 @@ class AscendAttnBackend(AttentionBackend):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        if self.token_to_kv_pool.dsa_kv_cache_store_fp8 or getattr(
-            self.token_to_kv_pool, "dsa_kv_cache_store_int8", False
-        ):
-            return self._forward_quantized_sparse(
+        if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+            return self._forward_fp8_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -2004,7 +1996,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out
 
-    def _forward_quantized_sparse(
+    def _forward_fp8_sparse(
         self,
         q_nope,
         q_pe,
@@ -2014,19 +2006,18 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        int8_kv = packed_kv.dtype == torch.int8
-        if int8_kv or (self.qk_rope_head_dim == 0 and is_npu_arch35()):
+        if self.qk_rope_head_dim == 0 and is_npu_arch35():
             from sgl_kernel_npu.operators.attention import (
                 kv_quant_sparse_flash_attention,
             )
 
-            # RoPE0 uses compact KV528. The kernel supplies the missing
-            # lanes without widening the physical KV cache.
+            # RoPE0 uses Q512 and packed KV528. The operator fills the
+            # missing RoPE lanes without widening the physical KV cache.
             # DSA supplies indices that already encode causal visibility.
             output, _, _ = kv_quant_sparse_flash_attention(
                 query=q_nope,
-                query_rope=q_nope[..., :0] if self.qk_rope_head_dim == 0 else q_pe,
-                packed_kv=packed_kv if int8_kv else packed_kv.view(torch.uint8),
+                query_rope=q_nope[..., :0],
+                packed_kv=packed_kv.view(torch.uint8),
                 sparse_indices=topk_indices,
                 block_table=self.forward_metadata.block_tables,
                 actual_seq_lengths_query=actual_seq_qlen.to(
@@ -2182,10 +2173,8 @@ class AscendAttnBackend(AttentionBackend):
         # The BF16 MLA interface needs an explicit zero RoPE tensor.
         packed_rope0 = (
             self.qk_rope_head_dim == 0
-            and (
-                self.kv_cache_dtype == torch.int8
-                or (is_npu_arch35() and self.token_to_kv_pool.dsa_kv_cache_store_fp8)
-            )
+            and is_npu_arch35()
+            and self.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         if packed_rope0:
             q_pe = q_nope[..., :0]
@@ -2299,10 +2288,10 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
-                    quantized_attention=self.dcp_quantized_sparse_attention,
+                    fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype in (torch.float8_e4m3fn, torch.int8):
-                attn_out = self._forward_quantized_sparse(
+            if self.kv_cache_dtype == torch.float8_e4m3fn:
+                attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,
                     k_nope,
