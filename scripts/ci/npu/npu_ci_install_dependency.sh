@@ -80,9 +80,12 @@ case "${DEVICE_TYPE}" in
         exit 1
         ;;
 esac
-${PIP_INSTALL} memfabric-hybrid==1.5.0.dev20261123 \
+
+${PIP_INSTALL} "memfabric-hybrid==1.5.0.dev20261123" \
     --trusted-host ascend.devcloud.huaweicloud.com \
-    -i https://ascend.devcloud.huaweicloud.com/artifactory/ascend-pypi/nightly/memfabric-hybrid
+    --index-url https://ascend.devcloud.huaweicloud.com/pypi/simple
+
+command -v mfcli
 mfcli kernel install --soc-version "${MF_SOC_VERSION}"
 
 ${PIP_INSTALL} "https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_${DEVICE_ARCH}.whl" \
