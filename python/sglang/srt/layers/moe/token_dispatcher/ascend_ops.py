@@ -178,6 +178,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
         self._pad_buffers: dict[tuple, tuple] = {}
+        # Resolved once per layer: the symmetric EP buffer identity is the
+        # process group and the model geometry is fixed at load time.
+        self._mega_moe_symm_buffer: Any = None
         if self.moe_ascend_ops_config.uses_fused_op:
             self._init_fused_op(moe_runner_config)
         if self.moe_ascend_ops_config.prefill == "allgather":

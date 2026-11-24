@@ -37,32 +37,33 @@ def _mega_moe_ops():
     return mega_moe, get_symm_buffer_for_mega_moe
 
 
-def _get_symm_buffer(x, config, state, quant_mode, quant_dtype):
+def _get_symm_buffer(layer, x, config, state, quant_mode, quant_dtype):
+    """Return the process group's symmetric EP buffer, creating it once.
+
+    The provider registers peermem once per process group, so a group owns
+    exactly one buffer: the dispatcher unifies the prefill/decode capacity and
+    the expert and quantization geometry is fixed at model load. The group is
+    therefore the buffer identity. The resolved buffer is memoized on the
+    layer's dispatcher so the forward path does not rebuild it per layer.
+    """
+    dispatcher = getattr(layer, "dispatcher", None)
+    buffer = getattr(dispatcher, "_mega_moe_symm_buffer", None)
+    if buffer is not None:
+        return buffer
+
     _, get_symm_buffer_for_mega_moe = _mega_moe_ops()
 
     buffers = get_buffer(_BUFFER_NAME, dict)
     topk = state.topk_ids.shape[1]
-    # One buffer per process group: the provider registers peermem once per
-    # group, so a second buffer (e.g. a separate prefill/decode capacity) makes
-    # the MegaMoE tiling fail with "Failed to get peermem base".
     capacity = state.buffer_capacity
-    key = (
-        state.group,
-        x.device,
-        config.num_experts,
-        topk,
-        config.hidden_size,
-        config.intermediate_size_per_partition,
-        quant_mode,
-        quant_dtype,
-    )
-    if key not in buffers:
+    buffer = buffers.get(state.group)
+    if buffer is None:
         # The CANN provider looks up an initialized HCCL communicator.
         backend = state.group._get_backend(x.device)
         rank = torch.distributed.get_rank(state.group)
         if not backend.get_hccl_comm_name(rank, init_comm=True):
             raise RuntimeError("Failed to initialize the MegaMoE EP communicator")
-        buffers[key] = get_symm_buffer_for_mega_moe(
+        buffer = get_symm_buffer_for_mega_moe(
             state.group,
             num_experts=config.num_experts,
             num_max_tokens_per_rank=capacity,
@@ -73,7 +74,10 @@ def _get_symm_buffer(x, config, state, quant_mode, quant_dtype):
             dispatch_quant_mode=quant_mode,
             dispatch_quant_out_dtype=quant_dtype,
         )
-    return buffers[key]
+        buffers[state.group] = buffer
+    if dispatcher is not None:
+        dispatcher._mega_moe_symm_buffer = buffer
+    return buffer
 
 
 def destroy_mega_moe_buffers() -> None:
@@ -296,7 +300,7 @@ def run_mega_moe(
         topk_weights=weights,
         l1_weights=w13,
         l2_weights=w2,
-        sym_buffer=_get_symm_buffer(x, config, state, quant_mode, quant_dtype),
+        sym_buffer=_get_symm_buffer(layer, x, config, state, quant_mode, quant_dtype),
         l1_weights_sf=s13,
         l2_weights_sf=s2,
         l1_bias=b13,
