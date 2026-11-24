@@ -149,6 +149,22 @@ def compute_graph_capture_bases(graph_inputs: List[tuple]):
     return bases_info, input_chunk_indices, input_offsets
 
 
+def adjacent_runs(bases: List[tuple]) -> List[List[int]]:
+    """Group ``(base_ptr, alloc_size)`` allocations into runs adjacent in VA.
+
+    Returns lists of indices into ``bases``, each in address order.
+    """
+    runs: List[List[int]] = []
+    end = None
+    for idx in sorted(range(len(bases)), key=lambda i: int(bases[i][0])):
+        base, size = int(bases[idx][0]), int(bases[idx][1])
+        if base != end:
+            runs.append([])
+        runs[-1].append(idx)
+        end = base + size
+    return runs
+
+
 def make_rw_access_desc(device_id: int):
     """A read-write, device-local ``CUmemAccessDesc`` for ``device_id``."""
     drv = _get_cuda_driver()
@@ -1175,11 +1191,13 @@ class VmmGraphInputManager:
                     [len(peer_bases) for peer_bases in all_base_payload],
                 )
 
-            # Import + map peer allocations. Individual base mappings are kept for
-            # single-chunk inputs; span mappings reserve a contiguous VA range and
-            # map each chunk at its original relative offset.
+            # Import + map peer allocations. A captured tensor can cross
+            # expandable-segment allocation boundaries, so a peer's allocations
+            # are mapped in runs that keep its layout: one reserved range per
+            # run of adjacent allocations, each at its original relative
+            # offset. An input's chunks are adjacent, so they share a run and
+            # the input needs no mapping of its own.
             peer_base_va = {}  # (rank, base_idx) -> local VA
-            peer_span_va = {}  # (rank, chunk_indices...) -> (local VA, peer base)
             new_mappings = []
 
             try:
@@ -1190,18 +1208,38 @@ class VmmGraphInputManager:
                         continue
 
                     peer_bases = all_base_payload[peer_rank]
-                    for idx, (_, fb, alloc_size) in enumerate(peer_bases):
-                        fd = None if use_fabric else posix_peer_fds[(peer_rank, idx)]
-                        va = import_and_map_alloc(
-                            fb,
-                            fd,
-                            alloc_size,
-                            device_id,
-                            use_fabric=use_fabric,
-                            peer_rank=peer_rank,
+                    for run in adjacent_runs(
+                        [(base_ptr, size) for base_ptr, _, size in peer_bases]
+                    ):
+                        first_base = int(peer_bases[run[0]][0])
+                        last_base, _, last_size = peer_bases[run[-1]]
+                        run_size = int(last_base) + int(last_size) - first_base
+                        run_va = int(
+                            check_drv(
+                                drv.cuMemAddressReserve(run_size, 0, 0, 0),
+                                "cuMemAddressReserve(run)",
+                            )
                         )
-                        peer_base_va[(peer_rank, idx)] = va
-                        new_mappings.append((va, alloc_size, [(0, alloc_size)]))
+                        mapped_chunks = []
+                        new_mappings.append((run_va, run_size, mapped_chunks))
+                        for idx in run:
+                            base_ptr, fb, alloc_size = peer_bases[idx]
+                            rel = int(base_ptr) - first_base
+                            fd = (
+                                None if use_fabric else posix_peer_fds[(peer_rank, idx)]
+                            )
+                            map_chunk_into_span(
+                                fb,
+                                fd,
+                                run_va,
+                                rel,
+                                int(alloc_size),
+                                device_id,
+                                use_fabric=use_fabric,
+                                peer_rank=peer_rank,
+                            )
+                            mapped_chunks.append((rel, int(alloc_size)))
+                            peer_base_va[(peer_rank, idx)] = run_va + rel
 
                 # Build per-input peer VA lists and register.
                 peer_ptrs = []
@@ -1209,53 +1247,17 @@ class VmmGraphInputManager:
                     ptrs_j = []
                     for rank in range(self.world_size):
                         chunks = all_input_chunks[rank][j]
-                        off = all_input_offsets[rank][j]
-                        if len(chunks) == 1:
-                            ptrs_j.append(peer_base_va[(rank, chunks[0])] + off)
-                            continue
-
-                        span_key = (rank, *chunks)
-                        if span_key not in peer_span_va:
-                            peer_bases = all_base_payload[rank]
-                            first_base = peer_bases[chunks[0]][0]
-                            last_base, _, last_size = peer_bases[chunks[-1]]
-                            span_size = (
-                                int(last_base) + int(last_size) - int(first_base)
-                            )
-                            if rank == self.rank:
-                                span_va = int(first_base)
-                            else:
-                                span_va = check_drv(
-                                    drv.cuMemAddressReserve(span_size, 0, 0, 0),
-                                    "cuMemAddressReserve(span)",
+                        peer_bases = all_base_payload[rank]
+                        first_va = peer_base_va[(rank, chunks[0])]
+                        first_base = int(peer_bases[chunks[0]][0])
+                        for idx in chunks[1:]:
+                            rel = int(peer_bases[idx][0]) - first_base
+                            if peer_base_va[(rank, idx)] - first_va != rel:
+                                raise RuntimeError(
+                                    f"graph input {j} of rank {rank} crosses "
+                                    "allocations that are not adjacent"
                                 )
-                                mapped_chunks = []
-                                for chunk_idx in chunks:
-                                    base_ptr, fb, alloc_size = peer_bases[chunk_idx]
-                                    rel = int(base_ptr) - int(first_base)
-                                    fd = (
-                                        None
-                                        if use_fabric
-                                        else posix_peer_fds[(rank, chunk_idx)]
-                                    )
-                                    map_chunk_into_span(
-                                        fb,
-                                        fd,
-                                        span_va,
-                                        rel,
-                                        int(alloc_size),
-                                        device_id,
-                                        use_fabric=use_fabric,
-                                        peer_rank=rank,
-                                    )
-                                    mapped_chunks.append((rel, int(alloc_size)))
-                                new_mappings.append(
-                                    (int(span_va), span_size, mapped_chunks)
-                                )
-                            peer_span_va[span_key] = (int(span_va), int(first_base))
-
-                        span_va, _ = peer_span_va[span_key]
-                        ptrs_j.append(span_va + off)
+                        ptrs_j.append(first_va + all_input_offsets[rank][j])
                     peer_ptrs.append(ptrs_j)
 
                 self.obj.register_peer_mapped_inputs(peer_ptrs)
