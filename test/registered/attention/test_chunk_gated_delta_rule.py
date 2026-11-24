@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.fla import chunk_o
 from sglang.kernels.ops.attention.fla.chunk import (
     CHUNK_SIZE,
     chunk_gated_delta_rule,
@@ -78,10 +80,12 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         )
         return o, pool
 
+    @patch.object(chunk_o, "is_batch_invariant_mode_enabled", lambda: True)
     def test_short_sequence_output_independent_of_batchmates(self):
-        """A short sequence must give bitwise the same output alone and packed with
-        other sequences: the output kernel's tile must not shrink with the batch's
-        total length (it did, which made deterministic inference batch-variant)."""
+        """In batch-invariant mode a short sequence must give bitwise the same output
+        alone and packed with other sequences: the output kernel's tile must not shrink
+        with the batch's total length (it did, which made deterministic inference
+        batch-variant)."""
         device = get_device()
         Hk, Hv, K, V = 16, 48, 128, 128
         for L in range(10, 17):
