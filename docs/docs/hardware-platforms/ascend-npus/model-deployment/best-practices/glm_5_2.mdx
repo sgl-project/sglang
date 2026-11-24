@@ -120,7 +120,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --speculative-draft-model-quantization unquant \
         --enable-prefill-cp \
@@ -160,8 +160,7 @@ do
         --port 8001 \
         --trust-remote-code \
         --tp-size 16 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --ep-size 16 \
         --mem-fraction-static 0.895 \
         --max-running-requests 128 \

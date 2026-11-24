@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import builtins
 import importlib
 import logging
 import os
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "is_hip",
     "FP8_E4M3_MAX",
-    "FP8_E4M3_MIN",
     "is_cuda",
     "is_cuda_alike",
     "is_hpu",
@@ -88,6 +86,7 @@ __all__ = [
     "device_stream_context",
     "is_device_stream_capturing",
     "create_device_event",
+    "current_device_stream",
     "get_amdgpu_memory_capacity",
     "get_device_sm",
     "get_nvgpu_memory_capacity",
@@ -144,15 +143,6 @@ if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-FP8_E4M3_MIN = -FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 @lru_cache(maxsize=1)
@@ -722,6 +712,13 @@ def create_device_event(device):
     return torch.get_device_module(device).Event()
 
 
+def current_device_stream(device):
+    """The calling thread's current stream on ``device``."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).current_stream(device)
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
@@ -1280,11 +1277,14 @@ def get_compiler_backend(mode=None) -> str:
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
             )
+        if mode == "npugraph_ex":
+            from sglang.srt.hardware_backend.npu.compile_backend import (
+                get_npugraph_ex_backend,
+            )
+
+            return get_npugraph_ex_backend()
         compiler_config = CompilerConfig()
         compiler_config.mode = "max-autotune"
-        if mode == "npugraph_ex":
-            compiler_config.mode = "reduce-overhead"
-            compiler_config.debug.run_eagerly = True
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 

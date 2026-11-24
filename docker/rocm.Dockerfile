@@ -73,7 +73,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -83,6 +83,9 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+# Held at the pre-581579ab5 pin: the FlyDSL MoE/MegaMoE AOT replay added
+# between these commits reaches the HIP runtime on this torch 2.9 base and
+# fails in `docker build`, which has no GPU. Bump once that is fixed upstream.
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
@@ -94,7 +97,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -118,7 +121,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -128,6 +131,9 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+# Held at the pre-581579ab5 pin: the FlyDSL MoE/MegaMoE AOT replay added
+# between these commits reaches the HIP runtime on this torch 2.9 base and
+# fails in `docker build`, which has no GPU. Bump once that is fixed upstream.
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
@@ -139,7 +145,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -316,7 +322,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -337,7 +343,7 @@ ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -355,9 +361,11 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 # gfx1250 is promoted to its own AITER pin here, ahead of the gfx942/gfx950
-# shared pin. Validated by the manual gfx1250 AITER Scout #173 A/B (no automated
-# gfx1250 Scout): gpt-oss, Flux.2, Wan2.2 and Kimi-K2 all NO_NEW_REGRESSION.
-ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
+# shared pin. Validated by a manual gfx1250 AITER Scout A/B (no automated gfx1250
+# Scout) against the previous pin 07ff5f318: gpt-oss-120B TP1, Kimi-K2 TP8,
+# Flux.2 and Wan2.2 all NO_NEW_REGRESSION. This pin additionally carries the
+# a16w16 FlyDSL kernel update (aiter ROCm/aiter#7851) that Flux.2 depends on.
+ENV AITER_COMMIT_DEFAULT="58b435276ffe1400fe86f108b577b6f26107f3b1"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
@@ -380,7 +388,7 @@ ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
+ENV AITER_COMMIT_DEFAULT="58b435276ffe1400fe86f108b577b6f26107f3b1"
 ENV BUILD_RCCL="1"
 # rocm-systems develop. The fix for the hang in the first all-reduce on gfx1250
 # (ROCm/rocm-systems#14254) has landed on the mainline, so pin develop instead

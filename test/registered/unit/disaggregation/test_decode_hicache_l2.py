@@ -263,11 +263,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
                     return_logprob=False,
                     model_config=SimpleNamespace(vocab_size=512),
                 )
-                with patch(
-                    "sglang.srt.disaggregation.decode_schedule_batch_mixin."
-                    "SamplingBatchInfo.from_schedule_batch"
-                ):
-                    ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+                ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
                 self.cache.unlock(req.lock)
                 self.cache.evict(EvictParams(num_tokens=128))
                 self.assertEqual(req.cached_tokens, sum(expected))
