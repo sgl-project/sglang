@@ -465,9 +465,8 @@ class TestHierarchyBlockResultProcessing(unittest.TestCase):
         """A causal forward replayed from a graph captured bidirectionally
         would write the wrong KV without any error."""
         forward_batch = SimpleNamespace(replace_embeds=None, dllm_eager=True)
-        self.assertFalse(
-            DecodeCudaGraphRunner.can_run_graph(SimpleNamespace(), forward_batch)
-        )
+        runner = SimpleNamespace(model_runner=SimpleNamespace(model=torch.nn.Module()))
+        self.assertFalse(DecodeCudaGraphRunner.can_run_graph(runner, forward_batch))
 
     def test_worker_passes_inherited_tokens_into_sync_runs(self):
         def worker(inherits):

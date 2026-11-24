@@ -18,17 +18,7 @@ from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
-from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
-    ListLorasReq,
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    ShutdownReq,
-    UnmergeLoraWeightsReq,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    format_lora_message,
-    save_outputs,
-)
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )
@@ -47,16 +37,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-
-# re-export LoRA protocol types for backward compatibility
-__all__ = [
-    "SetLoraReq",
-    "MergeLoraWeightsReq",
-    "UnmergeLoraWeightsReq",
-    "ListLorasReq",
-    "ShutdownReq",
-    "format_lora_message",
-]
 
 logger = init_logger(__name__)
 
@@ -200,6 +180,32 @@ def request_model_kwargs(
         value = request_extra_value(request, field_name)
         if value is not None:
             kwargs[field_name] = value
+    return kwargs
+
+
+def parse_form_extra_value(value: Any) -> Any:
+    """Decode a multipart form value as JSON, keeping text that is not JSON."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def form_model_kwargs(
+    form: Any,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Multipart counterpart of ``request_model_kwargs``: the active model's
+    declared constructor fields sent as form fields."""
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, api):
+        if field_name in form:
+            value = parse_form_extra_value(form[field_name])
+            if value is not None:
+                kwargs[field_name] = value
     return kwargs
 
 

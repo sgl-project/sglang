@@ -4,12 +4,22 @@
 //! beside the msgpack scalar header, and crosses the pyo3 boundary the same
 //! way: an inline buffer hands its very allocation to numpy (no copy); a shm
 //! buffer hands over only its segment name, for the receiver to map after the
-//! TP broadcast.
+//! TP broadcast; an external buffer hands over the handle its processor built.
 //!
 //! The storage choice is the producer's, from a switch Python sets at start
-//! (`MmSpec::feature_shm`); the transport itself has no policy.
+//! (`MmSpec::feature_shm`) or the processor's own publication
+//! (`MmProcessor::publish_features`); the transport itself has no policy.
 
 use crate::utils::shm::ShmSegment;
+
+/// A payload a processor published in its own transport, e.g. a feature copied
+/// into a device memory pool the scheduler reads. Only the object `into_py`
+/// builds crosses to Python, and it settles like a `ShmBuffer`: `release()`
+/// once Python admitted the request, `discard()` when it rejected it. Dropped
+/// with neither, or before it reaches Python, it frees what it holds.
+pub trait ExternalBuffer: Send + std::fmt::Debug {
+    fn into_py(self: Box<Self>, py: pyo3::Python<'_>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>>;
+}
 
 /// Element type, named as the numpy dtype Python views the bytes with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +152,8 @@ pub enum BufferStore {
     /// check, a full ring) or dropped at shutdown -- the segment is unlinked
     /// with it.
     Shm { segment: ShmSegment, dtype: DType },
+    /// Placed by the processor (see [`ExternalBuffer`]).
+    External(Box<dyn ExternalBuffer>),
 }
 
 /// One named payload of a scheduler request.
@@ -213,11 +225,13 @@ impl Buffer {
         })
     }
 
+    /// `None` for an external buffer, whose processor names its own type.
     #[cfg(test)]
-    pub fn dtype(&self) -> DType {
+    pub fn dtype(&self) -> Option<DType> {
         match &self.store {
-            BufferStore::Inline(data) => data.dtype(),
-            BufferStore::Shm { dtype, .. } => *dtype,
+            BufferStore::Inline(data) => Some(data.dtype()),
+            BufferStore::Shm { dtype, .. } => Some(*dtype),
+            BufferStore::External(_) => None,
         }
     }
 }
@@ -239,12 +253,15 @@ mod tests {
     fn inline_and_shm_stores_agree_on_shape_and_bytes() {
         let data = BufferData::from(vec![1.5f32, -2.0, 3.25, 4.0]);
         let inline = Buffer::inline_shaped("x", vec![2, 2], vec![1.5f32, -2.0, 3.25, 4.0]).unwrap();
-        assert_eq!((inline.dtype(), &inline.shape), (DType::F32, &vec![2, 2]));
+        assert_eq!(
+            (inline.dtype(), &inline.shape),
+            (Some(DType::F32), &vec![2, 2])
+        );
         assert_eq!(Buffer::inline("y", vec![1u8, 2, 3]).shape, [3]);
 
         let segment = unique_name("test");
         let shm = Buffer::shm("x", segment.clone(), vec![2, 2], &data).unwrap();
-        assert_eq!((shm.dtype(), &shm.shape), (DType::F32, &vec![2, 2]));
+        assert_eq!((shm.dtype(), &shm.shape), (Some(DType::F32), &vec![2, 2]));
         assert_eq!(std::fs::read(shm_path(&segment)).unwrap(), data.as_bytes());
         drop(shm);
         assert!(!shm_path(&segment).exists(), "dropping the buffer unlinks");
