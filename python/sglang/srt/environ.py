@@ -2467,6 +2467,10 @@ class Envs:
     # FP8-weight small-M GEMMs (activations quantized in-kernel per row and K group) for the attention QKV / O
     # projections and the MoE unpooler at decode / verify widths; =0 keeps BF16 weights.
     SGLANG_ROCM_MUSE_DENSE_FP8 = EnvBool(True)
+    # Verify batches above 128 rows (17 requests and more): the attention QKV projection stays on that FP8 weight
+    # up to this many rows where its small-M GEMM has a tuned launch for the shape (TP4: 512). The default keeps
+    # them on the BF16 weight.
+    SGLANG_ROCM_MUSE_DENSE_FP8_MAX_ROWS = EnvInt(128)
     # Prefill widths (plain extend, > 128 rows): the attention QKV / O projections and the MoE pooler / unpooler on
     # those FP8 weight copies through aiter's CK a8w8 GEMM, activations quantized per row by the boundary kernels or
     # one Triton pass; the Ulysses gathered projections are then kept in FP8 only. Needs SGLANG_ROCM_MUSE_DENSE_FP8;

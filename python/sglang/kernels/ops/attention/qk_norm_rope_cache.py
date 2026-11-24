@@ -5,6 +5,8 @@
   (optionally through the full -> SWA slot mapping).
 * ``qkv_proj_qk_norm_rope_cache``: the same epilogue fed straight from the BF16 split-K partials of the fused
   QKV + output-gate projection (``bf16_splitk_gemm``), which also emits V and the gate.
+* ``qkv_fp8_qk_norm_rope_cache``: that epilogue on the split-K partials of the FP8 small-M projection
+  (``fp8w_small_m_gemm``), applying the row and channel scales as the projection's own scaled-sum launch does.
 
 The BF16 round trips of the unfused sequence (norm output, query scaling, RoPE products, projection store)
 are explicit, so the results match the separate norm / RoPE / cache-write kernels.
@@ -15,6 +17,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
+from sglang.kernels.ops.gemm.fp8w_small_m_gemm import fp8_gemm_partials
 
 # (max rows, (BN, BK, SK, warps, stages)) of the QKV + gate projection, tuned at N 2304 (TP8) on gfx1250. BK and SK
 # match the default launch, so the partials are bit-identical to it.
@@ -114,17 +117,32 @@ def _muse_qk_rope_cache(
 
 @triton.jit
 def _project_slice(
-    P, TOKEN, FIRST, M: tl.constexpr, N: tl.constexpr, SK: tl.constexpr, D: tl.constexpr
+    P,
+    XS,
+    WS,
+    TOKEN,
+    FIRST,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    SK: tl.constexpr,
+    D: tl.constexpr,
 ):
+    # XS / WS (FP32 per row / per output channel, or None): the partials are those of FP8 codes and take both
+    # scales before the BF16 rounding, the arithmetic of fp8w_small_m_gemm._sum_scaled.
     split = tl.arange(0, SK)
     col = FIRST + tl.arange(0, D)
     partial = tl.load(P + split[:, None] * M * N + TOKEN * N + col[None, :])
-    return tl.sum(partial, axis=0).to(tl.bfloat16)
+    value = tl.sum(partial, axis=0)
+    if XS is not None:
+        value = value * tl.load(XS + TOKEN) * tl.load(WS + col)
+    return value.to(tl.bfloat16)
 
 
 @triton.jit
 def _qkv_epilogue(
     P,
+    XS,
+    WS,
     POS,
     COS,
     LOC,
@@ -151,15 +169,15 @@ def _qkv_epilogue(
 ):
     token, head = tl.program_id(0), tl.program_id(1)
     d = tl.arange(0, D)
-    gate = _project_slice(P, token, (HQ + 2 * HK) * D + head * D, M, N, SK, D)
+    gate = _project_slice(P, XS, WS, token, (HQ + 2 * HK) * D + head * D, M, N, SK, D)
     tl.store(GO + token * HQ * D + head * D + d, gate)
-    q = _project_slice(P, token, head * D, M, N, SK, D)
+    q = _project_slice(P, XS, WS, token, head * D, M, N, SK, D)
     q = _norm_rope(q, COS, POS, EPS, SCALE, D, ROPE, True, COS_STRIDE)
     tl.store(QO + token * HQ * D + head * D + d, q)
     if head % (HQ // HK) == 0:
         kh = head // (HQ // HK)
-        k = _project_slice(P, token, HQ * D + kh * D, M, N, SK, D)
-        v = _project_slice(P, token, (HQ + HK) * D + kh * D, M, N, SK, D)
+        k = _project_slice(P, XS, WS, token, HQ * D + kh * D, M, N, SK, D)
+        v = _project_slice(P, XS, WS, token, (HQ + HK) * D + kh * D, M, N, SK, D)
         k = _norm_rope(k, COS, POS, EPS, 1.0, D, ROPE, False, COS_STRIDE)
         tl.store(KO + token * HK * D + kh * D + d, k)
         tl.store(VO + token * HK * D + kh * D + d, v)
@@ -279,12 +297,26 @@ def qkv_proj_qk_norm_rope_cache(
         num_warps=warps,
         num_stages=stages,
     )
-    qo = torch.empty((m, hq * d), device=x.device, dtype=torch.bfloat16)
-    ko = torch.empty((m, hk * d), device=x.device, dtype=torch.bfloat16)
+    return _launch_qkv_epilogue(
+        partials, None, None, positions, cos_sin, cache_k, cache_v, locations, mapping,
+        eps, q_scale, k_scale, v_scale, hq, hk,
+    )  # fmt: skip
+
+
+def _launch_qkv_epilogue(
+    partials, xs, ws, positions, cos_sin, cache_k, cache_v, locations, mapping,
+    eps, q_scale, k_scale, v_scale, hq, hk,
+):  # fmt: skip
+    sk, m, n = partials.shape
+    d = 64
+    qo = torch.empty((m, hq * d), device=partials.device, dtype=torch.bfloat16)
+    ko = torch.empty((m, hk * d), device=partials.device, dtype=torch.bfloat16)
     vo = torch.empty_like(ko)
     go = torch.empty_like(qo)
     _qkv_epilogue[(m, hq)](
         partials,
+        xs,
+        ws,
         positions,
         cos_sin,
         locations,
@@ -299,7 +331,7 @@ def qkv_proj_qk_norm_rope_cache(
         v_scale,
         m,
         n,
-        8,
+        sk,
         hq,
         hk,
         d,
@@ -311,3 +343,37 @@ def qkv_proj_qk_norm_rope_cache(
         num_warps=1,
     )
     return qo, ko, vo, go
+
+
+def qkv_fp8_qk_norm_rope_cache(
+    xq,
+    xs,
+    fp8_weight,
+    positions,
+    cos_sin,
+    cache_k,
+    cache_v,
+    locations,
+    mapping,
+    eps,
+    q_scale,
+    k_scale,
+    v_scale,
+    *,
+    num_heads,
+    num_kv_heads,
+):
+    """``qkv_proj_qk_norm_rope_cache`` on the FP8 small-M QKV + gate projection of the per-row FP8 activation
+    ``xq`` / ``xs`` (``fp8_gemm_applies`` operands); the values are those of ``fp8_gemm`` followed by
+    ``qk_norm_rope_cache``."""
+    m = xq.shape[0]
+    hq, hk = num_heads, num_kv_heads
+    wq, ws = fp8_weight
+    assert wq.shape[0] == (2 * hq + 2 * hk) * 64 and ws.is_contiguous()
+    assert xs.dtype == ws.dtype == torch.float32 and xs.shape == (m,)
+    assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
+    assert cache_k.is_contiguous() and cache_v.is_contiguous()
+    return _launch_qkv_epilogue(
+        fp8_gemm_partials(xq, fp8_weight), xs, ws, positions, cos_sin, cache_k, cache_v, locations,
+        mapping, eps, q_scale, k_scale, v_scale, hq, hk,
+    )  # fmt: skip

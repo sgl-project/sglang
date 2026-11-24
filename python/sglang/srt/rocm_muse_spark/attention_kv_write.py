@@ -7,6 +7,8 @@ attention layer with ``save_kv_cache=False``, the usual SGLang pattern for produ
 * ``qkv_proj_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_FUSED_QKV_CACHE``): up to 32 rows, the QKV + output-gate
   projection's split-K partials feed the QK-norm / RoPE / cache-store epilogue directly.
 * ``qk_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_QK_ROPE_CACHE``): up to 64 rows, from the projected Q/K/V.
+* ``qkv_fp8_norm_rope_kv_write`` (both switches): where the QKV + output-gate projection runs the FP8 small-M
+  GEMM, its split-K partials feed that epilogue, which applies the projection's scales.
 
 Both write exactly where and what the backend's own store would (FP8 with the layer's per-tensor scales, through
 the full -> SWA slot mapping on sliding layers), so they only engage when the backend reads K/V from the
@@ -22,6 +24,7 @@ import torch
 
 from sglang.kernels.ops.attention.qk_norm_rope_cache import (
     qk_norm_rope_cache,
+    qkv_fp8_qk_norm_rope_cache,
     qkv_proj_qk_norm_rope_cache,
 )
 from sglang.srt.environ import envs
@@ -201,4 +204,46 @@ def qk_norm_rope_kv_write(
         attention.scale_query_by,
         target.k_scale,
         target.v_scale,
+    )
+
+
+def qkv_fp8_norm_rope_kv_write(
+    attention,
+    positions: torch.Tensor,
+    x_fp8: tuple[torch.Tensor, torch.Tensor],
+    qkv_fp8: tuple[torch.Tensor, torch.Tensor],
+    forward_batch: ForwardBatch,
+):
+    """(q, k, v, o_gate) of the FP8 small-M QKV + gate projection of ``x_fp8`` (per-row FP8 activation, scales)
+    with K/V already in the cache, or None when the fused store does not apply. ``qkv_fp8`` =
+    ``quantize_weight`` of the projection; the caller has checked ``fp8_gemm_applies``."""
+    xq, xs = x_fp8
+    if not (
+        0 < xq.shape[0] <= QK_ROPE_CACHE_MAX_ROWS
+        and attention.use_o_gate
+        and qkv_fp8[0].shape[0]
+        == (2 * attention.num_heads + 2 * attention.num_kv_heads) * 64
+        and _attention_shape_ok(attention, forward_batch)
+    ):
+        return None
+    target = _kv_write_target(attention, forward_batch)
+    if target is None:
+        return None
+    _note("FP8 QKV projection/QK norm/RoPE/FP8 cache", xq.shape[0])
+    return qkv_fp8_qk_norm_rope_cache(
+        xq,
+        xs,
+        qkv_fp8,
+        positions,
+        target.cos_sin,
+        target.k_cache,
+        target.v_cache,
+        target.locations,
+        target.swa_mapping,
+        attention.norm_eps,
+        attention.scale_query_by,
+        target.k_scale,
+        target.v_scale,
+        num_heads=attention.num_heads,
+        num_kv_heads=attention.num_kv_heads,
     )
