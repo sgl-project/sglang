@@ -1419,9 +1419,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 and config.is_gated
                 and not hasattr(layer, "_flashinfer_trtllm_gemm1_clamp_limit")
             ):
-                # Weight reloads can reuse CUDA graphs that read this tensor.
-                layer._flashinfer_trtllm_gemm1_clamp_limit = layer.w13_weight.new_full(
+                clamp_limit = layer.w13_weight.new_full(
                     (layer.num_local_experts,), swiglu_limit, dtype=torch.float32
+                )
+                # Keep the configured limit when resetting weights for validation.
+                clamp_limit._skip_weight_check = True
+                # Memory saver restores buffers in place for CUDA graph replay.
+                layer.register_buffer(
+                    "_flashinfer_trtllm_gemm1_clamp_limit",
+                    clamp_limit,
+                    persistent=False,
                 )
 
         if _is_npu:
