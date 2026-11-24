@@ -958,8 +958,6 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 

@@ -25,7 +25,7 @@ on:
 
 # check-maintenance reads this; reusable workflows do not inherit the caller's env.
 env:
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
   restore:
@@ -39,7 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           # What the cache key hashes, plus the actions and scripts this job runs.
           sparse-checkout: |
             sgl-router
@@ -83,7 +87,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -118,6 +126,7 @@ jobs:
 
       # After the glibc check, so a rejected build cannot poison this key.
       - name: Save built binary
+        if: github.event_name != 'pull_request_target'
         uses: actions/cache/save@v4
         with:
           path: sgl-router-bin/sgl-router

@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.hy_v4_flash import HYV4FlashDFlyConfig, HYV4FlashTextConfig
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs
@@ -72,7 +71,7 @@ class HYV4FlashDFlyLayer(nn.Module):
             if self.mlp.gate_up_proj.output_sizes[0] != width:
                 raise ValueError("Inconsistent DFly FFN widths in the checkpoint")
             return
-        if width % get_tensor_model_parallel_world_size():
+        if width % get_parallel().tp_size:
             raise ValueError("DFly FFN width must be divisible by TP")
         previous = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
