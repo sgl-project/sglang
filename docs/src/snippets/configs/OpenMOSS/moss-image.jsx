@@ -1,9 +1,9 @@
 export const config = {
   modelName: "MOSS-Image",
-  supportedHardware: ["h200", "h100", "rtx5090", "rtx6000pro"],
+  supportedHardware: ["h200", "h100", "rtx5090", "rtxpro6000"],
   hardware: [
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
-    { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
+    { id: "rtxpro6000", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
   ],
   groupHardware: false,
   matchDims: [],

@@ -251,8 +251,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 
     ``load_format`` overrides the config's: a draft runner loading under
     ``--speculative-draft-load-format`` needs its own transfer engine. Every
-    input is a ``model`` leaf, so this serves both the pre-publish member and
-    the post-publish accessor."""
+    input is a ``model`` leaf, so the published ``model`` bag answers it."""
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
         return True
     if (load_format or cfg.load_format) != "remote_instance":
