@@ -191,6 +191,8 @@ device_module = get_device_module()
 _STORAGE_UNREPORTED_WARN_ROUNDS = 1000
 # Port, host length, host bytes (an IPv6 literal fits).
 _PP_STORE_ADDRESS_SLOTS = 2 + 64
+# Arbitrary; failed ticks in a row before PP0 escalates to one error.
+_PP_STORE_OPEN_ERROR_TICKS = 100
 
 
 class _PPSyncAddressRelay:
@@ -265,7 +267,7 @@ class UnifiedRadixCache(BasePrefixCache):
     # it ends with the process.
     _pp_ready_store: Optional[PPConsensusStore] = None
     _pp_store_expected: bool = False
-    _pp_store_failure_logged: bool = False
+    _pp_store_open_failures: int = 0
     _storage_drained: tuple[int, ...] = ()
     _storage_epoch: int = 0
     _storage_unreported_rounds: int = 0
@@ -4361,13 +4363,21 @@ class UnifiedRadixCache(BasePrefixCache):
                     relay.broadcast_object(None)
             if relay.address is not None:
                 raise  # PP0 opened a store this rank cannot join
-            if self.pp_rank == 0 and not self._pp_store_failure_logged:
-                self._pp_store_failure_logged = True
-                logger.warning(
-                    "HiCache PP storage drain: PP0 could not open its PP store; "
-                    "retrying every tick, and nothing is drained until it opens.",
-                    exc_info=True,
-                )
+            if self.pp_rank == 0:
+                self._pp_store_open_failures += 1
+                if self._pp_store_open_failures in (1, _PP_STORE_OPEN_ERROR_TICKS):
+                    log = (
+                        logger.warning
+                        if self._pp_store_open_failures == 1
+                        else logger.error
+                    )
+                    log(
+                        "HiCache PP storage drain: PP0 could not open its PP store "
+                        "(%d ticks in a row); retrying every tick, and nothing is "
+                        "drained until it opens.",
+                        self._pp_store_open_failures,
+                        exc_info=True,
+                    )
 
     def _storage_ready_key(self, index: int) -> str:
         return f"hicache_storage:{self._storage_epoch}:{index}"

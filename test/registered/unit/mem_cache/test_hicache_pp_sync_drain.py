@@ -375,6 +375,8 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         self.assertTrue(
             done.wait(timeout=5), "PP1 blocked draining acks it has not received"
         )
+        if follower._pp_ready_store is None:
+            return
         # Let PP1's latest totals (one per storage queue) reach PP0.
         keys = [follower._storage_ready_key(index) for index in range(4)]
         self._wait_until(
@@ -495,6 +497,51 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         self.assertEqual(leader._pp_sync.call_count, 1)
         self.assertEqual(follower._storage_epoch, leader._storage_epoch)
         for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_store_open_failure_retries_next_tick(self):
+        """If PP0 cannot open its store, PP1 hears "no store" on the same channel,
+        so the PP-sync stream stays aligned; nothing is drained, PP0 warns once,
+        escalates once to an error, and a later tick opens the store and drains."""
+        leader = self._storage_stage(0, None, backups=1)
+        follower = self._storage_stage(1, None, backups=1)
+        for cache in (leader, follower):  # cleanups run last-in first, PP1 first
+            self.addCleanup(
+                lambda c=cache: c._pp_ready_store and c._pp_ready_store.close()
+            )
+        relayed = []
+        leader._pp_sync = MagicMock(
+            side_effect=lambda data: relayed.append(data.clone())
+        )
+        follower._pp_sync = MagicMock(
+            side_effect=lambda data: data.copy_(relayed.pop(0))
+        )
+        failures_left = [2]
+
+        def flaky_store(pp_size, pp_rank, group):
+            if pp_rank == 0 and failures_left[0]:
+                failures_left[0] -= 1
+                raise OSError("no routable address")
+            return PPConsensusStore(pp_size, pp_rank, group)
+
+        module = "sglang.srt.mem_cache.unified_radix_cache"
+        relayed_counts = []
+        with (
+            patch(f"{module}.PPConsensusStore", flaky_store),
+            patch(f"{module}._PP_STORE_OPEN_ERROR_TICKS", 2),
+            self.assertLogs(module, level="WARNING") as logs,
+        ):
+            for _ in range(4):
+                counts, n_backup = self._leader_round(leader)
+                relayed_counts.append(n_backup)
+                self._follower_round(follower, leader, counts)
+                self.assertEqual(relayed, [])  # PP1 heard every address message
+
+        # Ticks 1-2 fail (no store anywhere); tick 3 opens both, tick 4 drains.
+        self.assertEqual(relayed_counts, [0, 0, 0, 1])
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING", "ERROR"])
+        for cache in (leader, follower):
+            self.assertIsNotNone(cache._pp_ready_store)
             self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
 
     def test_pp0_warns_once_when_a_stage_never_reports(self):
