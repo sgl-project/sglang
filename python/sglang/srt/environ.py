@@ -1778,7 +1778,10 @@ class Envs:
     # RoPE cache
     # ===================================================================
     SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
-    # gfx1250 large-T fused RoPE + KV write. False keeps the per-token kernel.
+    # Tiled fused RoPE + KV-cache write (16 tokens x 8 q heads per program).
+    # Only used on gfx1250 (is_gfx1250_supported) for T >= 256, with fp32
+    # cos/sin, fp16/bf16/fp32 Q/K and neox layout; a no-op on every other arch.
+    # False forces the per-token kernel.
     SGLANG_FUSED_ROPE_KV_TILED = EnvBool(True)
     SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
