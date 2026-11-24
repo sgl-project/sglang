@@ -9,6 +9,9 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage21 import QwenImage21Dit
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import QwenImage21VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -111,6 +114,11 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
 
     def preprocess_condition_image(self, image, **kwargs):
         return image
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # Component offload moves the DiT onto the GPU whole, so it must stream
+        # when it exceeds the auto policy's DiT memory budget.
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
 
 
 def register():
