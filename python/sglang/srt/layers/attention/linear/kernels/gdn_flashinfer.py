@@ -260,7 +260,9 @@ def is_flashinfer_gdn_prefill_available() -> bool:
 # sequence's chunks serially, so a call lasts as long as its longest sequence.
 # With the switch on, an eager prefill of several sequences runs its longest
 # sequences as one-sequence CP calls (the split extend_in_graph makes with
-# tables.cp_single) and the others as one non-CP call per contiguous run.
+# tables.cp_single) and the others as one non-CP call per contiguous run; on a
+# device with its own fit (_CP_SPLIT_DEVICE_FITS) a one-sequence prefill that
+# FlashInfer keeps on the non-CP kernel is planned the same way.
 # Same kernels and state layout; only the grouping of sequences changes.
 # ---------------------------------------------------------------------------
 GDN_PREFILL_CP_SPLIT = os.environ.get(
@@ -283,6 +285,29 @@ _CP_SPLIT_FIT = {
     True: ((74.1, 19.66), (10.3, 41.91)),
     False: ((55.4, 14.49), (9.1, 22.66)),
 }
+# Fits measured on other devices, by compute capability (same setup). Only a
+# device listed here also plans one-sequence batches: there FlashInfer's own
+# rule (heads x 4 < SMs) keeps the non-CP kernel, e.g. GB300 at 48 heads.
+# "sparse": a one-sequence call storing one tracked row
+# (SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS' "every" mode), CP and non-CP.
+_CP_SPLIT_DEVICE_FITS = {
+    # GB300 (152 SMs), FlashInfer 0.7.2, 48 value heads, fp16 state.
+    (10, 3): {
+        True: ((76.2, 30.02), (11.49, 52.94)),
+        False: ((49.25, 21.49), (10.51, 26.63)),
+        "sparse": ((69.0, 21.5), (15.9, 36.9)),
+    },
+}
+
+
+def _cp_split_device_fit() -> Optional[dict]:
+    return _CP_SPLIT_DEVICE_FITS.get(tuple(torch.cuda.get_device_capability()))
+
+
+def _cp_split_fit() -> dict:
+    return _cp_split_device_fit() or _CP_SPLIT_FIT
+
+
 # Modeled gain required over the stock call; arbitrary margin for the fit.
 _CP_SPLIT_MARGIN = 0.10
 
@@ -338,25 +363,31 @@ def _choose_cp_seqs(
     )
     if not GDN_PREFILL_CP_SPLIT_MODEL:
         return frozenset(longest), 0.0, 0.0
-    (cp_a, cp_b), (walk_a, walk_b) = _CP_SPLIT_FIT[checkpoints]
+    fit = _cp_split_fit()
+    (cp_a, cp_b), (walk_a, walk_b) = fit[checkpoints]
+    sparse = fit.get("sparse") if cp_checkpoints is not None else None
 
     def walk_us(n: int) -> float:
         return walk_a + walk_b * n / 1000
 
-    stock = _ncp_call_us(lens, walk_us, heads=heads, sms=sms)
+    def run_us(a: int, b: int) -> float:
+        walk = walk_us
+        if sparse is not None and b - a == 1 and cp_checkpoints[a]:
+            _, (sa, sb) = sparse
+            walk = lambda n: sa + sb * n / 1000  # noqa: E731
+        return _ncp_call_us(lens[a:b], walk, heads=heads, sms=sms)
+
+    stock = run_us(0, len(lens))
     best, chosen, cp_us = stock * (1 - _CP_SPLIT_MARGIN), frozenset(), 0.0
     for k, i in enumerate(longest, 1):
         if cp_checkpoints is not None:
             # A CP call storing any checkpoint costs about the every-64 fit (measured).
-            cp_a, cp_b = _CP_SPLIT_FIT[bool(cp_checkpoints[i])][0]
+            cp_a, cp_b = (sparse or fit[True])[0] if cp_checkpoints[i] else fit[False][0]
         cp_us += cp_a + cp_b * lens[i] / 1000
         if cp_us >= best:
             break
         cp_seqs = frozenset(longest[:k])
-        split = cp_us + sum(
-            _ncp_call_us(lens[a:b], walk_us, heads=heads, sms=sms)
-            for a, b in _runs_without(len(lens), cp_seqs)
-        )
+        split = cp_us + sum(run_us(a, b) for a, b in _runs_without(len(lens), cp_seqs))
         if split < best:
             best, chosen = split, cp_seqs
     return chosen, stock, (best if chosen else stock)
@@ -391,10 +422,10 @@ def build_gdn_prefill_cp_split(
     cp_checkpoints=None,
 ) -> Optional[GDNPrefillCPSplit]:
     """The SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT plan of a plain extend batch, or
-    None for the stock call (one sequence, which FlashInfer already runs on CP,
-    or no split worth its modeled cost)."""
+    None for the stock call (one sequence that FlashInfer already runs on CP or
+    that has no device fit, or no split worth its modeled cost)."""
     lens = tuple(int(n) for n in extend_seq_lens_cpu)
-    if len(lens) < 2:
+    if len(lens) < 2 and (heads * 4 < sms or _cp_split_device_fit() is None):
         return None
     cp_seqs, stock_us, split_us = _choose_cp_seqs(
         lens,
