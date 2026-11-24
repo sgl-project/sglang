@@ -956,7 +956,6 @@ class QuarkConfig(QuantizationConfig):
         # A projection mapped only to itself (Phi-3's qkv_proj) is one
         # checkpoint tensor, so it is matched as a leaf instead of recursing.
         if shard_proj_names and shard_proj_names != [proj_name]:
-
             # Convert fused_name --> [shard_names]
             shard_names = [
                 layer_name.replace(proj_name, shard_proj_name)
