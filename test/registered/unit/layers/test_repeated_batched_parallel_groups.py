@@ -224,13 +224,10 @@ class TestRepeatedBatchedParallelGroups(CustomTestCase):
                                         layer, linear.ColumnParallelBatchedLinear
                                     )
                                     row = isinstance(layer, linear.RowParallelLinear)
-                                    size = (
-                                        4 // dp
-                                        if kind == "glm"
-                                        or shard_attn
-                                        or isinstance(layer, linear.QKVParallelLinear)
-                                        else 4
-                                    )
+                                    # Kimi shards every KDA projection, QKV
+                                    # included, on one group: attn_tp with
+                                    # shard_attn, the global tp otherwise.
+                                    size = 4 // dp if kind == "glm" or shard_attn else 4
                                     if isinstance(layer, linear.ReplicatedLinear):
                                         size = 1
                                     local_rank = rank % size
