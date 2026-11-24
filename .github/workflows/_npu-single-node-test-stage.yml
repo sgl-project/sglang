@@ -17,6 +17,11 @@ on:
         type: string
         default: ''
         description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
+      test_case:
+        required: false
+        type: string
+        default: ''
+        description: 'Repo-relative test file run directly (python <file>) instead of the suite; test_suite then only names the output directory.'
       image:
         required: true
         type: string
@@ -75,6 +80,14 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      use_image_sglang:
+        description: "If 'true', import sglang from the image's site-packages (the checkout's test helpers are synced on top). Empty/false runs the checkout's sglang."
+        type: string
+        default: ''
+      upload_metrics_artifact:
+        description: 'Upload the nightly per-case output directory as npu-metrics-* so release-data pipelines can aggregate it.'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -243,9 +256,14 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
 
-          # Determine test mode: suite (run_suite.py --suite) or single case file.
+          # Determine test mode: a single test case file, or a registered suite.
           test_suite="${{ inputs.test_suite }}"
-          echo "Test mode: suite (${test_suite})"
+          test_case="${{ inputs.test_case }}"
+          if [ -n "${test_case}" ]; then
+            echo "Test mode: single case (${test_case})"
+          else
+            echo "Test mode: suite (${test_suite})"
+          fi
           tc_name="${test_suite}"
 
           # The ID is used to locate the current job instance,
@@ -347,8 +365,19 @@ jobs:
           echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
 
 
-          # Run the checkout's sglang; the image only supplies the environment.
-          export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+          # Release-data runs may import sglang from the image's site-packages
+          # (the published artifact); the checkout's test helpers are synced on
+          # top of it. Every other caller runs the checkout's sglang.
+          if [ "${{ inputs.use_image_sglang }}" = "true" ] || [ "${{ inputs.use_image_sglang }}" = "True" ]; then
+            image_sglang_pkg="$(${PYTHON_FOR_SGLANG} -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+            if [ -d "${image_sglang_pkg}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+              echo "Syncing checkout sglang/test → ${image_sglang_pkg}/test"
+              cp -r "${sglang_source_path}/python/sglang/test/"* "${image_sglang_pkg}/test/"
+            fi
+          else
+            # Run the checkout's sglang; the image only supplies the environment.
+            export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+          fi
 
           # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
           # which abort the whole script under `set -u`. Temporarily disable -u.
@@ -373,7 +402,15 @@ jobs:
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
-          cd test
+          if [ -n "${test_case}" ] && [ ! -f "${sglang_source_path}/${test_case}" ]; then
+            echo "The test case does not exist: ${sglang_source_path}/${test_case}"
+            exit 1
+          fi
+          # A single case file runs from the repo root, the same way the pods
+          # invoke it; the suite mode keeps the run_suite.py working directory.
+          if [ -z "${test_case}" ]; then
+            cd test
+          fi
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
@@ -430,10 +467,15 @@ jobs:
             exit 0
           fi
 
-          # Run NPU test suite with run_suite.py.
-          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
-          # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          if [ -n "${test_case}" ]; then
+            # Single-case mode: run the file directly with unittest's __main__.
+            ${PYTHON_FOR_SGLANG} -u "${test_case}" 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          else
+            # Run NPU test suite with run_suite.py.
+            # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+            # tee pipe, so leftover server processes cannot block the pipeline on exit.
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          fi
 
           echo "Finished test: ${tc_name}"
 
@@ -474,3 +516,15 @@ jobs:
           path: /tmp/test-logs/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+      # Same artifact shape as the multi-node template, so release-data
+      # pipelines aggregate single-node cases without extra special-casing.
+      - name: Upload metrics artifact
+        if: ${{ always() && inputs.upload_metrics_artifact && inputs.is_nightly_pipeline_job }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-metrics-${{ inputs.test_suite }}-attempt-${{ github.run_attempt }}
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 9
