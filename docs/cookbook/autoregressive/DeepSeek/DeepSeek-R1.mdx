@@ -20,7 +20,7 @@ import { DeepSeekR1AdvancedDeployment } from '/src/snippets/autoregressive/deeps
 
 **Available Models:**
 
-- **Ascend A3 ModelSlim W4A8**: [Modelers_Park/DeepSeek-R1-0528-w4a8](https://modelers.cn/Modelers_Park/DeepSeek-R1-0528-w4a8) — use the Ascend A3 selection below; this checkpoint uses a different format from the W4AFP8 checkpoint listed below.
+- **Ascend A3 ModelSlim W4A8**: [Modelers_Park/DeepSeek-R1-0528-w4a8](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8) — use the Ascend A3 selection below; this checkpoint uses a different format from the W4AFP8 checkpoint listed below.
 - **FP8 (8-bit quantized)**: [deepseek-ai/DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) - Recommended for H200 and MI300X
 - **FP4 (4-bit quantized)**: [nvidia/DeepSeek-R1-0528-FP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2) - Recommended for B200 and MI355X
 - **BF16 (upcast from FP8)**: [unsloth/DeepSeek-R1-0528-BF16](https://huggingface.co/unsloth/DeepSeek-R1-0528-BF16)
@@ -112,7 +112,7 @@ Before launching:
 
 1. Use an SGLang build that includes the grouped ModelSlim W4A8 loading fix. Without it, this checkpoint produces invalid output.
 2. Pull the A3 image with `docker pull quay.io/ascend/sglang:main-cann9.1.0-a3`. Set up a container with a matched driver, CANN, TorchNPU, and MemFabric by following the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation). Mount all 16 devices and the model directory.
-3. Download the [ModelSlim W4A8 checkpoint](https://modelers.cn/Modelers_Park/DeepSeek-R1-0528-w4a8) (about 403 GB) on every node. It includes the NextN/MTP weights used by the speculative-decoding settings.
+3. Download the [ModelSlim W4A8 checkpoint](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8) (about 376 GB) on every node. It includes the NextN/MTP weights used by the speculative-decoding settings.
 4. Apply the host tuning from the best practice on each host:
 
    ```bash
@@ -1056,7 +1056,7 @@ Use the generated A3 commands for both the performance and the accuracy runs.
 
 #### 5.3.1 Performance
 
-The [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) lists 50 ms TPOT for both deployments. Run the benchmark against the running service, and add `--dataset-path` with a local ShareGPT file if the host is offline.
+The [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) lists 50 ms TPOT for both deployments. Run the benchmark against the running service.
 
 ```bash Command
 # 1×A3, PD co-located
