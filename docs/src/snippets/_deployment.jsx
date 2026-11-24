@@ -103,6 +103,11 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+//   ratings            optional — false hides the per-recipe 👍/👎 row (it is
+//                      also off for commandBuilder pages and redirect cells).
+//                      A recipe is keyed by page path + hw, match-dim and shown
+//                      overlay-dim ids (ratingKey), so renaming any of them
+//                      resets that recipe's ratings
 // Component props besides `config` / `benchmarks`:
 //   agenticLink        optional — heading id of the page's agentic long-context
 //                      section; adds a footer link to it under the Playground link
@@ -593,15 +598,6 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   const rowVisible = (spec, sel) =>
     (typeof spec.showWhen !== "function" || spec.showWhen(sel)) &&
     visibleOptions(spec, sel).length > 0;
-  // Recipe-rating key for a selection: every dim that shapes the command, i.e.
-  // the match dims plus the overlay dims whose row is showing (an overlay such
-  // as speculative decoding changes the command, so its on and off states are
-  // rated apart). docs/scripts/export_rating_ids.mjs enumerates these keys
-  // into the allowlist the rating service accepts votes for.
-  const ratingKey = (sel) =>
-    [...DIMENSIONS, ...overlayDimSpecs.filter((d) => rowVisible(d, sel)).map((d) => d.id)]
-      .map((d) => `${d}=${sel[d]}`)
-      .join("&");
   const overlayPick = (sel) => {
     const picked = [];
     for (const spec of (config.overlayDims || [])) {
@@ -652,6 +648,16 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return out;
   };
   // ==== end MIRROR ====
+  // Recipe-rating key for a selection: every dim that shapes the command, i.e.
+  // the match dims plus the overlay dims whose row is showing (an overlay such
+  // as speculative decoding changes the command, so its on and off states are
+  // rated apart). These ids are the ratings' storage keys: renaming hw, a
+  // dim, or an option id (or moving the page) starts its recipes from zero.
+  // docs/scripts/export_rating_ids.mjs lists every reachable key.
+  const ratingKey = (sel) =>
+    [...DIMENSIONS, ...overlayDimSpecs.filter((d) => rowVisible(d, sel)).map((d) => d.id)]
+      .map((d) => `${d}=${sel[d]}`)
+      .join("&");
   // `soft` marks an option that is plausible but outside the verified matrix:
   // it stays selectable (the status badge reports verification separately),
   // where `disabled` is reserved for combinations that cannot work at all.

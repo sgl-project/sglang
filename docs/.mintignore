@@ -8,6 +8,3 @@ drafts/
 
 # Data read by test_server_args_docs_coverage.py, not a page
 advanced_features/server_arguments_undocumented.txt
-
-# Recipe-rating allowlist fetched by ratings.sglang.io, not a page
-ratings/

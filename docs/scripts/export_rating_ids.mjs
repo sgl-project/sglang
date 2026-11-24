@@ -1,17 +1,17 @@
-// Writes docs/ratings/recipe-ids.json: every recipe id a Cookbook Deployment can show a rating
-// for. The rating service (ratings.sglang.io) accepts votes only for ids in this list, so a
-// forged id cannot create rows. The export-rating-ids pre-commit hook runs it; never edit the
-// file by hand.
+// Prints every recipe id a Cookbook Deployment can show a rating for, one per line, sorted.
+// Use it to audit or clean up the rating service's data, e.g. to drop rows whose id no page
+// can produce:
+//
+//   node docs/scripts/export_rating_ids.mjs > recipe-ids.txt
 //
 // A recipe id is "<page path>|<ratingKey(sel)>", the same string _deployment.jsx builds in the
 // browser: ratingKey comes from the engine block, so the two cannot drift apart.
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const docs = fileURLToPath(new URL("..", import.meta.url));
 const configsDir = join(docs, "src/snippets/configs");
-const outputPath = join(docs, "ratings/recipe-ids.json");
 
 const engineSource = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
 const start = engineSource.indexOf("// ==== COMMAND ENGINE ====");
@@ -74,12 +74,5 @@ for (const path of walk(join(docs, "cookbook")).filter((p) => p.endsWith(".mdx")
   for (const id of await idsForPage(pagePath, name)) all.add(id);
 }
 
-const json = `${JSON.stringify([...all].sort(), null, 0).replace(/","/g, '",\n"').replace(/^\[/, "[\n").replace(/\]$/, "\n]")}\n`;
-mkdirSync(dirname(outputPath), { recursive: true });
-const unchanged = existsSync(outputPath) && readFileSync(outputPath, "utf8") === json;
-console.log(`${relative(docs, outputPath)}: ${all.size} recipe ids${unchanged ? "" : " (updated)"}`);
-if (!unchanged) {
-  writeFileSync(outputPath, json);
-  // pre-commit only notices edits to tracked files, so fail to make the change visible.
-  process.exit(1);
-}
+process.stdout.write(`${[...all].sort().join("\n")}\n`);
+console.error(`${all.size} recipe ids`);
