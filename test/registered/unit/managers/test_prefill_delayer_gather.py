@@ -1,3 +1,5 @@
+import datetime
+import json
 import os
 import tempfile
 import time
@@ -7,6 +9,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.managers.prefill_delayer import PrefillDelayer, _State
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -125,6 +128,111 @@ class TestPrefillDelayerQueueTimeoutMultiRank(CustomTestCase):
                 args=(world_size, os.path.join(tmp, "init")),
                 nprocs=world_size,
             )
+
+
+# (enable_lora_overlap_loading, lora_drain_wait_threshold) per case; None: no LoRA.
+_LORA_CASES = {"overlap_loading": (True, 0.0), "drain": (False, 5.0), "no_lora": None}
+
+
+def _negotiate_with_diverging_readiness(rank, world_size, init_file, out_dir):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    traces = {}
+    try:
+        for name, lora in _LORA_CASES.items():
+            gathers = []
+
+            def _counting_gather(*args, **kwargs):
+                gathers.append(1)
+                return all_gather_single(*args, **kwargs)
+
+            with (
+                published_topology(ranks=dict(world_rank=rank), tp_size=world_size),
+                get_parallel().override(
+                    tp_group=SimpleNamespace(
+                        cpu_group=torch.distributed.group.WORLD, device_group=None
+                    )
+                ),
+                patch(
+                    "sglang.srt.managers.prefill_delayer.all_gather_single",
+                    side_effect=_counting_gather,
+                ),
+                patch(
+                    "sglang.srt.managers.prefill_delayer.get_lora",
+                    return_value=SimpleNamespace(
+                        enable_lora=lora is not None,
+                        enable_lora_overlap_loading=lora is not None and lora[0],
+                        lora_drain_wait_threshold=lora[1] if lora else 0.0,
+                    ),
+                ),
+            ):
+                delayer = PrefillDelayer(
+                    max_delay_passes=4, token_usage_low_watermark=None
+                )
+                delayer.skip_first_delayer = False
+                # With LoRA, rank 1 skips the request on the first pass (its adapter
+                # copy is still in flight); without LoRA both ranks see the same.
+                ready = [rank == 0 or lora is None, True, True]
+                trace = []
+                for local_prefillable in ready:
+                    num_gathers = len(gathers)
+                    out = delayer._negotiate_should_allow_prefill(
+                        local_prefillable=local_prefillable,
+                        token_usage=0.9,
+                        running_batch=8,
+                        max_prefill_bs=4,
+                        max_running_requests=8,
+                        waiting_queue_len=1,
+                    )
+                    trace.append(
+                        [
+                            len(gathers) > num_gathers,
+                            out.output_allow,
+                            delayer._curr_state is None,
+                        ]
+                    )
+                traces[name] = trace
+    finally:
+        torch.distributed.destroy_process_group()
+    with open(os.path.join(out_dir, f"rank{rank}.json"), "w") as f:
+        json.dump(traces, f)
+
+
+class TestPrefillDelayerRankLocalAdmission(CustomTestCase):
+    def test_ranks_with_diverging_lora_readiness_take_the_same_path(self):
+        """Every rank must agree on whether the next pass gathers. A LoRA adapter
+        ready on one TP rank only lets that rank alone reach the delayer; a verdict
+        from its own row would start a wait there alone, and the next pass would
+        all-gather on that rank only and hang."""
+        world_size = 2
+        with tempfile.TemporaryDirectory() as tmp:
+            torch.multiprocessing.spawn(
+                _negotiate_with_diverging_readiness,
+                args=(world_size, os.path.join(tmp, "init"), tmp),
+                nprocs=world_size,
+            )
+            traces = []
+            for rank in range(world_size):
+                with open(os.path.join(tmp, f"rank{rank}.json")) as f:
+                    traces.append(json.load(f))
+        for name in _LORA_CASES:
+            with self.subTest(name):
+                self.assertEqual(traces[0][name], traces[1][name])
+        # Rank 0's row starts the wait on both ranks, which then gather until it ends.
+        expected_lora = [
+            [True, False, False],
+            [True, False, False],
+            [True, False, False],
+        ]
+        self.assertEqual(traces[0]["overlap_loading"], expected_lora)
+        self.assertEqual(traces[0]["drain"], expected_lora)
+        # Identical rows: the first verdict needs no gather.
+        self.assertEqual(traces[0]["no_lora"][0], [False, False, False])
 
 
 if __name__ == "__main__":

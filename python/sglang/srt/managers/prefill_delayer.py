@@ -10,6 +10,7 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_lora,
     get_parallel,
     get_schedule,
 )
@@ -105,6 +106,15 @@ class PrefillDelayer:
         parallel = get_parallel()
         self.num_dp_ranks = parallel.num_dp_ranks
         self.attn_dp_enabled = parallel.attn_dp_enabled
+        # Without attention DP every TP rank sees the same queue and admits the same
+        # batch, so its own row equals rank 0's and an idle verdict needs no gather.
+        # LoRA admission reads rank-local state (an async adapter copy, a wall-clock
+        # drain), so one rank can reach the delayer while another skips the request.
+        lora = get_lora()
+        rank_local_admission = bool(lora.enable_lora) and (
+            bool(lora.enable_lora_overlap_loading) or lora.lora_drain_wait_threshold > 0
+        )
+        self._local_row_is_shared = not (self.attn_dp_enabled or rank_local_admission)
         dp_size_dim = self.num_dp_ranks if self.attn_dp_enabled else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
@@ -193,9 +203,9 @@ class PrefillDelayer:
                 and (time.perf_counter() - prev_state.start_time) * 1000.0
                 >= self._max_delay_ms
             ),
-            # Without attention DP every TP rank sees the same queue, so the rows agree;
-            # only an ongoing wait (timed by each rank's own clock) needs the gather.
-            local_only=prev_state is None and not self.attn_dp_enabled,
+            # When every rank's row equals rank 0's, only an ongoing wait (timed by
+            # each rank's own clock) needs the gather.
+            local_only=prev_state is None and self._local_row_is_shared,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
