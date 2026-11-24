@@ -4965,6 +4965,92 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
         self.assertEqual(updates, {})
 
 
+def _head_dim_model_config(
+    head_dim, *, swa_head_dim=None, arch="LlamaForCausalLM", mla=False
+):
+    swa_head_dim = head_dim if swa_head_dim is None else swa_head_dim
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[arch]),
+        attention_arch=AttentionArch.MLA if mla else AttentionArch.MHA,
+        head_dim=head_dim,
+        v_head_dim=head_dim,
+        swa_head_dim=swa_head_dim,
+        swa_v_head_dim=swa_head_dim,
+        has_attention_sinks=False,
+    )
+
+
+class TestDefaultAttnBackendFlashInferFa2HeadDims(CustomTestCase):
+    """An unset backend must not resolve to flashinfer for head dims its FA2 prefill
+    cannot run (not multiples of 64): they read out of bounds or give wrong results,
+    and FlashInfer 0.7.5 rejects them in plan()."""
+
+    def test_mha_default_off_hopper_and_sm100(self):
+        server_args = SimpleNamespace(
+            speculative_algorithm=None, speculative_eagle_topk=None
+        )
+        cases = {
+            "supported (128)": (_head_dim_model_config(128), "flashinfer"),
+            "unsupported (96, Phi-3-mini)": (_head_dim_model_config(96), "triton"),
+            "unsupported SWA layers only": (
+                _head_dim_model_config(128, swa_head_dim=96),
+                "triton",
+            ),
+        }
+        for label, (model_config, expected) in cases.items():
+            with (
+                self.subTest(label),
+                override_platform(
+                    is_sail=False,
+                    is_hopper_with_cuda_12_3=False,
+                    is_sm100=False,
+                    is_hip=False,
+                    has_flashinfer=True,
+                ),
+                patch.object(base_module, "is_mps", return_value=False),
+            ):
+                self.assertEqual(
+                    base_module.get_default_attn_backend(
+                        server_args, use_mla_backend=False, model_config=model_config
+                    ),
+                    expected,
+                )
+
+    def test_deterministic_default_on_sm100(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+
+        cases = {
+            "supported (128)": (_head_dim_model_config(128), "flashinfer"),
+            "unsupported (96, Phi-3-mini)": (_head_dim_model_config(96), "triton"),
+            # MLA head_dim is a placeholder; Kimi-Linear's real dims are qk 192, vo 128.
+            "MLA placeholder (Kimi-Linear)": (
+                _head_dim_model_config(72, arch="KimiLinearForCausalLM", mla=True),
+                "flashinfer",
+            ),
+        }
+        for label, (model_config, expected) in cases.items():
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=True,
+                    attention_backend=None,
+                    prefill_attention_backend=None,
+                    decode_attention_backend=None,
+                    model_path="org/model",
+                )
+            )
+            with (
+                self.subTest(label),
+                override_platform(is_xpu=False, is_sm100=True, is_sm120=False),
+                patch.object(
+                    overrides_module, "model_config_of", return_value=model_config
+                ),
+            ):
+                self.assertEqual(
+                    overrides_module._deterministic_attention_backend(view),
+                    {"attention_backend": expected},
+                )
+
+
 class TestGlm5NextAgenticMambaPool(CustomTestCase):
     ARCH = "Glm5NextForConditionalGeneration"
 

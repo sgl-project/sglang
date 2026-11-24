@@ -1252,6 +1252,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
 def _deterministic_flashinfer_serves_head_dims(view: Any) -> bool:
     """Whether flashinfer's FA2 prefill handles the model's head dims (see
     `flashinfer_fa2_serves_head_dims`). Unknown configs keep flashinfer."""
+    from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.connector import ConnectorType
     from sglang.srt.utils.common import parse_connector_type
 
@@ -1260,6 +1261,10 @@ def _deterministic_flashinfer_serves_head_dims(view: Any) -> bool:
     try:
         model_config = model_config_of(view)
     except Exception:
+        return True
+    # MLA head_dim/swa_head_dim are placeholders (e.g. 72 for Kimi-Linear),
+    # not the dims the MLA prefill kernel runs with.
+    if model_config.attention_arch == AttentionArch.MLA:
         return True
     return flashinfer_fa2_serves_head_dims(model_config)
 

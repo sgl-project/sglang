@@ -379,9 +379,12 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
                     return "flashinfer"
                 logger.info(
                     "FlashInfer FA2 prefill does not support head_dim=%s "
-                    "(v_head_dim=%s); using triton.",
+                    "(v_head_dim=%s, swa_head_dim=%s, swa_v_head_dim=%s); "
+                    "using triton.",
                     model_config.head_dim,
                     model_config.v_head_dim,
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
                 )
             return "triton"
     else:
