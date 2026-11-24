@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.triton_utils import next_power_of_2
+
 # Split low-row-count reductions across CTAs and fuse temperature scaling.
 _MIN_BLOCK = 2048
 _TARGET_CTAS = 512
@@ -92,7 +94,7 @@ def _split_geometry(rows: int, vocab_size: int):
     splits = min(
         triton.cdiv(_TARGET_CTAS, rows), max(1, triton.cdiv(vocab_size, _MIN_BLOCK))
     )
-    block = max(_MIN_BLOCK, triton.next_power_of_2(triton.cdiv(vocab_size, splits)))
+    block = max(_MIN_BLOCK, next_power_of_2(triton.cdiv(vocab_size, splits)))
     return block, triton.cdiv(vocab_size, block)
 
 
@@ -152,7 +154,7 @@ def temperature_softmax(
         row_max,
         row_sum,
         num_splits,
-        BLOCK=triton.next_power_of_2(num_splits),
+        BLOCK=next_power_of_2(num_splits),
         num_warps=1,
     )
     _normalize_kernel[(rows, num_splits)](
