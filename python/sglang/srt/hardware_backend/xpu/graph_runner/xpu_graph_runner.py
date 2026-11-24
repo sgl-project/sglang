@@ -151,6 +151,8 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         )
 
     def cleanup(self) -> None:
-        unregister_graph_scratchpad_owner(self)
-        if hasattr(super(), "cleanup"):
-            super().cleanup()
+        try:
+            if hasattr(super(), "cleanup"):
+                super().cleanup()
+        finally:
+            unregister_graph_scratchpad_owner(self)
