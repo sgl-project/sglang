@@ -1603,10 +1603,18 @@ def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
 
 
 def _intel_xpu_pages_by_default(view: Any) -> bool:
-    return (
-        get_platform().is_xpu
-        and view.page_size is None
-        and "intel_xpu" in attention_backends_of(view)
+    if not get_platform().is_xpu or view.page_size is not None:
+        return False
+    attention_backend = view.attention_backend
+    if (
+        attention_backend == "intel_xpu"
+        and not xpu_has_xmx_support()
+        and view.device == "xpu"
+    ):
+        attention_backend = "triton"
+    return "intel_xpu" in (
+        view.prefill_attention_backend or attention_backend,
+        view.decode_attention_backend or attention_backend,
     )
 
 

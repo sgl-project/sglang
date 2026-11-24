@@ -42,6 +42,7 @@ class TestIntelXpuMambaPageSize(CustomTestCase):
             patch.object(
                 overrides_module, "model_config_of", return_value=_model(arch)
             ),
+            patch.object(overrides_module, "xpu_has_xmx_support", return_value=True),
         ):
             return _mamba_radix_cache_resolution(_view(**fields))
 
