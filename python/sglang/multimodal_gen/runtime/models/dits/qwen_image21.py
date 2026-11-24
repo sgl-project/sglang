@@ -20,6 +20,12 @@ from sglang.kernels.ops.diffusion import (
     residual_gate_add_sum2,
     tensors_equal,
 )
+from sglang.kernels.ops.diffusion.norm.gated_residual_layernorm_modulate_triton import (
+    can_use_gated_residual_layernorm_modulate,
+    gated_residual_add,
+    gated_residual_layernorm_modulate,
+    layernorm_modulate,
+)
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     qknorm_complex_rope_kv,
 )
@@ -54,7 +60,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitche
     ConvRotInt8ComfyKitchenLinearMethod,
     comfy_kitchen_swiglu_mlp,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -70,6 +79,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+_is_rocm = current_platform.is_rocm()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -148,7 +158,31 @@ def _eager_rope(x, rope):
     return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
 
 
+def _rocm_lossless():
+    # The Triton fast paths are not bit-exact on ROCm, so they need the lossless tier.
+    return _is_rocm and not torch.compiler.is_compiling() and request_allows_lossless()
+
+
+def _rope_table_matches(x, rope, half):
+    return (
+        x.ndim == 4
+        and x.is_contiguous()
+        and rope.dtype == torch.complex64
+        and rope.is_contiguous()
+        and rope.device == x.device
+        and rope.shape == (x.shape[1], half)
+    )
+
+
 def apply_rope(x, rope):
+    if (
+        _rocm_lossless()
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and x.shape[-1] % 2 == 0
+        and _rope_table_matches(x, rope, x.shape[-1] // 2)
+    ):
+        return fused_complex_rope(x, rope)
     if _is_cuda and x.is_cuda:
         return _ROPE_FUSION.run(
             lambda: fused_complex_rope(x, rope),
@@ -173,6 +207,15 @@ def apply_qk_norm_rope(x, norm, rope):
             lambda: apply_rope(norm(x), rope),
             logger=logger,
         )
+    if (
+        _rocm_lossless()
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.shape[-1] == 128
+        and norm.weight.dtype == x.dtype
+        and _rope_table_matches(x, rope, 64)
+    ):
+        return qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
     if (
         _is_cuda
         and x.is_cuda
@@ -268,6 +311,8 @@ def projected_residual_gate_add(layer, hidden, residual, gate):
 
 
 def apply_modulation(x, norm, scale):
+    if _rocm_lossless() and can_use_gated_residual_layernorm_modulate(x, scale):
+        return layernorm_modulate(x, scale, norm.eps)
     if x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1]):
         return _MODULATION_FUSION.run(
             lambda: fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps),
@@ -275,6 +320,32 @@ def apply_modulation(x, norm, scale):
             logger=logger,
         )
     return norm(x) * (1 + scale)
+
+
+def _fused_gated_residual(residual, update, gate, *per_batch):
+    return (
+        _rocm_lossless()
+        and update.shape == residual.shape
+        and update.is_contiguous()
+        and update.dtype == residual.dtype
+        and can_use_gated_residual_layernorm_modulate(residual, gate, *per_batch)
+    )
+
+
+def gated_residual(residual, update, gate):
+    if _fused_gated_residual(residual, update, gate):
+        return gated_residual_add(residual, update, gate)
+    return residual_gate_add(residual, update, gate)
+
+
+def gated_residual_modulation(residual, update, gate, norm, scale):
+    """``r = residual + update * gate``; returns ``(r, modulated norm of r)``."""
+    if _fused_gated_residual(residual, update, gate, scale):
+        return gated_residual_layernorm_modulate(
+            residual, update, gate, scale, norm.eps
+        )
+    residual = residual_gate_add(residual, update, gate)
+    return residual, apply_modulation(residual, norm, scale)
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
@@ -468,7 +539,7 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
-        if _is_cuda and gate.dtype is torch.bfloat16:
+        if (_is_cuda or _is_rocm) and gate.dtype is torch.bfloat16:
             hidden = _SILU_MUL_FUSION.run(
                 lambda: fused_silu_mul_bitexact(gate, value),
                 lambda: nn.functional.silu(gate) * value,
@@ -958,13 +1029,12 @@ class QwenImage21TransformerBlock(nn.Module):
                 gate2,
             )
         else:
-            hidden_states = residual_gate_add(hidden_states, attention, gate1)
-            hidden_states = residual_gate_add(
+            hidden_states, mlp_input = gated_residual_modulation(
+                hidden_states, attention, gate1, self.img_norm2, scale2
+            )
+            hidden_states = gated_residual(
                 hidden_states,
-                self.img_mlp(
-                    apply_modulation(hidden_states, self.img_norm2, scale2),
-                    use_packed_bf16=use_packed_bf16_mlp,
-                ),
+                self.img_mlp(mlp_input, use_packed_bf16=use_packed_bf16_mlp),
                 gate2,
             )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
