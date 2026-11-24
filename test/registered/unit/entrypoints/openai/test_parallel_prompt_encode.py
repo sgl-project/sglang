@@ -747,7 +747,7 @@ class TestPromptSegments(_EncodeCase):
         encoder = ppe._segment_encoder_for(self.tokenizer)
         self.assertLessEqual(encoder.cached_tokens, 40)
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
-        self.assertNotIn("hello world " * 30, encoder.cache)
+        self.assertNotIn((None, "hello world " * 30), encoder.cache)
 
 
 class TestRenderedPrompt(_EncodeCase):
@@ -794,6 +794,30 @@ class TestRenderedPrompt(_EncodeCase):
         self.assertEqual(len(encoded), len(set(encoded)), encoded)
         self.assertIn(history, encoded)
         self.assertIn("next question", encoded)
+
+    def test_the_cache_is_namespaced_by_cache_salt(self):
+        # Like the radix cache: a salted request never hits text another salt
+        # (or an unsalted request) encoded, so its latency cannot reveal it.
+        text = "<|user|>" + "hello world " * 40 + "<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            for cache_salt in (None, "tenant-a", "tenant-b", "tenant-a", None):
+                self.assertEqual(
+                    list(
+                        ppe.encode_rendered_prompt(
+                            self.tokenizer, text, {}, cache_salt=cache_salt
+                        )
+                    ),
+                    self.tokenizer.encode(text),
+                )
+        self.assertEqual(
+            [call.args[2] for call in encode.call_args_list],
+            [None, "tenant-a", "tenant-b"],
+        )
 
     def test_only_the_first_prompts_are_checked_against_a_whole_encode(self):
         # The plan refuses a tokenizer whose encode is patched: build it first.
@@ -846,10 +870,10 @@ class TestRenderedPrompt(_EncodeCase):
         started, release = threading.Event(), threading.Event()
         encode = ppe._SegmentEncoder._encode
 
-        def slow_encode(encoder, texts):
+        def slow_encode(encoder, texts, cache_salt):
             started.set()
             release.wait(10)
-            return encode(encoder, texts)
+            return encode(encoder, texts, cache_salt)
 
         results = []
         threads = [

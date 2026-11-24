@@ -312,6 +312,29 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 3)
 
+    def test_cache_is_namespaced_by_cache_salt(self):
+        """Like the radix cache, a salted request never reuses another salt's render."""
+        for cache_salt in ("tenant-a", "tenant-a", ["tenant-a"], "tenant-b", None):
+            self._render(cache_salt=cache_salt)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            3,
+        )
+
+    def test_the_segment_cache_gets_the_cache_salt(self):
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encode_rendered_prompt",
+            return_value=[11, 12],
+        ) as encode:
+            for cache_salt in ("tenant-a", ["tenant-a"], "", None):
+                self._render(use_cache=False, cache_salt=cache_salt)
+
+        self.assertEqual(
+            [call.kwargs["cache_salt"] for call in encode.call_args_list],
+            ["tenant-a", "tenant-a", None, None],
+        )
+
     def test_cache_key_tracks_tokenizer_chat_template_updates(self):
         self.tokenizer_manager.tokenizer.chat_template = "template-v1"
         self._render()
