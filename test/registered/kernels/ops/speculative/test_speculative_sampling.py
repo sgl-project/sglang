@@ -453,28 +453,42 @@ def test_uno_fused_top_p_mass_matches_the_compiled_bound(
     assert torch.equal(base > 0, fused > 0)
     torch.testing.assert_close(fused, base, rtol=1e-5, atol=1e-7)
 
-    # the switch routes the support builder through the fused bound; FlashInfer's
-    # top-k in the builder needs rows of whole 16-byte words
+    # Builder level, switch off vs on. Main's FlashInfer top-k has a known fault
+    # (misaligned address) on rows that are not whole 16-byte words, so skip those.
     if vocab * logits.element_size() % 16:
         return
-    calls = []
+    # one FlashInfer top-k for both arms: its tie order is not deterministic
+    real_top_k, top_k_out, calls = uno_utils._flashinfer_top_k, [], []
+
+    def top_k_once(*args, **kwargs):
+        if not top_k_out:
+            top_k_out.append(real_top_k(*args, **kwargs))
+        return top_k_out[0]
 
     def fused_bound(*args):
         calls.append(args)
         return top_p_for_top_k_support(*args)
 
-    monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", True)
+    monkeypatch.setattr(uno_utils, "_flashinfer_top_k", top_k_once)
     monkeypatch.setattr(uno_utils, "top_p_for_top_k_support", fused_bound)
-    _build_sparse_target_support_tensors(
-        next_token_logits=logits,
-        temperatures=temperatures,
-        top_ks=top_ks,
-        top_ps=top_ps,
-        batch_size=requests,
-        forward_width=width,
-        max_top_k=max_top_k,
-    )
+    supports = {}
+    for fused in (False, True):
+        monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", fused)
+        supports[fused] = _build_sparse_target_support_tensors(
+            next_token_logits=logits,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            batch_size=requests,
+            forward_width=width,
+            max_top_k=max_top_k,
+        )
     assert len(calls) == 1
+    assert torch.equal(supports[False][0], supports[True][0])
+    assert torch.equal(supports[False][1] > 0, supports[True][1] > 0)
+    torch.testing.assert_close(
+        supports[True][1], supports[False][1], rtol=1e-5, atol=1e-7
+    )
 
 
 if __name__ == "__main__":
