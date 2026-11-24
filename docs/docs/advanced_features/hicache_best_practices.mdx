@@ -228,6 +228,35 @@ python3 -m sglang.launch_server \
   --hicache-storage-prefetch-policy timeout
 ```
 
+#### L3 in decode-node memory under PD disaggregation
+
+In a PD deployment the decode nodes often have spare host memory while the prefill node's host memory is taken by its L2 pool. Mooncake can serve the prefill server's L3 from the decode nodes: the store memory lives in `mooncake_store_service` processes on the decode nodes, and the prefill ranks join as clients that contribute no memory.
+
+1. **Start order.** Start the decode server and wait for `/health`, then start the master and the store services on the decode nodes, then the prefill server. The prefill server attaches to the store at startup. Allocating the store memory before the decode server finishes its first boot can leave the decode server short of host memory.
+2. **Store services on the decode node.** Run one store per host NUMA node, bound to that node's memory:
+
+   ```bash
+   MC=$(python3 -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')
+   $MC/mooncake_master --eviction_high_watermark_ratio=0.95 &
+   for nm in 0 1; do
+     MOONCAKE_MASTER=$DECODE_IP:50051 MOONCAKE_PROTOCOL=rdma MOONCAKE_DEVICE=$DEVICE_LIST \
+     MOONCAKE_TE_META_DATA_SERVER=P2PHANDSHAKE MOONCAKE_GLOBAL_SEGMENT_SIZE=448gb \
+     MOONCAKE_LOCAL_HOSTNAME=$DECODE_IP \
+     numactl --membind=$nm --cpunodebind=$nm python3 -m mooncake.mooncake_store_service --port=$((8081 + nm)) &
+   done
+   ```
+
+3. **Prefill server.** Pass the store config through `--hicache-storage-backend-extra-config` with `global_segment_size` 0 so that every L3 page lives on the decode nodes:
+
+   ```bash
+   --hicache-storage-backend mooncake \
+   --hicache-storage-backend-extra-config '{"master_server_address":"'$DECODE_IP':50051","metadata_server":"P2PHANDSHAKE","protocol":"rdma","device_name":"'$DEVICE_LIST'","global_segment_size":0,"local_hostname":"'$PREFILL_IP'","check_server":false}'
+   ```
+
+4. **Set `protocol` explicitly.** When the store config omits `protocol`, the backend falls back to `MOONCAKE_PROTOCOL`. PD deployments that move KV over NVLink set `MOONCAKE_PROTOCOL=nvlink` for the KV transfer, and the store would inherit it.
+5. **Multi-plane RoCE.** On fabrics where a NIC only reaches the same-named NIC on the peer node, set `MC_ENABLE_DEST_DEVICE_AFFINITY=1` on the prefill server and the store services. Otherwise reads that pick a peer NIC on another plane time out, and the backend's warmup read fails at startup.
+6. **Check it serves.** Every prefill rank logs `Mooncake store setup successfully` and `Mooncake store warmup successfully`; during traffic the master's `Master Admin Metrics` lines show `Mem Storage` and `Keys` growing, and the prefill server's `sglang:cached_tokens{cache_source="storage"}` metric grows.
+
 
 ## Custom Storage Backend Integration
 
