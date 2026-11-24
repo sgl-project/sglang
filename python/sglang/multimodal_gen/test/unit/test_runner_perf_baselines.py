@@ -19,34 +19,84 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 def test_default_runner_baseline(monkeypatch, runner):
     monkeypatch.setenv("RUNNER_NAME", runner)
     config = BaselineConfig.load(get_perf_baseline_path("b200"))
-    assert config.scenarios["flux1_modelopt_nvfp4_t2i"].expected_e2e_ms == 836.71
+    assert config.scenarios["flux2_modelopt_nvfp4_t2i"].expected_e2e_ms == 1990.84
     assert (
         config.scenarios["qwen_image_2512_modelopt_nvfp4_t2i"].expected_e2e_ms
         == 9650.06
     )
 
 
+@pytest.mark.parametrize("phase", ["load", "runtime"])
+def test_turbowan_host_budget_has_a_bounded_environment_allowance(monkeypatch, phase):
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    config = BaselineConfig.load(get_perf_baseline_path("5090"))
+    scenario = config.scenarios["turbo_wan2_1_t2v_1.3b"]
+    assert config.tolerances.host_anon == 0.02
+    assert scenario.host_anon_tolerance is None
+    validator = PerformanceValidator(scenario, config.tolerances, config.step_fractions)
+    expected = (
+        scenario.load_peak_host_anon_mb
+        if phase == "load"
+        else scenario.runtime_peak_host_anon_mb
+    )
+    limit = expected + max(expected * config.tolerances.host_anon, 256.0)
+    summary = PerformanceSummary(0, 0, 0, {}, [], {}, {})
+    summary.load_peak_host_anon_mb = scenario.load_peak_host_anon_mb
+    summary.runtime_peak_host_anon_mb = scenario.runtime_peak_host_anon_mb
+    if phase == "load":
+        summary.load_peak_host_anon_mb = limit - 1
+    else:
+        summary.runtime_peak_host_anon_mb = limit - 1
+    validator.validate_peak_host_anon(
+        summary, scenario.load_peak_host_anon_mb, scenario.runtime_peak_host_anon_mb
+    )
+    if phase == "load":
+        summary.load_peak_host_anon_mb = limit + 1
+    else:
+        summary.runtime_peak_host_anon_mb = limit + 1
+    with pytest.raises(AssertionError, match="Peak Host Anon"):
+        validator.validate_peak_host_anon(
+            summary, scenario.load_peak_host_anon_mb, scenario.runtime_peak_host_anon_mb
+        )
+
+
+def test_consumer_host_budget_keeps_the_profile_tolerance(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    config = BaselineConfig.load(get_perf_baseline_path("5090"))
+    scenario = config.scenarios["minimax_h3_t2va_consumer_budget_1gpu_5090"]
+    assert scenario.host_anon_tolerance is None
+    validator = PerformanceValidator(scenario, config.tolerances, config.step_fractions)
+    summary = PerformanceSummary(0, 0, 0, {}, [], {}, {})
+    summary.load_peak_host_anon_mb = scenario.load_peak_host_anon_mb * 1.02 + 1
+    summary.runtime_peak_host_anon_mb = scenario.runtime_peak_host_anon_mb
+    with pytest.raises(AssertionError, match="Load Peak Host Anon"):
+        validator.validate_peak_host_anon(
+            summary, scenario.load_peak_host_anon_mb, scenario.runtime_peak_host_anon_mb
+        )
+
+
 @pytest.mark.parametrize(
-    "runner,flux,qwen",
+    "runner,qwen",
     [
-        ("b200-di01-4567", 1334.16, 16126.87),
-        ("b200-cirrascale1-0123", 1574.32, 17742.04),
-        ("b200-cirrascale1-4567", 1574.32, 17742.04),
-        ("b200-cirrascale2", 1471.19, 17346.65),
-        ("b200-cirrascale3-0123", 1470.24, 17894.49),
-        ("b200-cirrascale3-4567", 1471.19, 17346.65),
-        ("b200-cirrascale4-0123", 1470.24, 17894.49),
-        ("b200-cirrascale4-4567", 1471.19, 17346.65),
+        ("b200-di01-4567", 16126.87),
+        ("b200-cirrascale1-0123", 17742.04),
+        ("b200-cirrascale1-4567", 17742.04),
+        ("b200-cirrascale2", 17346.65),
+        ("b200-cirrascale3-0123", 17894.49),
+        ("b200-cirrascale3-4567", 17346.65),
+        ("b200-cirrascale4-0123", 17894.49),
+        ("b200-cirrascale4-4567", 17346.65),
     ],
 )
-def test_runner_override_preserves_other_metrics(monkeypatch, runner, flux, qwen):
+def test_runner_override_preserves_other_metrics(monkeypatch, runner, qwen):
     monkeypatch.delenv("RUNNER_NAME", raising=False)
     default = BaselineConfig.load(get_perf_baseline_path("b200"))
     h100_default = BaselineConfig.load(get_perf_baseline_path("h100"))
     monkeypatch.setenv("RUNNER_NAME", runner)
     pool = BaselineConfig.load(get_perf_baseline_path("b200"))
     expected = {
-        "flux1_modelopt_nvfp4_t2i": flux,
         "qwen_image_2512_modelopt_nvfp4_t2i": qwen,
     }
     for name, scenario in default.scenarios.items():
@@ -78,7 +128,7 @@ def test_runner_baseline_enforces_e2e_boundary(monkeypatch, runner):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.delenv("SGLANG_E2E_TOLERANCE", raising=False)
     config = BaselineConfig.load(get_perf_baseline_path("b200"))
-    for name in ("flux1_modelopt_nvfp4_t2i", "qwen_image_2512_modelopt_nvfp4_t2i"):
+    for name in ("flux2_modelopt_nvfp4_t2i", "qwen_image_2512_modelopt_nvfp4_t2i"):
         scenario = config.scenarios[name]
         validator = PerformanceValidator(
             scenario, config.tolerances, config.step_fractions

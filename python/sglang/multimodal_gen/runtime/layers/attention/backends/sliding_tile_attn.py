@@ -47,8 +47,6 @@ class RangeDict(dict):
 
 
 class SlidingTileAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # TODO(will-refactor): check this
@@ -61,10 +59,6 @@ class SlidingTileAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SlidingTileAttentionImpl"]:
         return SlidingTileAttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["SlidingTileAttentionMetadata"]:
-        return SlidingTileAttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["SlidingTileAttentionMetadataBuilder"]:

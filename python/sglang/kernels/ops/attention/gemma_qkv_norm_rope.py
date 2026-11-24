@@ -66,7 +66,7 @@ def _gemma_qkv_norm_rope(
             R < D,
             False,
             False,
-            False,
+            ENABLE_PDL=False,
             WEIGHT_SHIFT=0.0,
             EXPLICIT_ROPE_FMA=True,
         )

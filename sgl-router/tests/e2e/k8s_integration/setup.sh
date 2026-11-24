@@ -6,6 +6,9 @@
 # Usage:
 #   ./tests/e2e/k8s_integration/setup.sh           # full setup
 #   ./tests/e2e/k8s_integration/setup.sh teardown  # delete the cluster
+#
+# ROUTER_FROM=prebuilt puts <repo root>/sgl-router-bin/sgl-router in the router
+# image instead of building it (see Dockerfile.router).
 
 set -euo pipefail
 
@@ -61,6 +64,7 @@ else
     log "Building sgl-router:e2e from ${REPO_ROOT} ..."
     docker build \
         -f "${SCRIPT_DIR}/Dockerfile.router" \
+        --build-arg ROUTER_FROM="${ROUTER_FROM:-source}" \
         -t sgl-router:e2e \
         "${REPO_ROOT}"
 
