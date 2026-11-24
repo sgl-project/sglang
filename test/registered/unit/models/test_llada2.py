@@ -11,6 +11,7 @@ from torch import nn
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import RouterGate
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -18,7 +19,6 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.models.llada2 import (
-    LLaDA2MoeGate,
     LLaDA2MoeSparseMoeBlock,
     _prepare_llada2_language_weights,
     _require_block_routing_ep1,
@@ -356,7 +356,13 @@ class TestLLaDA2LanguageModel(CustomTestCase):
         config = SimpleNamespace(
             num_experts=4, hidden_size=8, moe_router_enable_expert_bias=True
         )
-        gate = LLaDA2MoeGate(config, params_dtype=torch.float32)
+        gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
+            params_dtype=torch.float32,
+            has_correction_bias=config.moe_router_enable_expert_bias,
+            correction_bias_name="expert_bias",
+        )
         with torch.no_grad():
             gate.weight.copy_(torch.arange(32).reshape(4, 8) / 37)
         hidden = (torch.arange(24).reshape(3, 8) / 19).to(torch.bfloat16)

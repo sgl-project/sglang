@@ -38,6 +38,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import RouterGate
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -109,28 +110,6 @@ class LagunaMLP(nn.Module):
         return x
 
 
-class LagunaMoEGate(nn.Module):
-    def __init__(
-        self,
-        config: LagunaConfig,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_size, dtype=torch.float32)
-        )
-        # Released checkpoint stores this under `mlp.experts.e_score_correction_bias`
-        # (load_weights remaps it) but every value is 0.0; zero-init keeps us
-        # correct if a future checkpoint omits the tensor entirely.
-        self.e_score_correction_bias = nn.Parameter(
-            torch.zeros(config.num_experts, dtype=torch.float32),
-            requires_grad=False,
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.linear(hidden_states.to(torch.float32), self.weight, None)
-
-
 class LagunaMoE(nn.Module):
     def __init__(
         self,
@@ -151,7 +130,15 @@ class LagunaMoE(nn.Module):
                 f"TP size {self.tp_size} > num_experts {config.num_experts}."
             )
 
-        self.gate = LagunaMoEGate(config, prefix=add_prefix("gate", prefix))
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
+            has_correction_bias=True,
+            zero_init_correction_bias=True,
+            correction_bias_requires_grad=False,
+            fp32_compute=True,
+            prefix=add_prefix("gate", prefix),
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,

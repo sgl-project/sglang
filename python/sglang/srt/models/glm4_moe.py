@@ -20,7 +20,6 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -59,6 +58,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    RouterGate,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -380,27 +380,6 @@ class Glm4MoeAttention(nn.Module):
         return self.forward_core(s)
 
 
-class Glm4MoeGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(
-                (config.n_routed_experts, config.hidden_size), dtype=torch.float32
-            )
-        )
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty((config.n_routed_experts), dtype=torch.float32)
-        )
-
-    def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
-        return logits
-
-
 class Glm4MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -433,7 +412,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.n_routed_experts,
+            has_correction_bias=True,
+            fp32_compute=True,
+            prefix=add_prefix("gate", prefix),
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts + self.num_fused_shared_experts,

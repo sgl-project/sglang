@@ -517,7 +517,7 @@ class TestMiniMaxM31Forward(CustomTestCase):
             alt_stream=None,
             shared_experts=object(),
             _forward_shared_experts=lambda h: shared,
-            _compute_router_logits=lambda h: None,
+            gate=lambda h: None,
             topk=lambda h, logits: None,
             experts=experts,
         )
