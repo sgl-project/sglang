@@ -54,6 +54,16 @@ class HybridAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
+        # The child that served the latest init_forward_metadata* call.
+        self._active_backend = prefill_backend
+
+    @property
+    def forward_metadata(self):
+        return self._active_backend.forward_metadata
+
+    @forward_metadata.setter
+    def forward_metadata(self, value):
+        self._active_backend.forward_metadata = value
 
     def window_capacity_children(self) -> list:
         return [self.prefill_backend, self.decode_backend]
@@ -143,14 +153,17 @@ class HybridAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         backend = self._select_backend(forward_batch.forward_mode)
+        self._active_backend = backend
         backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
+        self._active_backend = backend
         backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
+        self._active_backend = backend
         backend.init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
