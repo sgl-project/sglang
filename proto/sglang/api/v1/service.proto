@@ -36,6 +36,10 @@ service SglangService {
   // allowlist (never the raw server-args dump, which embeds keys).
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
+  // Read the load snapshot of this listener's DP rank without contacting the
+  // scheduler. UNAVAILABLE when no usable snapshot can be read.
+  rpc GetLoad(GetLoadRequest) returns (GetLoadResponse);
+
   // `/hicache/storage-backend`: configuration snapshot and runtime attach/detach.
   rpc GetHiCacheStorage(GetHiCacheStorageRequest) returns (HiCacheStatus);
   rpc AttachHiCacheStorage(AttachHiCacheStorageRequest) returns (HiCacheStorageResponse);
@@ -242,6 +246,27 @@ message GetModelInfoResponse {
 }
 
 message GetServerInfoRequest {}
+
+message GetLoadRequest {
+  // Optional assertion of the addressed listener's DP rank. A different rank
+  // is INVALID_ARGUMENT. Discover the other listeners through GetServerInfo.
+  optional uint32 dp_rank = 1;
+}
+
+message GetLoadResponse {
+  uint32 dp_rank = 1;
+  // The owning-runtime identity reported by this listener's GetServerInfo.
+  string instance_id = 2;
+  // UTC Unix seconds when the scheduler sampled the load. A successful read
+  // can return an old sample. Clients can apply their own freshness policy.
+  double snapshot_unix_seconds = 3;
+  uint64 num_running_requests = 4;
+  uint64 num_waiting_requests = 5;
+  uint64 num_waiting_uncached_tokens = 6;
+  uint64 num_used_tokens = 7;
+  uint64 max_total_num_tokens = 8;
+  uint64 max_running_requests = 9;
+}
 
 message GetServerInfoResponse {
   string model_path = 1;

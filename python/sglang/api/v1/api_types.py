@@ -4255,6 +4255,44 @@ class GetServerInfoRequest(msgspec.Struct, kw_only=True, frozen=True):
         return encode_GetServerInfoRequest(self)
 
 
+class GetLoadRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetLoadRequest: JSON object (unknown keys ignored)."""
+
+    dp_rank: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetLoadRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetLoadRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetLoadRequest(self)
+
+
+class GetLoadResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetLoadResponse: JSON object (unknown keys ignored)."""
+
+    dp_rank: int = 0
+    instance_id: str = ""
+    snapshot_unix_seconds: float = 0.0
+    num_running_requests: int = 0
+    num_waiting_requests: int = 0
+    num_waiting_uncached_tokens: int = 0
+    num_used_tokens: int = 0
+    max_total_num_tokens: int = 0
+    max_running_requests: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetLoadResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetLoadResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetLoadResponse(self)
+
+
 class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.GetServerInfoResponse: JSON object (unknown keys ignored)."""
 
@@ -12091,6 +12129,61 @@ def decode_GetServerInfoRequest(value: Any) -> GetServerInfoRequest:
 
 def encode_GetServerInfoRequest(v: GetServerInfoRequest) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
+    return d
+
+
+def decode_GetLoadRequest(value: Any) -> GetLoadRequest:
+    m = _expect_map(value, expected="struct GetLoadRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
+    return GetLoadRequest(**kw)
+
+
+def encode_GetLoadRequest(v: GetLoadRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.dp_rank is not None:
+        d["dp_rank"] = v.dp_rank
+    return d
+
+
+def decode_GetLoadResponse(value: Any) -> GetLoadResponse:
+    m = _expect_map(value, expected="struct GetLoadResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "instance_id":
+            kw["instance_id"] = _expect_str(x, expected="a string")
+        elif key == "snapshot_unix_seconds":
+            kw["snapshot_unix_seconds"] = _expect_float(x, expected="f64")
+        elif key == "num_running_requests":
+            kw["num_running_requests"] = _expect_uint(x, expected="u64")
+        elif key == "num_waiting_requests":
+            kw["num_waiting_requests"] = _expect_uint(x, expected="u64")
+        elif key == "num_waiting_uncached_tokens":
+            kw["num_waiting_uncached_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "num_used_tokens":
+            kw["num_used_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "max_total_num_tokens":
+            kw["max_total_num_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "max_running_requests":
+            kw["max_running_requests"] = _expect_uint(x, expected="u64")
+    return GetLoadResponse(**kw)
+
+
+def encode_GetLoadResponse(v: GetLoadResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["dp_rank"] = v.dp_rank
+    d["instance_id"] = v.instance_id
+    d["snapshot_unix_seconds"] = float(v.snapshot_unix_seconds)
+    d["num_running_requests"] = v.num_running_requests
+    d["num_waiting_requests"] = v.num_waiting_requests
+    d["num_waiting_uncached_tokens"] = v.num_waiting_uncached_tokens
+    d["num_used_tokens"] = v.num_used_tokens
+    d["max_total_num_tokens"] = v.max_total_num_tokens
+    d["max_running_requests"] = v.max_running_requests
     return d
 
 

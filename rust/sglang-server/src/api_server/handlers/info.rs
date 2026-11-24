@@ -14,6 +14,10 @@ use super::handle::CoreHandle;
 use crate::api_server::core::CoreError;
 
 impl CoreHandle {
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.inner.instance_id
+    }
+
     /// The scheduler-owned model facts: the cache, refreshed from the local
     /// scheduler when a control call since may have changed them. A failed
     /// refresh keeps the last facts (logged), so metadata reads never fail
@@ -119,7 +123,7 @@ impl CoreHandle {
             max_total_num_tokens: metadata.max_total_num_tokens,
             num_reserved_tokens: metadata.num_reserved_tokens,
             version: metadata.version.clone(),
-            instance_id: self.inner.instance_id.clone(),
+            instance_id: self.instance_id().to_owned(),
             frontend: "rust",
             startup_time,
             internal_states,

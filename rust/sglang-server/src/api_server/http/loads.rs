@@ -8,8 +8,6 @@
 //! its own slot, as rank 0.
 
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,21 +17,14 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::FlockOperation;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::app::AppState;
 use super::auth::DeclaredRoute;
 use super::native_api::native_error;
-
-/// The file header, Python's `HEADER_STRUCT` (`<4sHHI`): magic, version,
-/// dp_size, slot_size. Each rank's slot follows at `HEADER_LEN + rank *
-/// slot_size`: a little-endian `u32` length, then the msgpack snapshot.
-const MAGIC: &[u8; 4] = b"SLNS";
-const VERSION: u16 = 2;
-const HEADER_LEN: u64 = 12;
-const SLOT_LEN_PREFIX: u64 = 4;
+use crate::api_server::load_snapshot::read_snapshots;
 
 /// The zero value a field takes when the snapshot omits it.
 #[derive(Clone, Copy)]
@@ -180,14 +171,19 @@ async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuer
     let path = path.to_owned();
     let dp_size = args.load_snapshot_dp_size;
     let loads: Vec<Map<String, Value>> = tokio::task::spawn_blocking(move || {
-        read_snapshots(Path::new(&path), dp_size, &ranks)
-            .iter()
-            .filter_map(|snapshot| to_dict(snapshot, include.as_ref()))
-            .map(|mut load| {
-                load.insert("dp_rank".into(), Value::from(0));
-                load
-            })
-            .collect()
+        read_snapshots(
+            Path::new(&path),
+            dp_size,
+            &ranks,
+            FlockOperation::LockShared,
+        )
+        .iter()
+        .filter_map(|snapshot| to_dict(snapshot, include.as_ref()))
+        .map(|mut load| {
+            load.insert("dp_rank".into(), Value::from(0));
+            load
+        })
+        .collect()
     })
     .await
     .expect("reading load snapshots does not panic");
@@ -243,53 +239,6 @@ fn parse_include(include: Option<&str>) -> Result<Option<BTreeSet<String>>, Stri
         ));
     }
     Ok(Some(names))
-}
-
-/// The decoded snapshots of `ranks`, read under the shared lock Python's
-/// reader takes. A missing or mismatched file, or an empty or malformed slot,
-/// yields nothing for that rank, as Python's reader does.
-fn read_snapshots(path: &Path, dp_size: usize, ranks: &[usize]) -> Vec<rmpv::Value> {
-    let Ok(file) = File::open(path) else {
-        return Vec::new();
-    };
-    if flock(&file, FlockOperation::LockShared).is_err() {
-        return Vec::new();
-    }
-    let mut header = [0u8; HEADER_LEN as usize];
-    if file.read_exact_at(&mut header, 0).is_err() {
-        return Vec::new();
-    }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    let file_dp_size = usize::from(u16::from_le_bytes([header[6], header[7]]));
-    let slot_size = u64::from(u32::from_le_bytes([
-        header[8], header[9], header[10], header[11],
-    ]));
-    let file_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-    if &header[..4] != MAGIC
-        || version != VERSION
-        || file_dp_size != dp_size
-        || slot_size < SLOT_LEN_PREFIX
-        || file_len < HEADER_LEN + dp_size as u64 * slot_size
-    {
-        tracing::warn!(path = %path.display(), "load snapshot header mismatch");
-        return Vec::new();
-    }
-    ranks
-        .iter()
-        .filter_map(|&rank| {
-            let offset = HEADER_LEN + rank as u64 * slot_size;
-            let mut len = [0u8; SLOT_LEN_PREFIX as usize];
-            file.read_exact_at(&mut len, offset).ok()?;
-            let len = u64::from(u32::from_le_bytes(len));
-            if len == 0 || len > slot_size - SLOT_LEN_PREFIX {
-                return None;
-            }
-            let mut payload = vec![0u8; len as usize];
-            file.read_exact_at(&mut payload, offset + SLOT_LEN_PREFIX)
-                .ok()?;
-            rmpv::decode::read_value(&mut payload.as_slice()).ok()
-        })
-        .collect()
 }
 
 /// Python `LoadSnapshot.to_dict`: every flat field, then each present section
@@ -408,54 +357,20 @@ fn utc_now_isoformat() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::load_snapshot::test_support::{SnapshotFile, fixture};
     use crate::message::config::ServerArgs;
+    use rustix::fs::flock;
     use serde_json::json;
+    use std::fs::File;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-
-    fn fixture() -> Value {
-        serde_json::from_str(include_str!("../../../testdata/load_snapshot.json")).unwrap()
-    }
-
-    /// The fixture's payloads in Python's file format, one slot per rank.
-    struct SnapshotFile(std::path::PathBuf);
-
-    impl SnapshotFile {
-        fn new(dp_size: usize) -> Self {
-            let slot_size = 16 * 1024u32;
-            let mut bytes = Vec::from(&MAGIC[..]);
-            bytes.extend(VERSION.to_le_bytes());
-            bytes.extend((dp_size as u16).to_le_bytes());
-            bytes.extend(slot_size.to_le_bytes());
-            for payload in fixture()["payloads"].as_array().unwrap() {
-                let hex = payload.as_str().unwrap();
-                let payload: Vec<u8> = (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                    .collect();
-                let mut slot = (payload.len() as u32).to_le_bytes().to_vec();
-                slot.extend(payload);
-                slot.resize(slot_size as usize, 0);
-                bytes.extend(slot);
-            }
-            let path = std::env::temp_dir().join(format!("sglang-loads-{}", uuid::Uuid::new_v4()));
-            std::fs::write(&path, bytes).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for SnapshotFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
 
     /// The JSON and Prometheus renderings match what Python produces from the
     /// same bytes, key order and float formatting included.
     #[test]
     fn renders_snapshots_as_python_does() {
         let file = SnapshotFile::new(2);
-        let snapshots = read_snapshots(&file.0, 2, &[0, 1]);
+        let snapshots = read_snapshots(&file.0, 2, &[0, 1], FlockOperation::LockShared);
         assert_eq!(snapshots.len(), 2);
         let expected = fixture();
         for name in ["all", "core", "core,queues"] {
