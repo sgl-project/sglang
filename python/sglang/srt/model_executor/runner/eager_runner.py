@@ -68,6 +68,32 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _bf16_autotune_batch_size(
+    *, model: torch.nn.Module, batch_size: int, alignment: int, min_probe_rows: int
+) -> int:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    capacity = batch_size
+    for module in model.modules():
+        if isinstance(module, FusedMoE):
+            bound = module.dispatcher.get_decode_token_capacity()
+            if bound is not None:
+                if bound <= 0:
+                    raise ValueError(
+                        "Decode dispatcher token capacity must be positive"
+                    )
+                capacity = min(capacity, bound)
+    if capacity == batch_size:
+        return batch_size
+    # A global token bound is conservative for both replicated and TP-split inputs.
+    selected = capacity // alignment * alignment
+    if selected // alignment < min_probe_rows:
+        raise ValueError(
+            "Decode dispatcher capacity cannot retain the BF16 autotune probe rows"
+        )
+    return selected
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
@@ -142,23 +168,51 @@ class EagerRunner(BaseRunner):
             self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
-        """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
-        flashinfer-autotune forward.
+        """Allocate decode scratch without changing the live eager registry."""
+        from sglang.srt.layers.moe.utils import is_tbo_enabled
+        from sglang.srt.model_executor.runner.flashinfer_autotune import (
+            should_run_flashinfer_autotune,
+        )
 
-        flashinfer's MoE autotuner times candidate tactics against the buffer it
-        is given, so it must match the live decode shape for the cached tactic to
-        be optimal at decode. The eager input registry spans the prefill token
-        ceiling; the dummy run only needs the decode-sized slice.
-        """
         mr = self.model_runner
+        parallel = get_parallel()
+        batch_size = self._eager_max_bs
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             num_tokens_per_req = mr.decode_num_tokens_per_req()
+        if (
+            mr.is_generation
+            and not mr.is_draft_worker
+            and mr.spec_algorithm.is_none()
+            and DllmConfig.from_server_args(mr.server_args) is None
+            and not is_tbo_enabled()
+            and parallel.dp_size == parallel.attn_dp_size == parallel.attn_cp_size == 1
+            and parallel.moe_dp_size == parallel.pp_size == 1
+            and parallel.tp_size == parallel.attn_tp_size == parallel.moe_ep_size
+            and get_exec().moe.moe_a2a_backend == "deepep"
+            and should_run_flashinfer_autotune(mr, require_bf16_only=True)
+        ):
+            from sglang.srt.layers.quantization.unquant import (
+                _BF16_LOW_M_AUTOTUNE_MAX_M,
+            )
+
+            batch_size = _bf16_autotune_batch_size(
+                model=mr.model,
+                batch_size=batch_size,
+                alignment=parallel.attn_tp_size,
+                min_probe_rows=_BF16_LOW_M_AUTOTUNE_MAX_M,
+            )
+            if batch_size != self._eager_max_bs:
+                logger.info(
+                    "FlashInfer BF16 autotune scratch batch %s (live eager batch %s)",
+                    batch_size,
+                    self._eager_max_bs,
+                )
         return (
             self._alloc_dummy_decode_buffers(
-                self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
+                batch_size, num_tokens_per_req=num_tokens_per_req
             ),
-            self._eager_max_bs,
+            batch_size,
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:

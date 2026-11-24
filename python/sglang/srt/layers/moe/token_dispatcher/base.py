@@ -420,6 +420,14 @@ class BaseDispatcher(ABC):
         handle = self._post_combine_hooks.register_hook(hook)
         return handle
 
+    def get_decode_token_capacity(self) -> Optional[int]:
+        """Maximum input rows per rank during decode, or None if not advertised.
+
+        This queries instantiated resources without resizing them. Callers own
+        the conversion from their batch layout to dispatcher input rows.
+        """
+        return None
+
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
 

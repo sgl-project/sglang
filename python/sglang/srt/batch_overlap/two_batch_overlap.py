@@ -1199,6 +1199,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         for inner in self._inners:
             inner.prebuild()
 
+    def get_decode_token_capacity(self) -> Optional[int]:
+        capacities = [inner.get_decode_token_capacity() for inner in self._inners]
+        return min((bound for bound in capacities if bound is not None), default=None)
+
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
