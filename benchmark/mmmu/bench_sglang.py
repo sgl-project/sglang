@@ -33,6 +33,7 @@ from eval_utils import (
 )
 from tqdm import tqdm
 
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
@@ -51,11 +52,15 @@ class RequestFuncOutput:
     error: str = ""
 
 
-async def async_request_profile(api_url: str) -> RequestFuncOutput:
+async def async_request_profile(
+    api_url: str, admin_api_key: Optional[str] = None
+) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            async with session.post(
+                url=api_url, headers=admin_auth_headers(admin_api_key)
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -161,7 +166,8 @@ async def eval_mmmu(args) -> None:
     if args.profile:
         print("Starting profiler...")
         profile_output = await async_request_profile(
-            api_url=f"{base_url}/start_profile"
+            api_url=f"{base_url}/start_profile",
+            admin_api_key=eval_args.admin_api_key,
         )
         if profile_output.success:
             print("Profiler started")
@@ -219,7 +225,10 @@ async def eval_mmmu(args) -> None:
 
     if args.profile:
         print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=f"{base_url}/stop_profile")
+        profile_output = await async_request_profile(
+            api_url=f"{base_url}/stop_profile",
+            admin_api_key=eval_args.admin_api_key,
+        )
         if profile_output.success:
             print("Profiler stopped")
 

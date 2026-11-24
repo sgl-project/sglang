@@ -238,7 +238,6 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
             "envs": SimpleNamespace(
                 SGLANG_DSPARK_EMBED_IN_GRAPH=SimpleNamespace(get=lambda: False)
             ),
-            "_make_num_token_non_padded": lambda *args: None,
             "DraftForwardResult": SimpleNamespace,
         },
     )
@@ -270,6 +269,7 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
         _draft_block_spec_info=object(),
         _fill_dp_moe_sync_metadata=Mock(),
         deferred_draft_kv=None,
+        _num_token_non_padded=None,
     )
     proposer.draft_block_ids_view = lambda **kwargs: draft_block_ids_view(
         proposer, **kwargs
@@ -291,7 +291,6 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
         draft_input=draft,
         verify_window=window,
         bs=1,
-        device="cpu",
         embed_module=lambda x: torch.zeros(1, 7, 16),
     )
     if needs_cpu and mirror is None:
@@ -348,7 +347,6 @@ def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mir
             verify_cache_loc=torch.arange(8),
             iteration_ids=object(),
         ),
-        sampling_info=None,
     )
     method(executor, **kwargs)
     assert fb.seq_lens.tolist() == [127]
