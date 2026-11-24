@@ -496,6 +496,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        filler_seed: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -570,11 +571,11 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
+        # Seed this row samples with in a seeded batch when it has no sampling_seed.
+        self.filler_seed = filler_seed
         # Index in the scheduler's PenaltyStatusPool, held while the request uses
         # a penalty; a retraction keeps it.
         self.penalty_index: Optional[int] = None
-        # The random seed this unseeded request samples with in a seeded step.
-        self.filler_sampling_seed: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
         self.page_guard_state: Optional[PageGuardState] = None
@@ -714,8 +715,6 @@ class Req(ReqDllmMixin):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
         )
-        self.temp_scaled_logprobs = False
-        self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
         self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
@@ -3302,10 +3301,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
-
-        # Clear context parallel metadata - CP is only for prefill, not decode
-        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
-            self.attn_cp_metadata = None
 
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).

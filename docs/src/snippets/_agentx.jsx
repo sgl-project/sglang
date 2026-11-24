@@ -214,11 +214,20 @@ export const AgentX = ({ data: input }) => {
       args: [["--model-id", served], ["--tokenizer-path", model], ["--worker-urls", ...urls], ...rest] };
     return blocks.map((x) => (x === b ? router : withKvEvents(x)));
   };
+  // SGLang 1.0 takes the linker's storage options only from --unified-cache-external-linker-config
+  // and refuses --hicache-storage-backend-extra-config, which older submissions and kv.py record.
+  const withLinkerConfig = (b) => {
+    const args = b.args || [];
+    if (!args.some((a) => a[0] === "--enable-unified-cache-external-linker")
+      || args.some((a) => a[0] === "--unified-cache-external-linker-config")) return b;
+    return { ...b, args: args.map((a) => (a[0] === "--hicache-storage-backend-extra-config"
+      ? ["--unified-cache-external-linker-config", ...a.slice(1)] : a)).sort(cmpArgs) };
+  };
   const blocksFor = (ci, pi, router, kv) => {
     const cell = data.cells[ci];
     const base = materialize(ci, router);
     const measured = pi === 0 ? base : applyPatch(base, ((cell.points[pi] || {}).patch || {})[router]);
-    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
+    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router).map(withLinkerConfig);
     return blocks.some((b) => b.kind === "sgl-router") ? toSglRouter(blocks) : blocks;
   };
 
