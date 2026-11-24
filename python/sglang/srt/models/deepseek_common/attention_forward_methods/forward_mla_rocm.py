@@ -205,20 +205,60 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
 
 
 _use_gfx1250_absorb_bmm = _use_aiter and _is_gfx1250_supported
-if _use_gfx1250_absorb_bmm:
+_use_gfx950_absorb_bmm = _use_aiter_gfx95
+if _use_gfx1250_absorb_bmm or _use_gfx950_absorb_bmm:
     try:
         from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
     except ImportError:
         logger.warning(
-            "aiter has no batched_gemm_bf16; the gfx1250 MLA absorb BMMs keep torch.bmm"
+            "aiter has no batched_gemm_bf16; the MLA absorb BMMs keep torch.bmm"
         )
-        _use_gfx1250_absorb_bmm = False
+        _use_gfx1250_absorb_bmm = _use_gfx950_absorb_bmm = False
 
 
-def _gfx1250_absorb_bmm_ok(*, x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
-    """aiter's bf16 batched GEMM beats torch.bmm on gfx1250 at decode rows only;
-    prefill rows stay on torch.bmm. Piecewise CUDA graphs also keep torch.bmm,
-    since dynamo does not trace the aiter launch."""
+def _gfx950_absorb_bmm_config(m: int, k: int) -> dict:
+    """Triton tiles for the bf16 absorb BMMs on gfx950. Swept on MI355X at 16 heads
+    (GLM-5.3-Flash TP4): q (K 256, N 512) / v (K 512, N 256) take 2.1-4.1 us for
+    M 1-192 where torch.bmm takes 3.7-5.3 / 6.3-13.3 us."""
+    if m <= 24 or (k > 256 and m <= 48):
+        block_m, block_n, block_k, num_warps, waves = 16, 64, 256, 4, 2
+    elif m <= 48:
+        block_m, block_n, block_k, num_warps, waves = 32, 32, 128, 4, 2
+    elif m <= 96:
+        block_m, block_n = 32, 64
+        block_k, num_warps, waves = (128, 4, 2) if k <= 256 else (256, 8, 1)
+    else:
+        block_m, block_n, block_k, num_warps, waves = 64, 64, 128, 4, 2
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": 1,
+        "num_warps": num_warps,
+        "num_stages": 2,
+        "waves_per_eu": waves,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": None,
+        "NUM_KSPLIT": 1,
+        "SPLITK_BLOCK_SIZE": k,
+    }
+
+
+def _gfx950_absorb_bmm(x: torch.Tensor, w: torch.Tensor, out=None) -> torch.Tensor:
+    """``x [B, M, K] @ w [B, K, N]`` with aiter's Triton bf16 batched GEMM."""
+    return batched_gemm_bf16(
+        XQ=x,
+        WQ=w.transpose(1, 2),
+        YQ=out,
+        backend="triton",
+        config=_gfx950_absorb_bmm_config(x.shape[1], x.shape[2]),
+    )
+
+
+def _bf16_absorb_bmm_ok(*, x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
+    """aiter's bf16 batched GEMM beats torch.bmm on gfx1250 and gfx950 at decode
+    rows only; prefill rows stay on torch.bmm. Piecewise CUDA graphs also keep
+    torch.bmm, since dynamo does not trace the aiter launch."""
     return (
         x.dtype == torch.bfloat16
         and w.dtype == torch.bfloat16
@@ -285,7 +325,7 @@ def rocm_absorb_q_bmm(
                     ),
                 )
             )
-        elif _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+        elif _use_gfx1250_absorb_bmm and _bf16_absorb_bmm_ok(
             x=q_nope, w=attn.w_kc, w_scale=attn.w_scale
         ):
             q_nope_out = batched_gemm_bf16(
@@ -293,6 +333,10 @@ def rocm_absorb_q_bmm(
                 WQ=attn.w_kc.transpose(1, 2),
                 backend="gluon" if q_nope.shape[0] <= 4 else "triton",
             )
+        elif _use_gfx950_absorb_bmm and _bf16_absorb_bmm_ok(
+            x=q_nope, w=attn.w_kc, w_scale=attn.w_scale
+        ):
+            q_nope_out = _gfx950_absorb_bmm(q_nope.transpose(0, 1), attn.w_kc)
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -374,7 +418,7 @@ def rocm_absorb_v_bmm(
             ):
                 # the monokernel's decode-sized batch: one launch, what the bmm writes
                 _vab.mla_v_absorb(attn_output, attn.w_vc, _bmm_buf)
-            elif _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+            elif _use_gfx1250_absorb_bmm and _bf16_absorb_bmm_ok(
                 x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
             ):
                 batched_gemm_bf16(
@@ -382,6 +426,12 @@ def rocm_absorb_v_bmm(
                     WQ=attn.w_vc.transpose(1, 2),
                     YQ=_bmm_buf.transpose(0, 1),
                     backend="gluon",
+                )
+            elif _use_gfx950_absorb_bmm and _bf16_absorb_bmm_ok(
+                x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
+            ):
+                _gfx950_absorb_bmm(
+                    attn_output.transpose(0, 1), attn.w_vc, _bmm_buf.transpose(0, 1)
                 )
             else:
                 torch.bmm(
