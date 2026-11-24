@@ -183,10 +183,12 @@ class TensorDictRecvHandle:
         src: int,
         tag: int = 0,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        batch_p2p: bool = False,
     ):
         self._coordinator = coordinator
         self._all_gather_group = all_gather_group
         self._gather_shapes = {}
+        self._batch_p2p = batch_p2p
         self._tag = tag
         # src is group-local; torch.distributed P2P requires the global rank.
         self._src_global_rank = coordinator.ranks[src]
@@ -257,6 +259,7 @@ class TensorDictRecvHandle:
                 if isinstance(value, TensorMetadata)
                 else value
             )
+        payloads = []
         for key, value in received_tensor_dict.items():
             if isinstance(value, torch.Tensor) and value.numel():
                 gather_group = self._all_gather_group
@@ -274,13 +277,32 @@ class TensorDictRecvHandle:
                     if value.is_cpu
                     else self._coordinator.device_group
                 )
-                payload_recv_work = torch.distributed.irecv(
+                payloads.append((value, payload_comm_group))
+        if self._batch_p2p and payloads:
+            works = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        value,
+                        self._src_global_rank,
+                        group=group,
+                        tag=self._tag if value.is_cpu else 0,
+                    )
+                    for value, group in payloads
+                ]
+            )
+            self._payload_recv_works = [
+                P2PWork(work, value) for work, (value, _) in zip(works, payloads)
+            ]
+        else:
+            for value, group in payloads:
+                work = torch.distributed.irecv(
                     value,
                     src=self._src_global_rank,
-                    group=payload_comm_group,
+                    group=group,
                     **({"tag": self._tag} if value.is_cpu else {}),
                 )
-                self._payload_recv_works.append(P2PWork(payload_recv_work, value))
+                self._payload_recv_works.append(P2PWork(work, value))
         self._received_tensor_dict = received_tensor_dict
         return True
 
@@ -303,9 +325,20 @@ class TensorDictRecvHandle:
             for item in self._payload_recv_works:
                 item.wait()
             for key, shape in self._gather_shapes.items():
-                self._received_tensor_dict[key] = self._all_gather_group.all_gather(
-                    self._received_tensor_dict[key], dim=0
-                ).reshape(shape)
+                value = self._received_tensor_dict[key].contiguous()
+                output = torch.empty(shape, dtype=value.dtype, device=value.device)
+                gather_group = self._all_gather_group
+                # A CUDA coordinator's device group cannot gather CPU payloads.
+                work = torch.distributed.all_gather_into_tensor(
+                    output.view(-1),
+                    value,
+                    group=gather_group.cpu_group
+                    if value.is_cpu
+                    else gather_group.device_group,
+                    async_op=True,
+                )
+                work.wait()
+                self._received_tensor_dict[key] = output
             self._payload_recv_works.clear()
             self._payload_waits_issued = True
         return self._received_tensor_dict
@@ -1962,6 +1995,7 @@ class GroupCoordinator:
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
         tag: int = 0,
+        batch_p2p: bool = False,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -1999,6 +2033,7 @@ class GroupCoordinator:
             metadata_list, dst=dst, async_send=async_send, tag=tag
         )
 
+        payloads = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
@@ -2009,6 +2044,9 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
+            if batch_p2p:
+                payloads.append((tensor, comm_group))
+                continue
             work = send_func(
                 tensor,
                 self.ranks[dst],
@@ -2017,6 +2055,24 @@ class GroupCoordinator:
             )
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))
+        if payloads:
+            works = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        tensor,
+                        self.ranks[dst],
+                        group=comm_group,
+                        tag=tag if tensor.is_cpu else 0,
+                    )
+                    for tensor, comm_group in payloads
+                ]
+            )
+            for work, (tensor, _) in zip(works, payloads):
+                if async_send:
+                    p2p_works.append(P2PWork(work, tensor))
+                else:
+                    work.wait()
         return p2p_works
 
     def recv_tensor_dict_async(
@@ -2024,6 +2080,7 @@ class GroupCoordinator:
         src: Optional[int] = None,
         tag: int = 0,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        batch_p2p: bool = False,
     ) -> TensorDictRecvHandle:
         """Receive asynchronously, optionally reconstructing TP slices.
 
@@ -2037,7 +2094,7 @@ class GroupCoordinator:
         if not 0 <= src < self.world_size or src == self.rank_in_group:
             raise ValueError(f"Invalid source rank ({src})")
         return TensorDictRecvHandle(
-            self, src, tag=tag, all_gather_group=all_gather_group
+            self, src, tag=tag, all_gather_group=all_gather_group, batch_p2p=batch_p2p
         )
 
     def recv_tensor_dict(

@@ -518,7 +518,11 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             with self.pp_comm_stream_ctx:
                 self.device_module.current_stream().wait_event(event)
                 send_work = group.send_tensor_dict(
-                    tensors, all_gather_group=self.attn_tp_group, async_send=True, tag=1
+                    tensors,
+                    all_gather_group=self.attn_tp_group,
+                    async_send=True,
+                    tag=1,
+                    batch_p2p=True,
                 )
         self.launch_event = event
         self.schedule_stream.wait_event(event)

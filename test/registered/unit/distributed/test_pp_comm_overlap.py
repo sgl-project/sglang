@@ -245,8 +245,10 @@ class TestPPCommOverlap(CustomTestCase):
 
 class TestVPPActivationTransport(CustomTestCase):
     def test_async_tp_slices_reconstruct_original_shapes(self):
-        for lane in range(4):
-            with self.subTest(lane=lane):
+        for lane, batch_p2p in [
+            (lane, batch) for lane in range(4) for batch in (False, True)
+        ]:
+            with self.subTest(lane=lane, batch_p2p=batch_p2p):
                 mailbox = deque()
                 expected = {
                     "hidden": torch.arange(24).reshape(3, 8),
@@ -264,11 +266,22 @@ class TestVPPActivationTransport(CustomTestCase):
                     self.assertEqual(tensor.shape, sent.shape)
                     return SimpleNamespace(wait=lambda: tensor.copy_(sent))
 
-                def gather(tensor, dim=0):
+                def gather(output, tensor, group=None, async_op=False):
+                    self.assertIs(group, tp.cpu_group)
                     torch.testing.assert_close(
                         tensor, expected["hidden"].reshape(4, -1)[lane]
                     )
-                    return expected["hidden"].flatten().clone()
+                    return SimpleNamespace(
+                        wait=lambda: output.copy_(expected["hidden"].flatten())
+                    )
+
+                def batch(ops):
+                    self.assertEqual([op.tensor.numel() for op in ops], [6, 7])
+                    self.assertTrue(all(op.tag == 17 for op in ops))
+                    return [
+                        op.op(op.tensor, op.peer, group=op.group, tag=op.tag)
+                        for op in ops
+                    ]
 
                 group = object.__new__(GroupCoordinator)
                 group.__dict__.update(
@@ -280,19 +293,29 @@ class TestVPPActivationTransport(CustomTestCase):
                     device=torch.device("cpu"),
                 )
                 tp = SimpleNamespace(
-                    world_size=4, rank_in_group=lane, all_gather=gather
+                    world_size=4, rank_in_group=lane, cpu_group=object()
                 )
                 with patch.multiple(
                     torch.distributed,
                     is_initialized=lambda: True,
                     isend=send,
                     irecv=recv,
+                    P2POp=lambda op, tensor, peer, group=None, tag=0: SimpleNamespace(
+                        op=op, tensor=tensor, peer=peer, group=group, tag=tag
+                    ),
+                    batch_isend_irecv=batch,
+                    all_gather_into_tensor=gather,
                 ):
                     group.send_tensor_dict(
-                        expected, dst=1, all_gather_group=tp, async_send=True
+                        expected,
+                        dst=1,
+                        all_gather_group=tp,
+                        async_send=True,
+                        batch_p2p=batch_p2p,
+                        tag=17,
                     )
                     actual = group.recv_tensor_dict_async(
-                        src=1, all_gather_group=tp
+                        src=1, all_gather_group=tp, batch_p2p=batch_p2p, tag=17
                     ).wait()
                 for key in ("hidden", "uneven", "empty"):
                     torch.testing.assert_close(actual[key], expected[key])

@@ -62,6 +62,7 @@ class VPPSchedulerActivationReceiver:
     def __init__(self, pp_group, tp_group, max_inflight, *, batch_p2p, tag):
         self.pp_group = pp_group
         self.tp_group = tp_group
+        self.batch_p2p = batch_p2p
         self.tag = tag
         self._handle = None
         self._receive_ready = False
@@ -85,7 +86,9 @@ class VPPSchedulerActivationReceiver:
     def _post_metadata(self):
         with self._context():
             self._handle = self.pp_group.recv_tensor_dict_async(
-                tag=self.tag, all_gather_group=self.tp_group
+                tag=self.tag,
+                all_gather_group=self.tp_group,
+                batch_p2p=self.batch_p2p,
             )
 
     def progress(self):
