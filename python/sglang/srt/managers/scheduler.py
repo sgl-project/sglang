@@ -3107,14 +3107,20 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
-        # PrefillAdder reserves one page per shard; the allocator reserves one.
-        # Subtract the other N - 1 pages to keep queue admission schedulable.
-        token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
-            - self.page_size * (self.kv_shard_widening - 1)
-        )
+        if shares_memory(self.token_to_kv_pool_allocator):
+            # Shared bands: the nominal max_total_num_tokens split is no
+            # per-request bound; max_new_tokens_for_memory prices the exact fit.
+            token_capacity = self.max_req_len + 1
+        else:
+            # PrefillAdder reserves one page per shard; the allocator reserves one.
+            # Subtract the other N - 1 pages to keep queue admission schedulable.
+            token_capacity = (
+                self.max_total_num_tokens * self.kv_shard_widening
+                - self.page_size * (self.kv_shard_widening - 1)
+            )
+            if is_cp_sharded_padded():
+                token_capacity = from_cp_sharded(token_capacity)
         if is_cp_sharded_padded():
-            token_capacity = from_cp_sharded(token_capacity)
             # (-input_len) % size is padding to the next multiple of size.
             # Replace physical-page padding and decode headroom with a CP group.
             group_size = self.logical_page_size

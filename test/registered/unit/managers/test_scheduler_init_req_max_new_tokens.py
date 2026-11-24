@@ -256,6 +256,46 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 scheduler.init_req_max_new_tokens(req)
                 self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
+    def test_unified_prompt_past_nominal_capacity_keeps_its_decode(self):
+        """Bug regression: under unified memory a prompt longer than the sizing's
+        nominal max_total_num_tokens, but within what the shared bands hold, was
+        admitted and then generated 0 tokens."""
+        bundle = build_test_unified_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float16,
+            head_num=1,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=1,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=4,
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            total_bytes=11648,
+            enable_memory_saver=False,
+            need_sort=False,
+            lazy_compaction=True,
+        )
+        allocator = bundle.token_to_kv_pool_allocator
+        allocator.storage.bind_window_retention(8, None)
+        # The ratio-derived nominal capacity is well below what one request may hold.
+        scheduler = self._new_scheduler(
+            page_size=4,
+            max_total_num_tokens=allocator.size_full // 2,
+            max_req_len=allocator.size_full,
+        )
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.sliding_window_size = 8
+        scheduler.chunked_prefill_size = 8
+        scheduler.max_new_tokens_limit = None
+        req = self._new_req(max_new_tokens=32, input_len=allocator.size_full // 2 + 60)
+        req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 32)
+
     def test_pd_prefill_forces_one_handoff_token(self):
         """Bug regression: a PD-prefill request whose memory budget clamps to
         0 became is_prefill_only, so the prefill node shipped a dummy token 0
