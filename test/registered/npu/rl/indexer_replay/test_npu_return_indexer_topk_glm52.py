@@ -46,9 +46,7 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env={
                 **os.environ,
-                "PYTORCH_NPU_ALLOC_CONF": (
-                    "expandable_segments:True,pin_memory_expandable_segments:True"
-                ),
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             other_args=[
                 "--device",
