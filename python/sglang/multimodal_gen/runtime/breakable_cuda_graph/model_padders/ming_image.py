@@ -5,7 +5,7 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph import prompt_padding
 
 
 def is_ming_image(current_model, call_kwargs):
-    return prompt_padding.transformer_class_name_matches(current_model, "MingImage")
+    return prompt_padding.transformer_class_name_matches(current_model, "mingimage")
 
 
 def preserve_ming_prompt(call_kwargs, current_model, buckets):

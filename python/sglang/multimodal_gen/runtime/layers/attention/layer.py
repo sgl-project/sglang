@@ -136,6 +136,7 @@ def _kv_gather_unsupported_reason(
     replicated_mode_count: int,
     attn_mask: torch.Tensor | None,
     num_replicated_kv_prefix: int,
+    query_len: int,
 ) -> str | None:
     """Call shapes the gather path does not take; explicit mode fails closed
     on these, auto falls back to the Ulysses exchange for the call."""
@@ -153,6 +154,11 @@ def _kv_gather_unsupported_reason(
             return "K/V-gather SP masked attention expects a [B, S_local] mask."
         if torch.is_floating_point(attn_mask):
             return "K/V-gather SP supports boolean or integer padding masks."
+        # the gather path reads the mask as the local rows of one sequence: its
+        # keys after the gather, and the query rows to zero. A cross-attention
+        # key mask has another length
+        if attn_mask.shape[1] != query_len:
+            return "K/V-gather SP masked attention expects one mask row per query row."
     return None
 
 
@@ -1108,6 +1114,7 @@ class USPAttention(nn.Module):
                 replicated_mode_count=replicated_mode_count,
                 attn_mask=attn_mask,
                 num_replicated_kv_prefix=num_replicated_kv_prefix,
+                query_len=q.shape[1],
             )
             if unsupported is None:
                 return self._forward_with_kv_gather(
@@ -1671,7 +1678,8 @@ class USPAttention(nn.Module):
         """
         groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
         if (
-            not q.is_cuda
+            envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+            or not q.is_cuda
             or groups in (0, 1)
             or self.backend not in PIPELINED_ATTENTION_BACKENDS
             or torch.compiler.is_compiling()
