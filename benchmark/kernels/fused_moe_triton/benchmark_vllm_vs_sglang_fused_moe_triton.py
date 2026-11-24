@@ -1,9 +1,14 @@
-# python3 benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py --model /DeepSeek-V3/ --tp-size 8 --use-fp8-w8a8
+# Run from the repository root:
+# python3 -m benchmark.kernels.fused_moe_triton.benchmark_vllm_vs_sglang_fused_moe_triton --model /DeepSeek-V3/ --tp-size 8 --use-fp8-w8a8
 import argparse
 
 import torch
 import triton
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
+from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    fused_experts as fused_experts_vllm,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 
 from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.distributed.parallel_state import (
@@ -12,9 +17,11 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.test_utils import publish_build_topology
 
 from .common_utils import get_model_config
@@ -33,37 +40,19 @@ def fused_moe_vllm_api(
     a2_scale=None,
     block_shape=None,
 ):
-    if block_shape is not None:
-        return fused_moe_vllm(
-            x,
-            w1,
-            w2,
-            input_gating,
-            topk,
-            renormalize=True,
-            inplace=True,
-            use_fp8_w8a8=use_fp8_w8a8,
+    topk_weights, topk_ids, _ = fused_topk(x, input_gating, topk, renormalize=True)
+    quant_config = None
+    if use_fp8_w8a8:
+        quant_config = fp8_w8a8_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
         )
-    else:
-        return fused_moe_vllm(
-            x,
-            w1,
-            w2,
-            input_gating,
-            topk,
-            renormalize=True,
-            inplace=True,
-            use_fp8_w8a8=use_fp8_w8a8,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-        )
+    return fused_experts_vllm(
+        x, w1, w2, topk_weights, topk_ids, quant_config=quant_config
+    )
 
 
 def fused_moe_sglang_api(
@@ -79,14 +68,19 @@ def fused_moe_sglang_api(
     a2_scale=None,
     block_shape=None,
 ):
+    # Keep routing in the timed call, as in the vLLM provider.
+    topk_output = select_experts(
+        hidden_states=x,
+        router_logits=input_gating,
+        topk_config=TopKConfig(top_k=topk, renormalize=True),
+    )
     return fused_moe_sglang(
         x,
         w1,
         w2,
-        input_gating,
-        topk,
-        renormalize=True,
-        inplace=True,
+        topk_output,
+        # vLLM's fused_experts also allocates a separate output tensor.
+        moe_runner_config=MoeRunnerConfig(inplace=False),
         use_fp8_w8a8=use_fp8_w8a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
