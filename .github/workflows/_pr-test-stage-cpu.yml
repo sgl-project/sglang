@@ -39,7 +39,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
 jobs:
@@ -73,7 +73,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - uses: ./.github/actions/check-pr-test-health
 
@@ -110,7 +114,7 @@ jobs:
         with:
           workspaces: rust
           shared-key: "sglang-grpc-cpu"
-          save-if: ${{ matrix.partition == 0 && !fromJson(inputs.caller_inputs).skip_cache_save }}
+          save-if: ${{ matrix.partition == 0 && !fromJson(inputs.caller_inputs).skip_cache_save && github.event_name != 'pull_request_target' }}
 
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
@@ -158,13 +162,12 @@ jobs:
           # its kernel libraries. The fork worker skips these on a host with a CUDA driver.
           python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json --fork-worker-batch-size 20 --fork-worker-preload transformers.models.llama.modeling_llama sglang.srt.layers.quantization sglang.test.test_utils $CONTINUE_ON_ERROR_FLAG
 
-      # PRs save only what the base lacks; the implicit if: success() keeps a
-      # half-downloaded cache unpublished. skip_cache_save is for callers that
-      # dispatch on main but test PR code (run-cpu-ci.yml): a save there would
-      # publish PR-written files under main's cache scope.
+      # skip_cache_save callers dispatch on main but test PR code (run-cpu-ci.yml): a save
+      # there would publish PR-written files under main's cache scope. The implicit
+      # if: success() keeps a half-downloaded cache unpublished.
       - name: Decide whether to save the HF cache
         id: hf_cache_save
-        if: ${{ !fromJson(inputs.caller_inputs).skip_cache_save }}
+        if: ${{ !fromJson(inputs.caller_inputs).skip_cache_save && github.event_name != 'pull_request_target' }}
         run: |
           size=$(du -sb "$HF_HOME" 2>/dev/null | cut -f1)
           after=${size:-0}

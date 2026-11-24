@@ -308,7 +308,7 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ignore_eos</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`bool = False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Don't stop generation when EOS token is sampled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Don't stop generation when EOS token is sampled. A length finish's `meta_info.finish_reason.ignored_stop.position` is the output length at which a stop token (EOS, the tokenizer's additional stop tokens, or `stop_token_ids`) would have ended the request without `ignore_eos`. `ignored_stop` is `null` if none would have, and a beam's length finish always reports `null`.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>sampling_seed</td>

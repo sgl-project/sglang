@@ -64,7 +64,7 @@ jobs:
           fi
 
   # A draft or missing run-ci skips the checks; reruns fetch current labels
-  # instead of replaying the original event's labels after /tag-run-ci-label adds run-ci.
+  # instead of replaying the original event's labels after /tag-and-rerun-ci adds run-ci.
   sgl-processor-gate:
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-gate' || 'sgl-processor-gate' }}
     needs: sgl-processor-changes
