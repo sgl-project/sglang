@@ -220,6 +220,12 @@ _SP_ASYNC_TP_MIN_TOKENS = 4096
 _SP_O_PROJ_A2A_MIN_TOKENS = 256
 
 
+_SP_O_PROJ_DIRECT_UPDATE_ERROR = (
+    "load_format='direct' does not refresh Muse Spark's replicated SP o_proj; "
+    "update weights with the default load format."
+)
+
+
 @torch.no_grad()
 def _replicate_sp_o_proj(layers) -> None:
     group = get_parallel().tp_group
@@ -234,6 +240,8 @@ def _replicate_sp_o_proj(layers) -> None:
             gathered.permute(1, 0, 2).reshape(shard.shape[0], -1).contiguous()
         )
         o_proj._sp_full_weight_min_tokens = _SP_O_PROJ_A2A_MIN_TOKENS
+        # post_load_weights rebuilds the replica; a direct copy would bypass it
+        o_proj._direct_weight_update_error = _SP_O_PROJ_DIRECT_UPDATE_ERROR
         del gathered
 
 
