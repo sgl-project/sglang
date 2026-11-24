@@ -51,6 +51,9 @@ pub enum DatasetName {
     /// The first turn of each ShareGPT conversation, with its reply's length
     /// as the output length.
     Sharegpt,
+    /// OpenAI chat completion requests, one JSON object per line, sent to a
+    /// chat backend with their `messages` and other fields as written.
+    Openai,
 }
 
 #[derive(Debug, Deserialize, Parser)]
@@ -93,7 +96,8 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "sharegpt")]
     pub dataset_name: DatasetName,
 
-    /// Path to a local ShareGPT JSON. Empty downloads and caches it.
+    /// Path to a local ShareGPT JSON, or the `openai` dataset's JSONL. Empty
+    /// downloads and caches ShareGPT.
     #[arg(long, default_value = "")]
     pub dataset_path: String,
 
@@ -306,6 +310,7 @@ impl DatasetName {
             Self::Random => "random",
             Self::RandomIds => "random-ids",
             Self::Sharegpt => "sharegpt",
+            Self::Openai => "openai",
         }
     }
 
@@ -381,6 +386,14 @@ impl Args {
         anyhow::ensure!(
             !self.tokenize_prompt || self.backend.api() != Api::OpenaiChat,
             "--tokenize-prompt cannot be used with a chat backend, which sends messages"
+        );
+        anyhow::ensure!(
+            self.dataset_name != DatasetName::Openai || self.backend.api() == Api::OpenaiChat,
+            "--dataset-name openai sends chat messages; use a chat backend such as sglang-oai-chat"
+        );
+        anyhow::ensure!(
+            self.dataset_name != DatasetName::Openai || !self.dataset_path.is_empty(),
+            "--dataset-name openai needs --dataset-path, a JSONL file of chat requests"
         );
         anyhow::ensure!(
             self.protocol == Protocol::Http || self.backend.api() == Api::SglangGenerate,

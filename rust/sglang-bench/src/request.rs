@@ -100,6 +100,9 @@ impl RequestTemplate {
                 match &row.prompt {
                     Prompt::Text(text) => body["text"] = serde_json::json!(text),
                     Prompt::TokenIds(ids) => body["input_ids"] = serde_json::json!(ids),
+                    Prompt::Messages(_) => {
+                        unreachable!("--dataset-name openai is rejected for non-chat backends")
+                    }
                 }
                 if self.top_logprobs_num > 0 {
                     body["top_logprobs_num"] = serde_json::json!(self.top_logprobs_num);
@@ -110,6 +113,9 @@ impl RequestTemplate {
                 let prompt = match &row.prompt {
                     Prompt::Text(text) => serde_json::json!(text),
                     Prompt::TokenIds(ids) => serde_json::json!(ids),
+                    Prompt::Messages(_) => {
+                        unreachable!("--dataset-name openai is rejected for non-chat backends")
+                    }
                 };
                 let mut body = serde_json::json!({
                     "model": self.model,
@@ -130,19 +136,31 @@ impl RequestTemplate {
                 body
             }
             Api::OpenaiChat => {
-                let Prompt::Text(text) = &row.prompt else {
-                    unreachable!("--tokenize-prompt is rejected for chat backends");
+                let messages = match &row.prompt {
+                    Prompt::Text(text) => serde_json::json!([{"role": "user", "content": text}]),
+                    Prompt::Messages(messages) => serde_json::json!(messages),
+                    Prompt::TokenIds(_) => {
+                        unreachable!("--tokenize-prompt is rejected for chat backends")
+                    }
                 };
                 let mut body = serde_json::json!({
                     "model": self.model,
-                    "messages": [{"role": "user", "content": text}],
+                    "messages": messages,
                     "max_completion_tokens": output_len,
                     "stream": self.stream,
                 });
-                if !self.extra_body.contains_key("temperature") {
+                // The row's prompt length comes from the server; a stream only
+                // reports usage when asked to.
+                if self.stream && row.prompt_len == 0 {
+                    body["stream_options"] = serde_json::json!({"include_usage": true});
+                }
+                let overrides = |key: &str| {
+                    self.extra_body.contains_key(key) || row.extra_body.contains_key(key)
+                };
+                if !overrides("temperature") {
                     body["temperature"] = serde_json::json!(0.0);
                 }
-                if !self.extra_body.contains_key("ignore_eos") {
+                if !overrides("ignore_eos") {
                     body["ignore_eos"] = serde_json::json!(self.ignore_eos);
                 }
                 body
@@ -152,7 +170,8 @@ impl RequestTemplate {
         let Some(object) = body.as_object_mut() else {
             unreachable!("every branch builds a JSON object");
         };
-        for (key, value) in &self.extra_body {
+        // The row's fields win over `--extra-request-body`, as in Python.
+        for (key, value) in self.extra_body.iter().chain(&row.extra_body) {
             object.insert(key.clone(), value.clone());
         }
         body
@@ -565,6 +584,8 @@ fn completion_tokens(data: &Value) -> Option<usize> {
 /// Take the prompt length from the server, the only side that knows it:
 /// `usage.prompt_tokens` on the OpenAI routes, `meta_info.prompt_tokens` on
 /// the native one. A server that reports neither leaves the row's value.
+/// A row that could not count its own prompt (the `openai` dataset) takes the
+/// reported length for the input totals as well.
 fn record_server_prompt_len(data: &Value, output: &mut RequestOutput) {
     let reported = data.get("usage").or_else(|| data.get("meta_info"));
     let Some(tokens) = reported
@@ -575,6 +596,10 @@ fn record_server_prompt_len(data: &Value, output: &mut RequestOutput) {
     };
     if tokens > 0 {
         output.prompt_len = tokens as usize;
+        if output.dataset_prompt_len == 0 {
+            output.dataset_prompt_len = output.prompt_len;
+            output.dataset_text_prompt_len = output.prompt_len;
+        }
     }
 }
 
@@ -620,6 +645,7 @@ mod tests {
             output_len: 16,
             text_prompt_len: 7,
             vision_prompt_len: 0,
+            extra_body: Map::new(),
         }
     }
 
@@ -761,6 +787,63 @@ mod tests {
         assert_eq!(output.output_len, 2);
         assert_eq!(output.prompt_len, 3);
         assert_eq!(output.itl.len(), 1);
+    }
+
+    /// An `openai` row goes out as written: its messages, its fields over
+    /// `--extra-request-body`, and a request for usage so the stream reports
+    /// the prompt length the row could not count. A text row asks for nothing.
+    #[test]
+    fn chat_body_sends_an_openai_row_as_written() {
+        let mut template = template(Api::OpenaiChat);
+        template.extra_body =
+            serde_json::from_str(r#"{"temperature": 0.1, "top_p": 0.5}"#).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "user", "content": "q"}),
+        ];
+        let mut openai = row(Prompt::Messages(messages.clone()));
+        openai.prompt_len = 0;
+        openai.extra_body =
+            serde_json::from_str(r#"{"temperature": 0.7, "tools": [{"type": "function"}]}"#)
+                .unwrap();
+
+        let body = template.body(&openai, 8);
+        assert_eq!(body["messages"], serde_json::json!(messages));
+        assert_eq!(body["max_completion_tokens"], 8);
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.5);
+        assert_eq!(body["tools"], serde_json::json!([{"type": "function"}]));
+        assert_eq!(body["stream_options"]["include_usage"], true);
+
+        let text = template.body(&row(Prompt::Text("hi".into())), 8);
+        assert!(text.get("stream_options").is_none());
+        assert_eq!(text["temperature"], 0.1);
+    }
+
+    /// The reported prompt length fills the input totals only for a row that
+    /// had none of its own.
+    #[test]
+    fn server_prompt_len_fills_only_an_unknown_row_length() {
+        let frame: Value = serde_json::from_str(r#"{"usage": {"prompt_tokens": 42}}"#).unwrap();
+        let mut unknown = RequestOutput::default();
+        record_server_prompt_len(&frame, &mut unknown);
+        assert_eq!(
+            (
+                unknown.prompt_len,
+                unknown.dataset_prompt_len,
+                unknown.dataset_text_prompt_len
+            ),
+            (42, 42, 42)
+        );
+
+        let mut known = RequestOutput {
+            prompt_len: 7,
+            dataset_prompt_len: 7,
+            dataset_text_prompt_len: 7,
+            ..Default::default()
+        };
+        record_server_prompt_len(&frame, &mut known);
+        assert_eq!((known.prompt_len, known.dataset_prompt_len), (42, 7));
     }
 
     /// Reasoning tokens count as generated content, and the standard spelling
