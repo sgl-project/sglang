@@ -32,13 +32,14 @@ def enable_func_timer():
     global enable_metrics, FUNC_LATENCY
     enable_metrics = True
 
-    FUNC_LATENCY = Histogram(
-        "sglang:func_latency_seconds",
-        "Function latency in seconds",
-        # captures latency in range [50ms - ~50s]
-        buckets=exponential_buckets(start=0.05, width=1.5, length=18),
-        labelnames=["name"],
-    )
+    if FUNC_LATENCY is None:
+        FUNC_LATENCY = Histogram(
+            "sglang:func_latency_seconds",
+            "Function latency in seconds",
+            # captures latency in range [50ms - ~50s]
+            buckets=exponential_buckets(start=0.05, width=1.5, length=18),
+            labelnames=["name"],
+        )
 
 
 FUNC_LATENCY = None
@@ -59,28 +60,26 @@ def time_func_latency(
     """
 
     def measure(func: Callable[..., Any]) -> Callable[..., Any]:
-        nonlocal name
-
-        name = name or func.__name__
+        metric_name = name or func.__name__
 
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
-            if not enable_metrics:
+            if not enable_metrics or FUNC_LATENCY is None:
                 return await func(*args, **kwargs)
 
             metric = FUNC_LATENCY
             start = time.monotonic()
-            ret = func(*args, **kwargs)
-            if isinstance(ret, asyncio.Future) or asyncio.iscoroutine(ret):
-                try:
+            try:
+                ret = func(*args, **kwargs)
+                if isinstance(ret, asyncio.Future) or asyncio.iscoroutine(ret):
                     ret = await ret
-                finally:
-                    metric.labels(name=name).observe(time.monotonic() - start)
-            return ret
+                return ret
+            finally:
+                metric.labels(name=metric_name).observe(time.monotonic() - start)
 
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
-            if not enable_metrics:
+            if not enable_metrics or FUNC_LATENCY is None:
                 return func(*args, **kwargs)
 
             metric = FUNC_LATENCY
@@ -88,7 +87,7 @@ def time_func_latency(
             try:
                 ret = func(*args, **kwargs)
             finally:
-                metric.labels(name=name).observe(time.monotonic() - start)
+                metric.labels(name=metric_name).observe(time.monotonic() - start)
             return ret
 
         if asyncio.iscoroutinefunction(func):
