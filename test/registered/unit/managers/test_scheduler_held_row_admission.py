@@ -19,7 +19,10 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler import ADMISSION_RETRY_DECAY_STEPS, Scheduler
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -371,3 +374,47 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAdmissionRetryAsRatioDecays(CustomTestCase):
+    """A batch closed by NO_TOKEN reopens while the new token ratio decays (#52821)."""
+
+    def _scheduler(self, waiting, current=0.7):
+        return SimpleNamespace(
+            new_token_ratio_tracker=NewTokenRatioTracker(
+                init=0.7, min=0.1, decay=0.001, current=current
+            ),
+            waiting_queue=[object()] * waiting,
+            decays_since_admission_retry=0,
+        )
+
+    def _decay(self, s, batch, steps):
+        for _ in range(steps):
+            Scheduler._decay_new_token_ratio(s, batch)
+
+    def test_full_batch_reopens_after_the_retry_interval(self):
+        s = self._scheduler(waiting=1)
+        batch = SimpleNamespace(batch_is_full=True)
+        self._decay(s, batch, ADMISSION_RETRY_DECAY_STEPS - 1)
+        self.assertTrue(batch.batch_is_full)
+        self._decay(s, batch, 1)
+        self.assertFalse(batch.batch_is_full)
+
+    def test_empty_queue_keeps_the_batch_closed(self):
+        s = self._scheduler(waiting=0)
+        batch = SimpleNamespace(batch_is_full=True)
+        self._decay(s, batch, 4 * ADMISSION_RETRY_DECAY_STEPS)
+        self.assertTrue(batch.batch_is_full)
+
+    def test_ratio_at_its_floor_keeps_the_batch_closed(self):
+        s = self._scheduler(waiting=1, current=0.1)
+        batch = SimpleNamespace(batch_is_full=True)
+        self._decay(s, batch, 4 * ADMISSION_RETRY_DECAY_STEPS)
+        self.assertTrue(batch.batch_is_full)
+
+    def test_last_decay_step_reopens_the_batch(self):
+        s = self._scheduler(waiting=1, current=0.1005)
+        batch = SimpleNamespace(batch_is_full=True)
+        self._decay(s, batch, 1)
+        self.assertEqual(s.new_token_ratio_tracker.current, 0.1)
+        self.assertFalse(batch.batch_is_full)

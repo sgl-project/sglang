@@ -470,6 +470,10 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
 STEP_MAX_US = 2_000_000
+
+# Decode steps between admission retries while a batch closed by NO_TOKEN has
+# requests waiting and the new token ratio is still decaying.
+ADMISSION_RETRY_DECAY_STEPS = 16
 # Min wall-clock between load publishes on the stalled no-batch path, which
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
@@ -1621,6 +1625,7 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+        self.decays_since_admission_retry = 0
 
     def feed_watchdog(self) -> None:
         """Tell the watchdogs the scheduler is alive while it waits on the host
@@ -5233,6 +5238,30 @@ class Scheduler(
             and req.next_output_finishes_by_length()
         ]
 
+    def _decay_new_token_ratio(self, batch: ScheduleBatch) -> None:
+        """Decay the ratio and let a batch closed by NO_TOKEN retry admission.
+
+        The reservation for running requests shrinks with the ratio, so the
+        budget that refused a waiting request grows while no request leaves.
+        """
+        tracker = self.new_token_ratio_tracker
+        before = tracker.current
+        tracker.decay_step()
+        if (
+            not batch.batch_is_full
+            or len(self.waiting_queue) == 0
+            or tracker.current == before
+        ):
+            self.decays_since_admission_retry = 0
+            return
+        self.decays_since_admission_retry += 1
+        if (
+            self.decays_since_admission_retry >= ADMISSION_RETRY_DECAY_STEPS
+            or tracker.current == tracker.min
+        ):
+            self.decays_since_admission_retry = 0
+            batch.batch_is_full = False
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
@@ -5312,7 +5341,7 @@ class Scheduler(
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
         else:
-            self.new_token_ratio_tracker.decay_step()
+            self._decay_new_token_ratio(batch)
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
