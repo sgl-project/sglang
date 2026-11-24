@@ -77,9 +77,16 @@ destination per configured live slot before applying backpressure.
 | Qwen2-Audio, Qwen3-ASR | — | — | Yes |
 
 Use PP=DP=1. Each encoder replica can use tensor parallelism within one node.
-All media in a request go to one replica. On P/PD, TP rank 0 receives the
-embeddings and broadcasts them to its peers. In E/P/D, D reconstructs the token
-positions from the descriptor. Configure P→D KV transfer independently.
+All media in a request go to one encoder replica. On P/PD, TP rank 0 claims
+the transfer once, receives and verifies the embeddings, and broadcasts each
+item's tensor to its TP peers. E tracks one destination and can release its
+embedding when that send completes. With NIXL, only rank 0 registers a receive
+pool. P/PD receives host tensors over NIXL or ZMQ and broadcasts them
+through the CPU process group (Gloo). Native scheduler ZMQ can send directly
+to each TP rank, which avoids that broadcast and sends one copy from E per rank.
+
+In E/P/D, D reconstructs token positions from the descriptor. Configure P→D KV
+transfer independently.
 
 A registered Python multimodal processor declares its `staged_layouts` by
 model type. Its `StagedMediaLayout` supplies the media capabilities, embedding
