@@ -932,6 +932,19 @@ def install_megakernel(
     tokens = _tokens_per_request()
     tensor_verify = tokens > 1 and spec.tensor_verify_build is not None
     reasons = _requirement_reasons(spec=spec, hf_config=hf_config)
+    # The draft's own forward serves a draft spec this server or GPU does not meet; all
+    # ranks decline together, skipping the collectives below.
+    if is_draft and (
+        unmet := sorted(set().union(*_gather_tp(reasons + _residency_reasons(spec))))
+    ):
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "NVIDIA megakernel: %s does not serve this setup (%s); the draft "
+                "keeps its own forward",
+                spec.name,
+                "; ".join(unmet),
+            )
+        return
     reasons += _layout_reasons()
     if not tensor_verify:
         reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
@@ -1308,15 +1321,20 @@ def _model_disable_reasons(
         reasons += spec.model_disable_reasons(model, hf_config)
     if "forward" in model.__dict__:
         reasons.append("the model's forward is already replaced on this instance")
+    return reasons + _residency_reasons(spec)
+
+
+def _residency_reasons(spec: MegakernelSpec) -> list[str]:
+    """This rank's GPU cannot keep the spec's persistent grids resident."""
     sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
     if sms < spec.requires.resident_blocks:
-        reasons.append(
+        return [
             f"{Feature.PARTITIONED_GPU.value}: {sms} SMs, the persistent grids need "
             f"{spec.requires.resident_blocks}"
-        )
-    return reasons
+        ]
+    return []
 
 
 class _Dispatch:

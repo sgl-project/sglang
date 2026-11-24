@@ -1,0 +1,33 @@
+name: CI Scripts Test
+
+on:
+  pull_request:
+    paths:
+      - "scripts/ci/**"
+      - ".github/workflows/pr-test.yml"
+      - ".github/workflows/pr-gate.yml"
+      - ".github/workflows/ci-scripts-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install PyGithub PyYAML
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s scripts/ci/utils -p 'test_run_ci_approval.py' -v
+          python -m unittest discover -s scripts/ci -p 'test_diffusion_rust_gate.py' -v
