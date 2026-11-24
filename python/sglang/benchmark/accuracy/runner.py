@@ -70,9 +70,7 @@ def resolve_eval_name(dataset_name: str) -> str:
 
 
 def _build_run_eval_args(args, base_url: str, eval_name: str) -> SimpleNamespace:
-    num_threads = getattr(args, "accuracy_num_threads", None)
-    if num_threads is None:
-        num_threads = args.max_concurrency or 64
+    num_threads = args.max_concurrency or 64
 
     num_examples = args.num_prompts
     if num_examples is None or num_examples <= 0:
@@ -81,6 +79,10 @@ def _build_run_eval_args(args, base_url: str, eval_name: str) -> SimpleNamespace
     api = "chat"
     if eval_name == "gsm8k":
         api = "completion"
+
+    dataset_path = getattr(args, "dataset_path", None) or None
+    if dataset_path == "":
+        dataset_path = None
 
     return SimpleNamespace(
         base_url=base_url,
@@ -91,7 +93,7 @@ def _build_run_eval_args(args, base_url: str, eval_name: str) -> SimpleNamespace
         api=api,
         num_examples=num_examples,
         num_threads=num_threads,
-        max_tokens=getattr(args, "accuracy_max_tokens", 2048),
+        max_tokens=2048,
         temperature=getattr(args, "temperature", 0.0),
         top_p=getattr(args, "top_p", 1.0),
         repeat=1,
