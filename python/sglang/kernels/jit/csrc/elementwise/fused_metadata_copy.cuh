@@ -170,12 +170,16 @@ __global__ void fused_metadata_copy_kernel(const FusedMetadataCopyParams __grid_
 
   // Branch 1: page_table copy (different dimensions per mode)
   if (forward_mode == 0) {  // DECODE
-    int page_table_elements = bs * max_len;
+    // a row's live prefix only: readers bound page-table reads by cache_seqlens
+    // (the decode metadata fill leaves the tail stale too)
+    for (int row = 0; row < bs; ++row) {
+      const int n = min(src.cache_seqlens[row], max_len);
+      const int32_t* s = src.page_indices + row * max_len;
+      int32_t* d = dst.page_table_1 + row * page_table_1_stride;
 #pragma unroll 4
-    for (int i = tid; i < page_table_elements; i += total_threads) {
-      int row = i / max_len;
-      int col = i % max_len;
-      dst.page_table_1[row * page_table_1_stride + col] = src.page_indices[i];
+      for (int col = tid; col < n; col += total_threads) {
+        d[col] = s[col];
+      }
     }
   } else {  // TARGET_VERIFY or DRAFT_EXTEND
     int page_table_elements = page_indices_rows * max_seqlen_k;

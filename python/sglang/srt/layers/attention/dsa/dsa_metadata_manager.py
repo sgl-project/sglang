@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
 
 from sglang.kernels.ops.attention.dsa.metadata import (
     fused_dsa_decode_metadata,
@@ -231,8 +233,13 @@ class DSAMetadataManagementMixin:
         bs: int,
         precomputed: PrecomputedMetadata,
         forward_mode: ForwardMode,
+        kpool_copies: Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]] = None,
     ) -> None:
-        """Copy replay metadata from a sibling using the same precomputed input."""
+        """Copy replay metadata from a sibling using the same precomputed input.
+
+        With ``kpool_copies`` (dst list, src list), the KPool buffer copies are
+        appended there for the caller to issue as one batched copy.
+        """
         metadata = self.decode_cuda_graph_metadata.get(bs)
         src_metadata = src_backend.decode_cuda_graph_metadata.get(bs)
         if (
@@ -274,45 +281,50 @@ class DSAMetadataManagementMixin:
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
-        self._copy_kpool_metadata_from_sibling(metadata, src_metadata)
+        self._copy_kpool_metadata_from_sibling(metadata, src_metadata, kpool_copies)
 
         self.forward_metadata = metadata
 
     def _copy_kpool_metadata_from_sibling(
-        self, metadata: DSAMetadata, src_metadata: DSAMetadata
+        self,
+        metadata: DSAMetadata,
+        src_metadata: DSAMetadata,
+        kpool_copies: Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]] = None,
     ) -> None:
         """Copy KPool metadata derived from identical inputs from a sibling."""
         if self.dsa_index_kpool <= 1 or not (is_cuda() or _is_hip):
             return
 
-        if metadata.pooled_cache_seqlens_int32 is not None:
-            metadata.pooled_cache_seqlens_int32.copy_(
-                src_metadata.pooled_cache_seqlens_int32
-            )
-        if metadata.pooled_real_page_table is not None:
-            metadata.pooled_real_page_table.copy_(src_metadata.pooled_real_page_table)
-        if metadata.pooled_paged_mqa_schedule_metadata is not None:
-            metadata.pooled_paged_mqa_schedule_metadata.copy_(
-                src_metadata.pooled_paged_mqa_schedule_metadata
-            )
-        if metadata.pooled_topk_v2_plan is not None:
-            metadata.pooled_topk_v2_plan.copy_(src_metadata.pooled_topk_v2_plan)
-
+        pairs = [
+            (
+                metadata.pooled_cache_seqlens_int32,
+                src_metadata.pooled_cache_seqlens_int32,
+            ),
+            (metadata.pooled_real_page_table, src_metadata.pooled_real_page_table),
+            (
+                metadata.pooled_paged_mqa_schedule_metadata,
+                src_metadata.pooled_paged_mqa_schedule_metadata,
+            ),
+            (metadata.pooled_topk_v2_plan, src_metadata.pooled_topk_v2_plan),
+        ]
         dst_plan = metadata.kpool_write_plan
         src_plan = src_metadata.kpool_write_plan
-        if dst_plan is None:
+        if dst_plan is not None:
+            pairs += [
+                (dst_plan.req, src_plan.req),
+                (dst_plan.write_start, src_plan.write_start),
+                (dst_plan.tail_logical_start, src_plan.tail_logical_start),
+                (dst_plan.write_loc, src_plan.write_loc),
+                (dst_plan.pool_seqlens_per_q, src_plan.pool_seqlens_per_q),
+                (dst_plan.seqlens_per_q, src_plan.seqlens_per_q),
+                (dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata),
+                (dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch),
+                (dst_plan.pool_topk_v2_plan, src_plan.pool_topk_v2_plan),
+            ]
+        pairs = [(d, s) for d, s in pairs if d is not None]
+        if kpool_copies is not None:
+            kpool_copies[0].extend(d for d, _ in pairs)
+            kpool_copies[1].extend(s for _, s in pairs)
             return
-        dst_plan.req.copy_(src_plan.req)
-        dst_plan.write_start.copy_(src_plan.write_start)
-        dst_plan.tail_logical_start.copy_(src_plan.tail_logical_start)
-        dst_plan.write_loc.copy_(src_plan.write_loc)
-        if dst_plan.pool_seqlens_per_q is not None:
-            dst_plan.pool_seqlens_per_q.copy_(src_plan.pool_seqlens_per_q)
-        if dst_plan.seqlens_per_q is not None:
-            dst_plan.seqlens_per_q.copy_(src_plan.seqlens_per_q)
-        if dst_plan.pool_schedule_metadata is not None:
-            dst_plan.pool_schedule_metadata.copy_(src_plan.pool_schedule_metadata)
-        if dst_plan.effective_n_per_batch is not None:
-            dst_plan.effective_n_per_batch.copy_(src_plan.effective_n_per_batch)
-        if dst_plan.pool_topk_v2_plan is not None:
-            dst_plan.pool_topk_v2_plan.copy_(src_plan.pool_topk_v2_plan)
+        for d, s in pairs:
+            d.copy_(s)

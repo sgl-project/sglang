@@ -642,10 +642,17 @@ def _can_use_kpool_topk_v2(
 
 
 def _alloc_kpool_topk_out(
-    *, logits: torch.Tensor, rows: int, out_cols: int, out_rows: int | None
+    *,
+    logits: torch.Tensor,
+    rows: int,
+    out_cols: int,
+    out_rows: int | None,
+    pad_rows_unset: bool = False,
 ) -> torch.Tensor:
     if out_rows is None or out_rows == rows:
         return logits.new_empty((rows, out_cols), dtype=torch.int32)
+    if pad_rows_unset:
+        return logits.new_empty((out_rows, out_cols), dtype=torch.int32)
     return logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
 
 
@@ -661,13 +668,18 @@ def _kpool_topk_v2_ragged(
     seq_lens: torch.Tensor | None,
     row_starts: torch.Tensor | None,
     out_rows: int | None,
+    pad_rows_unset: bool = False,
 ) -> torch.Tensor:
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_ragged_v2
 
     rows = logits.shape[0]
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
     full = _alloc_kpool_topk_out(
-        logits=logits, rows=rows, out_cols=out_cols, out_rows=out_rows
+        logits=logits,
+        rows=rows,
+        out_cols=out_cols,
+        out_rows=out_rows,
+        pad_rows_unset=pad_rows_unset,
     )
     topk_transform_kpool_ragged_v2(
         scores=logits,
@@ -698,6 +710,7 @@ def _kpool_topk_v2(
     seq_lens: torch.Tensor | None,
     out_rows: int | None,
     topk_v2_plan: torch.Tensor,
+    pad_rows_unset: bool = False,
 ) -> torch.Tensor:
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_v2
 
@@ -705,7 +718,11 @@ def _kpool_topk_v2(
     group_lengths = group_lengths.to(torch.int32)
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
     full = _alloc_kpool_topk_out(
-        logits=logits, rows=rows, out_cols=out_cols, out_rows=out_rows
+        logits=logits,
+        rows=rows,
+        out_cols=out_cols,
+        out_rows=out_rows,
+        pad_rows_unset=pad_rows_unset,
     )
     topk_transform_kpool_v2(
         scores=logits,
@@ -733,6 +750,7 @@ def _try_kpool_topk_v2(
     row_starts: torch.Tensor | None,
     out_rows: int | None,
     topk_v2_plan: torch.Tensor | None,
+    pad_rows_unset: bool = False,
 ) -> torch.Tensor | None:
     if topk_v2_plan is not None and _can_use_kpool_topk_v2(
         logits=logits,
@@ -750,6 +768,7 @@ def _try_kpool_topk_v2(
             seq_lens=seq_lens,
             out_rows=out_rows,
             topk_v2_plan=topk_v2_plan,
+            pad_rows_unset=pad_rows_unset,
         )
     if _kpool_topk_v2_layout_ok(logits=logits, pool_size=kpool):
         return _kpool_topk_v2_ragged(
@@ -763,6 +782,7 @@ def _try_kpool_topk_v2(
             seq_lens=seq_lens,
             row_starts=row_starts,
             out_rows=out_rows,
+            pad_rows_unset=pad_rows_unset,
         )
     return None
 
@@ -779,7 +799,10 @@ def topk_from_pooled_history_logits(
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
     topk_v2_plan: torch.Tensor | None = None,
+    pad_rows_unset: bool = False,
 ) -> torch.Tensor:
+    """``pad_rows_unset``: the ``out_rows`` rows past ``logits``' rows are left
+    unwritten instead of -1 (for callers that never read them)."""
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
     assert logits.shape[0] == group_lengths.shape[0]
@@ -817,6 +840,7 @@ def topk_from_pooled_history_logits(
         row_starts=row_starts,
         out_rows=out_rows,
         topk_v2_plan=topk_v2_plan,
+        pad_rows_unset=pad_rows_unset,
     )
     if v2_result is not None:
         return v2_result
@@ -1993,5 +2017,6 @@ def kpool_write_tail_and_maybe_compress(
         KEY_LN=key_norm is not None,
         QUANT_Q=q_out is not None,
         Q_HEADS=q_heads,
+        num_warps=1 if _is_hip else 4,
     )
     return q_out
