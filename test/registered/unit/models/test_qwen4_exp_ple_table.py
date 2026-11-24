@@ -502,11 +502,20 @@ class TestPlePinnedHugepageTable(CustomTestCase):
         self.assertEqual((table, cudart.calls), (None, []))
 
     def test_low_huge_page_coverage_is_a_warning(self):
-        with self.assertLogs(qwen4_exp_ple_table.logger, "WARNING") as logs:
+        # 16000-byte table, 4096-byte "huge pages": 12288 bytes can be covered
+        with (
+            mock.patch.object(qwen4_exp_ple_table, "_HUGEPAGE_ALIGN", 4096),
+            self.assertLogs(qwen4_exp_ple_table.logger, "WARNING") as logs,
+        ):
             table, _, _, _ = self._table(rc=0, coverage=0.5)
         self.assertIsNotNone(table)
         self.assertIn("only 50% of the", logs.output[0])
         self.assertIn("transparent_hugepage/enabled", logs.output[0])
+
+    def test_a_table_smaller_than_one_huge_page_does_not_warn(self):
+        with self.assertNoLogs(qwen4_exp_ple_table.logger, "WARNING"):
+            table, _, _, _ = self._table(rc=0, coverage=0.0)
+        self.assertIsNotNone(table)
 
     def test_the_table_is_unregistered_with_its_last_view(self):
         table, cudart, _, _ = self._table(rc=0)

@@ -555,7 +555,9 @@ def _pinned_hugepage_table(
     # interpreter exit the driver reclaims it.
     weakref.finalize(raw, cudart.cudaHostUnregister, base + offset).atexit = False
     covered = _huge_page_bytes(base + offset, nbytes)
-    if covered is not None and covered < _MIN_HUGEPAGE_COVERAGE * nbytes:
+    # only whole huge pages fit: the tail past the last one stays on base pages
+    coverable = nbytes // _HUGEPAGE_ALIGN * _HUGEPAGE_ALIGN
+    if covered is not None and covered < _MIN_HUGEPAGE_COVERAGE * coverable:
         logger.warning(
             "PLE table: only %.0f%% of the %.1f GiB table is on transparent huge pages, "
             "so its gather is slower; check /sys/kernel/mm/transparent_hugepage/enabled "
