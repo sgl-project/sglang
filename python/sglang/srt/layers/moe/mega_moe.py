@@ -36,7 +36,9 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -225,6 +227,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
         max_tokens_per_rank = max(global_num_tokens)
+        if len(global_num_tokens) > 1:
+            parallel = get_parallel()
+            if parallel.attn_dp_size > 1 and parallel.attn_cp_size == 1:
+                max_tokens_per_rank = ceil_div(
+                    max_tokens_per_rank, parallel.attn_tp_size
+                )
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
