@@ -127,6 +127,11 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     if child_a_batch_size > child_a_num_q_tokens:
         return False
 
+    # A cut on a seq boundary would give child_a a trailing zero-token seq;
+    # the seq-boundary split is as balanced without one.
+    if sum(extend_lens[:split_seq_index]) == child_a_num_q_tokens:
+        return False
+
     return True
 
 
@@ -534,10 +539,12 @@ class TboForwardBatchPreparer:
 
         tbo_split_token_index = cls._compute_split_token_index(batch)
 
+        # Same modes as compute_split_seq_index / compute_split_token_index: the
+        # children's seq range must follow the token range those two picked.
         is_enable_two_chunk = (
             batch.forward_mode == ForwardMode.EXTEND
-            and _is_two_chunk_split_enabled(batch.extend_seq_lens_cpu)
-        )
+            or batch.forward_mode == ForwardMode.MIXED
+        ) and _is_two_chunk_split_enabled(batch.extend_seq_lens_cpu)
 
         if _tbo_debug:
             logger.info(
