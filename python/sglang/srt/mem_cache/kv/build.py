@@ -87,6 +87,8 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     decode_pre_alloc_size: int = 0
     # Logged only: the state share governs the total budget, not the split.
     mamba_full_memory_ratio: Optional[float] = None
+    # Logical-page KV sharding of the owner sub-pool on this rank.
+    kv_shard_spec: Optional[Any] = None
 
 
 def _log_banner(*lines) -> None:
@@ -371,6 +373,7 @@ def build_kv_storage(
         lazy_compaction=ctx.lazy_compaction,
         full_cap_tokens=sized.full_cap_tokens,
         request_rows=sized.request_rows,
+        kv_shard_spec=ctx.kv_shard_spec,
         **legacy_capacities,
     )
     if window is None:

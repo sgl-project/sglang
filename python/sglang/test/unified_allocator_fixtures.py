@@ -676,6 +676,7 @@ def build_test_unified_pools(
     decode_pre_alloc_size=0,
     mamba_full_memory_ratio=None,
     fused_draft=None,
+    kv_shard_spec=None,
 ):
     """Build a unified pool stack from flat model arguments: the layer ids given
     for each kind (full, sliding-window, state) decide the sub-pools."""
@@ -747,6 +748,7 @@ def build_test_unified_pools(
         disable_overlap_schedule=disable_overlap_schedule,
         decode_pre_alloc_size=decode_pre_alloc_size,
         mamba_full_memory_ratio=mamba_full_memory_ratio,
+        kv_shard_spec=kv_shard_spec,
     )
     return storage_parts(
         build_unified_pools(

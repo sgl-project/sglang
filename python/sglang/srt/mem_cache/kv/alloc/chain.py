@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.kv.alloc.invariants import (
     WINDOW_SEGMENT_BOUND,
     WINDOW_SEGMENT_RELEASED,
 )
+from sglang.srt.mem_cache.kv.alloc.kv_shard import ShardedOwner
 from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     NO_MOVE,
@@ -271,6 +272,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     _stage_memo: Tuple[Optional[int], Tuple[ChainSnapshot, ...]] = (None, ())
     # The state sub-pool's band; None without recurrent state.
     mamba_allocator: Optional[Band] = None
+    # Logical-page KV sharding of the owner band (`kv_shard.ShardedOwner`);
+    # unsharded, every rank holds every owner page.
+    shard_size: int = 1
+    shard_spec = None
+    kv_shard: Optional[ShardedOwner] = None
+    # The snapshot a sharded chain's questions are asked of, by pricing key.
+    _shard_memo: Tuple[Any, Optional[ChainSnapshot]] = (None, None)
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -278,7 +286,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Token capacity for observers: held plus `available_size` with no window
         (the leak census's available term cancels), else the smaller side share."""
         if not self._windows:
-            return self.available_size() + self.full_attn_allocator.allocated_count()
+            return self.available_size() + self._held(self.full_attn_allocator)
         return min(self._size_full, self._size_swa)
 
     @size.setter
@@ -301,6 +309,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
         request_rows: Optional[int] = None,
+        kv_shard_spec=None,
     ):
         # Token bands share widened virtual pages. A replicated draft carries
         # every token inside its entries; target views select the rank's rows.
@@ -331,7 +340,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_attn_allocator = Band(
             sub_pool_name=roles.owner,
-            is_id_owner=True,
+            # Sharded, the sharding allocator mints the ids.
+            is_id_owner=kv_shard_spec is None,
             page_size=page_size,
             shards_under_dcp=shards_under_dcp,
             lazy_compaction=lazy_compaction,
@@ -381,6 +391,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             )
             for name in roles.requests
         }
+        if kv_shard_spec is not None:
+            self.shard_spec = kv_shard_spec
+            self.shard_size = kv_shard_spec.shard_size
+            self.kv_shard = ShardedOwner(
+                band=self.full_attn_allocator,
+                shard_spec=kv_shard_spec,
+            )
         # Role order: owner, window, state, requests. Every fan-out walks this tuple.
         self.members: Tuple[Band, ...] = tuple(
             b
@@ -443,6 +460,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Each side's nominal token share: the sizing's rows per rank in logical
         tokens, else the empty pool's; without a window, the owner's id space."""
         owner, window = self.full_attn_allocator, self.swa_attn_allocator
+        if self.kv_shard is not None:
+            # The logical id space: tables indexed by token id are sized from it.
+            self._size_full = self.kv_shard.token_id_space - 1
+            self._size_swa = 0
+            return
         if window is None:
             # A logical token capacity, widened like `size`, not a row count.
             self._size_full = (owner.max_slots - 1) * get_parallel().attn_dcp_size
@@ -510,10 +532,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             bits = (bits << 1) | bool(band.lazy_compaction)
         return (epoch << len(self.bands)) | bits
 
-    def pricing_key(self) -> int:
+    def pricing_key(self) -> Hashable:
         """What every capacity answer depends on besides its question: the key
         `pricing_snapshot` (and each stage's snapshot) is kept under."""
-        return self._snapshot_key_now()
+        key = self._snapshot_key_now()
+        if self.kv_shard is not None:
+            # A peer's take or free moves the class lists, not this rank's bands.
+            return key, self.kv_shard.ids_epoch
+        return key
 
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
@@ -628,6 +654,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     ) -> None:
         """Answer capacity questions as stage ``stage`` of ``geometries`` (stage order),
         asking every stage; each keeps the smallest nominal window share."""
+        assert self.kv_shard is None, "a sharded chain asks its shard snapshot"
         if geometries[stage] != self.stage_geometry():
             raise ValueError(f"stage {stage}'s geometry is not this chain's")
         check_stage_pools([(g.sub_pools(), g.page_size) for g in geometries])
@@ -649,7 +676,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             - band.min_page_index
             - len(band.free_virtual_ids)
             for band in (self.full_attn_allocator, self.mamba_allocator)
-            if band is not None
+            # A sharded owner band mints no ids: its count is the class lists'.
+            if band is not None and band.free_virtual_ids is not None
         }
         return live, used
 
@@ -657,6 +685,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """The snapshots each capacity question is asked of: the pricing snapshot on a
         single stage, else every stage's simulated snapshot, in stage order."""
         capacity = self.stage_capacity
+        if self.kv_shard is not None:
+            return (self._shard_snapshot(),)
         if capacity is None:
             return (self.pricing_snapshot(),)
         key = self._snapshot_key_now()
@@ -671,6 +701,27 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             )
         return self._stage_memo[1]
 
+    def _shard_snapshot(self) -> ChainSnapshot:
+        """The snapshot every rank of a KV shard group asks: the ranks build the
+        same arena and hold the same units, but for the owner band, which is
+        simulated at the fullest rank's pages (read off the mirrored class lists)."""
+        key = self.pricing_key()
+        if self._shard_memo[0] != key:
+            live, used = self._logical_counts()
+            owner = self.full_attn_allocator.sub_pool_name
+            live[owner] = used[owner] = max(self.kv_shard.live_pages())
+            snapshot = simulated_snapshot(self.stage_geometry(), live, used)
+            self._shard_memo = (key, snapshot)
+        return self._shard_memo[1]
+
+    def _per_rank(self, demands: Dict[str, int]) -> Dict[str, int]:
+        """Sharded, an owner demand of P logical pages of unknown rotation gives
+        one rank at most ``ceil(P / N)`` of them."""
+        owner = self.full_attn_allocator.sub_pool_name
+        if self.kv_shard is None or not demands.get(owner):
+            return demands
+        return {**demands, owner: -(-demands[owner] // self.shard_size)}
+
     def _ask(
         self,
         op: str,
@@ -682,17 +733,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         or under pipeline stages ``combine`` of its answers on every stage's
         snapshot; ``key`` is built only for the stages' digest."""
         capacity = self.stage_capacity
-        if capacity is None:
+        if capacity is None and self.kv_shard is None:
             return on_stage(self.pricing_snapshot())
         answer = combine(on_stage(s) for s in self._stage_snapshots())
-        if capacity.checks:
+        if capacity is not None and capacity.checks:
             capacity.note(op, key(), answer)
         return answer
 
     def _decided_take(self, demands: Dict[str, int]) -> Optional[bool]:
         """Whether a take of ``demands`` (units per band) succeeds on every pipeline
         stage; None on a single stage, where the take itself decides."""
-        if self.stage_capacity is None:
+        if self.stage_capacity is None and self.kv_shard is None:
             return None
         demands = {n: d for n, d in demands.items() if d > 0}
         return self._ask(
@@ -706,8 +757,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # held only inside its own scope, which laid out every take of that load.
         if decided:
             raise RuntimeError(
-                f"this pipeline stage cannot take {demands}, which every "
-                "stage decided it takes"
+                f"this pipeline stage or shard rank cannot take {demands}, which "
+                "every one of them decided it takes"
             )
 
     def stage_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -725,6 +776,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if state is not None and state.sub_pool_name in demands:
             self._settle_state_free_group()
+        demands = self._per_rank(demands)
         return self._ask(
             "units_fit",
             lambda: _units_key(demands),
@@ -755,10 +807,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Pages each of ``names`` could take together by free bytes, index space, id
         room and FULL cap; it ignores alignment, fixed and pending pages, so may err."""
         # The least over every stage's simulated snapshot, so every stage agrees.
-        return min(
+        pages = min(
             self._estimated_pages_on(snapshot, names)
             for snapshot in self._stage_snapshots()
         )
+        if (
+            self.kv_shard is not None
+            and self.full_attn_allocator.sub_pool_name in names
+        ):
+            # Sharded, a page on every rank is N logical pages of the owner.
+            pages *= self.shard_size
+        return pages
 
     def _estimated_pages_on(
         self, snapshot: ChainSnapshot, names: Tuple[str, ...]
@@ -824,6 +883,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 and plan_layout(snapshot, demands, NO_MOVE) is not None
             )
 
+        if self.kv_shard is not None:
+            # Where the bands stand differs per shard rank: every take runs alone.
+            return False
         if self.stage_capacity is None:
             return in_place(self.held_snapshot())
         return self._ask("state_in_place", lambda: _units_key(demands), in_place)
@@ -834,7 +896,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def held_units(self, sub_pool: str) -> int:
         """Units sub-pool ``sub_pool`` holds now: tokens (slots for state)."""
-        return self.bands[self._band_positions[sub_pool]].allocated_count()
+        return self._held(self.bands[self._band_positions[sub_pool]])
+
+    def _held(self, band: Band) -> int:
+        # Sharded, the owner's tokens are the whole shard group's logical tokens.
+        if band is self.full_attn_allocator and self.kv_shard is not None:
+            return sum(self.kv_shard.live_pages()) * self.page_size
+        return band.allocated_count()
 
     # The scalar reads the shared allocator interface requires: estimates
     # (`estimated_units_available`), never for decisions.
@@ -869,7 +937,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def conserve_full_available_size(self) -> int:
         """The sizing's nominal owner share minus the owner tokens held: the
         static split, not what a take can serve."""
-        return self._size_full - self.full_attn_allocator.allocated_count()
+        return self._size_full - self._held(self.full_attn_allocator)
 
     def conserve_swa_available_size(self) -> int:
         """The sizing's nominal window share minus the window tokens held."""
@@ -964,6 +1032,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         *,
         evictable: Optional[Dict[str, int]] = None,
         empty_pool: bool = False,
+        owner_class_evictable: Optional[
+            Callable[[int], Optional[Sequence[int]]]
+        ] = None,
     ) -> bool:
         """Whether ``demand`` fits once ``evictable`` cached entries (tokens per
         sub-pool, slots for state) are evicted, or in an empty pool. Every
@@ -991,6 +1062,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if units is None:
             return self._ask("admits", key, lambda snapshot: False)
         demands, reclaim = units
+        if self.kv_shard is not None:
+            return self._sharded_admits(
+                demand.state_slots, demands, reclaim, empty_pool, owner_class_evictable
+            )
         return self._ask(
             "admits",
             key,
@@ -1031,6 +1106,34 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             demands[name] = int(demand.request_rows)
             reclaim[name] = 0
         return demands, reclaim
+
+    def _sharded_admits(
+        self, state_slots, demands, reclaim, empty_pool, owner_class_evictable
+    ) -> bool:
+        """`admits` of a sharded chain: each rank takes ``ceil(P / N)`` owner pages,
+        and an eviction is credited by what it frees on the fullest rank."""
+        owner = self.full_attn_allocator.sub_pool_name
+        evictable_pages = reclaim[owner]
+        demands = self._per_rank(demands)
+
+        def with_credit(owner_pages: int) -> bool:
+            return self._admits_on(
+                self._shard_snapshot(),
+                state_slots,
+                demands,
+                {**reclaim, owner: owner_pages},
+                empty_pool,
+            )
+
+        # The per-class count walks the cache: asked only if eviction is needed.
+        if with_credit(0):
+            return True
+        if empty_pool or not evictable_pages:
+            return False
+        by_class = (
+            owner_class_evictable(self.shard_size) if owner_class_evictable else None
+        )
+        return with_credit(self.kv_shard.eviction_credit(evictable_pages, by_class))
 
     def _admits_on(
         self,
@@ -1144,7 +1247,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         for band in self.bands:
             name = band.sub_pool_name
             free = self.estimated_units_available(name)
-            usage[name] = (band.allocated_count() + free, free)
+            usage[name] = (self._held(band) + free, free)
         return usage
 
     def _ceiling_windows(self, sliding_window_size: int | None) -> Dict[str, int]:
@@ -1217,6 +1320,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # Below the grid no shorter chunk is admissible: admission runs the
         # request at the configured chunk or not at all.
         chunk = smallest_admissible_chunk(chunk_size, page, chunk_align) or chunk_size
+        # Sharded, admission charges a request one rounding page per owner class.
+        class_rounding_tokens = (self.shard_size - 1) * page
 
         def fits(new_tokens):
             return self.admits(
@@ -1233,6 +1338,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     decode_retire_lag=decode_retire_lag,
                     state_slots=state_slots,
                     request_rows=int(bool(self.request_allocators)),
+                    extra_tokens=class_rounding_tokens,
                 ).demand(),
                 empty_pool=True,
             )
@@ -1398,6 +1504,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Owner read path: virtual TOKEN ids -> physical TOKEN ids; an unmapped
         or negative id lands on 0, the sink. ``out=`` writes in place, for
         cuda-graph buffer stability."""
+        assert self.kv_shard is None, "a sharded prefix is read from the gather scratch"
         return self.full_attn_allocator.ids.translate(loc, out=out)
 
     @property
@@ -1647,6 +1754,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return (
             chain_byte_accounting_violations(list(self.bands))
             + self._snapshot_memo_violations()
+            + ([] if self.kv_shard is None else self.kv_shard.mirror_violations())
         )
 
     # -- alloc --
@@ -1666,6 +1774,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         no reachable layout serves the demand. With ``window_tail_pages`` (naming
         every window), each window binds only the last that many new pages."""
         owner = self.full_attn_allocator
+        assert self.kv_shard is None, "a sharded chain takes through alloc_extend"
         demands = {owner.sub_pool_name: num_owner_pages}
         for window in self._windows:
             demands[window.sub_pool_name] = (
@@ -2029,11 +2138,23 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         consumer: Consumer = Consumer.FORWARD,
+        rotation_bases: Optional[List[Optional[int]]] = None,
     ) -> Optional[torch.Tensor]:
         """Paged extend; returns virtual TOKEN ids. A window binds exactly the
         virtual pages the owner consumed. ``consumer`` writes the new pages
         first (`Band.acquire`)."""
         with record_function("ChainAllocator.alloc_extend"):
+            if self.kv_shard is not None:
+                return self._sharded_extend(
+                    consumer,
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=extend_num_tokens,
+                    rotation_bases=rotation_bases,
+                )
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
@@ -2055,6 +2176,42 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 ),
                 consumer=consumer,
             )
+
+    def _sharded_extend(self, consumer: Consumer, **extend) -> Optional[torch.Tensor]:
+        """Logical token ids from the sharding allocator, this rank's pages bound
+        in its band. None exactly when every rank refuses, with nothing changed."""
+        shard = self.kv_shard
+        owner = self.full_attn_allocator
+        runs = (
+            extend["prefix_lens_cpu"],
+            extend["seq_lens_cpu"],
+            extend["rotation_bases"],
+        )
+        # Decided for the rank the extend leaves fullest, so every rank decides alike.
+        growth = shard.fullest_growth(*runs)
+        if growth and not self._decided_take({owner.sub_pool_name: growth}):
+            return None
+        logical = shard.take_ids(**extend)
+        if logical is None:
+            raise RuntimeError("the class lists refused a take every rank decided")
+        pages, count = shard.owned_new_pages(logical, *runs)
+        if not count:
+            return logical
+        demands = {owner.sub_pool_name: count}
+        physical = self._plan_and_take(
+            demands, bind_at_frontier=True, consumer=consumer
+        )
+        if physical is None:
+            self._refused_decided_take(True, demands)
+        taken = physical[owner.sub_pool_name]
+        if taken is not None:
+            owner._bind_pages(pages, taken)
+        elif owner.place_pages(pages, count, consumer) is None:
+            raise RuntimeError(
+                f"{owner.sub_pool_name}: the planned frontier take of {count} "
+                "pages was refused"
+            )
+        return logical
 
     @_one_operation
     def alloc_extend_swa_tail(
@@ -2258,6 +2415,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
+            if self.kv_shard is not None:
+                self._sharded_free(free_index)
+                return
             # Order is not load-bearing: each band's v2p IS the mapping. Only a
             # window needs the tombstone filter; the owner's ids are all bound.
             v = free_index.detach().to(torch.int64)
@@ -2269,6 +2429,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     window.free(live_tokens)
             self.full_attn_allocator.free(v)
             self._clear_inverse_history()
+
+    def _sharded_free(
+        self, logical_tokens: torch.Tensor, *, distinct_pages: bool = False
+    ) -> None:
+        # The logical ids go back to the class lists on every rank; this
+        # rank's band frees the pages it owns among them.
+        owner = self.full_attn_allocator
+        pages = self.kv_shard.give_back(logical_tokens, distinct_pages=distinct_pages)
+        if pages.numel():
+            owner.free(pages * owner.page_size, _pages=pages)
+        self._clear_inverse_history()
 
     def free_swa(self, free_index: torch.Tensor) -> None:
         self.free_window(self.roles.window, free_index)
@@ -2415,6 +2586,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         reps = self.full_attn_allocator._page_reps(
             free_index.detach().to(torch.int64), start_pos
         )
+        if self.kv_shard is not None:
+            # One token per page; a free group takes them like any token list.
+            if self.free_group is None:
+                self._sharded_free(reps, distinct_pages=True)
+            else:
+                self.free(reps)
+            return
         if self.free_page_reps_group is None:
             self._release_page_reps((reps,), ())
         else:
@@ -2435,9 +2613,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self._clear_inverse_history()
 
+    def get_all_free_pages(self):
+        """The invariant checker's census; sharded, the free logical pages."""
+        if self.kv_shard is not None:
+            return self.kv_shard.ids.get_all_free_pages()
+        return super().get_all_free_pages()
+
+    def class_free_page_counts(self) -> List[int]:
+        """Free logical pages per owner class of a sharded chain."""
+        return list(self.kv_shard.class_free_page_counts())
+
     def clear(self) -> None:
         for member in self.members:
             member.clear()
+        if self.kv_shard is not None:
+            self.kv_shard.clear()
         if self.state is not None:
             # The state slots and the side states; the request table keeps ids.
             self.state.clear()

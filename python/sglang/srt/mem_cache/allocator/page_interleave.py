@@ -44,7 +44,7 @@ aggregate within the bounded skew.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
@@ -365,6 +365,17 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             self.debug_check_classes()
 
+    def free_classed(self, pages_by_class: Sequence[torch.Tensor]) -> None:
+        """`free` of whole pages already split by owner class, each class
+        distinct and ascending: the lists end up as `free` leaves them."""
+        assert self.free_group is None and len(pages_by_class) == self.shard_size
+        lists = self.class_release_pages if self.need_sort else self.class_free_pages
+        for r, freed in enumerate(pages_by_class):
+            if freed.numel():
+                lists[r] = torch.cat((freed, lists[r]))
+        if self.debug_mode:
+            self.debug_check_classes()
+
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         # Back to the base contract (plain free): the paged override derives
         # page representatives by striding and hands them to _release_page_ids,
@@ -418,6 +429,10 @@ def page_interleave_shard_size(allocator: BaseTokenToKVPoolAllocator) -> int:
     rotation-base plumbing, invariant slack) branch on this, exactly
     parallel to their existing DCP conditions.
     """
-    if isinstance(allocator, PageInterleavePoolAllocator):
+    # A unified chain with a sharded owner band answers alike; imported here
+    # because the chain builds on this module.
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+    if isinstance(allocator, (PageInterleavePoolAllocator, ChainAllocator)):
         return allocator.shard_size
     return 1
