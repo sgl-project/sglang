@@ -136,7 +136,15 @@ impl RouterGrpc {
             Ok(response) => response.status.as_u16(),
             Err(error) => error.status_code().as_u16(),
         };
-        metrics.record_response(&route, "POST", status);
+        metrics.record_response_with_model(
+            &route,
+            "POST",
+            status,
+            log_context
+                .as_ref()
+                .map(|c| c.model_id.as_str())
+                .unwrap_or(""),
+        );
         log_call(&route, &headers, status, log_context.as_ref(), started);
         let replies = result.map_err(ApiError::into_grpc_status)?.replies;
         // Counted until the client's stream ends, as an HTTP body is.

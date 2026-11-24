@@ -22,7 +22,7 @@ Families the router emits. The dashboard graphs all of them except the
 | Metric | Type | What it shows |
 |---|---|---|
 | `sgl_router_requests_total` | Counter | **Edge intake** — every request received at the router HTTP boundary, by `route`, `method`, counted before worker dispatch (true intake) |
-| `sgl_router_responses_total` | Counter | **Edge responses** — every response returned, by `route`, `method`, `status_code` (incl. early-exit 400/413/503). `requests_total - responses_total` = received-but-not-answered |
+| `sgl_router_responses_total` | Counter | **Edge responses** — every response returned, by `route`, `method`, `model_id`, `status_code` (incl. early-exit 400/413/503). `requests_total - responses_total` = received-but-not-answered. Pre-dispatch failures have an empty `model_id` |
 | `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops). See [Dispatch outcomes](#dispatch-outcomes) |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
