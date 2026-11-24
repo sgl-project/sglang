@@ -3263,6 +3263,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             elif (
+                _is_gfx1250_supported
+                and _use_aiter
+                and not (self.is_fp4_expert or self.use_mxfp8 or _use_hip_int4)
+            ):
+                # aiter's only gfx1250 MoE kernel takes MXFP4 weights.
+                logger.warning_once(
+                    "aiter has no FP8 MoE kernel on gfx1250; using the triton runner."
+                )
+                moe_runner_backend = MoeRunnerBackend.TRITON
+            elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
                 and get_moe_a2a_backend().supports_aiter()

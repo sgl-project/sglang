@@ -1,6 +1,6 @@
 name: PR Test Extra
-# Extra CI, opted into per PR: needs a run-ci approval of the head commit
-# (pr-gate-approve.yml) and the run-ci-nv-extra label. pr-gate.yml reads both from the API,
+# Extra CI, opted into per PR: needs run-ci, a run-ci approval of the head commit (unless
+# its author may approve), and the run-ci-nv-extra label. pr-gate.yml reads them from the API,
 # because an event payload does not refresh on rerun.
 #
 # Stages: extra-a (1-/2-gpu) and extra-b (4-/8-gpu) caller stubs reuse
@@ -11,8 +11,7 @@ on:
   # cancel the run in progress. Adding `run-ci-nv-extra` after a push takes a
   # rerun (/run-extra-ci nv, or a manual rerun), which the live label
   # gate in pr-gate.yml then passes.
-  # Workflow file from the base branch, never the PR. pr-gate-approve.yml also reruns this
-  # workflow's gated run when run-ci-nv-extra is on the PR.
+  # Workflow file from the base branch, never the PR.
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, 'release/**']
