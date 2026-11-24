@@ -868,7 +868,7 @@ class GdnUcacheVerifier:
         self._options = gdn_ucache_flush_options(device)
         # SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV / _NORM: the vendored kernel's conv prologue and
         # norm epilogue, which its strided, dependent launch carries (the conv prologue only
-        # where fused_conv_unsupported_reason allows: SM107)
+        # where fused_conv_unsupported_reason allows: SM103, SM107)
         self.fused_conv_capable = (
             self._options.strided_qkv and self._options.pdl and _vendored_flush(device)
         )

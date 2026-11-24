@@ -507,5 +507,116 @@ class TestGdnUcacheVendoredOptions(CustomTestCase):
             )
 
 
+# The fused conv (SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV) runs one CTA per key head and row: the batch must keep
+# every value head of a key head in one CTA (B x H x HV / H CTAs past 4 per SM on 152-212 SMs).
+FC_BATCH = 96
+FC_SLOTS = 112
+FC_STEPS = 8
+
+
+@unittest.skipUnless(VENDORED, "the conv prologue is a vendored-kernel build")
+class TestGdnUcacheFusedConv(CustomTestCase):
+    def _run(self, *, fused: bool):
+        """FC_STEPS verifies (strided, dependent launches, as served) whose q / k / v come from the target-verify
+        conv of raw projection rows: the Q38 front conv (retiled, as served) then the flush, or the flush's own
+        conv prologue. Returns per step (conv output, verify output) and the conv state, windows and SSM state."""
+        from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+            GdnFusedConv,
+            fused_conv_unsupported_reason,
+        )
+        from unittest import mock
+
+        from sglang.kernels.ops.attention.q38_gdn_front import conv as front_conv
+
+        device = torch.device("cuda")
+        gen = torch.Generator(device=device).manual_seed(19)
+
+        def randn(*shape, scale=1.0):
+            return torch.randn(*shape, generator=gen, device=device) * scale
+
+        T, B = NUM_DRAFT_TOKENS, FC_BATCH
+        D = 2 * H * K + HV * V
+        slots = torch.randperm(FC_SLOTS - 1, generator=gen, device=device)[:B] + 1
+        slots[5] = 0
+        slots[17] = -1
+        slots = slots.int()
+        win_rows = torch.randperm(B, generator=gen, device=device).int()
+        state = randn(FC_SLOTS, HV, V, K, scale=0.5).to(torch.float16)
+        A_log = torch.full((HV,), -3.0, device=device) + randn(HV, scale=0.3).abs()
+        dt_bias = randn(HV, scale=0.5).to(torch.bfloat16)
+        conv_w = randn(D, 4, scale=0.5).to(torch.bfloat16)
+        conv_state = randn(FC_SLOTS, D, 3).to(torch.bfloat16)
+        win_buf = torch.zeros(B, D, T + 2, dtype=torch.bfloat16, device=device)
+        window = win_buf.as_strided((B, T, D, 3), ((T + 2) * D, 1, T + 2, 1))
+        accepts = torch.randint(1, T + 1, (FC_STEPS, B), generator=gen, device=device)
+        inputs = [
+            (randn(B * T, D).to(torch.bfloat16), randn(B * T, 2 * HV, scale=0.5).to(torch.bfloat16))
+            for _ in range(FC_STEPS)
+        ]
+        with ExitStack() as stack:
+            for name in ("STRIDED_QKV", "PDL", "FUSED_CONV"):
+                stack.enter_context(getattr(envs, f"SGLANG_ENABLE_GDN_UCACHE_{name}").override(True))
+            # SGLANG_ENABLE_GDN_VERIFY_CONV_RETILE (read at import): the served separate conv
+            stack.enter_context(mock.patch.object(front_conv, "_RETILE_CONFIG", front_conv.RETILE_DEFAULT))
+            buffers = allocate_gdn_ucache(
+                num_layers=1,
+                num_slots=FC_SLOTS,
+                num_k_heads=H,
+                num_v_heads=HV,
+                head_k_dim=K,
+                head_v_dim=V,
+                max_num_draft_tokens=T,
+                device="cuda",
+            )
+            verifier = GdnUcacheVerifier(device=device, first_layer_id=0)
+            self.assertTrue(verifier.fused_conv_capable)
+            results = []
+            for step, (x, gates) in enumerate(inputs):
+                if fused:
+                    conv_out = torch.empty(B, T, D, dtype=torch.bfloat16, device=device)
+                    fc = GdnFusedConv(
+                        x=x.view(B, T, D), weight=conv_w, conv_state=conv_state, window=window,
+                        window_indices=win_rows,
+                    )
+                    self.assertIsNone(fused_conv_unsupported_reason(fc, num_k_heads=H, num_v_heads=HV))
+                else:
+                    fc = None
+                    # the backend's verify call (gdn_backend, Q38_GDN_FRONT): token-major output
+                    # rows on slot 0 (the reserved padding slot) are padding to the flush (its row gather
+                    # maps them to -1, so the prologue stores nothing); the separate conv skips -1 only
+                    conv_out = front_conv.conv_update(
+                        x.view(B, T, D).transpose(1, 2), conv_state, conv_w, None, "silu",
+                        conv_state_indices=torch.where(slots > 0, slots, -1), intermediate_conv_window=window,
+                        intermediate_state_indices=win_rows, block_n=128, token_major_out=True, num_warps=2,
+                    ).transpose(1, 2)
+                mixed = conv_out.reshape(B * T, D)
+                q, k, v = torch.split(mixed, [H * K, H * K, HV * V], dim=1)
+                q, k, v = q.view(-1, H, K), k.view(-1, H, K), v.view(-1, HV, V)
+                b, a = gates[:, :HV], gates[:, HV:]
+                out = verifier.target_verify(
+                    layer_id=0, query=q, key=k, value=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias, state=state,
+                    k_ring=buffers.k_ring[0], u_ring=buffers.u_ring[0], g_ring=buffers.g_ring[0], buffers=buffers,
+                    cache_indices=slots, num_draft_tokens=T, fused_conv=fc,
+                )
+                results.append((conv_out.clone(), out.clone()))
+                commit_gdn_ucache_cursors(buffers=buffers, slots=slots, num_accept_tokens=accepts[step].int())
+        torch.cuda.synchronize()
+        return results, conv_state, win_buf, state, slots
+
+    def test_fused_conv_equals_separate_conv(self):
+        """The flush's conv prologue stores the conv outputs, conv state and step windows of the separate
+        (retiled) verify conv, and its verify outputs and SSM state are the separate path's, bit for bit."""
+        ref, ref_cs, ref_win, ref_state, slots = self._run(fused=False)
+        got, cs, win, state, _ = self._run(fused=True)
+        live = slots > 0
+        bits = lambda t: t.view(torch.int16)
+        for step, ((rc, ro), (gc, go)) in enumerate(zip(ref, got)):
+            self.assertTrue(torch.equal(bits(rc[live]), bits(gc[live])), f"conv output differs at step {step}")
+            self.assertTrue(torch.equal(bits(ro), bits(go)), f"verify output differs at step {step}")
+        self.assertTrue(torch.equal(bits(ref_cs), bits(cs)), "conv state differs")
+        self.assertTrue(torch.equal(bits(ref_win), bits(win)), "step windows differ")
+        self.assertTrue(torch.equal(bits(ref_state), bits(state)), "SSM state differs")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4885,6 +4885,9 @@ _CTA_SLOTS_PER_SM = _MIN_BLOCKS_PER_SM
 # the whole device (fitted on Rubin, see auto_heads_per_cta); elsewhere cap1 = 1 and cap2 =
 # _HPC2_MAX_WAVES.
 _HPC_TUNED_CC = ((10, 7),)
+# archs whose SGLang verify serves the conv prologue (fused_conv_unsupported_reason): sm_107a, and sm_103a on the
+# sm_100a build (the prologue is plain bf16x2 / f32 arithmetic; heads per CTA from the untuned caps there)
+_FUSED_CONV_CC = ((10, 3), (10, 7))
 _HPC1_MAX_WAVES = 1.0
 _HPC2_MAX_WAVES = 8  # without T
 _HPC2_MAX_WAVES_MTP = 1.5  # T >= 2, round to nearest
@@ -5600,9 +5603,11 @@ def fused_conv_unsupported_reason(
     if T != 4 or D != 2 * H * K_DIM + HV * V_DIM or HV % H:  # build asserts pro_reorder, not split
         return f"T {T}, D {D}, heads {H} / {HV}"
     target = gdn_device_target(x.device)
-    if (target.major, target.minor) not in _HPC_TUNED_CC:
-        return f"sm_{target.major}{target.minor} (validated on sm_107a)"
-    hpc = auto_heads_per_cta(B, H, target.num_sms, hpk, T, None, "", 0, whole_device=True)
+    if (target.major, target.minor) not in _FUSED_CONV_CC:
+        return f"sm_{target.major}{target.minor} (validated on sm_107a and sm_103a)"
+    # as _launch picks it: the T-dependent caps on _HPC_TUNED_CC only
+    tuned = (target.major, target.minor) in _HPC_TUNED_CC
+    hpc = auto_heads_per_cta(B, H, target.num_sms, hpk, T if tuned else None, None, "", 0, whole_device=True)
     if hpc != hpk:
         return f"{hpc} of {hpk} value heads per CTA at batch {B}"
     if x.dtype != bf or x.stride(2) != 1 or x.stride(0) != T * x.stride(1):
