@@ -9,6 +9,7 @@ permissions:
   pull-requests: write # Required to add labels and reactions
   actions: write       # Required to rerun workflows
   issues: write        # Required for comment reactions in some contexts
+  statuses: write      # Required to record the per-commit run-ci approval
 
 jobs:
   slash_command:
@@ -76,5 +77,6 @@ jobs:
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           USER_LOGIN: ${{ github.event.comment.user.login }}
+          COMMENT_ACTION: ${{ github.event.action }}
         run: |
           python scripts/ci/utils/slash_command_handler.py
