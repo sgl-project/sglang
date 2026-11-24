@@ -32,6 +32,12 @@ Per call the union pass allocates G * ceil128(min(ROWS * topk, longest context))
 quarter of that in row masks (G = sum of ceil(extend_len / ROWS) over requests): at most about 180 MB
 for a 16K-row pass.
 
+SGLANG_QSA_UNION_PREFILL_CPASYNC=1 runs the 64-token-tile kernel with a different feed, bitwise the same
+output: the loader warps gather K/V rows with 16-byte cp.async instead of TMA gather4 (on GB300 the gather
+feed, not L2 or HBM, bounded the kernel: without it the kernel is 32% faster, with L2-resident rows no
+faster), each tile's token rows are loaded a tile ahead, Q sits in TMEM as the A operand of S = Q K^T,
+and the freed shared memory holds 3 + 3 stages.
+
 Patterns borrowed: the partitions, TMEM operands and P-in-TMEM aliasing of Triton's Gluon attention
 example (triton-lang/triton python/examples/gluon/01-attention-forward.py, v3.9.0), TMA gather4 as in
 python/tutorials/gluon/09-tma-gather-scatter.py, the mask-by-bit select of that example's causal mask,
@@ -83,6 +89,10 @@ _BM = 128
 _BN = 128
 # The union pass keeps a bitmap of the request's context in shared memory (2 words per 32 positions).
 _MAX_KV = 786432
+# cp.async feed (see the module docstring): loader warps and K/V ring stages of 64-token tiles.
+CPASYNC = _env_flag("SGLANG_QSA_UNION_PREFILL_CPASYNC")
+CPASYNC_WARPS = _env_int("SGLANG_QSA_UNION_PREFILL_CPASYNC_WARPS", 4)
+CPASYNC_STAGES = _env_int("SGLANG_QSA_UNION_PREFILL_CPASYNC_STAGES", 3)
 _state = {"logged": False, "checked": 0, "fallback": set()}
 
 try:
@@ -97,6 +107,7 @@ try:
         tensor_memory_descriptor_type,
         tma,
     )
+    from triton.experimental.gluon.language.nvidia.ampere import async_copy
     from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
     _GLUON = True
@@ -565,6 +576,155 @@ if _GLUON:
                 [48, 80],
             )
 
+    @gluon.jit
+    def _upc_load(KP, VP, TOK, k_smem, v_smem, k_ready, v_ready, k_free, v_free, tok_base, head, n_tiles, n_kv,
+                  ROW_STRIDE, BN: gl.constexpr, D: gl.constexpr, NSK: gl.constexpr, NSV: gl.constexpr):
+        # 16-byte cp.async per thread (a warp copies one 512-byte row per step); each thread's copies arrive on
+        # the stage barrier (count = loader threads). Rows >= n_kv (the union's tail) are zero-filled.
+        ld: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [gl.num_warps(), 1], [1, 0])
+        r_idx = gl.arange(0, BN, gl.SliceLayout(1, ld))
+        cols = gl.arange(0, D, gl.SliceLayout(0, ld)) + head * D
+        nxt = gl.load(TOK + tok_base + r_idx)
+        for i in range(n_tiles):
+            sk = i % NSK
+            sv = i % NSV
+            rows = nxt
+            nxt = gl.load(TOK + tok_base + (i + 1) * BN + r_idx, mask=(r_idx * 0 + i + 1) < n_tiles, other=0)
+            ok = (rows < n_kv)[:, None]
+            off = rows.to(gl.int64)[:, None] * ROW_STRIDE + cols[None, :]
+            mbarrier.wait(k_free.index(sk), ((i // NSK) & 1) ^ 1)
+            async_copy.async_load(k_smem.index(sk), KP + off, mask=ok)
+            async_copy.mbarrier_arrive(k_ready.index(sk), increment_count=False)
+            mbarrier.wait(v_free.index(sv), ((i // NSV) & 1) ^ 1)
+            async_copy.async_load(v_smem.index(sv), VP + off, mask=ok)
+            async_copy.mbarrier_arrive(v_ready.index(sv), increment_count=False)
+
+    @gluon.jit
+    def _upc_pv(v_smem, s_tmem, o_tmem, v_ready, v_free, p_ready, o_done, j, BM: gl.constexpr,
+                BN: gl.constexpr, NSV: gl.constexpr):
+        sj = j % NSV
+        bj = j % 2
+        mbarrier.wait(v_ready.index(sj), (j // NSV) & 1)
+        mbarrier.wait(p_ready.index(bj), (j // 2) & 1)
+        fence_async_shared()  # cp.async (generic proxy) writes before the tensor core's reads
+        tcgen05_mma(_p_view(s_tmem.index(bj), BM, BN), v_smem.index(sj), o_tmem, use_acc=j > 0,
+                    mbarriers=[o_done.index(0), v_free.index(sj)])
+
+    @gluon.jit
+    def _upc_mma(q_tmem, k_smem, v_smem, s_tmem, o_tmem, k_ready, v_ready, k_free, v_free, s_ready, p_ready,
+                 o_done, q_ready, n_tiles, BM: gl.constexpr, BN: gl.constexpr, NSK: gl.constexpr,
+                 NSV: gl.constexpr):
+        # _upa_mma with Q from TMEM and a proxy fence after each cp.async stage lands
+        mbarrier.wait(q_ready.index(0), 0)
+        for i in range(n_tiles):
+            s = i % NSK
+            b = i % 2
+            mbarrier.wait(k_ready.index(s), (i // NSK) & 1)
+            fence_async_shared()
+            tcgen05_mma(q_tmem, k_smem.index(s).permute((1, 0)), s_tmem.index(b), use_acc=False,
+                        mbarriers=[s_ready.index(b), k_free.index(s)])
+            if i > 0:
+                _upc_pv(v_smem, s_tmem, o_tmem, v_ready, v_free, p_ready, o_done, i - 1, BM, BN, NSV)
+        if n_tiles > 0:
+            _upc_pv(v_smem, s_tmem, o_tmem, v_ready, v_free, p_ready, o_done, n_tiles - 1, BM, BN, NSV)
+
+    @gluon.jit
+    def _qsa_union_prefill_cp(
+        Q,
+        KP,
+        VP,
+        OUT,
+        TOK,
+        MASK,
+        META,
+        scale,
+        Q_STRIDE_M,
+        Q_STRIDE_H,
+        O_STRIDE_M,
+        O_STRIDE_H,
+        NT,
+        n_kv,
+        ROW_STRIDE,
+        GQ: gl.constexpr,
+        W: gl.constexpr,
+        D: gl.constexpr,
+        NSK: gl.constexpr,
+        NSV: gl.constexpr,
+        RESCALE: gl.constexpr,
+        LW: gl.constexpr,
+        LREGS: gl.constexpr,
+    ):
+        # _qsa_union_prefill at 64-token tiles, fed by _upc_load, Q in TMEM
+        BM: gl.constexpr = 128
+        BN: gl.constexpr = 64
+        MT: gl.constexpr = 128
+        QC: gl.constexpr = 64
+        gl.static_assert(W * GQ <= BM)
+        g = gl.program_id(0)
+        head = gl.program_id(1)
+
+        kv_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BN, D], gl.bfloat16)
+        k_smem = gl.allocate_shared_memory(gl.bfloat16, [NSK, BN, D], kv_layout)
+        v_smem = gl.allocate_shared_memory(gl.bfloat16, [NSV, BN, D], kv_layout)
+        k_ready = gl.allocate_shared_memory(gl.int64, [NSK, 1], mbarrier.MBarrierLayout())
+        k_free = gl.allocate_shared_memory(gl.int64, [NSK, 1], mbarrier.MBarrierLayout())
+        v_ready = gl.allocate_shared_memory(gl.int64, [NSV, 1], mbarrier.MBarrierLayout())
+        v_free = gl.allocate_shared_memory(gl.int64, [NSV, 1], mbarrier.MBarrierLayout())
+        s_ready = gl.allocate_shared_memory(gl.int64, [2, 1], mbarrier.MBarrierLayout())
+        p_ready = gl.allocate_shared_memory(gl.int64, [2, 1], mbarrier.MBarrierLayout())
+        o_done = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
+        q_ready = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
+        for i in gl.static_range(NSK):
+            mbarrier.init(k_ready.index(i), count=32 * LW)
+            mbarrier.init(k_free.index(i), count=1)
+        for i in gl.static_range(NSV):
+            mbarrier.init(v_ready.index(i), count=32 * LW)
+            mbarrier.init(v_free.index(i), count=1)
+        for i in gl.static_range(2):
+            mbarrier.init(s_ready.index(i), count=1)
+            mbarrier.init(p_ready.index(i), count=1)
+        mbarrier.init(o_done.index(0), count=1)
+        mbarrier.init(q_ready.index(0), count=1)
+        # TMEM columns: S 2 x 64 (P aliases each) + O 256 + Q 128 (BF16 pairs)
+        s_tmem = allocate_tensor_memory(gl.float32, [2, BM, BN], TensorMemoryLayout((BM, BN), col_stride=1))
+        o_tmem = allocate_tensor_memory(gl.float32, [BM, D], TensorMemoryLayout((BM, D), col_stride=1))
+        q_tl: gl.constexpr = TensorMemoryLayout((BM, D), col_stride=1)
+        q_tmem = allocate_tensor_memory(gl.bfloat16, [BM, D], q_tl)
+
+        row0 = gl.load(META + g * 4)
+        rows = gl.load(META + g * 4 + 1)
+        n_tiles = (gl.load(META + g * 4 + 2) + BN - 1) // BN
+        tok_base = g * NT
+        mask_base = g * (NT // MT) * (W * 4)
+
+        # Q scaled exactly as the stock kernel, into TMEM
+        q_ld: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [gl.num_warps(), 1], [1, 0])
+        mq = gl.arange(0, BM, gl.SliceLayout(1, q_ld))
+        jq = mq // GQ
+        okq = (mq < W * GQ) & (jq < rows)
+        qrow = Q + (row0 + jq).to(gl.int64) * Q_STRIDE_M + (head * GQ + mq % GQ) * Q_STRIDE_H
+        dq = gl.arange(0, QC, gl.SliceLayout(0, q_ld))
+        qc_layout: gl.constexpr = _reg_layout(gl.bfloat16, [BM, QC], q_tl, [BM, D], gl.num_warps())
+        for c in gl.static_range(D // QC):
+            qv = gl.load(qrow[:, None] + (c * QC + dq)[None, :], mask=okq[:, None], other=0.0)
+            qv = (qv * scale * 1.4426950408).to(gl.bfloat16)
+            q_tmem.slice(c * QC, QC).store(gl.convert_layout(qv, qc_layout))
+        mbarrier.arrive(q_ready.index(0), count=1)
+
+        gl.warp_specialize(
+            [
+                (_upa_softmax64, (s_tmem, o_tmem, s_ready, p_ready, o_done, MASK, mask_base, OUT, row0, rows, head,
+                                  n_tiles, O_STRIDE_M, O_STRIDE_H, GQ, W, D, BM, BN, RESCALE)),
+                (_upc_mma, (q_tmem, k_smem, v_smem, s_tmem, o_tmem, k_ready, v_ready, k_free, v_free, s_ready,
+                            p_ready, o_done, q_ready, n_tiles, BM, BN, NSK, NSV)),
+                (_upc_load, (KP, VP, TOK, k_smem, v_smem, k_ready, v_ready, k_free, v_free, tok_base, head,
+                             n_tiles, n_kv, ROW_STRIDE, BN, D, NSK, NSV)),
+            ],
+            [1, LW],
+            [48, LREGS],
+        )
+
+
 
 LAST_KERNEL: dict = {}
 
@@ -577,6 +737,34 @@ def attend(q, packed_k, packed_v, tok, mask, meta, nt, scale, *, groups, rows, s
     if out is None:
         out = torch.empty_like(q)
     if groups == 0:
+        return out
+    if CPASYNC and stages is None and tile is None and rescale is None:
+        LAST_KERNEL["union_prefill"] = _qsa_union_prefill_cp[(groups, kv_heads)](
+            q,
+            packed_k,
+            packed_v,
+            out,
+            tok,
+            mask,
+            meta,
+            float(scale),
+            q.stride(0),
+            q.stride(1),
+            out.stride(0),
+            out.stride(1),
+            nt,
+            packed_k.shape[0],
+            packed_k.stride(0),
+            GQ=gq,
+            W=rows,
+            D=_HEAD_DIM,
+            NSK=CPASYNC_STAGES,
+            NSV=CPASYNC_STAGES,
+            RESCALE=RESCALE_LOG2,
+            LW=CPASYNC_WARPS,
+            LREGS=96 if CPASYNC_WARPS <= 4 else 64,
+            num_warps=4,
+        )
         return out
     nsk, nsv = stages or (STAGES_K, STAGES_V)
     bn = tile or tile_for(q.device.index or 0, nsk, nsv)
@@ -635,7 +823,7 @@ def log_once(q, packed_k, indices) -> None:
     heads = packed_k.shape[1]
     logger.info(
         "QSA union prefill: on (rows=%d heads=%d/%d topk=%d stages=%d,%d tile=%d rescale_log2=%g "
-        "min_rows=%d check_calls=%d) "
+        "min_rows=%d check_calls=%d cpasync=%d warps=%d stages=%d) "
         "(SGLANG_ENABLE_QSA_UNION_PREFILL)",
         rows_per_group(q.shape[1], heads),
         q.shape[1],
@@ -647,6 +835,9 @@ def log_once(q, packed_k, indices) -> None:
         RESCALE_LOG2,
         MIN_ROWS,
         CHECK_CALLS,
+        int(CPASYNC),
+        CPASYNC_WARPS,
+        CPASYNC_STAGES,
     )
 
 
