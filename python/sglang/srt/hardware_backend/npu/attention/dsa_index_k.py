@@ -7,14 +7,7 @@ import torch
 def get_scored_indexer():
     try:
         from sgl_kernel_npu.operators.indexer import lightning_indexer_v2
-        from sgl_kernel_npu.operators.utils.cann import detect_cann_version
-        from sgl_kernel_npu.operators.utils.generation import Generation, get_hardware
 
-        if (
-            detect_cann_version() != "9.2.0"
-            or get_hardware().generation is not Generation.ARCH22
-        ):
-            return None
         # The public wrapper can be installed without its CANN binding.
         from sgl_kernel_npu._third_party.sgl_ops_transformer.ops import (
             lightning_indexer,
