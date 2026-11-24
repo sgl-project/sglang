@@ -32,7 +32,7 @@ sys.path.insert(
 import ci_register as _ci_register  # noqa: E402
 from run_ci_approval import (  # noqa: E402
     APPROVAL_WORKFLOWS,
-    APPROVE_WORKFLOW,
+    APPROVER_REPO_PERMISSIONS,
     approval_workflows_for,
     can_approve,
     head_seen_by,
@@ -55,6 +55,11 @@ from run_ci_approval import (  # noqa: E402
 _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
+WRITE_ACCESS_CI_PERMISSIONS = {
+    "can_tag_run_ci_label": True,
+    "can_rerun_failed_ci": True,
+    "cooldown_interval_minutes": 0,
+}
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
@@ -360,12 +365,12 @@ def handle_tag_run_ci(
     tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
     the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
     their own label, so `run-ci` is always added alongside. The commenter
-    needs `can_tag_run_ci_label` or write access.
+    must pass run_ci_approval.can_approve, for every tier.
 
-    A commenter with write access (run_ci_approval.can_approve) also approves
-    the PR's head commit for the workflows that gate on a per-commit approval
-    (pr-test.yml, pr-test-extra.yml), as adding the label in the UI does, but
-    only a head they could have seen: one pushed before the comment was posted.
+    Adding `run-ci` here also approves the PR's head commit for the workflows
+    that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), but
+    only a head the commenter could have seen: one pushed before the comment
+    was posted.
 
     Labels added here start no run (GITHUB_TOKEN label events trigger no
     workflow); the callers re-run the gated runs.
@@ -373,18 +378,17 @@ def handle_tag_run_ci(
     Returns True if action was taken, False otherwise.
     """
     user_login = comment.user.login
-    approver, _ = can_approve(gh_repo, user_login)
-    if not (approver or user_perms.get("can_tag_run_ci_label", False)):
-        print("Permission denied: no write access and no can_tag_run_ci_label.")
+    allowed, reason = can_approve(gh_repo, user_login, user_perms)
+    if not allowed:
+        print(f"Permission denied: {reason}.")
         pr.create_issue_comment(
-            f"`run-ci` was not added: {user_login} has neither write access nor "
-            "`can_tag_run_ci_label` in `.github/CI_PERMISSIONS.json`."
+            f"`run-ci` was not added and no commit was approved for CI: {reason}."
         )
         comment.create_reaction("confused")
         return False
 
     head_sha = pr.head.sha
-    if approver and not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
+    if not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
         print(f"Not approving {head_sha}: pushed after the comment, or no run yet.")
         pr.create_issue_comment(
             f"`run-ci` was not added and no commit was approved for CI: the head "
@@ -398,14 +402,8 @@ def handle_tag_run_ci(
     print(f"Permission granted. Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
-    if approver:
-        record_approval(gh_repo, head_sha, user_login)
-    else:
-        pr.create_issue_comment(
-            "`run-ci` was added, but NVIDIA PR Test Base and Extra run only for a "
-            "commit approved by a maintainer with write access (`/tag-and-rerun-ci`, "
-            "or remove and re-add `run-ci`)."
-        )
+    record_approval(gh_repo, head_sha, user_login)
+    pr.create_issue_comment(f"✅ Approved by {user_login}: CI runs on {head_sha}.")
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -532,15 +530,10 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   (`run-ci`, an approved head commit for the approval workflows, not a draft, the
     #   workflow's opt-in labels), since rerun_failed_jobs() would rerun at most the
     #   finish job. This command never approves.
-    # - pr-gate-approve.yml runs are left out: re-running one does nothing.
-    runs = [
-        run
-        for run in latest_run_per_workflow(pr_workflow_runs(gh_repo, pr))
-        if workflow_file(run) != APPROVE_WORKFLOW
-    ]
+    runs = latest_run_per_workflow(pr_workflow_runs(gh_repo, pr))
     labels = {label.name for label in pr.get_labels()}
     can_run = "run-ci" in labels and not pr.draft
-    head_approved = is_approved(gh_repo, head_sha, labels)
+    head_approved = is_approved(gh_repo, head_sha, labels, pr.user.login)
     tiers = load_opt_in_tiers().values()
 
     rerun_count = 0
@@ -614,12 +607,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 ),
                 (
                     left_unapproved,
-                    "have a maintainer approve this commit (`/tag-and-rerun-ci`, "
-                    + (
-                        "or remove and re-add `run-ci`)"
-                        if "run-ci" in labels
-                        else "or add `run-ci`)"
-                    ),
+                    "have a maintainer approve this commit (`/tag-and-rerun-ci`)",
                 ),
             )
             if lacking
@@ -2067,9 +2055,15 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
+    # Write access grants every CI permission; CI_PERMISSIONS.json lists only
+    # users without it.
+    if repo.get_collaborator_permission(user_login) in APPROVER_REPO_PERMISSIONS:
+        print(f"User {user_login} has write access. Granting all CI permissions.")
+        user_perms = dict(WRITE_ACCESS_CI_PERMISSIONS)
+
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires can_tag_run_ci_label or write access.
+    # Note: /tag-run-ci-label still requires run_ci_approval.can_approve.
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
