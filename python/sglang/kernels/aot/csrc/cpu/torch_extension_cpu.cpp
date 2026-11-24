@@ -620,8 +620,8 @@ void gemma_qkv_rmsnorm_cpu(
     const std::optional<at::Tensor>& v,
     const at::Tensor& q_weight,
     const std::optional<at::Tensor>& k_weight,
-    int64_t num_heads,
-    int64_t num_heads_kv,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
     int64_t head_dim,
     double eps);
 
@@ -1092,7 +1092,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "gemma_qkv_rmsnorm_cpu(Tensor(a!) q, Tensor(b!)? k, Tensor(c!)? v, Tensor q_weight, Tensor? k_weight, "
-      "int num_heads, int num_heads_kv, int head_dim, float eps) -> ()");
+      "int num_q_heads, int num_kv_heads, int head_dim, float eps) -> ()");
   m.impl("gemma_qkv_rmsnorm_cpu", torch::kCPU, &gemma_qkv_rmsnorm_cpu);
 
   m.def(

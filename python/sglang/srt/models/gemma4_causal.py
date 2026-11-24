@@ -84,8 +84,21 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_server_args,
 )
+from sglang.srt.utils import is_cpu
 
 logger = logging.getLogger(__name__)
+
+_is_cpu = is_cpu()
+if _is_cpu:
+    gemma_qkv_rmsnorm = torch.ops.sgl_kernel.gemma_qkv_rmsnorm_cpu
+    gemma_rmsnorm_residual_scalar = (
+        torch.ops.sgl_kernel.gemma_rmsnorm_residual_scalar_cpu
+    )
+    gemma_dual_rmsnorm_residual_scalar = (
+        torch.ops.sgl_kernel.gemma_dual_rmsnorm_residual_scalar_cpu
+    )
+    gemma4_fused_routing = torch.ops.sgl_kernel.gemma4_fused_routing_cpu
+    gemma_routing_post_topk = torch.ops.sgl_kernel.gemma_routing_post_topk_cpu
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -268,7 +281,7 @@ class Gemma4MoE(nn.Module):
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
             if (
-                gating_output.is_cuda
+                (gating_output.is_cuda or _is_cpu)
                 and gating_output.dim() == 2
                 and gating_output.dtype
                 in (torch.float16, torch.bfloat16, torch.float32)
@@ -278,7 +291,7 @@ class Gemma4MoE(nn.Module):
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
 
             # Fused: softmax + per_expert_scale gather + mul + casts in one kernel
-            if topk_logits.is_cuda or topk_logits.is_xpu:
+            if _is_cpu or topk_logits.is_cuda or topk_logits.is_xpu:
                 return gemma_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
 
             topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
@@ -481,15 +494,14 @@ class Gemma4Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-        # Preconditions for the fused path: tensors on CUDA or XPU (the kernel
-        # is pure Triton and lowers to both backends), q_norm/k_norm use the
+        # Preconditions for the fused path: q_norm/k_norm use the
         # standard norm*weight (scale_shift==0) and v_norm has weight=ones
         # (with_scale=False) — the canonical Gemma4 attention configuration.
         is_kv_shared = (
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
         can_fuse_qkv_norm = (
-            (q.is_cuda or q.is_xpu)
+            (q.is_cuda or q.is_xpu or _is_cpu)
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
@@ -804,7 +816,7 @@ class Gemma4DecoderLayer(nn.Module):
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
                 not self.has_ple
-                and (hidden_states_1.is_cuda or hidden_states_1.is_xpu)
+                and (hidden_states_1.is_cuda or hidden_states_1.is_xpu or _is_cpu)
                 and hidden_states_1.dim() == 2
             ):
                 norm1 = self.post_feedforward_layernorm_1
@@ -837,7 +849,7 @@ class Gemma4DecoderLayer(nn.Module):
         if (
             not self.has_ple
             and self.moe is None
-            and (hidden_states.is_cuda or hidden_states.is_xpu)
+            and (hidden_states.is_cuda or hidden_states.is_xpu or _is_cpu)
             and hidden_states.dim() == 2
         ):
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel

@@ -166,8 +166,8 @@ void gemma_qkv_rmsnorm_kernel_impl(
     const scalar_t* q_weight,
     const scalar_t* k_weight,
     int64_t num_tokens,
-    int64_t num_heads,
-    int64_t num_heads_kv,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
     int64_t head_dim,
     int64_t q_strideT,
     int64_t k_strideT,
@@ -175,10 +175,10 @@ void gemma_qkv_rmsnorm_kernel_impl(
     float eps) {
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
-      for (int64_t head = 0; head < num_heads; ++head) {
+      for (int64_t head = 0; head < num_q_heads; ++head) {
         qkv_rmsnorm_head<scalar_t, true>(q + row * q_strideT + head * head_dim, q_weight, head_dim, eps);
       }
-      for (int64_t head = 0; head < num_heads_kv; ++head) {
+      for (int64_t head = 0; head < num_kv_heads; ++head) {
         qkv_rmsnorm_head<scalar_t, true>(k + row * k_strideT + head * head_dim, k_weight, head_dim, eps);
         qkv_rmsnorm_head<scalar_t, false>(v + row * v_strideT + head * head_dim, nullptr, head_dim, eps);
       }
@@ -469,8 +469,8 @@ gemma4_fused_routing_cpu(const at::Tensor& gating_output, const at::Tensor& per_
 //   v = RMSNorm(v, no weight, eps)
 // if K and V are absent, only Q is updated.
 //
-// q    : [num_tokens, num_heads * head_dim]
-// k, v : [num_tokens, num_heads_kv * head_dim]
+// q    : [num_tokens, num_q_heads * head_dim]
+// k, v : [num_tokens, num_kv_heads * head_dim]
 // q_weight, k_weight: [head_dim]
 //
 void gemma_qkv_rmsnorm_cpu(
@@ -479,22 +479,22 @@ void gemma_qkv_rmsnorm_cpu(
     const std::optional<at::Tensor>& v,
     const at::Tensor& q_weight,
     const std::optional<at::Tensor>& k_weight,
-    int64_t num_heads,
-    int64_t num_heads_kv,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
     int64_t head_dim,
     double eps) {
   CHECK_DIM(2, q);
-  TORCH_CHECK(num_heads > 0 && head_dim > 0, "Expected positive num_heads and head_dim");
+  TORCH_CHECK(num_q_heads > 0 && head_dim > 0, "Expected positive num_q_heads and head_dim");
   TORCH_CHECK(k.has_value() == v.has_value(), "K and V must both be present or both absent");
   const bool has_kv = k.has_value();
   const auto st = q.scalar_type();
   const int64_t num_tokens = q.size(0);
-  CHECK_INPUT_SHAPE_DTYPE<true>(q, {num_tokens, num_heads * head_dim}, st);
+  CHECK_INPUT_SHAPE_DTYPE<true>(q, {num_tokens, num_q_heads * head_dim}, st);
   CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {head_dim}, st);
   if (has_kv) {
-    TORCH_CHECK(num_heads_kv > 0 && k_weight.has_value(), "K/V require positive num_heads_kv and k_weight");
-    CHECK_INPUT_SHAPE_DTYPE<true>(*k, {num_tokens, num_heads_kv * head_dim}, st);
-    CHECK_INPUT_SHAPE_DTYPE<true>(*v, {num_tokens, num_heads_kv * head_dim}, st);
+    TORCH_CHECK(num_kv_heads > 0 && k_weight.has_value(), "K/V require positive num_kv_heads and k_weight");
+    CHECK_INPUT_SHAPE_DTYPE<true>(*k, {num_tokens, num_kv_heads * head_dim}, st);
+    CHECK_INPUT_SHAPE_DTYPE<true>(*v, {num_tokens, num_kv_heads * head_dim}, st);
     CHECK_INPUT_SHAPE_DTYPE<false>(*k_weight, {head_dim}, st);
   }
 
@@ -506,8 +506,8 @@ void gemma_qkv_rmsnorm_cpu(
         q_weight.data_ptr<scalar_t>(),
         has_kv ? k_weight->data_ptr<scalar_t>() : nullptr,
         num_tokens,
-        num_heads,
-        has_kv ? num_heads_kv : 0,
+        num_q_heads,
+        has_kv ? num_kv_heads : 0,
         head_dim,
         q.stride(0),
         has_kv ? k->stride(0) : 0,
