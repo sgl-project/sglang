@@ -20,10 +20,13 @@ class TestNativeEagerVerify(CustomTestCase):
             sparse_bonus_argmax=True,
         )
         for label, options in (("eagle", eagle_options), ("defaults", {})):
-            for enabled in (False, True):
-                with self.subTest(options=label, enabled=enabled):
+            # A custom processor matters only with the switch on.
+            for enabled, custom in ((False, False), (True, False), (True, True)):
+                with self.subTest(options=label, enabled=enabled, custom=custom):
                     batch = SimpleNamespace(
-                        sampling_info=object(),
+                        sampling_info=SimpleNamespace(
+                            has_custom_logit_processor=custom
+                        ),
                         seq_lens=object(),
                         req_pool_indices=object(),
                         device="cpu",
@@ -72,7 +75,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         (accept.tokens, accept.accept_lens, accept.accept_index),
                         outputs,
                     )
-                    if enabled:
+                    if enabled and not custom:
                         sample.assert_not_called()
                         make_io.assert_called_once()
                         hooks.post_verify.assert_called_once_with(make_io.return_value)
@@ -90,6 +93,7 @@ class TestNativeEagerVerify(CustomTestCase):
                             sparse_bonus_argmax=options.get(
                                 "sparse_bonus_argmax", False
                             ),
+                            has_custom_logit_processor=custom,
                         )
 
 
