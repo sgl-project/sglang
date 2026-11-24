@@ -104,6 +104,9 @@ def fp8_gemm_applies(xq: torch.Tensor, fp8_weight) -> bool:
     """Whether ``fp8_gemm(xq, ...)`` covers these operands (tuned launch for this row count)."""
     if fp8_weight is None or xq.dim() != 2 or not xq.is_contiguous() or xq.dtype != F8:
         return False
+    if len(fp8_weight) != 2:
+        # a weight kept in aiter's preshuffle layout (fp8_prefill_gemm.preshuffle_weight)
+        return False
     if not MIN_M <= xq.shape[0] <= MAX_M:
         return False
     wq = fp8_weight[0]

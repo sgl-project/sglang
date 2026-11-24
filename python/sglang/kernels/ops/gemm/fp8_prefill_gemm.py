@@ -28,11 +28,14 @@ _MIN_ROWS = {(18432, 8192): 129, (8192, 8192): 129}
 _ROW_QUANT_CONFIGS = {2048: (1, 2), 4096: (1, 2), 8192: (1, 4)}
 _gemm_a8w8_ck = None
 # [N, K] -> launch of aiter's FlyDSL preshuffle a8w8 GEMM (tile_m, tile_n, tile_k, async copy, waves per EU, LDS
-# stages) for a weight kept in its preshuffle layout (``preshuffle_weight``): the gathered Ulysses QKV / O
-# projections. One launch per weight shape at every row count, so a row chunk's rows equal the whole shard's.
+# stages) for a weight kept in its preshuffle layout (``preshuffle_weight``): the full-width QKV / O projections
+# (gathered Ulysses shards, pipeline stages) and a pipeline stage's pooler / unpooler. One launch per weight shape
+# at every row count, so a row chunk's rows equal the whole shard's.
 PRESHUFFLE_CONFIGS: dict[tuple[int, int], tuple[int, int, int, int, int, int]] = {
     (18432, 8192): (128, 256, 128, 1, 2, 2),
     (8192, 8192): (128, 256, 128, 1, 2, 2),
+    (4096, 8192): (128, 256, 128, 1, 2, 2),
+    (8192, 4096): (256, 128, 128, 1, 2, 2),
 }
 _preshuffle_gemm_a8 = None
 
