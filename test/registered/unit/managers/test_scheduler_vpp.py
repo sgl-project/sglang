@@ -288,7 +288,6 @@ class TestSchedulingVPPCore(CustomTestCase):
             _pp_vpp_early_activations={},
             _pp_vpp_fixed_received=deque(),
             _pp_vpp_arrivals=deque(),
-            _pp_vpp_fixed_batch=True,
             _pp_vpp_pending_recv=object(),
             pp_group=SimpleNamespace(
                 world_size=2,
@@ -316,7 +315,6 @@ class TestSchedulingVPPCore(CustomTestCase):
     def _fixed_scheduler(self, *, rank=0):
         scheduler = self._scheduler(rank=rank)
         scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
-        scheduler._pp_vpp_overlap_chunks = False
         scheduler._pp_vpp_init_fixed_batch(2)
         return scheduler
 
@@ -357,7 +355,6 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler.pp_group.is_first_rank = False
         scheduler.pp_group.is_last_rank = True
         scheduler._vpp_layout = SimpleNamespace(virtual_stages=2)
-        scheduler._pp_vpp_overlap_chunks = False
         scheduler._pp_vpp_init_fixed_batch(2)
         scheduler._pp_vpp_slot_batch_seqs = [owner, None]
         scheduler.mbs = [None, None]
@@ -952,50 +949,6 @@ class TestSchedulingVPPCore(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "invalid .* phase"):
                     context["handle_control"](invalid, invalid_wire)
 
-    def test_cpu_broadcast_reuses_buffers_and_validates_source_values(self):
-        scheduler = self._scheduler()
-        scheduler.attn_tp_group = SimpleNamespace(world_size=1, rank_in_group=0)
-        first = scheduler._pp_vpp_broadcast_cpu_state((3, 7), width=2)
-        self.assertEqual(first.tolist(), [3, 7])
-        self.assertEqual(first.device.type, "cpu")
-        self.assertEqual(first.dtype, torch.int64)
-        second = scheduler._pp_vpp_broadcast_cpu_state((4, 8), width=2)
-        self.assertIs(second, first)
-        self.assertEqual(first.tolist(), [4, 8])
-        narrow = scheduler._pp_vpp_broadcast_cpu_state((9,), width=1)
-        self.assertIsNot(narrow, first)
-        self.assertEqual(narrow.tolist(), [9])
-        for values in (None, (), (1,), (1, 2, 3)):
-            with self.subTest(values=values):
-                with self.assertRaisesRegex(RuntimeError, "invalid VPP TP broadcast"):
-                    scheduler._pp_vpp_broadcast_cpu_state(values, width=2)
-
-    def test_cpu_broadcast_maps_tp_source_to_its_global_rank(self):
-        cpu_group = object()
-        transmitted = []
-        for tp_rank in (1, 0):
-            scheduler = self._scheduler()
-            scheduler.attn_tp_group = SimpleNamespace(
-                world_size=2,
-                rank_in_group=tp_rank,
-                ranks=[4, 6],
-                cpu_group=cpu_group,
-            )
-
-            def broadcast(state, *, src, group):
-                self.assertEqual(src, 6)
-                self.assertIs(group, cpu_group)
-                if tp_rank == 1:
-                    transmitted.append(state.clone())
-                else:
-                    state.copy_(transmitted[0])
-
-            with patch("torch.distributed.broadcast", side_effect=broadcast):
-                state = scheduler._pp_vpp_broadcast_cpu_state(
-                    (5, 3) if tp_rank == 1 else None, width=2, src=1
-                )
-            self.assertEqual(state.tolist(), [5, 3])
-
     def test_cancel_waits_for_admission_and_never_targets_a_reused_slot(self):
         scheduler = self._fixed_scheduler()
         req = SimpleNamespace(rid="request", session_generation=1, bootstrap_room=3)
@@ -1204,85 +1157,6 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertEqual(final, PipelineWavefrontAction(5, 0, 0, 3, 1))
         self.assertEqual(len(pending), 2)
         self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
-
-    def test_collective_task_selection_requires_every_tp_lane_to_permit_dispatch(self):
-        scheduler = self._fixed_scheduler()
-        scheduler._pp_vpp_fixed_tp = False
-        cpu_group = object()
-        scheduler.attn_tp_group = SimpleNamespace(
-            world_size=2, rank_in_group=1, ranks=[4, 6], cpu_group=cpu_group
-        )
-        schedule = PipelineRankSchedule(0, 2, 2, 2)
-        schedule.admit(0)
-
-        def broadcast(state, *, src, group):
-            self.assertEqual(src, 4)
-            self.assertIs(group, cpu_group)
-            state.copy_(torch.tensor([0, 0]))
-
-        for remote_ready in (0, 1):
-
-            def gather(output, local, *, group):
-                self.assertIs(group, cpu_group)
-                self.assertEqual(local.tolist(), [1])
-                output.copy_(torch.cat((torch.tensor([remote_ready]), local)))
-
-            with (
-                patch("torch.distributed.broadcast", side_effect=broadcast),
-                patch("torch.distributed.all_gather_into_tensor", side_effect=gather),
-            ):
-                action = scheduler._pp_vpp_fixed_select_tp_action(
-                    schedule, 7, lambda batch, stage: True
-                )
-            if remote_ready:
-                self.assertEqual(action, PipelineWavefrontAction(7, 0, 0, 0, 0))
-                self.assertIs(schedule.running, action)
-            else:
-                self.assertIsNone(action)
-                self.assertIsNone(schedule.running)
-                self.assertEqual(scheduler._pp_vpp_fixed_wave, [])
-
-    def test_collective_task_selection_waits_for_every_lanes_input(self):
-        scheduler, schedule, wire = self._downstream_admission()
-        scheduler._pp_vpp_accept_received_tensors(wire)
-        scheduler._pp_vpp_fixed_tp = False
-        cpu_group = object()
-        scheduler.attn_tp_group = SimpleNamespace(
-            world_size=2, rank_in_group=0, ranks=[4, 6], cpu_group=cpu_group
-        )
-
-        def broadcast(state, *, src, group):
-            self.assertIs(group, cpu_group)
-            self.assertEqual(src, 4)
-            self.assertEqual(state.tolist(), [0, 1])
-
-        for remote_input in (0, 1):
-            gathers = []
-
-            def gather(output, local, *, group):
-                self.assertIs(group, cpu_group)
-                self.assertEqual(local.tolist(), [1])
-                other = remote_input if not gathers else 1
-                gathers.append(other)
-                output.copy_(torch.cat((local, torch.tensor([other]))))
-
-            with (
-                patch("torch.distributed.broadcast", side_effect=broadcast),
-                patch("torch.distributed.all_gather_into_tensor", side_effect=gather),
-            ):
-                action = scheduler._pp_vpp_fixed_select_tp_action(
-                    schedule, 8, lambda batch, stage: True
-                )
-            if remote_input:
-                self.assertEqual(action, PipelineWavefrontAction(8, 0, 0, 1, 1))
-                # Input presence, remote admission readiness, dispatch permission.
-                self.assertEqual(gathers, [1, 1, 1])
-            else:
-                self.assertIsNone(action)
-                self.assertEqual(gathers, [0])
-                self.assertEqual(schedule.inflight_count, 0)
-                self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [None, None])
-                self.assertIn((0, 1), scheduler._pp_vpp_early_activations)
 
     def test_control_queue_has_one_tp_sender_and_rejects_device_payloads(self):
         scheduler = self._scheduler(rank=1)
@@ -1520,7 +1394,8 @@ class TestSchedulingVPPCore(CustomTestCase):
 
     def test_control_broadcast_rejects_foreign_protocol_epoch_and_layout(self):
         scheduler = self._scheduler()
-        scheduler._pp_vpp_fixed_tp = False
+        scheduler._pp_vpp_activation_receiver = _ActivationFIFO()
+        scheduler._pp_vpp_round_candidate = False
         scheduler.attn_tp_group = SimpleNamespace(
             rank_in_group=0, broadcast_object=lambda value, src: value
         )
@@ -1674,19 +1549,17 @@ class TestSchedulingVPPCore(CustomTestCase):
                 self.assertEqual(synchronized, [True])
 
     def test_fixed_wave_requires_the_supported_layout_and_capacity(self):
-        for pp_size, virtual_stages, inflight, overlap in (
-            (3, 2, 2, False),
-            (2, 3, 2, False),
-            (2, 2, 1, False),
-            (2, 2, 2, True),
+        for pp_size, virtual_stages, inflight in (
+            (3, 2, 2),
+            (2, 3, 2),
+            (2, 2, 1),
         ):
             with self.subTest(
-                pp=pp_size, vpp=virtual_stages, inflight=inflight, overlap=overlap
+                pp=pp_size, vpp=virtual_stages, inflight=inflight
             ):
                 scheduler = self._scheduler()
                 scheduler.pp_group.world_size = pp_size
                 scheduler._vpp_layout = SimpleNamespace(virtual_stages=virtual_stages)
-                scheduler._pp_vpp_overlap_chunks = overlap
                 with self.assertRaises(ValueError):
                     scheduler._pp_vpp_init_fixed_batch(inflight)
 

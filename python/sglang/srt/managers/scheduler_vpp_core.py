@@ -44,8 +44,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulingVPPCore:
-    _pp_vpp_fixed_tp = True
-
     def _pp_vpp_remote_admit_slot_available(
         self: Scheduler,
         envelope: PipelineControlEnvelope,
@@ -181,8 +179,7 @@ class SchedulingVPPCore:
         if key in self._pp_vpp_ready_proxies or key in self._pp_vpp_early_activations:
             raise RuntimeError(f"Duplicate VPP activation for batch/stage {key}")
         proxy = PPProxyTensors(tensors)
-        if getattr(self, "_pp_vpp_fixed_batch", False):
-            self._pp_vpp_fixed_received.append(key)
+        self._pp_vpp_fixed_received.append(key)
         if slot_batch_seq is None or retiring_previous_generation:
             if len(self._pp_vpp_early_activations) >= len(self._pp_vpp_slot_batch_seqs):
                 raise RuntimeError("VPP early-activation quarantine is full")
@@ -233,28 +230,17 @@ class SchedulingVPPCore:
         self: Scheduler,
         max_inflight: int,
     ) -> None:
-        self._pp_vpp_fixed_batch = True
-        self._pp_vpp_fixed_tp = True
-        if self._pp_vpp_fixed_tp and not self._pp_vpp_fixed_batch:
-            raise ValueError("SGLANG_VPP_FIXED_TP requires SGLANG_VPP_FIXED_BATCH=1")
-        if self._pp_vpp_fixed_batch:
-            if (
-                self.pp_group.world_size != 2
-                or self._vpp_layout.virtual_stages != 2
-                or max_inflight != 2
-            ):
-                raise ValueError(
-                    "SGLANG_VPP_FIXED_BATCH requires PP2/VPP2/max-inflight=2"
-                )
-            if self._pp_vpp_overlap_chunks:
-                raise ValueError(
-                    "SGLANG_VPP_FIXED_BATCH does not support overlapping chunks"
-                )
-            logger.info(
-                "VPP fixed batch scheduling enabled: two-batch waves, "
-                "activation manifests, cross-rank RESOURCE gate disabled"
-            )
-        self._pp_vpp_resource_control_enabled = not self._pp_vpp_fixed_batch
+        if (
+            self.pp_group.world_size != 2
+            or self._vpp_layout.virtual_stages != 2
+            or max_inflight != 2
+        ):
+            raise ValueError("VPP scheduling requires PP2/VPP2/max-inflight=2")
+        logger.info(
+            "VPP fixed batch scheduling enabled: two-batch waves, "
+            "activation manifests, cross-rank RESOURCE gate disabled"
+        )
+        self._pp_vpp_resource_control_enabled = False
         self._pp_vpp_fixed_wave = []
         self._pp_vpp_fixed_second_pass = False
         self._pp_vpp_fixed_received = deque()
@@ -262,12 +248,10 @@ class SchedulingVPPCore:
         self._pp_vpp_pending_batch_controls = deque()
         self._pp_vpp_fixed_activation_received = False
         self._pp_vpp_round_check = True
-        self._pp_vpp_static_send_done = None
-        if self._pp_vpp_fixed_tp:
-            logger.info(
-                "VPP fixed TP scheduling enabled: local task selection, "
-                "scheduler-owned FIFO with GPU event fences, ordered send credits"
-            )
+        logger.info(
+            "VPP fixed TP scheduling enabled: local task selection, "
+            "scheduler-owned FIFO with GPU event fences, ordered send credits"
+        )
 
     def _pp_vpp_fixed_next_task(
         self: Scheduler,
@@ -524,37 +508,33 @@ class SchedulingVPPCore:
     def _pp_vpp_poll_control_receiver_tp_broadcast(
         self: Scheduler,
     ) -> Optional[Tuple[PipelineControlEnvelope, Dict[str, object]]]:
-        if self._pp_vpp_fixed_tp:
-            # Progress each lane's P2P receive, but never enter a TP collective
-            # until all lanes receive the same consume command below.
-            self._pp_vpp_activation_receiver.progress()
+        # Progress each lane's P2P receive, but never enter a TP collective
+        # until all lanes receive the same consume command below.
+        self._pp_vpp_activation_receiver.progress()
         wire = None
         if self.attn_tp_group.rank_in_group == 0:
             message = self._pp_vpp_poll_control_receiver()
             if message is not None:
                 wire = message[1]
-        if self._pp_vpp_fixed_tp:
-            progress = (
-                (
-                    wire,
-                    self._pp_vpp_activation_receiver.receive_count(),
-                    self._pp_vpp_round_candidate,
-                )
-                if self.attn_tp_group.rank_in_group == 0
-                else None
+        progress = (
+            (
+                wire,
+                self._pp_vpp_activation_receiver.receive_count(),
+                self._pp_vpp_round_candidate,
             )
-            wire, consume, self._pp_vpp_round_check = (
-                self.attn_tp_group.broadcast_object(progress, src=0)
+            if self.attn_tp_group.rank_in_group == 0
+            else None
+        )
+        wire, consume, self._pp_vpp_round_check = (
+            self.attn_tp_group.broadcast_object(progress, src=0)
+        )
+        for _ in range(consume):
+            # Follow exactly the leader's FIFO prefix, even when local
+            # metadata arrives later. Device waits stay on the receive stream.
+            self._pp_vpp_accept_received_tensors(
+                self._pp_vpp_activation_receiver.take()
             )
-            for _ in range(consume):
-                # Follow exactly the leader's FIFO prefix, even when local
-                # metadata arrives later. Device waits stay on the receive stream.
-                self._pp_vpp_accept_received_tensors(
-                    self._pp_vpp_activation_receiver.take()
-                )
-                self._pp_vpp_fixed_activation_received = True
-        else:
-            wire = self.attn_tp_group.broadcast_object(wire, src=0)
+            self._pp_vpp_fixed_activation_received = True
         if wire is None:
             return None
         envelope = PipelineControlEnvelope.from_dict(wire)
@@ -642,31 +622,6 @@ class SchedulingVPPCore:
             key: value.to("cpu") if isinstance(value, torch.Tensor) else value
             for key, value in output_proxy.tensors.items()
         }
-
-    def _pp_vpp_broadcast_cpu_state(
-        self: Scheduler,
-        values: Optional[Tuple[int, ...]],
-        width: int,
-        src: int = 0,
-    ) -> torch.Tensor:
-        buffers = getattr(self, "_pp_vpp_cpu_broadcast_buffers", None)
-        if buffers is None:
-            buffers = self._pp_vpp_cpu_broadcast_buffers = {}
-        if width not in buffers:
-            buffers[width] = torch.empty(width, dtype=torch.int64, device="cpu")
-        state = buffers[width]
-        if self.attn_tp_group.rank_in_group == src:
-            if values is None or len(values) != width:
-                raise RuntimeError("invalid VPP TP broadcast state")
-            for index, value in enumerate(values):
-                state[index] = int(value)
-        if self.attn_tp_group.world_size > 1:
-            torch.distributed.broadcast(
-                state,
-                src=self.attn_tp_group.ranks[src],
-                group=self.attn_tp_group.cpu_group,
-            )
-        return state
 
     def _pp_vpp_cancel_target(
         self: Scheduler,
@@ -756,59 +711,19 @@ class SchedulingVPPCore:
         is_ready,
         pending_send_work: Optional[deque] = None,
     ) -> Optional[PipelineWavefrontAction]:
-        if self._pp_vpp_fixed_tp:
-            target = self._pp_vpp_fixed_next_task(rank_schedule)
-            if target is None:
-                return None
-            batch_seq, stage_id = target
-            if stage_id > 0:
-                key = (batch_seq, stage_id)
-                while (
-                    key not in self._pp_vpp_ready_proxies
-                    and key not in self._pp_vpp_early_activations
-                ):
-                    self._pp_vpp_accept_received_tensors(
-                        self._pp_vpp_activation_receiver.take()
-                    )
-                if not self.pp_group.is_first_rank:
-                    if not self._pp_vpp_fixed_remote_admit(batch_seq, rank_schedule):
-                        return None
-
-            while self._pp_vpp_arrivals:
-                rank_schedule.mark_ready(*self._pp_vpp_arrivals.popleft())
-            if (
-                pending_send_work is not None
-                and stage_id < rank_schedule.logical_size - 1
-            ):
-                self._pp_vpp_fixed_wait_send_credit(
-                    pending_send_work, rank_schedule.max_inflight
-                )
-            if not is_ready(batch_seq, stage_id):
-                return None
-            action = rank_schedule.dispatch(tick, batch_seq, stage_id)
-            self._pp_vpp_fixed_record_dispatch(action, rank_schedule)
-            return action
-
-        values = None
-        if self.attn_tp_group.rank_in_group == 0:
-            target = self._pp_vpp_fixed_next_task(rank_schedule)
-            values = (-1, -1) if target is None else target
-
-        identity = self._pp_vpp_broadcast_cpu_state(values, width=2)
-        batch_seq, stage_id = map(int, identity)
-        if batch_seq < 0:
+        target = self._pp_vpp_fixed_next_task(rank_schedule)
+        if target is None:
             return None
-
-        key = (batch_seq, stage_id)
+        batch_seq, stage_id = target
         if stage_id > 0:
-            has_input = (
-                key in self._pp_vpp_ready_proxies
-                or key in self._pp_vpp_early_activations
-            )
-            input_states = self._pp_vpp_all_gather_cpu_state((int(has_input),))
-            if not bool(input_states[:, 0].all()):
-                return None
-
+            key = (batch_seq, stage_id)
+            while (
+                key not in self._pp_vpp_ready_proxies
+                and key not in self._pp_vpp_early_activations
+            ):
+                self._pp_vpp_accept_received_tensors(
+                    self._pp_vpp_activation_receiver.take()
+                )
             if not self.pp_group.is_first_rank:
                 if not self._pp_vpp_fixed_remote_admit(batch_seq, rank_schedule):
                     return None
@@ -816,10 +731,14 @@ class SchedulingVPPCore:
         while self._pp_vpp_arrivals:
             rank_schedule.mark_ready(*self._pp_vpp_arrivals.popleft())
 
-        permitted = self._pp_vpp_all_gather_cpu_state(
-            (int(is_ready(batch_seq, stage_id)),)
-        )
-        if not bool(permitted[:, 0].all()):
+        if (
+            pending_send_work is not None
+            and stage_id < rank_schedule.logical_size - 1
+        ):
+            self._pp_vpp_fixed_wait_send_credit(
+                pending_send_work, rank_schedule.max_inflight
+            )
+        if not is_ready(batch_seq, stage_id):
             return None
 
         action = rank_schedule.dispatch(tick, batch_seq, stage_id)
@@ -842,8 +761,6 @@ class SchedulingVPPCore:
         self._init_scheduling_native_loop_state()
         prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
         decode = self.disaggregation_mode == DisaggregationMode.DECODE
-        self._pp_vpp_overlap_chunks = False
-        self._pp_vpp_launched_prefix = {}
         max_inflight = self._pp_vpp_max_inflight()
         rank_schedule = PipelineRankSchedule(
             physical_rank=self.pp_group.rank_in_group,
@@ -852,10 +769,6 @@ class SchedulingVPPCore:
             max_inflight=max_inflight,
             prefill_burst_size=1,
         )
-        if self._pp_vpp_overlap_chunks and rank_schedule.prefill_burst_size != 1:
-            raise RuntimeError(
-                "SGLANG_VPP_OVERLAP_CHUNKS requires --pp-vpp-prefill-burst-size=1"
-            )
         self._pp_vpp_init_fixed_batch(max_inflight)
         slot_batch_seqs: List[Optional[int]] = [None] * max_inflight
         self._pp_vpp_slot_batch_seqs = slot_batch_seqs
@@ -872,31 +785,28 @@ class SchedulingVPPCore:
         self._pp_vpp_prefix_registry = PipelinePrefixRegistry()
         self._pp_vpp_replica_registry = PipelineReplicaRegistry()
         self._pp_vpp_cpu_state_buffers = {}
-        self._pp_vpp_cpu_broadcast_buffers = {}
         self._pp_vpp_control_layout_digest = self._pp_vpp_layout_digest()
         is_epoch_source = self.world_group.rank_in_group == 0
         self._pp_vpp_runtime_epoch = self.world_group.broadcast_object(
             time.time_ns() if is_epoch_source else None,
             src=0,
         )
-        if self._pp_vpp_fixed_tp:
-            source_rank = (self.pp_group.rank_in_group - 1) % self.pp_group.world_size
-            self._pp_vpp_activation_receiver = VPPSchedulerActivationReceiver(
-                self._pp_vpp_activation_group(source_rank),
-                self.pp_group.vpp_activation_tp_group,
-                max_inflight,
-                batch_p2p=self.pp_group.world_size == 2,
-                tag=_VPP_ACTIVATION_TAG,
-            )
-            self._pp_vpp_activation_receiver.start()
+        source_rank = (self.pp_group.rank_in_group - 1) % self.pp_group.world_size
+        self._pp_vpp_activation_receiver = VPPSchedulerActivationReceiver(
+            self._pp_vpp_activation_group(source_rank),
+            self.pp_group.vpp_activation_tp_group,
+            max_inflight,
+            batch_p2p=self.pp_group.world_size == 2,
+            tag=_VPP_ACTIVATION_TAG,
+        )
+        self._pp_vpp_activation_receiver.start()
         self._pp_vpp_start_receiver()
         self._pp_vpp_start_control_receiver()
 
         activation_send_work = deque()
         control_send_work = deque()
         max_control_sends = max_inflight * rank_schedule.logical_size
-        if self._pp_vpp_fixed_tp:
-            max_control_sends = max(64, max_control_sends)
+        max_control_sends = max(64, max_control_sends)
         token_budget = max(max_prefill_buffer_tokens(), 1)
         hidden_size = int(self.model_config.hidden_size)
         hc_mult = int(getattr(self.model_config.hf_config, "hc_mult", 1))
@@ -1126,8 +1036,7 @@ class SchedulingVPPCore:
                 and envelope.hops >= self.pp_group.world_size
             )
             if (
-                self._pp_vpp_fixed_batch
-                and envelope.batch_seq > self._pp_vpp_highest_admitted_batch_seq
+                envelope.batch_seq > self._pp_vpp_highest_admitted_batch_seq
                 and envelope.kind
                 in (
                     PipelineControlKind.CANCEL,
@@ -1462,12 +1371,9 @@ class SchedulingVPPCore:
             if envelope.kind == PipelineControlKind.CANCEL:
                 if returned_to_source:
                     return
-                if self._pp_vpp_fixed_batch:
-                    _, req = self._pp_vpp_cancel_target(envelope)
-                else:
-                    req = self._pp_vpp_find_req(str(payload["rid"]))
+                _, req = self._pp_vpp_cancel_target(envelope)
                 if req is not None:
-                    if not self._pp_vpp_fixed_batch or req in getattr(
+                    if req in getattr(
                         self, "chunked_reqs", (self.chunked_req,)
                     ):
                         self._pending_chunked_abort_req = req
@@ -1476,7 +1382,7 @@ class SchedulingVPPCore:
                         # Avoid the generic RID-based abort path, which may
                         # target a newer incarnation in a different queue.
                         req.to_finish = FINISH_ABORT()
-                if req is not None or not self._pp_vpp_fixed_batch:
+                if req is not None:
                     rank_schedule.cancel(envelope.batch_seq)
                 forward_control(envelope, wire)
                 return
@@ -1710,14 +1616,7 @@ class SchedulingVPPCore:
                         for slot_id, batch in enumerate(self.mbs)
                         if batch is not None
                         and slot_batch_seqs[slot_id] is not None
-                        and any(
-                            (
-                                req is pending_abort
-                                if self._pp_vpp_fixed_batch
-                                else req.rid == pending_abort.rid
-                            )
-                            for req in batch.reqs
-                        )
+                        and any(req is pending_abort for req in batch.reqs)
                     ]
                     if not cancelled_batches:
                         cancelled_batches = [-1]
@@ -1743,8 +1642,6 @@ class SchedulingVPPCore:
                                                 pending_abort, "bootstrap_room", None
                                             ),
                                         }
-                                        if self._pp_vpp_fixed_batch
-                                        else {}
                                     ),
                                 },
                             ).forwarded()
@@ -1754,9 +1651,7 @@ class SchedulingVPPCore:
                 continuation = (
                     self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
-                required_kv_tokens = token_budget + (
-                    self.page_size if self._pp_vpp_overlap_chunks else 0
-                )
+                required_kv_tokens = token_budget
                 if (
                     (
                         not bootstrap_round_active
@@ -1800,20 +1695,7 @@ class SchedulingVPPCore:
                             slot_id,
                             batch,
                         )
-                        if getattr(self, "_pp_vpp_fixed_batch", False):
-                            batch._vpp_fixed_manifest = manifest
-                        else:
-                            envelope = self._pp_vpp_new_control(
-                                PipelineControlKind.ADMIT,
-                                batch_seq=next_batch_seq,
-                                slot_id=slot_id,
-                                payload={
-                                    "manifest": manifest,
-                                    "errors": [],
-                                },
-                            )
-                            self._pp_vpp_queue_control(envelope.forwarded())
-                            pending_admits.add(next_batch_seq)
+                        batch._vpp_fixed_manifest = manifest
                         rank_schedule.admit(next_batch_seq)
                         self._pp_vpp_highest_admitted_batch_seq = max(
                             self._pp_vpp_highest_admitted_batch_seq, next_batch_seq
@@ -1857,16 +1739,6 @@ class SchedulingVPPCore:
                 pending_first_pass.pop(batch_seq, None)
 
             def action_ready(batch_seq: int, stage_id: int) -> bool:
-                if self._pp_vpp_overlap_chunks:
-                    batch = self.mbs[batch_seq % max_inflight]
-                    for req, start in zip(batch.reqs, batch.prefix_lens):
-                        generation = int(getattr(req, "session_generation", None) or 0)
-                        entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
-                        launched = self._pp_vpp_launched_prefix.get(
-                            (req.rid, generation, stage_id), entry.committed_end
-                        )
-                        if launched < start:
-                            return False
                 if (
                     stage_id < rank_schedule.logical_size - 1
                     and len(activation_send_work) >= max_inflight
@@ -1876,35 +1748,20 @@ class SchedulingVPPCore:
                     return True
                 return (batch_seq, stage_id) in self._pp_vpp_ready_proxies
 
-            if self._pp_vpp_fixed_tp:
-                received = self._pp_vpp_fixed_activation_received
-                self._pp_vpp_fixed_activation_received = False
-                ready_states = None
-            else:
-                received, ready_states = self._pp_vpp_gather_tick_consensus(
-                    rank_schedule,
-                    action_ready,
-                )
+            received = self._pp_vpp_fixed_activation_received
+            self._pp_vpp_fixed_activation_received = False
             if received:
                 mark_progress("activation")
             while self._pp_vpp_arrivals:
                 batch_seq, stage_id = self._pp_vpp_arrivals.popleft()
                 rank_schedule.mark_ready(batch_seq, stage_id)
 
-            if getattr(self, "_pp_vpp_fixed_batch", False):
-                action = self._pp_vpp_fixed_select_tp_action(
-                    rank_schedule,
-                    tick,
-                    action_ready,
-                    activation_send_work,
-                )
-            else:
-                action = self._pp_vpp_select_tp_action(
-                    rank_schedule,
-                    tick,
-                    action_ready,
-                    ready_states,
-                )
+            action = self._pp_vpp_fixed_select_tp_action(
+                rank_schedule,
+                tick,
+                action_ready,
+                activation_send_work,
+            )
             if action is not None:
                 replica_restores = []
                 if action.stage_id > 0:
@@ -1990,10 +1847,6 @@ class SchedulingVPPCore:
                                 getattr(req, "session_generation", None) or 0
                             )
                             end = batch.disagg_prefill_chunk_end_by_rid[req.rid]
-                            if self._pp_vpp_overlap_chunks:
-                                self._pp_vpp_launched_prefix[
-                                    (req.rid, request_generation, action.stage_id)
-                                ] = end
                             self._pp_vpp_pending_materialized.append(
                                 (
                                     action.batch_seq,
