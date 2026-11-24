@@ -216,6 +216,41 @@ class TestDSV4CompressedPools(CustomTestCase):
                         full_page_ids(batch, producer, 4).tolist(), [5, 3, 2, 1]
                     )
 
+    def test_v41_tail_selections_keep_compact_rows_and_full_kv_pages(self):
+        producer = torch.tensor(
+            [[8, 9, 10, 11, 4, 5, 6, 7], [20, 21, 22, 23, 12, 13, 14, 15]]
+        )
+        consumer = torch.tensor(
+            [[0, 1, 2, 3, 24, 25, 26, 27], [16, 17, 18, 19, 28, 29, 30, 31]]
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.tensor([1, 0]),
+            seq_lens=torch.tensor([8, 6]),
+            seq_lens_cpu=[8, 6],
+            extend_seq_lens=torch.tensor([3, 2]),
+            input_ids=torch.zeros(5, dtype=torch.int64),
+        )
+        tail_lens = torch.tensor([2, 1])
+        logical = torch.tensor([[0, 2, -1], [1, 2, -1], [2, 3, -1]])
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                slots = physical_selection(logical, batch, producer, ratio, tail_lens)
+                transported = logical_selection(
+                    slots, batch, producer, 4, ratio, tail_lens
+                )
+                torch.testing.assert_close(transported, logical.to(torch.int32))
+                actual = physical_selection(
+                    transported, batch, consumer, ratio, tail_lens
+                )
+                expected = physical_selection(
+                    logical, batch, consumer, ratio, tail_lens
+                )
+                torch.testing.assert_close(actual, expected)
+                self.assertEqual(
+                    full_page_ids(batch, producer, 4).tolist(), [5, 3, 2, 1]
+                )
+
     def test_checkpoint_pages_alias_complete_rings_and_exclude_trailing_rows(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             with self.subTest(dtype=dtype):

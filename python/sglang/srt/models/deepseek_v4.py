@@ -4076,10 +4076,11 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
-            if self.tail_writes_source_kv:
+            if self.tail_writes_source_kv and last_source in self.layer_ids:
                 assert self.layers[last_source].engram is None, (
                     "the last kv_source layer must not carry an Engram"
                 )
+            if self.tail_writes_source_kv:
                 # The tail layers read the top-k and candidates the source layer
                 # publishes inside the tail; no earlier layer carries them over.
                 assert (
@@ -4104,7 +4105,9 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
-        self.decoder_replay_tail = DecoderReplayTail.maybe_create(self)
+        self.decoder_replay_tail = (
+            DecoderReplayTail.maybe_create(self) if self.vpp_layout is None else None
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4628,8 +4631,8 @@ class DeepseekV4Model(nn.Module):
             raise NotImplementedError(
                 "DSV4 VPP auxiliary hidden-state capture is not wired"
             )
-        if self.late_layer_start is not None or self.decoder_replay_tail is not None:
-            raise NotImplementedError("DSV4 VPP bounded replay is not wired")
+        if self.decoder_replay_tail is not None:
+            raise NotImplementedError("DSV4 VPP decoder replay graphs are not wired")
         if self._can_run_tbo(forward_batch):
             raise NotImplementedError("DSV4 VPP two-batch overlap is not wired")
         if stage_id == 0:
@@ -4642,8 +4645,18 @@ class DeepseekV4Model(nn.Module):
 
         from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
 
+        tail = None
+        if (
+            self.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+            self._check_late_layer_tail_readers(forward_batch, tail)
         try:
-            with mega_gate_forward_scope(forward_batch):
+            with (
+                self._vpp_late_layer_tail_scope(forward_batch) as activate_tail,
+                mega_gate_forward_scope(forward_batch),
+            ):
                 return self._forward_vpp_stage_impl(
                     stage,
                     input_ids,
@@ -4651,9 +4664,28 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_embeds,
                     pp_proxy_tensors,
+                    tail,
+                    activate_tail,
                 )
         finally:
             residual_batch.clear(forward_batch)
+
+    @contextmanager
+    def _vpp_late_layer_tail_scope(self, forward_batch):
+        backend = get_attn_backend()
+        saved = None
+
+        def activate():
+            nonlocal saved
+            if saved is not None:
+                raise RuntimeError("VPP tail activated twice in one stage")
+            saved = backend.enter_late_layer_tail(forward_batch)
+
+        try:
+            yield activate
+        finally:
+            if saved is not None:
+                backend.exit_late_layer_tail(saved, forward_batch)
 
     def _forward_vpp_stage_impl(
         self,
@@ -4663,7 +4695,21 @@ class DeepseekV4Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors],
+        tail=None,
+        activate_tail=None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        in_tail = bool(
+            pp_proxy_tensors is not None
+            and pp_proxy_tensors.tensors.get("vpp_late_layer_tail", False)
+        )
+        if in_tail:
+            if tail is None or stage.start_layer <= self.late_layer_start:
+                raise ValueError("Unexpected compact VPP tail handoff")
+            activate_tail()
+            input_ids = tail.rows(input_ids)
+            positions = tail.positions
+        elif tail is not None and stage.start_layer > self.late_layer_start:
+            raise ValueError("A late VPP stage requires a compact tail handoff")
         if stage.stage_id == 0:
             from sglang.kernels.ops.layernorm.mhc import hc_broadcast
 
@@ -4707,7 +4753,11 @@ class DeepseekV4Model(nn.Module):
             else:
                 state = hidden_states
         hidden_states = residual_batch.set_written(state, forward_batch)
-        input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
+        input_ids_global = getattr(forward_batch, "input_ids_global", None)
+        if input_ids_global is None:
+            input_ids_global = input_ids
+        elif in_tail:
+            input_ids_global = tail.rows(input_ids_global)
         for attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, attr):
                 delattr(forward_batch, attr)
@@ -4722,6 +4772,34 @@ class DeepseekV4Model(nn.Module):
         )
         for i in range(stage.start_layer, stage.end_layer):
             layer = self.layers[i]
+            if tail is not None and i == self.late_layer_start:
+                call = hc_boundary.LayerCall(input_ids, input_ids_global)
+                next_boundary = (
+                    hc_boundary.HcRead(layer, True)
+                    .bind(forward_batch, call)
+                    .next_boundary
+                )
+                state = hc_boundary.materialize(
+                    hidden_states, forward_batch, next=next_boundary
+                )
+                if self.tail_writes_source_kv:
+                    source_x = mhc.combine(layer.attn_hc, state)
+                    get_attn_backend().write_tail_source_kv(
+                        layer=layer.self_attn,
+                        x=source_x,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                    )
+                    del source_x
+                activate_tail()
+                state = state.take_rows(tail.rows)
+                hidden_states = residual_batch.set_written(state, forward_batch)
+                input_ids = tail.rows(input_ids)
+                input_ids_global = tail.rows(input_ids_global)
+                positions = tail.positions
+                if hash_ids is not None:
+                    hash_ids = tail.rows(hash_ids)
+                in_tail = True
             if self.hc_pre_from_prev_sublayer and layer.engram is not None:
                 state = hc_boundary.materialize(hidden_states, forward_batch)
                 streams = layer.engram(
@@ -4761,6 +4839,8 @@ class DeepseekV4Model(nn.Module):
             hidden_states, last_pre = state, None
         if stage.stage_id != self.vpp_layout.logical_size - 1:
             tensors = {"hidden_states": hidden_states.flatten(1)}
+            if in_tail:
+                tensors["vpp_late_layer_tail"] = True
             if self.hc_pre_from_prev_sublayer:
                 tensors["hc_pre"] = last_pre
             if hash_ids is not None:
@@ -5405,7 +5485,15 @@ class DeepseekV4ForCausalLM(
             )
         if stage_id != self.model.vpp_layout.logical_size - 1:
             return hidden_states
-        return self._postprocess_output(hidden_states, input_ids, forward_batch)
+        tail = (
+            get_attn_backend().tail_forward_metadata.late_layer_tail
+            if self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            else None
+        )
+        return self._postprocess_output(
+            hidden_states, input_ids, forward_batch, tail=tail
+        )
 
     def forward(
         self,
@@ -5466,14 +5554,15 @@ class DeepseekV4ForCausalLM(
             hidden_states, forward_batch.input_ids, forward_batch
         )
 
-    def _postprocess_output(self, hidden_states, input_ids, forward_batch):
+    def _postprocess_output(self, hidden_states, input_ids, forward_batch, tail=None):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
         logits_metadata = forward_batch
-        tail = self._get_dspark_prefill_tail(forward_batch)
+        if tail is None:
+            tail = self._get_dspark_prefill_tail(forward_batch)
         token_indices = None
         if tail is not None:
             # CP output has been gathered into compact global request order.

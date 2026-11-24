@@ -276,7 +276,9 @@ class TestVPPTransport(CustomTestCase):
         handles.append(SimpleNamespace(poll_metadata_ready=lambda: False))
         group = SimpleNamespace(
             device="cpu",
-            recv_tensor_dict_async=lambda *, tag: handles.popleft(),
+            recv_tensor_dict_async=lambda *, tag, all_gather_group, batch_p2p: (
+                handles.popleft()
+            ),
         )
         receiver = VPPSchedulerActivationReceiver(
             group, None, 2, batch_p2p=False, tag=17

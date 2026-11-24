@@ -389,9 +389,12 @@ class TestSchedulingVPPCore(CustomTestCase):
             hidden_size=8, hf_config=SimpleNamespace(hc_mult=4)
         )
         scheduler.receive_tags = []
+        scheduler.pp_group.vpp_activation_tp_group = scheduler.attn_tp_group
         scheduler.activation_group = SimpleNamespace(
             device="cpu",
-            recv_tensor_dict_async=lambda tag: scheduler.receive_tags.append(tag),
+            recv_tensor_dict_async=lambda tag, **kwargs: scheduler.receive_tags.append(
+                tag
+            ),
         )
         scheduler.world_group = SimpleNamespace(
             rank_in_group=rank,

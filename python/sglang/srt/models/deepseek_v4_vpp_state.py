@@ -17,14 +17,14 @@ def stage_hash_ids(stage_id, hasher, input_ids, batch, tensors):
     return hashes
 
 
-def request_rows(batch):
+def request_rows(batch, extend_lens=None, num_rows=None):
     requests = batch.req_pool_indices.to(torch.int64)
     if batch.forward_mode.is_decode():
         return requests
     return torch.repeat_interleave(
         requests,
-        batch.extend_seq_lens.to(torch.int64),
-        output_size=batch.input_ids.numel(),
+        (batch.extend_seq_lens if extend_lens is None else extend_lens).to(torch.int64),
+        output_size=batch.input_ids.numel() if extend_lens is None else num_rows,
     )
 
 
@@ -42,7 +42,7 @@ def full_page_ids(batch, req_to_token, page_size):
     )
 
 
-def logical_selection(slots, batch, req_to_token, page_size, ratio):
+def logical_selection(slots, batch, req_to_token, page_size, ratio, extend_lens=None):
     """Convert pool slots to request-local positions before crossing ranks."""
     width = (max(int(n) for n in batch.seq_lens_cpu) + page_size - 1) // page_size
     table = (
@@ -60,7 +60,11 @@ def logical_selection(slots, batch, req_to_token, page_size, ratio):
     rows = torch.arange(table.shape[0], device=table.device)
     if not batch.forward_mode.is_decode():
         rows = torch.repeat_interleave(
-            rows, batch.extend_seq_lens.to(torch.int64), output_size=slots.shape[0]
+            rows,
+            (batch.extend_seq_lens if extend_lens is None else extend_lens).to(
+                torch.int64
+            ),
+            output_size=slots.shape[0],
         )
     compressed_page = page_size // ratio
     selected_pages = slots.to(torch.int64).clamp_min(0) // compressed_page
@@ -72,14 +76,16 @@ def logical_selection(slots, batch, req_to_token, page_size, ratio):
     return positions.masked_fill(slots < 0, -1).to(torch.int32)
 
 
-def physical_selection(positions, batch, req_to_token, ratio):
-    rows = request_rows(batch)
+def physical_selection(positions, batch, req_to_token, ratio, extend_lens=None):
+    rows = request_rows(batch, extend_lens, positions.shape[0])
     full_positions = positions.to(torch.int64).clamp_min(0) * ratio
     slots = req_to_token[rows[:, None], full_positions] // ratio
     return slots.masked_fill(positions < 0, -1).to(torch.int32)
 
 
 def export_state(tensors, *, config, next_layer, batch, pool, req_to_token, metadata):
+    tail = metadata.late_layer_tail if tensors.get("vpp_late_layer_tail") else None
+    extend_lens = None if tail is None else tail.extend_seq_lens
     ratio = config.compress_ratios[next_layer]
     if ratio in (1, 2):
         source = max(
@@ -109,6 +115,7 @@ def export_state(tensors, *, config, next_layer, batch, pool, req_to_token, meta
                     req_to_token,
                     pool.page_size,
                     ratio,
+                    extend_lens,
                 )
             tensors["vpp_index_ratio"] = ratio
             tensors["vpp_index_positions"] = raw
@@ -118,6 +125,8 @@ def export_state(tensors, *, config, next_layer, batch, pool, req_to_token, meta
 
 
 def install_state(tensors, *, batch, pool, req_to_token, metadata):
+    tail = metadata.late_layer_tail if tensors.get("vpp_late_layer_tail") else None
+    extend_lens = None if tail is None else tail.extend_seq_lens
     source = tensors.get("vpp_source_layer")
     if source is not None:
         pool.install_source_pages(
@@ -134,13 +143,15 @@ def install_state(tensors, *, batch, pool, req_to_token, metadata):
         raw = tensors["vpp_index_positions"]
         metadata.core_metadata.set_sparse_topk(
             ratio,
-            page_indices=physical_selection(raw, batch, req_to_token, ratio),
+            page_indices=physical_selection(
+                raw, batch, req_to_token, ratio, extend_lens
+            ),
             topk_lengths=tensors["vpp_index_lengths"],
             raw_indices=raw if not batch.forward_mode.is_decode() else None,
         )
     if "vpp_candidate_kind" in tensors:
         metadata.candidate_metadata = _install_candidates(
-            tensors, batch, pool, req_to_token
+            tensors, batch, pool, req_to_token, extend_lens
         )
 
 
@@ -175,7 +186,7 @@ def _export_candidates(tensors, candidate):
         raise TypeError(f"Unsupported VPP candidate metadata: {type(candidate)}")
 
 
-def _install_candidates(tensors, batch, pool, req_to_token):
+def _install_candidates(tensors, batch, pool, req_to_token, extend_lens=None):
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
 
     blocks = tensors["vpp_candidate_blocks"]
@@ -197,7 +208,8 @@ def _install_candidates(tensors, batch, pool, req_to_token):
     ) // index_page_size
     table = (
         req_to_token[
-            request_rows(batch), : width * index_page_size : index_page_size
+            request_rows(batch, extend_lens, blocks.shape[0]),
+            : width * index_page_size : index_page_size,
         ].to(torch.int32)
         // index_page_size
     )
