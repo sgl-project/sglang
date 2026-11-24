@@ -186,10 +186,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         graph_batch_capacity=4,
                     )
                     self.assertEqual(plan.copy_sfa_query_heads, native_heads)
-                    self.assertEqual(
-                        plan.output_scratch_bytes,
-                        4 * native_heads * 512 * 2,
-                    )
                     self.assertNotIn("query_scale", plan.adapter_buffers)
 
     def test_graph_alignment_is_reserved_before_buckets_are_resolved(self):

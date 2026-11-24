@@ -94,7 +94,6 @@ class BudgetPlan:
             "device_slot_map": BufferSpec(
                 (resident_rows + 1, context_len), metadata_dtype, num_layers
             ),
-            "resident_begin": BufferSpec((num_layers, request_rows), metadata_dtype),
             "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
             "planner_hbm_block_table": BufferSpec(
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
@@ -149,17 +148,6 @@ class BudgetPlan:
             for n in ("device_k_buffer", "device_v_buffer")
         )
         self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
-        # Reserve one maximal forward output without allocating it persistently.
-        self.output_scratch_bytes = BufferSpec(
-            (batch_capacity * max_query_width, copy_sfa_query_heads, kv_lora_rank),
-            kv_dtype,
-        ).nbytes
-        self.copy_sfa_bytes = sum(
-            s.nbytes
-            for n, s in self.manager_buffers.items()
-            if n not in ("device_k_buffer", "device_v_buffer", "device_slot_map")
-            and not n.startswith("prefill_")
-        )
         self.prefill_workspace_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
@@ -171,11 +159,10 @@ class BudgetPlan:
 
     @property
     def managed_hbm_bytes(self) -> int:
+        """Reserve HBM for resident KV, slot maps, LIM metadata, and prefill."""
         return (
             self.device_kv_bytes
             + self.slot_map_bytes
-            + self.copy_sfa_bytes
-            + self.output_scratch_bytes
             + self.prefill_workspace_bytes
             + self.adapter_bytes
         )

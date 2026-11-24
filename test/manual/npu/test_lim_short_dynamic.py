@@ -159,7 +159,6 @@ def test_prefill_attention_and_short_residency():
                     tp_q_head_num=heads,
                     scaling=576**-0.5,
                 )
-                manager.resident_begin[layer_id][1:3] = 0
                 manager.resident_end[layer_id][1:3] = 1
                 output = forward_fused_sparse_kv_offload(
                     backend,
@@ -196,7 +195,6 @@ def test_prefill_attention_and_short_residency():
                         rtol=0,
                         atol=0,
                     )
-                assert manager.resident_begin[layer_id][1:3].cpu().tolist() == [-1, -1]
                 assert manager.resident_end[layer_id][1:3].cpu().tolist() == [-1, -1]
         finally:
             if manager is not None:
@@ -265,10 +263,15 @@ def test_short_sparse_graph_lifecycle(
             )
             allocations = [
                 tensor
-                for owner in (manager, manager.lim_adapter)
-                for value in vars(owner).values()
+                for owner, names in (
+                    (
+                        manager,
+                        ("device_k_buffer", "device_v_buffer", "device_slot_map"),
+                    ),
+                    (manager.lim_adapter, budget.adapter_buffers),
+                )
+                for value in (getattr(owner, name) for name in names)
                 for tensor in (value if isinstance(value, (list, tuple)) else [value])
-                if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu"
             ]
             assert (
                 sum(t.numel() * t.element_size() for t in allocations)
@@ -528,10 +531,6 @@ def test_short_sparse_graph_lifecycle(
                             rtol=0,
                             atol=0,
                         )
-                    assert manager.resident_begin[layer_id, 1:3].cpu().tolist() == [
-                        -1,
-                        -1,
-                    ]
                     assert manager.resident_end[layer_id, 1:3].cpu().tolist() == [
                         -1,
                         -1,

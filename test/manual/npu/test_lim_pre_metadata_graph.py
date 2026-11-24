@@ -122,10 +122,10 @@ def test_npu_graph_replay_matches_torch_reference(
         expected_valid, expected_state, expected_next, expected_cache = [], [], [], []
         for slot, length in zip(host_slots, host_lengths):
             ok = slot > 0 and slot < rows and length > 0
-            ln = int(length) if ok else 0
+            ln = length if ok else 0
             pre = ln
             sp = ok and pre >= capacity
-            old = int(last_prefix[slot if ok else rows].item())
+            old = last_prefix[slot if ok else rows].item()
             warm = sp and old >= 0 and pre >= old
             expected_safe.append(slot if ok else rows)
             expected_len.append(ln)

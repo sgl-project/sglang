@@ -1214,7 +1214,7 @@ class TestEagleConfigurator(CustomTestCase):
                 )
 
             # Eager MLP-sync can pad a one-row target to attention TP=8 even
-            # when graphs are disabled. Admission must price that scratch too.
+            # when graphs are disabled. Admission reserves the padded LIM metadata.
             with get_parallel().override(
                 tp_size=16,
                 attn_tp_size=8,
@@ -1231,10 +1231,7 @@ class TestEagleConfigurator(CustomTestCase):
                 self.assertEqual(padded.device_kv_bytes, 3 * 4 * 8192 * 1152)
                 self.assertGreater(padded.batch_capacity, unpadded.batch_capacity)
                 self.assertEqual(padded.copy_sfa_query_heads, 16)
-                self.assertEqual(
-                    padded.output_scratch_bytes,
-                    padded.batch_capacity * 3 * 16 * 512 * 2,
-                )
+                self.assertGreater(padded.managed_hbm_bytes, unpadded.managed_hbm_bytes)
 
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
         """Budget the target manager per attention-DP worker, including PD slots."""

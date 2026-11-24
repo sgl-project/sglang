@@ -285,4 +285,4 @@ def fit_pd_sparse_budget_from_config(
 def get_sparse_kv_max_query_width() -> int:
     spec = get_spec()
     # The budget resolver validates the resulting native query geometry.
-    return int(spec.speculative_num_draft_tokens or 1)
+    return spec.speculative_num_draft_tokens or 1

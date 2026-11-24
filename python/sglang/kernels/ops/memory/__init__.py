@@ -6,11 +6,7 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import (
-    CUDA_ONLY,
-    KernelBackend,
-    KernelSpec,
-)
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [

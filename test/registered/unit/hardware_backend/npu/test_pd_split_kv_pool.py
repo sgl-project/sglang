@@ -278,19 +278,7 @@ class TestPDSplitKVPool(CustomTestCase):
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
         src, dst = torch.tensor([0]), torch.tensor([1])
         valid, positions = torch.tensor([True]), torch.tensor([7])
-        current = ("payload", "rows", "valid")
-        kernels = ModuleType("sglang.kernels.ops.kvcache.npu_sparse_kv")
-        kernels.prepare_sparse_kv_offload = lambda *args, **kwargs: (
-            src,
-            dst,
-            positions,
-            valid,
-            current,
-        )
-        mtp = ModuleType(
-            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim"
-        )
-        mtp.sparse_query_width = lambda batch: 1
+        offload_rows = (src, dst, positions, valid)
         shared = [torch.zeros(2, 1, w) for w in (2, 1)]
         events = []
 
@@ -307,35 +295,30 @@ class TestPDSplitKVPool(CustomTestCase):
 
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: False),
-            req_pool_indices=torch.tensor([0]),
-            seq_lens=torch.tensor([1]),
-            positions=positions,
-            out_cache_loc=dst,
         )
-        with patch.dict(sys.modules, {kernels.__name__: kernels, mtp.__name__: mtp}):
-            for rank, value in ((0, 3), (1, 99)):
-                m = SimpleNamespace(
-                    start_layer=0,
-                    size=1,
-                    logical_max_context_len=2,
-                    host_token_capacity=2,
-                    host_pool=Pool(rank),
-                    host_k_buffer=[shared[0]],
-                    host_v_buffer=[shared[1]],
-                )
-                result = ns["offload_v2"](
-                    m,
-                    torch.full((1, 1, 2), value, dtype=shared[0].dtype),
-                    torch.full((1, 1, 1), value, dtype=shared[1].dtype),
-                    SimpleNamespace(layer_id=0),
-                    batch,
-                )
-                self.assertIs(result[0], current)
-                self.assertIs(result[1], positions)
-                self.assertIs(result[2], valid)
+        for rank, value in ((0, 3), (1, 99)):
+            manager_state = SimpleNamespace(
+                start_layer=0,
+                host_pool=Pool(rank),
+                host_k_buffer=[shared[0]],
+                host_v_buffer=[shared[1]],
+            )
+            k = torch.full((1, 1, 2), value, dtype=shared[0].dtype)
+            k_rope = torch.full((1, 1, 1), value + 1, dtype=shared[1].dtype)
+            result = ns["offload_v2"](
+                manager_state,
+                k,
+                k_rope,
+                SimpleNamespace(layer_id=0),
+                batch,
+                offload_rows=offload_rows,
+            )
+            torch.testing.assert_close(result[0], torch.cat((k, k_rope), dim=-1))
+            self.assertIs(result[1], positions)
+            self.assertIs(result[2], valid)
         self.assertEqual(events, [0, 1])
-        for tensor in shared:
-            self.assertTrue(torch.all(tensor[1] == 3))
+        self.assertTrue(torch.all(shared[0][1] == 3))
+        self.assertTrue(torch.all(shared[1][1] == 4))
 
     def test_shared_host_allocation_and_copy(self):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (

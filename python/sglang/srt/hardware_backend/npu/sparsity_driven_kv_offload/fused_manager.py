@@ -40,10 +40,10 @@ class FusedSparseKVCacheManager:
         *,
         paged_kv_cache: MLATokenToKVPool,
     ) -> None:
-        self.actual_request_rows = int(req_to_token_pool.req_to_token.shape[0])
-        self.logical_max_context_len = int(req_to_token_pool.req_to_token.shape[1])
+        self.actual_request_rows = req_to_token_pool.req_to_token.shape[0]
+        self.logical_max_context_len = req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = req_to_token_pool
-        self.sparse_topk = int(sparse_topk)
+        self.sparse_topk = sparse_topk
         self.device = req_to_token_pool.device
         self.paged_kv_cache = paged_kv_cache
         self.start_layer = paged_kv_cache.start_layer
@@ -69,7 +69,7 @@ class FusedSparseKVCacheManager:
         try:
             for name, spec in self.budget.manager_buffers.items():
                 fill_value = None
-                if name in ("device_slot_map", "resident_begin", "resident_end"):
+                if name in ("device_slot_map", "resident_end"):
                     fill_value = -1
                 elif name == "request_to_resident":
                     fill_value = 0
@@ -161,7 +161,6 @@ class FusedSparseKVCacheManager:
                 self.device, non_blocking=True
             )
         )
-        self.resident_begin.index_fill_(1, req_indices, -1)
         self.resident_end.index_fill_(1, req_indices, -1)
         for slot_map in self.device_slot_map:
             slot_map.index_fill_(0, resident_indices, -1)
@@ -276,7 +275,6 @@ class FusedSparseKVCacheManager:
             valid=valid,
             request_slots=plan.request_safe_slots,
             req_to_token=self.req_to_token_pool.req_to_token,
-            resident_begin=self.resident_begin[layer_idx, : self.actual_request_rows],
             resident_end=self.resident_end[layer_idx, : self.actual_request_rows],
             host_token_capacity=self.host_token_capacity,
             dram_rope_dev_ptr=self.rope_dev_ptr_list[layer_idx],
@@ -366,7 +364,6 @@ class FusedSparseKVCacheManager:
             # A prefill can rewrite an existing request's host prefix.
             # Invalidate only this layer's resident extent.
             requests = forward_batch.req_pool_indices.to(torch.long)
-            self.resident_begin[layer_idx].index_fill_(0, requests, -1)
             self.resident_end[layer_idx].index_fill_(0, requests, -1)
 
         return current, positions, valid
@@ -412,7 +409,7 @@ class FusedSparseKVCacheManager:
         device cache idea and avoids repeatedly copying the full prefix KV from
         host for every chunk.
         """
-        layer_id = layer.layer_id if hasattr(layer, "layer_id") else int(layer)
+        layer_id = layer.layer_id if hasattr(layer, "layer_id") else layer
         layer_idx = layer_id - self.start_layer
         device = self.device
         if plan is not None:

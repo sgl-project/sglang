@@ -99,7 +99,6 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(plan.manager_buffers["device_k_buffer"].shape[0], 3)
         self.assertEqual(plan.manager_buffers["device_v_buffer"].shape[0], 3)
         self.assertEqual(plan.manager_buffers["device_slot_map"].shape[0], 4)
-        self.assertEqual(plan.manager_buffers["resident_begin"].shape, (2, 103))
         self.assertEqual(plan.manager_buffers["resident_end"].shape, (2, 103))
         self.assertEqual(plan.manager_buffers["request_to_resident"].shape, (103,))
         self.assertEqual(plan.adapter_buffers["last_prefix"].shape, (4,))
@@ -125,7 +124,6 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(spec.dtype, torch.bfloat16)
         self.assertEqual(plan.managed_hbm_bytes - base.managed_hbm_bytes, 129 * 576 * 2)
         self.assertEqual(plan.prefill_workspace_bytes, 129 * 576 * 2)
-        self.assertEqual(plan.copy_sfa_bytes, base.copy_sfa_bytes)
         without_workspace = plan.without_prefill_workspace()
         self.assertEqual(plan.prefill_workspace_tokens, 129)
         self.assertIn("prefill_nope", plan.manager_buffers)
@@ -183,7 +181,11 @@ class TestLIMState(CustomTestCase):
         padded = resolve_sparse_kv_budget(**self.options())
         self.assertEqual(small.device_kv_bytes, padded.device_kv_bytes)
         self.assertEqual(small.slot_map_bytes, padded.slot_map_bytes)
-        self.assertGreater(padded.copy_sfa_bytes, small.copy_sfa_bytes)
+        self.assertGreater(padded.adapter_bytes, small.adapter_bytes)
+        self.assertEqual(
+            padded.managed_hbm_bytes - small.managed_hbm_bytes,
+            padded.adapter_bytes - small.adapter_bytes,
+        )
 
     def test_adapter_budget_matches_actual_dynamic_query_allocations(self):
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
@@ -420,9 +422,10 @@ class TestLIMState(CustomTestCase):
             )
 
         self.assertEqual(
-            actual_bytes(manager, plan.manager_buffers)
-            + actual_bytes(manager.lim_adapter, plan.adapter_buffers)
-            + plan.output_scratch_bytes,
+            actual_bytes(
+                manager, ("device_k_buffer", "device_v_buffer", "device_slot_map")
+            )
+            + actual_bytes(manager.lim_adapter, plan.adapter_buffers),
             plan.managed_hbm_bytes,
         )
         self.assertFalse(hasattr(manager.lim_adapter, "key_scale"))
@@ -513,7 +516,7 @@ class TestLIMState(CustomTestCase):
                 kwargs["request_slots"], torch.tensor(request_ids, dtype=torch.int32)
             )
             self.assertEqual(
-                kwargs["resident_begin"].numel(), req_pool.req_to_token.shape[0]
+                kwargs["resident_end"].numel(), req_pool.req_to_token.shape[0]
             )
             self.assertEqual(tensors[7].ndim, 2)
             self.assertEqual(tensors[8].ndim, 2)
@@ -563,7 +566,6 @@ class TestLIMState(CustomTestCase):
         if compact_pd:
             manager.device_slot_map[0][1].fill_(7)
             adapter.last_prefix[1].fill_(12)
-            manager.resident_begin[:, 3].fill_(10)
             manager.resident_end[:, 3].fill_(11)
             req_pool.release_sparse_resident_row(
                 1
@@ -576,7 +578,6 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 1, 2, 0])
             self.assertTrue(manager.device_slot_map[0][1].eq(-1).all())
             self.assertTrue(adapter.last_prefix[1].eq(-1).all())
-            self.assertTrue(manager.resident_begin[:, 3].eq(-1).all())
             self.assertTrue(manager.resident_end[:, 3].eq(-1).all())
         # Use the allocated index pages, including their dummy page, rather
         # than reconstructing the physical capacity from a logical size.

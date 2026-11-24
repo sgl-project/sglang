@@ -69,13 +69,10 @@ def make_fused_prefill_plan(batch, manager, *, prepared=None, current_valid=None
 
 def _pack_current_row_metadata(batch, current_valid):
     """Build native fused-plan metadata for compact or padded current rows."""
-    req = batch.req_pool_indices_cpu
-    ext = batch.extend_seq_lens_cpu
-    prefix = batch.extend_prefix_lens_cpu
-    n = req.numel()
-    counts = [int(x) for x in ext]
-    prefixes = [int(x) for x in prefix]
-    rows = int(current_valid.numel())
+    n = batch.req_pool_indices_cpu.numel()
+    counts = batch.extend_seq_lens_cpu
+    prefixes = batch.extend_prefix_lens_cpu
+    rows = current_valid.numel()
     if not rows:
         return None, 0
     if sum(counts) == rows:
