@@ -11,7 +11,9 @@ import logging
 import os
 import pathlib
 import random
+import socket
 import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -20,6 +22,7 @@ from typing import Awaitable, Callable, List, NamedTuple, Optional
 import requests
 
 from sglang.benchmark.serving import run_benchmark
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -933,6 +936,218 @@ def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
         json.dump(conf, f, indent=2)
     logger.info(f"Wrote memfabric tent config to {path}: {conf}")
     return path
+
+
+# Default ports for the Ascend MemCache meta service components.
+MEMCACHE_META_SERVICE_PORT = 5007
+MEMCACHE_CONFIG_STORE_PORT = 6007
+MEMCACHE_METRICS_PORT = 8007
+
+
+def start_memcache_meta_service(
+    config_path="/tmp/metaservice_config.json",
+    meta_service_port=MEMCACHE_META_SERVICE_PORT,
+    config_store_port=MEMCACHE_CONFIG_STORE_PORT,
+    metrics_port=MEMCACHE_METRICS_PORT,
+    extra_config=None,
+):
+    """Start the Ascend MemCache MetaService on the current node.
+
+    The IP comes from ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for
+    single-machine runs), so a generated ``metaservice_config.json`` works both
+    on every node of a multi-node deployment and on single-machine runs.
+
+    The ports default to the ``MEMCACHE_*_PORT`` constants above, which avoid
+    clashes with the ports the test framework already uses.
+
+    Args:
+        config_path (str): Path of the generated JSON config.
+        meta_service_port (int): Port of ``meta_service_url``.
+        config_store_port (int): Port of ``config_store_url``.
+        metrics_port (int): Port of the HTTP ``metrics_url``.
+        extra_config (dict): Additional MetaConfig keys merged into the config.
+
+    Returns:
+        subprocess.Popen: The meta service process.
+    """
+    host_ip = resolve_local_ip()
+    meta_config = {
+        "meta_service_url": f"tcp://{host_ip}:{meta_service_port}",
+        "config_store_url": f"tcp://{host_ip}:{config_store_port}",
+        "metrics_url": f"http://{host_ip}:{metrics_port}",
+    }
+    if extra_config:
+        meta_config.update(extra_config)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta_config, f, indent=2)
+    logger.info(f"Wrote metaservice config to {config_path}: {meta_config}")
+
+    command = [
+        sys.executable,
+        "-m",
+        "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+        "--config_path",
+        config_path,
+    ]
+    logger.info(f"Starting memcache meta service: {' '.join(command)}")
+    try:
+        process = subprocess.Popen(command)
+        logger.info(f"Memcache meta service started with PID: {process.pid}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to start memcache meta service: {e}")
+
+    return process
+
+
+HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
+
+# Default port of the Mooncake master service.
+MOONCAKE_MASTER_PORT = 50051
+
+
+def get_server_args_value(args_list, name):
+    """Return the value of the server arg ``name`` in ``args_list``.
+
+    Accepts both ``["--key", value]`` and ``["--key=value"]`` forms and returns
+    None when the flag is absent. ``name`` must be a flag that takes a value;
+    boolean switches have no value to return.
+    """
+    args = [str(arg) for arg in args_list or []]
+    for i, arg in enumerate(args):
+        if arg == name:
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith(f"{name}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _wait_for_tcp_port(process, port, timeout=30, poll_interval=0.5):
+    """Wait until ``port`` on this node accepts connections.
+
+    A Mooncake store client that connects before the master is listening fails
+    its setup, and the store does not retry, so every launch of the master has
+    to be followed by this check.
+
+    Args:
+        process (subprocess.Popen): The process expected to open the port.
+        port (int): Port the process listens on.
+        timeout (float): Seconds to wait before giving up.
+        poll_interval (float): Seconds between connection attempts.
+
+    Raises:
+        RuntimeError: If the process exits or the port never opens.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Process {process.pid} exited with code {process.returncode} "
+                f"before opening port {port}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                logger.info(f"Port {port} is ready")
+                return
+        except OSError:
+            time.sleep(poll_interval)
+
+    kill_process_tree(process.pid)
+    raise RuntimeError(f"Port {port} was not opened within {timeout}s")
+
+
+def start_mooncake_master(
+    master_port=MOONCAKE_MASTER_PORT,
+    eviction_high_watermark_ratio=0.95,
+):
+    """Start the Mooncake master service on the current node.
+
+    SGLang servers are Mooncake store clients: with a non-zero
+    ``global_segment_size`` they contribute their own memory, so no separate
+    store service is needed and the master is the only required process. The
+    metadata server keeps its ``P2PHANDSHAKE`` default, which avoids needing a
+    shared metadata endpoint (and its auth token) for multi-node runs.
+
+    The flags follow the standalone deployment scripts. The one difference is
+    the RPC bind address: those scripts bind loopback on a single host, while
+    prefill peers here may live in other pods and have to reach this one.
+
+    Args:
+        master_port (int): Port the master service listens on.
+        eviction_high_watermark_ratio (float): Watermark that triggers eviction.
+
+    Returns:
+        subprocess.Popen: The Mooncake master process.
+    """
+    metrics_port = envs.MOONCAKE_MASTER_METRICS_PORT.get()
+    command = [
+        "mooncake_master",
+        "--rpc_address=0.0.0.0",
+        f"--rpc_port={master_port}",
+        "--metrics_host=127.0.0.1",
+        f"--metrics_port={metrics_port}",
+        f"--eviction_high_watermark_ratio={eviction_high_watermark_ratio}",
+    ]
+    logger.info(f"Starting mooncake master: {' '.join(command)}")
+    try:
+        process = subprocess.Popen(command)
+        logger.info(f"Mooncake master started with PID: {process.pid}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to start mooncake master: {e}")
+
+    _wait_for_tcp_port(process, master_port)
+    return process
+
+
+def set_mooncake_master_env(host_ip=None):
+    """Point the SGLang servers launched next at the Mooncake master.
+
+    ``MOONCAKE_MASTER`` is the environment form of
+    ``master_server_address``: the store reads it through
+    ``MooncakeStoreConfig.load_from_env()`` when
+    ``--hicache-storage-backend-extra-config`` carries no explicit address, so
+    each launching node only needs the resolved master address in its
+    environment.
+
+    Args:
+        host_ip (str): Node that runs the master. Defaults to this node.
+
+    Returns:
+        str: The ``<host>:<port>`` address written to the environment.
+    """
+    address = f"{host_ip or resolve_local_ip()}:{MOONCAKE_MASTER_PORT}"
+    os.environ["MOONCAKE_MASTER"] = address
+    logger.info(f"Setting ENV_VAR MOONCAKE_MASTER={address}")
+    return address
+
+
+def maybe_start_hicache_storage_service(other_args):
+    """Start the external service required by the HiCache L3 backend.
+
+    ``npu_memcache`` connects through the Ascend MemCache MetaService, while
+    ``mooncake`` connects through the Mooncake master service. Other backends
+    need no external process and are skipped.
+
+    For ``mooncake`` the master address is also exported as
+    ``MOONCAKE_MASTER`` so the server launched from this process picks it up
+    from the environment.
+
+    Args:
+        other_args (list): Server launch args.
+
+    Returns:
+        subprocess.Popen: The storage service process, or None if not started.
+    """
+    backend = get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG)
+    if backend == "npu_memcache":
+        process = start_memcache_meta_service()
+        logger.info(f"Memcache meta service started with PID: {process.pid}")
+        return process
+    if backend == "mooncake":
+        process = start_mooncake_master()
+        set_mooncake_master_env()
+        return process
+    return None
 
 
 def append_ld_library_path(*module_specs):
