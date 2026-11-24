@@ -13,19 +13,21 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 
-def uses_sharded_index_k(kvc: KVCacheConfigurator) -> bool:
+def kimi_k31_index_k_sharding(kvc: KVCacheConfigurator) -> bool | None:
+    """Return the Ascend hybrid target's Index-K layout, or None for other pools."""
     if not kvc.use_mla_backend or kvc.mambaish_config is None or kvc.is_draft_worker:
-        return False
+        return None
     hf_config = kvc.model_config.hf_config
     if not is_kimi_k31(hf_config) or get_dsa_index_kpool(hf_config) != 1:
-        return False
+        return None
 
     parallel = get_parallel()
+    if parallel.attn_dcp_size <= 1:
+        return None
     memory = get_memory()
     # Ascend PD, host cache, and prefill CP use global Index-K.
     if (
-        parallel.attn_dcp_size <= 1
-        or parallel.attn_cp_size > 1
+        parallel.attn_cp_size > 1
         or kvc.kv_cache_dtype != torch.bfloat16
         or kvc.modelslim_cache_layout is not None
         or get_disagg().disaggregation_mode != "null"
@@ -36,24 +38,32 @@ def uses_sharded_index_k(kvc: KVCacheConfigurator) -> bool:
     return get_scored_indexer() is not None
 
 
-class NPUShardedIndexKPoolConfigurator(DefaultPoolConfigurator):
-    """Size the Ascend hybrid pool with one Index-K cell per local token."""
+class NPUKimiK31PoolConfigurator(DefaultPoolConfigurator):
+    """Size the Ascend hybrid target using its actual Index-K layout."""
 
-    def __init__(self, kvc: KVCacheConfigurator):
-        self._replicated_index_k_bytes = 0
+    def __init__(self, kvc: KVCacheConfigurator, *, shard_index_k: bool):
+        self._shard_index_k = shard_index_k
+        self._target_index_k_budget_delta = 0
         super().__init__(kvc)
-        self._cell_size -= self._replicated_index_k_bytes
+        self._cell_size += self._target_index_k_budget_delta
 
     def _compute_cell_size(
         self, kvc: KVCacheConfigurator, num_layers: int, dcp_size: int | None = None
     ) -> int:
-        # MLA KV bytes per token are independent of dcp_size. Passing 1 leaves
-        # a single Index-K copy in the budget before adding any draft costs.
-        sharded_cell_size = super()._compute_cell_size(kvc, num_layers, dcp_size=1)
+        # MLA KV bytes per token are independent of DCP width. At width 1
+        # the common calculation includes one Index-K copy under either flag.
+        cell_size = super()._compute_cell_size(kvc, num_layers, dcp_size=1)
+        if not self._shard_index_k and kvc.modelslim_cache_layout is None:
+            index_k_size = self._compute_dsa_indexer_cell_size(
+                kvc=kvc, num_layers=num_layers
+            )
+            width = get_parallel().attn_dcp_size if dcp_size is None else dcp_size
+            cell_size += (width - 1) * index_k_size
+
         if kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone():
-            # The default draft estimator subtracts replicated target Index-K.
-            # Keep that estimate intact and remove the extra target copies below it.
-            replicated_cell_size = super()._compute_cell_size(kvc, num_layers, dcp_size)
-            self._replicated_index_k_bytes = replicated_cell_size - sharded_cell_size
-            return replicated_cell_size
-        return sharded_cell_size
+            # The common draft estimator subtracts Index-K using its own layout.
+            # Apply the target correction after it has sized the draft.
+            common_cell_size = super()._compute_cell_size(kvc, num_layers, dcp_size)
+            self._target_index_k_budget_delta = cell_size - common_cell_size
+            return common_cell_size
+        return cell_size

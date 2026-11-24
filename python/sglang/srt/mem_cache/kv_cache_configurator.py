@@ -452,15 +452,15 @@ class KVCacheConfigurator:
     _unified_sized: Any = field(init=False, default=None)
 
     @property
-    def npu_dsa_shards_index_k(self) -> bool:
+    def npu_kimi_k31_index_k_sharding(self) -> bool | None:
         if not _is_npu:
-            return False
+            return None
 
         from sglang.srt.hardware_backend.npu.pool_configurator import (
-            uses_sharded_index_k,
+            kimi_k31_index_k_sharding,
         )
 
-        return uses_sharded_index_k(self)
+        return kimi_k31_index_k_sharding(self)
 
     @property
     def use_combined_kv_buffer(self) -> bool:
@@ -3037,7 +3037,7 @@ class KVCacheConfigurator:
                 return partial(
                     NPUDSATokenToKVPool,
                     is_draft_worker=self.is_draft_worker,
-                    shard_index_k=self.npu_dsa_shards_index_k,
+                    shard_index_k=bool(self.npu_kimi_k31_index_k_sharding),
                 )
             return dsa_pool_class
         if _is_npu:
@@ -3514,12 +3514,13 @@ class KVCacheConfigurator:
         return max_num_reqs
 
     def _create_memory_pool_configurator(self) -> MemoryPoolConfigurator:
-        if self.npu_dsa_shards_index_k:
+        shard_index_k = self.npu_kimi_k31_index_k_sharding
+        if shard_index_k is not None:
             from sglang.srt.hardware_backend.npu.pool_configurator import (
-                NPUShardedIndexKPoolConfigurator,
+                NPUKimiK31PoolConfigurator,
             )
 
-            return NPUShardedIndexKPoolConfigurator(self)
+            return NPUKimiK31PoolConfigurator(self, shard_index_k=shard_index_k)
 
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
