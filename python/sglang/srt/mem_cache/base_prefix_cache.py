@@ -106,6 +106,8 @@ class InsertParams:
     # (kept out of the free list) until its copy lands, instead of a host wait.
     mamba_host_src_keep_idx: Optional[int] = None
     mamba_host_parked: bool = False
+    # The D2H copy into mamba_host_value; freeing an unused host value waits on it.
+    mamba_host_copy_done: Optional[torch.cuda.Event] = None
     # Both mamba values stay empty and the leaf already holds the checkpoint.
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.

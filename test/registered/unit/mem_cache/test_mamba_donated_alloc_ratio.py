@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     TreeLock,
 )
@@ -754,7 +755,7 @@ class _FakeCopyEvent:
         self.synchronize = Mock()
 
 
-def _host_only_component():
+def _host_only_component(*, enable_storage=False, linker=None):
     """A MambaComponent whose HiCache D2H copy and state storage are recorded, not run."""
     comp = MambaComponent.__new__(MambaComponent)
     comp._parked, comp._step = [], 0
@@ -769,8 +770,9 @@ def _host_only_component():
         write_fence_stream=SimpleNamespace(wait_event=Mock()),
         _move_write_operation=lambda op: (None, None, op.pool_transfers),
         _l2_transfers=lambda host, device, pools: pools,
+        enable_storage=enable_storage,
     )
-    comp.cache = SimpleNamespace(cache_controller=controller)
+    comp.cache = SimpleNamespace(cache_controller=controller, linker=linker)
     comp._mamba_pool_host = SimpleNamespace(alloc=lambda n: torch.tensor([7]))
     storage = SimpleNamespace(free_state_slots=Mock())
     comp._state = lambda: (storage, "state")
@@ -801,6 +803,28 @@ class TestHostOnlyParkedCheckpointCopy(CustomTestCase):
                 self.assertEqual(
                     engine.host_to_device_stream.wait_event.called, not host_wait
                 )
+
+    def test_l3_storage_or_a_linker_waits_for_the_copy_before_publishing(self):
+        # Their CPU threads read and write host slots outside the waiting streams.
+        for l3 in (dict(enable_storage=True), dict(linker=object())):
+            for finished, keep_idx in ((False, None), (True, 1)):
+                comp, _, _, done, _ = _host_only_component(**l3)
+                with self.subTest(l3=l3, finished=finished):
+                    self._copy(comp, finished=finished, keep_idx=keep_idx)
+                    done.synchronize.assert_called_once()
+
+    def test_an_unused_host_value_waits_for_its_copy_before_it_is_freed(self):
+        comp, _, _, done, _ = _host_only_component()
+        params = self._copy(comp, finished=False, keep_idx=None)
+        done.synchronize.assert_not_called()
+        freed = []
+        comp.free_host_values = lambda values: freed.append(
+            (done.synchronize.call_count, values)
+        )
+        comp._release_unused_host_checkpoint(
+            InsertResult(prefix_len=0, mamba_exist=True), params
+        )
+        self.assertEqual(freed, [(1, [params.mamba_host_value])])
 
     def test_parked_slots_are_freed_two_steps_later_or_on_demand(self):
         comp, _, _, done, storage = _host_only_component()

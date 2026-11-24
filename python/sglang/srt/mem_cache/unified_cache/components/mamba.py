@@ -79,7 +79,7 @@ class MambaComponent(TreeComponent):
     family = TREE_STATE
     # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
     state_cost: Optional[StateCostStrategy] = None
-    # Class-level defaults (nothing parked) for instances built without __init__.
+    # Nothing parked, for the same subclasses (they reach _try_alloc_mamba_slot).
     _parked: Sequence = ()
     _step = 0
 
@@ -307,6 +307,7 @@ class MambaComponent(TreeComponent):
         except Exception:
             self.free_host_values([host_indices])
             raise
+        insert_params.mamba_host_copy_done = done
         if park:
             self._parked.append((self._step, slot.reshape(-1).clone(), done))
             insert_params.mamba_keep_idx = insert_params.mamba_host_src_keep_idx
@@ -366,7 +367,10 @@ class MambaComponent(TreeComponent):
             controller._l2_transfers(write_host, write_device, write_pools)
         )
         done = completion.finish_event
-        if source_freed or forward_stream is None:
+        # L3 storage and the linker read and write host slots from CPU threads, outside
+        # the streams that wait on the copy: publish only once it has landed.
+        l3_reads_host = controller.enable_storage or self.cache.linker is not None
+        if source_freed or forward_stream is None or l3_reads_host:
             # The slot is freed next, or nothing orders its next writer.
             done.synchronize()
             return done
@@ -428,6 +432,9 @@ class MambaComponent(TreeComponent):
             return
         inserted = insert_result is not None and not insert_result.mamba_exist
         if not inserted:
+            if insert_params.mamba_host_copy_done is not None:
+                # Rare: the copy may still be writing the slot that is freed here.
+                insert_params.mamba_host_copy_done.synchronize()
             self.free_host_values([insert_params.mamba_host_value])
 
     def _commit_host_only_checkpoint(
