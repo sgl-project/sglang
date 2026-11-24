@@ -691,6 +691,28 @@ class TestPromptSegments(_EncodeCase):
         ):
             self._assert_segments_match_encode(tokenizer, segments)
 
+    def test_bpe_dropout_never_uses_the_cache(self):
+        # Dropout samples the merges on every encode: a cached sample would be
+        # handed to every later request.
+        tokenizer = _tokenizer(lambda b: setattr(b.model, "dropout", 0.5))
+        self.assertEqual(tokenizer._tokenizer.model.dropout, 0.5)
+        segments = ["<|user|>", "the quick brown fox " * 20, "<|assistant|>"]
+        text = "".join(segments)
+        with (
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "encode",
+                side_effect=AssertionError("segment cache used"),
+            ),
+            unittest.mock.patch.object(
+                ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+            ) as fallback,
+        ):
+            for _ in range(2):
+                ids = ppe.encode_prompt_segments(tokenizer, segments)
+                self.assertEqual(tokenizer.decode(ids), text)
+        self.assertEqual(fallback.call_count, 2)
+
     def _assert_falls_back(self, tokenizer, segments, encode_kwargs):
         with (
             unittest.mock.patch.object(
@@ -1015,6 +1037,23 @@ class TestRenderedPrompt(_EncodeCase):
                 ids = ppe.encode_rendered_prompt(tokenizer, text)
                 fallback.assert_called_once()
                 self.assertEqual(ids, tokenizer.encode(text))
+
+    def test_bpe_dropout_is_not_split_or_checked(self):
+        tokenizer = _tokenizer(lambda b: setattr(b.model, "dropout", 0.5))
+        text = "<|user|>" + "the quick brown fox " * 20 + "<|assistant|>"
+        with (
+            unittest.mock.patch.object(
+                ppe, "encode_prompt_segments", side_effect=AssertionError("split")
+            ),
+            unittest.mock.patch.object(
+                ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+            ) as fallback,
+        ):
+            for _ in range(2):
+                ids = ppe.encode_rendered_prompt(tokenizer, text)
+                self.assertEqual(tokenizer.decode(ids), text)
+        self.assertEqual(fallback.call_count, 2)
+        self.assertFalse(ppe._rendered_checks(tokenizer).failed)
 
     def test_concurrent_requests_encode_a_shared_history_once(self):
         self._set_min_chars(64)

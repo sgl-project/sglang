@@ -31,7 +31,8 @@ the prompt is not scanned and no length threshold applies, and the ids of the
 text between them are cached per tokenizer: text that recurs across requests,
 like the system prompt, the tool list and earlier turns, is encoded once. Like
 the radix cache, the cache is namespaced by the request's cache_salt, so a
-salted request never hits text that another salt encoded.
+salted request never hits text that another salt encoded. A BPE model with
+dropout samples its merges on every encode, so it never uses the cache.
 
 Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
 """
@@ -440,6 +441,12 @@ class _SegmentEncoder:
         return encoded
 
 
+def _samples_merges(backend):
+    """BPE dropout samples the merges on every encode: cached ids would hand
+    one sample to every later request."""
+    return bool(getattr(backend.model, "dropout", None))
+
+
 def _entry_bytes(key, ids):
     cache_salt, text = key
     size = sys.getsizeof(text) + sys.getsizeof(ids) + _SEGMENT_CACHE_ENTRY_OVERHEAD
@@ -475,6 +482,7 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=N
         or encoder.backend.truncation is not None
         or encoder.backend.padding is not None
         or encoder.backend.encode_special_tokens
+        or _samples_merges(encoder.backend)
     ):
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments, cache_salt)
@@ -531,7 +539,7 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
         and not _rendered_split_failed(tokenizer)
     ):
         plan = _plan_for(tokenizer)
-    if plan is None or plan[2] is None:
+    if plan is None or plan[2] is None or _samples_merges(plan[0]):
         return parallel_prompt_encode(tokenizer, text, encode_kwargs)
     segments, pos = [], 0
     for m in plan[2].finditer(text):
