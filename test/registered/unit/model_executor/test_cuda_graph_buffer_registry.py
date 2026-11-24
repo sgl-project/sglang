@@ -21,7 +21,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -284,14 +283,11 @@ class TestFillFromAndExtract(unittest.TestCase):
             )
             return lambda name: r.get_slot(name).buffer.tolist()
 
-        with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True):
-            slots = fill(raw_bs=2, raw_num_tokens=8)
-            self.assertEqual(slots("req_pool_indices"), [1, 2, 0, 0])
-            self.assertEqual(slots("seq_lens"), [20, 21, 5, 5])
-            slots = fill(raw_bs=4, raw_num_tokens=6)
-            self.assertEqual(
-                slots("out_cache_loc"), [100, 101, 102, 103, 104, 105, 0, 0]
-            )
+        slots = fill(raw_bs=2, raw_num_tokens=8)
+        self.assertEqual(slots("req_pool_indices"), [1, 2, 0, 0])
+        self.assertEqual(slots("seq_lens"), [20, 21, 5, 5])
+        slots = fill(raw_bs=4, raw_num_tokens=6)
+        self.assertEqual(slots("out_cache_loc"), [100, 101, 102, 103, 104, 105, 0, 0])
 
     def test_keep_pad_preserves_padded_tail(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)

@@ -7,7 +7,6 @@ import torch
 from sglang.kernels.ops.memory import small_field_copy as small_field_copy_module
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -115,9 +114,8 @@ class TestSmallCopy(CustomTestCase):
         self.assertTrue(torch.equal(destinations[1], source))
         self.assertFalse(try_small_copy(destinations, [expanded, source._neg_view()]))
 
-    def test_grouped_copy_fast_path_matches_the_copies(self):
-        """With the fill fast path, one dense integer dtype pair takes one foreach
-        launch; every group shape still writes exactly the copies."""
+    def test_grouped_copy_matches_the_copies(self):
+        """Every group shape of a grouped graph-input copy writes exactly the copies."""
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             _grouped_foreach_copy_,
         )
@@ -141,11 +139,10 @@ class TestSmallCopy(CustomTestCase):
                 [torch.arange(4, **cuda), torch.arange(12, **cuda).view(3, 4)],
             ),
         )
-        with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True):
-            for dsts, srcs in cases:
-                _grouped_foreach_copy_(dsts, srcs)
-                for dst, src in zip(dsts, srcs):
-                    self.assertTrue(torch.equal(dst, src.to(dst.dtype)))
+        for dsts, srcs in cases:
+            _grouped_foreach_copy_(dsts, srcs)
+            for dst, src in zip(dsts, srcs):
+                self.assertTrue(torch.equal(dst, src.to(dst.dtype)))
         self.assertTrue(bool((backing[13:16] == -1).all()))
         self.assertTrue(bool((mrope[:, 4:] == -1).all()))
 
