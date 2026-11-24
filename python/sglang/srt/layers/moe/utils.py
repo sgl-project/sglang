@@ -734,6 +734,14 @@ def is_tbo_enabled() -> bool:
     return moe.tbo_enabled
 
 
+def is_tbo_graph_enabled() -> bool:
+    """Whether TBO also splits captured decode and verify batches; on plain TP
+    it splits only eager extend and mixed batches."""
+    return is_tbo_enabled() and (
+        not get_moe_a2a_backend().is_none() or get_parallel().attn_dp_enabled
+    )
+
+
 def is_sbo_enabled() -> bool:
     moe = get_flags().moe
     if moe.sbo_enabled is None:

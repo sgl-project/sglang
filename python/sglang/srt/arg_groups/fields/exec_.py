@@ -1239,6 +1239,10 @@ class ExecOverlap(msgspec.Struct):
         float,
         "The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
     ] = 0.48
+    tbo_min_extend_tokens: A[
+        int,
+        "Without an EP a2a backend or DP attention, two-batch overlap splits only eager extend and mixed batches of at least this many tokens; decode and verify batches run whole.",
+    ] = 2048
 
 
 class ExecOffload(msgspec.Struct):

@@ -419,6 +419,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             num_tokens=num_tokens,
         )
 
+    def op_mlp(self, state):
+        state.hidden_states_mlp_output = self.forward_normal(
+            state.pop("hidden_states_mlp_input")
+        )
+
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input

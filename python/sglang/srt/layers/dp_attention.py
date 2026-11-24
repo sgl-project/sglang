@@ -1473,10 +1473,12 @@ def get_cuda_graph_batch_size_alignment(
     include_cp_alignment: bool = True,
 ) -> int:
     """Decode may waive CP alignment only when no gathered buffer needs it."""
+    from sglang.srt.layers.moe.utils import is_tbo_graph_enabled
+
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
-    if get_exec().overlap.enable_two_batch_overlap:
+    if is_tbo_graph_enabled():
         alignment *= 2
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size

@@ -25,6 +25,7 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
@@ -1925,6 +1926,7 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
+            TboForwardBatchPreparer.prepare_plain_tp(forward_batch)
             forward_batch.prepare_attn_tp_scatter_input(self)
         if self.lora_manager is not None and self.lora_manager.attn_dp_enabled:
             self.lora_manager.prepare_lora_batch(forward_batch)

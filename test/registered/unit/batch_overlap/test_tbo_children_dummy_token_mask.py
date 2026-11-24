@@ -28,7 +28,13 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context, get_device, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_device,
+    get_flags,
+    get_parallel,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -214,6 +220,38 @@ class TestTboTwoChunkSplit(CustomTestCase):
             ),
             (6, 2),
         )
+
+
+class TestTboPlainTpSplit(CustomTestCase):
+    """On plain TP only an eager extend or mixed batch of at least
+    --tbo-min-extend-tokens tokens splits, and only into two non-empty halves;
+    speculative batches stay whole."""
+
+    def _split(self, extend_seq_lens, *, spec=SpeculativeAlgorithm.NONE):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            spec_algorithm=spec,
+            extend_num_tokens=sum(extend_seq_lens),
+            extend_seq_lens_cpu=extend_seq_lens,
+            tbo_split_seq_index=None,
+        )
+        with (
+            get_context().override_server_args(tbo_min_extend_tokens=8),
+            get_flags().moe.override(
+                tbo_enabled=True, tbo_token_distribution_threshold=0
+            ),
+            patch.object(TboForwardBatchPreparer, "prepare") as prepare,
+        ):
+            TboForwardBatchPreparer.prepare_plain_tp(batch)
+        self.assertEqual(prepare.called, batch.tbo_split_seq_index is not None)
+        return batch.tbo_split_seq_index
+
+    def test_only_a_large_target_batch_splits(self):
+        self.assertEqual(self._split([4, 4]), 1)
+        self.assertIsNone(self._split([4, 3]))
+        self.assertIsNone(self._split([4, 4], spec=SpeculativeAlgorithm.EAGLE))
+        # Without a two-chunk split one request would leave child_a empty.
+        self.assertIsNone(self._split([8]))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
+from sglang.srt.layers.moe import is_tbo_graph_enabled
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_hip
@@ -238,6 +239,11 @@ def _compute_moe_qwen3_layer_operations_strategy_tbo(
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
     assert layer.is_layer_sparse, "qwen3 moe only support sparse layers"
+    if not is_tbo_graph_enabled() and forward_mode in (
+        ForwardMode.EXTEND,
+        ForwardMode.MIXED,
+    ):
+        return _compute_moe_qwen3_plain_tp_prefill(layer)
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_qwen3_prefill(layer)
     elif (
@@ -273,6 +279,24 @@ def _compute_moe_qwen3_prefill(layer):
             operations.YieldOperation(),
             layer.mlp.op_combine_b,
             layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
+
+
+# Plain TP has no dispatcher: the MoE runs whole.
+def _compute_moe_qwen3_plain_tp_prefill(layer):
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            operations.YieldOperation(),
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_mlp,
+            operations.YieldOperation(),
             layer.op_comm_postprocess_layer,
         ],
     )
