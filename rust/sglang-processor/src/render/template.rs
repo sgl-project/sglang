@@ -94,9 +94,10 @@ impl ChatFormatter {
             _ => last_assistant_message(request, continuing)?,
         }
         .unzip();
-        let jinja = matches!(
+        let use_dumped_tools = matches!(
             self,
             ChatFormatter::HuggingFace { .. }
+                | ChatFormatter::Native { .. }
                 | ChatFormatter::Glm53(_)
                 | ChatFormatter::MiniMaxM3 { .. }
                 | ChatFormatter::Qwen38 { .. }
@@ -106,7 +107,7 @@ impl ChatFormatter {
             request,
             args: args.kwargs.clone(),
             messages,
-            tools: jinja.then(|| args.tools.clone()),
+            tools: use_dumped_tools.then(|| args.tools.clone()),
         };
         let prompt = self.render_prompt(&request)?;
         Ok((prompt, continuation.unwrap_or_default()))

@@ -95,6 +95,7 @@ impl ChatProcessor {
             // generic template. A model-specific decline must reach the caller.
             let (prompt, continuation) = match &self.formatter {
                 ChatFormatter::HuggingFace { .. }
+                | ChatFormatter::Native { .. }
                 | ChatFormatter::KimiK25 { .. }
                 | ChatFormatter::Legacy(_) => {
                     let args = TemplateArgs::new(&body, defaults);

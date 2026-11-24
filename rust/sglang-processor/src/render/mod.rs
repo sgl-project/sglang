@@ -58,8 +58,7 @@ pub enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-/// A chat prompt formatter: either the model's HuggingFace Jinja template or a
-/// legacy SGLang conversation template.
+/// A model's chat formatter, selected from its template or native encoder.
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace {
@@ -68,6 +67,11 @@ pub enum ChatFormatter {
         /// The template's own errors for a developer turn, which Dynamo would
         /// render as a system turn instead.
         developer_errors: DeveloperErrors,
+    },
+    /// A native Dynamo encoder selected by model identity, without a Jinja template.
+    Native {
+        formatter: PromptFormatter,
+        thinking: ThinkingTemplates,
     },
     KimiK25 {
         formatter: PromptFormatter,
@@ -142,7 +146,8 @@ impl ChatFormatter {
                     message: QWEN38_DEVELOPER_ERROR.to_owned(),
                 })
             }
-            ChatFormatter::Glm53(formatter)
+            ChatFormatter::Native { formatter, .. }
+            | ChatFormatter::Glm53(formatter)
             | ChatFormatter::MiniMaxM3 { formatter, .. }
             | ChatFormatter::Qwen38 { formatter, .. }
             | ChatFormatter::Step3p5 { formatter, .. } => render_oai(formatter, request),
@@ -339,6 +344,7 @@ impl ChatFormatter {
     pub fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
             ChatFormatter::HuggingFace { .. }
+            | ChatFormatter::Native { .. }
             | ChatFormatter::KimiK25 { .. }
             | ChatFormatter::DeepSeekV4(_)
             | ChatFormatter::DeepSeekV41(_)
@@ -357,6 +363,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::Glm53(_) => true,
             ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::Native { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
             | ChatFormatter::Step3p5 { thinking, .. } => {
                 thinking.default_policy() == ThinkingPolicy::Always
@@ -372,6 +379,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::Qwen38 { .. } => Some(("enable_thinking", true)),
             ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::Native { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
             | ChatFormatter::Step3p5 { thinking, .. } => match thinking.default_policy() {
                 ThinkingPolicy::TemplateToggle {
@@ -394,6 +402,7 @@ impl ChatFormatter {
     ) -> Option<bool> {
         match self {
             ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::Native { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
             | ChatFormatter::Qwen38 { thinking, .. }
             | ChatFormatter::Step3p5 { thinking, .. } => thinking

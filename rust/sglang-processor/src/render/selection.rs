@@ -6,7 +6,6 @@ use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 
 use super::legacy::infer_legacy_template_from_model_path;
-use super::loader::DeveloperErrors;
 use super::{ChatFormatter, TemplateError, ThinkingTemplates, load_chat_formatter};
 use crate::model_files::{resolve_chat_template_file, resolve_model_file, resolve_tokenizer_file};
 
@@ -72,10 +71,9 @@ pub fn select_chat_formatter(
             && let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower)
         {
             return (
-                Some(ChatFormatter::HuggingFace {
+                Some(ChatFormatter::Native {
                     formatter,
                     thinking: ThinkingTemplates::always(),
-                    developer_errors: DeveloperErrors::default(),
                 }),
                 None,
             );
@@ -148,18 +146,16 @@ fn native_fallback(
     display_name_lower: &str,
 ) -> Option<ChatFormatter> {
     if identity.is_deepseek_v32() {
-        return Some(ChatFormatter::HuggingFace {
+        return Some(ChatFormatter::Native {
             formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
             thinking: ThinkingTemplates::native(false, false),
-            developer_errors: DeveloperErrors::default(),
         });
     }
-    Some(ChatFormatter::HuggingFace {
+    Some(ChatFormatter::Native {
         formatter: native_formatter_for(model_type_lower, display_name_lower)?,
         // The remaining display-name fallback formatters are constructed with
         // their thinking mode enabled.
         thinking: ThinkingTemplates::native(true, false),
-        developer_errors: DeveloperErrors::default(),
     })
 }
 
