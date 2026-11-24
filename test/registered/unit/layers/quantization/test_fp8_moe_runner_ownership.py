@@ -361,15 +361,19 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
         with (
             patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
             patch.object(fp8_module, "_use_aiter", True),
+            patch.object(fp8_module, "_is_shuffle_moe_mxfp4", True),
             patch.object(fp8_module, "_require_fp4_dtype", return_value=torch.uint8),
         ):
             quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+            layer.fp8_activations = False
+            explicit_false_quant_info = method.maybe_get_hip_aiter_quant_info(layer)
 
         self.assertIsNotNone(quant_info)
         self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
         self.assertEqual(quant_info.swiglu_limit, 0.0)
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "interleave"})
         self.assertTrue(quant_info.fp8_activations)
+        self.assertFalse(explicit_false_quant_info.fp8_activations)
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
 
 
