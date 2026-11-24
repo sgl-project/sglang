@@ -179,7 +179,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_AUTOTUNE_CACHE`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs, including MegaMoE capacity profiles. Set to `0` to disable disk-cache reuse; the fresh result is written to a `runs/<rank>.<timestamp>.<uuid>.json` sibling file (the canonical cache is left untouched). Target MegaMoE rank files include the physical GPU UUID. Use separate `SGLANG_CACHE_DIR` roots for engines sharing physical GPUs; a running process retains tactics for already-pooled workspaces.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs, including MegaMoE capacity profiles. Single-rank servers on SM90 and SM100-family GPUs keep them in FlashInfer's managed store under `SGLANG_CACHE_DIR/flashinfer/autotune/managed/<model key>/`, one entry per tuned shape; other deployments keep per-rank JSON files. Set to `0` to disable disk-cache reuse; the fresh result is written to a `runs/<rank>.<timestamp>.<uuid>.json` sibling file (the canonical cache is left untouched). Target MegaMoE rank files include the physical GPU UUID. Use separate `SGLANG_CACHE_DIR` roots for engines sharing physical GPUs; a running process retains tactics for already-pooled workspaces.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
@@ -200,6 +200,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apply RoPE inside the ROCm fused MLA decode kernel (<code>SGLANG_ROCM_FUSED_DECODE_MLA</code>) instead of before it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FUSED_ROPE_KV_TILED`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx1250, use the tiled fused RoPE and KV-cache write once T is at least 256. Set to `false` to keep the per-token kernel. The tile shape is fixed.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
