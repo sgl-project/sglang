@@ -29,6 +29,10 @@ from sglang.kernels.ops.diffusion.norm.gated_residual_layernorm_modulate_triton 
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     qknorm_complex_rope_kv,
 )
+from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_strided_triton import (
+    can_use_qknorm_complex_rope_strided,
+    qknorm_complex_rope_strided,
+)
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
 )
@@ -207,6 +211,8 @@ def apply_qk_norm_rope(x, norm, rope):
             lambda: apply_rope(norm(x), rope),
             logger=logger,
         )
+    if _rocm_lossless() and can_use_qknorm_complex_rope_strided(x, norm.weight, rope):
+        return qknorm_complex_rope_strided(x, norm.weight, rope, norm.variance_epsilon)
     if (
         _rocm_lossless()
         and x.is_cuda
@@ -443,21 +449,23 @@ class QwenImage21FeedForward(nn.Module):
         parameters so offload can release the storage, as with packed QKV.
         """
         gate, up = self.gate_layer, self.proj
-        if (
-            all(
-                type(layer) is ColumnParallelLinear
-                and isinstance(layer.quant_method, UnquantizedLinearMethod)
-                and layer.bias is None
-                and not layer.gather_output
-                and layer.tp_size == 1
-                and layer.weight.is_cuda
-                and layer.weight.dtype is torch.bfloat16
-                and layer.weight.shape == (12288, 4096)
-                and layer.weight.is_contiguous()
-                for layer in (gate, up)
+        if all(
+            type(layer) is ColumnParallelLinear
+            and isinstance(layer.quant_method, UnquantizedLinearMethod)
+            and layer.bias is None
+            and not layer.gather_output
+            and layer.tp_size == 1
+            and layer.weight.is_cuda
+            and layer.weight.dtype is torch.bfloat16
+            and layer.weight.shape == (12288, 4096)
+            and layer.weight.is_contiguous()
+            for layer in (gate, up)
+        ) and (
+            _is_rocm
+            or (
+                _is_cuda
+                and torch.cuda.get_device_capability(gate.weight.device) == (12, 0)
             )
-            and _is_cuda
-            and torch.cuda.get_device_capability(gate.weight.device) == (12, 0)
         ):
             if _stacked_rows(gate.weight, up.weight) is None:
                 weight = torch.cat([gate.weight.data, up.weight.data], dim=0)
@@ -513,6 +521,26 @@ class QwenImage21FeedForward(nn.Module):
         return module
 
     def forward(self, x, use_packed_bf16=False, project_out=True):
+        if _rocm_lossless():
+            hidden = self._rocm_packed_swiglu(x)
+            if hidden is not None:
+                return self.out(hidden)[0] if project_out else hidden
+        return self._forward(x, use_packed_bf16, project_out)
+
+    def _rocm_packed_swiglu(self, x):
+        """``silu(gate(x)) * up(x)`` as one GEMM over the stacked [gate; up] weight, or None."""
+        if not (
+            can_project_into(self.gate_layer, x)
+            and can_project_into(self.proj, x)
+            and x.device == self.gate_layer.weight.device
+        ):
+            return None
+        weight = _stacked_rows(self.gate_layer.weight, self.proj.weight)
+        if weight is None:
+            return None
+        return fused_packed_silu_mul_bitexact(nn.functional.linear(x, weight))
+
+    def _forward(self, x, use_packed_bf16, project_out):
         # project_out=False returns ``out``'s input; the comfy_kitchen MLP never
         # runs then, since it needs a TP group of one.
         # GEMM width can change rounding. Only use the measured target lengths;
@@ -674,6 +702,16 @@ class QwenImage21Attention(nn.Module):
         return module
 
     def project_qkv(self, x):
+        if _rocm_lossless() and x.dim() == 3 and x.shape[0] == 1:
+            weight = self.packed_qkv_weight()
+            if weight is not None and all(
+                can_project_into(layer, x)
+                for layer in (self.to_q, self.to_k, self.to_v)
+            ):
+                qkv = nn.functional.linear(x, weight).unflatten(
+                    -1, (3, self.heads, self.head_dim)
+                )
+                return qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))

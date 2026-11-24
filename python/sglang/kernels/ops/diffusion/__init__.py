@@ -473,6 +473,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.qknorm_complex_rope_strided",
+        KernelBackend.TRITON,
+        "rope.qknorm_complex_rope_strided_triton:qknorm_complex_rope_strided",
+        _HIP,
+    ),
+    (
         "diffusion.complex_rope",
         KernelBackend.TRITON,
         "rope.complex_rope_triton:fused_complex_rope",
@@ -885,6 +891,8 @@ _EXPORTS: dict[str, str] = {
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     "fused_complex_rope": "rope.complex_rope_triton",
+    "can_use_qknorm_complex_rope_strided": "rope.qknorm_complex_rope_strided_triton",
+    "qknorm_complex_rope_strided": "rope.qknorm_complex_rope_strided_triton",
     "can_use_gated_residual_layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
     "gated_residual_add": "norm.gated_residual_layernorm_modulate_triton",
     "gated_residual_layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
