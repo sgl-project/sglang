@@ -17,6 +17,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
+register_cuda_ci(
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 
 GROUP_SIZE = 256
 
@@ -43,7 +46,11 @@ def _torch_bf16(x, weight, bias):
 
 
 @marker.parametrize("shape", SHAPES, [(2048, 3072, 3072), (2048, 12288, 3072)])
-@marker.benchmark("provider", ["convrot_int8", "convrot_int8_prequant", "torch_bf16"])
+@marker.benchmark(
+    "provider",
+    ["convrot_int8", "convrot_int8_prequant", "torch_bf16"],
+    gate=["convrot_int8", "convrot_int8_prequant"],
+)
 def benchmark(shape, provider):
     if torch.cuda.get_device_capability() not in SUPPORTED_CAPABILITIES:
         marker.skip("convrot_int8 kernels carry no code for this GPU")
