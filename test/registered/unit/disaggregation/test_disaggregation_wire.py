@@ -3151,6 +3151,74 @@ class TestMooncakePPStaging(unittest.TestCase):
             ],
         )
 
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
+    )
+    def test_pp_stage_without_layer_ids_writes_positional_slots(self, gather):
+        """A PP stage over a pool without layer ids (plain MHA) must still stage its
+        layers: at their global slots on a decode holding every layer, else in place."""
+        tensor = SimpleNamespace(shape=(1, 2, 8), element_size=lambda: 2)
+        base = 0x100000
+        # Stage layers 2-3 of 4; 128 bytes per layer slot (4 tokens x 2 heads x 16 B).
+        for dst_num_layers, dst_slots in ((4, [2, 3, 6, 7]), (2, [0, 1, 2, 3])):
+            with self.subTest(dst_num_layers=dst_num_layers):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_buffer_tensors = {
+                    "k_buffers": [tensor, tensor],
+                    "v_buffers": [tensor, tensor],
+                    "page_size": 2,
+                    "slot_layer_ids": [],
+                }
+                manager.attn_tp_size = 1
+                manager.pp_size = 2
+                manager.kv_args = SimpleNamespace(
+                    engine_rank=0,
+                    gpu_id=0,
+                    total_kv_head_num=2,
+                    kv_head_num=2,
+                    kv_layer_ids=[],
+                    prefill_start_layer=2,
+                )
+                writes = Mock(return_value=0)
+                attach_mooncake_transport(
+                    manager,
+                    engine_writes(writes),
+                    staging=[0x9000],
+                    peer_staging=base,
+                    sessions=("peer",),
+                )
+                manager.decode_kv_args_table = {
+                    "peer": SimpleNamespace(
+                        staging_base_ptr=base,
+                        dst_kv_ptrs=list(range(2 * dst_num_layers)),
+                    )
+                }
+                staging = SimpleNamespace(
+                    fits=lambda size: True, get_ptr=lambda: 0x9000
+                )
+
+                ret = manager.send_kvcache_staged(
+                    "peer",
+                    np.array([1, 2], dtype=np.int32),
+                    dst_staging_ptr=base,
+                    dst_staging_size=1 << 20,
+                    dst_tp_rank=0,
+                    dst_attn_tp_size=1,
+                    dst_kv_item_len=128,
+                    dst_layer_ids=[],
+                    staging_buffer=staging,
+                    dst_slot_layer_ids=[],
+                )
+
+                self.assertEqual(ret, 0)
+                writes.assert_called_once_with(
+                    "peer",
+                    [
+                        (0x9000 + i * 128, base + slot * 128, 128)
+                        for i, slot in enumerate(dst_slots)
+                    ],
+                )
+
 
 class TestEagleDsaSeedTransfer(CustomTestCase):
     @staticmethod

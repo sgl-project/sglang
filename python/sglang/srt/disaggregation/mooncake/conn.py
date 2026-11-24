@@ -864,13 +864,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 or self.kv_args.kv_layer_ids
             )
             dst_slot_ids = dst_slot_layer_ids or dst_layer_ids
-            pairs = build_transfer_entry_pairs(
-                src_slot_ids,
-                dst_slot_ids,
-                num_layers * 2,
-                len(dst_slot_ids),
-            )
-            dst_num_layers = len(dst_slot_ids) // 2
+            if src_slot_ids or dst_slot_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_slot_ids,
+                    dst_slot_ids,
+                    num_layers * 2,
+                    len(dst_slot_ids),
+                )
+                dst_num_layers = len(dst_slot_ids) // 2
+            else:
+                # Without layer ids (plain MHA) pair as get_mha_kv_ptrs_with_pp does:
+                # a decode holding every layer takes this stage's slots from its start.
+                dst_num_layers = (
+                    len(self.decode_kv_args_table[mooncake_session_id].dst_kv_ptrs) // 2
+                )
+                start = (
+                    0
+                    if dst_num_layers == num_layers
+                    else self.kv_args.prefill_start_layer
+                )
+                pairs = [(i, start + i) for i in range(num_layers)] + [
+                    (num_layers + i, dst_num_layers + start + i)
+                    for i in range(num_layers)
+                ]
         else:
             pairs = None
             dst_num_layers = num_layers

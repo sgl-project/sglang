@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=246, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=430, stage="extra-b", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
@@ -154,6 +154,39 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
         )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_sgl_eval(args)
+        print(f"{metrics=}")
+
+        self.assertGreater(metrics["score"], 0.24)
+        # Wait a little bit so that the memory check happens.
+        time.sleep(5)
+
+
+class TestDisaggregationStagingPrefillPPDecodeLargerTP(PDDisaggregationServerBase):
+    """Prefill TP1 PP2 -> decode TP2 through the staging buffer (MHA model): each
+    prefill stage must stage its layers into the decode's slots for them."""
+
+    decode_tp_size = 2
+    decode_base_gpu_id = 2
+    extra_prefill_args = ["--pp-size", "2"]
+    extra_prefill_env = {"SGLANG_DISAGG_STAGING_BUFFER": "1"}
+    extra_decode_env = {"SGLANG_DISAGG_STAGING_BUFFER": "1"}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.launch_all()
 
     def test_gsm8k(self):
         args = SimpleNamespace(
