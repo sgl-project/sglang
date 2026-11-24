@@ -50,3 +50,23 @@ def _bailing_moe_v3_overrides(server_args: Any, hf_config: Any) -> dict:
         model_arch,
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
+
+
+@_register_for("BailingMoeV3VLForConditionalGeneration")
+def _bailing_moe_v3_vl_nextn_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if (
+        cfg.speculative_algorithm not in ("NEXTN", "EAGLE")
+        or cfg.speculative_draft_attention_backend is not None
+        or cfg.page_size is not None
+        or not get_platform().is_sm100
+    ):
+        return {}
+
+    # The FlashInfer MLA draft-extend forward has no CUDA graph; trtllm_mla has
+    # one and requires page_size 32 or 64.
+    logger.info(
+        "Bailing V3 VL with NEXTN: speculative_draft_attention_backend=trtllm_mla, "
+        "page_size=64."
+    )
+    return {"speculative_draft_attention_backend": "trtllm_mla", "page_size": 64}
