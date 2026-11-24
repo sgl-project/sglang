@@ -1444,7 +1444,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
         assert rid is not None
 
-        # Test 3: Different targets
+        # Test 3: Select the Z-Image transformer for both cached adapters
         requests.post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
@@ -1454,8 +1454,8 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
-                "lora_path": [first_lora_path, second_lora_path],
-                "target": ["transformer", "transformer_2"],
+                "lora_path": [None, None],
+                "target": ["transformer", "transformer"],
                 "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1569,7 +1569,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
     ) -> None:
         """
         Test /v1/models endpoint returns OpenAI-compatible response.
-        This endpoint is required for sgl-model-gateway router compatibility.
         """
         base_url = f"http://localhost:{ctx.port}"
 

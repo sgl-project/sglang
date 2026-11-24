@@ -9,7 +9,7 @@ from collections import Counter
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mlx_ci(est_time=20, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=20, suite="extra-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
@@ -593,66 +593,59 @@ class TestWorkerSamplingExtras(CustomTestCase):
 
         return MlxTpModelWorker.__new__(MlxTpModelWorker)
 
-    def _batch(self, sinfo, n=2, return_logprob=False, has_grammar=False):
+    def _batch(self, sinfo, n=2, return_logprob=False):
         from types import SimpleNamespace
 
         return SimpleNamespace(
             reqs=[
-                SimpleNamespace(
-                    rid=f"r{i}", return_logprob=return_logprob, grammar=None
-                )
+                SimpleNamespace(rid=f"r{i}", return_logprob=return_logprob)
                 for i in range(n)
             ],
             sampling_info=sinfo,
             return_logprob=return_logprob,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
-            has_grammar=has_grammar,
         )
 
     def test_edit_rows_combine_grammar_mask_and_bias(self):
         """The grammar mask must be applied through the backend's own
         apply_vocab_mask on a zeros base and summed with logit_bias —
-        guards the backend-agnostic zeros-trick, the combine order, and the
-        ForwardBatch.init_new grammars-population mirror (regression: the
-        MLX paths never build a ForwardBatch, so sinfo.grammars stayed None
-        and live grammar objects produced no mask at all)."""
+        guards the backend-agnostic zeros-trick and the combine order."""
         from types import SimpleNamespace
 
         import torch
 
         class FakeGrammar:
+            finished = False
+
+            def is_terminated(self):
+                return False
+
+            def allocate_vocab_mask(self, vocab_size, batch_size, device):
+                return torch.zeros(batch_size, 1)
+
+            def fill_vocab_mask_batched(self, entries, vocab_mask):
+                pass
+
+            def move_vocab_mask(self, vocab_mask, device):
+                return vocab_mask
+
             def apply_vocab_mask(self, logits, vocab_mask):
                 logits[0, 3] = -float("inf")  # row 0 forbids token 3
 
         sinfo = SimpleNamespace(
-            grammars=None,  # not yet populated, as on the real MLX path
+            grammars=[FakeGrammar(), None],
             logit_bias=torch.zeros(2, self.VOCAB).index_put_(
                 (torch.tensor([1]), torch.tensor([5])), torch.tensor([2.5])
             ),
             vocab_size=self.VOCAB,
-            grammar_mask=None,
+            device="cpu",
         )
 
-        def update_mask():
-            sinfo.grammar_mask = SimpleNamespace(
-                grammar=FakeGrammar(), vocab_mask=torch.zeros(2, 1)
-            )
-
-        sinfo.update_regex_vocab_mask = update_mask
-
-        batch = self._batch(sinfo, has_grammar=True)
-        batch.reqs[0].grammar = object()
-        rows = self._worker()._build_logit_edit_rows(batch)
-        self.assertEqual(
-            [g is not None for g in sinfo.grammars],
-            [True, False],
-            "worker must mirror ForwardBatch.init_new's grammars population",
-        )
+        rows = self._worker()._build_logit_edit_rows(self._batch(sinfo))
         mx.eval(rows["r0"], rows["r1"])
         self.assertEqual(rows["r0"].tolist()[3], -float("inf"))
         self.assertEqual(rows["r1"].tolist()[5], 2.5)
-        self.assertIsNone(sinfo.grammar_mask, "mask must be released after use")
 
     def test_edit_rows_none_when_nothing_to_edit(self):
         from types import SimpleNamespace

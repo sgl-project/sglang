@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -7,14 +8,16 @@ import subprocess
 import threading
 import time
 from functools import wraps
-from types import SimpleNamespace
-from typing import Iterable, Union
+from typing import Iterable, Optional, Union
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
-from sglang.test.test_utils import CustomTestCase, popen_launch_server
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    SGL_ROUTER_REQUEST_TIMEOUT_SECS,
+    find_sgl_router_binary,
+    sgl_router_command,
+)
+from sglang.test.test_utils import popen_launch_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +45,8 @@ BOOTSTRAP_INIT_PORT = 8995
 
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
+PD_WORKER_READY_TIMEOUT = 600
+MOONCAKE_MASTER_READY_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
 
@@ -338,6 +343,67 @@ def check_port_availability(host, port, timeout=3):
         return False
 
 
+def _resolve_mooncake_master_address(args_list, default_address):
+    """Return the master address the server launched with ``args_list`` uses.
+
+    ``--hicache-storage-backend-extra-config`` wins over the ``MOONCAKE_MASTER``
+    environment variable, so its ``master_server_address`` is the endpoint to
+    poll when the case passes one; otherwise fall back to the environment form.
+
+    Args:
+        args_list (list): Server launch args.
+        default_address (str): Address set through ``MOONCAKE_MASTER``.
+
+    Returns:
+        str: ``<host>:<port>`` of the Mooncake master.
+    """
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    extra_config = get_server_args_value(
+        args_list, "--hicache-storage-backend-extra-config"
+    )
+    if extra_config:
+        try:
+            address = json.loads(extra_config).get("master_server_address")
+        except (json.JSONDecodeError, TypeError):
+            address = None
+        if address:
+            return address
+    return default_address
+
+
+def wait_for_mooncake_master(
+    address, timeout=MOONCAKE_MASTER_READY_TIMEOUT, poll_interval=2
+):
+    """Wait until the Mooncake master at ``address`` accepts connections.
+
+    Only the node that starts the master waits for its port locally (see
+    ``maybe_start_hicache_storage_service``). The other nodes of a multi-node
+    instance launch concurrently and can reach the store setup before the
+    master is listening; the store does not retry, so they wait here first.
+
+    Args:
+        address (str): ``<host>:<port>`` of the master.
+        timeout (int): Total timeout in seconds.
+        poll_interval (int): Interval between connection attempts.
+
+    Raises:
+        RuntimeError: If the master does not open its port within ``timeout``.
+    """
+    host, _, port = address.rpartition(":")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if check_port_availability(host, int(port)):
+            logger.info(f"Mooncake master {address} is ready")
+            return
+        logger.info(f"Mooncake master {address} is not ready yet, waiting ...")
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f"Mooncake master {address} did not open its port within {timeout}s"
+    )
+
+
 def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15):
     """Wait for all nodes' ports to be ready.
 
@@ -383,11 +449,155 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
     return False
 
 
+def wait_for_pd_worker_roles(
+    expected_roles,
+    port,
+    timeout=PD_WORKER_READY_TIMEOUT,
+    check_interval=5,
+    report_interval=30,
+):
+    """Wait until every PD worker is serving and reports its own role.
+
+    sgl-router classifies a worker as prefill/decode by introspecting
+    `/server_info` once when it starts, and static worker URLs are never
+    re-introspected. Two windows have to close before that introspection can
+    be trusted:
+
+    * The engine may still be starting. `/server_info` is answered as soon as
+      the HTTP server binds, while `/health` stays 503 until the engine
+      finishes its warmup, so a worker can pass a role-only check and then
+      stop answering for the seconds its warmup owns. The router retries the
+      introspection for ~5s, falls back to the discovery backend's `Plain`
+      classification, and rejects the worker when the model already has PD
+      workers ("does not support mixed pools") — a rejection that is never
+      retried, leaving `/readiness` at 503 forever.
+    * A worker that is too busy to answer HTTP a few seconds later would
+      likewise stay registered as `Plain`, and the decode side then rejects
+      every request with "Disaggregated request received without bootstrap
+      room id".
+
+    Requiring `/health` == 200 before reading `/server_info` removes both
+    races before the router is launched.
+
+    The last `/server_info` snapshot of every pending worker is also logged
+    every ``report_interval`` seconds, so a worker that is wedged during warmup
+    leaves a trail in the router log instead of only the final timeout.
+
+    Args:
+        expected_roles (dict): {pod_ip: "prefill" | "decode"}.
+        port (int): Worker HTTP port.
+        timeout (int): Total timeout in seconds.
+        check_interval (int): Interval between checks in seconds.
+        report_interval (int): Interval between state snapshots in seconds.
+
+    Raises:
+        RuntimeError: If a worker never becomes healthy or never reports the
+            expected role.
+    """
+    start_time = time.time()
+    pending = dict(expected_roles)
+    last_seen = {}
+    next_report = start_time + report_interval
+
+    while time.time() - start_time < timeout:
+        for ip, role in list(pending.items()):
+            health_url = f"http://{ip}:{port}/health"
+            try:
+                health = requests.get(health_url, timeout=10)
+            except Exception as e:
+                last_seen[ip] = f"health request failed: {e}"
+                continue
+            if health.status_code != 200:
+                last_seen[ip] = f"health returned {health.status_code}"
+                continue
+
+            url = f"http://{ip}:{port}/server_info"
+            try:
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                info = response.json()
+            except Exception as e:
+                last_seen[ip] = f"request failed: {e}"
+                continue
+
+            mode = info.get("disaggregation_mode")
+            bootstrap_port = info.get("disaggregation_bootstrap_port")
+            # A responsive worker answers with one internal state per DP rank,
+            # so the count shows whether the scheduler behind it is alive.
+            last_seen[ip] = (
+                f"disaggregation_mode={mode!r} bootstrap_port={bootstrap_port!r} "
+                f"dp_ranks={len(info.get('internal_states') or [])}"
+            )
+            if mode != role:
+                continue
+            if mode == "prefill" and not bootstrap_port:
+                last_seen[ip] += " (bootstrap port missing)"
+                continue
+            del pending[ip]
+            logger.info(
+                f"Worker {url} reports disaggregation_mode={mode} "
+                f"bootstrap_port={bootstrap_port}"
+            )
+
+        if not pending:
+            logger.info(f"All {len(expected_roles)} PD workers report their role")
+            return
+
+        now = time.time()
+        if now >= next_report:
+            logger.info(
+                f"PD worker roles pending after {now - start_time:.0f}s: "
+                f"{ {ip: _sample_worker_server_info(ip, port) for ip in pending} }"
+            )
+            next_report = now + report_interval
+
+        time.sleep(check_interval)
+
+    raise RuntimeError(
+        f"PD workers did not report their disaggregation role within {timeout}s: "
+        f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+    )
+
+
+def _sample_worker_server_info(ip, port, timeout=5):
+    """One-line `/server_info` snapshot of a worker that is still pending.
+
+    The readiness wait may short-circuit on a 503 `/health`, which says nothing
+    about whether the scheduler behind the tokenizer is alive. Probing
+    `/server_info` directly (it carries one internal state per DP rank) tells
+    a wedged worker (request times out) from a busy one (it answers).
+    """
+    try:
+        info = requests.get(f"http://{ip}:{port}/server_info", timeout=timeout).json()
+    except Exception as e:
+        return f"server_info failed: {e}"
+    return (
+        f"disaggregation_mode={info.get('disaggregation_mode')!r} "
+        f"bootstrap_port={info.get('disaggregation_bootstrap_port')!r} "
+        f"dp_ranks={len(info.get('internal_states') or [])}"
+    )
+
+
 def _get_nnodes_from_args(args_list):
-    for i, arg in enumerate(args_list):
-        if arg == "--nnodes" and i + 1 < len(args_list):
-            return int(args_list[i + 1])
-    return None
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    nnodes = get_server_args_value(args_list, "--nnodes")
+    return int(nnodes) if nnodes is not None else None
+
+
+def _is_instance_head(pod_index, is_multi_node_instance, nnodes):
+    if not is_multi_node_instance:
+        return True
+    if nnodes is not None and nnodes >= 1:
+        return pod_index % nnodes == 0
+    return pod_index == 0
+
+
+def _get_served_model_name(model_config):
+    args = model_config["prefill_args"]
+    if "--served-model-name" in args:
+        return str(args[args.index("--served-model-name") + 1])
+    return model_config["model_path"]
 
 
 def _get_pod_ip_by_keyword(configmap_data, keyword):
@@ -395,6 +605,118 @@ def _get_pod_ip_by_keyword(configmap_data, keyword):
         if keyword in pod_name:
             return pod_ip
     return None
+
+
+# Pod name suffixes of the node that runs the HiCache L3 storage service
+# (Ascend MemCache MetaService or Mooncake master), checked in order. PD
+# separation uses the first prefill pod, PD mix uses the master node.
+STORAGE_SERVICE_NODE_SUFFIXES = ("prefill-0", "sglang-node-0")
+
+
+def _get_storage_service_node_ip(timeout: int = LOCAL_TIMEOUT, poll_interval: int = 15):
+    """Get the IP of the node that hosts the HiCache L3 storage service.
+
+    The service always runs on the first prefill node:
+    - single-machine run: the local node itself;
+    - multi-node PD mix: the master node (``*-sglang-node-0``);
+    - multi-node PD separation: the first prefill node (``*-prefill-0``).
+
+    Args:
+        timeout (int): Total timeout in seconds.
+        poll_interval (int): Interval between checks in seconds.
+
+    Returns:
+        str: IP of the node that hosts the storage service.
+
+    Raises:
+        RuntimeError: If the node entry is not published in time.
+    """
+    if not (CONFIGMAP_NAME and NAMESPACE):
+        # Single-machine run: the service binds the local pod IP.
+        from sglang.test.ascend.test_ascend_utils import resolve_local_ip
+
+        node_ip = resolve_local_ip()
+        logger.info(f"Single-machine run, HiCache storage service IP: {node_ip}")
+        return node_ip
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if configmap and configmap.data:
+            for suffix in STORAGE_SERVICE_NODE_SUFFIXES:
+                node_ip = _get_pod_ip_by_keyword(configmap.data, suffix)
+                if node_ip:
+                    logger.info(f"HiCache storage service IP ({suffix}): {node_ip}")
+                    return node_ip
+        logger.info(
+            "The HiCache storage service node is not published in ConfigMap yet, "
+            "waiting ..."
+        )
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f"Failed to get the HiCache storage service IP "
+        f"({', '.join(STORAGE_SERVICE_NODE_SUFFIXES)}) "
+        f"from ConfigMap within {timeout}s"
+    )
+
+
+def get_memcache_meta_service_url(
+    port: Optional[int] = None,
+    timeout: int = LOCAL_TIMEOUT,
+    poll_interval: int = 15,
+):
+    """Get the URL of a memcache meta service endpoint.
+
+    The host is the node that runs the storage service (see
+    ``_get_storage_service_node_ip``). The port is owned by the common helpers:
+    it defaults to ``MEMCACHE_META_SERVICE_PORT``, and callers pass
+    ``MEMCACHE_CONFIG_STORE_PORT`` for the config store endpoint, so the ports
+    stay in one place instead of being hardcoded in each test case.
+
+    Args:
+        port (int): Endpoint port. Defaults to the meta service port.
+        timeout (int): Total timeout when resolving the host IP.
+        poll_interval (int): Interval between host IP checks.
+
+    Returns:
+        str: ``tcp://<host ip>:<port>``.
+    """
+    if port is None:
+        from sglang.test.ascend.test_ascend_utils import MEMCACHE_META_SERVICE_PORT
+
+        port = MEMCACHE_META_SERVICE_PORT
+    host_ip = _get_storage_service_node_ip(timeout=timeout, poll_interval=poll_interval)
+    return f"tcp://{host_ip}:{port}"
+
+
+def get_mooncake_master_server_address(
+    port: Optional[int] = None,
+    timeout: int = LOCAL_TIMEOUT,
+    poll_interval: int = 15,
+):
+    """Get the ``<host>:<port>`` address of the Mooncake master.
+
+    The host is the node that runs the storage service (see
+    ``_get_storage_service_node_ip``), i.e. the first prefill pod rather than
+    whichever pod asks. This is the value for ``master_server_address`` in the
+    ``--hicache-storage-backend-extra-config`` JSON.
+
+    Args:
+        port (int): Master port. Defaults to ``MOONCAKE_MASTER_PORT`` so it
+            stays in step with the master launch helper.
+        timeout (int): Total timeout when resolving the host IP.
+        poll_interval (int): Interval between host IP checks.
+
+    Returns:
+        str: ``<host ip>:<port>``.
+    """
+    if port is None:
+        from sglang.test.ascend.test_ascend_utils import MOONCAKE_MASTER_PORT
+
+        port = MOONCAKE_MASTER_PORT
+    host_ip = _get_storage_service_node_ip(timeout=timeout, poll_interval=poll_interval)
+    return f"{host_ip}:{port}"
 
 
 def check_role(allowed_roles: Union[str, Iterable[str]]):
@@ -482,6 +804,24 @@ def launch_pd_mix_node(model_config):
         logger.info(f"ENV_VAR_CASE {key}:{value}")
         os.environ[key] = value
 
+    from sglang.test.ascend.test_ascend_utils import (
+        HICACHE_STORAGE_BACKEND_ARG,
+        get_server_args_value,
+        resolve_local_ip,
+        set_mooncake_master_env,
+    )
+
+    if get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
+        master_address = set_mooncake_master_env(master_node_ip)
+        # Each node registers its own address with the store instead of the
+        # shared "localhost" default, which other nodes cannot reach.
+        os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
+        # Nodes other than the one hosting the master start concurrently with
+        # it and would otherwise race its listen port.
+        wait_for_mooncake_master(
+            _resolve_mooncake_master_address(other_args, master_address)
+        )
+
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
     try:
@@ -554,9 +894,27 @@ def launch_pd_separation_node(model_config):
     # Generate prefill/decode run command
     service_args = list()
 
-    mf_addr = f"tcp://{master_prefill_ip}:24666"
-    os.environ["ASCEND_MF_STORE_URL"] = mf_addr
-    logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    # ASCEND_MF_STORE_URL belongs to the Ascend memfabric transfer path. Other
+    # backends (e.g. mooncake with TENT) configure their metadata through their
+    # own config (MC_TENT_CONF), so the legacy store URL must not leak into the
+    # launched process.
+    role_args = (
+        model_config["prefill_args"]
+        if role == "prefill"
+        else model_config["decode_args"]
+    )
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    transfer_backend = get_server_args_value(
+        role_args, "--disaggregation-transfer-backend"
+    )
+    if transfer_backend in (None, "ascend"):
+        mf_addr = f"tcp://{master_prefill_ip}:24666"
+        os.environ["ASCEND_MF_STORE_URL"] = mf_addr
+        logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    else:
+        os.environ.pop("ASCEND_MF_STORE_URL", None)
+        logger.info(f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}")
 
     if role == "prefill":
         # Current node is prefill
@@ -674,6 +1032,24 @@ def launch_pd_separation_node(model_config):
 
     other_args.extend(service_args)
 
+    from sglang.test.ascend.test_ascend_utils import (
+        HICACHE_STORAGE_BACKEND_ARG,
+        get_server_args_value,
+        resolve_local_ip,
+        set_mooncake_master_env,
+    )
+
+    if get_server_args_value(service_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
+        master_address = set_mooncake_master_env(master_prefill_ip)
+        # Each node registers its own address with the store instead of the
+        # shared "localhost" default, which other nodes cannot reach.
+        os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
+        # Nodes other than the one hosting the master start concurrently with
+        # it and would otherwise race its listen port.
+        wait_for_mooncake_master(
+            _resolve_mooncake_master_address(service_args, master_address)
+        )
+
     try:
         process = popen_launch_server(
             model_config["model_path"],
@@ -688,31 +1064,22 @@ def launch_pd_separation_node(model_config):
 
 
 # Launch router node
-def launch_router(model_config):
+def launch_router(model_config, router_binary, process_holder=None):
     logger.info(f"launch_router start ......")
     discover_worker_nodes()
 
     # Monitor to generate prefill/decode URL
     prefill_url = []
     decode_url = []
-    bootstrap_ports = []
     node_ip_list = []
-    is_multi_node_prefill_instance = "--node-rank" not in model_config["prefill_args"]
-    is_multi_node_decode_instance = "--node-rank" not in model_config["decode_args"]
-
-    prefill_nnodes = (
-        _get_nnodes_from_args(model_config["prefill_args"])
-        if is_multi_node_prefill_instance
-        else None
-    )
-    decode_nnodes = (
-        _get_nnodes_from_args(model_config["decode_args"])
-        if is_multi_node_decode_instance
-        else None
-    )
+    roles = []
+    for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+        args = model_config[f"{role}_args"]
+        is_multi_node_instance = "--node-rank" not in args
+        nnodes = _get_nnodes_from_args(args) if is_multi_node_instance else None
+        roles.append((role, urls, is_multi_node_instance, nnodes))
 
     is_ready = False
-    bootstrap_init_port = BOOTSTRAP_INIT_PORT
     start_time = time.time()
     while not is_ready and time.time() - start_time < ROUTER_CONFIGMAP_TIMEOUT:
         configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
@@ -724,7 +1091,6 @@ def launch_router(model_config):
 
         prefill_url.clear()
         decode_url.clear()
-        bootstrap_ports.clear()
         node_ip_list.clear()
 
         for pod_name, pod_ip in configmap.data.items():
@@ -737,44 +1103,11 @@ def launch_router(model_config):
                 continue
             pod_index = int(last_part)
 
-            if "prefill" in pod_name:
-                if is_multi_node_prefill_instance:
-                    if prefill_nnodes is not None and prefill_nnodes > 1:
-                        if pod_index % prefill_nnodes == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(
-                                str(bootstrap_init_port + pod_index // prefill_nnodes)
-                            )
-                            node_ip_list.append(pod_ip)
-                    elif prefill_nnodes is not None and prefill_nnodes == 1:
-                        prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        bootstrap_ports.append(str(bootstrap_init_port + pod_index))
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(str(bootstrap_init_port))
-                            node_ip_list.append(pod_ip)
-                else:
-                    prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                    bootstrap_ports.append(str(bootstrap_init_port + pod_index))
-                    node_ip_list.append(pod_ip)
-
-            if "decode" in pod_name:
-                if is_multi_node_decode_instance:
-                    if decode_nnodes is not None and decode_nnodes > 1:
-                        if pod_index % decode_nnodes == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                    elif decode_nnodes is not None and decode_nnodes == 1:
-                        decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                else:
-                    decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
+            for role, urls, is_multi_node_instance, nnodes in roles:
+                if role in pod_name and _is_instance_head(
+                    pod_index, is_multi_node_instance, nnodes
+                ):
+                    urls.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
                     node_ip_list.append(pod_ip)
 
         if prefill_url and decode_url:
@@ -789,7 +1122,7 @@ def launch_router(model_config):
         )
     logger.info(
         f"ConfigMap monitoring complete: prefill_url={prefill_url}, decode_url={decode_url}, "
-        f"bootstrap_ports={bootstrap_ports}, node_ip_list={node_ip_list}"
+        f"node_ip_list={node_ip_list}"
     )
 
     # Check all node port ready
@@ -798,48 +1131,88 @@ def launch_router(model_config):
     ):
         raise RuntimeError("Failed to wait for all nodes to be ready")
 
+    # PD separation only: the router reads each worker's role from
+    # /server_info exactly once when it starts, so wait until every worker is
+    # both healthy (/health == 200, i.e. warmup done) and reporting its role.
+    # An open TCP port is not enough, and neither is /server_info on its own:
+    # it answers during warmup, and the router's introspection lands in the
+    # warmup window — it then falls back to Plain and rejects the worker as a
+    # mixed pool, which never recovers.
+    if "prefill_args" in model_config and "decode_args" in model_config:
+        expected_roles = {}
+        for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+            for url in urls:
+                expected_roles[url.rsplit(":", 1)[0]] = role
+        wait_for_pd_worker_roles(expected_roles, port=PREFILL_DECODE_PORT)
+
     # Set environment variables
     set_environment_variables(model_config.get("router_envs"))
 
-    router_args = model_config["router_args"]
-    # Router server params
-    router_command = [
-        "python3",
-        "-u",
-        "-m",
-        "sglang_router.launch_router",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(SERVICE_PORT),
-        "--pd-disaggregation",
-        "--policy",
-        "cache_aware",
-        *[str(x) for x in router_args],
-    ]
-
-    for index, url in enumerate(prefill_url):
-        router_command.extend(
-            ["--prefill", f"http://{url}", f"{bootstrap_ports[index]}"]
-        )
-
-    for url in decode_url:
-        router_command.extend(["--decode", f"http://{url}"])
+    router_args = [str(x) for x in model_config["router_args"]]
+    request_timeout_secs = SGL_ROUTER_REQUEST_TIMEOUT_SECS
+    if "--request-timeout-secs" in router_args:
+        i = router_args.index("--request-timeout-secs")
+        request_timeout_secs = router_args[i + 1]
+        del router_args[i : i + 2]
+    router_command = sgl_router_command(
+        router_binary,
+        _get_served_model_name(model_config),
+        [f"http://{url}" for url in prefill_url + decode_url],
+        host="0.0.0.0",
+        port=SERVICE_PORT,
+        request_timeout_secs=request_timeout_secs,
+        extra_args=router_args,
+    )
 
     logger.info(f"Starting router with command: {' '.join(router_command)}")
     try:
         router_process = subprocess.Popen(router_command)
         logger.info(f"Router process started with PID: {router_process.pid}")
+        if process_holder is not None:
+            process_holder.append(router_process)
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
+def start_router_thread(model_config, base_url):
+    logger.info(f"Starting router in thread...")
+    # Looked up here so a missing binary fails the test, not the daemon thread.
+    router_binary = find_sgl_router_binary()
+    # Filled by launch_router so the readiness wait can fail fast if the router
+    # exits early (e.g. rejected arguments) instead of polling until timeout.
+    process_holder = []
+    router_thread = threading.Thread(
+        target=launch_router, args=(model_config, router_binary, process_holder)
+    )
+    router_thread.daemon = True
+    router_thread.start()
+
+    # /health answers once the router listens; /readiness waits for the
+    # prefill and decode workers to be registered.
+    health_check_url = f"{base_url}/readiness"
+    logger.info(f"Waiting for router to be ready at {health_check_url}")
+    wait_server_ready(
+        health_check_url,
+        process_holder=process_holder,
+        launch_thread=router_thread,
+    )
+    return router_thread
+
+
+def wait_server_ready(
+    url, timeout=LOCAL_TIMEOUT, process_holder=None, launch_thread=None
+):
     """Wait for the server to be ready.
 
     Args:
         url (str): Server URL to check.
         timeout (int): Timeout in seconds.
+        process_holder (list): Optional single-element list holding the router
+            subprocess, so an early exit fails fast instead of polling.
+        launch_thread (threading.Thread): Optional thread running the launcher.
+            A launcher cannot outlive its thread, so a thread that exited
+            before the subprocess was created means the launcher raised (its
+            traceback is printed by the thread) — fail fast instead of polling.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -849,6 +1222,20 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
     check_interval = 10
 
     while True:
+        if process_holder and process_holder[0].poll() is not None:
+            raise RuntimeError(
+                f"Router exited with code {process_holder[0].returncode} before "
+                f"serving {url}; check the router output above for the reason"
+            )
+        if (
+            launch_thread is not None
+            and not launch_thread.is_alive()
+            and not process_holder
+        ):
+            raise RuntimeError(
+                f"Server launcher exited before starting the server for {url}; "
+                "check the traceback printed by the launcher thread above"
+            )
         try:
             response = requests.get(url, timeout=30)
             if response.status_code == 200:
@@ -868,220 +1255,6 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
                 f"Server {url} failed to start in {timeout}s (elapsed: {elapsed_time:.2f}s)"
             )
         time.sleep(check_interval)
-
-
-class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
-    model_config = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-        cls.sglang_thread = None
-        cls.stop_event = threading.Event()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def launch_pd_mix_master_node(cls):
-        logger.info(f"Starting master node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def launch_pd_mix_worker_node(cls):
-        logger.info(f"Starting master node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-        keep_alive_time = 1800
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {keep_alive_time} seconds"
-        )
-        time.sleep(keep_alive_time)
-
-    @classmethod
-    @check_role(allowed_roles=["master", "worker"])
-    def stop_sglang_thread(cls):
-        if cls.sglang_thread:
-            logger.info(f"Stopping sglang thread {cls.sglang_thread}")
-            if cls.sglang_thread.is_alive():
-                logger.info("Notifying stop event...")
-                cls.stop_event.set()
-                cls.sglang_thread.join(timeout=5)
-                if cls.sglang_thread.is_alive():
-                    logger.info(
-                        "Warning: subprocess is not terminated normally, it may has been already force stopped."
-                    )
-                else:
-                    logger.info("Subprocess has been Stopped.")
-        else:
-            logger.info("No running sglang thread.")
-
-    @check_role(allowed_roles=["master"])
-    def run_gsm8k_test(
-        self,
-        expect_accuracy,
-        num_shots=8,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-    ):
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
-            host=self.host,
-            port=self.port,
-        )
-        logger.info("Starting gsm8k test...")
-        metrics = run_eval_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            expect_accuracy,
-            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
-        )
-
-
-class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
-    model_config = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-        cls.sglang_thread = None
-        cls.stop_event = threading.Event()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        logger.info(f"Starting router in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_router, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        logger.info(f"Starting pd separation node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_separation_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-        keep_alive_time = 1800
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {keep_alive_time} seconds"
-        )
-        time.sleep(keep_alive_time)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode", "router"])
-    def stop_sglang_thread(cls):
-        if cls.sglang_thread:
-            logger.info(f"Stopping sglang thread {cls.sglang_thread}")
-            if cls.sglang_thread.is_alive():
-                logger.info("Notifying stop event...")
-                cls.stop_event.set()
-                cls.sglang_thread.join(timeout=5)
-                if cls.sglang_thread.is_alive():
-                    logger.info(
-                        "Warning: subprocess is not terminated normally, it may has been already force stopped."
-                    )
-                else:
-                    logger.info("Subprocess has been Stopped.")
-        else:
-            logger.info("No running sglang thread.")
-
-    @check_role(allowed_roles=["router"])
-    def run_gsm8k_test(
-        self,
-        expect_accuracy,
-        num_shots=8,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-    ):
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
-            host=self.host,
-            port=self.port,
-        )
-        logger.info("Starting gsm8k test...")
-        metrics = run_eval_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            expect_accuracy,
-            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
-        )
 
 
 def kill_process_group(process):

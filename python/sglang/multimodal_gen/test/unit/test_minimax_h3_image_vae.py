@@ -171,6 +171,14 @@ def test_attention_and_tile_batching_share_decode_gate(tiny_image):
     assert not gate.enabled
 
 
+def test_rocm_keeps_the_image_decoder_blocks_unfused(tiny_image):
+    """ROCm installs the fused residual-add RMSNorm on the video VAE only."""
+    from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
+
+    assert RocmPlatform.optimize_vae(tiny_image) is tiny_image
+    assert tiny_image.decoder._sgl_gate is None
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_decode_tile_batching_bounds_order_and_exact_restoration(
     tiny_image, monkeypatch, device

@@ -2,6 +2,8 @@
 
 # export SGLANG_TORCH_PROFILER_DIR=/data/sglang/
 export SGLANG_TORCH_PROFILER_DIR=/sgl-workspace/sglang/profile/
+# The server reads its admin key (required by /start_profile) from SGLANG_ADMIN_API_KEY:
+# export it before running this script.
 
 # Get the current timestamp
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
