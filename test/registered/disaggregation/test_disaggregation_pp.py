@@ -231,6 +231,7 @@ class TestDisaggregationStagingPrefillPPDecodeLargerTP(PDDisaggregationServerBas
         # transfer that skipped staging would go through the slice path instead.
         log = self._prefill_stdout_buf.getvalue() + self._prefill_stderr_buf.getvalue()
         for stage in ("PP0", "PP1"):
+            # Assumes prefill TP1: with TP > 1 the prefix is "PP<rank> TP<rank> PID".
             pattern = rf"{stage} PID\d+\] \[Staging\] Sending KV through"
             self.assertTrue(re.search(pattern, log), f"{stage} sent no staged KV")
         # Wait a little bit so that the memory check happens.
