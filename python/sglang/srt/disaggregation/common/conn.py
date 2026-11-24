@@ -2682,10 +2682,17 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        # A landed transfer stays Success; a nonzero count means a chunk can still fail.
+        # A landed transfer stays Success. A nonzero count means a chunk can still
+        # fail; with deferred allocation the entry itself means the worker is still
+        # cleaning up, poll() reports Transferring and decode has not been told.
+        outstanding = self.kv_mgr._staging_outstanding
         if (
             self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Success
-            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) == 0
+            and outstanding.get(self.bootstrap_room, 0) == 0
+            and not (
+                self.kv_mgr.defer_decode_allocation
+                and self.bootstrap_room in outstanding
+            )
         ):
             return
         self.kv_mgr.record_failure(

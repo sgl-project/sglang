@@ -1077,6 +1077,23 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertNotIn(1, mgr.request_status)
             self.assertNotIn(1, mgr.failure_records)
 
+    def test_abort_during_deferred_worker_cleanup_fails_the_room(self):
+        """With deferred allocation a zero entry means the worker is still cleaning
+        up: poll reports Transferring and decode has not been told, so an abort lands."""
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        self.prefill._staging_outstanding[1] = 0
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        sender.abort()
+        self.prefill._staging_outstanding.pop(1)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        sender.clear()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+
 
 if __name__ == "__main__":
     unittest.main()
