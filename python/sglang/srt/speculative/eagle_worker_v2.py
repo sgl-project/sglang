@@ -1525,8 +1525,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
                 logits = draft_logits_output.next_token_logits
-                if logits.numel() >= _DRAFT_TOP1_SPLIT_ARGMAX_MIN_LOGITS:
-                    # Same token as torch.argmax for finite logits (ties: lowest index).
+                if _is_cuda and logits.numel() >= _DRAFT_TOP1_SPLIT_ARGMAX_MIN_LOGITS:
+                    # Same token as torch.argmax for finite logits (ties: lowest index);
+                    # a row with NaN differs (torch.argmax returns the NaN).
                     ret_topk_index = sampling_argmax(logits).unsqueeze(-1)
                 else:
                     ret_topk_index = torch.argmax(logits, dim=-1, keepdim=True)

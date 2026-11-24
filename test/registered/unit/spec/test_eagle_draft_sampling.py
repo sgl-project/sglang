@@ -80,11 +80,13 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         )
 
     @staticmethod
-    def _run(out, runner=None, **patches):
-        """One topk-1 draft extend of two requests; returns the next draft input."""
+    def _run(out, is_cuda):
+        """One topk-1 draft extend of two requests; returns the next draft input
+        and the mocked sampler argmax. Routing only: the kernel's tie behavior is
+        covered by test_argmax.py."""
         worker = EagleDraftWorker.__new__(EagleDraftWorker)
         worker.speculative_num_draft_tokens = 4
-        worker.cuda_graph_runner_for_draft_extend = runner
+        worker.cuda_graph_runner_for_draft_extend = None
         worker.plan_stream = None
         worker.plan_stream_ctx = nullcontext()
         worker.seed_dsa_topk_from_draft_extend = False
@@ -109,27 +111,30 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         with (
             patch(v2 + "prepare_for_draft_extend", return_value=SimpleNamespace()),
             patch(v2 + "get_spec", return_value=spec),
-            patch(v2 + patches["name"], **patches["kw"]) as mock,
+            patch(v2 + "_is_cuda", is_cuda),
+            patch(
+                v2 + "sampling_argmax", side_effect=lambda x: torch.argmax(x, dim=-1)
+            ) as sampler,
         ):
             worker._draft_extend_for_decode(batch, batch_result)
-        return batch_result.next_draft_input, mock
+        return batch_result.next_draft_input, sampler
 
     def test_draft_extend_top1_takes_the_sampler_argmax_for_large_logits(self):
         logits = torch.randn(8, 16)
         logits[:, 5] = logits[:, 9] = logits.max() + 1  # tie: lowest index
         out = SimpleNamespace(next_token_logits=logits, hidden_states=None)
-        argmax = dict(side_effect=lambda x: torch.argmax(x, dim=-1))
         selected = 2 * logits.shape[1]  # one row per request
-        for min_logits, called in ((selected + 1, 0), (selected, 1)):
+        cases = ((selected + 1, True, 0), (selected, True, 1), (selected, False, 0))
+        for min_logits, is_cuda, called in cases:
             with (
-                self.subTest(min_logits=min_logits),
+                self.subTest(min_logits=min_logits, is_cuda=is_cuda),
                 patch(
                     "sglang.srt.speculative.eagle_worker_v2."
                     "_DRAFT_TOP1_SPLIT_ARGMAX_MIN_LOGITS",
                     min_logits,
                 ),
             ):
-                draft, sampler = self._run(out, name="sampling_argmax", kw=argmax)
+                draft, sampler = self._run(out, is_cuda)
                 self.assertEqual(sampler.call_count, called)
                 self.assertTrue(torch.equal(draft.topk_index, torch.full((2, 1), 5)))
 
