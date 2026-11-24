@@ -276,21 +276,25 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
     def test_the_pool_is_presized_for_the_largest_batch_when_memory_allows(self):
+        """Two fp32 sampling buffers of the largest batch plus the margin, and only with
+        that much plus the spare free: otherwise 0 and the pool grows per key as on main."""
         graphs = _worker(switch=True)._post_verify_graphs._graphs
         self.assertIsNotNone(graphs.presize)
+        shape = dict(max_requests=128, tokens_per_request=4, vocab=248320)
         nbytes = eagle_post_verify_graphs.pool_presize_bytes(
-            max_requests=128, tokens_per_request=4, vocab=248320, free_bytes=1 << 40
+            **shape, free_bytes=1 << 40
         )
-        self.assertEqual(nbytes, 2 * 128 * 4 * 248320 * 4 + (64 << 20))
         self.assertEqual(
-            eagle_post_verify_graphs.pool_presize_bytes(
-                max_requests=128,
-                tokens_per_request=4,
-                vocab=248320,
-                free_bytes=nbytes + (1 << 30) - 1,
-            ),
-            0,
+            nbytes, 2 * 128 * 4 * 248320 * 4 + eagle_post_verify_graphs._PRESIZE_MARGIN
         )
+        enough = nbytes + eagle_post_verify_graphs._PRESIZE_SPARE
+        for free_bytes, want in ((enough, nbytes), (enough - 1, 0)):
+            self.assertEqual(
+                eagle_post_verify_graphs.pool_presize_bytes(
+                    **shape, free_bytes=free_bytes
+                ),
+                want,
+            )
 
     def test_pool_presize_runs_once_inside_the_first_sampled_capture(self):
         events = []
@@ -735,6 +739,97 @@ def _sampled(batch, *, generator):
     info.top_ks = torch.randint(2, TOP_K + 1, (bs,), device="cuda", generator=generator)
     info.top_ps = torch.full((bs,), 0.95, device="cuda")
     return SimpleNamespace(**{**vars(batch), "sampling_info": info})
+
+
+# A vocabulary whose sampling scratch is large blocks, outside the small-block pool.
+POOL_VOCAB = 32768
+POOL_BATCH_SIZES = (1, 2, 4, 8, 16)
+
+
+def _temperature_sampled(batch):
+    """The round's batch with temperature-1 sampling and no truncation on every request."""
+    bs = len(batch.seq_lens)
+    info = SimpleNamespace(**vars(batch.sampling_info))
+    info.is_all_greedy = False
+    info.temperatures = torch.ones((bs, 1), device="cuda")
+    info.top_ks = torch.full((bs,), 1 << 30, dtype=torch.int32, device="cuda")
+    info.top_ps = torch.ones((bs,), device="cuda")
+    return SimpleNamespace(**{**vars(batch), "sampling_info": info})
+
+
+def _pool_bytes(pool):
+    return sum(
+        seg["total_size"]
+        for seg in torch.cuda.memory_snapshot()
+        if tuple(seg.get("segment_pool_id", (0, 0))) == tuple(pool)
+    )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestPresizedPoolHoldsLaterKeys(CustomTestCase):
+    """Presized at the first sampled capture, the graph pool takes later sampled keys of
+    larger batches in that one segment; without the presize it grows with each."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def _pool_bytes_per_key(self, *, presize):
+        graphs = EaglePostVerifyGraphs(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    watermark=None,
+                    model_config=None,
+                    decode_cuda_graph_capture_bs=list(POOL_BATCH_SIZES),
+                )
+            ),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        if not presize:
+            graphs._graphs.presize = None
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=1),
+            attn_tp_group=SimpleNamespace(world_size=1),
+        )
+        sizes = []
+        with (
+            torch.cuda.stream(torch.cuda.Stream()),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0),
+            patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            patch.object(
+                eagle_post_verify_graphs, "mambaish_config", return_value=None
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for bs in POOL_BATCH_SIZES:
+                logits_buf = torch.empty(bs * TOKENS, POOL_VOCAB, device="cuda")
+                for _ in range(ROUNDS):
+                    batch, verify_input, logits = _round(bs, generator, POOL_VOCAB)
+                    logits_buf.copy_(logits)
+                    got = graphs.run(
+                        batch=_temperature_sampled(batch),
+                        verify_input=verify_input,
+                        logits_output=SimpleNamespace(
+                            next_token_logits=logits_buf,
+                            next_token_logits_vocab_shard=None,
+                        ),
+                        can_run_cuda_graph=True,
+                    )
+                    graphs.join()
+                    self.assertIsNotNone(got)
+                sizes.append(_pool_bytes(graphs._graphs._pool))
+        return sizes
+
+    def test_later_keys_split_the_presized_segment(self):
+        # each larger key's two sampling buffers are 3.5-28 MiB here
+        presized = self._pool_bytes_per_key(presize=True)
+        self.assertLess(presized[-1] - presized[0], 8 << 20, presized)
+        grown = self._pool_bytes_per_key(presize=False)
+        self.assertGreater(grown[-1] - grown[0], 32 << 20, grown)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

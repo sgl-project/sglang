@@ -39,17 +39,19 @@ _MAX_POST_VERIFY_STATES = 64
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
-# Arbitrary headroom for the body's large temporaries besides its two sampling buffers.
+# Headroom for the body's other large temporaries besides its two sampling buffers.
 _PRESIZE_MARGIN = 64 << 20
+# Device memory left outside the pool after presizing, for the rest of the process.
+_PRESIZE_SPARE = 1 << 30
 
 
 def pool_presize_bytes(
     *, max_requests: int, tokens_per_request: int, vocab: int, free_bytes: int
 ) -> int:
     """Two fp32 [requests * tokens, vocab] sampling buffers plus a margin; 0 (the pool
-    grows per key) without 1 GiB to spare."""
+    grows per key) without _PRESIZE_SPARE to spare."""
     nbytes = 2 * max_requests * tokens_per_request * vocab * 4 + _PRESIZE_MARGIN
-    if free_bytes < nbytes + (1 << 30):
+    if free_bytes < nbytes + _PRESIZE_SPARE:
         logger.warning(
             "The post-verify graph pool is not presized: %.2f GiB free for %.2f GiB",
             free_bytes / 2**30,
