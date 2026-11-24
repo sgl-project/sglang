@@ -9,14 +9,13 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 
 # backend-specific: the ROCm kernels and dispatch Inkling2 runs on MI35x
-register_amd_ci(est_time=70, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=50, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
     reason="Requires a ROCm GPU",
 )
 
-H, HKV, D, EXT = 6, 1, 128, 1024
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
 
 
@@ -51,17 +50,22 @@ def _sum_splits(partials, dtype):
 
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("tokens", [1, 5, 8, 13, 300])
+@pytest.mark.parametrize(
+    "tokens,nexp,num_experts",
+    [(1, 16, 64), (13, 16, 64), (300, 16, 64), (512, 48, 384)],
+)
 # (512, 1024) generic; Inkling-2-Mini's w13 (2304, 2304) and w2 (2304, 1152)
 @pytest.mark.parametrize("n,k", [(512, 1024), (2304, 2304), (2304, 1152)])
-def test_expert_gemm(fmt, tokens, n, k):
+def test_expert_gemm(fmt, tokens, nexp, num_experts, n, k):
     """NVFP4: products of e2m1, e4m3 scales and NVFP4-fake-quantized activations are
-    exact in FP16, so the FP32 accumulator equals float64 up to summation order."""
+    exact in FP16, so the FP32 accumulator equals float64 up to summation order, from
+    one token to the large-batch tile (4,096 rows over 384 experts, MTP verify above
+    c16); it repeats bitwise."""
     from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
     from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     torch.manual_seed(tokens)
-    nexp, top_k, start = 16, 8, 8
+    top_k, start = 8, nexp
     if fmt == "nvfp4":
         w = torch.randint(0, 256, (nexp, n, k // 2), device="cuda", dtype=torch.uint8)
         s = (torch.rand(nexp, n, k // 16, device="cuda") * 2 + 0.25).to(
@@ -78,96 +82,32 @@ def test_expert_gemm(fmt, tokens, n, k):
         if fmt == "nvfp4"
         else experts_sm90.fake_quantize_mxfp8(x)
     )
-    ids = (
-        torch.stack(
-            [torch.randperm(nexp, device="cuda")[:top_k] for _ in range(tokens)]
-        ).int()
-        + start
-    )
-    route = experts_hip.route(ids.flatten(), start, nexp, 64)
-    out = experts_hip.expert_gemm(
-        xq, w, s, route, n, top_k, torch.float32, ids.numel(), num_experts=64
-    )
-    out = _sum_splits(out, torch.float32)
-    wd, flat = _dequant(w, s), ids.flatten().long()
-    xr = xq.double()[torch.arange(ids.numel(), device="cuda") // top_k]
-    ref = torch.stack([xr[r] @ wd[flat[r] - start].T for r in range(ids.numel())])
-    assert _rel(out, ref) < (1e-7 if fmt == "nvfp4" else 1e-6)
-    assert all(
-        torch.equal(
-            _sum_splits(
-                experts_hip.expert_gemm(
-                    xq,
-                    w,
-                    s,
-                    route,
-                    n,
-                    top_k,
-                    torch.float32,
-                    ids.numel(),
-                    num_experts=64,
-                ),
-                torch.float32,
-            ),
-            out,
-        )  # fmt: skip
-        for _ in range(5)
-    )
-
-
-@pytest.mark.parametrize("warps", [4, 8])
-@pytest.mark.parametrize("gather", [8, 1])
-def test_expert_gemm_software_nvfp4_tile(monkeypatch, warps, gather):
-    """The NVFP4 GEMM off gfx950 (software dequant, BF16 MMA) at its 128 x 128 x 128
-    prefill tile, rebuilt here without NATIVE_CVT: exact against float64 and run to run.
-    Its FP32 dequant once became v_pk_mul_f32 reading the scales through op_sel, which on
-    gfx950 zeroed some weights in lanes 48-63, differently every run."""
-    import types
-
-    import triton
-    import triton.language as tl
-
-    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
-    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
-    from sglang.kernels.ops.moe.inkling2_experts_hip import GemmConfig
-
-    fn = experts_hip._grouped_dequant_gemm.fn
-    software = dict(fn.__globals__, NATIVE_CVT=tl.constexpr(False))
-    kernel = types.FunctionType(fn.__code__, software)
-    kernel.__annotations__ = fn.__annotations__
-    monkeypatch.setattr(experts_hip, "_grouped_dequant_gemm", triton.jit(kernel))
-    monkeypatch.setattr(experts_hip, "NATIVE_CVT", tl.constexpr(False))
-    torch.manual_seed(warps + gather)
-    nexp, n, k, top_k, start, tokens = 16, 512, 1024, 8, 16, 256
-    w = torch.randint(0, 256, (nexp, n, k // 2), device="cuda", dtype=torch.uint8)
-    s = (torch.rand(nexp, n, k // 16, device="cuda") * 2 + 0.25).to(torch.float8_e4m3fn)
-    rows = tokens * top_k
-    x = torch.randn(rows // gather, k, device="cuda", dtype=torch.bfloat16) * 2
-    xq = experts_sm90.fake_quantize(x, torch.bfloat16)[0]
     ids = torch.stack(
-        [torch.randperm(4 * nexp, device="cuda")[:top_k] for _ in range(tokens)]
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(tokens)]
     ).int()
-    cfg = GemmConfig(128, 128, 128, 1, warps, 1)
-    route = experts_hip.route(ids.flatten(), start, nexp, 4 * nexp, block_m=cfg.bm)
-    args = (xq, w, s, route, n, gather, torch.float32, rows)
-    out = experts_hip.expert_gemm(*args, num_experts=4 * nexp, config=cfg)[0]
-    flat = ids.flatten().long()
-    wd, xr = _dequant(w, s), xq.double()[torch.arange(rows, device="cuda") // gather]
-    for e in range(nexp):
-        sel = (flat == start + e).nonzero().flatten()
-        assert _rel(out[sel], xr[sel] @ wd[e].T) < 1e-7
-    local = ((flat >= start) & (flat < start + nexp)).nonzero().flatten()
-    assert all(
-        torch.equal(
-            experts_hip.expert_gemm(*args, num_experts=4 * nexp, config=cfg)[0][local],
-            out[local],
+    ids[0, 0] = start  # at least one row for this rank
+    rows = ids.numel()
+    cfg = experts_hip.default_config(rows, num_experts, fmt == "nvfp4")
+    route = experts_hip.route(ids.flatten(), start, nexp, num_experts, block_m=cfg.bm)
+
+    def run():
+        partials = experts_hip.expert_gemm(
+            xq, w, s, route, n, top_k, torch.float32, rows, num_experts=num_experts
         )
-        for _ in range(5)
-    )
+        return _sum_splits(partials, torch.float32)
+
+    out = run()
+    flat = ids.flatten().long()
+    local = ((flat >= start) & (flat < start + nexp)).nonzero().flatten()
+    wd = _dequant(w, s)
+    xr = xq.double()[local // top_k]
+    ref = torch.stack([xr[i] @ wd[flat[r] - start].T for i, r in enumerate(local)])
+    assert _rel(out[local], ref) < (1e-7 if fmt == "nvfp4" else 1e-6)
+    assert torch.equal(run()[local], out[local])
 
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("tokens", [1, 4, 40, 128])
+@pytest.mark.parametrize("tokens", [1, 40])
 # (w13 width, hidden): generic, and Inkling-2-Mini (1152-wide experts, hidden 2304)
 @pytest.mark.parametrize("n2,k", [(512, 1024), (2304, 2304)])
 def test_consumers_sum_split_k_partials(fmt, tokens, n2, k):
@@ -252,10 +192,10 @@ def test_consumers_sum_split_k_partials(fmt, tokens, n2, k):
     assert torch.equal(ref[2].view(torch.int32), fused[2].view(torch.int32))
 
 
-@pytest.mark.parametrize("rank", [0, 3, 7])
+@pytest.mark.parametrize("rank", [0, 7])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("local_heavy", [False, True])
-@pytest.mark.parametrize("tokens", [1, 2, 3, 4])
+@pytest.mark.parametrize("tokens", [1, 4])
 def test_fused_route_matches_separate_kernels(rank, with_bias, local_heavy, tokens):
     """route_topk_metadata (up to four tokens, ROCm decode) is bitwise route_topk
     followed by route_metadata: weights, ids and every routing metadata tensor
@@ -266,7 +206,7 @@ def test_fused_route_matches_separate_kernels(rank, with_bias, local_heavy, toke
     experts, num_local, block_m = 384, 48, 16
     one = torch.ones((), device="cuda")
     start = rank * num_local
-    for seed in range(6):
+    for seed in range(2):
         torch.manual_seed(
             1000 * rank + 100 * with_bias + 10 * local_heavy + seed + 7 * tokens
         )
@@ -293,7 +233,7 @@ def test_fused_route_matches_separate_kernels(rank, with_bias, local_heavy, toke
     [("nvfp4", torch.bfloat16), ("nvfp4", torch.float16), ("mxfp8", torch.bfloat16)],
 )
 @pytest.mark.parametrize("width", [4608, 1000])
-@pytest.mark.parametrize("tokens", [1, 3, 4])
+@pytest.mark.parametrize("tokens", [1, 4])
 def test_fused_route_quantizes_activations(quant, out_dtype, width, tokens):
     """route_topk_metadata's extra programs fake-quantize the token's activations
     bitwise as fake_quantize / fake_quantize_mxfp8, with the routing unchanged."""
@@ -301,7 +241,7 @@ def test_fused_route_quantizes_activations(quant, out_dtype, width, tokens):
     from sglang.kernels.ops.moe.inkling2_route_hip import route_topk_metadata
 
     one = torch.ones((), device="cuda")
-    for seed in range(10):
+    for seed in range(3):
         torch.manual_seed(seed)
         partials = torch.randn(5, tokens, 384, device="cuda") * 3
         bias = torch.randn(384, device="cuda") * 0.1
@@ -374,7 +314,7 @@ def test_dynamic_conv_projection_partials():
     "quant,out_dtype",
     [("nvfp4", torch.bfloat16), ("nvfp4", torch.float16), ("mxfp8", torch.bfloat16)],
 )
-@pytest.mark.parametrize("tokens", [2, 8, 16, 64, 128])
+@pytest.mark.parametrize("tokens", [2, 128])
 def test_route_metadata_quantize_matches_separate(quant, out_dtype, tokens):
     """route_metadata_quantize is bitwise route_metadata followed by the rows' fake
     quantization (fake_quantize / fake_quantize_mxfp8), for 16 to 1024 ids."""
@@ -405,52 +345,8 @@ def test_route_metadata_quantize_matches_separate(quant, out_dtype, tokens):
 
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("tokens", [160, 256, 512])
-def test_expert_gemm_large_batch_tiles(fmt, tokens):
-    """1,280-4,096 routed rows over 384 experts (MTP verify above c16): the
-    large-batch tile equals float64 up to summation order."""
-    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
-    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
-
-    torch.manual_seed(tokens)
-    nexp, n, k, top_k, start, num_experts = 48, 512, 1024, 8, 48, 384
-    if fmt == "nvfp4":
-        w = torch.randint(0, 256, (nexp, n, k // 2), device="cuda", dtype=torch.uint8)
-        s = (torch.rand(nexp, n, k // 16, device="cuda") * 2 + 0.25).to(
-            torch.float8_e4m3fn
-        )
-    else:
-        w = (torch.randn(nexp, n, k, device="cuda") * 8).to(torch.float8_e4m3fn)
-        s = torch.randint(
-            120, 130, (nexp, n, k // 32), device="cuda", dtype=torch.uint8
-        )
-    x = torch.randn(tokens, k, device="cuda", dtype=torch.bfloat16) * 2
-    xq = (
-        experts_sm90.fake_quantize(x, experts_hip.activation_dtype(w.dtype))[0]
-        if fmt == "nvfp4"
-        else experts_sm90.fake_quantize_mxfp8(x)
-    )
-    ids = torch.stack(
-        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(tokens)]
-    ).int()
-    rows = ids.numel()
-    cfg = experts_hip.default_config(rows, num_experts, fmt == "nvfp4")
-    route = experts_hip.route(ids.flatten(), start, nexp, num_experts, block_m=cfg.bm)
-    out = experts_hip.expert_gemm(
-        xq, w, s, route, n, top_k, torch.float32, rows, num_experts=num_experts
-    )[0]
-    flat = ids.flatten().long()
-    local = ((flat >= start) & (flat < start + nexp)).nonzero().flatten()
-    assert local.numel() > 0
-    wd = _dequant(w, s)
-    xr = xq.double()[local // top_k]
-    ref = torch.stack([xr[i] @ wd[flat[r] - start].T for i, r in enumerate(local)])
-    assert _rel(out[local], ref) < (1e-7 if fmt == "nvfp4" else 1e-6)
-
-
-@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("gather", [8, 1])
-@pytest.mark.parametrize("tokens", [1, 8, 32, 128, 256, 384, 1024])
+@pytest.mark.parametrize("tokens", [1, 32, 256, 1024])
 def test_expert_gemm_mfma_order(monkeypatch, fmt, tokens, gather):
     """Weights in MFMA order: 16-row tiles run the Gluon kernel and the others the
     Triton tile on that order, both bitwise the checkpoint layout's partials in

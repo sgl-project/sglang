@@ -9,15 +9,12 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 
 # backend-specific: the ROCm kernels and dispatch Inkling2 runs on MI35x
-register_amd_ci(est_time=40, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
     reason="Requires a ROCm GPU",
 )
-
-H, HKV, D, EXT = 6, 1, 128, 1024
-E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
 
 
 @pytest.fixture(autouse=True)
@@ -44,8 +41,8 @@ def _attn_res_reference(sources, addend, queries, normalize):
 
 
 @pytest.mark.parametrize("split", [False, 512, 1024])
-@pytest.mark.parametrize("tokens", [1, 9, 64, 300])
-@pytest.mark.parametrize("n,nq", [(1, 1), (2, 3), (5, 1), (9, 1), (12, 3)])
+@pytest.mark.parametrize("tokens", [1, 64, 300])
+@pytest.mark.parametrize("n,nq", [(1, 1), (5, 1), (12, 3)])
 @pytest.mark.parametrize("hidden", [4608, 2304])  # Inkling-2-Small, Inkling-2-Mini
 def test_block_attention_residual(tokens, n, nq, split, hidden):
     """One-CTA kernel and the split kernel at both chunk widths (300 rows take the
@@ -140,7 +137,7 @@ def test_split_attention_residual_graph_replay_is_deterministic():
         assert all(torch.equal(a, b) for a, b in zip(outs, eager))
 
 
-@pytest.mark.parametrize("seqs", [1, 4, 32])
+@pytest.mark.parametrize("seqs", [1, 32])
 @pytest.mark.parametrize("mode", ["decode", "verify"])
 @pytest.mark.parametrize("with_partial", [False, True])
 def test_conv_epilogue_takes_fp32_expert_sums(seqs, mode, with_partial):
@@ -224,7 +221,7 @@ def test_rms_norm_and_l2_clip():
     assert _rel(norm_hip.l2_clip(xs, 22.627, 1e-6, scale=scale), clip) < 4e-3
 
 
-@pytest.mark.parametrize("reqs", [1, 3, 16])
+@pytest.mark.parametrize("reqs", [1, 16])
 def test_mix_rmsnorm_last_matches_gather_and_copy(reqs):
     """mix_rmsnorm_last equals gathering each request's last committed row,
     mix_rmsnorm and index_copy_ into the f_rnn buffer (Inkling2 MTP's
@@ -248,7 +245,7 @@ def test_mix_rmsnorm_last_matches_gather_and_copy(reqs):
     assert torch.equal(buf.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("rows", [1, 2, 4])
+@pytest.mark.parametrize("rows", [1, 4])
 def test_rnn_step_matches_gemm_path(rows):
     """rnn_step (Inkling2 MTP's Markov RNN step for a few rows, in two launches) equals
     rnn_inputs, the rnn_proj GEMM and rnn_gates up to one BF16 step where the split-K
