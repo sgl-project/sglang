@@ -48,6 +48,7 @@ mod tests {
     async fn lists_configured_model() {
         let mut ctx = crate::server::app_context::AppContext::stub();
         ctx.config.model = crate::config::ModelConfig {
+                    chat_stop_after_reasoning: false,
             aliases: Vec::new(),
             id: "qwen3".into(),
             tokenizer_path: Some("x".into()),

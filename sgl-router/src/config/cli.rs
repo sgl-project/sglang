@@ -252,6 +252,12 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "legacy")]
     pub chat_routing: ChatRoutingKind,
 
+    /// Reorg chat: match a request's `stop` strings on the answer only when
+    /// the model thinks first (DeepSeek API semantics), instead of letting the
+    /// engine match them inside the reasoning.
+    #[arg(long)]
+    pub chat_stop_after_reasoning: bool,
+
     /// Routing policy (defaults to power_of_two with reorg routing).
     #[arg(
         long,
@@ -696,6 +702,7 @@ impl Cli {
                 log_format: self.server.log_format,
             },
             model: ModelConfig {
+                chat_stop_after_reasoning: self.routing.chat_stop_after_reasoning,
                 tokenizer_path: (!self.model.no_tokenizer).then(|| {
                     self.model
                         .tokenizer_path

@@ -564,7 +564,10 @@ pub fn lower_chat(
     // match it inside the reasoning. With a reasoning parser and thinking on,
     // the strings stay out of the engine request and the responder matches
     // them on the content (one choice only: a content stop ends the stream).
-    let content_stops = match (&request.stop, thinking && request.n == 1) {
+    let content_stops = match (
+        &request.stop,
+        settings.stop_after_reasoning && thinking && request.n == 1,
+    ) {
         (Some(stop), true) if deepseek.is_some() || parser.is_some() => {
             sampling.stop = None;
             match stop {
@@ -1752,6 +1755,7 @@ mod tests {
         });
         let settings = OpenAiSettings {
             reasoning_parser: Some("qwen3".into()),
+            stop_after_reasoning: true,
             ..OpenAiSettings::default()
         };
         let (lowered, mut responder) = lower_chat(
@@ -1814,10 +1818,14 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "stop": "END",
         });
+        let settings = OpenAiSettings {
+            stop_after_reasoning: true,
+            ..OpenAiSettings::default()
+        };
         let (lowered, responder) = lower_chat(
             &serde_json::to_vec(&body).unwrap(),
             &OpenAiHeaders::default(),
-            &OpenAiSettings::default(),
+            &settings,
             &ChatModel::default(),
             |_: &Value| Some(vec![1]),
             None,

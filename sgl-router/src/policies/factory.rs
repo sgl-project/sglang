@@ -335,6 +335,7 @@ mod tests {
             },
             observability: Default::default(),
             model: ModelConfig {
+                chat_stop_after_reasoning: false,
                 aliases: Vec::new(),
                 id: id.into(),
                 tokenizer_path: Some("/tmp/x".into()),

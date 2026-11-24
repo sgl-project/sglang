@@ -428,6 +428,9 @@ pub struct ModelConfig {
     pub sticky: Option<StickyConfig>,
     /// Session and cache-affinity tuning.
     pub affinity: Option<AffinityConfig>,
+    /// `--chat-stop-after-reasoning`: the processor matches a chat request's
+    /// `stop` strings on the content only when the model thinks first.
+    pub chat_stop_after_reasoning: bool,
     /// Terms for `fused_score` or `score_policy`; defaults to [`DEFAULT_FUSE`].
     pub fused: Option<Vec<FusedTerm>>,
     /// Hard constraints applied before policy selection.

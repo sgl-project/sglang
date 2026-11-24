@@ -919,7 +919,12 @@ async fn register_one(
     let profile = EngineProfile {
         protocol,
         dp_ranks: info.dp_ranks,
-        openai: info.openai.map(Arc::new),
+        openai: info.openai.map(|mut settings| {
+            // `--chat-stop-after-reasoning` is the router's, not the engine's.
+            settings.stop_after_reasoning =
+                cfg.as_ref().is_some_and(|c| c.model.chat_stop_after_reasoning);
+            Arc::new(settings)
+        }),
         grpc_port: info.grpc_port,
         supports_inline_system: info.supports_inline_system,
     };
@@ -1010,6 +1015,7 @@ mod tests {
             },
             observability: Default::default(),
             model: ModelConfig {
+                chat_stop_after_reasoning: false,
                 aliases: Vec::new(),
                 id: id.into(),
                 tokenizer_path: Some("/tmp/x".into()),

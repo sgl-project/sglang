@@ -43,6 +43,7 @@ pub fn config() -> Config {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            chat_stop_after_reasoning: false,
             aliases: Vec::new(),
             id: MODEL.into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),

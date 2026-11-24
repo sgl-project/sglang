@@ -38,6 +38,7 @@ fn config_for(_worker_url: &str) -> Config {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            chat_stop_after_reasoning: false,
             aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),

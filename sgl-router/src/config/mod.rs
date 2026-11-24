@@ -255,6 +255,7 @@ mod tests {
             server: ServerConfig::default(),
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
+                chat_stop_after_reasoning: false,
                 aliases: Vec::new(),
                 id: model_id.into(),
                 tokenizer_path: Some("/tmp/tok.json".into()),

@@ -51,6 +51,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            chat_stop_after_reasoning: false,
             aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),

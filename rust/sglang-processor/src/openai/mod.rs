@@ -88,6 +88,11 @@ impl Responder {
 #[serde(default)]
 pub struct OpenAiSettings {
     pub allow_auto_truncate: bool,
+    /// Router-side: with a reasoning parser and thinking on, the request's
+    /// `stop` strings are matched on the content only (DeepSeek's API
+    /// semantics) instead of reaching the engine, which also matches them
+    /// inside the reasoning. Not an engine server arg; the router sets it.
+    pub stop_after_reasoning: bool,
     pub completion_template: Option<String>,
     /// `--context-length`; the model's own when unset.
     pub context_length: Option<u64>,

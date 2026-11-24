@@ -129,6 +129,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         },
         observability: ObservabilityConfig::default(),
         model: sgl_router::config::ModelConfig {
+            chat_stop_after_reasoning: false,
             aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),

@@ -130,6 +130,7 @@ fn registry_with_defaults(
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            chat_stop_after_reasoning: false,
             aliases: Vec::new(),
             id: model_id.into(),
             tokenizer_path: Some(tokenizer_path.to_str().unwrap().into()),
