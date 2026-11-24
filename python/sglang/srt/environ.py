@@ -1134,6 +1134,10 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # A/B controls for Ascend DFlash2 rejection sampling.
+    SGLANG_OPT_DFLASH_NPU_ROW_FALLBACK = EnvBool(False)
+    SGLANG_DEBUG_DFLASH_NPU_ROW_FALLBACK_SHADOW = EnvBool(False)
+    SGLANG_LOG_DFLASH_NPU_SAMPLING_BATCHES = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

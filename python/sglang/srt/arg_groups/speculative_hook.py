@@ -254,6 +254,38 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     _resolve_dflash_draft_attention_backend(server_args)
 
+    if server_args.speculative_use_rejection_sampling:
+        from sglang.srt.environ import envs
+
+        if not server_args.device.startswith("npu"):
+            raise ValueError(
+                "--speculative-use-rejection-sampling with DFLASH requires Ascend NPU and a DFlash2 selector draft."
+            )
+        if int(server_args.speculative_num_draft_tokens) < 2:
+            raise ValueError(
+                "Ascend DFlash2 rejection sampling needs at least one draft and one bonus position."
+            )
+        if (
+            server_args.attn_cp_size != 1
+            or server_args.disaggregation_mode != "null"
+            or not server_args.disable_overlap_schedule
+            or server_args.max_running_requests not in (1, 2, 3, 4)
+        ):
+            raise ValueError(
+                "Ascend DFlash2 rejection sampling requires --disable-overlap-schedule, "
+                "--max-running-requests between 1 and 4, no attention CP, and no disaggregation."
+            )
+        if (
+            server_args.enable_deterministic_inference
+            or server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+            or envs.SGLANG_SIMULATE_ACC_LEN.get() > 0
+        ):
+            raise ValueError(
+                "Ascend DFlash2 rejection sampling requires unseeded inference, "
+                "default acceptance thresholds, and no simulated acceptance."
+            )
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
