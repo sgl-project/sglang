@@ -16,8 +16,6 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineRankSchedule,
     PipelineReplicaIdentity,
     PipelineReplicaRegistry,
-    PipelineResourceGate,
-    PipelineResourceSnapshot,
 )
 from sglang.srt.distributed.vpp_transport import (
     P2PWorkGroup,
@@ -113,35 +111,6 @@ class TestVPPPolicy(CustomTestCase):
         rank.mark_ready(1, 2)
         second_pass = rank.next_action(2)
         self.assertEqual((second_pass.batch_seq, second_pass.stage_id), (0, 2))
-
-    def test_resource_hysteresis_and_bootstrap_have_separate_budgets(self):
-        """Crossing the high mark blocks admission until the low mark is met."""
-        gate = PipelineResourceGate([0, 1], 40, 100, 2)
-        idle = PipelineResourceSnapshot(2, 1000, 0, 0, metadata_slots=1)
-        gate.update(0, idle)
-        self.assertFalse(gate.can_admit(1, 100, 10))
-        self.assertFalse(gate.can_bootstrap())
-        gate.update(1, idle)
-        self.assertTrue(gate.can_admit(2, 1000, 100))
-        self.assertFalse(gate.can_admit(3, 1000, 100))
-        self.assertFalse(gate.can_admit(2, 1001, 100))
-        self.assertFalse(gate.can_admit(2, 1000, 101))
-        for snapshot in (
-            replace(idle, activation_bytes=100),
-            replace(idle, activation_bytes=70),
-        ):
-            gate.update(1, snapshot)
-            self.assertFalse(gate.can_admit(1, 100, 10))
-            self.assertFalse(gate.can_send(1, 10))
-            self.assertTrue(gate.can_bootstrap())
-        gate.update(1, replace(idle, activation_bytes=40))
-        self.assertTrue(gate.can_send(1, 60))
-        self.assertFalse(gate.can_send(1, 61))
-        gate.update(1, replace(idle, pending_sends=2))
-        self.assertFalse(gate.can_admit(1, 100, 10))
-        gate.update(1, replace(idle, metadata_slots=0))
-        self.assertTrue(gate.can_admit(1, 100, 10))
-        self.assertFalse(gate.can_bootstrap())
 
     def test_prefix_commit_waits_for_every_stage_and_residency_reset(self):
         """A fast stage cannot publish KV that another stage has not produced."""

@@ -662,7 +662,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         wire["hops"] = 2 if returned else 1
         return PipelineControlEnvelope.from_dict(wire), wire
 
-    def test_control_loop_initializes_identity_receivers_and_resource_bounds(self):
+    def test_control_loop_initializes_identity_receivers_and_send_bounds(self):
         for rank in (0, 1):
             with self.subTest(rank=rank):
                 scheduler, context = self._control_loop(rank=rank)
@@ -675,13 +675,6 @@ class TestSchedulingVPPCore(CustomTestCase):
                 )
                 self.assertEqual(context["rank_schedule"].inflight_count, 0)
                 self.assertEqual(context["max_control_sends"], 64)
-                self.assertEqual(
-                    context["resource_gate"].activation_high_watermark, 2048
-                )
-                self.assertEqual(
-                    context["resource_gate"].activation_low_watermark, 1024
-                )
-                self.assertFalse(scheduler._pp_vpp_resource_control_enabled)
                 self.assertEqual(scheduler._pp_vpp_pending_batch_controls, deque())
 
     def test_control_publication_waits_for_fifo_events_and_keeps_shared_fences(self):
@@ -1348,7 +1341,7 @@ class TestSchedulingVPPCore(CustomTestCase):
                 take=queued.popleft,
             )
             envelope = scheduler._pp_vpp_new_control(
-                PipelineControlKind.RESOURCE, payload={}
+                PipelineControlKind.REQUEST, payload={}
             )
             wire = envelope.to_dict()
             if tp_rank == 0:
@@ -1399,7 +1392,7 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler.attn_tp_group = SimpleNamespace(
             rank_in_group=0, broadcast_object=lambda value, src: value
         )
-        envelope = scheduler._pp_vpp_new_control(PipelineControlKind.RESOURCE)
+        envelope = scheduler._pp_vpp_new_control(PipelineControlKind.REQUEST)
         for changes, error in (
             ({"protocol_version": 2}, "protocol version mismatch"),
             ({"runtime_epoch": 2}, "stale VPP control runtime epoch"),
@@ -2145,7 +2138,7 @@ class TestNativeVPPAdapter(CustomTestCase):
         ):
             with self.subTest(changed=changed):
                 wire = PipelineControlEnvelope(
-                    1, 3, "layout", PipelineControlKind.RESOURCE, 1
+                    1, 3, "layout", PipelineControlKind.REQUEST, 1
                 ).to_dict()
                 wire.update(changed)
                 ready = [False]
@@ -2176,7 +2169,7 @@ class TestNativeVPPAdapter(CustomTestCase):
                     self.assertEqual(received, [2])
                 else:
                     envelope, actual = scheduler._pp_vpp_poll_control_receiver()
-                    self.assertEqual(envelope.kind, PipelineControlKind.RESOURCE)
+                    self.assertEqual(envelope.kind, PipelineControlKind.REQUEST)
                     self.assertIs(actual, wire)
                     self.assertEqual(received, [2, 2])
 

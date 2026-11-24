@@ -21,8 +21,6 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineRankSchedule,
     PipelineReplicaIdentity,
     PipelineReplicaRegistry,
-    PipelineResourceGate,
-    PipelineResourceSnapshot,
     PipelineWavefrontAction,
 )
 from sglang.srt.distributed.vpp_transport import (
@@ -33,7 +31,6 @@ from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import max_prefill_buffer_tokens
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -238,9 +235,8 @@ class SchedulingVPPCore:
             raise ValueError("VPP scheduling requires PP2/VPP2/max-inflight=2")
         logger.info(
             "VPP fixed batch scheduling enabled: two-batch waves, "
-            "activation manifests, cross-rank RESOURCE gate disabled"
+            "activation manifests"
         )
-        self._pp_vpp_resource_control_enabled = False
         self._pp_vpp_fixed_wave = []
         self._pp_vpp_fixed_second_pass = False
         self._pp_vpp_fixed_received = deque()
@@ -807,17 +803,6 @@ class SchedulingVPPCore:
         control_send_work = deque()
         max_control_sends = max_inflight * rank_schedule.logical_size
         max_control_sends = max(64, max_control_sends)
-        token_budget = max(max_prefill_buffer_tokens(), 1)
-        hidden_size = int(self.model_config.hidden_size)
-        hc_mult = int(getattr(self.model_config.hf_config, "hc_mult", 1))
-        activation_high = max_inflight * token_budget * hidden_size * hc_mult * 2
-        resource_gate = PipelineResourceGate(
-            ranks=range(self.pp_group.world_size),
-            activation_low_watermark=activation_high // 2,
-            activation_high_watermark=activation_high,
-            max_pending_sends=max_inflight,
-        )
-        last_resource_snapshot = None
         next_batch_seq = 0
         pending_admits: set[int] = set()
         pending_remote_admits = deque()
@@ -1050,16 +1035,6 @@ class SchedulingVPPCore:
                 # These messages may overtake the activation that admits their
                 # batch. Keep receiving so they cannot block its bootstrap.
                 self._pp_vpp_pending_batch_controls.append((envelope, wire))
-                return
-
-            if envelope.kind == PipelineControlKind.RESOURCE:
-                if self.pp_group.rank_in_group == 0:
-                    resource_gate.update(
-                        envelope.source_rank,
-                        PipelineResourceSnapshot(**payload),
-                    )
-                else:
-                    forward_control(envelope, wire)
                 return
 
             if envelope.kind == PipelineControlKind.REQUEST:
@@ -1425,10 +1400,6 @@ class SchedulingVPPCore:
                 (
                     (
                         not bootstrap_round_active
-                        and (
-                            not self._pp_vpp_resource_control_enabled
-                            or resource_gate.can_bootstrap()
-                        )
                         and bool(self.disagg_prefill_bootstrap_queue.queue)
                     )
                     or (
@@ -1457,7 +1428,6 @@ class SchedulingVPPCore:
                 else:
                     handle_control(envelope, wire)
                 if envelope.kind not in (
-                    PipelineControlKind.RESOURCE,
                     PipelineControlKind.BOOTSTRAP_STATUS,
                     PipelineControlKind.TRANSFER_STATUS,
                 ):
@@ -1481,26 +1451,6 @@ class SchedulingVPPCore:
                 control_send_work,
                 max_control_sends,
             )
-
-            if self._pp_vpp_resource_control_enabled:
-                snapshot = self._pp_vpp_resource_snapshot(activation_send_work)
-                if snapshot != last_resource_snapshot:
-                    last_resource_snapshot = snapshot
-                    if self.pp_group.rank_in_group == 0:
-                        resource_gate.update(0, snapshot)
-                    else:
-                        self._pp_vpp_queue_control(
-                            self._pp_vpp_new_control(
-                                PipelineControlKind.RESOURCE,
-                                payload={
-                                    "request_slots": snapshot.request_slots,
-                                    "kv_tokens": snapshot.kv_tokens,
-                                    "activation_bytes": snapshot.activation_bytes,
-                                    "pending_sends": snapshot.pending_sends,
-                                    "metadata_slots": snapshot.metadata_slots,
-                                },
-                            )
-                        )
 
             if self.pp_group.is_first_rank:
                 recv_reqs = self.ingest_requests()
@@ -1544,10 +1494,6 @@ class SchedulingVPPCore:
                     self._pp_vpp_all_gather_cpu_state(
                         (
                             not bootstrap_round_active
-                            and (
-                                not self._pp_vpp_resource_control_enabled
-                                or resource_gate.can_bootstrap()
-                            )
                             and bool(self.disagg_prefill_bootstrap_queue.queue),
                             not transfer_round_active
                             and bool(self.disagg_prefill_transfer_queue),
@@ -1647,11 +1593,9 @@ class SchedulingVPPCore:
                             ).forwarded()
                         )
 
-                required_activation = token_budget * hidden_size * hc_mult * 2
                 continuation = (
                     self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
-                required_kv_tokens = token_budget
                 if (
                     (
                         not bootstrap_round_active
@@ -1665,14 +1609,6 @@ class SchedulingVPPCore:
                         pending_admits,
                         slot_batch_seqs,
                         rank_schedule,
-                    )
-                    and (
-                        not self._pp_vpp_resource_control_enabled
-                        or resource_gate.can_admit(
-                            required_request_slots=0 if continuation else 1,
-                            required_kv_tokens=required_kv_tokens,
-                            required_activation_bytes=required_activation,
-                        )
                     )
                 ):
                     slot_id = next_batch_seq % max_inflight
@@ -1934,8 +1870,7 @@ class SchedulingVPPCore:
                     "metadata_slots=%s bootstrap_applies=%s "
                     "materialized=%s replica_updates=%s "
                     "control_outbox=%s control_sends=%s activation_sends=%s "
-                    "ready_proxies=%s arrivals=%s resource_ranks=%s blocked_ranks=%s "
-                    "local_resource=%s",
+                    "ready_proxies=%s arrivals=%s",
                     now - stall_last_progress_at,
                     tick,
                     stall_last_progress_event,
@@ -1966,9 +1901,6 @@ class SchedulingVPPCore:
                     len(activation_send_work),
                     len(self._pp_vpp_ready_proxies),
                     len(self._pp_vpp_arrivals),
-                    sorted(resource_gate._snapshots),
-                    sorted(resource_gate._blocked),
-                    last_resource_snapshot,
                 )
             if activation_send_work or control_send_work:
                 server_is_idle = False

@@ -25,7 +25,6 @@ class PipelineControlKind(str, Enum):
     CANCEL = "cancel"
     FIRST_PASS_DONE = "first_pass_done"
     COMPLETION = "completion"
-    RESOURCE = "resource"
     PREFIX_MATERIALIZED = "prefix_materialized"
     PREFIX_COMMIT = "prefix_commit"
     CACHE_UPDATE = "cache_update"
@@ -268,81 +267,6 @@ class PipelineRankSchedule:
         self._completed.remove(batch_seq)
         self._cancelled.discard(batch_seq)
         self._slots[slot_id] = None
-
-
-@dataclass(frozen=True)
-class PipelineResourceSnapshot:
-    request_slots: int
-    kv_tokens: int
-    activation_bytes: int
-    pending_sends: int
-    metadata_slots: int = 0
-
-
-class PipelineResourceGate:
-    def __init__(
-        self,
-        ranks: Iterable[int],
-        activation_low_watermark: int,
-        activation_high_watermark: int,
-        max_pending_sends: int,
-    ):
-        if not 0 <= activation_low_watermark <= activation_high_watermark:
-            raise ValueError("invalid activation watermarks")
-        if max_pending_sends < 1:
-            raise ValueError("max pending sends must be positive")
-        self._ranks = tuple(sorted(set(ranks)))
-        self._snapshots: Dict[int, PipelineResourceSnapshot] = {}
-        self._blocked: set[int] = set()
-        self.activation_low_watermark = activation_low_watermark
-        self.activation_high_watermark = activation_high_watermark
-        self.max_pending_sends = max_pending_sends
-
-    def update(self, rank: int, snapshot: PipelineResourceSnapshot) -> None:
-        if rank not in self._ranks:
-            raise ValueError(f"unexpected resource rank {rank}")
-        self._snapshots[rank] = snapshot
-        if (
-            snapshot.activation_bytes >= self.activation_high_watermark
-            or snapshot.pending_sends >= self.max_pending_sends
-        ):
-            self._blocked.add(rank)
-        elif (
-            snapshot.activation_bytes <= self.activation_low_watermark
-            and snapshot.pending_sends < self.max_pending_sends
-        ):
-            self._blocked.discard(rank)
-
-    def can_admit(
-        self,
-        required_request_slots: int,
-        required_kv_tokens: int,
-        required_activation_bytes: int,
-    ) -> bool:
-        if len(self._snapshots) != len(self._ranks) or self._blocked:
-            return False
-        return all(
-            snapshot.request_slots >= required_request_slots
-            and snapshot.kv_tokens >= required_kv_tokens
-            and snapshot.activation_bytes + required_activation_bytes
-            <= self.activation_high_watermark
-            for snapshot in self._snapshots.values()
-        )
-
-    def can_send(self, rank: int, activation_bytes: int) -> bool:
-        snapshot = self._snapshots.get(rank)
-        return (
-            snapshot is not None
-            and rank not in self._blocked
-            and snapshot.pending_sends < self.max_pending_sends
-            and snapshot.activation_bytes + activation_bytes
-            <= self.activation_high_watermark
-        )
-
-    def can_bootstrap(self) -> bool:
-        return len(self._snapshots) == len(self._ranks) and all(
-            snapshot.metadata_slots > 0 for snapshot in self._snapshots.values()
-        )
 
 
 @dataclass
