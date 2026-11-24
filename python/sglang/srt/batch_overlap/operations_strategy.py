@@ -285,6 +285,7 @@ def _compute_moe_qwen3_prefill(layer):
 
 
 # Plain TP has no dispatcher: the MoE runs whole.
+# Each TP all-reduce runs on the comm stream while the other micro-batch computes.
 def _compute_moe_qwen3_plain_tp_prefill(layer):
     return OperationsStrategy(
         deep_gemm_num_sms=None,
@@ -293,11 +294,12 @@ def _compute_moe_qwen3_plain_tp_prefill(layer):
             layer.op_comm_prepare_attn,
             layer.self_attn.op_prepare,
             layer.self_attn.op_core,
+            layer.op_attn_sum_a,
             operations.YieldOperation(),
-            layer.op_comm_prepare_mlp,
-            layer.mlp.op_mlp,
+            layer.op_attn_sum_b,
+            layer.op_mlp_sum_a,
             operations.YieldOperation(),
-            layer.op_comm_postprocess_layer,
+            layer.op_mlp_sum_b,
         ],
     )
 

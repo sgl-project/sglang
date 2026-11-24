@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
@@ -1262,6 +1263,21 @@ def _tbo_event(key) -> torch.cuda.Event:
 # HSA_STATUS_ERROR_OUT_OF_RESOURCES at large prefill chunks, even though the live
 # (allocated) working set was only ~10GB.
 _TBO_PERSIST_BUF: dict = {}
+
+
+@contextmanager
+def on_tbo_comm_stream(event_key):
+    """Run the block on the TBO comm stream after the work queued so far.
+    Its inputs must stay alive until ``wait_tbo_comm_stream(event_key)``."""
+    comm = get_dp_tbo_comm_stream()
+    comm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(comm):
+        yield
+        _tbo_event(event_key).record()
+
+
+def wait_tbo_comm_stream(event_key) -> None:
+    torch.cuda.current_stream().wait_event(_tbo_event(event_key))
 
 
 def get_tbo_persistent_buffer(
