@@ -1,13 +1,22 @@
 """Fused HC low-rank mix for decode-size batches.
 
 One persistent kernel replaces the five-kernel `GatedResidual._mix_compute` chain.
-One CTA per SM keeps every CTA resident, so the software grid barrier cannot deadlock;
+One CTA per SM keeps every CTA of a single grid resident, so the software grid barrier
+cannot deadlock;
 the last CTA to finish resets the barrier counters,
 so a captured CUDA graph replays with them in their initial state.
 Row counts beyond ``_FUSED_MIX_MAX_ROWS`` stay on the torch.compile path.
+
+The barrier assumes one grid runs at a time: the counters are shared per device, and a
+second grid that is only partly resident would be waited on forever. Eager calls from
+different CUDA streams are therefore ordered: a call on a new stream first waits for the
+work queued so far on the stream of the previous call. Replaying two captured graphs,
+or a graph and an eager call, on different streams is not ordered and must not overlap.
 """
 
 from __future__ import annotations
+
+import threading
 
 import torch
 import triton
@@ -153,6 +162,41 @@ def _get_counters(device: torch.device) -> torch.Tensor:
     return buf
 
 
+class _OrderedLaunch:
+    """Makes a launch on a new stream wait for the stream that launched the mix last."""
+
+    _locks = {}
+    _last_stream = {}
+
+    __slots__ = ("device", "lock")
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.lock = None
+
+    def __enter__(self):
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            return
+        lock = self._locks.get(self.device)
+        if lock is None:
+            lock = self._locks.setdefault(self.device, threading.Lock())
+        lock.acquire()
+        self.lock = lock
+        try:
+            stream = torch.cuda.current_stream(self.device)
+            last = self._last_stream.get(self.device)
+            if last is not None and last != stream:
+                stream.wait_event(last.record_event())
+            self._last_stream[self.device] = stream
+        except BaseException:
+            lock.release()
+            raise
+
+    def __exit__(self, *exc):
+        if self.lock is not None:
+            self.lock.release()
+
+
 def _deterministic_inference() -> bool:
     from sglang.srt.runtime_context import get_exec
 
@@ -201,25 +245,26 @@ def fused_hc_mix(
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
-    _hc_mix_persistent_kernel[(num_ctas,)](
-        hyper_input_normed,
-        w_down,
-        w_up,
-        t_raw,
-        out,
-        _get_counters(device),
-        k,
-        lowrank,
-        hs,
-        rows,
-        num_ctas,
-        1.0 / hc,
-        ROWS=rows_pad,
-        HC=hc,
-        BLOCK_N=32,
-        BLOCK_K=256,
-        BLOCK_J=32,
-        BLOCK_R=64,
-        num_warps=8,
-    )
+    with _OrderedLaunch(device):
+        _hc_mix_persistent_kernel[(num_ctas,)](
+            hyper_input_normed,
+            w_down,
+            w_up,
+            t_raw,
+            out,
+            _get_counters(device),
+            k,
+            lowrank,
+            hs,
+            rows,
+            num_ctas,
+            1.0 / hc,
+            ROWS=rows_pad,
+            HC=hc,
+            BLOCK_N=32,
+            BLOCK_K=256,
+            BLOCK_J=32,
+            BLOCK_R=64,
+            num_warps=8,
+        )
     return out

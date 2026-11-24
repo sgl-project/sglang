@@ -1,4 +1,6 @@
+import subprocess
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -78,6 +80,80 @@ def test_fused_hc_mix_no_less_accurate_than_eager():
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
+
+
+_CONCURRENT_STREAMS_SCRIPT = textwrap.dedent(
+    """
+    import torch
+    from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix
+
+    HC, HS, LOWRANK, ROWS, NUM_STREAMS, TRIALS = {hc}, {hs}, {lowrank}, 16, {streams}, 8
+    torch.manual_seed(0)
+    xs = [
+        torch.randn(ROWS, HC * HS, dtype=torch.bfloat16, device="cuda")
+        for _ in range(NUM_STREAMS)
+    ]
+    w_down = torch.randn(LOWRANK, HC * HS, dtype=torch.bfloat16, device="cuda") * 0.02
+    w_up = torch.randn(HC * HS, LOWRANK, dtype=torch.bfloat16, device="cuda") * 0.02
+    serial = [fused_hc_mix(x, w_down, w_up, HC, HS) for x in xs]
+    torch.cuda.synchronize()
+
+    streams = [torch.cuda.Stream() for _ in range(NUM_STREAMS)]
+    for trial in range(TRIALS):
+        # Hold every stream behind a delayed gate so the launches overlap.
+        gate = torch.cuda.Event()
+        gate_stream = torch.cuda.Stream()
+        with torch.cuda.stream(gate_stream):
+            torch.cuda._sleep(50_000_000)
+            gate.record()
+        outs = []
+        for stream, x in zip(streams, xs):
+            stream.wait_event(gate)
+            with torch.cuda.stream(stream):
+                outs.append(fused_hc_mix(x, w_down, w_up, HC, HS))
+        torch.cuda.synchronize()
+        for out, ref in zip(outs, serial):
+            torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-3)
+    print("CONCURRENT_STREAMS_OK")
+    """
+)
+
+
+@pytest.mark.parametrize("num_streams", [2, 8])
+def test_fused_hc_mix_concurrent_streams_complete(num_streams):
+    """Launches from several CUDA streams must finish instead of hanging.
+
+    Runs in a subprocess because a hung kernel cannot be interrupted in-process.
+    """
+    script = _CONCURRENT_STREAMS_SCRIPT.format(
+        hc=HC_COUNT, hs=HIDDEN_SIZE, lowrank=LOWRANK, streams=num_streams
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        pytest.fail(f"fused_hc_mix hung with {num_streams} concurrent streams: {e}")
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "CONCURRENT_STREAMS_OK" in result.stdout
+
+
+def test_fused_hc_mix_cuda_graph_replays_match_eager():
+    x, w_down, w_up = _make_inputs(4, torch.bfloat16)
+    expected = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected, rtol=1e-2, atol=5e-3)
+        # An eager call between replays still sees counters in their initial state.
+        again = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+        torch.testing.assert_close(again, expected, rtol=1e-2, atol=5e-3)
 
 
 if __name__ == "__main__":
