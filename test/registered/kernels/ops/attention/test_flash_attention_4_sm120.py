@@ -2002,6 +2002,47 @@ def test_sm120_short_extend_over_cached_prefix_splits_kv(monkeypatch, window_lef
         )
 
 
+def test_sm120_short_prompt_in_large_pool_keeps_one_split(monkeypatch):
+    """Without max_seqlen_k, a paged extend must not plan its KV length from the pool:
+    a 16-token prompt with no cached prefix launches one split and no combine."""
+    sm120_forward_host.clear_launch_plans()
+    plan_splits = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def record_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        plan_splits.append(plan.num_splits)
+        return plan
+
+    monkeypatch.setattr(Sm120ForwardHost, "resolve_plan", staticmethod(record_plan))
+    torch.manual_seed(20261124)
+    # Qwen3-30B-A3B heads under TP4, in a pool of 1024 pages.
+    num_q_heads, head_dim, page_size, num_pages, q_len = 8, 128, 128, 1024, 16
+    q = torch.randn(q_len, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(
+        num_pages, page_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.tensor([[num_pages - 1]], device="cuda", dtype=torch.int32)
+    policy = get_flash_attention_v4_sm120_runtime_policy(
+        device_capability=torch.cuda.get_device_capability(),
+        deterministic=False,
+    )
+    flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor([q_len], device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, q_len], device="cuda", dtype=torch.int32),
+        max_seqlen_q=q_len,
+        causal=True,
+        num_splits=policy.num_splits,
+    )
+
+    assert plan_splits == [1]
+
+
 def test_sm120_paged_decode_graph_splits_follow_replay_lengths(monkeypatch):
     """A large capture bound must not collapse shorter replay contexts into one split."""
     sm120_forward_host.clear_launch_plans()
