@@ -114,9 +114,7 @@ class Mxfp4W4A8Config(QuantizationConfig):
                 self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
-                )
+                return UnquantizedFusedMoEMethod(layer.use_flashinfer_trtllm_moe)
             if is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
                     NPUW4A8MXFP4OnlineMoEMethod,

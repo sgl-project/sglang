@@ -14,12 +14,86 @@ in this same directory, reused by ``dac.py``, ``ltx_2_audio.py``,
 """
 
 import math
+from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 sinc = torch.sinc
+
+_Conv = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
+# ROCm: MIOpen serves these FP32 depthwise filters with a naive FP64 solver or a
+# GEMM solver depending on the shape, at up to 0.9 ms a call. Each shape keeps
+# the first Triton replica of those orders that gives the eager conv's bytes at
+# its first sight, or stays eager.
+_ROCM_DEPTHWISE_REPLICA: dict[tuple, _Conv | None] = {}
+
+
+def _conv1d_replicas() -> list[_Conv]:
+    from sglang.kernels.ops.diffusion import conv1d_depthwise_fma, conv1d_fp64acc
+
+    def naive(x, w, stride):
+        return conv1d_fp64acc(x, w, stride=stride, groups=x.shape[1])
+
+    def gemm(x, w, stride):
+        return conv1d_depthwise_fma(x, w, stride=stride)
+
+    return [naive, gemm]
+
+
+def _conv_transpose1d_replicas() -> list[_Conv]:
+    from sglang.kernels.ops.diffusion import conv_transpose1d_depthwise
+
+    def naive(x, w, stride):
+        return conv_transpose1d_depthwise(x, w, stride=stride, fp64=True)
+
+    def col2im(x, w, stride):
+        return conv_transpose1d_depthwise(
+            x, w, stride=stride, fp64=False, taps_ascending=False
+        )
+
+    return [naive, col2im]
+
+
+def _depthwise(
+    eager: _Conv, replicas: Callable[[], list[_Conv]], x, weight, stride
+) -> torch.Tensor:
+    if not (current_platform.is_rocm() and x.is_cuda and x.dtype == torch.float32):
+        return eager(x, weight, stride)
+    sig = (eager, tuple(x.shape), tuple(weight.shape), stride)
+    if sig in _ROCM_DEPTHWISE_REPLICA:
+        replica = _ROCM_DEPTHWISE_REPLICA[sig] or eager
+        return replica(x, weight, stride)
+    out = eager(x, weight, stride)
+    # the check syncs the host: never inside compile tracing or graph capture
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return out
+    _ROCM_DEPTHWISE_REPLICA[sig] = next(
+        (r for r in replicas() if _same_bytes(r, x, weight, stride, out)), None
+    )
+    return out
+
+
+def _same_bytes(replica: _Conv, x, weight, stride, out) -> bool:
+    try:
+        return torch.equal(replica(x, weight, stride), out)
+    except Exception as e:  # a replica that cannot launch leaves the shape eager
+        logger.warning("depthwise conv replica %s failed: %s", replica.__name__, e)
+        return False
+
+
+def _eager_conv1d(x, weight, stride):
+    return F.conv1d(x, weight, stride=stride, groups=x.shape[1])
+
+
+def _eager_conv_transpose1d(x, weight, stride):
+    return F.conv_transpose1d(x, weight, stride=stride, groups=x.shape[1])
 
 
 # This code is adopted from adefossez's julius.lowpass.LowPassFilters under the MIT License
@@ -93,7 +167,13 @@ class LowPassFilter1d(nn.Module):
 
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
-        out = F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)
+        out = _depthwise(
+            _eager_conv1d,
+            _conv1d_replicas,
+            x,
+            self.filter.expand(C, -1, -1),
+            self.stride,
+        )
 
         return out
 
@@ -122,8 +202,12 @@ class UpSample1d(nn.Module):
         _, C, _ = x.shape
 
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = F.conv_transpose1d(
-            x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C
+        x = _depthwise(
+            _eager_conv_transpose1d,
+            _conv_transpose1d_replicas,
+            x,
+            self.filter.expand(C, -1, -1),
+            self.stride,
         )
         x.mul_(self.ratio)
         x = x[..., self.pad_left : -self.pad_right]

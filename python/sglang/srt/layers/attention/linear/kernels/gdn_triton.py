@@ -20,9 +20,11 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-        fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
+    from sgl_kernel_npu.operators.attention.gdn import (
+        chunk_gated_delta_rule_npu,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_gdn_decode as fused_sigmoid_gating_delta_rule_update,
     )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
@@ -44,6 +46,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # The chunk kernel steps slots by the pool's stride(0) in int64.
+    extend_honors_slot_pitch: bool = True
 
     def packed_decode(
         self,

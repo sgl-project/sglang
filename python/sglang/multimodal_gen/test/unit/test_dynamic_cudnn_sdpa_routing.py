@@ -5,8 +5,12 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
+    SDPAImpl,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -38,6 +42,7 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
         is_sm100: bool = True,
         *,
         graph: bool = False,
+        replay: bool = False,
         quality: str = "lossless",
     ) -> bool:
         impl = SimpleNamespace(
@@ -46,6 +51,7 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
         with (
             set_forward_context(0, None, quality=quality),
             enable_breakable_cuda_graph() if graph else nullcontext(),
+            replay_token_scope() if replay else nullcontext(),
         ):
             return DynamicCudnnSDPAImpl._use_cudnn_sdpa(
                 impl, *_qkv(q_len, kv_len, kv_heads=kv_heads)
@@ -63,6 +69,9 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
     def test_blackwell_keeps_cudnn_when_both_sides_fill_a_tile(self):
         for q_len, kv_len in ((128, 128), (1536, 1024), (6144, 6144), (192, 6144)):
             self.assertTrue(self._uses_cudnn(q_len, kv_len), (q_len, kv_len))
+            self.assertTrue(
+                self._uses_cudnn(q_len, kv_len, replay=True), (q_len, kv_len)
+            )
 
     def test_blackwell_subtile_route_depends_on_execution_mode(self):
         for q_len, kv_len in ((126, 1024), (1536, 126), (126, 1536), (32, 4096)):
@@ -70,7 +79,10 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
             self.assertFalse(
                 self._uses_cudnn(q_len, kv_len, graph=True), (q_len, kv_len)
             )
-            # Graph breaks replay eagerly after leaving the capture scope.
+            # a replay's eager breaks run outside the capture scope
+            self.assertFalse(
+                self._uses_cudnn(q_len, kv_len, replay=True), (q_len, kv_len)
+            )
             self.assertTrue(self._uses_cudnn(q_len, kv_len), (q_len, kv_len))
 
     def test_blackwell_keeps_cudnn_when_both_sides_are_short(self):
@@ -133,6 +145,65 @@ class TestDynamicCudnnSelection(unittest.TestCase):
     def test_sm100_keeps_cudnn(self):
         impl = _impl((10, 0))
         self.assertTrue(impl._use_cudnn_sdpa(*_qkv(75600, 75600, 2, 128)))
+
+
+class _IntoOnLongSegments(SDPAImpl):
+    """forward doubles q; forward_into serves segments of 4+ rows."""
+
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, query, key, value, attn_metadata):
+        self.calls.append(("forward", query.shape[1]))
+        return query * 2
+
+    def forward_into(self, query, key, value, out, attn_metadata):
+        if query.shape[1] < 4:
+            return False
+        self.calls.append(("into", query.shape[1]))
+        out.copy_(query * 2)
+        return True
+
+
+class TestVarlenSegmentsWriteInPlace(unittest.TestCase):
+    def test_segments_use_forward_into_and_fall_back_to_forward(self):
+        impl = _IntoOnLongSegments()
+        q = torch.randn(9, 2, 8)
+        out = impl.forward_varlen(
+            q, q, q, cu_seqlens=torch.tensor([0, 6, 9]), max_seqlen=6
+        )
+        torch.testing.assert_close(out, q * 2, rtol=0, atol=0)
+        self.assertEqual(impl.calls, [("into", 6), ("forward", 3)])
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 3),
+        "FA4 self-attention route is sm_103 only",
+    )
+    def test_fa4_segment_written_in_place_is_bit_identical(self):
+        used, total, heads = 16448, 16512, 4
+        impl = DynamicCudnnSDPAImpl(
+            num_heads=heads, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+        g = torch.Generator(device="cuda").manual_seed(0)
+        qkv = torch.randn(
+            total, 3 * heads, 128, device="cuda", dtype=torch.bfloat16, generator=g
+        )
+        q, k, v = qkv.split(heads, dim=1)
+        out = impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=torch.tensor([0, used, total], device="cuda", dtype=torch.int32),
+            max_seqlen=used,
+            cu_seqlens_host=(0, used, total),
+        )
+        ref = torch.cat(
+            [
+                impl.forward(*(t[a:b].unsqueeze(0) for t in (q, k, v)), None)[0]
+                for a, b in ((0, used), (used, total))
+            ]
+        )
+        self.assertTrue(torch.equal(out, ref))
 
 
 if __name__ == "__main__":

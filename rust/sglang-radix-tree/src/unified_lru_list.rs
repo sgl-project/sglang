@@ -408,6 +408,24 @@ impl UnifiedLRUList {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PriorityKey(pub i64, pub i64);
 
+/// A state_cost priority; `total_cmp` gives it the total order a heap needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CostPriority(pub f64);
+
+impl Eq for CostPriority {}
+
+impl PartialOrd for CostPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CostPriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Ranks nodes for eviction; lower priority evicts first.
 pub trait EvictionStrategy<K: ChildKeyType> {
     /// The node's eviction priority.
@@ -543,7 +561,8 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
     tlru_float_config: Option<TlruFloatConfig>,
 ) -> Box<dyn EvictionStrategy<K> + Send> {
     match policy.to_lowercase().as_str() {
-        "lru" => Box::new(LruStrategy),
+        // Under joint eviction each component keeps its own lru order.
+        "lru" | "joint_lru" => Box::new(LruStrategy),
         "lfu" => Box::new(LfuStrategy),
         "fifo" => Box::new(FifoStrategy),
         "mru" => Box::new(MruStrategy),
@@ -556,12 +575,44 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
             tail_budget: tlru_tail_budget,
             float_config: tlru_float_config,
         }),
+        // state_cost ranks Mamba states in the component; Full KV stays in recency order.
+        "state_cost" => Box::new(LruStrategy),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \
-             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
+             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'joint_lru', 'state_cost'."
         ),
     }
 }
+
+/// Device SWA access ticks for joint Full/SWA eviction (the joint_lru policy),
+/// indexed by arena slot. They come from the arena counter that stamps Full's
+/// `last_access_counter`, so the two compare. A tick follows the node's place in
+/// the device SWA LRU list: stamped when a value enters it or moves to its MRU
+/// end, inherited by a split's prefix, cleared when the value leaves it.
+#[derive(Default)]
+pub(crate) struct JointLRU {
+    swa_ticks: Vec<Option<i64>>,
+}
+
+impl JointLRU {
+    pub(crate) fn swa_tick(&self, idx: NodeIdx_) -> Option<i64> {
+        self.swa_ticks.get(idx.0).copied().flatten()
+    }
+
+    pub(crate) fn set_swa_tick(&mut self, idx: NodeIdx_, tick: i64) {
+        if idx.0 >= self.swa_ticks.len() {
+            self.swa_ticks.resize(idx.0 + 1, None);
+        }
+        self.swa_ticks[idx.0] = Some(tick);
+    }
+
+    pub(crate) fn clear_swa_tick(&mut self, idx: NodeIdx_) {
+        if let Some(tick) = self.swa_ticks.get_mut(idx.0) {
+            *tick = None;
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/unified_lru_list.rs"]
 mod tests;

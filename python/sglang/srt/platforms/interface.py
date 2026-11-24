@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.managers.io_struct import ProfileReq
+    from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+        BaseBreakableGraphBackend,
+    )
 
 # Re-export for convenience
 __all__ = [
@@ -137,6 +140,17 @@ class SRTPlatform(DeviceMixin):
 
     def get_full_graph_backend_cls(self) -> type[Any]:
         """Return the full device-graph backend class for this platform."""
+        return None
+
+    def get_breakable_graph_backend_cls(
+        self, phase: Literal["decode", "prefill"]
+    ) -> type[BaseBreakableGraphBackend] | None:
+        """Return the breakable device-graph backend class for ``phase``.
+
+        ``None`` keeps the built-in ``BreakableCudaGraphBackend``. A returned
+        class must implement ``BaseBreakableGraphBackend`` and accept the same
+        construction arguments as the built-in backend for the selected phase.
+        """
         return None
 
     def get_moe_expert_executor_cls(
@@ -283,6 +297,27 @@ class SRTPlatform(DeviceMixin):
 
     def support_mamba_cache_extra_buffer(self) -> bool:
         """Whether this out-of-tree platform supports Mamba cache snapshots."""
+        return False
+
+    def supports_kv_cache_dtype(self, kv_cache_dtype: str) -> bool:
+        """Whether this out-of-tree platform serves a platform-registered KV
+        cache dtype.
+
+        Consulted only for ``--kv-cache-dtype`` values added with
+        ``register_kv_cache_dtype`` and only on out-of-tree platforms; in-tree
+        platforms always reject those values, and built-in dtypes are validated
+        as before. Return True only if the pools this platform returns from
+        ``get_kv_pool_cls`` store the format and its own attention backend reads
+        it: in-tree pools and attention backends have no path for it. The pool
+        is constructed with the registered storage dtype and reads the format
+        from the ``kv_cache_dtype`` server argument. Core rejects a model that
+        builds a pool kind this platform does not provide (a hybrid DSA model
+        with sliding-window layers builds both ``dsa`` and ``mla`` pools), and PD
+        disaggregation, hierarchical cache, LMCache and
+        ``--prefill-only-disable-kv-cache``. The platform must reject any pool
+        kind it provides but cannot serve with the format, which core cannot
+        detect, and any head size or feature it cannot serve.
+        """
         return False
 
     # ------------------------------------------------------------------

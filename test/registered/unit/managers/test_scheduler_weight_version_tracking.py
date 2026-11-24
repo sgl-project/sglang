@@ -1,6 +1,7 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
 import torch
 
@@ -10,6 +11,8 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -106,6 +109,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         scheduler.token_to_kv_pool_allocator = None
@@ -114,7 +118,10 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.scheduler_stage_metrics = None
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
-        scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
+        scheduler.tree_cache = SimpleNamespace(
+            flush_pending_backups=MagicMock(),
+            lease_checkpoint_state_slots=lambda reqs: nullcontext(),
+        )
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.invariant_checker = MagicMock()
@@ -143,6 +150,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
             still_in_batch=lambda req: True,
+            prefill_launched_reqs=scheduler.prefill_launched_reqs,
         )
         for name, value in (
             ("get_observability", SimpleNamespace(enable_metrics=False)),
@@ -275,6 +283,7 @@ def _runner(result=(True, "ok")):
         ("weight", torch.tensor([1.0]))
     ]
     runner.weight_updater.load_rejection.return_value = None
+    runner.weight_updater.end_weight_update.return_value = None
     return runner
 
 
@@ -300,9 +309,27 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
-        patcher = patch("torch.distributed.barrier")
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # a single rank, whose gathers return its own outcome
+        group_gather = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            side_effect=lambda obj: [obj],
+        )
+        group_gather.start()
+        self.addCleanup(group_gather.stop)
+        gather = patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
+        )
+        gather.start()
+        self.addCleanup(gather.stop)
+        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
         self.recorded = []
 
     def _build_manager(self, target, draft):
@@ -323,7 +350,8 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             scheduler=SimpleNamespace(
                 record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version
-                )
+                ),
+                wait_for_launched_forward=lambda: None,
             ),
         )
 
@@ -394,7 +422,9 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
-        with patch("torch.distributed.barrier"):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        ):
             output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
@@ -500,6 +530,33 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
                 run_post_load=False
             )
 
+    def test_end_reports_an_incomplete_update_and_closes_the_session(self):
+        """A fused param whose other half never arrived keeps old values; the caller must hear it."""
+        target, draft = _runner(), _runner()
+        draft.weight_updater.end_weight_update.return_value = "only one half"
+        manager = self._manager(target, draft)
+
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "draft: only one half")
+        target.weight_updater.end_weight_update.assert_called_once()
+        self.assertIsNone(manager._session)
+
+    def test_end_reports_other_ranks_incomplete_update_once(self):
+        """Only one rank of the group replies: halves left unpaired on its peers fail its reply, named once."""
+        manager = self._manager(_runner())
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[None, "target: only one half", "target: only one half"],
+        ):
+            output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "target: only one half")
+        self.assertIsNone(manager._session)
+
     def test_session_selector_confines_begin_and_end_to_selected_runners(self):
         """end finalizing a runner begin never restored would repack unrestored weights."""
         target, draft = _runner(), _runner()
@@ -551,15 +608,6 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
 class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
     def setUp(self):
         super().setUp()
-        gather = patch(
-            "torch.distributed.all_gather_object",
-            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
-        )
-        gather.start()
-        self.addCleanup(gather.stop)
-        override = get_parallel().override(tp_rank=0, tp_size=1)
-        override.__enter__()
-        self.addCleanup(override.__exit__, None, None, None)
         self.flushes = []
 
     def _manager_serving(self, handlers, *, target=None, draft=None, session=True):
@@ -708,6 +756,155 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(unknown.success)
         self.assertIn("nccl", unknown.message)
         self.assertEqual(called, [])
+
+
+class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
+    def test_an_idle_rank_refuses_when_a_tp_peer_is_busy(self):
+        """A rank that released alone would wait forever in the group barrier."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[True, False],
+        ):
+            output = manager.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
+            )
+
+        self.assertFalse(output.success)
+        manager.memory_saver_adapter.pause.assert_not_called()
+
+
+class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):
+    def test_a_failed_release_retries_only_unreleased_tags(self):
+        """A tag released before a later tag failed is not released again on retry."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.pause.side_effect = [None, RuntimeError, None]
+        manager.flush_cache = Mock()
+        request = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+
+        with (
+            patch("torch.distributed.all_reduce"),
+            patch("torch.distributed.barrier"),
+            patch("torch.get_device_module"),
+        ):
+            with self.assertRaises(RuntimeError):
+                manager.release_memory_occupation(request)
+            manager.release_memory_occupation(request)
+
+        self.assertEqual(
+            [c.args[0] for c in manager.memory_saver_adapter.pause.call_args_list],
+            ["kv_cache", "cuda_graph", "cuda_graph"],
+        )
+        self.assertEqual(manager.offload_tags, {"kv_cache", "cuda_graph"})
+
+    def test_a_failed_resume_retries_only_released_tags(self):
+        """A tag resumed before a later tag failed is not resumed again on retry."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.resume.side_effect = [None, RuntimeError, None]
+        manager.offload_tags.update({"kv_cache", "cuda_graph"})
+        request = ResumeMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+
+        with self.assertRaises(RuntimeError):
+            manager.resume_memory_occupation(request)
+        manager.resume_memory_occupation(request)
+
+        self.assertEqual(
+            [c.args[0] for c in manager.memory_saver_adapter.resume.call_args_list],
+            ["cuda_graph", "kv_cache", "kv_cache"],
+        )
+        self.assertEqual(manager.offload_tags, set())
+
+
+class _RecordingStream:
+    """Stands in for a device stream; records the cross-stream waits enqueued on it."""
+
+    def __init__(self, name: str, log: list):
+        self.name = name
+        self.log = log
+
+    def wait_stream(self, stream: "_RecordingStream") -> None:
+        self.log.append(f"{self.name} waits for {stream.name}")
+
+
+class TestWeightWritesWaitForLaunchedForward(_WeightUpdaterManagerTestBase):
+    def setUp(self):
+        super().setUp()
+
+        def transport(*, context, payload):
+            self.log.append("write transport")
+            return [("w", object())]
+
+        platform = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.current_platform",
+            SimpleNamespace(get_weight_update_handlers=lambda: {"ici": transport}),
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+        self.log = []
+
+    def _overlap_manager(self, *, session):
+        def record_write(name):
+            return lambda *args, **kwargs: self.log.append(f"write {name}") or DEFAULT
+
+        target = _runner()
+        for name in (
+            "begin_weight_update",
+            "end_weight_update",
+            "update_weights_from_disk",
+            "update_weights_from_tensor",
+            "update_weights_from_ipc",
+            "load_weights_from_distributed",
+        ):
+            getattr(target.weight_updater, name).side_effect = record_write(name)
+        manager = self._manager(target, session=session)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_overlap = True
+        scheduler.schedule_stream = _RecordingStream("schedule", self.log)
+        scheduler.forward_stream = _RecordingStream("forward", self.log)
+        scheduler.record_weight_version_change = lambda new_version: None
+        manager.scheduler = scheduler
+        return manager
+
+    def test_weight_writes_wait_for_the_forward_launched_before_the_update(self):
+        """An in_place pause can leave the last launched forward reading the weights;
+        every update path must order its weight writes after that whole forward."""
+        calls = {
+            "begin": (
+                False,
+                lambda m: m.begin_weight_update(BeginWeightUpdateReqInput()),
+            ),
+            "end": (True, lambda m: m.end_weight_update(EndWeightUpdateReqInput())),
+            "disk": (False, lambda m: m.update_weights_from_disk(_request())),
+            "ipc": (False, lambda m: m.update_weights_from_ipc(_request())),
+            "tensor": (True, lambda m: m.update_weights_from_tensor(_request())),
+            "distributed": (
+                True,
+                lambda m: m.update_weights_from_distributed(_request()),
+            ),
+            "plugin": (
+                True,
+                lambda m: m.plugin_weight_update(
+                    PluginWeightUpdateReqInput(handler="ici")
+                ),
+            ),
+        }
+        for path, (session, call) in calls.items():
+            with self.subTest(path=path):
+                self.log.clear()
+
+                output = call(self._overlap_manager(session=session))
+
+                self.assertTrue(output.success)
+                writes = [i for i, e in enumerate(self.log) if e.startswith("write")]
+                self.assertTrue(writes, f"{path} wrote no weights")
+                self.assertIn("schedule waits for forward", self.log[: writes[0]])
 
 
 class TestPluginWeightUpdateReply(CustomTestCase):
