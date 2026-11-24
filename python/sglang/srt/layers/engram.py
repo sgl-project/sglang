@@ -1845,7 +1845,9 @@ class Engram(nn.Module):
     def _check_staged(self, rows, hash_ids, forward_batch, cp_all_tokens) -> None:
         """Debug: the staged rows against the table lookup of the forward's hash ids."""
         ref = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
-        bad = int((rows.view(torch.int16) != ref.view(torch.int16)).any(-1).any(-1).sum())
+        bad = int(
+            (rows.view(torch.int16) != ref.view(torch.int16)).any(-1).any(-1).sum()
+        )
         log = logger.warning if bad else logger.info
         log(
             "engram staging check, layer %d: %d of %d rows differ",
