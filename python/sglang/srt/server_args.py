@@ -45,7 +45,6 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
-    remote_instance_transfer_engine_of,
     resolution_result,
 )
 from sglang.srt.arg_groups.validation_hook import (
@@ -60,6 +59,11 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
     publish,
+)
+from sglang.srt.sampling.watermarking.redaction import (
+    WATERMARK_SECRET_FIELD_NAMES,
+    redact_watermark_command_line,
+    redact_watermark_secrets,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import (
@@ -326,12 +330,7 @@ class ServerArgs:
         return getattr(self, "_launch_command", None)
 
     def __repr__(self) -> str:
-        hidden = {
-            "watermark_key",
-            "watermark_key_b",
-            "watermark_config",
-            *SERVER_ARGS_SECRET_FIELD_NAMES,
-        }
+        hidden = {*WATERMARK_SECRET_FIELD_NAMES, *SERVER_ARGS_SECRET_FIELD_NAMES}
         values = ", ".join(
             f"{field.name}={getattr(self, field.name)!r}"
             for field in record_fields(type(self))
@@ -361,12 +360,13 @@ class ServerArgs:
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
         "Gemma4ForConditionalGeneration",
+        "HYV4FlashForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
-    # _handle_page_major_kv_layout); the model-family gate is enforced at pool
-    # construction in model_runner_kv_cache_mixin._init_pools.
+    # handle_page_major_kv_layout); the model-family gate is enforced at pool
+    # construction in mem_cache/kv_cache_configurator.py (_init_pools).
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
         return {"mooncake", "nixl"}
@@ -515,11 +515,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-
-    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
-        """``load_format`` overrides the seed's: a draft runner loading under
-        ``--speculative-draft-load-format`` needs its own transfer engine."""
-        return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
 
 # Collect input fields only; field_order.py preserves positional argument order.
@@ -695,9 +690,6 @@ def redact_server_args_secrets(values: dict[str, Any]) -> dict[str, Any]:
     """A copy of a server-args mapping with the credentials and the watermark
     secrets replaced. An unset credential stays None, so readers can still
     tell whether one is configured."""
-    # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-
     return redact_watermark_secrets(
         {
             name: (
@@ -809,9 +801,6 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
-
     server_args._launch_command = redact_watermark_command_line(
         redact_secret_cli_args(argv, parser), raw_args.watermark_config
     )
@@ -937,6 +926,7 @@ class PortArgs:
                 port_base = dist_init_port + 1
 
             detokenizer_port = port_base + 1
+            # port_base + 2 is unused; the slot stays so the ports below keep their offsets.
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
             if dp_rank is None:

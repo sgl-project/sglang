@@ -81,8 +81,7 @@ def default_post_verify(
     )
     kwargs = dict(
         uno_target_max_top_k=io.sparse_target_max_top_k,
-        watermark_state=io.watermark,
-        watermark_full_mask=io.watermark_full_mask,
+        watermark=io.watermark,
         simulated_acc_len=io.simulated_accept_length,
         simulated_acc_len_rng=io.simulated_accept_length_rng,
         sparse_bonus_argmax=io.sparse_bonus_argmax,
