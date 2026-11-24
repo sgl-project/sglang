@@ -66,7 +66,9 @@ def public_adapter(request, monkeypatch):
     )
     options = dict(
         execution_profile=DecodeExecutionProfile.from_dict(fixture["capture_profile"]),
-        native_segment_profile_id=fixture["profile"]["sha256"],
+        native_segment_profile_id=Path(fixture["profile"]["path"]).stem.rsplit("-", 1)[
+            -1
+        ],
         source_binding=dict(
             root=str(root.resolve()),
             **{k: fixture[k] for k in ("profile", "cohort", "stack")},

@@ -127,7 +127,7 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
         from sglang_simulator.time_predictor.simopus_native import (
             SimOpusNativeCostAdapter,
         )
-        from sglang_simulator.time_predictor.simopus_sdk import load_sdk
+        from sglang_simulator.time_predictor.simopus_sdk import load_sdk, open_database
         from simopus.sdk import build_model_description, load_model_config
 
         package, sdk = load_sdk()
@@ -150,11 +150,11 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
                 allow_download=False,
             )
             _geometry(model, description, model_id)
-            database = sdk.PerfDatabase.open_fidb(
+            database = open_database(
+                sdk,
                 system,
-                "sglang",
                 config.backend_version,
-                systems_root=systems_root,
+                perfdb_dir=systems_root,
                 database_mode=database_mode,
             )
             _, capture_raw, capture_sha = _asset(
