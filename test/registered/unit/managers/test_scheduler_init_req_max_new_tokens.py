@@ -256,10 +256,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 scheduler.init_req_max_new_tokens(req)
                 self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
-    def test_unified_prompt_past_nominal_capacity_keeps_its_decode(self):
-        """Bug regression: under unified memory a prompt longer than the sizing's
-        nominal max_total_num_tokens, but within what the shared bands hold, was
-        admitted and then generated 0 tokens."""
+    def _new_unified_scheduler(self) -> Scheduler:
+        """A scheduler on a unified pool; a test sets max_total_num_tokens and
+        max_req_len from the pool's full-band size."""
         bundle = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
@@ -281,20 +280,43 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         )
         allocator = bundle.token_to_kv_pool_allocator
         allocator.storage.bind_window_retention(8, None)
-        # The ratio-derived nominal capacity is well below what one request may hold.
-        scheduler = self._new_scheduler(
-            page_size=4,
-            max_total_num_tokens=allocator.size_full // 2,
-            max_req_len=allocator.size_full,
-        )
+        scheduler = self._new_scheduler(page_size=4)
         scheduler.token_to_kv_pool_allocator = allocator
         scheduler.sliding_window_size = 8
         scheduler.chunked_prefill_size = 8
         scheduler.max_new_tokens_limit = None
-        req = self._new_req(max_new_tokens=32, input_len=allocator.size_full // 2 + 60)
+        return scheduler
+
+    def test_unified_prompt_past_nominal_capacity_keeps_its_decode(self):
+        """Bug regression: under unified memory a prompt longer than the sizing's
+        nominal max_total_num_tokens, but within what the shared bands hold, was
+        admitted and then generated 0 tokens."""
+        scheduler = self._new_unified_scheduler()
+        size_full = scheduler.token_to_kv_pool_allocator.size_full
+        # The ratio-derived nominal capacity is well below what one request may hold.
+        scheduler.max_total_num_tokens = size_full // 2
+        scheduler.max_req_len = size_full
+        req = self._new_req(max_new_tokens=32, input_len=size_full // 2 + 60)
         req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(req.sampling_params.max_new_tokens, 32)
+
+    def test_unified_prompt_at_context_length_keeps_its_decode(self):
+        """Under unified memory, a context length below the pool and a prompt
+        within two pages of it keep the decode the context leaves; a page-
+        rounded clip at max_req_len would leave 0 tokens."""
+        scheduler = self._new_unified_scheduler()
+        size_full = scheduler.token_to_kv_pool_allocator.size_full
+        scheduler.max_total_num_tokens = size_full // 4
+        scheduler.max_req_len = size_full // 2
+        # The longest prompt the tokenizer lets through: max_req_len - 5.
+        input_len = scheduler.max_req_len - 5
+        req = self._new_req(max_new_tokens=32, input_len=input_len)
+        req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(
+            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len - 1
+        )
 
     def test_pd_prefill_forces_one_handoff_token(self):
         """Bug regression: a PD-prefill request whose memory budget clamps to
