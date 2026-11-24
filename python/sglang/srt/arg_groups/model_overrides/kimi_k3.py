@@ -184,8 +184,6 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides = {"decode_state_free_radix_default": True}
     if cfg.dcp_size > 1:
         if platform.is_npu:
-            if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
-                overrides["speculative_attention_mode"] = "decode"
             if (
                 cfg.speculative_algorithm == "DFLASH"
                 and cfg.speculative_draft_attention_backend is None
