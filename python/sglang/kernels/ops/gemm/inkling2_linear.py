@@ -4,10 +4,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.arch.triton_portability import IS_HIP
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.gemm.sm12x_bf16_gemv import b12x_bf16_gemv
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -238,13 +240,13 @@ def uses_k_groups(
         x.is_cuda
         and torch.cuda.get_device_capability(x.device)[0] in (9, 10)
         and (
-            not IS_HIP
+            not _is_hip
             or (x.numel() <= 128 * x.shape[-1] and _k_group_tiles(x, weight) < 256)
         )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.stride(-1) == weight.stride(-1) == 1
         and weight.shape[1] >= 2560
-        and (weight.shape[0] not in (1, 2, 4) or (partials and IS_HIP))
+        and (weight.shape[0] not in (1, 2, 4) or (partials and _is_hip))
     )
 
 

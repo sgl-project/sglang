@@ -10,14 +10,17 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.arch.triton_portability import rcp_rn
 from sglang.kernels.jit.utils import load_jit
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import (
     ROW_LOOP_MIN_ROWS,
     _nvfp4_values,
     _ue8m0,
 )
-from sglang.kernels.ops.moe.inkling2_moe import _capped_swiglu, _mxfp8_block
+from sglang.kernels.ops.moe.inkling2_moe import (
+    _capped_swiglu,
+    _mxfp8_block,
+    _rcp_rn,
+)
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 from sglang.srt.layers.quantization.marlin_utils import (
@@ -308,7 +311,7 @@ def _split_sum(X, offs, mask, split_stride, SPLITS: tl.constexpr, ROUND: tl.cons
 @triton.jit
 def _row_scale(XAmax, WAmax, WDenominator, expert, amax_row):
     denominator = 1536.0 * tl.load(WDenominator)
-    return (tl.load(XAmax + amax_row) * tl.load(WAmax + expert)) * rcp_rn(denominator)
+    return (tl.load(XAmax + amax_row) * tl.load(WAmax + expert)) * _rcp_rn(denominator)
 
 
 @triton.jit

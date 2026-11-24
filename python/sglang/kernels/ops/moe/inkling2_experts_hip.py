@@ -14,7 +14,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.arch.triton_portability import IS_HIP
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import _ue8m0
 from sglang.kernels.ops.moe.inkling2_route import ROUTE_MAX_IDS, route_metadata
 from sglang.kernels.ops.moe.inkling_moe import (
@@ -22,6 +21,7 @@ from sglang.kernels.ops.moe.inkling_moe import (
     compute_grouped_gemm_metadata,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.utils import is_hip
 
 
 @triton.jit
@@ -89,7 +89,7 @@ def _mxfp8_weight_tile(
 
 # v_cvt_scalef32_pk_* exist from gfx950 (CDNA4) on.
 NATIVE_CVT = tl.constexpr(
-    bool(IS_HIP)
+    is_hip()
     and torch.cuda.is_available()
     and torch.cuda.get_device_properties().gcnArchName.startswith("gfx95")
 )
