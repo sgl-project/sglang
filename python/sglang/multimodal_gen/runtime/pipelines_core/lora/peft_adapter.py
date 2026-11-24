@@ -228,12 +228,10 @@ def _validate_peft_features(
         )
 
 
-def apply_peft_config(
-    state_dict: dict[str, torch.Tensor], config: Mapping[str, Any]
-) -> dict[str, torch.Tensor]:
-    """Represent PEFT scaling variants with native LoRA tensors and alpha."""
-    _validate_peft_features(state_dict, config)
-    normalized = dict(state_dict)
+def compile_peft_alpha_patterns(
+    config: Mapping[str, Any],
+) -> list[tuple[re.Pattern[str], int]]:
+    """Validate PEFT `alpha_pattern` and compile each entry to a module-name matcher."""
     patterns = config.get("alpha_pattern", {})
     if not isinstance(patterns, dict):
         raise ValueError("PEFT alpha_pattern must be an object")
@@ -253,15 +251,32 @@ def apply_peft_config(
                 f"PEFT alpha_pattern value for {pattern!r} must be a positive integer"
             )
         compiled_patterns.append((expression, alpha))
+    return compiled_patterns
+
+
+def match_peft_alpha_pattern(
+    module_name: str, compiled_patterns: list[tuple[re.Pattern[str], int]]
+) -> int | None:
+    return next(
+        (alpha for pattern, alpha in compiled_patterns if pattern.match(module_name)),
+        None,
+    )
+
+
+def apply_peft_config(
+    state_dict: dict[str, torch.Tensor], config: Mapping[str, Any]
+) -> dict[str, torch.Tensor]:
+    """Represent PEFT scaling variants with native LoRA tensors and alpha."""
+    _validate_peft_features(state_dict, config)
+    normalized = dict(state_dict)
+    compiled_patterns = compile_peft_alpha_patterns(config)
 
     for name in state_dict:
         base = name.removesuffix(".weight")
         if not base.endswith(".lora_A"):
             continue
         base = base.removesuffix(".lora_A")
-        alpha = next(
-            (alpha for pattern, alpha in compiled_patterns if pattern.match(base)), None
-        )
+        alpha = match_peft_alpha_pattern(base, compiled_patterns)
         if alpha is None:
             continue
         alpha_key = f"{base}.alpha"
