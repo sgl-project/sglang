@@ -1231,8 +1231,7 @@ class SchedulingVPPCore:
 
             raise RuntimeError(f"unsupported VPP control kind {envelope.kind}")
 
-        while True:
-            server_is_idle = True
+        def process_control_messages() -> None:
             # TP0's false rules out an all-TP true result. Share it through
             # the existing control broadcast; newly ingested requests are
             # eligible for bootstrap/transfer on the next tick.
@@ -1286,11 +1285,9 @@ class SchedulingVPPCore:
             if not rank_schedule.inflight_count and pending_decode_controls:
                 handle_control(*pending_decode_controls.popleft())
 
-            self._pp_vpp_reap_send_work(activation_send_work)
-            self._pp_vpp_flush_control_outbox(
-                control_send_work,
-                max_control_sends,
-            )
+        def admit_batches() -> None:
+            nonlocal bootstrap_round_active, transfer_round_active, decode_round_active
+            nonlocal next_batch_seq, server_is_idle
 
             if self.pp_group.is_first_rank:
                 recv_reqs = self.ingest_requests()
@@ -1484,6 +1481,7 @@ class SchedulingVPPCore:
             else:
                 self.process_pending_chunked_abort()
 
+        def commit_first_passes() -> None:
             for batch_seq, ranks in tuple(pending_first_pass.items()):
                 if len(ranks) != self.pp_group.world_size:
                     continue
@@ -1513,6 +1511,9 @@ class SchedulingVPPCore:
                 else:
                     pending_chunk_batches.discard(batch_seq)
                 pending_first_pass.pop(batch_seq, None)
+
+        def dispatch_stage() -> None:
+            nonlocal server_is_idle
 
             def action_ready(batch_seq: int, stage_id: int) -> bool:
                 if (
@@ -1608,6 +1609,9 @@ class SchedulingVPPCore:
                         )
                     server_is_idle = False
 
+        def finish_tick() -> None:
+            nonlocal stall_last_log_at, server_is_idle
+
             flush_materialized()
 
             self._pp_vpp_flush_control_outbox(
@@ -1700,4 +1704,17 @@ class SchedulingVPPCore:
                 not prefill or not self.disagg_prefill_transfer_queue
             ):
                 self.on_idle()
+
+        while True:
+            server_is_idle = True
+            process_control_messages()
+            self._pp_vpp_reap_send_work(activation_send_work)
+            self._pp_vpp_flush_control_outbox(
+                control_send_work,
+                max_control_sends,
+            )
+            admit_batches()
+            commit_first_passes()
+            dispatch_stage()
+            finish_tick()
             tick += 1
