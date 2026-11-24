@@ -231,13 +231,24 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             raise ValueError("MiniMax H3 image requires the native SGLang backend")
         selected_backend = self.resolve_transformer_attention_backend(server_args)
         dense_backend = _dense_attention_backend()
-        if selected_backend not in (None, dense_backend):
+        supported_backends = (None, dense_backend)
+        if dense_backend is AttentionBackendEnum.FA:
+            supported_backends += (AttentionBackendEnum.FP8_FA_SM120,)
+        if selected_backend not in supported_backends:
             raise ValueError(
                 "MiniMax H3 image requires dense FlashAttention "
-                f"(--attention-backend {dense_backend.name.lower()} on this platform)"
+                f"(--attention-backend {dense_backend.name.lower()} on this platform); "
+                "CUDA also supports explicit fp8_fa_sm120 attention"
+            )
+        if (
+            server_args.ring_degree > 1
+            and selected_backend is AttentionBackendEnum.FP8_FA_SM120
+        ):
+            raise ValueError(
+                "MiniMax H3 image Ring parallelism requires FlashAttention"
             )
         if dense_backend is not AttentionBackendEnum.FA and server_args.ring_degree > 1:
-            # The DiT's ring exchange is built on the FA backend only.
+            # the DiT's ring exchange is built on the FA backend only
             raise ValueError(
                 "MiniMax H3 image ring parallelism requires FA; use --ulysses-degree "
                 f"or --tp-size with {dense_backend.name.lower()}"
@@ -247,8 +258,7 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             if type(value) is not int or value != 1:
                 raise ValueError(f"MiniMax H3 image requires {name}=1")
         # tp_size and ulysses_degree * ring_degree stay with the DiT's own
-        # head/alignment admission checks; where ring is allowed it already has
-        # the FA it needs because the image release forces dense FA below.
+        # head/alignment admission checks; Ring's FA requirement is checked above.
         if server_args.kv_gather_degree > 1 and not server_args.sp_split_auto:
             # The auto-assigned sp_degree=2 alias is fine: the H3 DiT exchanges
             # sequence shards with its own Ulysses all-to-all and never takes
@@ -309,14 +319,10 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             "transformer"
         )
         if component_backend is None:
-            # Request dense FA for the transformer through the generic explicit-request
-            # path, so the loader refuses a transformer that does not run it.
-            # Explicit global/component/forced choices were checked above.
-            dense_backend = _dense_attention_backend().name.lower()
-            server_args.component_attention_backends["transformer"] = dense_backend
-            server_args._requested_component_attention_backends["transformer"] = (
-                dense_backend
-            )
+            # preserve explicit choices through the component loader's strict path
+            backend = (selected_backend or dense_backend).name.lower()
+            server_args.component_attention_backends["transformer"] = backend
+            server_args._requested_component_attention_backends["transformer"] = backend
 
     def _configure_online_adaln(self, server_args) -> None:
         # Measured H200/B300, GB10 and RTX PRO 6000 Blackwell recipes avoid keeping

@@ -59,13 +59,13 @@ def build_flashinfer_kda_checkpoint_plan(
         "KDA checkpoint rows disagree with the prefill tracking metadata"
     )
     metadata.state_checkpoint_cu_starts = torch.tensor(
-        checkpoint_starts, dtype=torch.int64, device=device
-    )
+        checkpoint_starts, dtype=torch.int64, pin_memory=True
+    ).to(device, non_blocking=True)
     metadata.num_state_checkpoints = num_tracked_checkpoints
     metadata.state_checkpoint_every_n_tokens = chunk_size
     metadata.state_checkpoint_indices = torch.tensor(
-        checkpoint_destinations, dtype=torch.int32, device=device
-    )
+        checkpoint_destinations, dtype=torch.int32, pin_memory=True
+    ).to(device, non_blocking=True)
 
 
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):

@@ -179,7 +179,7 @@ def _depth4_model():
     return m
 
 
-def test_streaming_loop_runs_and_accumulates_concat_block():
+def test_streaming_loop_runs_and_accumulates_concat_block(single_threaded_cpu):
     """Drive forward_long chunk-by-chunk (the stage's core loop) on a depth-4
     model: accumulate -> denoise(save=False) -> clean(save=True). Verify finite
     output, threaded GDN state, and that the softmax block (idx 3) accumulates a

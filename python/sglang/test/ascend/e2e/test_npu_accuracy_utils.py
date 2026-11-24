@@ -22,6 +22,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     start_router_thread,
     wait_server_ready,
 )
+from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -147,6 +148,39 @@ def apply_accuracy_dataset_override(test_cls):
     )
 
 
+def extract_report_accuracy(report_data):
+    """Return the primary accuracy ratio from an evalscope report.
+
+    Older reports carry a top-level ``score``. Schema v2 reports (evalscope
+    1.11+) moved it into ``metrics[]``: each entry has ``identity.name`` plus a
+    ``score`` already normalised to 0..1, next to ``num``/``num_correct``.
+    """
+    score = report_data.get("score")
+    if isinstance(score, (int, float)):
+        return float(score)
+
+    primary_identity = report_data.get("primary_metric_identity")
+    primary = (
+        primary_identity.get("name") if isinstance(primary_identity, dict) else None
+    )
+    metrics = report_data.get("metrics")
+    if not isinstance(metrics, list):
+        metrics = []
+    for name in (primary, "accuracy"):
+        if not name:
+            continue
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            identity = metric.get("identity")
+            if not isinstance(identity, dict) or identity.get("name") != name:
+                continue
+            value = metric.get("score")
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
 def run_evalscope(
     host,
     port,
@@ -259,15 +293,18 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                score = report_data.get("score")
+                score = extract_report_accuracy(report_data)
                 if score is not None:
-                    metrics["accuracy"] = float(score)
+                    metrics["accuracy"] = score
                     logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
         if "accuracy" not in metrics:
             accuracy_patterns = [
+                # evalscope 1.11+ adds a Correct column between Num and Score:
+                # │ ... │ Accuracy ↑ │ default │ 20 │ 18 │ 90% │
+                r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 # Add adaptation for evalscope 1.11+ table format
                 r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
@@ -284,7 +321,8 @@ def run_evalscope(
                     final_accuracy = float(matches[-1].group(1))
                     # evalscope 1.11+ reports accuracy as a percentage (e.g. 66.67%);
                     # normalize it to a 0-1 fraction to compare against the baseline.
-                    if "%" in matches[-1].group(0):
+                    # Accuracy can never exceed 1, so a bare "90" is a percentage too.
+                    if "%" in matches[-1].group(0) or final_accuracy > 1.0:
                         final_accuracy /= 100.0
                     metrics["accuracy"] = final_accuracy
                     logger.info(f"The Final Accuracy from output: {final_accuracy}")
@@ -546,6 +584,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     def setUpClass(cls):
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = list(cls.other_args)
+        cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
+
         env = os.environ.copy()
         for key, value in env.items():
             logger.info(f"ENV_VAR_SYS {key}:{value}")
@@ -553,8 +594,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             for key, value in cls.envs.items():
                 logger.info(f"ENV_VAR_CASE {key}:{value}")
                 env[key] = value
-
-        other_args = list(cls.other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -571,6 +610,12 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
@@ -620,11 +665,19 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        pass
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["master"])
     def start_pd_mix_master_node(cls):
+        cls.storage_service_process = maybe_start_hicache_storage_service(
+            cls.model_config.get("other_args")
+        )
         sglang_thread = threading.Thread(
             target=launch_pd_mix_node, args=(cls.model_config,)
         )
@@ -705,6 +758,12 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
@@ -719,6 +778,10 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
+        if cls.hostname.endswith("prefill-0"):
+            cls.storage_service_process = maybe_start_hicache_storage_service(
+                cls.model_config.get("prefill_args")
+            )
         logger.info(f"Starting pd separation node...")
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")

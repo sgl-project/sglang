@@ -29,6 +29,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.beam_decode_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.beam_decode_gemv:beam_decode_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.bf16_mega_gate",
         backend=KernelBackend.DEEPGEMM,
         target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
@@ -326,6 +337,17 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
         capabilities=CUDA_ONLY,
+    )
+)
+
+
+# Vendored tlx.ops.moe (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="moe.tlx_moe",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.tlx_ops.kernels.moe.gfx950:moe",
+        capabilities=_HIP,
     )
 )
 

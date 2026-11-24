@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import (
+from sglang.srt.multimodal.qwen_vl_media_processing import (
     ceil_by_factor,
     floor_by_factor,
     round_by_factor,

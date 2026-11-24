@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    write_memfabric_tent_conf,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -14,6 +19,17 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
+
+MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
+DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
+
+# Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
+MOONCAKE_ENVS = {
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
+}
 
 # Common environment variables for DSV4-Flash PD-Sep 128k1k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
@@ -39,7 +55,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
@@ -80,6 +95,23 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
 }
 
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection.
+DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
+]
+
 # Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--page-size",
@@ -96,18 +128,17 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--disaggregation-transfer-backend",
-    "ascend",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--disaggregation-bootstrap-port",
     18998,
     "--mem-fraction-static",
-    0.62,
+    0.68,
     "--prefill-max-requests",
     256,
     "--max-prefill-tokens",
     70000,
     "--max-running-requests",
     256,
-    "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",
@@ -119,7 +150,8 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--load-balance-method",
     "round_robin",
     "--enable-metrics",
@@ -132,7 +164,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "dynamic",
     "--ep-num-redundant-experts",
     16,
-    "--dp-size",
+    "--attn-dp-size",
     4,
     "--enable-prefill-cp",
     "--cp-strategy",
@@ -145,6 +177,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "stat",
     "--expert-distribution-recorder-buffer-size",
     512,
+    *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
@@ -165,12 +198,11 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
-    "ascend",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--max-running-requests",
     256,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -182,17 +214,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
-    # DSPARK configuration.
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
     "--enable-cache-report",
     "--swa-full-tokens-ratio",
@@ -210,8 +231,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     '{"use_index_cache":true,"index_topk_freq":2}',
     "--tokenizer-worker-num",
     16,
-    "--speculative-dspark-block-size",
-    5,
+    *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k1k deployment
@@ -221,7 +241,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS,
-    "router_args": ["--policy", "round_robin"],
+    "router_args": [],
     "router_envs": {},
 }
 
@@ -245,6 +265,30 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
+
+    @classmethod
+    def setUpClass(cls):
+        common_envs = dict(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS)
+        if MOONCAKE_INSTALLED:
+            common_envs.update(MOONCAKE_ENVS)
+            common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+            common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
+                ("memfabric_hybrid", "lib"), ("mooncake", None)
+            )
+        cls.model_config = {
+            **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG,
+            "prefill_args": list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS),
+            "decode_args": list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS),
+            "prefill_envs": {
+                **common_envs,
+                **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS,
+            },
+            "decode_envs": {
+                **common_envs,
+                **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS,
+            },
+        }
+        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k prefix90."""

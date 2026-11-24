@@ -33,6 +33,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx1250_supported
+
 
 # ----------------------------------------------------------------------------- GEMM
 @triton.jit
@@ -295,33 +297,32 @@ def finalize_norm_weighted_sum_kernel(
     for s in tl.static_range(TOP_K):
         e = tl.load(ids_ptr + m * TOP_K + s)
         is_local = (e >= local_start) & (e < local_start + num_local)
-        row = (m * TOP_K + s).to(tl.int64)
-        if SPLIT_K == 1:
-            y = tl.load(y_ptr + row * H + offs, mask=mask & is_local, other=0.0).to(
-                tl.float32
-            )
-        else:
-            y = tl.zeros((BLOCK_H,), dtype=tl.float32)
-            for k in tl.static_range(SPLIT_K):
-                y += tl.load(
-                    y_ptr + k * stride_yk + row * H + offs,
-                    mask=mask & is_local,
-                    other=0.0,
-                )
-            y = y.to(tl.bfloat16).to(
-                tl.float32
-            )  # the expert output is bf16 in the reference
-        sc = tl.load(scores_ptr + m * TOP_K + s).to(tl.float32)
-        if HAS_NORM:
-            # reference: x = bf16(weight * x); rms_norm in fp32; no affine after
-            if HAS_SCALE:
-                y = (y * scale).to(tl.bfloat16).to(tl.float32)
-            ss = tl.sum(y * y, axis=0)
-            inv = 1.0 / tl.sqrt(ss / H + eps)
-            wgt = tl.where(is_local, sc * inv, 0.0)
-        else:
-            wgt = tl.where(is_local, sc, 0.0)
-        acc += wgt * y
+        # branch, not mask: with EP8 ~7 of 8 slots are remote, and a masked slot still pays the row reduction
+        # (it would add 0 * 0 to acc)
+        if is_local:
+            row = (m * TOP_K + s).to(tl.int64)
+            if SPLIT_K == 1:
+                y = tl.load(y_ptr + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+            else:
+                y = tl.zeros((BLOCK_H,), dtype=tl.float32)
+                for k in tl.static_range(SPLIT_K):
+                    y += tl.load(
+                        y_ptr + k * stride_yk + row * H + offs, mask=mask, other=0.0
+                    )
+                y = y.to(tl.bfloat16).to(
+                    tl.float32
+                )  # the expert output is bf16 in the reference
+            sc = tl.load(scores_ptr + m * TOP_K + s).to(tl.float32)
+            if HAS_NORM:
+                # reference: x = bf16(weight * x); rms_norm in fp32; no affine after
+                if HAS_SCALE:
+                    y = (y * scale).to(tl.bfloat16).to(tl.float32)
+                ss = tl.sum(y * y, axis=0)
+                inv = 1.0 / tl.sqrt(ss / H + eps)
+                wgt = sc * inv
+            else:
+                wgt = sc
+            acc += wgt * y
     tl.store(
         out_ptr + m.to(tl.int64) * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask
     )
@@ -537,7 +538,105 @@ def moe_align_block_size_small(
     return sorted_ids, expert_ids, num_post
 
 
+@triton.jit
+def _align_count_kernel(
+    ids_ptr, counts_ptr, n, local_start, E: tl.constexpr, BLOCK: tl.constexpr
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    local = tl.load(ids_ptr + offs, mask=offs < n, other=-1) - local_start
+    ok = (offs < n) & (local >= 0) & (local < E)
+    # 2E bins (a power of two): non-local slots land in bin E, which is not added
+    hist = tl.histogram(tl.where(ok, local, E), 2 * E)
+    tl.atomic_add(
+        counts_ptr + tl.arange(0, 2 * E),
+        hist,
+        mask=tl.arange(0, 2 * E) < E,
+        sem="relaxed",
+    )
+
+
+@triton.jit
+def _align_scatter_kernel(
+    ids_ptr,
+    counts_ptr,
+    sorted_ptr,
+    expert_ptr,
+    num_post_ptr,
+    n,
+    local_start,
+    num_blocks,
+    E: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NB_BLOCK: tl.constexpr,
+):
+    # counts_ptr: [E] local slot counts (from _align_count_kernel), then [E] zeroed cursors. Each local slot takes
+    # the next free position of its expert's BLOCK_M-padded segment (any order within the segment: the GEMM's rows
+    # are independent and land at their token slot). Program 0 also pads the segments and labels the blocks.
+    e_offs = tl.arange(0, E)
+    counts = tl.load(counts_ptr + e_offs)
+    padded = (counts + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    cum = tl.cumsum(padded, axis=0)
+    start = cum - padded
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    local = tl.load(ids_ptr + offs, mask=offs < n, other=-1) - local_start
+    ok = (offs < n) & (local >= 0) & (local < E)
+    e = tl.where(ok, local, 0)
+    rank = tl.atomic_add(counts_ptr + E + e, 1, mask=ok, sem="relaxed")
+    seg = tl.sum(tl.where(e_offs[None, :] == e[:, None], start[None, :], 0), axis=1)
+    tl.store(sorted_ptr + seg + rank, offs.to(tl.int32), mask=ok)
+    if tl.program_id(0) == 0:
+        j = tl.arange(0, BLOCK_M)
+        pad = (start + counts)[:, None] + j[None, :]
+        tl.store(
+            sorted_ptr + pad,
+            tl.full((E, BLOCK_M), 0, tl.int32) + n,
+            mask=j[None, :] < (padded - counts)[:, None],
+        )
+        b = tl.arange(0, NB_BLOCK)
+        owner = tl.sum((cum[None, :] <= (b * BLOCK_M)[:, None]).to(tl.int32), axis=1)
+        tl.store(expert_ptr + b, tl.minimum(owner, E - 1), mask=b < num_blocks)
+        tl.store(num_post_ptr, tl.sum(padded, axis=0))
+
+
+ALIGN_TRITON_MIN = 16384  # routed slots (2048 tokens x top-8: the SP prefill widths) from which the Triton align runs
+
+
+def moe_align_block_size_triton(
+    topk_ids: torch.Tensor, num_local_experts: int, local_start: int, block_m: int
+):
+    """moe_align_block_size_torch's contract (non-local slots dropped, padding = numel) in 3 launches, for prefill
+    widths (8192 x 8 slots over 32 local experts), where the sgl kernel pair is slow."""
+    E = num_local_experts
+    n = topk_ids.numel()
+    dev = topk_ids.device
+    cap = triton.cdiv(n + E * (block_m - 1), block_m) * block_m
+    num_blocks = cap // block_m
+    counts = torch.zeros(2 * E, dtype=torch.int32, device=dev)
+    sorted_ids = torch.empty((cap,), dtype=torch.int32, device=dev)
+    expert_ids = torch.empty((num_blocks,), dtype=torch.int32, device=dev)
+    num_post = torch.empty((1,), dtype=torch.int32, device=dev)
+    ids = topk_ids.reshape(-1)
+    block = 1024
+    _align_count_kernel[(triton.cdiv(n, block),)](
+        ids, counts, n, local_start, E, block, num_warps=4
+    )
+    _align_scatter_kernel[(triton.cdiv(n, block),)](
+        ids, counts, sorted_ids, expert_ids, num_post, n, local_start, num_blocks, E, block_m, block,
+        triton.next_power_of_2(num_blocks), num_warps=4,
+    )  # fmt: skip
+    return sorted_ids, expert_ids, num_post
+
+
 def moe_align_block_size(topk_ids, num_local_experts, local_start, block_m):
+    if (
+        topk_ids.numel() >= ALIGN_TRITON_MIN
+        and num_local_experts & (num_local_experts - 1) == 0
+        and block_m & (block_m - 1) == 0
+    ):
+        return moe_align_block_size_triton(
+            topk_ids, num_local_experts, local_start, block_m
+        )
     if topk_ids.numel() <= ALIGN_SMALL_MAX and ALIGN_BACKEND != "torch":
         return moe_align_block_size_small(
             topk_ids, num_local_experts, local_start, block_m
@@ -566,6 +665,10 @@ _LARGE_M = dict(
     BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=2
 )
 CONFIG_TABLE = {"small": _SMALL_M, "mid": _MID_M, "large": _LARGE_M}
+# gfx1250 prefill (layers 0 / 61 ship BF16 experts), M=8192 x top-8 over 32 local experts: faster than the large-M config
+_PREFILL_M_GFX1250 = dict(
+    BLOCK_M=128, BLOCK_N=128, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=2
+)
 # MXFP4: the dequant costs VALU work per B tile; BLOCK_K=128 halves the per-k-step overhead.
 _SMALL_M_FP4 = dict(
     BLOCK_M=16, BLOCK_N=64, BLOCK_K=128, GROUP_M=1, num_warps=4, num_stages=2
@@ -588,6 +691,8 @@ def _pick_config(M: int, topk: int, num_local: int, mxfp4: bool = False):
     # MXFP4 mid wins up to M=768 (rows 6144), BF16 mid only up to M=256 (rows 2048).
     if rows <= (6144 if mxfp4 else 2048):
         return table["mid"]
+    if not mxfp4 and rows >= 16384 and is_gfx1250_supported():
+        return _PREFILL_M_GFX1250
     return table["large"]
 
 
