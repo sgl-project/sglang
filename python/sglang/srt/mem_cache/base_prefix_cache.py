@@ -106,7 +106,9 @@ class InsertParams:
     # keeps its tracked checkpoint for a later insert.
     mamba_checkpoint_deferred: bool = False
     # Prepare found no free state slot to publish the running request's
-    # checkpoint: the tree takes nothing and the request drops the checkpoint.
+    # checkpoint: the tree takes nothing, and retirement measures from the
+    # request's own frontier. Cleanup then clears the request's checkpoint
+    # (`mamba_last_track_seqlen`), as it does after a publication.
     mamba_checkpoint_dropped: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.

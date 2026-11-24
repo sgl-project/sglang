@@ -1,10 +1,12 @@
 import unittest
 from array import array
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -21,15 +23,17 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import alloc_tracking_slots
-from sglang.srt.mem_cache.kv.advance import advance_tracking
+from sglang.srt.mem_cache.kv.advance import advance_tracking, retire_window_rows
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
 
@@ -39,6 +43,32 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 # The decode checkpoint grid is lcm(mamba_cache_chunk_size, tree page,
 # interval); keeping all three equal leaves it at the interval under test.
 TRACK_INTERVAL = 4
+# Shorter than the interval, so the window behind a checkpoint an interval
+# back keeps rows the request's own window does not.
+WINDOW = 2
+
+
+def _retired_up_to(req: Req, frontier: int) -> int:
+    """Where window retirement at ``frontier`` frees the request's rows up to,
+    keeping the window behind its latest checkpoint as the tree asks
+    (`UnifiedRadixCache.swa_retain_floor`)."""
+    req.kv.req_pool_idx = 0
+    retire_window_rows(
+        req,
+        frontier,
+        window_sub_pool="swa",
+        sliding_window_size=WINDOW,
+        page_size=1,
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.arange(frontier).reshape(1, -1)
+        ),
+        token_to_kv_pool_allocator=None,
+        retain_floor=UnifiedRadixCache.swa_retain_floor(
+            SimpleNamespace(is_mamba_enabled=True), req, window=WINDOW
+        ),
+        free_segment=lambda slots, start_pos: None,
+    )
+    return req.kv.get_evicted_seqlen("swa")
 
 
 def _make_batch() -> tuple[Req, ScheduleBatch]:
@@ -87,7 +117,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         ),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=SimpleNamespace(
-            page_size=TRACK_INTERVAL, window_slots=lambda: (ComponentType.SWA,)
+            page_size=TRACK_INTERVAL,
+            window_slots=lambda: (ComponentType.SWA,),
+            lease_checkpoint_state_slots=lambda reqs: nullcontext(),
         ),
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
@@ -334,6 +366,24 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 self.assertEqual(req.kv.mamba_next_track_idx, 1 if took else 0)
                 self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
 
+    def test_a_boundary_without_a_second_slot_drops_the_checkpoint(self):
+        """The boundary wrote no snapshot, so its result drops the checkpoint
+        an interval back and retirement keeps only the window."""
+        req, batch = self._make_lazy_batch(took=False)
+        self._prepare_decode(batch)
+        # _prepare_decode patches out alloc_for_decode, which commits the row.
+        req.kv.allocate_decode(1)
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            mamba_track_interval=TRACK_INTERVAL,
+            _mamba_cache_chunk_size=TRACK_INTERVAL,
+        ):
+            _make_processor().process_batch_result_decode(batch, _make_result())
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        self.assertEqual(
+            _retired_up_to(req, 2 * TRACK_INTERVAL), 2 * TRACK_INTERVAL - WINDOW
+        )
+
     def test_spec_crossing_plans_no_write_and_drops_the_checkpoint(self):
         req, batch = self._make_lazy_batch(took=False)
         batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
@@ -346,6 +396,9 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         self.assertEqual(req.kv.mamba_next_track_idx, 0)
         self.assertEqual(req.kv.mamba_last_track_idx, 0)
         self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        self.assertEqual(
+            _retired_up_to(req, 2 * TRACK_INTERVAL), 2 * TRACK_INTERVAL - WINDOW
+        )
 
     def test_eviction_frees_the_slot_before_skipping(self):
         for spec in (False, True):
@@ -374,6 +427,38 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                     self.assertEqual(batch.mamba_track_mask_cpu, [True])
                     self.assertEqual(req.kv.mamba_next_track_idx, 1)
                 self.assertEqual(evicted, [1])
+
+
+class TestMambaMixedDecodeRowAtBoundary(unittest.TestCase):
+    """A decode row of a mixed forward is not tracked (`mix_with_running`), so
+    a track boundary it reaches writes no snapshot."""
+
+    def test_the_boundary_drops_the_checkpoint(self):
+        req, decode = TestMambaLazyBoundaryWithoutSlot._make_lazy_batch(took=False)
+        batch = ScheduleBatch(
+            reqs=[req],
+            forward_mode=ForwardMode.MIXED,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            token_to_kv_pool_allocator=decode.token_to_kv_pool_allocator,
+        )
+        batch.decoding_reqs = [req]
+        # The decode row's one new row reaches the boundary.
+        batch.prefix_lens = [2 * TRACK_INTERVAL - 1]
+        batch.extend_lens = [1]
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=torch.tensor([4]),
+        )
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            mamba_track_interval=TRACK_INTERVAL,
+            _mamba_cache_chunk_size=TRACK_INTERVAL,
+        ):
+            _make_processor().process_batch_result_prefill(batch, result)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        self.assertEqual(
+            _retired_up_to(req, 2 * TRACK_INTERVAL), 2 * TRACK_INTERVAL - WINDOW
+        )
 
 
 class _StatePoolCache:

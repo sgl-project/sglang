@@ -150,9 +150,9 @@ def request_demand(
             # publication with no replacement slot inserts nothing and retires
             # behind the request's frontier (`checkpoint_into_tree`).
             # (Sub-grid chunks are cut on the grid by `mamba_prefill_chunk_grid`.)
-            # TODO: in decode, what the request's last prefill checkpoint locks
-            # stays beside its decode window; only the prefill terms below count
-            # it, and not always fully.
+            # TODO(ch-wan): in decode, what the request's last prefill checkpoint
+            # locks stays beside its decode window; only the prefill terms below
+            # count it, and not always fully.
             retained = retained_window_tokens(window, page_size)
             in_prefix = min(retained, cached_tokens)
             # Past its latest checkpoint a chunk keeps up to an interval less a

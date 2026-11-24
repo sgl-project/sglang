@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import request_demand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import (
@@ -51,6 +52,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingWriteThrough,
 )
 from sglang.srt.runtime_context import (
+    get_context,
     get_serving,
     publish,
     reset_context,
@@ -1964,6 +1966,113 @@ class TestMambaFinishedOvershootCheckpoint(
                 else:
                     self.assertIsNone(req.kv.mamba_pool_idx)
                 cache.sanity_check()
+
+
+class TestMambaCheckpointWithoutStateSlot(
+    UnifiedRadixCacheCoreFixtures, CustomTestCase
+):
+    """A running request's checkpoint no free state slot can take is not
+    published: the tree takes nothing, and the request's window retires behind
+    its own frontier."""
+
+    # The window of 7 retains 8 rows, two pages.
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        sliding_window_size=7,
+        enable_mamba_extra_buffer=True,
+        kv_size=192,
+        max_context_len=192,
+    )
+    RETAINED = 8
+
+    @staticmethod
+    def _take_free_state_slots(pool):
+        return pool.state.slots.alloc(pool.state.slots.available_size())
+
+    @staticmethod
+    def _window_held(cache, allocator):
+        """Window rows only the request holds: its own and those its tree lock
+        keeps, while no other holder locks a window."""
+        used = allocator.size_swa - allocator.swa_available_size()
+        return used - window_evictable(cache)
+
+    def test_the_window_retires_behind_the_requests_frontier(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        tokens = list(range(1, 17))
+        req, _ = self._make_inflight_req(cache, allocator, pool, tokens, allocated=True)
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        # No state slot is free, and the tree holds no state to evict.
+        self._take_free_state_slots(pool)
+
+        cache.checkpoint(req, up_to=len(tokens))
+
+        self.assertEqual(match_prefix(cache, tokens).device_prefix_len, 0)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        # Rows from 4 are the 8 retained behind row 15, in whole pages.
+        sub_pool = cache.window_sub_pools()[0][0]
+        self.assertEqual(req.kv.get_evicted_seqlen(sub_pool), 4)
+        cache.sanity_check()
+
+    def test_the_locked_segment_stays_within_the_demand(self):
+        """Chunk 1's publication fails, chunks 2 and 3 publish and every later
+        one fails: the lock keeps chunk 3's leaf and the retained window chunk 2
+        published, two retained windows less a page, which with the request's
+        own rows stays within its demand."""
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        prompt, chunk = 48, 4
+        req = self._make_req(pool)
+        req.origin_input_ids = array("q", range(1, prompt + 1))
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.output_ids = array("q")
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        peak = 0
+        with get_context().override_server_args(
+            mamba_radix_cache_strategy="extra_buffer",
+            mamba_track_interval=chunk,
+            _mamba_cache_chunk_size=chunk,
+        ):
+            for k, start in enumerate(range(0, prompt, chunk)):
+                end = start + chunk
+                rows = self._alloc(allocator, chunk)
+                pool.write((req.kv.req_pool_idx, slice(start, end)), rows)
+                req.kv.kv_allocated_len = req.kv.kv_committed_len = end
+                req.extend_end = end
+                # The chunk tracks its checkpoint at its end.
+                position = req.kv.mamba_next_track_idx
+                req.kv.mamba_last_track_seqlen = end
+                req.kv.mamba_last_track_idx = position
+                req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(
+                    position
+                )
+                peak = max(peak, self._window_held(cache, allocator))
+                fails = k == 1 or k >= 4
+                taken = self._take_free_state_slots(pool) if fails else None
+                cache.checkpoint(req, up_to=end)
+                if fails:
+                    pool.state.slots.free(taken)
+                else:
+                    # Pin the published state, so no later take evicts it.
+                    cache.lock(req.last_node, skip_lock_components=(ComponentType.SWA,))
+                peak = max(peak, self._window_held(cache, allocator))
+            demand = request_demand(
+                prompt,
+                1,
+                windows={"swa": self.cfg.sliding_window_size},
+                page_size=self.cfg.page_size,
+                prefill_retire_lag=0,
+                eviction_interval=1,
+                checkpoint_interval=cache.window_checkpoint_interval(),
+                chunk_size=chunk,
+            ).window_tokens["swa"]
+
+        self.assertEqual(
+            window_protected(cache), 2 * self.RETAINED - self.cfg.page_size
+        )
+        self.assertLessEqual(peak, demand)
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(
