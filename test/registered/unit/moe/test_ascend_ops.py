@@ -470,6 +470,7 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
     def test_decode_capture_keeps_low_latency(self):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
         dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
         hidden_states = torch.zeros((8, 4))
         topk_weights, topk_ids, _ = self._topk_output(8)
 
