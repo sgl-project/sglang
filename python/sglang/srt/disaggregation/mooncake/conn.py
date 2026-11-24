@@ -771,6 +771,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             return (-1, False)
         if ret == 0:
+            logger.info_once("[Staging] Sending KV through the decode staging buffer")
             self.send_chunk_ready(
                 room=req.room,
                 chunk_idx=chunk_idx,
@@ -875,14 +876,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             else:
                 # Without layer ids (plain MHA) pair as get_mha_kv_ptrs_with_pp does:
                 # a decode holding every layer takes this stage's slots from its start.
-                dst_num_layers = (
-                    len(self.decode_kv_args_table[mooncake_session_id].dst_kv_ptrs) // 2
-                )
+                dst_info = self.decode_kv_args_table[mooncake_session_id]
+                dst_num_layers = len(dst_info.dst_kv_ptrs) // 2
                 start = (
                     0
                     if dst_num_layers == num_layers
                     else self.kv_args.prefill_start_layer
                 )
+                # A decode's draft entries need not have staging slots, so they would
+                # shift the V offset; refuse them rather than write a wrong slot.
+                if dst_info.num_draft_entries or start + num_layers > dst_num_layers:
+                    raise RuntimeError(
+                        "Positional staging pairing does not cover this layout: "
+                        f"stage has {num_layers} layers from layer {start}, decode "
+                        f"has {dst_num_layers} layers and "
+                        f"{dst_info.num_draft_entries} draft entries"
+                    )
                 pairs = [(i, start + i) for i in range(num_layers)] + [
                     (num_layers + i, dst_num_layers + start + i)
                     for i in range(num_layers)
