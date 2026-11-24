@@ -3743,12 +3743,13 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
 
 
 class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
-    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None):
+    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None, **overrides):
         args = ServerArgs(
             model_path="dummy",
             tp_size=tp_size,
             mem_fraction_static=0.8,
             cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=max_bs)),
+            **overrides,
         )
         with (
             patch(
@@ -3787,6 +3788,14 @@ class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
     def test_explicit_ceiling_is_kept(self):
         decode = self._resolve_decode(46068, 1, max_bs=64)
         self.assertEqual((decode.max_bs, decode.bs[-1]), (64, 64))
+
+    def test_default_ceiling_is_per_rank_running_requests(self):
+        # (max_running_requests, attn_dp_size, expected max_bs); tier default is 512
+        for running, attn_dp, expected in ((768, 1, 768), (64, 1, 64), (1536, 8, 192)):
+            decode = self._resolve_decode(
+                192 * 1024, attn_dp, max_running_requests=running, attn_dp_size=attn_dp
+            )
+            self.assertEqual((decode.max_bs, decode.bs[-1]), (expected, expected))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
