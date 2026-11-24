@@ -11,7 +11,7 @@ from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 _RUNNABLE = is_hip() and is_gfx95_supported() and get_bool_env_var("SGLANG_USE_AITER")
 
