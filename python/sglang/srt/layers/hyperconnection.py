@@ -45,6 +45,12 @@ _KS_BOUNDARY_MAX_ROWS = (
     else 0
 )
 _KS_BOUNDARY_FLAGS = int(os.environ.get("SGLANG_HC_BOUNDARY_KS_FLAGS", "3"))
+# Prefill mix up + gated mean in one tcgen05 kernel (kernels/ops/gemm/hc_up_gate_tc.py) from this many rows, the down
+# GEMM + silu kept as compiled: the [rows, 10240] logits never reach memory. Bitwise to the compiled chain.
+# 0 (default) keeps the chain.
+_UP_GATE_TC_MIN_ROWS = (
+    int(os.environ.get("SGLANG_HC_UP_GATE_TC_MIN_ROWS", "0")) if _HC_MACRO and _Q38C_EXTEND_PATH else 0
+)
 _KS_BOUNDARY_BUILT: list = []
 
 
@@ -260,6 +266,8 @@ class GatedResidual(HyperConnectionBase):
     _premixed: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     # Largest write-back row count this module may run as a one-launch boundary, in either role; 0 = never.
     _ks_boundary_max_rows: int = 0
+    # Prefill mix up + gated mean as one kernel (SGLANG_HC_UP_GATE_TC_MIN_ROWS).
+    _up_gate_tc_ok: bool = False
 
     # Import-time selection keeps the disabled entry and launch body stock.
     if _Q38C_EXTEND_PATH:
@@ -457,6 +465,22 @@ class GatedResidual(HyperConnectionBase):
 
             self._mix_compute = torch.compile(_mix_compute)
             self._combine_compute = torch.compile(_combine_compute)
+            self._up_gate_tc_ok = (
+                _UP_GATE_TC_MIN_ROWS > 0
+                and self._macro_ok
+                and use_mix
+                and self._jit_mix_ok
+                and config.hc_lowrank == 320
+            )
+            if self._up_gate_tc_ok:
+
+                def _down_compute(
+                    hyper_input_normed: torch.Tensor, input_mix_weight_down: torch.Tensor, hc: int
+                ) -> torch.Tensor:
+                    # _mix_compute's first half, so t is that chain's bits.
+                    return F.silu(F.linear(hyper_input_normed, input_mix_weight_down) / hc)
+
+                self._down_compute = torch.compile(_down_compute)
     else:
         def __init__(
             self,
@@ -977,6 +1001,24 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        elif (
+            self._up_gate_tc_ok
+            and hyper_input_normed.shape[0] >= _UP_GATE_TC_MIN_ROWS
+            and hyper_input_normed.dtype == torch.bfloat16
+            and hyper_input_normed.is_contiguous()
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.gemm.hc_mix_splitk import permute_pad_up_weight
+            from sglang.kernels.ops.gemm.hc_up_gate_tc import hc_up_gate_tc
+
+            if self._mix_up_weight_padded is None:
+                self._mix_up_weight_padded = permute_pad_up_weight(
+                    self.input_mix_weight_up.weight, self.hc_count
+                )
+            t = self._down_compute(
+                hyper_input_normed, self.input_mix_weight_down.weight, self.hc_count
+            ).contiguous()
+            mixed_input = hc_up_gate_tc(t, self._mix_up_weight_padded, hyper_input_normed)
         elif fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
