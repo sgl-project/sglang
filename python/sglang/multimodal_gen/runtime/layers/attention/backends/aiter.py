@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
+    USE_AITER_GFX942,
     USE_AITER_GFX95,
     USE_AITER_GFX1250,
 )
@@ -603,9 +604,9 @@ class AITerImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         used = None
-        # gfx950 only: the batch kernels and the key split were measured there;
-        # other architectures keep the varlen kernel
-        if USE_AITER_GFX95 and cu_seqlens_host is not None:
+        # gfx942 and gfx950 only: the batch kernels and the key split were
+        # measured there; other architectures keep the varlen kernel
+        if (USE_AITER_GFX942 or USE_AITER_GFX95) and cu_seqlens_host is not None:
             if tuple(cu_seqlens_host) == (0, query.shape[0]):
                 used = query.shape[0]
             elif self.packed_trailing_padding:
