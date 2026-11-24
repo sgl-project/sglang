@@ -145,6 +145,16 @@ _QSA_DRAFT_EXTEND_UNION = envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.get()
 _DRAFT_EXTEND_UNION_LOGGED: set = set()
 
 
+def _qsa_union_prefill_for(device):
+    """SGLANG_ENABLE_QSA_UNION_PREFILL's kernel module: union_prefill_sm103 on GB300 (64-token tiles fit its
+    shared memory), union_prefill everywhere else."""
+    if torch.cuda.get_device_capability(device) == (10, 3):
+        from sglang.srt.layers.attention.qsa import union_prefill_sm103
+
+        return union_prefill_sm103
+    return qsa_union_prefill
+
+
 @lru_cache(maxsize=1)
 def _qsa_pool_decode_enabled() -> bool:
     """SGLANG_QSA_POOL_DECODE=0 restores fused_kv_prepare + trtllm decode for
@@ -2064,7 +2074,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         union.log_engaged(rows, width, kc.shape[1], q.device)
         verify = union.qsa_pool_union_decode
         if _QSA_FP8_POOL_VERIFY_WS:
-            from sglang.srt.layers.attention.qsa import pool_union_ws
+            if torch.cuda.get_device_capability(q.device) == (10, 3):
+                # GB300's ring and split choice; every other device keeps pool_union_ws.
+                from sglang.srt.layers.attention.qsa import (
+                    pool_union_ws_sm103 as pool_union_ws,
+                )
+            else:
+                from sglang.srt.layers.attention.qsa import pool_union_ws
 
             verify = pool_union_ws.qsa_pool_union_decode_ws
         return verify(
@@ -2405,7 +2421,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         if not qsa_union_prefill.kv_ok(packed_k, packed_v):
             return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
-        qsa_union_prefill.log_once(q, packed_k, topk_indices)
+        up = _qsa_union_prefill_for(q.device)
+        up.log_once(q, packed_k, topk_indices)
 
         def run_ref():
             if max_q is not None and qsa_tma_prefill.applies(
@@ -2415,7 +2432,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
 
         return qsa_union_prefill.checked(
-            lambda: qsa_union_prefill.union_prefill(
+            lambda: up.union_prefill(
                 *kernel_args, extend_lens=extend_lens, kv_max=kv_max, out=out
             ),
             run_ref,
@@ -2455,10 +2472,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         if k.ndim != 3 or v.dtype != k.dtype or not qsa_union_prefill.kv_ok(k, v):
             return None
-        qsa_union_prefill.log_once(q, k, topk_indices)
+        up = _qsa_union_prefill_for(q.device)
+        up.log_once(q, k, topk_indices)
         kv_lens = forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32)
         return qsa_union_prefill.checked(
-            lambda: qsa_union_prefill.union_prefill(
+            lambda: up.union_prefill(
                 q,
                 k,
                 v,

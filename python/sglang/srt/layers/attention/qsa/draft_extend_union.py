@@ -54,7 +54,11 @@ def attend(
     """Writes k/v_new at loc and returns the rows' sparse attention [rows, QH * D], as the stock store + packed
     trtllm decode over token_indices would (up to rounding)."""
     blocks = block_indices_of(token_indices, ratio=ratio, block_topk=block_topk)
-    return pool_union_ws.qsa_pool_union_decode_ws(
+    ws = pool_union_ws
+    if torch.cuda.get_device_capability(q.device) == (10, 3):
+        # GB300's ring and split choice; every other device keeps pool_union_ws.
+        from sglang.srt.layers.attention.qsa import pool_union_ws_sm103 as ws
+    return ws.qsa_pool_union_decode_ws(
         q,
         k_cache,
         v_cache,

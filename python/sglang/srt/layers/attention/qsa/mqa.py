@@ -1754,7 +1754,8 @@ def _grouped4_verify_applies(
         and scoring_dtype == torch.bfloat16
         and not is_hip()
         and device.type == "cuda"
-        and torch.cuda.get_device_capability(device) == (10, 7)
+        # SM103 (GB300): bit-identical to grouped v7 and faster at 24-144 requests
+        and torch.cuda.get_device_capability(device) in ((10, 7), (10, 3))
     )
 
 
