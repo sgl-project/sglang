@@ -23,17 +23,45 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
     convrot_int8_shares_input,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_xpu import (
+    _BMG_DEVICE,
     ConvRotInt8XpuLinearMethod,
     _load_xpu_kernels,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _CONFIG = (
     "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config"
 )
 _XPU = "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_xpu"
 
-requires_xpu = pytest.mark.skipif(
-    not torch.xpu.is_available(), reason="requires BMG XPU and ConvRot sgl-kernel-xpu"
+
+def _no_bmg_reason(device_index: int | None = None) -> str | None:
+    """Why the native ops cannot run on ``device_index`` (default: current)."""
+    if not torch.xpu.is_available():
+        return "requires an Intel BMG XPU"
+    if device_index is None:
+        device_index = torch.xpu.current_device()
+    if device_index >= torch.xpu.device_count():
+        return f"requires {device_index + 1} visible XPU devices"
+    try:
+        import sgl_kernel  # noqa: F401  # registers torch.ops.sgl_kernel.query_device
+    except ImportError:
+        return "requires sgl-kernel-xpu"
+    try:
+        with torch.xpu.device(device_index):
+            capability = current_platform.get_device_capability()
+    except RuntimeError:
+        # query_device raises on architectures it does not know (e.g. PVC).
+        capability = None
+    if capability != _BMG_DEVICE:
+        return f"XPU {device_index} is not Intel BMG/Xe2"
+    return None
+
+
+# The native ops are BMG-only; other XPUs (e.g. PVC, Xe3) run only the mocked tests.
+_NO_BMG_REASON = _no_bmg_reason()
+requires_bmg = pytest.mark.skipif(
+    _NO_BMG_REASON is not None, reason=_NO_BMG_REASON or ""
 )
 
 
@@ -310,7 +338,7 @@ def test_tp4_merged_qkv_and_gate_up_scales_follow_each_logical_shard(
     torch.testing.assert_close(layer.weight[:, :1], expected.to(torch.int8))
 
 
-@requires_xpu
+@requires_bmg
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_apply_rejects_non_bf16_without_fallback(dtype):
     layer = ReplicatedLinear(
@@ -325,11 +353,11 @@ def test_apply_rejects_non_bf16_without_fallback(dtype):
         layer(torch.zeros(1, 256, device="xpu", dtype=dtype))
 
 
-@requires_xpu
 @pytest.mark.parametrize("device_index", [0, 1, 2, 3])
 def test_modelopt_mixed_checkpoint_dispatch_runs_native_on_each_card(device_index):
-    if device_index >= torch.xpu.device_count():
-        pytest.skip("requires four visible XPU devices")
+    reason = _no_bmg_reason(device_index)
+    if reason is not None:
+        pytest.skip(reason)
     from sgl_kernel import convrot_int8_linear_prequant, convrot_rotate_quantize
 
     from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
@@ -365,7 +393,7 @@ def test_modelopt_mixed_checkpoint_dispatch_runs_native_on_each_card(device_inde
         assert not convrot_int8_fuses_gelu_input(layer)
 
 
-@requires_xpu
+@requires_bmg
 @pytest.mark.parametrize("offloaded", [False, True])
 def test_online_quantization_matches_serialized_layer(offloaded):
     device = torch.device("xpu", torch.xpu.current_device())
@@ -408,7 +436,7 @@ def test_online_quantization_matches_serialized_layer(offloaded):
     assert online_config._processed == 1
 
 
-@requires_xpu
+@requires_bmg
 @pytest.mark.parametrize("shape", [(256,), (0, 256), (2, 0, 256), (2, 17, 256)])
 @pytest.mark.parametrize("deferred_bias", [False, True])
 def test_forward_shapes_noncontiguous_and_bias_contract(shape, deferred_bias):
@@ -438,7 +466,7 @@ def test_forward_shapes_noncontiguous_and_bias_contract(shape, deferred_bias):
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-@requires_xpu
+@requires_bmg
 def test_layer_trace_contains_only_two_native_kernels():
     layer = ReplicatedLinear(
         256,
