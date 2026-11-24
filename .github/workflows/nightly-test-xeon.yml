@@ -125,7 +125,7 @@ jobs:
         timeout-minutes: 240
         run: |
           set -o pipefail
-          docker exec -e SGLANG_IS_IN_CI=true -e PYTHONUNBUFFERED=1 -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_XEON_NIGHTLY=true -e PYTHONUNBUFFERED=1 -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
             bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite extra-test-cpu-intel,extra-tp-test-cpu-intel --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
             2>&1 | tee "$REPORT_DIR/unit-tests.log"
 
