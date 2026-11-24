@@ -12,6 +12,7 @@ Runs on CPU: the arch is faked by patching ``current_arch()`` in the
 v41_indexer / index_logits module namespaces.
 """
 
+import os
 import unittest
 from contextlib import ExitStack
 from itertools import product
@@ -24,6 +25,7 @@ from sglang.kernels.ops.attention.dsv4 import index_logits
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import v41_indexer as indexer
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+    BlockIds,
     DenseBlocksBackend,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -178,6 +180,47 @@ class TestV41IndexerArchGates(CustomTestCase):
                     prefill.use_sm90_deep_gemm_consume,
                     deep_gemm_present and enable_consumer,
                 )
+
+    def test_hopper_prefill_consumer_scores_large_batches_against_shared_k(self):
+        backend = DenseBlocksBackend(
+            token_to_kv_pool=mock.Mock(),
+            req_to_token=torch.empty(0),
+            candidate_topk_blocks=2048,
+            candidate_block_size=8,
+            use_deep_gemm_publish=True,
+            use_deep_gemm_consume=False,
+            use_sm90_deep_gemm_consume=True,
+        )
+        with (
+            mock.patch.object(backend, "_sm90_consume_prefill") as score_fp8,
+            mock.patch.object(backend, "_torch_consume_prefill") as score_torch,
+        ):
+            for rows, context, compact in (
+                (4, 524288, True),
+                (5, 1048576, False),
+                (4, 131072, False),
+                (4, 36864, False),
+            ):
+                inputs = SimpleNamespace(seq_lens_cpu=[context], compress_ratio=1)
+                published = BlockIds(blocks=torch.empty(rows, 2048, dtype=torch.int32))
+                backend.consume_prefill(inputs, published)
+                score_fp8.assert_called_with(inputs, published, compact=compact)
+            score_torch.assert_not_called()
+
+    def test_hopper_prefill_consumer_defaults_to_deepgemm(self):
+        with (
+            self._route(_FakeCudaArch((9, 0)), deep_gemm_present=True),
+            mock.patch.dict(os.environ),
+        ):
+            os.environ.pop("SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL", None)
+            backend, _ = indexer.make_candidate_indexer(
+                token_to_kv_pool=SimpleNamespace(),
+                req_to_token=torch.empty(0),
+                page_size=64,
+                candidate_topk_blocks=2048,
+                candidate_block_size=8,
+            )
+        self.assertTrue(backend.use_sm90_deep_gemm_consume)
 
     def test_deep_gemm_prefill_still_needs_deep_gemm(self):
         with self._route(_FakeCudaArch((12, 1)), deep_gemm_present=False):

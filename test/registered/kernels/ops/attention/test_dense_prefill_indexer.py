@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
@@ -450,9 +451,15 @@ class TestDensePrefillIndexer(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_consumer_selects_published_blocks(self):
-        # Cover the all-block, wide-candidate and physically compact paths.
+        # Cover the all-block, wide-candidate, packed, and paged paths.
         # An invalid trailing candidate or wrong request offset must never be selected.
-        for context in (16, 25, 65):
+        for context, candidate_blocks, expected_k_rows in (
+            (16, 2, 19),
+            (25, 2, 28),
+            (65, 2, 68),
+            (1025, 2, 64),
+            (32769, 256, 32896),
+        ):
             with self.subTest(context=context):
                 cases = [(2, 3), (2, context)]
                 source = make_inputs(cases)
@@ -493,10 +500,11 @@ class TestDensePrefillIndexer(CustomTestCase):
 
                 backend = dense_blocks.DenseBlocksBackend(
                     token_to_kv_pool=SimpleNamespace(
-                        get_low_ratio_index_k_fp4=get_fp4_rows
+                        get_low_ratio_index_k_fp4=get_fp4_rows,
+                        source_layer_of=lambda _: 0,
                     ),
                     req_to_token=torch.empty(0, device="cuda"),
-                    candidate_topk_blocks=2,
+                    candidate_topk_blocks=candidate_blocks,
                     candidate_block_size=8,
                     use_deep_gemm_publish=True,
                     use_deep_gemm_consume=False,
@@ -519,6 +527,14 @@ class TestDensePrefillIndexer(CustomTestCase):
                     return_value=(*consumer["q"], consumer["weights"]),
                 ):
                     backend.consume_prefill(inputs, published)
+                    if context == 32769:
+                        plan = published.sm90_paged
+                        self.assertIsNotNone(plan)
+                        previous = raw.sort(dim=1).values
+                        later_layer = msgspec.structs.replace(inputs, layer_id=1)
+                        backend.consume_prefill(later_layer, published)
+                        self.assertIs(published.sm90_paged, plan)
+                        torch.testing.assert_close(raw.sort(dim=1).values, previous)
                 scores = dense_scores(consumer)
                 columns = torch.arange(scores.shape[1], device="cuda")
                 member = (
@@ -531,7 +547,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                 torch.testing.assert_close(inputs.out_page_indices, selected)
                 self.assertEqual(
                     gathers,
-                    [3 + context, rows * 16 if context >= 32 else 3 + context],
+                    [3 + context, expected_k_rows],
                 )
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")

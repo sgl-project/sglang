@@ -19,10 +19,13 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
+from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.device import async_h2d
 
 from .scoring import (
+    _DEEP_GEMM_SCORE_BUDGET_BYTES,
     DeepGEMMPrefillData,
     PagedDecodeScores,
     decode_scores,
@@ -49,6 +52,22 @@ if TYPE_CHECKING:
 # A compact DeepGEMM call packs one contiguous K range per query. Bound the
 # repeated K, including requests in the batch with disjoint candidate sets.
 _MAX_COMPACT_PREFILL_KEYS = 1 << 16
+_SM90_INDEX_K_PAGE_SIZE = 64
+_SM90_PAGED_MIN_CONTEXT = 32 * 1024
+_SM90_PAGED_SMALL_QUERY_ROWS = 128
+
+
+class _Sm90PagedCandidates(msgspec.Struct, frozen=True):
+    source_layer: int
+    k_slots: torch.Tensor
+    cache: torch.Tensor
+    context_lens: torch.Tensor
+    block_table: torch.Tensor
+    schedules: List[Tuple[slice, torch.Tensor]]
+    max_context_len: int
+    score_columns: torch.Tensor
+    positions: torch.Tensor
+    lens: torch.Tensor
 
 
 class BlockIds(CandidateMetadata, msgspec.Struct):
@@ -60,6 +79,8 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     rows_per_request: Optional[List[int]] = None
     # Hopper decode materializes this once at the source and reuses it in consumers.
     decode_mask: Optional[torch.Tensor] = None
+    # A prefill publish owns the shared K pages and their candidate-to-page map.
+    sm90_paged: Optional[_Sm90PagedCandidates] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -104,22 +125,29 @@ class DenseBlocksBackend:
         if self.use_deep_gemm_consume:
             self._deep_gemm_consume_prefill(inputs, published)
             return
+        if self.use_sm90_deep_gemm_consume and (
+            published is None or published.blocks.shape[1] == 0
+        ):
+            inputs.reset_outputs()
+            return
         if (
             self.use_sm90_deep_gemm_consume
             and published is not None
-            and published.blocks.shape[1] > 0
             and inputs.seq_lens_cpu is not None
         ):
             candidate_width = published.blocks.shape[1] * self.block_size
             context_width = max(inputs.seq_lens_cpu, default=0) // inputs.compress_ratio
-            compact = 2 * candidate_width <= context_width
-            if (
-                not compact
-                or published.blocks.shape[0] * candidate_width
-                <= _MAX_COMPACT_PREFILL_KEYS
-            ):
-                self._sm90_consume_prefill(inputs, published, compact=compact)
-                return
+            packed_keys = published.blocks.shape[0] * candidate_width
+            shared_keys = sum(
+                length // inputs.compress_ratio for length in inputs.seq_lens_cpu
+            )
+            # For narrower selections with very few query rows, packing can
+            # avoid widening the full K cache. Otherwise share K across rows.
+            compact = 2 * candidate_width <= context_width and packed_keys <= min(
+                _MAX_COMPACT_PREFILL_KEYS, shared_keys // 8
+            )
+            self._sm90_consume_prefill(inputs, published, compact=compact)
+            return
         self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
@@ -255,10 +283,25 @@ class DenseBlocksBackend:
             data.write_selection(selected, inputs)
             return
 
+        context_width = max(data.lens_per_request)
+        candidate_width = blocks.shape[1] * self.block_size
+        # With few query rows, paged scoring can parallelize over K and
+        # amortize setup across the consumers even when pages overlap heavily.
+        sparse_small_batch = (
+            data.num_rows <= _SM90_PAGED_SMALL_QUERY_ROWS
+            and 2 * candidate_width <= context_width
+        )
+        if context_width >= _SM90_PAGED_MIN_CONTEXT and (
+            sparse_small_batch
+            or blocks.shape[1] * _SM90_INDEX_K_PAGE_SIZE <= context_width
+        ):
+            self._sm90_consume_paged(inputs, data, published, blocks)
+            return
+
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        if max(data.lens_per_request, default=0) <= blocks.shape[1] * self.block_size:
+        if context_width <= candidate_width:
             # The source selected every visible block. Reuse full top-k directly.
             dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
             data.write_page_indices(inputs)
@@ -276,7 +319,136 @@ class DenseBlocksBackend:
                 data.request_starts[tile],
                 selected[tile],
             )
+            del logits, compact_scores
         data.write_selection(selected, inputs)
+
+    def _sm90_consume_paged(
+        self,
+        inputs: PrefillInputs,
+        data: DeepGEMMPrefillData,
+        published: BlockIds,
+        blocks: torch.Tensor,
+    ) -> None:
+        import deep_gemm
+
+        source_layer = self.token_to_kv_pool.source_layer_of(inputs.layer_id)
+        plan = published.sm90_paged
+        if (
+            plan is None
+            or plan.source_layer != source_layer
+            or plan.k_slots is not data.k_slots
+            or plan.context_lens.shape[0] != data.num_rows
+        ):
+            plan = self._sm90_paged_candidates(inputs, data, blocks, source_layer)
+            published.sm90_paged = plan
+
+        selected = data.empty_selection(inputs.indexer.index_topk)
+        for rows, schedule in plan.schedules:
+            q, scale = widen_fp4_to_fp8(data.q_fp4[rows], data.q_sf[rows])
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q.unsqueeze(1),
+                plan.cache,
+                data.weights[rows] * scale,
+                plan.context_lens[rows],
+                plan.block_table[rows],
+                schedule,
+                plan.max_context_len,
+                clean_logits=False,
+            )
+            scores = logits.gather(1, plan.score_columns[rows])
+            _select_candidate_positions(
+                scores,
+                plan.positions[rows],
+                plan.lens[rows],
+                data.request_starts[rows],
+                selected[rows],
+            )
+            del logits, scores
+        data.write_selection(selected, inputs)
+
+    def _sm90_paged_candidates(
+        self,
+        inputs: PrefillInputs,
+        data: DeepGEMMPrefillData,
+        blocks: torch.Tensor,
+        source_layer: int,
+    ) -> _Sm90PagedCandidates:
+        import deep_gemm
+
+        page_size = _SM90_INDEX_K_PAGE_SIZE
+        blocks_per_page = page_size // self.block_size
+        # Pad each request separately so its local positions map to whole pages.
+        page_starts = []
+        padded_slots = []
+        pages = 0
+        for slots in data.k_slots.split(data.lens_per_request):
+            page_starts.append(pages)
+            pad = -slots.numel() % page_size
+            pages += (slots.numel() + pad) // page_size
+            padded_slots.append(
+                torch.cat((slots, slots[:1].expand(pad))) if pad else slots
+            )
+        slots = padded_slots[0] if len(padded_slots) == 1 else torch.cat(padded_slots)
+        k, scale = widen_fp4_to_fp8(
+            *self.token_to_kv_pool.get_low_ratio_index_k_fp4(inputs.layer_id, slots)
+        )
+        k_bytes = k.view(torch.uint8).reshape(pages, -1)
+        scale_bytes = scale.view(torch.uint8).reshape(pages, -1)
+        cache = torch.cat((k_bytes, scale_bytes), dim=1).view(pages, page_size, 1, -1)
+        row_page_starts = torch.repeat_interleave(
+            async_h2d(page_starts, dtype=torch.int32, device=blocks.device),
+            inputs.rows_per_request_device,
+            output_size=data.num_rows,
+        )
+
+        # The publisher sorts blocks, so equal page IDs are adjacent. Duplicate
+        # blocks targeting a page write the same ID. Invalid blocks use a sink column.
+        page_ids = blocks // blocks_per_page
+        valid = (blocks >= 0) & (blocks * self.block_size < data.compress_lens[:, None])
+        new_page = valid.clone()
+        new_page[:, 1:] &= page_ids[:, 1:] != page_ids[:, :-1]
+        ordinals = new_page.cumsum(dim=1, dtype=torch.int32) - 1
+        sink = blocks.shape[1]
+        block_table = blocks.new_zeros((data.num_rows, sink + 1))
+        block_table.scatter_(
+            1,
+            ordinals.masked_fill(~valid, sink).long(),
+            (page_ids + row_page_starts[:, None]).masked_fill(~valid, 0),
+        )
+        context_lens = (ordinals[:, -1:] + 1) * page_size
+        positions, lens = _pack_candidate_positions(
+            blocks, data.compress_lens, self.block_size
+        )
+        score_columns = (
+            ordinals.clamp_min(0).repeat_interleave(self.block_size, dim=1) * page_size
+            + positions.remainder(page_size)
+        ).long()
+        max_context_len = ((sink * page_size + 255) // 256) * 256
+        rows_per_tile = max(1, _DEEP_GEMM_SCORE_BUDGET_BYTES // (4 * max_context_len))
+        schedules = []
+        num_sms = deep_gemm.get_num_sms()
+        for start in range(0, data.num_rows, rows_per_tile):
+            rows = slice(start, min(start + rows_per_tile, data.num_rows))
+            schedules.append(
+                (
+                    rows,
+                    deep_gemm.get_paged_mqa_logits_metadata(
+                        context_lens[rows], page_size, num_sms
+                    ),
+                )
+            )
+        return _Sm90PagedCandidates(
+            source_layer,
+            data.k_slots,
+            cache,
+            context_lens,
+            block_table,
+            schedules,
+            max_context_len,
+            score_columns,
+            positions,
+            lens,
+        )
 
     # ---------- torch: per-request scores ----------
 
