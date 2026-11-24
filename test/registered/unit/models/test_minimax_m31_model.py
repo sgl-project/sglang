@@ -512,7 +512,9 @@ class TestMiniMaxM31Forward(CustomTestCase):
             top_k=2,
         )
         # Not callable: a finalizing expert call would raise instead of passing.
-        experts = SimpleNamespace(forward_deferred_finalize=lambda h, topk: deferred)
+        experts = SimpleNamespace(
+            forward_deferred_finalize=lambda h, topk, pre_quant_input=None: deferred
+        )
         moe = SimpleNamespace(
             alt_stream=None,
             shared_experts=object(),
@@ -533,6 +535,94 @@ class TestMiniMaxM31Forward(CustomTestCase):
         self.assertIsInstance(result, MoeDeferredFinalize)
         self.assertIs(result.gated_shared_output, shared)
         self.assertEqual(result.routed_output.data_ptr(), deferred.gemm2_out.data_ptr())
+
+    def test_router_quant_overlap_passes_pre_quant_with_ready_event(self):
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+
+        x = torch.ones(2, 16, dtype=torch.bfloat16)
+        fake_event = object()
+        fake_stream = SimpleNamespace(
+            wait_stream=lambda s: None,
+            record_event=lambda: fake_event,
+        )
+        fake_pre_quant = flashinfer_trtllm.Nvfp4PerTokenInputPreQuant(
+            torch.zeros(2, 8, dtype=torch.uint8),
+            torch.zeros(2, 1, dtype=torch.uint8),
+            torch.ones(2, dtype=torch.float32),
+        )
+        seen_pre_quant = []
+
+        class _FakeStreamCtx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *args):
+                return False
+
+        moe = SimpleNamespace(
+            alt_stream=fake_stream,
+            shared_experts=object(),
+            router_quant_overlap=True,
+            _forward_shared_experts=lambda h: torch.zeros_like(h),
+            _compute_router_logits=lambda h: None,
+            topk=lambda h, logits: None,
+            experts=lambda h, topk, pre_quant_input=None: (
+                seen_pre_quant.append(pre_quant_input) or torch.zeros_like(h)
+            ),
+        )
+        moe._forward_router_experts = partial(
+            minimax_m3.MiniMaxM3MoE._forward_router_experts, moe
+        )
+
+        with (
+            patch.object(
+                minimax_m3,
+                "get_forward",
+                return_value=SimpleNamespace(defer_moe_finalize=False),
+            ),
+            patch.object(minimax_m3, "get_is_capture_mode", return_value=True),
+            patch.object(minimax_m3, "is_in_breakable_cuda_graph", return_value=False),
+            patch.object(
+                minimax_m3, "is_in_tc_piecewise_cuda_graph", return_value=False
+            ),
+            patch.object(torch.cuda, "current_stream", return_value=fake_stream),
+            patch.object(torch.cuda, "stream", return_value=_FakeStreamCtx()),
+            patch.object(
+                flashinfer_trtllm,
+                "quantize_nvfp4_per_token_input",
+                return_value=fake_pre_quant,
+            ),
+        ):
+            minimax_m3.MiniMaxM3MoE.forward_normal(moe, x)
+        self.assertEqual(len(seen_pre_quant), 1)
+        self.assertIsInstance(
+            seen_pre_quant[0], flashinfer_trtllm.Nvfp4PerTokenInputPreQuant
+        )
+        self.assertIs(seen_pre_quant[0].ready, fake_event)
+
+        # Under TC piecewise CUDA graph, pre_quant must be skipped (not duplicated).
+        seen_pre_quant.clear()
+        with (
+            patch.object(
+                minimax_m3,
+                "get_forward",
+                return_value=SimpleNamespace(defer_moe_finalize=False),
+            ),
+            patch.object(minimax_m3, "get_is_capture_mode", return_value=True),
+            patch.object(minimax_m3, "is_in_breakable_cuda_graph", return_value=False),
+            patch.object(
+                minimax_m3, "is_in_tc_piecewise_cuda_graph", return_value=True
+            ),
+            patch.object(torch.cuda, "current_stream", return_value=fake_stream),
+            patch.object(torch.cuda, "stream", return_value=_FakeStreamCtx()),
+            patch.object(
+                flashinfer_trtllm,
+                "quantize_nvfp4_per_token_input",
+                side_effect=AssertionError("should not pre-quant under TC piecewise"),
+            ),
+        ):
+            minimax_m3.MiniMaxM3MoE.forward_normal(moe, x)
+        self.assertEqual(seen_pre_quant, [None])
 
     def test_attention_dp_norms_keep_bf16(self):
         """Under attention DP the norms keep bf16, since the DP gather after them takes a
