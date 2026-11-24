@@ -3047,7 +3047,7 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
-                    query_layout=decode_dp,
+                    **({"query_layout": decode_dp} if decode_dp is not None else {}),
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
