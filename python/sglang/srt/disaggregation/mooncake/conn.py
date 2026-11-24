@@ -3525,8 +3525,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                 # A room started anew since this chunk was counted no longer
                 # counts it: the decrement and the report find nothing.
-                if kv_chunk.room in self._staging_outstanding:
-                    self._add_staging_outstanding(kv_chunk.room, -1)
+                self._add_staging_outstanding(kv_chunk.room, -1, if_counted=True)
                 self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,

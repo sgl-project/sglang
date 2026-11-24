@@ -9,12 +9,14 @@ before both have concluded would let a stage free KV pages and the metadata slot
 its transfer still reads.
 
 The stress mixes completed requests with requests aborted at spread-out delays,
-so aborts land during prefill, during the KV transfer and after it. Afterwards
-both servers must be up and idle with no leaked pages (the strict idle memory
-check is on by default), and fixed prompts must give the same greedy output as
-before the stress.
+so aborts land during prefill, during the KV transfer and after it. Rounds repeat
+until the decode has logged at least one request aborted while it was receiving
+its KV. Afterwards both servers must be up and idle with no leaked pages (the
+strict idle memory check is on by default), and fixed prompts must give the same
+greedy output as before the stress.
 """
 
+import re
 import threading
 import time
 import unittest
@@ -36,7 +38,9 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=240, stage="extra-b", runner_config="4-gpu-h100")
 
-_ROUNDS = 3
+_MIN_ROUNDS = 3
+# Measured: 8 of 48 aborts landed mid-transfer in 3 rounds; 8 rounds leave margin.
+_MAX_ROUNDS = 8
 _REQUESTS_PER_ROUND = 32
 # Delays for the aborted half: from mid-prefill to after the KV has landed.
 _ABORT_DELAYS_S = (0.2, 0.35, 0.5, 0.7, 0.9, 1.2, 1.6, 2.0)
@@ -69,6 +73,13 @@ def _generate(url, rid, text, timeout=180):
     )
 
 
+# decode.py logs this when a request in the decode transfer queue concludes
+# Failed; an abort there records "Aborted by AbortReq." on its receiver.
+_TRANSFER_ABORT = re.compile(
+    r"Decode transfer failed for request .*rid='([^']+)'.*Aborted by AbortReq"
+)
+
+
 def _finish_type(response):
     if response.status_code != 200:
         return None
@@ -77,6 +88,7 @@ def _finish_type(response):
 
 
 class TestDisaggregationPPPrefillRelease(PDDisaggregationServerBase):
+    capture_per_side_logs = True
     decode_tp_size = 1
     decode_base_gpu_id = 2
 
@@ -160,22 +172,28 @@ class TestDisaggregationPPPrefillRelease(PDDisaggregationServerBase):
             self.assertFalse(thread.is_alive(), "a request or abort hung")
         return results, set(aborted)
 
+    def _aborted_in_transfer(self):
+        log = self._decode_stdout_buf.getvalue() + self._decode_stderr_buf.getvalue()
+        return set(_TRANSFER_ABORT.findall(log))
+
     def test_release_waits_for_every_stage_under_aborts(self):
         before = self._reference_outputs()
 
-        num_aborted = 0
-        for round_idx in range(_ROUNDS):
+        in_transfer = set()
+        for round_idx in range(_MAX_ROUNDS):
             results, aborted = self._stress_round(round_idx)
             for rid, response in results.items():
-                self.assertNotIsInstance(response, Exception, f"{rid}: {response!r}")
+                # An aborted request may end in any way, even a dropped connection.
                 if rid in aborted:
-                    # An abort that lands after the request finished leaves it done.
-                    if _finish_type(response) != "length":
-                        num_aborted += 1
                     continue
+                self.assertNotIsInstance(response, Exception, f"{rid}: {response!r}")
                 self.assertEqual(response.status_code, 200, f"{rid}: {response.text}")
                 self.assertEqual(_finish_type(response), "length", response.text)
-        self.assertGreater(num_aborted, 0, "no abort landed before its request ended")
+            in_transfer |= aborted & self._aborted_in_transfer()
+            if round_idx + 1 >= _MIN_ROUNDS and in_transfer:
+                break
+        print(f"{len(in_transfer)} requests aborted while decode received their KV")
+        self.assertTrue(in_transfer, "no abort landed while decode received the KV")
 
         # Idle long enough for both servers' idle memory check to run.
         time.sleep(10)

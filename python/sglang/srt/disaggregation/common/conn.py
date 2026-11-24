@@ -461,7 +461,10 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
-        self._staging_outstanding: Dict[int, int] = defaultdict(int)
+        # Change only through _add_staging_outstanding / _pop_staging_outstanding:
+        # under PP they also sync the room's held flag, under _staging_lock.
+        self._staging_outstanding: Dict[int, int] = {}
+        self._staging_lock = threading.Lock()
         self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
@@ -506,9 +509,6 @@ class CommonKVManager(BaseKVManager):
                 self.request_status = PPConsensusStore(
                     self.pp_size, self.pp_rank, self.pp_group
                 )
-                # Under PP every staging-count change also replicates the room's
-                # held flag; the lock keeps the two in step across threads.
-                self._staging_lock = threading.Lock()
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -741,27 +741,29 @@ class CommonKVManager(BaseKVManager):
             self.defer_decode_allocation and bootstrap_room in self._staging_outstanding
         )
 
-    def _add_staging_outstanding(self, room: int, delta: int) -> int:
+    def _add_staging_outstanding(
+        self, room: int, delta: int, *, if_counted: bool = False
+    ) -> int:
         """Add delta to the room's count of staging chunks dequeued and not yet
-        finished, and return the new count. Counts change only here and in
-        _pop_staging_outstanding."""
-        if not isinstance(self.request_status, PPConsensusStore):
-            count = self._staging_outstanding.get(room, 0) + delta
+        finished, and return the new count. A room not counted yet starts at 0,
+        or, with if_counted, stays uncounted (returns 0)."""
+        pp = isinstance(self.request_status, PPConsensusStore)
+        with self._staging_lock if pp else nullcontext():
+            count = self._staging_outstanding.get(room)
+            if count is None and if_counted:
+                return 0
+            count = (count or 0) + delta
             self._staging_outstanding[room] = count
-            return count
-        with self._staging_lock:
-            count = self._staging_outstanding.get(room, 0) + delta
-            self._staging_outstanding[room] = count
-            self._sync_staging_held(room)
+            if pp:
+                self._sync_staging_held(room)
         return count
 
     def _pop_staging_outstanding(self, room: int) -> None:
-        if not isinstance(self.request_status, PPConsensusStore):
+        pp = isinstance(self.request_status, PPConsensusStore)
+        with self._staging_lock if pp else nullcontext():
             self._staging_outstanding.pop(room, None)
-            return
-        with self._staging_lock:
-            self._staging_outstanding.pop(room, None)
-            self._sync_staging_held(room)
+            if pp:
+                self._sync_staging_held(room)
 
     def _sync_staging_held(self, room: int) -> None:
         """PP only: PP0 decides the release for every stage, so each stage

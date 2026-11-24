@@ -330,13 +330,11 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
             self.assertEqual(self.pp1.store[_pp_held_key(41)], 1)
             release()
             self.assertEqual(self.pp1.store[_pp_held_key(41)], 0)
-        # With deferred allocation the room holds until its count is popped.
-        mgr.defer_decode_allocation = True
-        mgr._add_staging_outstanding(41, 1)
-        mgr._add_staging_outstanding(41, -1)
-        self.assertEqual(self.pp1.store[_pp_held_key(41)], 1)
+        # A guarded decrement of a room that is no longer counted leaves it
+        # uncounted, instead of recording -1.
         mgr._pop_staging_outstanding(41)
-        self.assertEqual(self.pp1.store[_pp_held_key(41)], 0)
+        self.assertEqual(mgr._add_staging_outstanding(41, -1, if_counted=True), 0)
+        self.assertNotIn(41, mgr._staging_outstanding)
 
     def test_idle_iteration_sends_nothing(self):
         self.assertEqual(self._iterate(), ([], []))
