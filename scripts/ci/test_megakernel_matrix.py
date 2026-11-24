@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only checks for model selection and the GPU-runner allowlist."""
+"""CPU-only checks for runner selection and workflow cleanup."""
 
 import contextlib
 import io
@@ -14,6 +14,18 @@ from megakernel_matrix import LEGACY, build_matrix
 
 
 class TestMegakernelMatrix(unittest.TestCase):
+    def test_workflow_always_removes_plugin_after_saving_evidence(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/pr-test-megakernel.yml"
+        )
+        steps = yaml.safe_load(workflow.read_text())["jobs"]["test"]["steps"]
+        self.assertTrue(steps[-2]["uses"].startswith("actions/upload-artifact@"))
+        self.assertEqual(steps[-1]["if"], "always()")
+        self.assertEqual(
+            steps[-1]["run"], "python3 -m pip uninstall -y sgl-nvidia-mega"
+        )
+
     def test_routing_selection_and_fail_closed_inputs(self):
         with (
             tempfile.TemporaryDirectory() as directory,

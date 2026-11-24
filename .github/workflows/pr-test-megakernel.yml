@@ -128,3 +128,7 @@ jobs:
           name: megakernel-e2e-${{ matrix.runner }}
           path: ${{ runner.temp }}/megakernel-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
+
+      - name: Uninstall sgl-nvidia-mega
+        if: always()
+        run: python3 -m pip uninstall -y sgl-nvidia-mega
