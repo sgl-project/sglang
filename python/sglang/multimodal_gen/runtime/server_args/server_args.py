@@ -97,6 +97,7 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import validate_env_values
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
@@ -721,6 +722,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
         if timeout is not None and (
