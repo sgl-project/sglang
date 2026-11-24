@@ -769,6 +769,13 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req.last_node = cache.root_node_handle()
         preexisting_slot = req.kv.mamba_pool_idx
         self.assertIsNotNone(preexisting_slot)
+        # A held slot is left unmarked after an unadmitted pass, and a source
+        # staged earlier may remain: the refusal must reset both.
+        req.kv.mamba_needs_clear = False
+        req.kv.mamba_cow_src_index = node_device_value(
+            cache, chain[0], ComponentType.MAMBA
+        )
+        self.assertIsNotNone(req.kv.mamba_cow_src_index)
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
