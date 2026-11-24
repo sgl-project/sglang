@@ -3314,6 +3314,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             and not batch.return_logprob
             and batch.hisparse_coordinator is None
             and get_global_experts_capturer() is None
+            and get_global_indexer_capturer() is None
             and bs <= tree_max_batch(self.model_runner)
         )
         draft = self._draft_block(batch, draft_input, bs, tree=want_tree)
