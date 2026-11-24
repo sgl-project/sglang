@@ -220,9 +220,15 @@ impl ChatModel {
         let name = reasoning_parser?;
         let default = match think_config(name) {
             Some(config) => config.reasoning_default(),
-            // `DeepSeekV4Detector.reasoning_default`, which Python reads when recipe parses.
+            // The DeepSeek recipe renders the prompt's thinking from the
+            // kwargs (request, then the server defaults already merged into
+            // `kwargs`) and otherwise from `SGLANG_DEFAULT_THINKING`
+            // (`deepseek_v4::thinking`, `serving_chat._thinking_requested`).
+            // `require_reasoning` must agree with that prompt: a reply that
+            // starts in reasoning gets its grammar after `</think>`, one that
+            // starts answering gets it from the first token.
             None if self.recipe_parses_output(Some(name), None) == Ok(true) => {
-                ReasoningDefault::off_unless("thinking")
+                ReasoningDefault::off_unless_env("thinking", env_default_thinking())
             }
             None => return None,
         };
@@ -252,6 +258,13 @@ impl ChatModel {
         );
         self.thinking(reasoning_parser, &kwargs)
     }
+}
+
+/// `SGLANG_DEFAULT_THINKING`: the server's default for the DeepSeek recipe's
+/// thinking toggle when neither the request nor the default kwargs set it.
+pub(crate) fn env_default_thinking() -> bool {
+    std::env::var("SGLANG_DEFAULT_THINKING")
+        .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
 }
 
 /// `_process_messages`' template kwargs: the request's, then the thinking toggle
@@ -1667,7 +1680,16 @@ mod tests {
             chat_encoding_spec: Some("dsv4".into()),
             ..ChatModel::default()
         };
-        assert_eq!(dsv4.thinking(Some("deepseek-v4"), &Map::new()), Some(false));
+        // The DeepSeek recipe follows the prompt it rendered: off unless the
+        // kwargs (or SGLANG_DEFAULT_THINKING, unset here) turn thinking on.
+        assert_eq!(
+            dsv4.thinking(Some("deepseek-v4"), &Map::new()),
+            Some(env_default_thinking())
+        );
+        let on = Map::from_iter([("thinking".to_owned(), Value::Bool(true))]);
+        assert_eq!(dsv4.thinking(Some("deepseek-v4"), &on), Some(true));
+        let off = Map::from_iter([("thinking".to_owned(), Value::Bool(false))]);
+        assert_eq!(dsv4.thinking(Some("deepseek-v4"), &off), Some(false));
     }
 
     /// The reason `messages` is not lowered, with a renderer that accepts anything.

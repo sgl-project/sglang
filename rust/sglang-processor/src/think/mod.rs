@@ -115,7 +115,7 @@ pub(crate) struct TagConfig {
 }
 
 /// A detector's `reasoning_default`: reasoning is `on` unless `kwarg` says
-/// otherwise (`"enable_thinking"`), or off unless it does (`"explicit_thinking"`).
+/// otherwise (`"enable_thinking"`).
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(feature = "openai"), allow(dead_code))]
 pub(crate) struct ReasoningDefault {
@@ -128,9 +128,12 @@ impl ReasoningDefault {
         Self { kwarg, on: true }
     }
 
+    /// Off unless the kwarg turns it on; `env_on` (the server's
+    /// `SGLANG_DEFAULT_THINKING`) flips the default, as it does for the
+    /// DeepSeek recipe's prompt (`deepseek_v4::thinking`).
     #[cfg(feature = "openai")]
-    pub(crate) const fn off_unless(kwarg: &'static str) -> Self {
-        Self { kwarg, on: false }
+    pub(crate) const fn off_unless_env(kwarg: &'static str, env_on: bool) -> Self {
+        Self { kwarg, on: env_on }
     }
 
     /// `_get_reasoning_from_request` for a template without a reasoning config.

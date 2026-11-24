@@ -3609,6 +3609,13 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self._encoding_adapter is not None:
+            # A custom encoder (the DeepSeek recipe among them) renders the
+            # prompt from `_thinking_requested`: the reply starts in reasoning
+            # exactly when that was on, so `require_reasoning` follows it
+            # rather than the detector's own default.
+            return self._thinking_requested(request)
+
         if self.reasoning_parser == "iquest_q1":
             return IQuestQ1ReasoningDetector.thinking_enabled(
                 request.chat_template_kwargs or {}
