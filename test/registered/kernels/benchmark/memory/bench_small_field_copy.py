@@ -52,7 +52,9 @@ def torch_foreach_copy(dsts, srcs):
 
 @marker.parametrize("sampling", ["greedy", "sampled"])
 @marker.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64], [1, 16])
-@marker.benchmark("impl", ["per_element", "vec16", "torch_foreach"])
+@marker.benchmark(
+    "impl", ["per_element", "vec16", "torch_foreach"], gate=["per_element", "vec16"]
+)
 def benchmark(batch_size: int, sampling: str, impl: str):
     torch.manual_seed(42)
     dsts, srcs = make_post_verify_inputs(batch_size, sampling)

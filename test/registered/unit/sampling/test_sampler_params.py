@@ -57,6 +57,22 @@ class TestSamplerParamsPool(CustomTestCase):
         for field in (params.temperatures, params.top_ps, params.top_ks, params.min_ps):
             self.assertTrue(field.is_contiguous())
 
+    def test_unchanged_batch_reuses_its_params_until_a_write(self):
+        pool = SamplerParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool.write([_req(1, temperature=0.7), _req(4, top_k=1)])
+
+        first = _gather(pool, [1, 4])
+        self.assertIs(_gather(pool, [1, 4]), first)
+        self.assertIsNot(_gather(pool, [4, 1]), first)
+
+        after_slot_change = _gather(pool, [1, 4])
+        self.assertIsNot(after_slot_change, first)
+        pool.write([_req(4, temperature=1.2)])
+        params = _gather(pool, [1, 4])
+        self.assertIsNot(params, after_slot_change)
+        self.assertAlmostEqual(params.temperatures[1].item(), 1.2, places=6)
+        self.assertFalse(params.is_any_greedy)
+
     def test_rewritten_slot_reads_the_new_request(self):
         """A freed slot that a later admission reuses holds the new request's
         params, host flags included."""
