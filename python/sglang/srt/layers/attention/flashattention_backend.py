@@ -108,6 +108,31 @@ def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)
 
 
+def _dense_extend_wins(
+    *, extend_lens, prefix_lens, num_q_heads, num_kv_heads, head_dim
+) -> bool:
+    """Whether copying an extend's paged K/V out for the dense SM12x FA4 call pays off."""
+    # The dense kernel saves time with the attention FLOPs (QK and PV); the copy costs
+    # its bytes (bf16 K and V) plus a launch measured at about 4 MiB of them.
+    work = sum(q * (p + q / 2) for q, p in zip(extend_lens, prefix_lens))
+    copy_bytes = 4 * (sum(extend_lens) + sum(prefix_lens)) * num_kv_heads * head_dim
+    # FLOPs per copied byte, above the break-even measured on RTX PRO 5000 at head_dim
+    # 64, 128 and 256; the paged kernel runs 256 on a narrower pipeline.
+    threshold = 4096 if head_dim == 256 else 8192
+    # Measured there: past 256 MiB the saving shrinks, and at 1 GiB the copy costs more.
+    return (
+        copy_bytes <= 256 << 20
+        and 4 * head_dim * work * num_q_heads >= (copy_bytes + (4 << 20)) * threshold
+    )
+
+
+def _dense_kv_slots(*, page_table, seq_lens, cu_seqlens_k, num_keys, page_size):
+    """Pool slot of every key the paged call reads, request after request."""
+    req = torch.repeat_interleave(seq_lens, output_size=num_keys)
+    pos = torch.arange(num_keys, device=seq_lens.device) - cu_seqlens_k[req]
+    return page_table[req, pos // page_size] * page_size + pos % page_size
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -165,6 +190,9 @@ class FlashAttentionMetadata:
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
+    # Set when an extend gathers its paged K/V for the dense kernel; see _dense_kv_slots.
+    dense_kv_slots: Optional[torch.Tensor] = None
+
 
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
@@ -192,6 +220,7 @@ class FlashAttentionBackend(AttentionBackend):
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
     _draft_kv_ring: Optional[DFlashDraftKVRing] = None
     _ring_page_cols: Optional[torch.Tensor] = None
+    _gathers_extend_kv: bool = False
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
@@ -387,6 +416,15 @@ class FlashAttentionBackend(AttentionBackend):
             self._decode_uses_static_max_seqlen_k = (
                 runtime_policy.decode_uses_static_max_seqlen_k
             )
+        # SM12x paged FA4 loads K/V row by row through the page table, the dense call by TMA.
+        self._gathers_extend_kv = (
+            self.fa_impl_ver == 4
+            and device_capability[0] == 12
+            and self.kv_cache_dtype == torch.bfloat16
+            and not self.use_mla
+            # The choice depends on the batch; deterministic inference keeps one kernel.
+            and not deterministic
+        )
         # Set (never getattr'd) so forward_extend can identity-check "is this the
         # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
         # block-schedule cache (see forward_extend rel_bias handling).
@@ -1496,6 +1534,30 @@ class FlashAttentionBackend(AttentionBackend):
             self._fill_ring_page_table(forward_batch.req_pool_indices, page_table)
             metadata.page_table = page_table
 
+        if (
+            self._gathers_extend_kv
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            # MLP-sync padding and context parallel change the rows these lengths cover.
+            and forward_batch.global_num_tokens_cpu is None
+            and not is_cp_active(forward_batch)
+            and any(forward_batch.extend_prefix_lens_cpu)
+            and _dense_extend_wins(
+                extend_lens=forward_batch.extend_seq_lens_cpu,
+                prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                num_q_heads=self.num_attention_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+        ):
+            metadata.dense_kv_slots = _dense_kv_slots(
+                page_table=metadata.page_table,
+                seq_lens=metadata.cache_seqlens_int32,
+                cu_seqlens_k=metadata.cu_seqlens_k,
+                num_keys=sum(forward_batch.extend_prefix_lens_cpu)
+                + sum(forward_batch.extend_seq_lens_cpu),
+                page_size=self.page_size,
+            )
+
         self.forward_metadata = metadata
 
     def get_paged_mha_kv_cache(
@@ -2060,6 +2122,40 @@ class FlashAttentionBackend(AttentionBackend):
                         ),
                         verify=True,
                     )
+                )
+            elif (
+                metadata.dense_kv_slots is not None
+                and causal
+                and window_size == (-1, -1)
+                and not use_local_attn
+                and not layer.logit_cap
+                and not return_lse
+                # No sinks, score or mask mod, descale or relative bias.
+                and kwargs.keys() <= {"pack_gqa"}
+                # A piecewise prefill graph pads q past the real tokens.
+                and q.shape[0] == forward_batch.extend_num_tokens
+                # Slot-major pools only; an HND page cannot be flattened into slots.
+                and key_cache.stride(0) == self.page_size * key_cache.stride(1)
+                # The copy was sized from the model's head layout.
+                and layer.tp_k_head_num == self.num_kv_heads
+                and layer.head_dim == layer.v_head_dim == self.head_dim
+            ):
+                slots = metadata.dense_kv_slots
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                result = self.flash_attn_varlen_func(
+                    q=q,
+                    k=key_cache.flatten(0, 1).index_select(0, slots),
+                    v=value_cache.flatten(0, 1).index_select(0, slots),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=metadata.max_seq_len_k,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    num_splits=num_splits,
+                    out=_fa_out,
+                    **kwargs,
+                    ver=ver,
                 )
             else:
                 q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
