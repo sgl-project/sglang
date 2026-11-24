@@ -593,6 +593,15 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   const rowVisible = (spec, sel) =>
     (typeof spec.showWhen !== "function" || spec.showWhen(sel)) &&
     visibleOptions(spec, sel).length > 0;
+  // Recipe-rating key for a selection: every dim that shapes the command, i.e.
+  // the match dims plus the overlay dims whose row is showing (an overlay such
+  // as speculative decoding changes the command, so its on and off states are
+  // rated apart). docs/scripts/export_rating_ids.mjs enumerates these keys
+  // into the allowlist the rating service accepts votes for.
+  const ratingKey = (sel) =>
+    [...DIMENSIONS, ...overlayDimSpecs.filter((d) => rowVisible(d, sel)).map((d) => d.id)]
+      .map((d) => `${d}=${sel[d]}`)
+      .join("&");
   const overlayPick = (sel) => {
     const picked = [];
     for (const spec of (config.overlayDims || [])) {
@@ -1545,6 +1554,65 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     : findCell(config.cells, sel);
   const builderMeta = (cell && cell.builder) || {};
   const verifyStatus = cellVerifyStatus(cell, sel);
+
+  // ==== Recipe ratings (👍/👎 per cell) ====
+  // Votes live in an external service; the browser talks to it directly.
+  // Off when the endpoint is empty, for builder pages (no discrete cells to
+  // rate), or when a page sets `config.ratings: false`.
+  const RATINGS_ENDPOINT = "";
+  const ratingsEnabled =
+    !!RATINGS_ENDPOINT && !commandBuilder && config.ratings !== false;
+  // Keyed by page path + ratingKey(sel) (see the engine). The path is read
+  // after mount because the static render has no window.
+  const [ratingPath, setRatingPath] = useState(null);
+  useEffect(() => {
+    setRatingPath(window.location.pathname.replace(/\/+$/, "").toLowerCase() || "/");
+  }, []);
+  const recipeId =
+    ratingsEnabled && ratingPath && cell && !cell.redirect
+      ? `${ratingPath}|${ratingKey(sel)}`
+      : null;
+  // Fingerprint of the command the reader saw, stored with each vote so votes
+  // cast before a recipe fix can be told apart from votes cast after it.
+  const recipeFingerprint = (() => {
+    if (!recipeId) return "";
+    let h = 0x811c9dc5; // FNV-1a, 32-bit
+    const text = overlayCompose(cell.flags, sel).join("\n");
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  })();
+  // {up, down, mine} from the service; null while loading or unavailable.
+  const [rating, setRating] = useState(null);
+  const [ratingBusy, setRatingBusy] = useState(false);
+  useEffect(() => {
+    setRating(null);
+    if (!recipeId) return;
+    const ctrl = new AbortController();
+    fetch(`${RATINGS_ENDPOINT}?id=${encodeURIComponent(recipeId)}`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setRating(data); })
+      .catch(() => {}); // A down rating service must never break the page.
+    return () => ctrl.abort();
+  }, [recipeId]);
+  const castVote = (vote) => {
+    if (!recipeId || !rating || ratingBusy) return;
+    // Clicking the active thumb again withdraws the vote.
+    const next = rating.mine === vote ? "none" : vote;
+    setRatingBusy(true);
+    fetch(RATINGS_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: recipeId, vote: next, fp: recipeFingerprint }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setRating(data); })
+      .catch(() => {})
+      .finally(() => setRatingBusy(false));
+  };
+
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free. Cells sizing the pool
   // with --max-mamba-cache-size opt out.
@@ -2601,6 +2669,36 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               </div>
             )}
           </>)}
+        {recipeId && rating && (
+          <div
+            style={{
+              display: "flex", alignItems: "center", gap: "8px",
+              marginTop: "8px", fontSize: "12px",
+              color: isDark ? "#9ca3af" : "#6b7280",
+            }}
+          >
+            <span>Did this recipe work for you?</span>
+            {[["up", "👍"], ["down", "👎"]].map(([vote, icon]) => (
+              <button
+                key={vote}
+                type="button"
+                disabled={ratingBusy}
+                aria-pressed={rating.mine === vote}
+                aria-label={vote === "up" ? "This recipe worked" : "This recipe did not work"}
+                onClick={() => castVote(vote)}
+                style={{
+                  ...s.iconButton,
+                  ...(rating.mine === vote
+                    ? { borderColor: isDark ? "#FDBA74" : "#C2410C", fontWeight: 600 }
+                    : {}),
+                  opacity: ratingBusy ? 0.6 : 1,
+                }}
+              >
+                {icon} {rating[vote]}
+              </button>
+            ))}
+          </div>
+        )}
         </div>
       </div>
 
