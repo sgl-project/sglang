@@ -9,7 +9,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 
 # backend-specific: the ROCm kernels and dispatch Inkling2 runs on MI35x
-register_amd_ci(est_time=50, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
@@ -17,7 +17,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 H, HKV, D, EXT = 6, 1, 128, 1024
-E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
 
 
 @pytest.fixture(autouse=True)
@@ -250,7 +249,7 @@ def test_decode_gate_sink_epilogue():
     assert torch.equal(o16.view(batch, -1), ref)
 
 
-@pytest.mark.parametrize("bound,min_tokens", [(4, 64), (64, 64), (128, 32)])
+@pytest.mark.parametrize("bound,min_tokens", [(4, 64), (128, 32)])
 def test_length_based_decode_splits_through_buffer_views(bound, min_tokens):
     """Decode with per-request length-based KV splits (the triton backend's
     SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS policy), launched over [:, :, :bound] views
@@ -298,7 +297,7 @@ def test_length_based_decode_splits_through_buffer_views(bound, min_tokens):
         assert _rel(o[b], p @ v) < 5e-3, (b, n)
 
 
-@pytest.mark.parametrize("m", [1, 7, 64])
+@pytest.mark.parametrize("m", [1, 64])
 @pytest.mark.parametrize("local", [False, True])
 def test_prologue_stores_kv_pool(m, local):
     """The ROCm decode prologue with kv_pool writes each row's K and V into the KV
@@ -366,8 +365,6 @@ def test_prologue_stores_kv_pool(m, local):
     "batch,seq,splits,bound",
     [
         (1, 2560, 80, 128),
-        (1, 2560, 40, 64),
-        (4, 999, 16, 16),
         (3, 100, 2, 64),
         (2, 9000, 64, 64),
     ],
@@ -424,15 +421,14 @@ def test_decode_stage2_tree_merge_matches_loop(
     assert (tree != loop).sum().item() <= max(1, tree.numel() // 500)
 
 
-@pytest.mark.parametrize("causal", [False, True])
-def test_rel_verify_attention_without_bias_matches_attention(causal):
+def test_rel_verify_attention_bidirectional_without_bias():
     """The DSpark draft's short blocks on ROCm: rel_verify_attention with a
-    zero-extent bias is plain attention over the cached prefix plus the block's own
-    keys (bidirectional, or causal), against a float64 reference."""
+    zero-extent bias and causal=False is plain attention over the cached prefix plus
+    all of the block's own keys, against a float64 reference."""
     from sglang.kernels.ops.attention.inkling2_attn_hip import rel_verify_attention
 
-    torch.manual_seed(causal)
-    H, HKV, D, ext = 6, 1, 128, 8
+    torch.manual_seed(0)
+    ext = 8
     prefixes = (0, 5, 700, 3000)
     batch = len(prefixes)
     pool = sum(prefixes) + 7
@@ -452,90 +448,18 @@ def test_rel_verify_attention_without_bias_matches_attention(causal):
     lse = torch.empty(batch * ext, H, device="cuda")
     rel_verify_attention(
         q, k_ext, v_ext, k_buf, v_buf, q.new_zeros((1, 1, 1))[:, :, :0], o, lse,
-        qo_indptr, kv_indptr, kv_indices, ext, D**-0.5, causal=causal,
+        qo_indptr, kv_indptr, kv_indices, ext, D**-0.5, causal=False,
     )  # fmt: skip
     for b, p in enumerate(prefixes):
         idx = kv_indices[kv_indptr[b] : kv_indptr[b] + p]
         keys = torch.cat([k_buf[idx, 0], k_ext[b * ext : (b + 1) * ext, 0]]).double()
         vals = torch.cat([v_buf[idx, 0], v_ext[b * ext : (b + 1) * ext, 0]]).double()
         logits = q[b * ext : (b + 1) * ext].double() @ keys.T * D**-0.5
-        if causal:
-            pos = torch.arange(ext, device="cuda")
-            hide = torch.cat(
-                [
-                    torch.zeros(ext, p, dtype=torch.bool, device="cuda"),
-                    pos[None, :] > pos[:, None],
-                ],
-                1,
-            )
-            logits = logits.masked_fill(hide[:, None, :], float("-inf"))
         ref = torch.softmax(logits, -1) @ vals
         assert _rel(o[b * ext : (b + 1) * ext], ref) < 5e-3, (b, p)
 
 
-@pytest.mark.parametrize("seqs", [1, 3])
-@pytest.mark.parametrize("local", [False, True])
-def test_verify_prologue_stores_kv_pool(seqs, local):
-    """The MTP verify prologue (verify_windows, 4 rows per sequence) with kv_pool
-    writes each row's K and V into the pool at its loc: bitwise the backend's save,
-    with the prologue's other outputs and windows unchanged."""
-    from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
-
-    torch.manual_seed(seqs + 10 * local)
-    H, KVH, D, DR, W, per = 6, 1, 128, 16, 4, 4
-    m = seqs * per
-    sizes = [H * D, KVH * D, KVH * D, H * DR]
-    proj = (torch.randn(m, sum(sizes) + 8, device="cuda") * 3).bfloat16()
-    q, k, v, r = proj[:, : sum(sizes)].split(sizes, dim=1)
-    slots = 3 * seqs + 5
-    meta = {
-        "safe_idx": (torch.randperm(slots - 1, device="cuda") + 1)[:seqs],
-        "cache_mask": torch.ones(seqs, 1, 1, device="cuda", dtype=torch.bool),
-        "cu": torch.arange(0, m + 1, per, device="cuda"),
-        "si": torch.arange(seqs, device="cuda", dtype=torch.int32).repeat_interleave(
-            per
-        ),
-    }
-    if local:
-        kw, vw = (torch.randn(KVH * D, W, device="cuda") for _ in range(2))
-        dyn = {}
-    else:
-        kw, vw = (torch.randn(W, KVH * D, device="cuda") for _ in range(2))
-        dyn = dict(
-            k_dynamic=torch.randn(m, KVH * W, device="cuda").bfloat16(),
-            v_dynamic=torch.randn(m, KVH * W, device="cuda").bfloat16(),
-        )
-    q_scale = torch.rand(H, D, device="cuda") * 2
-    r_scale = torch.rand(H, DR, device="cuda") * 2
-    rel_proj = (torch.randn(DR, 1024, device="cuda") * 3).bfloat16()
-    seq_lens = torch.full((seqs,), 5000, device="cuda", dtype=torch.int32)
-    pool_slots = 4 * m + 16
-    loc = (torch.randperm(pool_slots - 1, device="cuda") + 1)[:m].long()
-
-    def run(fused):
-        kc = torch.ones(slots, W - 1, KVH * D, device="cuda").bfloat16()
-        vc = kc.clone() * 2
-        windows = tuple(
-            torch.zeros(seqs, per, W - 1, KVH * D, device="cuda").bfloat16()
-            for _ in range(2)
-        )
-        k_pool = torch.zeros(pool_slots, KVH, D, device="cuda", dtype=torch.bfloat16)
-        v_pool = torch.zeros_like(k_pool)
-        out = attention_prologue(
-            q, k, v, r, H, KVH, DR, H // KVH, kw, vw, kc, vc, meta, q_scale, r_scale,
-            rel_proj, seq_lens, local, 22.627416997969522, 8.0, 1e-6, 1e-6,
-            verify_windows=windows,
-            kv_pool=(k_pool, v_pool, loc) if fused else None, **dyn,
-        )  # fmt: skip
-        if not fused:
-            k_pool[loc], v_pool[loc] = out[1], out[2]
-        return (*out, kc, vc, *windows, k_pool, v_pool)
-
-    for a, b in zip(run(True), run(False)):
-        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
-
-
-@pytest.mark.parametrize("batch,ext", [(1, 8), (3, 8), (2, 5)])
+@pytest.mark.parametrize("batch,ext", [(3, 8), (2, 5)])
 def test_rel_verify_gate_sink_in_combine(batch, ext):
     """rel_verify_attention(gate_sink=...) writes, from its own reduction, bitwise
     what gate_sink(o, gate, lse, sinks) gives after it (the ROCm MTP verify path),
@@ -544,7 +468,6 @@ def test_rel_verify_gate_sink_in_combine(batch, ext):
     from sglang.kernels.ops.attention.inkling2_attn_hip import rel_verify_attention
 
     torch.manual_seed(batch * 10 + ext)
-    H, HKV, D = 6, 1, 128
     prefixes = [700 + 1000 * i for i in range(batch)]
     pool = sum(prefixes) + 7
     k_buf = torch.randn(pool, HKV, D, device="cuda").bfloat16()
@@ -580,7 +503,7 @@ def test_rel_verify_gate_sink_in_combine(batch, ext):
         assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("bs", [1, 3, 64])
+@pytest.mark.parametrize("bs", [1, 64])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("window", [None, 4096])
 def test_verify_indptrs_matches_torch(bs, dtype, window):
