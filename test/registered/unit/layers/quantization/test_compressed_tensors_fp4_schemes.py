@@ -519,5 +519,69 @@ class TestW4A4Fp4ApplyWeights(CustomTestCase):
         self.assertEqual((out.shape, out.dtype), ((7, self.W_N), torch.bfloat16))
 
 
+class TestW4A4Nvfp4MoeTrtllmHiddenPadding(CustomTestCase):
+    """The TRT-LLM NVFP4 MoE kernels return wrong output at a hidden size that
+    is not a multiple of 256 (Nemotron 3 Nano's 2688), so the weights are
+    zero-padded at load and the runner is told the padded width."""
+
+    E, I = 4, 128
+
+    def _process(self, hidden):
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w4a4_nvfp4_moe as scheme_module,
+        )
+
+        E, I = self.E, self.I
+        layer = torch.nn.Module()
+        params = {
+            "w13_weight_packed": torch.zeros(E, 2 * I, hidden // 2, dtype=torch.uint8),
+            "w2_weight_packed": torch.zeros(E, hidden, I // 2, dtype=torch.uint8),
+            "w13_weight_scale": torch.zeros(
+                E, 2 * I, hidden // 16, dtype=torch.float8_e4m3fn
+            ),
+            "w2_weight_scale": torch.zeros(
+                E, hidden, I // 16, dtype=torch.float8_e4m3fn
+            ),
+            "w13_weight_global_scale": torch.ones(E, 2),
+            "w2_weight_global_scale": torch.ones(E),
+            "w13_input_global_scale": torch.ones(E, 2),
+            "w2_input_global_scale": torch.ones(E),
+        }
+        for name, value in params.items():
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
+        layer.num_local_experts = E
+
+        scheme = CompressedTensorsW4A4Nvfp4MoE.__new__(CompressedTensorsW4A4Nvfp4MoE)
+        scheme.group_size = 16
+        scheme.use_flashinfer_trtllm = True
+
+        self.prepared = []
+
+        def prepare(w13, w2, w13_s, w2_s, hidden_size, intermediate, experts):
+            self.prepared.append((tuple(w13.shape), tuple(w2.shape), hidden_size))
+            return w13, w13_s, w2, w2_s
+
+        with mock.patch.object(
+            scheme_module, "prepare_static_weights_for_trtllm_fp4_moe", prepare
+        ):
+            scheme.process_weights_after_loading(layer)
+        return layer
+
+    def test_misaligned_hidden_is_padded_to_256(self):
+        layer = self._process(2688)
+        self.assertEqual(layer.trtllm_padded_hidden_size, 2816)
+        self.assertEqual(
+            self.prepared,
+            [((self.E, 2 * self.I, 2816 // 2), (self.E, 2816, self.I // 2), 2816)],
+        )
+
+    def test_aligned_hidden_is_left_alone(self):
+        layer = self._process(2048)
+        self.assertIsNone(layer.trtllm_padded_hidden_size)
+        self.assertEqual(self.prepared[0][2], 2048)
+
+
 if __name__ == "__main__":
     unittest.main()
