@@ -117,6 +117,15 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         )
         worker.draft_model_runner.forward.assert_not_called()
 
+    def test_tree_lookup_skips_cuda_on_other_devices(self):
+        """A target decode graph captured on XPU must verify chains without asking
+        CUDA for its current device."""
+        from sglang.srt.speculative.dflash_tree import tree_buffers, tree_max_batch
+
+        with patch.object(torch.cuda, "current_device", side_effect=RuntimeError):
+            self.assertIsNone(tree_buffers("xpu", max_bs=8))
+            self.assertEqual(tree_max_batch(SimpleNamespace(device="xpu")), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
