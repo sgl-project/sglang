@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_precompile import (
+    precompile_mamba2_prefill_conv_for_cache,
     precompile_mamba2_prefill_kernels,
 )
 from sglang.srt.layers.dp_attention import (
@@ -907,6 +908,17 @@ class NemotronHModel(nn.Module):
         return hidden_states
 
 
+def _mamba2_precompile_max_tokens() -> int | None:
+    """The largest prefill batch to precompile Mamba2 kernels for: the chunked
+    prefill size, or None (no limit) without one or under PP dynamic chunking."""
+    schedule = get_schedule()
+    if (schedule.chunked_prefill_size or 0) > 0 and not (
+        schedule.enable_dynamic_chunking and get_parallel().pp_size > 1
+    ):
+        return schedule.chunked_prefill_size
+    return None
+
+
 class NemotronHForCausalLM(nn.Module):
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -1238,20 +1250,13 @@ class NemotronHForCausalLM(nn.Module):
 
     def precompile_kernels_after_loading(self) -> None:
         # No prefill CUDA graphs here, so compile Mamba2 prefill kernels before serving.
-        # Stop at the chunked prefill size, except under PP dynamic chunking.
-        schedule = get_schedule()
-        max_tokens = None
-        if (schedule.chunked_prefill_size or 0) > 0 and not (
-            schedule.enable_dynamic_chunking and get_parallel().pp_size > 1
-        ):
-            max_tokens = schedule.chunked_prefill_size
         start = time.perf_counter()
         cases = precompile_mamba2_prefill_kernels(
             self,
             chunk_size=self.config.mamba_chunk_size,
             cache_params=self.config.mamba2_cache_params,
             use_triton_causal_conv=True,
-            max_tokens=max_tokens,
+            max_tokens=_mamba2_precompile_max_tokens(),
         )
         if cases:
             logger.info(
@@ -1259,6 +1264,41 @@ class NemotronHForCausalLM(nn.Module):
                 cases,
                 time.perf_counter() - start,
             )
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        # The causal conv1d specializes on the conv cache's strides, which the
+        # state pool fixes; precompile_kernels_after_loading ran before it existed.
+        start = time.perf_counter()
+        cases = precompile_mamba2_prefill_conv_for_cache(
+            self._mamba2_serving_conv_caches(model_runner.attn_backend),
+            chunk_size=self.config.mamba_chunk_size,
+            cache_params=self.config.mamba2_cache_params,
+            max_tokens=_mamba2_precompile_max_tokens(),
+        )
+        if cases:
+            logger.info(
+                "Precompiled Mamba2 causal conv1d for the state pool's conv cache "
+                "(%d cases) in %.1f s",
+                cases,
+                time.perf_counter() - start,
+            )
+
+    def _mamba2_serving_conv_caches(self, attn_backend):
+        """Each Mamba layer's mixer with the conv cache it reads while serving."""
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        if isinstance(attn_backend, TboAttnBackend):
+            attn_backend = attn_backend.primary
+        if not isinstance(attn_backend, HybridLinearAttnBackend) or not isinstance(
+            attn_backend.linear_attn_backend, Mamba2AttnBackend
+        ):
+            return []
+        mamba_backend = attn_backend.linear_attn_backend
+        return [
+            (layer.mixer, mamba_backend.state_layer_cache(layer.layer_id).conv[0])
+            for layer in self.modules()
+            if isinstance(layer, NemotronHMambaDecoderLayer)
+        ]
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False

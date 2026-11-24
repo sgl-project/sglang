@@ -252,6 +252,12 @@ class NemotronH_Nano_VL_V2(EVS):
         # The loader only looks for this hook on the top-level model.
         self.language_model.precompile_kernels_after_loading()
 
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        if self.config.encoder_only:
+            return
+        # Warmup also only looks for this hook on the top-level model.
+        self.language_model.prepare_before_cuda_graph_capture(model_runner)
+
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.language_model.set_dflash_layers_to_capture(layer_ids)
 

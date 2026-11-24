@@ -5,7 +5,8 @@ The sweep in ``mamba2_precompile`` only removes live-traffic compiles
 prefill kernels can see. These tests check that coverage on the layouts
 alone. The GPU check that nothing compiles after the sweep lives in
 ``test/registered/kernels/ops/mamba/test_mamba2_prefill_precompile.py``.
-The last test checks that Nano VL encoder-only workers skip the sweep.
+It also checks which conv caches need their own causal conv1d compiles, and
+that Nano VL encoder-only workers skip the precompile hooks.
 """
 
 import itertools
@@ -17,8 +18,11 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import torch
+
 from sglang.srt.layers.attention.mamba.mamba2_precompile import (
     _tracked_requests,
+    conv_cache_needs_own_compile,
     prefill_layouts,
 )
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
@@ -147,22 +151,60 @@ class TestTrackedRequests(CustomTestCase):
         self.assertEqual(end_locs, [100 + 256, 450 + 512])
 
 
+class TestConvCacheLayout(CustomTestCase):
+    # The causal conv1d takes the conv cache strides as constexpr arguments,
+    # so only a cache laid out like the sweep's dense dummy shares its binaries.
+    SLOTS, DIM, WIDTH = 5, 8, 3
+
+    def test_dense_cache_reuses_sweep(self):
+        conv = torch.zeros(self.SLOTS, self.DIM, self.WIDTH, dtype=torch.bfloat16)
+        self.assertFalse(conv_cache_needs_own_compile(conv))
+
+    def test_per_layer_view_of_dense_pool_reuses_sweep(self):
+        # The default pool: one dense (layers, slots, dim, width) tensor.
+        pool = torch.zeros(4, self.SLOTS, self.DIM, self.WIDTH, dtype=torch.bfloat16)
+        self.assertFalse(conv_cache_needs_own_compile(pool[2]))
+
+    def test_strided_entry_view_needs_own_compile(self):
+        # Unified memory and page-major pools keep each slot's whole state in
+        # one entry, so the conv view steps by the entry, not by dim * width.
+        entries = torch.zeros(self.SLOTS, 100, dtype=torch.bfloat16)
+        conv = entries[:, 40 : 40 + self.DIM * self.WIDTH].unflatten(
+            1, (self.DIM, self.WIDTH)
+        )
+        self.assertTrue(conv_cache_needs_own_compile(conv))
+
+    def test_misaligned_cache_needs_own_compile(self):
+        flat = torch.zeros(self.SLOTS * self.DIM * self.WIDTH + 1, dtype=torch.bfloat16)
+        conv = flat[1:].view(self.SLOTS, self.DIM, self.WIDTH)
+        self.assertTrue(conv_cache_needs_own_compile(conv))
+
+
 class TestNanoVLPrecompileHook(CustomTestCase):
-    # Nano VL only forwards the hook; an encoder-only worker has no
-    # language model to warm up, so it must not forward it.
-    def _forwarded(self, encoder_only: bool) -> Mock:
-        model = SimpleNamespace(
+    # Nano VL only forwards the hooks; an encoder-only worker has no
+    # language model to warm up, so it must not forward them.
+    def _model(self, encoder_only: bool) -> SimpleNamespace:
+        return SimpleNamespace(
             config=SimpleNamespace(encoder_only=encoder_only),
             language_model=Mock(),
         )
-        NemotronH_Nano_VL_V2.precompile_kernels_after_loading(model)
-        return model.language_model.precompile_kernels_after_loading
 
     def test_encoder_only_worker_skips(self):
-        self._forwarded(encoder_only=True).assert_not_called()
+        model = self._model(encoder_only=True)
+        NemotronH_Nano_VL_V2.precompile_kernels_after_loading(model)
+        NemotronH_Nano_VL_V2.prepare_before_cuda_graph_capture(model, Mock())
+        model.language_model.precompile_kernels_after_loading.assert_not_called()
+        model.language_model.prepare_before_cuda_graph_capture.assert_not_called()
 
     def test_language_model_worker_precompiles(self):
-        self._forwarded(encoder_only=False).assert_called_once_with()
+        model = self._model(encoder_only=False)
+        model_runner = Mock()
+        NemotronH_Nano_VL_V2.precompile_kernels_after_loading(model)
+        NemotronH_Nano_VL_V2.prepare_before_cuda_graph_capture(model, model_runner)
+        model.language_model.precompile_kernels_after_loading.assert_called_once_with()
+        model.language_model.prepare_before_cuda_graph_capture.assert_called_once_with(
+            model_runner
+        )
 
 
 if __name__ == "__main__":

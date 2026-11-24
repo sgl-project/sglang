@@ -15,11 +15,18 @@ collectives. ``precompile_mamba2_prefill_kernels`` replays the mixer's prefill
 steps (causal conv1d, then the SSD chunk scan) on dummy data over a sweep of
 batch layouts that covers those classes, so the compiles happen before the
 engine starts serving.
+
+The Triton causal conv1d also takes the conv cache's strides as constexpr
+arguments. The sweep runs before the state pool exists, on a dense dummy cache,
+which matches the default pool. Pools that store the conv state strided (unified
+memory, the page-major KV layout) need their own binaries, so once the pool
+exists ``precompile_mamba2_prefill_conv_for_cache`` reruns the conv on those
+caches.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional
 
 import msgspec
 import torch
@@ -103,6 +110,95 @@ def precompile_mamba2_prefill_kernels(
     return cases
 
 
+@torch.inference_mode()
+def precompile_mamba2_prefill_conv_for_cache(
+    mixer_conv_caches: Iterable[tuple[mamba_layer.MambaMixer2, torch.Tensor]],
+    *,
+    chunk_size: int,
+    cache_params: Mamba2CacheParams,
+    max_tokens: Optional[int] = None,
+) -> int:
+    """Compile the Triton causal conv1d for the serving conv caches.
+
+    ``mixer_conv_caches`` pairs each Mamba2 mixer with the conv cache it serves
+    from. Caches laid out like the dense dummy of ``precompile_mamba2_prefill_kernels``
+    are skipped, as their binaries exist. For any other layout, the conv runs
+    over the swept batch layouts on the serving cache itself, with every request
+    on the reserved slot 0, so it takes no state memory and no request's state.
+    Returns the number of conv runs (0 without CUDA or when every cache is dense).
+    """
+    if not torch.cuda.is_available():
+        return 0
+    seen = set()
+    cases = 0
+    for mixer, conv_states in mixer_conv_caches:
+        if not conv_cache_needs_own_compile(conv_states):
+            continue
+        dims, params = _mixer_prefill_inputs(
+            mixer=mixer, chunk_size=chunk_size, cache_params=cache_params
+        )
+        key = (
+            dims,
+            params.conv_bias is None,
+            params.activation,
+            conv_cache_specialization(conv_states),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        cases += sweep_mamba2_prefill_conv(
+            dims=dims, params=params, conv_states=conv_states, max_tokens=max_tokens
+        )
+    return cases
+
+
+def conv_cache_specialization(conv_states: torch.Tensor) -> tuple:
+    """What the causal conv1d kernel specializes on about its conv cache: the
+    strides (constexpr arguments) and whether the base pointer is 16-byte aligned."""
+    return tuple(conv_states.stride()), conv_states.data_ptr() % 16 == 0
+
+
+def conv_cache_needs_own_compile(conv_states: torch.Tensor) -> bool:
+    """Whether a (slots, dim, width) conv cache specializes the causal conv1d
+    differently from the dense dummy cache that the main sweep runs on."""
+    _, dim, width = conv_states.shape
+    return conv_cache_specialization(conv_states) != ((dim * width, width, 1), True)
+
+
+def sweep_mamba2_prefill_conv(
+    *,
+    dims: Mamba2PrefillDims,
+    params: Mamba2PrefillParams,
+    conv_states: torch.Tensor,
+    max_tokens: Optional[int] = None,
+) -> int:
+    """Run the Triton causal conv1d of every swept layout on ``conv_states``.
+
+    Every request writes the reserved slot 0, the pools' target for padding.
+    """
+    cases = 0
+    device = params.A.device
+    for seq_lens in prefill_layouts(dims.chunk_size, max_tokens=max_tokens):
+        query_start_loc, _ = _packed_batch_indices(seq_lens=seq_lens, device=device)
+        cache_indices = torch.zeros(len(seq_lens), dtype=torch.int32, device=device)
+        for with_initial_states in (False, True):
+            has_initial_states = torch.full(
+                (len(seq_lens),), with_initial_states, dtype=torch.bool, device=device
+            )
+            _run_prefill_conv(
+                dims=dims,
+                params=params,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_states=has_initial_states,
+                use_triton_causal_conv=True,
+                conv_states=conv_states,
+            )
+            cases += 1
+    return cases
+
+
 def sweep_mamba2_prefill(
     *,
     dims: Mamba2PrefillDims,
@@ -134,13 +230,15 @@ def run_mamba2_prefill(
     with_initial_states: bool,
     with_track: bool,
     use_triton_causal_conv: bool,
+    conv_states: Optional[torch.Tensor] = None,
 ) -> bool:
     """Run the mixer's prefill conv1d and SSD scan on dummy data.
 
     Builds the inputs with the same layout ``MambaMixer2.forward`` gives them
     (views into one projection, conv1d output transposed back), because the
-    strides are kernel arguments too. Returns False when the requested
-    variant does not exist for ``seq_lens`` (no request to track).
+    strides are kernel arguments too. ``conv_states`` replaces the dense dummy
+    conv cache; it needs a slot per request after slot 0. Returns False when the
+    requested variant does not exist for ``seq_lens`` (no request to track).
     """
     device = params.A.device
     c = dims.chunk_size
@@ -168,6 +266,7 @@ def run_mamba2_prefill(
         cache_indices=cache_indices,
         has_initial_states=has_initial_states,
         use_triton_causal_conv=use_triton_causal_conv,
+        conv_states=conv_states,
     )
 
     initial_states = chunk_indices = chunk_offsets = None
@@ -287,8 +386,13 @@ def _run_prefill_conv(
     cache_indices: torch.Tensor,
     has_initial_states: torch.Tensor,
     use_triton_causal_conv: bool,
+    conv_states: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the causal conv1d on a dummy projection; return x, B, C and dt."""
+    """Run the causal conv1d on a dummy projection; return x, B, C and dt.
+
+    Without ``conv_states``, the conv cache is a dense dummy, laid out like the
+    default state pool's.
+    """
     device = params.A.device
     num_tokens = sum(seq_lens)
     projected = torch.zeros(
@@ -300,13 +404,14 @@ def _run_prefill_conv(
     _, hidden_states_B_C, dt = torch.split(
         projected, [dims.intermediate_size, dims.conv_dim, dims.num_heads], dim=-1
     )
-    conv_states = torch.zeros(
-        len(seq_lens) + 1,
-        dims.conv_dim,
-        dims.conv_kernel - 1,
-        dtype=dims.conv_state_dtype,
-        device=device,
-    )
+    if conv_states is None:
+        conv_states = torch.zeros(
+            len(seq_lens) + 1,
+            dims.conv_dim,
+            dims.conv_kernel - 1,
+            dtype=dims.conv_state_dtype,
+            device=device,
+        )
     conv_fn = (
         mamba_layer.causal_conv1d_fn_triton
         if use_triton_causal_conv

@@ -3,8 +3,9 @@
 After ``sweep_mamba2_prefill`` runs, prefill batches of serving-like shapes
 (any request count, any lengths, with and without initial states and state
 tracking) must not load a single new Triton kernel binary. A load here is a
-compile that would otherwise land on live traffic (issue #51628). The CPU
-checks of the swept layouts live in
+compile that would otherwise land on live traffic (issue #51628). A strided
+conv cache, as unified memory and the page-major layout keep it, needs the conv
+sweep on that cache too. The CPU checks of the swept layouts live in
 ``test/registered/unit/layers/attention/mamba/test_mamba2_precompile.py``.
 """
 
@@ -17,8 +18,10 @@ import torch
 from sglang.srt.layers.attention.mamba.mamba2_precompile import (
     Mamba2PrefillDims,
     Mamba2PrefillParams,
+    conv_cache_needs_own_compile,
     run_mamba2_prefill,
     sweep_mamba2_prefill,
+    sweep_mamba2_prefill_conv,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -73,24 +76,28 @@ def _serving_like_batches(*, rng: random.Random, count: int):
         yield tuple(seq_lens), rng.random() < 0.5, rng.random() < 0.5
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
-def test_no_kernel_loads_after_sweep():
+def _strided_conv_cache(*, dims: Mamba2PrefillDims, slots: int, device):
+    # Like unified memory: each slot keeps its whole state in one entry, so the
+    # conv view steps by the entry instead of by conv_dim * (conv_kernel - 1).
+    conv_size = dims.conv_dim * (dims.conv_kernel - 1)
+    entries = torch.zeros(
+        slots, conv_size + 4104, dtype=dims.conv_state_dtype, device=device
+    )
+    return entries[:, :conv_size].unflatten(1, (dims.conv_dim, dims.conv_kernel - 1))
+
+
+def _kernel_load_hook():
     triton_knobs = pytest.importorskip("triton.knobs")
     load_hook = getattr(
         getattr(triton_knobs, "runtime", None), "kernel_load_start_hook", None
     )
     if load_hook is None or not hasattr(load_hook, "remove"):
         pytest.skip("this Triton build has no kernel load hook")
+    return load_hook
 
-    device = torch.device("cuda")
-    dims, params = _small_model(device=device)
-    with torch.inference_mode():
-        assert (
-            sweep_mamba2_prefill(dims=dims, params=params, use_triton_causal_conv=True)
-            > 0
-        )
-    torch.cuda.synchronize()
 
+def _late_loads(*, load_hook, dims, params, conv_states=None) -> list[str]:
+    """Kernels loaded while serving-like prefill batches run."""
     late_loads = []
 
     def on_load(module, function, name, metadata_group, hash):
@@ -111,13 +118,53 @@ def test_no_kernel_loads_after_sweep():
                     with_initial_states=with_initial_states,
                     with_track=with_track,
                     use_triton_causal_conv=True,
+                    conv_states=conv_states,
                 )
         torch.cuda.synchronize()
     finally:
         load_hook.remove(on_load)
+    return late_loads
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+def test_no_kernel_loads_after_sweep():
+    load_hook = _kernel_load_hook()
+    device = torch.device("cuda")
+    dims, params = _small_model(device=device)
+    with torch.inference_mode():
+        assert (
+            sweep_mamba2_prefill(dims=dims, params=params, use_triton_causal_conv=True)
+            > 0
+        )
+    torch.cuda.synchronize()
+
+    late_loads = _late_loads(load_hook=load_hook, dims=dims, params=params)
     assert late_loads == [], (
         f"kernels loaded after the sweep: {sorted(set(late_loads))}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+def test_no_kernel_loads_with_strided_conv_cache():
+    load_hook = _kernel_load_hook()
+    device = torch.device("cuda")
+    dims, params = _small_model(device=device)
+    # Room for the largest serving-like batch (31 requests) after slot 0.
+    conv_states = _strided_conv_cache(dims=dims, slots=64, device=device)
+    assert conv_cache_needs_own_compile(conv_states)
+    with torch.inference_mode():
+        sweep_mamba2_prefill(dims=dims, params=params, use_triton_causal_conv=True)
+        assert (
+            sweep_mamba2_prefill_conv(dims=dims, params=params, conv_states=conv_states)
+            > 0
+        )
+    torch.cuda.synchronize()
+
+    late_loads = _late_loads(
+        load_hook=load_hook, dims=dims, params=params, conv_states=conv_states
+    )
+    assert late_loads == [], (
+        f"kernels loaded after the sweeps: {sorted(set(late_loads))}"
     )
 
 
