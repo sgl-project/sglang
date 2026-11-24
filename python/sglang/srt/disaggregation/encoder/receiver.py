@@ -1335,19 +1335,21 @@ class WaitingStagedImage(WaitingZmqRequest):
             handoff.deliver(receive_url, envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get())
         )
 
-    def __init__(self, *args, staged_layout, **kwargs):
+    def __init__(self, *args, staged_layout, expected_identities, **kwargs):
         super().__init__(*args, **kwargs)
         self.staged_layout = staged_layout
+        self.expected_identities = expected_identities
+        self.verification_future = None
 
     def _embedding_shape(self):
         handoff = self.recv_req.encoder_handoff
         if handoff.version >= 3:
-            return (
-                sum(
-                    item.embedding_rows
-                    for item in (*handoff.images, *handoff.videos, *handoff.audios)
-                ),
+            from sglang.srt.disaggregation.encoder.handoff import staged_embedding_shape
+
+            return staged_embedding_shape(
+                sum(item.embedding_rows for item in (*handoff.images, *handoff.videos)),
                 handoff.embedding_width,
+                handoff.audios,
             )
         layout = self.mm_processor.staged_layouts[self.model_type]
         rows = sum(
@@ -1390,11 +1392,10 @@ class WaitingStagedImage(WaitingZmqRequest):
         recv_obj.req_id = self.rid
         return True
 
-    def _finish_assemble(self, recv_embedding):
+    def _embedding_views(self, packed):
         # The transfer groups rows by modality. The rebuilt request interleaves
         # media in prompt order, so each modality has its own read cursor.
         handoff = self.recv_req.encoder_handoff
-        (packed,) = recv_embedding.values()
         if handoff.version >= 3:
             image_rows = sum(image.embedding_rows for image in handoff.images)
         else:
@@ -1403,49 +1404,96 @@ class WaitingStagedImage(WaitingZmqRequest):
                 layout.vision_rows(self.mm_processor, image, video=False)
                 for image in handoff.images
             )
-        audio_start = packed.shape[0] - sum(a.embedding_rows for a in handoff.audios)
+        width = handoff.embedding_width if handoff.version >= 3 else packed.shape[1]
+        audio_elements = sum(
+            a.embedding_rows * a.embedding_width for a in handoff.audios
+        )
+        packed = packed.view(-1)
+        image_end = image_rows * width
+        audio_start = packed.numel() - audio_elements
         ends = {
-            Modality.IMAGE: image_rows,
+            Modality.IMAGE: image_end,
             Modality.VIDEO: audio_start,
-            Modality.AUDIO: packed.shape[0],
+            Modality.AUDIO: packed.numel(),
         }
         offsets = {
             Modality.IMAGE: 0,
-            Modality.VIDEO: image_rows,
+            Modality.VIDEO: image_end,
             Modality.AUDIO: audio_start,
         }
         audios = iter(handoff.audios)
-        mm = self.staged_layout
-        for item in mm.mm_items:
-            cursor = offsets[item.modality]
-            offsets[item.modality] = cursor + sum(
-                end - start + 1 for start, end in item.offsets
+        views = []
+        for item in self.staged_layout.mm_items:
+            rows = sum(end - start + 1 for start, end in item.offsets)
+            item_width = (
+                next(audios).embedding_width
+                if item.modality == Modality.AUDIO
+                else width
             )
-            tensor = packed[cursor : offsets[item.modality]]
-            if item.modality == Modality.AUDIO:
-                # DeepStack visual rows can have several times the audio width.
-                tensor = tensor[:, : next(audios).embedding_width].contiguous()
-            item.precomputed_embeddings = tensor
+            start = offsets[item.modality]
+            end = start + rows * item_width
+            offsets[item.modality] = end
+            views.append(packed[start:end].view(rows, item_width))
         if offsets != ends:
             raise ValueError("staged media rows differ from rebuilt prompt")
-        self._bind_pool_slot_to_mm_inputs(mm)
+        return views
+
+    def _verify_embeddings(self, packed):
+        from sglang.srt.disaggregation.encoder.handoff import verify_staged_embeddings
+
+        verify_staged_embeddings(
+            self.staged_layout.mm_items,
+            self._embedding_views(packed),
+            self.expected_identities,
+        )
+
+    def _assemble_mm_inputs_from_embeddings(self):
+        # Verify the received host tensor before publishing it or reserving a GPU
+        # pool slot. The background call retains the host storage through abort.
+        (packed,) = self.recv_embedding_data.embedding_list
+        if self.verification_future is None:
+            self.verification_future = self.registration_runner.submit(
+                asyncio.to_thread(self._verify_embeddings, packed)
+            )
+            return False
+        if not self.verification_future.done():
+            return False
+        try:
+            self.verification_future.result()
+        except Exception as exc:
+            self._fail_and_release(
+                f"Failed to verify staged embeddings: {exc}", HTTPStatus.BAD_GATEWAY
+            )
+            return True
+        if self.embedding_pool is not None:
+            return super()._assemble_mm_inputs_from_embeddings()
+        try:
+            self._finish_assemble(
+                {self.recv_req.encoder_handoff.packed_modality: packed}
+            )
+        except Exception as exc:
+            self._fail_assemble(exc)
+        return True
+
+    def _finish_assemble(self, recv_embedding):
+        (packed,) = recv_embedding.values()
+        for item, view in zip(
+            self.staged_layout.mm_items, self._embedding_views(packed), strict=True
+        ):
+            item.precomputed_embeddings = view
+        self._bind_pool_slot_to_mm_inputs(self.staged_layout)
         self._publish_layout()
 
     def _publish_layout(self):
         mm = self.staged_layout
-        self.recv_req.encoder_handoff.bind_identities(
-            mm.mm_items,
-            self.recv_req.encoder_routing_hashes,
-            use_routing_hash=self.mm_processor.staged_layouts[
-                self.model_type
-            ].use_routing_hash,
-        )
         attach_mm_routing_labels(mm.mm_items, self.recv_req.mm_routing_labels)
         self.recv_req.mm_inputs = mm
         self.recv_req.input_ids = array("q", mm.input_ids)
         self.status = WaitingMMRequestStatus.SUCCESS
 
     def release_resources(self):
+        if self.verification_future is not None:
+            self.verification_future.cancel()
         super().release_resources()
         if not getattr(self, "_release_submitted", False) and self.registration_runner:
             self._release_submitted = True
@@ -2604,7 +2652,20 @@ class MMReceiverBase(ABC):
                                 else None
                             ),
                         )
-                        transport_kwargs = {**extra_kwargs, "staged_layout": mm}
+                        # Validate rebuilt placeholders on every TP rank, including decode,
+                        # before allocating a receiver or issuing Deliver.
+                        expected = handoff.bind_identities(
+                            mm.mm_items,
+                            recv_req.encoder_routing_hashes,
+                            use_routing_hash=self.mm_processor.staged_layouts[
+                                self.model_type
+                            ].use_routing_hash,
+                        )
+                        transport_kwargs = {
+                            **extra_kwargs,
+                            "staged_layout": mm,
+                            "expected_identities": expected,
+                        }
                         if get_disagg().disaggregation_mode == "decode" or (
                             self.tp_size > 1 and self.tp_rank != 0
                         ):
@@ -2632,9 +2693,11 @@ class MMReceiverBase(ABC):
                             and self.scheduler_recv_socket is not None
                             else self.scheduler_context
                         ),
-                        embedding_port=None
-                        if handoff is not None
-                        else self.scheduler_embedding_port,
+                        embedding_port=(
+                            None
+                            if handoff is not None
+                            else self.scheduler_embedding_port
+                        ),
                         **transport_kwargs,
                     )
                     self.waiting_by_rid[waiting_req.rid] = waiting_req

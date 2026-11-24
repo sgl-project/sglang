@@ -103,7 +103,7 @@ DRAIN_FORCE_REQUESTED = 2
 DRAIN_CLOSED = 4
 
 
-class MissingEncoderHandoff(RuntimeError):
+class MissingEncoderHandoff(ValueError):
     pass
 
 
@@ -488,7 +488,7 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        external_handoff = envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+        external_handoff = envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
         if external_handoff:
             from sglang.srt.disaggregation.encoder.handoff_auth import (
                 require_handoff_key,
@@ -958,13 +958,13 @@ class RustServer:
                 type(e).__name__,
                 e,
             )
-            if isinstance(e, MissingEncoderHandoff):
-                status = 503
-            elif "epd.handoff" in buffers and isinstance(
-                e, (ValueError, msgspec.DecodeError)
+            if not (
+                isinstance(e, MissingEncoderHandoff)
+                or (
+                    "epd.handoff" in buffers
+                    and isinstance(e, (ValueError, msgspec.DecodeError))
+                )
             ):
-                status = 400
-            else:
                 self.server.push_error(obj.rid, f"invalid request: {e}")
                 raise
             self._push_abort_frame(
@@ -973,7 +973,7 @@ class RustServer:
                     finished_reason={
                         "type": "abort",
                         "message": str(e),
-                        "status_code": status,
+                        "status_code": 400,
                     },
                 ),
                 prompt_tokens=len(obj.input_ids),
@@ -1019,7 +1019,7 @@ class RustServer:
 
             if markers is None or self._handoff_key is None:
                 raise ValueError(
-                    "encoder_handoff requires SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
+                    "encoder_handoff requires SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1"
                 )
             receipt = EncoderHandoff.parse(
                 memoryview(handoff),

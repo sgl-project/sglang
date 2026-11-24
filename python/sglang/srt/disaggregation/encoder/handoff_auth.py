@@ -69,8 +69,9 @@ class EncoderHandoffSigner:
 
     @classmethod
     def from_config(cls):
-        if not envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.get():
+        if not envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
             return None
+        key = require_handoff_key()
         peer = envs.SGLANG_ENCODER_HANDOFF_ENDPOINT.get()
         if not peer:
             from sglang.srt.runtime_context import get_serving
@@ -78,7 +79,7 @@ class EncoderHandoffSigner:
 
             serving = get_serving()
             peer = NetworkAddress(serving.host, serving.port).to_url("grpc")
-        return cls(peer, require_handoff_key())
+        return cls(peer, key)
 
     def sign(self, transfer, instance_id: bytes) -> str:
         return _mac(self._key, self.peer, transfer, instance_id).hex()

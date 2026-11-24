@@ -2052,8 +2052,8 @@ class Envs:
     # ===================================================================
     # Encoder pipeline and disaggregation
     # ===================================================================
-    # Accept staged descriptors from a trusted orchestrator on a private listener.
-    SGLANG_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
+    # Issue signed Stage receipts on E or accept them on a Rust language worker.
+    SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
     SGLANG_ENCODER_HANDOFF_KEY_FILE = EnvStr(None)
     SGLANG_ENCODER_HANDOFF_ENDPOINT = EnvStr(None)
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)

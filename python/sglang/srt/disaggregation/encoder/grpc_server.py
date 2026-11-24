@@ -25,7 +25,10 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
-from sglang.srt.disaggregation.encoder.handoff import staged_embedding_digest
+from sglang.srt.disaggregation.encoder.handoff import (
+    staged_embedding_digest,
+    staged_embedding_shape,
+)
 from sglang.srt.disaggregation.encoder.handoff_auth import EncoderHandoffSigner
 from sglang.srt.disaggregation.encoder.receiver import create_part_req_id
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
@@ -99,6 +102,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         encoder: MMEncoder,
         send_sockets: List[zmq.Socket],
         *,
+        signer: EncoderHandoffSigner | None = None,
         on_dispatch_failure=None,
     ):
         self.encoder = encoder
@@ -108,7 +112,8 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         info = None
         parallel = get_parallel()
         staging_enabled = (
-            encoder.transfer_backend in ("zmq_to_scheduler", "nixl")
+            signer is not None
+            and encoder.transfer_backend in ("zmq_to_scheduler", "nixl")
             and parallel.num_dp_ranks == parallel.pp_size == parallel.nnodes == 1
             and len(send_sockets) == parallel.tp_size - 1
         )
@@ -144,9 +149,11 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 model_path=model,
                 tokenizer_path=get_serving().tokenizer_path or model,
                 served_model_name=get_serving().served_model_name or model,
-                native_model_type=encoder.model_type
-                if (images_enabled or videos_enabled) and not layout.legacy_vision
-                else "",
+                native_model_type=(
+                    encoder.model_type
+                    if (images_enabled or videos_enabled) and not layout.legacy_vision
+                    else ""
+                ),
                 staged_transfer_backend=encoder.transfer_backend,
                 staged_layout_id=layout.wire_id(encoder.model_type),
                 supports_staged_images=images_enabled,
@@ -163,10 +170,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             stage_timeout=envs.SGLANG_ENCODER_REQ_TIMEOUT.get(),
             ttl=encoder.send_timeout,
             capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get(),
-            signer=EncoderHandoffSigner.from_config() if info is not None else None,
+            signer=signer,
         )
 
-    def _configure_staging(self, info, *, stage_timeout, ttl, capacity, signer=None):
+    def _configure_staging(self, info, *, stage_timeout, ttl, capacity, signer):
         self._info = info
         self._stage_timeout = stage_timeout
         self._ttl = ttl
@@ -174,9 +181,8 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self._handoff_signer = signer
         if info is not None:
             info.instance_id = uuid4().bytes
-            if signer is not None:
-                info.handoff_key_id = signer.key_id
-                info.handoff_peer = signer.peer
+            info.handoff_key_id = signer.key_id
+            info.handoff_peer = signer.peer
 
     async def _stage_media(self, part_id, images, videos, audios):
         # The native encoder batches one modality at a time. Publish one lease
@@ -216,17 +222,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     tensor = data.embedding
                     if tensor.dtype != root.dtype or tensor.ndim != 2:
                         raise RuntimeError("Incompatible staged embedding formats")
-                    if tensor.shape[1] != root.shape[1]:
-                        if (
-                            modality != Modality.AUDIO
-                            or tensor.shape[1] > root.shape[1]
-                        ):
-                            raise RuntimeError("Incompatible staged embedding widths")
-                        # DeepStack vision includes auxiliary channels. Restore
-                        # the original audio width from AudioLayout on P/PD.
-                        tensor = torch.nn.functional.pad(
-                            tensor, (0, root.shape[1] - tensor.shape[1])
-                        )
+                    if tensor.shape[1] != root.shape[1] and (
+                        modality != Modality.AUDIO or tensor.shape[1] > root.shape[1]
+                    ):
+                        raise RuntimeError("Incompatible staged embedding widths")
                     tensors.append(tensor)
                 finally:
                     if index:
@@ -235,11 +234,21 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                             f"Retire staged {modality.name.lower()} {name}",
                         )
             if len(tensors) > 1:
-                packed = torch.cat(tensors)
+                if tensors[-1].shape[1] == tensors[0].shape[1]:
+                    packed = torch.cat(tensors)
+                else:
+                    # DeepStack vision and audio have different native widths.
+                    # Preserve each contiguous block in a single 2-D transfer.
+                    packed = torch.cat([part.reshape(-1, 1) for part in tensors])
                 root.embedding = packed
                 root.shape = list(packed.shape)
                 await meta_registry.publish(part_id, packed.nbytes, *packed.shape)
-        return layouts[Modality.IMAGE], layouts[Modality.VIDEO], layouts[Modality.AUDIO]
+        return (
+            layouts[Modality.IMAGE],
+            layouts[Modality.VIDEO],
+            layouts[Modality.AUDIO],
+            tensors[0].shape[1],
+        )
 
     async def _encode_modality(self, part_id, items, modality):
         request = {
@@ -347,7 +356,8 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         ):
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Staged media require a compatible processor, zmq_to_scheduler or nixl, "
+                "Staged media require SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1, "
+                "a compatible processor, zmq_to_scheduler or nixl, "
                 "a single-node TP group with PP=DP=1 and positive staging limits",
             )
 
@@ -400,7 +410,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self._stage_timeout
-            image_layouts, video_layouts, audio_layouts = await asyncio.wait_for(
+            image_layouts, video_layouts, audio_layouts, width = await asyncio.wait_for(
                 self._stage_media(part_id, images, videos, audios), self._stage_timeout
             )
             if loop.time() >= deadline:
@@ -430,24 +440,23 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             )
             if native_type:
                 shape = self._describe_part(part_id).shape
-                rows = sum(
-                    item.embedding_rows
-                    for item in (*image_layouts, *video_layouts, *audio_layouts)
+                visual_rows = sum(
+                    item.embedding_rows for item in (*image_layouts, *video_layouts)
                 )
-                if len(shape) != 2 or shape[0] != rows or shape[1] <= 0:
+                if width <= 0 or tuple(shape) != staged_embedding_shape(
+                    visual_rows, width, audio_layouts
+                ):
                     raise RuntimeError(
                         "Native staged layout does not match its embedding"
                     )
                 transfer.version = 4 if audios else 3
                 transfer.native_model_type = native_type
-                transfer.embedding_width = shape[1]
+                transfer.embedding_width = width
             response = encoder_pb2.StageResponse(
-                transfer=transfer, instance_id=self._info.instance_id
+                transfer=transfer,
+                instance_id=self._info.instance_id,
+                handoff_mac=self._handoff_signer.sign(transfer, self._info.instance_id),
             )
-            if self._handoff_signer is not None:
-                response.handoff_mac = self._handoff_signer.sign(
-                    transfer, self._info.instance_id
-                )
             if states.get(part_id) is not state or state.release_requested:
                 raise RuntimeError("Encoder request retired while staging")
             state.staged_transfer = transfer
@@ -472,9 +481,11 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         except Exception as exc:
             await self._retire_staged(part_id)
             await context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT
-                if isinstance(exc, ValueError)
-                else grpc.StatusCode.INTERNAL,
+                (
+                    grpc.StatusCode.INVALID_ARGUMENT
+                    if isinstance(exc, ValueError)
+                    else grpc.StatusCode.INTERNAL
+                ),
                 str(exc),
             )
 
@@ -508,6 +519,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             )
         description = self._describe_part(state.req_id)
         description.instance_id = self._info.instance_id
+        description.send_timeout_secs = self._ttl
         return description
 
     async def Deliver(self, request, context):
@@ -760,6 +772,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
 async def serve_grpc_encoder(server_args: ServerArgs):
     publish(server_args, role="encoder")
+    signer = EncoderHandoffSigner.from_config()
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.asyncio.Context(10)
     ipc_path_prefix = random_uuid()
@@ -804,6 +817,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         asyncio.create_task(server.stop(grace=1))
 
     encoder_servicer = SGLangEncoderServer(
+        signer=signer,
         on_dispatch_failure=stop_failed_group,
         encoder=encoder,
         send_sockets=send_sockets,

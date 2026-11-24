@@ -153,14 +153,16 @@ class DescribeRequest(_message.Message):
     def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ...) -> None: ...
 
 class DescribeResponse(_message.Message):
-    __slots__ = ("shape", "dtype", "instance_id")
+    __slots__ = ("shape", "dtype", "instance_id", "send_timeout_secs")
     SHAPE_FIELD_NUMBER: _ClassVar[int]
     DTYPE_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    SEND_TIMEOUT_SECS_FIELD_NUMBER: _ClassVar[int]
     shape: _containers.RepeatedScalarFieldContainer[int]
     dtype: str
     instance_id: bytes
-    def __init__(self, shape: _Optional[_Iterable[int]] = ..., dtype: _Optional[str] = ..., instance_id: _Optional[bytes] = ...) -> None: ...
+    send_timeout_secs: float
+    def __init__(self, shape: _Optional[_Iterable[int]] = ..., dtype: _Optional[str] = ..., instance_id: _Optional[bytes] = ..., send_timeout_secs: _Optional[float] = ...) -> None: ...
 
 class DeliverRequest(_message.Message):
     __slots__ = ("transfer", "receive_url", "nixl_target")

@@ -23,13 +23,19 @@ We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_t
 
 An external router such as Dynamo selects E and calls its `Stage` RPC. It
 passes the returned descriptor to the selected P/PD in the `encoder_handoff`
-field of a tokenized `/generate` request. Start E with `--encoder-only --grpc-mode`.
-On the Rust language workers, use `--language-only` with
-`SGLANG_RUST_SERVER=1` and `SGLANG_EXTERNAL_ENCODER_HANDOFF=1`. The worker
+field of a tokenized `/generate` request. Enable
+`SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF=1` on E and every language worker.
+Start E with `--encoder-only --grpc-mode`. On the Rust language workers,
+use `--language-only` with `SGLANG_RUST_SERVER=1`. The worker
 uses the encoder identified by the descriptor, so you can omit `--encoder-urls`.
 Use the same `--encoder-transfer-backend nixl` or
-`--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. NIXL requires
+`--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. In external
+mode, `auto` selects `zmq_to_scheduler` at every TP size. NIXL requires
 the UCX plugin on both ends.
+
+For staged `/generate`, pass one `mm_hashes` routing hint per source in
+image, video, then audio order, preserving order within each list. A video's
+frames share its source hint. Prompt placeholders can interleave the media.
 
 Mount a file containing the same 32 random bytes on E, P/PD and D. Set
 `SGLANG_ENCODER_HANDOFF_KEY_FILE` to its path on each worker. Generate it once
@@ -40,8 +46,9 @@ that address. E authenticates its endpoint, process instance, transfer ID and
 media layout with HMAC-SHA256. P/PD and D verify the receipt at ingress before
 using its metadata or contacting E. E computes a content digest for each staged
 embedding from its modality, dtype, shape and tensor bytes. P/PD verifies the
-received tensors against these digests even when `SGLANG_MM_SKIP_COMPUTE_HASH`
-is enabled on either worker. D uses the authenticated digests to reconstruct the
+received host tensors on a background thread before making them available to
+the scheduler, even when `SGLANG_MM_SKIP_COMPUTE_HASH` is enabled on either
+worker. D uses the authenticated digests to reconstruct the
 same media identities. Keep the encoder and language listeners
 private. Restart the workers with a new shared key to rotate it.
 
@@ -59,8 +66,11 @@ writes to the same pool. P/PD registers individual buffers when the pool is
 disabled, when startup registration fails, or when the embedding does not fit
 an available slice. Set the size to `0` to disable pooling.
 
-If a NIXL write's outcome is unknown, P/PD tries to fence it with the issuing E
-for up to `SGLANG_ENCODER_GRPC_TIMEOUT_SECS` (default 60 seconds). Without a
+If a NIXL write's outcome is unknown, P/PD asks the issuing E to confirm the
+write has retired. It allows E's advertised send timeout (default 180 seconds)
+plus one `SGLANG_ENCODER_GRPC_TIMEOUT_SECS` window (default 60 seconds).
+With an older E that omits its send timeout, P/PD uses its local
+`SGLANG_ENCODER_SEND_TIMEOUT`. Without a
 matching acknowledgement or a native write-completion notification, the memory
 stays registered in quarantine. Quarantine permits up to one additional
 destination per configured live slot before applying backpressure.
@@ -97,7 +107,9 @@ Qwen-family image and video handoffs use v1 and v2 respectively. Other model
 families use v3 to carry the native model type, tensor width and per-item row
 counts, plus the grids, dimensions or timing their processors need.
 Requests containing separate audio items use v4. E records the native feature
-length, embedding rows, width and identity for each audio input. The language
+length, embedding rows, width and identity for each audio input. The transfer
+preserves each modality's native width, including when DeepStack vision and
+audio share a request. The language
 processor uses these lengths to reconstruct audio token spans and positions.
 Use the same audio-capable model on both E and P/PD (and D in a split
 deployment). Independent audio items may share a prompt with images or videos

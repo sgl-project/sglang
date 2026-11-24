@@ -341,6 +341,7 @@ class TestStagedNativeTransfer(CustomTestCase):
         video_processor=True,
         audio_processor=False,
         video_decoder=True,
+        external_handoff=True,
         send_sockets=(),
     ):
         from sglang.srt.disaggregation.encoder import grpc_server
@@ -471,7 +472,12 @@ class TestStagedNativeTransfer(CustomTestCase):
             ThreadPoolExecutor(4) as enc.executor,
             zmq.asyncio.Context() as receivers,
         ):
-            svc = grpc_server.SGLangEncoderServer(enc, send_sockets)
+            signer = (
+                grpc_server.EncoderHandoffSigner("grpc://127.0.0.1:4200", bytes(32))
+                if external_handoff
+                else None
+            )
+            svc = grpc_server.SGLangEncoderServer(enc, send_sockets, signer=signer)
 
             yield svc, enc, receivers, grids, tensor
 
@@ -785,6 +791,10 @@ class TestStagedNativeTransfer(CustomTestCase):
                     self.assertEqual(
                         [x.embedding_rows for x in transfer.videos], [2, 3]
                     )
+                visual_rows = (3 if images else 0) + (5 if videos else 0)
+                shape = (visual_rows * width + 4, 1) if images else (2, 2)
+                spec = await svc.Describe(pb.DescribeRequest(transfer=transfer), Mock())
+                self.assertEqual(tuple(spec.shape), shape)
                 with patch.object(
                     nixl, "write_embedding", new_callable=AsyncMock
                 ) as write:
@@ -793,14 +803,10 @@ class TestStagedNativeTransfer(CustomTestCase):
                         Mock(),
                     )
                     packed = write.await_args.args[0]
-                    self.assertEqual(
-                        tuple(packed.shape),
-                        ((3 if images else 0) + (5 if videos else 0) + 2, width),
-                    )
+                    self.assertEqual(tuple(packed.shape), shape)
                     torch.testing.assert_close(
-                        packed[-2:, :2], torch.tensor([[51.0, 52.0], [61.0, 62.0]])
+                        packed.flatten()[-4:], torch.tensor([51.0, 52.0, 61.0, 62.0])
                     )
-                    self.assertFalse(packed[-2:, 2:].any())
                 self.assertFalse(enc.req_states)
 
         for model, images, videos in (
@@ -1043,6 +1049,46 @@ class TestStagedNativeTransfer(CustomTestCase):
                 context.abort.side_effect = RuntimeError("model lacks staged adapter")
                 with self.assertRaisesRegex(RuntimeError, "model lacks staged adapter"):
                     await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), context)
+
+        asyncio.run(run())
+
+    def test_native_grpc_encoder_without_external_handoff(self):
+        import grpc
+
+        from sglang.encoder.v1 import encoder_pb2 as pb
+
+        async def run():
+            with self.native_encoder(external_handoff=False) as (svc, enc, *_):
+                context = Mock()
+                context.abort = AsyncMock(side_effect=RuntimeError("staging disabled"))
+                for rpc, req in (
+                    (svc.GetEncoderInfo, pb.GetEncoderInfoRequest()),
+                    (svc.Stage, pb.StageRequest(request_id="r", mm_items=["a"])),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "staging disabled"):
+                        await rpc(req, context)
+                    code, _ = context.abort.call_args.args
+                    self.assertEqual(code, grpc.StatusCode.FAILED_PRECONDITION)
+                with (
+                    patch.object(
+                        svc, "_dispatch_encode", new_callable=AsyncMock
+                    ) as encode,
+                    patch(
+                        "sglang.srt.disaggregation.encoder.grpc_server.get_disagg",
+                        return_value=SimpleNamespace(
+                            encoder_transfer_backend=enc.transfer_backend
+                        ),
+                    ),
+                    patch.object(enc, "send_with_url", new_callable=AsyncMock) as send,
+                ):
+                    encode.return_value = (24, 2, 3, None, None)
+                    await svc.Encode(
+                        pb.EncodeRequest(req_id="native", num_parts=1, mm_items=["a"]),
+                        context,
+                    )
+                    encode.assert_awaited_once()
+                    send.assert_awaited_once_with(req_id="native")
+                    context.set_code.assert_not_called()
 
         asyncio.run(run())
 

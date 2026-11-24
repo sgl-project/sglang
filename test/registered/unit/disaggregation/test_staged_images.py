@@ -59,6 +59,7 @@ class FakeEncoder(StagedEncoderFixture):
             ],
             [],
             [],
+            1,
         )
 
     async def release(self, state):
@@ -87,12 +88,21 @@ class TestHandoffKeyConfig(unittest.TestCase):
     def test_external_workers_require_a_key_and_encoders_sign_their_configured_endpoint(
         self,
     ):
-        with envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(""):
+        with (
+            envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(False),
+            envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(""),
+        ):
             self.assertIsNone(EncoderHandoffSigner.from_config())
-            with self.assertRaisesRegex(ValueError, "SGLANG_ENCODER_HANDOFF_KEY_FILE"):
-                require_handoff_key()
+            with (
+                envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
+                self.assertRaisesRegex(ValueError, "SGLANG_ENCODER_HANDOFF_KEY_FILE"),
+            ):
+                EncoderHandoffSigner.from_config()
 
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
+            tempfile.TemporaryDirectory() as directory,
+        ):
             key_file = Path(directory) / "key"
             with envs.SGLANG_ENCODER_HANDOFF_KEY_FILE.override(str(key_file)):
                 for size in (0, 31, 33):
@@ -204,6 +214,7 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
         backend._describe_part = lambda part_id: descriptor
         description = await peer.Describe(describe)
         self.assertEqual(description.instance_id, backend._info.instance_id)
+        self.assertEqual(description.send_timeout_secs, backend._ttl)
         self.assertEqual(description, descriptor)
         invalid = pb.DescribeRequest(transfer=transfer)
         invalid.transfer.images[0].identity = "another image"

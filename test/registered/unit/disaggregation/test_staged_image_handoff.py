@@ -10,7 +10,10 @@ import torch
 
 from sglang.encoder.v1 import encoder_pb2 as pb
 from sglang.encoder.v1 import encoder_pb2_grpc as rpc
-from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
+from sglang.srt.disaggregation.encoder.handoff import (
+    EncoderHandoff,
+    verify_staged_embeddings,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -103,7 +106,9 @@ class TestStagedImageHandoff(unittest.TestCase):
                     # P/PD verifies bytes. D reconstructs the same cache identity from the receipt.
                     for tensors in (embeddings, (None, None)):
                         items = [item(t) for t in tensors]
-                        handoff.bind_identities(items, [42, None])
+                        identities = handoff.bind_identities(items, [42, None])
+                        if tensors is embeddings:
+                            verify_staged_embeddings(items, tensors, identities)
                         self.assertEqual([i.identity for i in items], expected)
                         self.assertEqual(items[0].hash, 42)
                         self.assertEqual(
@@ -112,8 +117,10 @@ class TestStagedImageHandoff(unittest.TestCase):
                     changed = item(embeddings[0] + 1)
                     changed.set_identity(expected[0])
                     with self.assertRaisesRegex(ValueError, "identity mismatch"):
-                        handoff.bind_identities(
-                            [changed, item(embeddings[1])], [42, None]
+                        verify_staged_embeddings(
+                            [changed, item(embeddings[1])],
+                            [embeddings[0] + 1, embeddings[1]],
+                            expected,
                         )
 
     def test_delivery_reaches_only_selected_grpc_peer(self):

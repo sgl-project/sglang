@@ -226,7 +226,7 @@ def _build_server_args(
             (get_mm().limit_mm_data_per_request or {}).items()
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
-        external_encoder_handoff=envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get(),
+        external_encoder_handoff=envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get(),
         enable_return_hidden_states=sa.enable_return_hidden_states,
         return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
@@ -498,7 +498,7 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+    if envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
         from sglang.srt.disaggregation.encoder.handoff_auth import (
             handoff_key_id,
             require_handoff_key,

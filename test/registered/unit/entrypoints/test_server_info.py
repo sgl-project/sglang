@@ -178,7 +178,7 @@ class TestServerInfoTransportParity(CustomTestCase):
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
         with (
-            envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True),
+            envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
             patch(
                 "sglang.srt.disaggregation.encoder.handoff_auth.require_handoff_key",
                 return_value=bytes(32),
@@ -232,7 +232,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                         None if mode == "decode" else backend,
                     )
 
-        with envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(False):
+        with envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(False):
             info = json.loads(rust_config._launch_server_info(scheduler))
             self.assertNotIn("staged_layout_id", info)
             self.assertNotIn("staged_transfer_backend", info)

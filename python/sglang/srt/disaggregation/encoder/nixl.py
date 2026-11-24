@@ -7,7 +7,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from uuid import uuid4
 
 import msgspec
@@ -58,37 +58,52 @@ class _NixlWriter:
         except Exception:
             if not self._peers:
                 raise
-            self.agent = _agent()
-            self._peers.clear()
-            peer = self.agent.add_remote_agent(metadata)
+            # Distinguish overlapping registrations from invalid metadata
+            # without retiring healthy connections on this writer.
+            probe = _agent()
+            peer = probe.add_remote_agent(metadata)
+            probe.remove_remote_agent(peer)
+            if peer not in self._peers.values():
+                raise
 
-        for old_metadata, name in self._peers.items():
-            if name == peer:
-                self.agent.remove_remote_agent(peer)
-                del self._peers[old_metadata]
-                peer = self.agent.add_remote_agent(metadata)
-                break
-        if len(self._peers) >= _MAX_CACHED_PEERS:
-            _, oldest_peer = self._peers.popitem(last=False)
-            self.agent.remove_remote_agent(oldest_peer)
+        previous = next(
+            (key for key, name in self._peers.items() if name == peer), None
+        )
+        if previous is not None:
+            self.disconnect(previous)
+            peer = self.agent.add_remote_agent(metadata)
         self._peers[metadata] = peer
+        if len(self._peers) > _MAX_CACHED_PEERS:
+            self.disconnect(next(iter(self._peers)))
         return peer
 
+    def disconnect(self, metadata):
+        peer = self._peers[metadata]
+        try:
+            self.agent.remove_remote_agent(peer)
+        except Exception:
+            # A failed native disconnect makes this agent unsafe to reuse.
+            # There is no in-flight write when a writer evicts a peer.
+            for name in self._peers.values():
+                try:
+                    self.agent.remove_remote_agent(name)
+                except Exception:
+                    logger.warning(
+                        "Could not disconnect NIXL peer %r", name, exc_info=True
+                    )
+            self._peers.clear()
+            if getattr(_writer, "state", None) is self:
+                del _writer.state
+            raise
+        del self._peers[metadata]
 
-@contextmanager
+
 def _writer_agent():
-    # A thread has one synchronous write in flight. Its previous transfer has
-    # drained before a cache eviction can disconnect a peer.
+    # A thread owns at most one synchronous write at a time.
     writer = getattr(_writer, "state", None)
     if writer is None:
         writer = _writer.state = _NixlWriter()
-    try:
-        yield writer
-    except BaseException:
-        # A failed native teardown can leave cached registrations on an agent.
-        # Start clean on this thread's next transfer.
-        del _writer.state
-        raise
+    return writer
 
 
 class _RegisteredMemory:
@@ -249,10 +264,40 @@ class NixlReceiver:
         return target
 
 
+def _release_handle(agent, handle):
+    while True:
+        try:
+            agent.release_xfer_handle(handle)
+            return
+        except Exception as exc:
+            from nixl._bindings import nixlRepostActiveError
+
+            if not isinstance(exc, nixlRepostActiveError):
+                raise
+            # Even a terminal status can have an in-flight notification. Keep
+            # the source registered and E's Release fenced until UCX retires it.
+            time.sleep(0.01)
+
+
 def _write(source, destination, stop, deadline):
-    with _writer_agent() as writer, ExitStack() as stack:
-        peer = writer.peer_for(destination.agent_metadata)
-        agent = writer.agent
+    def check_submission_deadline():
+        if stop.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError("NIXL encoder write expired before submission")
+
+    check_submission_deadline()
+    writer = _writer_agent()
+    peer = writer.peer_for(destination.agent_metadata)
+    agent = writer.agent
+    with ExitStack() as stack:
+        # Invalidate only the failed UCX connection, after its handle and
+        # source registration retire. Descriptor or deadline errors are local.
+        transfer_failed = False
+
+        def retire_peer():
+            if transfer_failed:
+                writer.disconnect(destination.agent_metadata)
+
+        stack.callback(retire_peer)
         registration = agent.register_memory(source, backends=["UCX"])
         stack.callback(agent.deregister_memory, registration)
         local = agent.get_xfer_descs(source)
@@ -262,17 +307,19 @@ def _write(source, destination, stop, deadline):
         handle = agent.initialize_xfer(
             "WRITE", local, remote, peer, destination.notification, backends=["UCX"]
         )
-        stack.callback(agent.release_xfer_handle, handle)
-        if stop.is_set() or time.monotonic() >= deadline:
-            raise TimeoutError("NIXL encoder write expired before submission")
-        state = agent.transfer(handle)
-        while state == "PROC":
-            # Release is a remote-write fence. A deadline or gRPC cancellation
-            # cannot retire the registration until UCX reaches terminal state.
-            time.sleep(0.001)
-            state = agent.check_xfer_state(handle)
-        if state != "DONE":
-            raise RuntimeError(f"NIXL encoder write failed with status {state}")
+        stack.callback(_release_handle, agent, handle)
+        check_submission_deadline()
+        try:
+            state = agent.transfer(handle)
+            while state == "PROC":
+                # Cancellation cannot retire the source before UCX finishes.
+                time.sleep(0.001)
+                state = agent.check_xfer_state(handle)
+            if state != "DONE":
+                raise RuntimeError(f"NIXL encoder write failed with status {state}")
+        except Exception:
+            transfer_failed = True
+            raise
         if time.monotonic() >= deadline:
             raise TimeoutError("NIXL encoder write exceeded its deadline")
 

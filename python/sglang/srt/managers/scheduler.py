@@ -1812,7 +1812,7 @@ class Scheduler(
 
             if (
                 self.rust_server is not None
-                and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+                and envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get()
             ):
                 self.rust_server.bind_external_encoder_processor(
                     self.mm_receiver.mm_processor

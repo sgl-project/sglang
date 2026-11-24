@@ -1293,7 +1293,7 @@ class TestRustServerExtension(CustomTestCase):
             disaggregation_mode="null", encoder_transfer_backend="zmq_to_tokenizer"
         )
         with (
-            server_module.envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True),
+            server_module.envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.override(True),
             patch(
                 "sglang.srt.disaggregation.encoder.handoff_auth.require_handoff_key",
                 return_value=bytes(32),
@@ -1302,7 +1302,7 @@ class TestRustServerExtension(CustomTestCase):
             patch.object(RustServer, "_load_extension", return_value=extension),
             patch.object(RustServer, "_resolve_multimodal") as resolve_mm,
         ):
-            # auto backend and DP can resolve after command-line validation.
+            # Check the resolved runtime configuration before starting the listener.
             with self.assertRaisesRegex(RuntimeError, "zmq_to_scheduler or nixl"):
                 RustServer.launch(scheduler)
             disagg.encoder_transfer_backend = "nixl"

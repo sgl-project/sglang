@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import pickle
+import threading
 import unittest
 from array import array
 from contextlib import asynccontextmanager
@@ -113,6 +114,7 @@ async def staged_encoder(
             ],
             video_layouts,
             [],
+            tensor.shape[1],
         )
 
     async def send(part_id, receive_url):
@@ -154,19 +156,17 @@ async def staged_encoder(
         async def release(self, state):
             await release(state.req_id)
 
+    server = grpc.aio.server()
+    port = server.add_insecure_port("127.0.0.1:0")
     service = Service(
         pb.GetEncoderInfoResponse(supports_staged_video=True),
         backend="zmq_to_scheduler" if writer is None else "nixl",
         ttl=10,
         stage_timeout=5,
         capacity=1,
+        signer=EncoderHandoffSigner(f"grpc://127.0.0.1:{port}", _HANDOFF_TEST_KEY),
     )
-    server = grpc.aio.server()
     rpc.add_SglangEncoderServicer_to_server(service, server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    service._handoff_signer = EncoderHandoffSigner(
-        f"grpc://127.0.0.1:{port}", _HANDOFF_TEST_KEY
-    )
     await server.start()
     try:
         async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
@@ -262,16 +262,29 @@ class TestStagedImageReceiver(unittest.TestCase):
                 input_ids=[7, 8, 9], encoder_handoff={}
             ).normalize_batch_and_arguments()
         rust = bridge()
-        for buffers in [
-            {"input_ids": array("q", [7, 8, 9])},
-            {"input_ids": array("q", [7, 10, 9])},
-        ]:
-            with self.assertRaisesRegex(MissingEncoderHandoff, "requires a staged"):
-                rust._attach_buffers(request("raw"), buffers)
+        for input_text, token_ids in (
+            (None, [7, 8, 9]),
+            ("<|vision_start|><|video_pad|><|vision_end|>", [7, 10, 9]),
+        ):
+            obj = request("missing")
+            obj.input_text = input_text
+            with (
+                self.subTest(input_text=input_text),
+                patch(
+                    "sglang.srt.rust_server.server.msgpack_decode_explained",
+                    return_value=obj,
+                ),
+                self.assertRaisesRegex(MissingEncoderHandoff, "requires a staged"),
+            ):
+                rust._admit(b"", {"input_ids": array("q", token_ids)})
+            wire, _ = rust.server.push_decode_result_batch.call_args.args
+            finish = msgspec.msgpack.decode(wire)[1][0]
+            self.assertEqual(finish["status_code"], 400)
+        rust.server.push_error.assert_not_called()
         text = request("text")
         rust._attach_buffers(text, {"input_ids": array("q", [1, 2])})
         self.assertIsNone(text.need_wait_for_mm_inputs)
-        with self.assertRaisesRegex(ValueError, "requires SGLANG_EXTERNAL"):
+        with self.assertRaisesRegex(ValueError, "requires SGLANG_ENABLE_EXTERNAL"):
             bridge(False)._attach_buffers(
                 text, {"input_ids": array("q", [8]), "epd.handoff": b"{}"}
             )
@@ -437,6 +450,56 @@ class TestStagedImageReceiver(unittest.TestCase):
         self.assertEqual(errors[0][2], 400)
         self.assertFalse(rx.waiting_list or rx.waiting_by_rid)
 
+    def test_invalid_rebuilt_count_is_400_before_allocating_on_decode_and_tp_peers(
+        self,
+    ):
+        # One signed image passes ingress, but the processor reconstructed no item.
+        transfer = "00" * 16
+        handoff = EncoderHandoff.parse(
+            msgspec.json.encode(
+                {
+                    "version": 1,
+                    "peer": "grpc://127.0.0.1:1",
+                    "request_id": "r",
+                    "transfer_id": transfer,
+                    "part_id": transfer + "_local_part_0",
+                    "part_idx": 0,
+                    "num_parts": 1,
+                    "image_count": 1,
+                    "images": [{"t": 1, "h": 2, "w": 2, "identity": "01" * 32}],
+                }
+            ),
+            1,
+        )
+        for role, rank in (("decode", 0), ("prefill", 1)):
+            rx = scheduler(None)
+            rx.tp_size, rx.tp_rank = 2, rank
+            rx.tp_group.all_gather_object = lambda error: [error, error]
+            rx.registration_runner = None
+            rx.create_req = lambda req: req
+            obj = request("r")
+            obj.encoder_handoff = handoff
+            obj.need_wait_for_mm_inputs = True
+            obj.input_ids = array("q", [7, 8, 9])
+            with (
+                self.subTest(role=role, rank=rank),
+                patch.object(
+                    receiver,
+                    "get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=role),
+                ),
+                patch.object(
+                    EncoderHandoff,
+                    "build_layout",
+                    return_value=SimpleNamespace(mm_items=[]),
+                ),
+            ):
+                admitted, errors = rx.process_waiting_requests([obj])
+                self.assertFalse(admitted)
+                self.assertEqual(errors[0][2], 400)
+                self.assertIn("media count differs", errors[0][1])
+                self.assertFalse(rx.waiting_by_rid)
+
     def test_abort_and_unavailable_encoder_retire_receiver_once(self):
         async def run(fail):
             reached, released = asyncio.Event(), asyncio.Event()
@@ -476,12 +539,10 @@ class TestStagedImageReceiver(unittest.TestCase):
             obj.input_ids = array("q", [7, 8, 9])
             with (
                 zmq.Context() as ctx,
-                (
-                    patch.object(
-                        receiver,
-                        "get_disagg",
-                        return_value=SimpleNamespace(disaggregation_mode="null"),
-                    )
+                patch.object(
+                    receiver,
+                    "get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode="null"),
                 ),
                 patch.object(EncoderHandoff, "deliver", deliver),
                 patch.object(EncoderHandoff, "release", release),
@@ -513,6 +574,8 @@ class TestStagedImageReceiver(unittest.TestCase):
                 asyncio.run(run(fail))
 
     def test_nixl_uncertain_delivery_keeps_registration_until_fenced(self):
+        from sglang.srt.environ import envs
+
         async def run(case):
             transfer_id = "11" * 16
             handoff = EncoderHandoff.parse(
@@ -535,6 +598,7 @@ class TestStagedImageReceiver(unittest.TestCase):
             fence = pb.ReleaseResponse(instance_id=issuer)
             responses = {
                 "fenced": [fence],
+                "slow_write_error": [fence],
                 "retry": [grpc.RpcError("lost fence"), fence],
                 "replacement": [pb.ReleaseResponse(instance_id=b"R" * 16)],
                 "legacy": [pb.ReleaseResponse()],
@@ -549,6 +613,17 @@ class TestStagedImageReceiver(unittest.TestCase):
                 Deliver=AsyncMock(side_effect=RuntimeError("lost Deliver response")),
                 Release=AsyncMock(side_effect=responses[case]),
             )
+            if case == "slow_write_error":
+                stub.Describe.return_value.send_timeout_secs = 0.2
+
+                # A failed WRITE has no native completion notification. E's
+                # Release acknowledges only after the active send has drained.
+                async def release_after_write(request, timeout):
+                    self.assertGreater(timeout, 0.1)
+                    await asyncio.sleep(0.1)
+                    return fence
+
+                stub.Release = AsyncMock(side_effect=release_after_write)
             target = Mock(
                 tensor=torch.empty(8, dtype=torch.uint8), descriptor=b"target"
             )
@@ -558,8 +633,11 @@ class TestStagedImageReceiver(unittest.TestCase):
             target.quarantine.side_effect = retired.set
             rx = Mock()
             rx.allocate.return_value = target
-            with patch.object(rpc, "SglangEncoderStub", return_value=stub):
-                timeout = 0.05 if case == "deadline" else 2
+            with (
+                patch.object(rpc, "SglangEncoderStub", return_value=stub),
+                envs.SGLANG_ENCODER_SEND_TIMEOUT.override(0.01),
+            ):
+                timeout = 0.05 if case in ("deadline", "slow_write_error") else 2
                 signed = msgspec.structs.replace(handoff, instance_id=issuer.hex())
                 for previous in (b"", b"R" * 16):
                     stub.Describe.return_value.instance_id = previous
@@ -570,6 +648,15 @@ class TestStagedImageReceiver(unittest.TestCase):
                     rx.allocate.assert_not_called()
                     stub.Deliver.assert_not_called()
                 stub.Describe.return_value.instance_id = issuer
+                if case == "fenced":
+                    for invalid in (0, -1, float("inf"), float("nan")):
+                        stub.Describe.return_value.send_timeout_secs = invalid
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid NIXL encoder send timeout"
+                        ):
+                            await handoff.receive_nixl(rx, (1, 4), timeout)
+                    stub.Describe.return_value.ClearField("send_timeout_secs")
+                    rx.allocate.assert_not_called()
                 with self.assertRaisesRegex(ValueError, "shape differs"):
                     await handoff.receive_nixl(rx, (2, 4), timeout)
                 rx.allocate.assert_not_called()
@@ -578,19 +665,26 @@ class TestStagedImageReceiver(unittest.TestCase):
                 target.abandon.assert_called_once()
                 await asyncio.wait_for(retired.wait(), 3)
                 self.assertEqual(stub.Release.await_count, len(responses[case]))
-                if case in ("fenced", "retry"):
+                if case in ("fenced", "retry", "slow_write_error"):
                     target.close.assert_called_once()
                     target.quarantine.assert_not_called()
                 else:
                     target.close.assert_not_called()
                     target.quarantine.assert_called_once()
 
-        for case in ("fenced", "retry", "replacement", "legacy", "deadline"):
+        for case in (
+            "fenced",
+            "retry",
+            "replacement",
+            "legacy",
+            "deadline",
+            "slow_write_error",
+        ):
             with self.subTest(case=case):
                 asyncio.run(run(case))
 
     def test_native_part_to_prefill_and_decode_layout_only(self):
-        async def run(backend, video_model=None, video_only=False):
+        async def run(backend, video_model=None, video_only=False, corrupt=False):
             prompt = [42, 7, 8, 9, 43, 7, 8, 9, 44]
             grids = [[1, 2, 2], [1, 4, 2]]
             tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -608,7 +702,7 @@ class TestStagedImageReceiver(unittest.TestCase):
                 # Packing is [image 1, image 2, video], prompt order is [image 1, video, image 2].
                 prompt[5:5] = [7, 10, 9]
                 requested_videos = ["clip"]
-                hints = [22, 101, 33]
+                hints = [22, 33, 101]
                 video = torch.tensor([[7.0, 8.0], [9.0, 10.0]])
                 if video_only:
                     grids, identities, requested_images = [], [], []
@@ -682,6 +776,10 @@ class TestStagedImageReceiver(unittest.TestCase):
                     calls,
                     held,
                 ):
+                    if corrupt:
+                        # E signed the original contents. Corrupt only the payload.
+                        tensor[0, 0] += 1
+                        rx.create_req = lambda req: req
                     self.assertEqual(held, {metadata["part_id"]})
                     self.assertEqual(
                         calls, [("encode", requested_images, requested_videos)]
@@ -722,6 +820,35 @@ class TestStagedImageReceiver(unittest.TestCase):
                             ],
                         )
                         self.assertFalse(held)
+                        scheduler_thread = threading.get_ident()
+                        verify = waiting._verify_embeddings
+
+                        def verify_off_scheduler(packed):
+                            self.assertNotEqual(threading.get_ident(), scheduler_thread)
+                            verify(packed)
+
+                        with patch.object(
+                            waiting, "_verify_embeddings", verify_off_scheduler
+                        ):
+                            self.assertEqual(rx.process_waiting_requests([]), ([], []))
+                            self.assertIsNone(prefill.mm_inputs)
+                            if corrupt:
+                                with self.assertRaisesRegex(
+                                    ValueError, "identity mismatch"
+                                ):
+                                    await asyncio.wait_for(
+                                        waiting.verification_future, 3
+                                    )
+                                ready, [(rejected, _, code)] = (
+                                    rx.process_waiting_requests([])
+                                )
+                                self.assertEqual(
+                                    (ready, rejected, code), ([], prefill, 502)
+                                )
+                                self.assertIsNone(prefill.mm_inputs)
+                                self.assertFalse(rx.waiting_by_rid)
+                                return
+                            await asyncio.wait_for(waiting.verification_future, 3)
                         self.assertEqual(
                             rx.process_waiting_requests([]), ([prefill], [])
                         )
@@ -806,6 +933,8 @@ class TestStagedImageReceiver(unittest.TestCase):
         if importlib.util.find_spec("nixl") is not None:
             backends.append("nixl-native")
         for backend in backends:
+            with self.subTest(backend=backend, corrupt=True):
+                asyncio.run(run(backend, corrupt=True))
             for model, video_only in (
                 (None, False),
                 ("qwen3_vl", False),

@@ -164,7 +164,7 @@ def rust_server_unsupported_args(
     defaults = {
         field.name: _field_default(field) for field in record_fields(type(server_args))
     }
-    if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+    if envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
         honored = (*honored, "language_only")
     offending = []
     for name in RUST_SERVER_UNSUPPORTED_ARGS:
@@ -198,17 +198,22 @@ def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueErr
 def validate_rust_server_unsupported_args(server_args: Any) -> None:
     """Refuse, in Rust-server mode, every argument the Rust server would ignore
     (``rust_server_unsupported_args``)."""
-    if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+    if envs.SGLANG_ENABLE_EXTERNAL_ENCODER_HANDOFF.get():
+        from sglang.srt.disaggregation.encoder.handoff_auth import require_handoff_key
+
         cfg = resolving_view(server_args)
-        if (
-            not envs.SGLANG_RUST_SERVER.get()
-            or not cfg.language_only
-            or cfg.pp_size != 1
-        ):
+        if cfg.encoder_only:
+            if not cfg.grpc_mode or cfg.nnodes != 1:
+                raise ValueError(
+                    "External encoder handoff requires --grpc-mode and a single-node encoder."
+                )
+        elif not cfg.language_only or not envs.SGLANG_RUST_SERVER.get():
             raise ValueError(
-                "SGLANG_EXTERNAL_ENCODER_HANDOFF=1 requires SGLANG_RUST_SERVER=1, "
-                "--language-only and PP=1"
+                "External encoder handoff requires SGLANG_RUST_SERVER=1 and "
+                "--language-only on language workers."
             )
+        if cfg.pp_size != 1 or num_dp_ranks_of(cfg) != 1:
+            raise ValueError("External encoder handoff requires PP=1 and one DP rank.")
         if cfg.encoder_transfer_backend not in ("auto", "zmq_to_scheduler", "nixl"):
             raise ValueError(
                 "External encoder handoff requires --encoder-transfer-backend "
@@ -219,8 +224,7 @@ def validate_rust_server_unsupported_args(server_args: Any) -> None:
                 "--enable-adaptive-dispatch-to-encoder is incompatible with "
                 "external encoder handoff"
             )
-        if num_dp_ranks_of(cfg) != 1:
-            raise ValueError("External encoder handoff requires one DP rank.")
+        require_handoff_key()
     if not envs.SGLANG_RUST_SERVER.get():
         return
     offending = rust_server_unsupported_args(server_args)

@@ -12,6 +12,7 @@ import torch
 from sglang.srt.disaggregation.encoder.handoff import (
     EncoderHandoff,
     StagedPromptMarkers,
+    verify_staged_embeddings,
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     WaitingMMRequestStatus,
@@ -104,12 +105,13 @@ def test_native_image_layout_and_identity(model, cls):
     assert d_layout.mm_items[0].precomputed_embeddings is None
     handoff.bind_identities(d_layout.mm_items, None)
     p_layout.mm_items[0].precomputed_embeddings = rows
-    handoff.bind_identities(p_layout.mm_items, None)
+    expected = handoff.bind_identities(p_layout.mm_items, None)
+    verify_staged_embeddings(p_layout.mm_items, [rows], expected)
     assert d_layout.mm_items[0].cache_key == p_layout.mm_items[0].cache_key
     assert d_layout.mm_items[0].cache_key.hex() != image["identity"]
     p_layout.mm_items[0].precomputed_embeddings = rows + 1
     with pytest.raises(ValueError, match="identity mismatch"):
-        handoff.bind_identities(p_layout.mm_items, None)
+        verify_staged_embeddings(p_layout.mm_items, [rows + 1], expected)
     image["embedding_rows"] = 1
     with pytest.raises(ValueError, match="rows"):
         EncoderHandoff.parse(msgspec.json.encode(payload), 1).build_layout(
@@ -174,6 +176,7 @@ def test_glm_interleaved_frame_offsets_positions_and_packed_rows(model):
     )
     waiting.mm_processor, waiting.model_type = p, model
     waiting.staged_layout = layout
+    handoff.bind_identities(layout.mm_items, None)
     waiting._bind_pool_slot_to_mm_inputs = lambda mm: None
     waiting._finish_assemble({Modality.IMAGE: torch.cat((img, vid))})
     torch.testing.assert_close(layout.mm_items[0].precomputed_embeddings, vid)
@@ -347,6 +350,8 @@ def check_audio_receive(handoff, processor, prompt, packed, audios):
     )
     waiting.mm_processor, waiting.model_type = processor, handoff.native_model_type
     waiting.staged_layout = prefill
+    waiting.expected_identities = handoff.bind_identities(prefill.mm_items, None)
+    waiting._verify_embeddings(packed)
     waiting._bind_pool_slot_to_mm_inputs = lambda mm: None
     assert waiting._embedding_shape() == tuple(packed.shape)
     waiting._finish_assemble({handoff.packed_modality: packed})
@@ -361,6 +366,10 @@ def check_audio_receive(handoff, processor, prompt, packed, audios):
     assert len(received) == len(audios)
     for actual, expected in zip(received, audios):
         torch.testing.assert_close(actual, expected)
+        assert actual.is_contiguous()
+        assert (
+            actual.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
+        )
     return prefill
 
 
@@ -450,10 +459,44 @@ def test_interleaved_audio_vision(model):
         p.image_preprocessor = SimpleNamespace(merge_size=2)
     handoff = EncoderHandoff.parse(msgspec.json.encode(data), 1, 0, 1)
     prompt = [11, 12, 13, 7, 8, 9]
-    packed_audio = torch.nn.functional.pad(audio, (0, width - 2))
-    layout = check_audio_receive(
-        handoff, p, prompt, torch.cat((img, packed_audio)), [audio]
+    metadata = handoff.build_layout(p, prompt, 512)
+    handoff.bind_identities(metadata.mm_items, [101, 202])
+    assert [(item.modality, item.hash) for item in metadata.mm_items] == [
+        (Modality.AUDIO, 202),
+        (Modality.IMAGE, 101),
+    ]
+    packed = (
+        torch.cat((img.reshape(-1, 1), audio.reshape(-1, 1)))
+        if width != audio.shape[1]
+        else torch.cat((img, audio))
     )
+    if width != audio.shape[1]:
+        # A v4 peer expecting the old padded rectangle rejects the compact shape.
+        padded = torch.cat((img, torch.nn.functional.pad(audio, (0, width - 2))))
+        assert packed.shape != padded.shape and packed.numel() < padded.numel()
+        from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
+
+        waiting = WaitingStagedImage.__new__(WaitingStagedImage)
+        waiting.recv_req = SimpleNamespace(encoder_handoff=handoff)
+        legacy_frame = EmbeddingData(
+            handoff.part_id, 1, 0, None, Modality.IMAGE, padded
+        )
+        with pytest.raises(ValueError, match="received tensor differs"):
+            waiting._is_valid_embedding_part(legacy_frame)
+        # The same frame validator on an older receiver expects the padded shape.
+        waiting._embedding_shape = lambda: (
+            sum(
+                item.embedding_rows
+                for item in (*handoff.images, *handoff.videos, *handoff.audios)
+            ),
+            handoff.embedding_width,
+        )
+        compact_frame = EmbeddingData(
+            handoff.part_id, 1, 0, None, Modality.IMAGE, packed
+        )
+        with pytest.raises(ValueError, match="received tensor differs"):
+            waiting._is_valid_embedding_part(compact_frame)
+    layout = check_audio_receive(handoff, p, prompt, packed, [audio])
     assert layout.input_ids == [11, 12, 12, 13, 7, 8, 9]
     assert [item.modality for item in layout.mm_items] == [
         Modality.AUDIO,
@@ -509,6 +552,14 @@ def test_staged_layout_id_distinguishes_model_and_wire_changes():
     layout = QwenVLImageProcessor.staged_layouts["qwen3_omni_moe"]
     original = layout.wire_id("qwen3_omni_moe")
     assert original != layout.wire_id("qwen2_5_vl")
+    assert msgspec.json.decode(original)["mixed_width_packing"] == "compact"
+    for single in (
+        replace(layout, audio=False),
+        replace(layout, images=False, video=None),
+    ):
+        assert "mixed_width_packing" not in msgspec.json.decode(
+            single.wire_id("single")
+        )
     for change in (
         {"legacy_vision": False},
         {"video": None},

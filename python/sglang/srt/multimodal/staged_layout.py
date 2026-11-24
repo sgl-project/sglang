@@ -39,21 +39,20 @@ class StagedMediaLayout:
 
     def wire_id(self, model_type):
         """Identify the descriptor layout shared by E, P/PD and D at discovery."""
-        return json.dumps(
-            {
-                "model_type": model_type,
-                "revision": self.wire_revision,
-                "legacy_vision": self.legacy_vision,
-                "images": self.images,
-                "video": self.video.value if self.video is not None else None,
-                "audio": self.audio,
-                "per_frame_items": self.per_frame_items,
-                "original_image_sizes": self.original_image_sizes,
-                "use_routing_hash": self.use_routing_hash,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
+        descriptor = {
+            "model_type": model_type,
+            "revision": self.wire_revision,
+            "legacy_vision": self.legacy_vision,
+            "images": self.images,
+            "video": self.video.value if self.video is not None else None,
+            "audio": self.audio,
+            "per_frame_items": self.per_frame_items,
+            "original_image_sizes": self.original_image_sizes,
+            "use_routing_hash": self.use_routing_hash,
+        }
+        if self.audio and (self.images or self.video is not None):
+            descriptor["mixed_width_packing"] = "compact"
+        return json.dumps(descriptor, separators=(",", ":"), sort_keys=True)
 
     def encoder_vision_enabled(self, encoder):
         return True
@@ -239,9 +238,11 @@ class StagedMediaLayout:
                 (Modality.AUDIO, audio_rows),
             ):
                 actual = [
-                    sum(end - start + 1 for start, end in item.offsets)
-                    if item.offsets
-                    else 0
+                    (
+                        sum(end - start + 1 for start, end in item.offsets)
+                        if item.offsets
+                        else 0
+                    )
                     for item in mm.mm_items
                     if item.modality == modality
                 ]

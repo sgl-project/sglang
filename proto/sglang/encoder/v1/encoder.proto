@@ -136,6 +136,8 @@ message DescribeResponse {
   string dtype = 2; // bfloat16, float16 or float32
   // Identity of the process holding this transfer. Only its Release can fence a WRITE.
   bytes instance_id = 3;
+  // Encoder's native send window. Receivers allow this plus one Release RPC window to fence a WRITE.
+  optional double send_timeout_secs = 4;
 }
 message DeliverRequest {
   StagedImageTransfer transfer = 1;

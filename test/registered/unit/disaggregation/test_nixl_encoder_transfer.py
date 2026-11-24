@@ -6,6 +6,7 @@ import multiprocessing
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import msgspec
@@ -190,15 +191,127 @@ class TestNixlEncoderTransfer(unittest.IsolatedAsyncioTestCase):
         agent.remove_remote_agent.assert_any_call("same-prefill")
 
     def test_writer_recovers_when_nixl_rejects_overlapping_peer_metadata(self):
-        old_agent, fresh_agent = Mock(), Mock()
-        old_agent.add_remote_agent.side_effect = ["prefill", RuntimeError("overlap")]
-        fresh_agent.add_remote_agent.return_value = "prefill"
-        with patch.object(nixl, "_agent", side_effect=[old_agent, fresh_agent]):
+        agent, probe = Mock(), Mock()
+        agent.add_remote_agent.side_effect = [
+            "healthy",
+            "prefill",
+            RuntimeError("overlap"),
+            "prefill",
+        ]
+        probe.add_remote_agent.return_value = "prefill"
+        with patch.object(nixl, "_agent", side_effect=[agent, probe]):
             writer = nixl._NixlWriter()
+            self.assertEqual(writer.peer_for(b"unchanged"), "healthy")
             self.assertEqual(writer.peer_for(b"old registration"), "prefill")
             self.assertEqual(writer.peer_for(b"new registration"), "prefill")
             self.assertEqual(writer.peer_for(b"new registration"), "prefill")
-        fresh_agent.add_remote_agent.assert_called_once_with(b"new registration")
+            self.assertEqual(writer.peer_for(b"unchanged"), "healthy")
+        self.assertIs(writer.agent, agent)
+        probe.remove_remote_agent.assert_called_once_with("prefill")
+        agent.remove_remote_agent.assert_called_once_with("prefill")
+
+    def test_writer_keeps_healthy_peers_on_timeout_or_bad_metadata(self):
+        agent, probe = Mock(), Mock()
+        agent.add_remote_agent.side_effect = ["healthy", ValueError("invalid metadata")]
+        probe.add_remote_agent.side_effect = ValueError("invalid metadata")
+        agent.transfer.return_value = "DONE"
+        source = torch.zeros(8, dtype=torch.uint8)
+        target = nixl._Destination(8, 8, b"1" * 16, b"good")
+        stop = threading.Event()
+        with (
+            patch.object(nixl, "_writer", threading.local()),
+            patch.object(nixl, "_agent", side_effect=[agent, probe]),
+        ):
+            nixl._write(source, target, stop, time.monotonic() + 3)
+            with self.assertRaises(TimeoutError):
+                nixl._write(source, target, stop, time.monotonic() - 1)
+            # Also expire after the registration and handle are acquired.
+            agent.initialize_xfer.side_effect = lambda *args, **kwargs: (
+                stop.set() or "expired"
+            )
+            with self.assertRaises(TimeoutError):
+                nixl._write(source, target, stop, time.monotonic() + 3)
+            agent.release_xfer_handle.assert_called_with("expired")
+            agent.initialize_xfer.side_effect = None
+            stop.clear()
+            with self.assertRaisesRegex(ValueError, "invalid metadata"):
+                nixl._write(
+                    source,
+                    msgspec.structs.replace(target, agent_metadata=b"bad"),
+                    stop,
+                    time.monotonic() + 3,
+                )
+            nixl._write(source, target, stop, time.monotonic() + 3)
+        self.assertEqual(
+            agent.add_remote_agent.call_args_list, [call(b"good"), call(b"bad")]
+        )
+        agent.remove_remote_agent.assert_not_called()
+        self.assertEqual(agent.deregister_memory.call_count, 3)
+
+    def test_terminal_write_failure_reconnects_only_affected_peer(self):
+        agent = Mock()
+        agent.add_remote_agent.side_effect = bytes.decode
+        agent.transfer.side_effect = ["DONE", "PROC", "DONE", "DONE"]
+        agent.check_xfer_state.return_value = "ERR"
+        source = torch.zeros(8, dtype=torch.uint8)
+
+        def write(peer):
+            target = nixl._Destination(8, 8, b"1" * 16, peer)
+            nixl._write(source, target, threading.Event(), time.monotonic() + 3)
+
+        with (
+            patch.object(nixl, "_writer", threading.local()),
+            patch.object(nixl, "_agent", return_value=agent) as factory,
+        ):
+            write(b"healthy")
+            with self.assertRaisesRegex(RuntimeError, "status ERR"):
+                write(b"failed")
+            write(b"healthy")
+            write(b"failed")
+
+        factory.assert_called_once()
+        agent.remove_remote_agent.assert_called_once_with("failed")
+        self.assertEqual(
+            agent.add_remote_agent.call_args_list,
+            [call(b"healthy"), call(b"failed"), call(b"failed")],
+        )
+        self.assertEqual(agent.release_xfer_handle.call_count, 4)
+        self.assertEqual(agent.deregister_memory.call_count, 4)
+
+    def test_deferred_handle_release_keeps_the_source_and_peer_registered(self):
+        class ActiveHandle(Exception):
+            pass
+
+        source = torch.zeros(8, dtype=torch.uint8)
+        agent = Mock()
+        agent.add_remote_agent.return_value = "prefill"
+        agent.transfer.return_value = "ERR"
+
+        def release(handle):
+            agent.deregister_memory.assert_not_called()
+            agent.remove_remote_agent.assert_not_called()
+            if agent.release_xfer_handle.call_count == 1:
+                raise ActiveHandle()
+
+        agent.release_xfer_handle.side_effect = release
+        with (
+            patch.object(nixl, "_writer", threading.local()),
+            patch.object(nixl, "_agent", return_value=agent),
+            patch.dict(
+                "sys.modules",
+                {"nixl._bindings": SimpleNamespace(nixlRepostActiveError=ActiveHandle)},
+            ),
+            self.assertRaisesRegex(RuntimeError, "status ERR"),
+        ):
+            nixl._write(
+                source,
+                nixl._Destination(8, 8, b"1" * 16, b"prefill"),
+                threading.Event(),
+                time.monotonic() + 3,
+            )
+        self.assertEqual(agent.release_xfer_handle.call_count, 2)
+        agent.deregister_memory.assert_called_once()
+        agent.remove_remote_agent.assert_called_once_with("prefill")
 
     async def test_invalid_transfer_never_registers_source(self):
         source = _source()

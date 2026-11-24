@@ -29,6 +29,13 @@ def staged_embedding_digest(modality, tensor) -> bytes:
     )
 
 
+def verify_staged_embeddings(items, tensors, expected_identities):
+    """Verify received tensor bytes before the scheduler publishes the request."""
+    for item, tensor, expected in zip(items, tensors, expected_identities, strict=True):
+        if staged_embedding_digest(item.modality, tensor) != expected:
+            raise ValueError("staged media embedding identity mismatch")
+
+
 class StagedPromptMarkers:
     """Raw media token IDs used at ingress, before the native processor expands them."""
 
@@ -121,6 +128,16 @@ class AudioLayout(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     feature_length: int
     embedding_rows: int
     embedding_width: int
+
+
+def staged_embedding_shape(vision_rows, vision_width, audios):
+    """Physical shape of the single native tensor shared by ZMQ and NIXL."""
+    if any(item.embedding_width != vision_width for item in audios):
+        audio_elements = sum(
+            item.embedding_rows * item.embedding_width for item in audios
+        )
+        return vision_rows * vision_width + audio_elements, 1
+    return vision_rows + sum(item.embedding_rows for item in audios), vision_width
 
 
 class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -289,15 +306,15 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         from sglang.srt.multimodal.modality import Modality
 
         image_index = 0
-        audio_iter = iter(self.audios)
-        media_index = -1
+        expected = []
+        audio_iter = enumerate(self.audios)
         hints = routing_hashes or ()
         all_media_hints = len(hints) == self.image_count + len(self.videos) + len(
             self.audios
         )
         video_segments = iter(
-            (video, index, identity)
-            for video in self.videos
+            (video_index, video, index, identity)
+            for video_index, video in enumerate(self.videos)
             for index, identity in enumerate(video.identities)
         )
         if len(mm_items) != self.image_count + len(self.audios) + sum(
@@ -310,17 +327,17 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 segment = next(video_segments, None)
                 if segment is None:
                     raise ValueError("too many staged video segments in prompt")
-                layout, index, raw_identity = segment
-                if index == 0:
-                    media_index += 1
+                video_index, layout, index, raw_identity = segment
+                media_index = self.image_count + video_index
                 identity = bytes.fromhex(raw_identity)
             elif item.modality == Modality.AUDIO:
-                layout = next(audio_iter, None)
-                if layout is None:
+                audio = next(audio_iter, None)
+                if audio is None:
                     raise ValueError("too many staged audio placeholders in prompt")
+                audio_index, layout = audio
+                media_index = self.image_count + len(self.videos) + audio_index
                 identity = bytes.fromhex(layout.identity)
                 index = 0
-                media_index += 1
             else:
                 if item.modality != Modality.IMAGE or image_index >= self.image_count:
                     raise ValueError("unexpected staged image placeholder in prompt")
@@ -329,8 +346,8 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 index = 0
                 if len(hints) == self.image_count:
                     hint = hints[image_index]
+                media_index = image_index
                 image_index += 1
-                media_index += 1
             if isinstance(layout, AudioLayout):
                 cache_identity = structured_digest(
                     (
@@ -382,16 +399,13 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             else:
                 cache_identity = identity
             if all_media_hints:
+                # The flat vector follows image_data, video_data, then audio_data.
                 hint = hints[media_index]
-            if item.precomputed_embeddings is not None:
-                if (
-                    staged_embedding_digest(item.modality, item.precomputed_embeddings)
-                    != identity
-                ):
-                    raise ValueError("staged media embedding identity mismatch")
+            expected.append(identity)
             item.set_identity(cache_identity)
             if hint is not None and use_routing_hash:
                 item.hash = hint
+        return expected
 
     def native_transfer(self):
         from sglang.encoder.v1.encoder_pb2 import StagedImageTransfer
@@ -423,6 +437,7 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         import torch
 
         from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
+        from sglang.srt.environ import envs
 
         deadline = asyncio.get_running_loop().time() + timeout
         transfer = self.native_transfer()
@@ -434,6 +449,15 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             issuer = spec.instance_id
             if self.instance_id and issuer.hex() != self.instance_id:
                 raise ValueError("NIXL Describe came from a different encoder instance")
+            # Legacy Describe replies lack E's send timeout. Use the local
+            # configuration as a fallback for those peers.
+            send_timeout = (
+                spec.send_timeout_secs
+                if spec.HasField("send_timeout_secs")
+                else envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+            )
+            if not 0 < send_timeout < math.inf:
+                raise ValueError("invalid NIXL encoder send timeout")
             if tuple(spec.shape) != shape:
                 raise ValueError(
                     "NIXL embedding shape differs from staged media layout/model"
@@ -461,7 +485,7 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 # Return the request error now; the receiver owns the destination.
                 target.abandon()
                 task = asyncio.create_task(
-                    self._refence_target(target, issuer, timeout)
+                    self._refence_target(target, issuer, send_timeout + timeout)
                 )
                 _fence_tasks.add(task)
                 task.add_done_callback(_fence_tasks.discard)
@@ -473,6 +497,8 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         import grpc
 
         delay = 0.25
+        # Deliver can time out on P while E is still draining a posted WRITE.
+        # Give E its send window plus one RPC window to acknowledge retirement.
         deadline = asyncio.get_running_loop().time() + timeout
         try:
             async with asyncio.timeout_at(deadline):

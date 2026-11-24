@@ -7,7 +7,7 @@ from sglang.srt.disaggregation.encoder.server import MMEncoder
 class StagedEncoderFixture(SGLangEncoderServer):
     """Subclasses supply media encoding and the native delivery backend's send/release."""
 
-    def __init__(self, info, *, backend, stage_timeout, ttl, capacity, signer=None):
+    def __init__(self, info, *, backend, stage_timeout, ttl, capacity, signer):
         self.encoder = MMEncoder.__new__(MMEncoder)
         self.encoder.req_states = {}
         self.encoder.mm_global_cache_enabled = False
