@@ -34,7 +34,7 @@ test('A2 emits the tested eight-device low-concurrency command regardless of GPU
     '--host 127.0.0.1 --port 31216', '--context-length 4096', '--max-running-requests 1',
     '--chunked-prefill-size 128', '--max-prefill-tokens 4096', '--mem-fraction-static 0.96',
     '--max-total-tokens 4096',
-    '--disable-cuda-graph', '--disable-radix-cache',
+    '--disable-decode-cuda-graph --disable-prefill-cuda-graph', '--disable-radix-cache',
   ]) assert.ok(command.includes(expected), `Missing ${expected}`);
   assert.doesNotMatch(command, /EAGLE3|custom_eagle3|speculative|ascend_fuseep|--dp-size|flashinfer|fp8_e4m3/);
   assert.ok(command.includes('MODEL_PATH=\'/models/MiniMax-M2.5-w8a8-QuaRot\''));
@@ -67,7 +67,7 @@ test('the existing default NVIDIA recipe retains its fusion and tensor parallel 
   assert.match(command, /^SGLANG_USE_FUSED_PARALLEL_QKNORM=1/);
   assert.match(command, /--model-path MiniMaxAI\/MiniMax-M2\.5/);
   assert.match(command, /--tp 4(?:\s|$)/);
-  assert.match(command, /--enable-flashinfer-allreduce-fusion/);
+  assert.match(command, /--flashinfer-allreduce-fusion-backend auto/);
   assert.doesNotMatch(command, /--device npu|modelslim|ascend_fuseep/);
 });
 
@@ -97,7 +97,7 @@ test('NPU keeps shared rows visible with fixed values matching its command', () 
 test('A3 produces the full 16-die W8A8 EAGLE3 recipe even after an AMD two-GPU selection', () => {
   const command = build({ hardware: 'a3', gpuCount: '2gpu' });
   for (const expected of [
-    '--device npu', '--tp-size 16', '--dp-size 16', '--enable-dp-attention',
+    '--device npu', '--tp-size 16', '--attn-dp-size 16',
     '--quantization modelslim', '--moe-a2a-backend ascend_fuseep', '--fuseep-mode 2',
     '--speculative-algorithm EAGLE3', '--speculative-num-steps 3',
     '--speculative-eagle-topk 1', '--speculative-num-draft-tokens 4',

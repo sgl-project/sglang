@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 OPS = SUPPORTED_ACTIVATIONS
@@ -315,7 +315,7 @@ def test_rounded_silu_table_matches_the_computed_kernel(dtype):
     from sglang.kernels.ops.activation import activation as act
 
     if act._silu_rounding_table(torch.empty(1, dtype=dtype, device="cuda")) is None:
-        pytest.skip("the SiLU table runs on sm_10x only")
+        pytest.skip("the SiLU table runs on sm_90 and sm_10x only")
     gate = (
         torch.arange(65536, device="cuda", dtype=torch.int32)
         .to(torch.int16)
