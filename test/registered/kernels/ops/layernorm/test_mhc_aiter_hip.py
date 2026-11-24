@@ -31,14 +31,15 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
     def setUp(self):
         mhc._AITER_MHC_RUNTIME_DISABLED = False
 
-    def _inputs(self, tokens: int, seed: int = 0):
+    def _inputs(self, tokens: int, seed: int = 0, hc_mult: int | None = None):
         torch.manual_seed(seed)
         device = torch.device("cuda")
-        mix_size = 2 * self.hc_mult + self.hc_mult**2
+        hc_mult = hc_mult or self.hc_mult
+        mix_size = 2 * hc_mult + hc_mult**2
         residual = (
             torch.randn(
                 tokens,
-                self.hc_mult,
+                hc_mult,
                 self.hidden_size,
                 device=device,
                 dtype=torch.bfloat16,
@@ -48,7 +49,7 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
         fn = (
             torch.randn(
                 mix_size,
-                self.hc_mult * self.hidden_size,
+                hc_mult * self.hidden_size,
                 device=device,
                 dtype=torch.float32,
             )
@@ -157,6 +158,23 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
             comb.view_as(comb_ref), comb_ref, atol=1e-4, rtol=1e-4
         )
         torch.testing.assert_close(layer_input, layer_ref)
+
+    def test_batch_invariant_mode_odd_stream_count_uses_torch(self):
+        """A stream count the Triton kernel cannot compile (hc_mult=3) must take the Torch path."""
+        residual, fn, scale, base = self._inputs(5, hc_mult=3)
+        kwargs = self._pre_kwargs(fn, scale, base)
+        with (
+            set_batch_invariant_mode(True),
+            patch.object(
+                mhc,
+                "mhc_pre_batch_invariant",
+                side_effect=AssertionError("Triton mhc_pre called"),
+            ),
+        ):
+            ref = mhc._mhc_pre_torch(residual=residual, **kwargs)
+            *got, _ = mhc._mhc_pre_dispatch(residual=residual, **kwargs)
+        for g, r in zip(got, ref):
+            self.assertTrue(torch.equal(g, r))
 
     def test_aiter_import_and_runtime_failures_latch_to_torch(self):
         """A missing symbol or a raising kernel must disable the route once, not fail the request."""

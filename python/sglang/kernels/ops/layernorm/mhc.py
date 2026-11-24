@@ -30,6 +30,7 @@ if _is_hip:
     )
     from sglang.kernels.ops.layernorm.mhc_pre_batch_invariant import (
         mhc_pre_batch_invariant,
+        mhc_pre_batch_invariant_supported,
     )
 
 logger = logging.getLogger(__name__)
@@ -1986,8 +1987,13 @@ def _mhc_pre_dispatch(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if _is_hip and is_batch_invariant_mode_enabled():
-        # AITER's and the TileLang mhc_pre pick their split-K by token count.
-        post_mix, comb_mix, layer_input = mhc_pre_batch_invariant(
+        # AITER's and the TileLang mhc_pre pick their split-K by token count. Stream
+        # counts the Triton kernel cannot take use the (batch-invariant) Torch path.
+        if mhc_pre_batch_invariant_supported(residual.shape[1]):
+            pre_fn = mhc_pre_batch_invariant
+        else:
+            pre_fn = _mhc_pre_torch
+        post_mix, comb_mix, layer_input = pre_fn(
             residual=residual,
             fn=fn,
             hc_scale=hc_scale,

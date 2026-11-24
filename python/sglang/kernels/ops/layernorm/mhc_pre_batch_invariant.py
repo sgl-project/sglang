@@ -156,6 +156,11 @@ def _mix_finish_kernel(
     )
 
 
+def mhc_pre_batch_invariant_supported(hc_mult: int) -> bool:
+    """The finish kernel indexes the streams with ``tl.arange``, which needs a power of two."""
+    return hc_mult >= 1 and hc_mult & (hc_mult - 1) == 0
+
+
 def mhc_pre_batch_invariant(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -170,6 +175,9 @@ def mhc_pre_batch_invariant(
     """Same signature and outputs as ``_mhc_pre_torch``: post [s, n, 1] fp32,
     comb [s, n, n] fp32 and layer_input [s, h] in the residual's dtype."""
     s, n, h = residual.shape
+    assert mhc_pre_batch_invariant_supported(n), (
+        f"hc_mult must be a power of two; got {n}"
+    )
     k = n * h
     nmix = 2 * n + n * n
     assert fn.shape == (nmix, k), f"fn must be ({nmix}, {k}); got {tuple(fn.shape)}"
