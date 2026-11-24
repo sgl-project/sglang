@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
-import importlib
-import importlib.util
 import logging
 import time
 from typing import List
@@ -118,36 +116,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 
 def register_memory_region(model, transfer_engine):
-    if importlib.util.find_spec("torch") is None:
-        return register_memory_region_v1(model, transfer_engine)
-    else:
-        return register_memory_region_v2(model, transfer_engine)
-
-
-def register_memory_region_v1(model, transfer_engine):
-    start_tic = time.time()
-
-    weight_mr_dict = {}
-    for name, weight in model.named_parameters():
-        ret = transfer_engine.register_memory(
-            weight.data_ptr(), weight.numel() * weight.element_size()
-        )
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight {name}, error: {ret}"
-            )
-        weight_mr_dict[name] = (
-            weight.data_ptr(),
-            weight.numel(),
-            weight.element_size(),
-        )
-
-    end_tic = time.time()
-    logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
-
-
-def register_memory_region_v2(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
