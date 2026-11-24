@@ -162,6 +162,10 @@ jobs:
     env:
       RUNNER_LABELS: ${{ inputs.runs_on }}
       SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.rdma_devices }}
+      # The two main-dispatch cases whose Run test gets a secret: they build the Rust
+      # extensions and sgl-router from source, since a pull_request_target run can write the cache.
+      MUSE_SPARK_RUN: ${{ inputs.pr_head_sha == '' && inputs.runs_on == '8-gpu-b300' && (contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_12_b300_pd.py') || contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_unified_memory.py')) }}
+      PRECISION_STORE_RUN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -200,10 +204,14 @@ jobs:
 
       # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
       - uses: ./trusted-ci/.github/actions/download-rust-ext
+        with:
+          from_source: ${{ env.MUSE_SPARK_RUN == 'true' || env.PRECISION_STORE_RUN == 'true' }}
 
       # Cache-only for the same reason. The PD fixture needs two GPUs.
       - uses: ./trusted-ci/.github/actions/download-sgl-router
         if: ${{ !startsWith(inputs.runs_on, '1-gpu') }}
+        with:
+          from_source: ${{ env.MUSE_SPARK_RUN == 'true' || env.PRECISION_STORE_RUN == 'true' }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
@@ -228,8 +236,8 @@ jobs:
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
           REQUESTED_TEST_COMMAND: ${{ inputs.test_command }}
-          HF_MUSE_SPARK_TOKEN: ${{ inputs.pr_head_sha == '' && inputs.runs_on == '8-gpu-b300' && (contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_12_b300_pd.py') || contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_unified_memory.py')) && secrets.HF_MUSE_SPARK_TOKEN || '' }}
-          SGLANG_PRECISION_HF_TOKEN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
+          HF_MUSE_SPARK_TOKEN: ${{ env.MUSE_SPARK_RUN == 'true' && secrets.HF_MUSE_SPARK_TOKEN || '' }}
+          SGLANG_PRECISION_HF_TOKEN: ${{ env.PRECISION_STORE_RUN == 'true' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
           if [[ "${{ inputs.refresh_precision_baseline }}" == "true" ]]; then
             expected="registered/debug_utils/test_nightly_precision_regression.py"
@@ -479,8 +487,11 @@ jobs:
 
       # Not through setup-amd-ci's sgl_router input: a local action that
       # another action uses resolves against the workspace, the PR checkout.
+      # Credentialed job: build from source; the cache may hold a pull_request_target run's files.
       - uses: ./trusted-ci/.github/actions/download-sgl-router
         if: needs.prepare-partitions.outputs.sgl_router == 'true'
+        with:
+          from_source: ${{ env.DOCKERHUB_AMD_TOKEN != '' }}
 
       - uses: ./trusted-ci/.github/actions/setup-amd-ci
         with:
