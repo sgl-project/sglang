@@ -2,7 +2,7 @@
 
 One 8-card machine runs a 4-card prefill worker (cards 0-3) and a 4-card
 decode worker (cards 4-7). KV is transferred with the Mooncake backend (TENT
-over the device URMA path), and sgl-router fronts both workers so every GPQA
+over the host RDMA path), and sgl-router fronts both workers so every GPQA
 question exercises the prefill -> decode handoff.
 """
 
@@ -93,6 +93,12 @@ DEEPSEEK_V4_FLASH_FP8_PD_SHARED_ARGS = [
     "--page-size",
     128,
     "--trust-remote-code",
+    # Every rank used to read all 48 shards off the shared model store, so the
+    # two workers pulled 8x the checkpoint at once. Prefetching splits the
+    # shards across the ranks of each worker and feeds the page cache instead.
+    "--weight-loader-prefetch-checkpoints",
+    "--weight-loader-prefetch-num-threads",
+    8,
     # run_accuracy sends the checkpoint basename as the OpenAI ``model`` field;
     # both workers serve that name so sgl-router can route it.
     "--served-model-name",
@@ -223,7 +229,10 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
         # get the TENT config of this host plus the memfabric/mooncake libs.
         transfer_envs = {
             "MC_USE_TENT": "1",
-            "MF_PROTOCOL": "device_urma",
+            # device_urma is unusable on this board (memfabric's URMA topo
+            # table has no entry for it), so the KV transfer runs over the
+            # host-side RDMA path instead.
+            "MF_PROTOCOL": "host_rdma",
             "MF_TRANSFER_TIMEOUT": "10000",
             "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
             "MC_TENT_CONF": write_memfabric_tent_conf(),
