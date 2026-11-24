@@ -50,7 +50,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils import is_npu, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
@@ -1186,6 +1186,13 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
+        if is_npu():
+            # The NPU pool stores window before channels; metadata uses window last.
+            self.conv_states_shape = (
+                *self.conv_states_shape[:-2],
+                self.conv_states_shape[-1],
+                self.conv_states_shape[-2],
+            )
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (

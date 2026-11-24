@@ -459,6 +459,9 @@ class MambaMixer2(torch.nn.Module):
         # stay the same and reused for all mamba layers in the same iteration
         state_indices_tensor = metadata.mamba_cache_indices
         conv_state = layer_cache.conv[0]
+        if is_npu():
+            # The NPU pool stores [slot, window, channels].
+            conv_state = conv_state.transpose(-1, -2)
         ssm_state = layer_cache.temporal
         intermediate_states = None
         track_states = None

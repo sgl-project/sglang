@@ -25,6 +25,42 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class TestMamba2ConvLayout(unittest.TestCase):
+    def test_tracking_uses_window_length_on_each_platform(self):
+        """NPU channels must not become the checkpoint's convolution window."""
+        settings = SimpleNamespace(
+            mamba=SimpleNamespace(
+                enable_mamba_extra_buffer=True, mamba_track_interval=128
+            )
+        )
+        module = "sglang.srt.layers.attention.hybrid_linear_attn_backend"
+        for npu_layout in (False, True):
+            with self.subTest(npu_layout=npu_layout):
+                shape = (1, 2, 3, 768) if npu_layout else (1, 2, 768, 3)
+
+                def init_base(backend, model_runner):
+                    backend.device = "cpu"
+                    backend._mamba_chunk_size = 128
+                    backend.state_pool = SimpleNamespace(
+                        mamba_cache=SimpleNamespace(conv=[torch.empty(shape)])
+                    )
+
+                with (
+                    patch.object(MambaAttnBackendBase, "__init__", init_base),
+                    patch(f"{module}.is_npu", return_value=npu_layout, create=True),
+                    patch(f"{module}.get_exec", return_value=settings),
+                ):
+                    backend = Mamba2AttnBackend(None)
+                batch = SimpleNamespace(
+                    mamba_track_aligned_lens=lambda: torch.tensor([128]),
+                    mamba_track_mask=torch.tensor([True]),
+                )
+                indices = backend._init_track_conv_indices(
+                    torch.tensor([0, 128]), batch
+                )
+                torch.testing.assert_close(indices, torch.tensor([[125, 126, 127]]))
+
+
 class NoHostRead(torch.Tensor):
     def cpu(self, *args, **kwargs):
         raise AssertionError("CPU tracking must not copy device metadata to the host")
