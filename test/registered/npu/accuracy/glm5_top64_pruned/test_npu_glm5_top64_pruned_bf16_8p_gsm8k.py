@@ -18,7 +18,6 @@ ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
-    "HCCL_BUFFSIZE": "1000",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_SOCKET_IFNAME": "lo",
@@ -42,7 +41,7 @@ OTHER_ARGS = [
     "--deepep-mode",
     "auto",
     "--cuda-graph-bs-decode",
-    16,
+    8,
 ]
 
 
