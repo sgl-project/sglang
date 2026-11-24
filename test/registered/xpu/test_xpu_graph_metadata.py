@@ -376,23 +376,6 @@ class TestXPUGraphMetadata(CustomTestCase):
                     )
                     self.assertEqual(backend.forward_metadata.max_seq_len_k, expected)
 
-            # Test local attention chunk size clamping
-            backend.attention_chunk_size = 1024
-            backend.decode_cuda_graph_metadata[2].local_attn_metadata = SimpleNamespace(
-                local_max_seq_len=0
-            )
-            with patch(
-                "sglang.srt.model_executor.runner_utils.capture_mode.get_capture_attention_variant",
-                return_value="medium",
-            ):
-                backend._init_full_cg_decode_metadata(
-                    make_batch([1, 1]), in_capture=True
-                )
-                self.assertEqual(
-                    backend.forward_metadata.local_attn_metadata.local_max_seq_len, 1024
-                )
-            backend.attention_chunk_size = None
-
             backend._init_full_cg_decode_metadata(
                 make_batch([128, 64]), in_capture=False
             )

@@ -1884,13 +1884,7 @@ class XPUAttentionBackend(AttentionBackend):
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
             # captured graph always reads from the same storage addresses.
-            existing = self.decode_cuda_graph_metadata.get(bs)
             metadata = FlashAttentionMetadata()
-            if (
-                existing is not None
-                and getattr(existing, "local_attn_metadata", None) is not None
-            ):
-                metadata.local_attn_metadata = existing.local_attn_metadata
             metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                 "cache_seqlens"
             ][:bs]
