@@ -358,10 +358,7 @@ def maybe_run_imports(model_runner, forward_batch) -> None:
             "KDA TP: this rank has PD state imports but no DP import counts "
             "(the scheduler's DP all-gather did not run)"
         )
-    if (
-        forward_batch.dp_kda_tp_state_imports is None
-        or model_runner.is_draft_worker
-    ):
+    if forward_batch.dp_kda_tp_state_imports is None or model_runner.is_draft_worker:
         return
     mamba_pool = model_runner.req_to_token_pool.mamba_pool
     if mamba_pool.pd_staging is not None:
