@@ -1331,11 +1331,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
-        layer_id = layer.layer_id if layer_id_override is None else layer_id_override
+        layer_id = layer.layer_id
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1407,13 +1406,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
+        if layer_id_override is not None:
+            return super().set_mla_kv_buffer(
+                layer, loc_info, cache_k_nope, cache_k_rope, layer_id_override
+            )
         self._check_physical_write_loc(loc_info, "set_mla_kv_buffer (NPU MLA)")
-        kwargs = (
-            {}
-            if layer_id_override is None
-            else {"layer_id_override": layer_id_override}
-        )
-        self.set_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope, **kwargs)
+        self.set_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
 
     def _set_fia_nz_kv_buffer(
         self,
