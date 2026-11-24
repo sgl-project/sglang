@@ -754,7 +754,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             parser_cls.return_value.parse_stream_chunk.side_effect = (
                 fake_parse_stream_chunk
             )
-            parser_cls.return_value.parse_stream_end.return_value = ("", [])
+            parser_cls.return_value.parse_stream_tail.return_value = []
             fixture = StreamFixture(serving, request)
             events = fixture.run(chunks)
 

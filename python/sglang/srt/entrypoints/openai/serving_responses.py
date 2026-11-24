@@ -2766,25 +2766,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not delta and not flush and not token_calls:
                     continue
 
+                # Each segment is (text, calls); segments are in generation
+                # order.
                 if isinstance(tool_parser, JsonArrayParser):
-                    result = tool_parser.parse_streaming_chunk(delta, chat_tools)
-                    normal_text, tool_calls = result.normal_text, result.calls
+                    results = [tool_parser.parse_streaming_chunk(delta, chat_tools)]
                     if flush:
-                        end = tool_parser.finish(chat_tools)
-                        normal_text += end.normal_text
-                        tool_calls += end.calls
+                        results += tool_parser.parse_streaming_end(chat_tools)
+                    segments = [(r.normal_text, r.calls) for r in results]
                 elif token_stream is not None:
-                    normal_text, tool_calls = delta, token_calls
+                    segments = [(delta, token_calls)]
                 elif tool_parser is not None and not self._answer_started(
                     reasoning_parser_obj
                 ):
-                    normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
+                    segments = [tool_parser.parse_stream_chunk(delta)]
                     if flush:
-                        end_text, end_calls = tool_parser.parse_stream_end()
-                        normal_text = (normal_text or "") + end_text
-                        tool_calls = list(tool_calls) + end_calls
+                        segments += tool_parser.parse_stream_tail()
                 else:
-                    normal_text, tool_calls = delta, []
+                    segments = [(delta, [])]
 
                 def _emit_tool_calls(calls):
                     nonlocal current_output_index
@@ -2957,22 +2955,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
 
                 # The parser's (text, calls) tuple is unordered, but positions
-                # are recoverable: continuing arguments precede this delta's
+                # are recoverable: continuing arguments precede this segment's
                 # text, a newly opened call follows it. Classify first --
                 # emitting mutates tool_call_states.
                 def _is_continuing(call):
                     state = tool_call_states.get(call.tool_index)
                     return state is not None and not state.get("done")
 
-                continuing = [c for c in tool_calls if _is_continuing(c)]
-                opening = [c for c in tool_calls if not _is_continuing(c)]
+                for normal_text, tool_calls in segments:
+                    continuing = [c for c in tool_calls if _is_continuing(c)]
+                    opening = [c for c in tool_calls if not _is_continuing(c)]
 
-                for ev in _emit_tool_calls(continuing):
-                    yield ev
-                for ev in _emit_normal_text():
-                    yield ev
-                for ev in _emit_tool_calls(opening):
-                    yield ev
+                    for ev in _emit_tool_calls(continuing):
+                        yield ev
+                    for ev in _emit_normal_text():
+                        yield ev
+                    for ev in _emit_tool_calls(opening):
+                        yield ev
         except Exception as e:
             logger.exception(
                 "Error while streaming /v1/responses %s", request.request_id

@@ -1223,7 +1223,9 @@ class TestBaseFormatDetector(unittest.TestCase):
 
         with patch.object(self.detector, "parse_streaming_increment", resend):
             result = self.detector.parse_streaming_chunk("<tool_call>{", self.tools)
+            end = self.detector.parse_streaming_end(self.tools)
         self.assertEqual(result.normal_text, "<tool_call>{")
+        self.assertEqual("".join(r.normal_text for r in end), "")
 
 
 class TestLlama32Detector(unittest.TestCase):
@@ -6523,6 +6525,46 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class TestStreamChunkOrder(unittest.TestCase):
+    """A chunk result is sent text first, so text after a call in the same
+    chunk must come in a later result."""
+
+    CHUNK = (
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}'
+        "\n</tool_call>\nDone."
+    )
+
+    def setUp(self):
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            ),
+        )
+        self.parser = FunctionCallParser(tools=[tool], tool_call_parser="hermes")
+
+    def _assert_whole_call(self, text, calls):
+        self.assertEqual(text, "")
+        self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
+        self.assertEqual(
+            json.loads("".join(c.parameters for c in calls)), {"city": "Paris"}
+        )
+
+    def test_text_after_a_call_comes_with_the_next_chunk(self):
+        self._assert_whole_call(*self.parser.parse_stream_chunk(self.CHUNK))
+        text, calls = self.parser.parse_stream_chunk(" Bye.")
+        self.assertEqual((text.strip(), calls), ("Done. Bye.", []))
+
+    def test_text_after_a_call_in_the_last_chunk_is_kept(self):
+        self._assert_whole_call(*self.parser.parse_stream_chunk(self.CHUNK))
+        text, calls = self.parser.parse_stream_tail()[0]
+        self.assertEqual((text.strip(), calls), ("Done.", []))
 
 
 class TestToolCallParserNames(unittest.TestCase):
