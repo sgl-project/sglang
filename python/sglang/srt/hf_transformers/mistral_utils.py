@@ -992,11 +992,7 @@ def attach_mistral_common_image_urls(messages: list[dict], image_data: list) -> 
 
 
 def retry_without_mistral_common_kwargs(tokenizer_name, *args, **common_kwargs):
-    """Retry ``AutoTokenizer.from_pretrained`` without kwargs that MistralCommon rejects.
-
-    Returns the loaded tokenizer, or *None* if the error is not a
-    MistralCommon kwargs rejection.
-    """
+    """Retry ``AutoTokenizer.from_pretrained`` without kwargs that MistralCommon rejects."""
     from transformers import AutoTokenizer
 
     stripped = {

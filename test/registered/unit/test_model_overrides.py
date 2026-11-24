@@ -210,6 +210,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_replicate_q_proj",
                     "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
+                    "num_continuous_decode_steps",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "decode_state_free_radix_default",
@@ -2096,6 +2097,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+
+    def test_exaone_and_olmo2_default_to_fa3_only_on_sm8x_and_sm9x(self):
+        """The fa3 backend is built for SM 8.x and 9.x and refuses any other
+        device at construction, so the default on SM110 / SM120 / SM121 must be
+        triton, as it is on a platform that is not CUDA."""
+        from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
+        from sglang.srt.arg_groups.model_overrides.olmo2 import _olmo2_overrides
+
+        exaone_config = SimpleNamespace(
+            sliding_window_pattern="LLLG", architectures=["Exaone4ForCausalLM"]
+        )
+        args = SimpleNamespace(attention_backend=None)
+        cases = (
+            (True, 80, "fa3"),
+            (True, 89, "fa3"),
+            (True, 90, "fa3"),
+            (True, 100, "trtllm_mha"),
+            (True, 103, "trtllm_mha"),
+            (True, 110, "triton"),
+            (True, 120, "triton"),
+            (True, 121, "triton"),
+            # gfx950 reports capability (9, 5) through torch.cuda.
+            (False, 95, "triton"),
+        )
+        for is_cuda, device_sm, expected in cases:
+            with (
+                self.subTest(is_cuda=is_cuda, device_sm=device_sm),
+                override_platform(
+                    is_cuda=is_cuda,
+                    is_sm100=is_cuda and device_sm // 10 == 10,
+                    device_sm=device_sm,
+                ),
+            ):
+                self.assertEqual(
+                    _exaone_overrides(args, exaone_config),
+                    {"attention_backend": expected},
+                )
+                self.assertEqual(
+                    _olmo2_overrides(args, None), {"attention_backend": expected}
+                )
 
     def test_exaone_without_pattern_declares_nothing(self):
         from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides

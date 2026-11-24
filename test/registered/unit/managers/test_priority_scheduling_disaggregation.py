@@ -47,6 +47,7 @@ from sglang.test.scheduler_test_utils import (
     FakeReq,
     decode_queue,
     empty_request_lists,
+    idle_penalty_status_pool,
     leaving_retirer,
     release_only_retirer,
 )
@@ -88,6 +89,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.hisparse_coordinator = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         return scheduler
 
@@ -170,6 +172,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.abort_on_priority_when_disabled = True
                 scheduler.enable_hicache_storage = True
                 scheduler.tree_cache = MagicMock(spec=["finish"])
+                scheduler.penalty_status_pool = idle_penalty_status_pool()
                 scheduler.init_request_retirer()
                 req = self._new_req(priority=10)
 
@@ -195,6 +198,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.max_queued_requests = 1
                 scheduler.enable_hicache_storage = True
                 scheduler.tree_cache = MagicMock(spec=["finish"])
+                scheduler.penalty_status_pool = idle_penalty_status_pool()
                 scheduler.init_request_retirer()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
@@ -494,6 +498,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
         scheduler.hisparse_coordinator = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
 
         with (
@@ -1028,6 +1033,8 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
+        scheduler.sampler_params_pool = MagicMock()
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
@@ -1124,6 +1131,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         """Admission moves the requests from waiting into running."""
         scheduler = self._new_scheduler(enable_overlap=False)
         scheduler.req_to_token_pool = MagicMock(size=2)
+        scheduler.penalty_status_pool = MagicMock()
         scheduler.max_running_requests = 2
         scheduler.kv_checksum_computer = None
         scheduler.enable_hisparse = False
