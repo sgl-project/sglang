@@ -16,7 +16,7 @@ class TestDiffusionRustGate(unittest.TestCase):
             "jobs"
         ]
         for name in ("rust-ext-build", "rust-ext-build-aarch64"):
-            for event in ("pull_request", "schedule", "workflow_dispatch"):
+            for event in ("pull_request_target", "schedule", "workflow_dispatch"):
                 for main, jit, kernel, diffusion in (
                     (False, False, False, True),
                     (True, False, False, True),
@@ -32,6 +32,7 @@ class TestDiffusionRustGate(unittest.TestCase):
                             "github.event_name": event,
                             "needs.check-changes.result": "success",
                             "needs.call-gate.result": "success",
+                            "needs.call-gate.outputs.opted-in": "true",
                             "needs.check-changes.outputs.main_package": str(
                                 main
                             ).lower(),
@@ -53,7 +54,7 @@ class TestDiffusionRustGate(unittest.TestCase):
                             " ".join(expression.split()), {"__builtins__": {}}
                         )
                         expected = (
-                            event != "pull_request"
+                            event != "pull_request_target"
                             or not diffusion
                             or main
                             or jit
