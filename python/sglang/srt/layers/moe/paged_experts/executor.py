@@ -47,7 +47,7 @@ class EagerExecutor:
         self.routed_scaling_factor = routed_scaling_factor
         # Shared with a DeviceExecutor, whose steps (and graph replays) move it on the GPU.
         self.device_residency = device_residency
-        # --paged-experts-fused-host-copy: the MoE kernel reads the device residency's count.
+        # Fused host copy: the MoE kernel reads the device residency's count.
         self.fused_host_copy = False
 
     def run(self, layer, dispatch_output):
@@ -155,7 +155,7 @@ class DeviceExecutor:
         # The next MoE layer's pre-copy, launched after this layer's gather; set by
         # ``precopy.install``.
         self.precopy_next = None
-        # --paged-experts-fused-host-copy: the MoE kernel pages the experts in as it computes.
+        # Fused host copy: the MoE kernel pages the experts in as it computes.
         self.fused_host_copy = False
 
     def run(self, layer, dispatch_output):

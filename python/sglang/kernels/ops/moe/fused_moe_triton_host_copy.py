@@ -23,12 +23,12 @@ def paged_expert_kernel_kwargs(B: torch.Tensor, paged_expert_info: dict) -> dict
     (the number of experts its current step pages in)."""
     host_table = paged_expert_info["host_table"]
     assert host_table.shape[1:] == B.shape[1:], (
-        "--paged-experts-fused-host-copy: the shape of one expert in the host table, "
+        "Paged experts, fused host copy: the shape of one expert in the host table, "
         f"{tuple(host_table.shape[1:])}, does not match the slot table's, "
         f"{tuple(B.shape[1:])}"
     )
     assert host_table.dtype == B.dtype, (
-        "--paged-experts-fused-host-copy: the dtype of the host table, "
+        "Paged experts, fused host copy: the dtype of the host table, "
         f"{host_table.dtype}, does not match the slot table's, {B.dtype}"
     )
     return {

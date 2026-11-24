@@ -1028,7 +1028,7 @@ def invoke_fused_moe_kernel(
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
         assert paged_expert_info is None, (
-            "--paged-experts-fused-host-copy is not supported for GPTQ/AWQ kernels"
+            "Paged experts: fused host copy is not supported for GPTQ/AWQ kernels"
         )
         group_size = block_shape[1]
         num_groups = triton.cdiv(A.shape[1], group_size)
@@ -1109,7 +1109,7 @@ def invoke_fused_moe_kernel(
         paged_expert_kwargs = {}
         if paged_expert_info is not None:
             assert not b_use_tma and bias is None and B_scale is None and not swap_ab, (
-                "--paged-experts-fused-host-copy supports only unquantized weights, "
+                "Paged experts: fused host copy supports only unquantized weights, "
                 "without bias, TMA or swapped operands"
             )
             paged_expert_kwargs = paged_expert_kernel_kwargs(

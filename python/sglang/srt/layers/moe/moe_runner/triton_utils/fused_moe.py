@@ -47,7 +47,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
+from .fused_moe_triton_config import (
+    get_config_dtype_str,
+    get_moe_configs,
+    try_get_optimal_moe_config,
+)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -460,6 +464,22 @@ def _moe_support_tma():
     return support_tensor_descriptor()
 
 
+def tuned_moe_configs_use_tma(w2: torch.Tensor) -> bool:
+    """Whether a launch on the unquantized experts ``w2`` can use TMA: the device supports it and
+    a tuned config of the up or the down kernel sets USE_TMA at some batch size."""
+    if not _moe_support_tma():
+        return False
+    E, _, N = w2.shape
+    dtype = get_config_dtype_str(dtype=w2.dtype)
+    for down_moe in (False, True):
+        configs = get_moe_configs(
+            E, N, dtype, 0, 0, per_channel_quant=False, down_moe=down_moe
+        )
+        if any(config.get("USE_TMA", False) for config in (configs or {}).values()):
+            return True
+    return False
+
+
 def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -511,15 +531,6 @@ def _prepare_fused_moe_run(
     # Copy config to avoid mutating the lru_cached dict returned by
     # get_moe_configs; we pop USE_TMA below.
     config = dict(config)
-    if host_ids:
-        # Paged experts, fused host copy: the kernel reads a host expert through pointers, not TMA.
-        up_tma = config.pop("USE_TMA", False)
-        down_tma = down_config.pop("USE_TMA", False) if down_config else False
-        if (up_tma or down_tma) and _moe_support_tma():
-            logger.warning_once(
-                "Paged experts: fused host copy runs the MoE kernels without TMA; USE_TMA in the "
-                "tuned MoE config is ignored"
-            )
     # Up-projection TMA is opt-in: only enabled when the up config file
     # explicitly carries "USE_TMA": true (produced by tuning). By default the
     # existing up config files do not contain this key, so existing users are
