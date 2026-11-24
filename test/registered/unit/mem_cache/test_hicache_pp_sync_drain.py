@@ -16,6 +16,7 @@ import torch.multiprocessing
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -330,6 +331,7 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cache.tree_core.enable_storage = True
         cache.tree_core.page_size = 1
         cache._backup_requested_tokens = {}
+        cache._storage_prefetch_hit_remaining_by_reqid = {}
         cache.ongoing_backup = {}
         cache._all_reduce_storage_drain = MagicMock()
         cc = cache.cache_controller
@@ -344,8 +346,10 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cc.backup_skip = False
         for _ in range(backups):
             self._ack_backup(cache)
-        cache._pp_ready_store = PPConsensusStore(2, pp_rank, group)
-        self.addCleanup(cache._pp_ready_store.close)
+        cache._pp_store_expected = True
+        if group is not None:
+            cache._pp_ready_store = PPConsensusStore(2, pp_rank, group)
+            self.addCleanup(cache._pp_ready_store.close)
         return cache
 
     def _ack_backup(self, cache):
@@ -439,6 +443,57 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
             self._follower_round(follower, leader, counts)
         # PP1's new ack is reported in round 2 and drained in round 3.
         self.assertEqual(relayed, [0, 0, 1])
+        for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
+
+    def test_store_opens_in_the_tick_and_outlives_detach(self):
+        """The store opens in the first tick with storage on, with PP0's address
+        relayed down the PP-sync channel (no collective, which would wait for a
+        stage that has not seen the attach). A detach keeps it and starts a new
+        epoch; after the next attach draining resumes without a second relay."""
+        leader = self._storage_stage(0, None, backups=1)
+        follower = self._storage_stage(1, None, backups=1)
+        for cache in (leader, follower):  # cleanups run last-in first, PP1 first
+            self.addCleanup(
+                lambda c=cache: c._pp_ready_store and c._pp_ready_store.close()
+            )
+        relayed = []
+        leader._pp_sync = MagicMock(
+            side_effect=lambda data: relayed.append(data.clone())
+        )
+        follower._pp_sync = MagicMock(
+            side_effect=lambda data: data.copy_(relayed.pop(0))
+        )
+        for cache in (leader, follower):
+            cache.tree_core.enable_storage = False
+            cache.check_hicache_events()
+            self.assertIsNone(cache._pp_ready_store)
+            cache.tree_core.enable_storage = True
+
+        def rounds(n):
+            out = []
+            for _ in range(n):
+                counts, n_backup = self._leader_round(leader)
+                out.append(n_backup)
+                self._follower_round(follower, leader, counts)
+            return out
+
+        self.assertEqual(rounds(2), [0, 1])
+        self.assertEqual(relayed, [])  # PP1 consumed PP0's one address
+        stores = [leader._pp_ready_store, follower._pp_ready_store]
+        old_key = follower._storage_ready_key(2)
+        for cache in (leader, follower):
+            cache.cache_controller.detach_storage_backend = MagicMock()
+            self.assertTrue(StorageAttachment(cache).detach()[0])
+            cache.tree_core.enable_storage = True  # what the next attach turns on
+            self._ack_backup(cache)
+        self._wait_until(lambda: leader._pp_ready_store.collect(old_key)[1] is None)
+
+        # The new epoch hears PP1 from its first round, so round 2 drains.
+        self.assertEqual(rounds(3), [0, 1, 0])
+        self.assertEqual([leader._pp_ready_store, follower._pp_ready_store], stores)
+        self.assertEqual(leader._pp_sync.call_count, 1)
+        self.assertEqual(follower._storage_epoch, leader._storage_epoch)
         for cache in (leader, follower):
             self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
 

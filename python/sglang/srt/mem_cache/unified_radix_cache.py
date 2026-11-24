@@ -8,7 +8,7 @@ import time
 import zlib
 from array import array
 from collections import deque
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, nullcontext, suppress
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -135,7 +135,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_observability,
-    get_parallel,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
@@ -190,6 +189,33 @@ device_module = get_device_module()
 
 # Arbitrary; far above the few rounds a stage takes to report in a new epoch.
 _STORAGE_UNREPORTED_WARN_ROUNDS = 1000
+# Port, host length, host bytes (an IPv6 literal fits).
+_PP_STORE_ADDRESS_SLOTS = 2 + 64
+
+
+class _PPSyncAddressRelay:
+    """PPConsensusStore's PP-group handle: sends PP0's address down the HiCache
+    PP-sync channel in tick order. A collective would make PP0 wait for stages
+    that receive the attach only after PP0's tick (PD prefill forwards it later)."""
+
+    def __init__(self, cache: UnifiedRadixCache):
+        self._cache = cache
+        self.exchanged = False
+        self.address: Optional[tuple[str, int]] = None
+
+    def broadcast_object(self, obj, src=0):
+        data = torch.zeros(_PP_STORE_ADDRESS_SLOTS, dtype=torch.int64)
+        if obj is not None:
+            host = list(obj[0].encode())
+            data[0], data[1] = obj[1], len(host)
+            data[2 : 2 + len(host)] = torch.tensor(host)
+        self._cache._pp_sync(data)
+        self.exchanged = True
+        port, size = data[:2].tolist()
+        if port == 0:
+            raise RuntimeError("PP0 has no HiCache PP store this tick")
+        self.address = (bytes(data[2 : 2 + size].tolist()).decode(), port)
+        return self.address
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -233,8 +259,13 @@ class UnifiedRadixCache(BasePrefixCache):
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
     # Cache-mode PP only: replicates each stage's storage-queue totals to PP0;
-    # the per-queue counts every stage drained in lockstep this epoch.
+    # the per-queue counts every stage drained in lockstep this epoch. Opened in
+    # the first tick with storage on and kept across detach / attach: a stage's
+    # close can block in zmq term once PP0's store is gone, so like the PD store
+    # it ends with the process.
     _pp_ready_store: Optional[PPConsensusStore] = None
+    _pp_store_expected: bool = False
+    _pp_store_failure_logged: bool = False
     _storage_drained: tuple[int, ...] = ()
     _storage_epoch: int = 0
     _storage_unreported_rounds: int = 0
@@ -672,6 +703,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self._pp_store_expected = (
+            self.pp_size > 1
+            and self.pp_group is not None
+            and self.host_memory_mode == "cache"
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -702,7 +738,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
-        self._close_pp_ready_store()
 
     @rank_consensus(
         same_params=["params"],
@@ -4313,21 +4348,26 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _open_pp_ready_store(self) -> None:
-        # Collective over the PP group; storage turns on at the same point on
-        # every stage (startup or an attach that every stage runs).
-        if (
-            self.pp_size > 1
-            and self.host_memory_mode == "cache"
-            and self._pp_ready_store is None
-        ):
-            self._pp_ready_store = PPConsensusStore(
-                self.pp_size, self.pp_rank, get_parallel().pp_group
-            )
-
-    def _close_pp_ready_store(self) -> None:
-        if self._pp_ready_store is not None:
-            self._pp_ready_store.close()
-            self._pp_ready_store = None
+        # Runs in the tick, where storage is on at the same point on every stage.
+        if not self._pp_store_expected or self._pp_ready_store is not None:
+            return
+        relay = _PPSyncAddressRelay(self)
+        try:
+            self._pp_ready_store = PPConsensusStore(self.pp_size, self.pp_rank, relay)
+        except Exception:
+            if not relay.exchanged:
+                # Keep the PP-sync stream aligned: PP0 says "no store", the rest hear it.
+                with suppress(RuntimeError):
+                    relay.broadcast_object(None)
+            if relay.address is not None:
+                raise  # PP0 opened a store this rank cannot join
+            if self.pp_rank == 0 and not self._pp_store_failure_logged:
+                self._pp_store_failure_logged = True
+                logger.warning(
+                    "HiCache PP storage drain: PP0 could not open its PP store; "
+                    "retrying every tick, and nothing is drained until it opens.",
+                    exc_info=True,
+                )
 
     def _storage_ready_key(self, index: int) -> str:
         return f"hicache_storage:{self._storage_epoch}:{index}"
@@ -4349,8 +4389,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _min_storage_totals(self, sizes: tuple[int, ...]) -> tuple[int, ...]:
         drained = self._storage_drained_counts(len(sizes))
+        store = self._pp_ready_store
         peer_totals = [
-            self._pp_ready_store.collect(self._storage_ready_key(index))[1:]
+            (
+                store.collect(self._storage_ready_key(index))[1:]
+                if store is not None
+                else [None] * (self.pp_size - 1)
+            )
             for index in range(len(sizes))
         ]
         self._warn_on_unreported_stages(sizes=sizes, peer_totals=peer_totals)
@@ -4422,7 +4467,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if self.enable_storage
                 else ()
             )
-            if self._pp_ready_store is not None and storage_queue_sizes:
+            if self._pp_store_expected and storage_queue_sizes:
                 storage_queue_sizes = self._min_storage_totals(storage_queue_sizes)
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
@@ -4773,6 +4818,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage:
             self._raise_if_storage_workers_died()
         self._bound_async_work()
+        if self.enable_storage:
+            self._open_pp_ready_store()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()

@@ -246,7 +246,6 @@ class StorageAttachment:
 
         cache.enable_storage = False
         cache.enable_storage_metrics = False
-        cache._close_pp_ready_store()
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:
@@ -292,8 +291,6 @@ class StorageAttachment:
         happen exactly when storage turns on belongs in this method.
         """
         cache = self._cache
-        if enable_storage:
-            cache._open_pp_ready_store()
 
         # Nodes already in the tree were built with hashing off. Fill them in as
         # storage turns on: a node hashed against an unhashed parent restarts the
