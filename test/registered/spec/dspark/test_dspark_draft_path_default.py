@@ -118,12 +118,17 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
                 )
 
     def test_modelscope_rejects_another_revision_for_a_bundled_draft(self):
-        for draft_revision, raises in (("target", False), ("draft", True)):
-            with self.subTest(draft_revision=draft_revision):
+        for revision, draft_revision, raises in (
+            ("target", "target", False),
+            ("target", "draft", True),
+            (None, "master", False),
+            (None, "draft", True),
+        ):
+            with self.subTest(revision=revision, draft_revision=draft_revision):
                 server_args = _make_dspark_server_args(
                     model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
                 )
-                server_args.revision = "target"
+                server_args.revision = revision
                 server_args.speculative_draft_model_revision = draft_revision
                 with envs.SGLANG_USE_MODELSCOPE.override(True):
                     if raises:

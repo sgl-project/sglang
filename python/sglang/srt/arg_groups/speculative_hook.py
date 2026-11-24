@@ -624,16 +624,18 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _check_bundled_draft_revision(cfg) -> None:
-    """The ModelScope cache keeps one revision of each repo, and
-    handle_modelscope_paths has already resolved --model-path to it."""
+    """With ModelScope, handle_modelscope_paths has resolved --model-path to
+    one local snapshot, and a bundled draft loads from it. An unset
+    --revision is master, the default revision of modelscope-hub."""
     revision = cfg.speculative_draft_model_revision
-    if envs.SGLANG_USE_MODELSCOPE.get() and revision not in (None, cfg.revision):
+    target_revision = cfg.revision or "master"
+    if envs.SGLANG_USE_MODELSCOPE.get() and revision not in (None, target_revision):
         raise ValueError(
-            f"--speculative-draft-model-revision {revision!r} differs from "
-            f"--revision {cfg.revision!r}, but the draft is bundled in the target "
-            "checkpoint and the ModelScope cache keeps one revision of each repo. "
-            "Download the draft revision to a local directory and pass it with "
-            "--speculative-draft-model-path."
+            f"--speculative-draft-model-revision {revision!r} differs from the "
+            f"target revision {target_revision!r}. With ModelScope, a bundled draft "
+            "loads from the local snapshot of --model-path. Pass the same value to "
+            "--revision, or download the draft revision to a local directory and "
+            "pass it with --speculative-draft-model-path."
         )
 
 
