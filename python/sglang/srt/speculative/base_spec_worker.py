@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 
@@ -327,11 +328,30 @@ class BaseSpecWorker(ABC):
                 mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
             )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
-            _check_hicache_draft_dcp_layout(HiCacheDraftMode.PACKED, draft_pools)
-            target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (
                 target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
             )
+            if get_platform().is_npu and len(draft_pools) == 1:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                (draft_pool,) = draft_pools
+                draft_state = draft_pool.layer_router.part_view(STATE_PART)
+                draft_kv = draft_pool.layer_router.wrapped_view() or draft_pool
+                # Packed MLA mirrors only the target indexer. A draft with its
+                # own quantized pooled keys needs its own host mirror.
+                if (
+                    isinstance(draft_kv, NPUMLATokenToKVPool)
+                    and draft_kv.indexer_kv_store_int8
+                    and draft_kv.kpool_use_compress
+                    and (draft_state is None or draft_state is target_mamba_pool)
+                ):
+                    return HiCacheDraftPlan(
+                        mode=HiCacheDraftMode.SIDECAR, device_pools=draft_pools
+                    )
+            _check_hicache_draft_dcp_layout(HiCacheDraftMode.PACKED, draft_pools)
+            target_model_runner.mtp_draft_device_pools = draft_pools
             draft_mamba_pools = tuple(
                 runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
                 for runner in draft_runners

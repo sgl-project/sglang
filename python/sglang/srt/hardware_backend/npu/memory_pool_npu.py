@@ -829,10 +829,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if (
             indexer_quant_mode in (QUANT_MODE_TOKEN_INT8, QUANT_MODE_TOKEN_MXFP8)
             and get_memory().enable_hierarchical_cache
+            and not (
+                indexer_quant_mode == QUANT_MODE_TOKEN_INT8
+                and index_kpool > 1
+                and dtype == torch.bfloat16
+            )
         ):
             raise ValueError(
-                "--indexer-kv-cache-dtype=int8/mxFP8 is not supported with "
-                "--enable-hierarchical-cache"
+                "A quantized indexer cache with --enable-hierarchical-cache "
+                "requires INT8 KPool and a BF16 main KV cache."
             )
         self.indexer_kv_store_int8 = (
             indexer_quant_mode == QUANT_MODE_TOKEN_INT8
