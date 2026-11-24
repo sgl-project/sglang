@@ -25,6 +25,13 @@ class LoRAPathAction(argparse.Action):
         setattr(namespace, self.dest, lora_paths)
 
 
+class NoneChoiceAction(argparse.Action):
+    """Store the chosen value; the choice spelled `none` is stored as None."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, None if values == "none" else values)
+
+
 def print_deprecated_warning(message: str):
     logger.warning(f"\033[1;33m{message}\033[0m")
 
