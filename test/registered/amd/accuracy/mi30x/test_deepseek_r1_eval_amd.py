@@ -143,7 +143,8 @@ DEEPSEEK_R1_MODELS = [
             "--cuda-graph-max-bs-decode",
             "8",
             "--enable-torch-compile",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--trust-remote-code",
         ],
         env_vars={

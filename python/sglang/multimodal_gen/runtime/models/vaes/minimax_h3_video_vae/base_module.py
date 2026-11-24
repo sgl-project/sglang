@@ -238,11 +238,14 @@ class TransformerBlock(nn.Module):
         fused_norm: bool = False,
         pending: torch.Tensor | None = None,
         pending_scale: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
     ):
         if fused_norm:
+            # out_dtype: dtype the normed rows are stored in (None = FP32 after
+            # a residual add, the input dtype otherwise)
             if pending is None:
                 normed = diffusion_ops.h3_vae_rmsnorm(
-                    hidden_states, self.norm1.weight, self.norm1.eps
+                    hidden_states, self.norm1.weight, self.norm1.eps, out_dtype
                 )
             else:
                 hidden_states, normed = diffusion_ops.h3_vae_scale_add_rmsnorm(
@@ -251,6 +254,7 @@ class TransformerBlock(nn.Module):
                     pending_scale,
                     self.norm1.weight,
                     self.norm1.eps,
+                    out_dtype=out_dtype or torch.float32,
                 )
             attn_output = self.attn(normed, rotary_pos_emb)
             hidden_states, normed = diffusion_ops.h3_vae_scale_add_rmsnorm(
@@ -259,6 +263,7 @@ class TransformerBlock(nn.Module):
                 self.scale1,
                 self.norm2.weight,
                 self.norm2.eps,
+                out_dtype=out_dtype or torch.float32,
             )
             pending = self.ff(normed)
             # the next block consumes this scale after offload post-hooks release
