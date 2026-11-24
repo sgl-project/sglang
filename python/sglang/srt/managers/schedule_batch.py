@@ -1404,20 +1404,21 @@ class Req(ReqDllmMixin):
                     # Seatbelt, not validation: patterns are checked at ingress
                     # (Python's `normalize`, or the rust server's stricter
                     # `stop_regex_bound`). This runs per decode step on the hot
-                    # path, so an `re.error` escaping here would take the whole
-                    # scheduler down over one malformed request. Fail that request
-                    # instead.
+                    # path, so an `re.error` — or a `MemoryError` from a
+                    # pathological pattern that passed ingress validation —
+                    # escaping here would take the whole scheduler down over one
+                    # request. Fail that request instead.
                     try:
                         matched = re.search(stop_regex_str, tail_str)
-                    except (re.error, RecursionError) as e:
+                    except (re.error, RecursionError, MemoryError) as e:
                         logger.warning(
-                            "req %s: invalid stop_regex %r (%s); aborting the request",
+                            "req %s: stop_regex %r failed (%s); aborting the request",
                             self.rid,
                             stop_regex_str,
                             e,
                         )
                         self.finished_reason = FINISH_ABORT(
-                            f"invalid stop_regex {stop_regex_str!r}: {e}",
+                            f"stop_regex {stop_regex_str!r} failed: {e}",
                             HTTPStatus.BAD_REQUEST,
                             "BadRequestError",
                         )

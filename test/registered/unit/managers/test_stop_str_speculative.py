@@ -7,7 +7,9 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 
 import unittest
 from array import array
+from unittest.mock import patch
 
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -144,6 +146,23 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
         self.assertEqual(req.finished_len, 2)
+
+    def test_stop_regex_memory_error_aborts_request(self):
+        # A pathological stop_regex that exhausts memory at match time must
+        # abort only its own request (FINISH_ABORT), not escape the safety
+        # net and kill the scheduler (#52041). `re.search` is stubbed to
+        # raise MemoryError: the real pattern allocates ~1.8 GB, and ingress
+        # validation is best-effort by design, so the seatbelt — not the
+        # validator — is what is under test here.
+        req = _make_req([10, 11, 12, 20, 21], stop_regex=[r"XY"])
+        with patch(
+            "sglang.srt.managers.schedule_batch.re.search",
+            side_effect=MemoryError("mocked match-time exhaustion"),
+        ):
+            req.update_finish_state(new_accepted_len=6)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIn("XY", req.finished_reason.message)
 
 
 if __name__ == "__main__":
