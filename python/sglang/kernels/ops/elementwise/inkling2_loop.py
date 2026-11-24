@@ -222,7 +222,12 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
     block_n = 16 if decode else 64
     block_k = 256 if tokens <= 1024 else 64
     # 64 x 64 tiles with 256-wide K stages need 128 KB of shared memory; SM120 has 99 KB.
-    if not decode and block_k == 256 and _max_shared_mem(dest.device.index) < 1 << 17:
+    # gfx950's Triton pipeline needs 195 KB of its 160 KB LDS for them.
+    if (
+        not decode
+        and block_k == 256
+        and (_max_shared_mem(dest.device.index) < 1 << 17 or torch.version.hip)
+    ):
         block_k = 128
     partial_groups = groups if split else 1
     partials = torch.empty(

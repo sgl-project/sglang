@@ -485,7 +485,7 @@ class Inkling2Attention(nn.Module):
             from sglang.srt.models.inkling_common.inkling2_attn_hip import forward
 
             return forward(
-                self, q, k, v, r, gate, sinks, sources, positions, forward_batch
+                self, attn, q, k, v, r, gate, sinks, sources, positions, forward_batch
             )
         mode = forward_batch.forward_mode
         verify = mode.is_target_verify()

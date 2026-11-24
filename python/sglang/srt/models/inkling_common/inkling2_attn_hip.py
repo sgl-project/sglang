@@ -14,16 +14,20 @@ if is_gfx95_supported():
         pass
 
 
-def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batch):
+def forward(
+    attention, attn, q, k, v, r, gate, sinks, sources, positions, forward_batch
+):
     """ROCm: the Triton backend's relative-bias attention on a compact rel bias.
     Decode and MTP verify take the fused prologue (verify saves the conv windows),
     which also stores K and V into the KV cache when the backend names the target,
-    and apply the gate and sink in their attention reductions."""
+    and apply the gate and sink in their attention reductions. attn is the
+    RadixAttention of this loop pass (attention.attn is a ModuleList on looped
+    layers)."""
     tokens = q.shape[0]
     mode = forward_batch.forward_mode
     verify = mode.is_target_verify()
     if attention.fused_decode_prologue and (mode.is_decode() or verify):
-        kv_pool = fused_kv_write_buffers(attention.attn, forward_batch, k.dtype)
+        kv_pool = fused_kv_write_buffers(attn, forward_batch, k.dtype)
         q, k, v, rel_bias = attention._decode_prologue(
             q,
             k,
@@ -39,7 +43,7 @@ def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batc
         verify_kwargs = (
             dict(rel_bias_scale_after_add=True, pack_gqa=False) if verify else {}
         )
-        output = attention.attn(
+        output = attn(
             q,
             k,
             v,
@@ -51,7 +55,7 @@ def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batc
         )
     else:
         q, k, v, r = attention._prologue(q, k, v, r, sources, positions, forward_batch)
-        output, lse = attention.attn(
+        output, lse = attn(
             q,
             k,
             v,

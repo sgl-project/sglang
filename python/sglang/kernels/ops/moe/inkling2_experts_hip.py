@@ -445,6 +445,10 @@ def expert_gemm(
     if not rows:
         return out.unsqueeze(0)
     cfg = config or default_config(rows, num_experts, nvfp4, mfma_order)
+    if config is None:
+        # Inkling-2-Mini's w2 is 1152 wide (9 x 128): halve BK until it divides K
+        while width % cfg.bk and cfg.bk > 64:
+            cfg = cfg._replace(bk=cfg.bk // 2)
     assert width % cfg.bk == 0 and out_size % cfg.bn == 0
     # The largest split of at most cfg.split_k that divides the K tiles evenly.
     tiles = width // cfg.bk

@@ -780,7 +780,9 @@ def _rocm_overrides(
     from sglang.srt.server_args import ServerArgs
 
     (tmp_path / "config.json").write_text(json.dumps(release_config))
-    platform = SimpleNamespace(is_hip=hip, is_sm90=False, is_sm100=False)
+    platform = SimpleNamespace(
+        is_hip=hip, is_sm90=False, is_sm100=False, is_sm120=False
+    )
     monkeypatch.setattr(inkling, "get_platform", lambda: platform)
     monkeypatch.setattr(inkling_hip, "is_gfx95_supported", lambda: gfx95)
     # the override exports these on ROCm; preset them so nothing leaks to later tests
