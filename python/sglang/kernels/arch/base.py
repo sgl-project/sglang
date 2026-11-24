@@ -59,6 +59,10 @@ class DeviceArch:
         return self.props.max_threads_per_multi_processor
 
     @property
+    def max_vec_bytes(self) -> int:
+        return 16  # typically uint4 vector; override if different
+
+    @property
     def cuda(self) -> Optional[CudaArch]:
         return None
 
