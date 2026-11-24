@@ -1,5 +1,6 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import json
 import os
 import re
 import subprocess
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -46,18 +47,6 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
-
-RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
-    "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": "SGLANG_Q35MF_BK_VEC_COPY",
-    "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS": "SGLANG_Q35MF_MKH_N3B",
-    "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD": "SGLANG_Q35MF_MKH_N3C",
-    "SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY": "SGLANG_Q35MF_EDGE_CHAIN_TREE",
-    "SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING": "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
-    "SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST": "SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC": "SGLANG_Q35MF_EDGE_SHM_SYNC",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST": "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
-    "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP": "SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
-}
 
 
 class TestEnvField(unittest.TestCase):
@@ -194,40 +183,6 @@ class TestEnvField(unittest.TestCase):
                         self.assertIsNone(child.get())
 
 
-class TestRenamedEnvAliases(unittest.TestCase):
-    def _read(self, new, env):
-        field = vars(type(envs))[new]
-        with (
-            patch.dict(os.environ, env),
-            warnings.catch_warnings(record=True) as caught,
-        ):
-            warnings.simplefilter("always")
-            if new not in env:
-                os.environ.pop(new, None)
-            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
-                value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
-        return field, value, deprecations
-
-    def test_former_name_applies_with_a_visible_warning(self):
-        """The warning must reach users: a DeprecationWarning raised from library
-        code is filtered out by Python's default warning filters."""
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
-            with self.subTest(new=new):
-                field, value, deprecations = self._read(new, {old: "1"})
-                self.assertEqual(field.deprecated_name, old)
-                self.assertIs(value, True)
-                self.assertEqual(len(deprecations), 1)
-                self.assertIn(new, str(deprecations[0].message))
-
-    def test_new_name_wins_over_former_name(self):
-        for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
-            with self.subTest(new=new):
-                _, value, deprecations = self._read(new, {old: "1", new: "0"})
-                self.assertIs(value, False)
-                self.assertEqual(deprecations, [])
-
-
 class TestDeprecatedEnvRegistry(unittest.TestCase):
     def _apply(self, old_name, deprecation):
         with warnings.catch_warnings(record=True) as caught:
@@ -291,6 +246,40 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)
+
+
+class TestImportTimeBooleanKnobs(unittest.TestCase):
+    """Modules that freeze a boolean at import must read it through the
+    registry: a second parser at the read site accepted fewer spellings than
+    the declaration, so `yes` set the knob for some readers and not for others."""
+
+    def test_frozen_module_flags_follow_the_registry(self):
+        deepgemm = "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
+        script = (
+            "import json\n"
+            "from sglang.srt.batch_invariant_ops import batch_invariant_ops as ops\n"
+            "from sglang.srt.batch_overlap import two_batch_overlap as tbo\n"
+            "print(json.dumps([ops._ENABLE_MM_DEEPGEMM, "
+            "ops._ENABLE_MM_FALLBACK_VARIANT, ops._ENABLE_MM_COMPARISON_TEST, "
+            "tbo._tbo_debug]))\n"
+        )
+        overrides = {
+            # The kill switch registered tests launch servers with.
+            deepgemm: "0",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "yes",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST": "1",
+            "SGLANG_TBO_DEBUG": "yes",
+        }
+        # One interpreter: the flags are read once, when the modules load.
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, **overrides}, text=True
+        )
+        self.assertEqual(
+            json.loads(out.strip().splitlines()[-1]), [False, True, True, True]
+        )
+        with patch.dict(os.environ):
+            os.environ.pop(deepgemm, None)
+            self.assertIs(vars(type(envs))[deepgemm].get(), True)
 
 
 if __name__ == "__main__":

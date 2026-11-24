@@ -185,7 +185,7 @@ fn finish_reason_round_trips() {
         r#"{"type":"stop","matched":"</s>"}"#,
         r#"{"type":"stop","matched":7}"#,
         r#"{"type":"stop","matched":[1,2]}"#,
-        r#"{"type":"length","length":2}"#,
+        r#"{"type":"length","length":2,"ignored_stop":null}"#,
     ] {
         let parsed: FinishReason = serde_json::from_str(json).unwrap();
         let back: serde_json::Value = serde_json::to_value(&parsed).unwrap();

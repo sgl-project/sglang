@@ -78,10 +78,7 @@ void shm_allgather_into_tensor(torch::Tensor& output_tensor, torch::Tensor& data
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle) {
   TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only torch.distributed.ReduceOp.SUM is supported");
 
-  auto numel = data.numel();
-  int data_size = numel * data.element_size();
-
-  reduce_scatter_outer_loop(output_tensor, data, numel, data_size, handle);
+  reduce_scatter_outer_loop(output_tensor, data, data.numel(), handle);
 }
 
 void shm_alltoall(torch::Tensor& output_tensor, torch::Tensor& input_tensor, int64_t handle) {

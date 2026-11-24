@@ -10,7 +10,7 @@ on:
         type: string
         default: ''
       job_filter:
-        description: 'Comma-separated job ids to run, e.g. "nightly-4-npu-a3,nightly-acc-2-npu-a3" (leave empty or "all" to run all jobs)'
+        description: 'Comma-separated job ids to run, e.g. "nightly-test-4-npu-a3,nightly-acc-test-2-npu-a3" (leave empty or "all" to run all jobs)'
         required: false
         type: string
         default: 'all'
@@ -41,7 +41,7 @@ on:
         type: string
         default: ''
       job_filter:
-        description: 'Comma-separated job ids to run, e.g. "nightly-4-npu-a3,nightly-acc-2-npu-a3" (leave empty or "all" to run all jobs)'
+        description: 'Comma-separated job ids to run, e.g. "nightly-test-4-npu-a3,nightly-acc-test-2-npu-a3" (leave empty or "all" to run all jobs)'
         required: false
         type: string
         default: 'all'
@@ -73,6 +73,7 @@ jobs:
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
       accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
+      accuracy_date_parity: ${{ steps.set-vars.outputs.accuracy_date_parity }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -110,7 +111,8 @@ jobs:
           # Package run metadata (branch/workflow/create_time) as a single JSON for reuse by all
           # test jobs; create_time is UTC+8 date + time (minute precision) recorded once at run
           # start, shared even across midnight.
-          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
+          BEIJING_CREATE_TIME="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "${BEIJING_CREATE_TIME}")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
           # Multi-node accuracy dataset: an explicit input wins; otherwise gsm8k
@@ -136,14 +138,27 @@ jobs:
               ;;
           esac
           echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
+          # Multi-node accuracy suites rotate by Beijing date parity so that the
+          # shared 4-node pool runs exactly one of them per night. Resolve the
+          # parity once per run so the job gates below stay consistent even
+          # across midnight. 10# forces decimal parsing, otherwise days 08/09
+          # are read as octal.
+          ACCURACY_DAY="$(TZ=Asia/Shanghai date +%d)"
+          if [ $((10#${ACCURACY_DAY} % 2)) -eq 1 ]; then
+            ACCURACY_DATE_PARITY="odd"
+          else
+            ACCURACY_DATE_PARITY="even"
+          fi
+          echo "accuracy_date_parity=${ACCURACY_DATE_PARITY}" | tee -a $GITHUB_OUTPUT
 
-  nightly-1-npu-a3:
-    name: nightly-1-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-1-npu-a3,')) }}
+  nightly-test-1-npu-a3:
+    name: nightly-test-1-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-1-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-1-npu-a3
+      ref: ${{ inputs.ref || '' }}
+      self_name: nightly-test-1-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '90'
@@ -152,13 +167,14 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  nightly-2-npu-a3:
-    name: nightly-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-2-npu-a3,')) }}
+  nightly-test-2-npu-a3:
+    name: nightly-test-2-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-2-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-2-npu-a3
+      ref: ${{ inputs.ref || '' }}
+      self_name: nightly-test-2-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '90'
@@ -167,14 +183,15 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
-  nightly-4-npu-a3:
-    name: nightly-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-4-npu-a3,')) }}
+  # The nightly-test-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring extra-b-test-4-npu-a3 in the PR pipeline.
+  nightly-test-4-npu-a3:
+    name: nightly-test-4-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,')) }}
     needs: [set-image-config, sgl-router-build-aarch64]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-4-npu-a3
+      ref: ${{ inputs.ref || '' }}
+      self_name: nightly-test-4-npu-a3
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
@@ -186,13 +203,14 @@ jobs:
       sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
-  nightly-8-npu-a3:
-    name: nightly-8-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-8-npu-a3,')) }}
+  nightly-test-8-npu-a3:
+    name: nightly-test-8-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-8-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-8-npu-a3
+      ref: ${{ inputs.ref || '' }}
+      self_name: nightly-test-8-npu-a3
       runner_config: linux-aarch64-a3-8-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '60'
@@ -201,13 +219,14 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  nightly-16-npu-a3:
-    name: nightly-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-16-npu-a3,')) }}
+  nightly-test-16-npu-a3:
+    name: nightly-test-16-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-16-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
-      self_name: nightly-16-npu-a3
+      ref: ${{ inputs.ref || '' }}
+      self_name: nightly-test-16-npu-a3
       runner_config: linux-aarch64-a3-16-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
@@ -216,15 +235,16 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-  nightly-perf-2-npu-a3:
-    name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-2-npu-a3,')) }}
+  nightly-perf-test-2-npu-a3:
+    name: nightly-perf-test-2-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-2-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-2
       test_type: 'perf'
-      test_suite: nightly-perf-2-npu-a3
+      test_suite: nightly-perf-test-2-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -232,15 +252,16 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-4-npu-a3:
-    name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-4-npu-a3,')) }}
+  nightly-perf-test-4-npu-a3:
+    name: nightly-perf-test-4-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-4-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
-      test_suite: nightly-perf-4-npu-a3
+      test_suite: nightly-perf-test-4-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -248,15 +269,16 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-16-npu-a3:
-    name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-16-npu-a3,')) }}
+  nightly-perf-test-16-npu-a3:
+    name: nightly-perf-test-16-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-16-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
-      test_suite: nightly-perf-16-npu-a3
+      test_suite: nightly-perf-test-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -266,15 +288,16 @@ jobs:
       test_timeout_minutes: '180'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
-  nightly-acc-2-npu-a3:
-    name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-2-npu-a3,')) }}
+  nightly-acc-test-2-npu-a3:
+    name: nightly-acc-test-2-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
-      test_suite: nightly-acc-2-npu-a3
+      test_suite: nightly-acc-test-2-npu-a3
       is_nightly_pipeline_job: true
       partitions: '{"size":4,"arr":[0,1,2,3]}'
       skip_pr_test_health_check: 'true'
@@ -283,15 +306,16 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-16-npu-a3:
-    name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-16-npu-a3,')) }}
+  nightly-acc-test-16-npu-a3:
+    name: nightly-acc-test-16-npu-a3
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-16-npu-a3,')) }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
-      test_suite: nightly-acc-16-npu-a3
+      test_suite: nightly-acc-test-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -299,15 +323,16 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-4-npu-a5:
-     name: nightly-acc-4-npu-a5
-     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-4-npu-a5,')) }}
+  nightly-acc-test-4-npu-a5:
+     name: nightly-acc-test-4-npu-a5
+     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-4-npu-a5,')) }}
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
+       ref: ${{ inputs.ref || '' }}
        runner: linux-amd64-a5-4
        test_type: 'accuracy'
-       test_suite: nightly-acc-4-npu-a5
+       test_suite: nightly-acc-test-4-npu-a5
        is_nightly_pipeline_job: true
        skip_pr_test_health_check: 'true'
        image: ${{ needs.set-image-config.outputs.image_a5 }}
@@ -315,12 +340,14 @@ jobs:
        device_type_for_deps: 'a5'
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # The router the PD tests in nightly-4-npu-a3 and nightly-poc-multi-node-tests launch.
+  # The router the PD tests in nightly-test-4-npu-a3, nightly-poc-multi-node-tests
+  # and the nightly-poc-multi-node-accuracy-* jobs launch.
   sgl-router-build-aarch64:
-    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') }}
+    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,') }}
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
+      git_ref: ${{ inputs.ref || '' }}
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64-nightly-npu
     secrets: inherit
@@ -328,13 +355,15 @@ jobs:
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, sgl-router-build-aarch64]
+    needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # deepseek_v4_flash performance tests
+          # NOTE: multi-node accuracy suites are date-gated in the dedicated
+          # nightly-poc-multi-node-accuracy-odd-day / -even-day jobs below.
+          # deepseek_v4_flash perf tests
           - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
             prefill_size: 1
             decode_size: 1
@@ -342,6 +371,14 @@ jobs:
             test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash perf tests (off_cp)
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_off_cp.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
           # deepseek_v4_flash accuracy tests
           - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
             prefill_size: 1
@@ -350,6 +387,22 @@ jobs:
             test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash accuracy tests (off_cp)
+          # - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_cp
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_cp.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash accuracy tests (off_dspark)
+          # - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_dspark
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_off_dspark.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
           # deepseek_v4_pro accuracy tests
           - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
             prefill_size: 2
@@ -358,22 +411,23 @@ jobs:
             test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          # glm_5_3 accuracy tests (2 prefill + 2 decode nodes)
-          - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          - name: glm_5_3_w8a8_1p1d_32p_dcp_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          # glm_5_3 performance tests (2 prefill + 2 decode nodes)
+          # deepseek_v4_pro accuracy tests (off_dspark)
+          # - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_dspark
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_dspark.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # deepseek_v4_pro accuracy tests (off_cp)
+          # - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_cp
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_off_cp.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # glm_5_3 perf tests
           - name: glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms
             prefill_size: 2
             decode_size: 2
@@ -383,8 +437,81 @@ jobs:
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
+      test_config_name: ${{ matrix.test_config.name }}
+      prefill_size: ${{ matrix.test_config.prefill_size }}
+      decode_size: ${{ matrix.test_config.decode_size }}
+      router_size: ${{ matrix.test_config.router_size }}
+      test_case: ${{ matrix.test_config.test_case }}
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
+      transformers_version: ''
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
+
+  # Multi-node accuracy suites: one suite list per parity, chosen by the Beijing-date
+  # parity resolved in set-image-config (odd day runs the odd-day suites, even day
+  # the even-day suites). Entries of the selected parity run one at a time behind
+  # the shared 4-node pool used by nightly-poc-multi-node-tests, and
+  # nightly-poc-multi-node-mix-tests waits for both parity jobs, so only one PD
+  # deployment occupies the pool at a time.
+  nightly-poc-multi-node-accuracy-odd-day:
+    name: multi-node-poc-accuracy-odd-day
+    if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'odd' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,')) }}
+    needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        test_config:
+          - name: multi_node_accuracy_odd_day
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
+    with:
+      ref: ${{ inputs.ref || '' }}
+      runner: linux-amd64-cpu-4
+      test_type: ${{ matrix.test_config.test_type || 'accuracy' }}
+      test_config_name: ${{ matrix.test_config.name }}
+      prefill_size: ${{ matrix.test_config.prefill_size }}
+      decode_size: ${{ matrix.test_config.decode_size }}
+      router_size: ${{ matrix.test_config.router_size }}
+      test_case: ${{ matrix.test_config.test_case }}
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
+      transformers_version: ''
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
+
+  nightly-poc-multi-node-accuracy-even-day:
+    name: multi-node-poc-accuracy-even-day
+    if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'even' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,')) }}
+    needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        test_config:
+          - name: multi_node_accuracy_even_day
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
+    with:
+      ref: ${{ inputs.ref || '' }}
+      runner: linux-amd64-cpu-4
+      test_type: ${{ matrix.test_config.test_type || 'accuracy' }}
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
       decode_size: ${{ matrix.test_config.decode_size }}
@@ -400,7 +527,7 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-mix-tests,')) }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, nightly-poc-multi-node-tests, nightly-poc-multi-node-accuracy-odd-day, nightly-poc-multi-node-accuracy-even-day]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -416,11 +543,6 @@ jobs:
             node_size: 4
             test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
             test_type: 'accuracy'
-          # deepseek_v4_pro performance tests
-          - name: deepseek_v4_pro_16p_in128k_out1k_prefix90_20ms
-            node_size: 2
-            test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms.py
-            test_type: 'perf'
           - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
@@ -431,6 +553,7 @@ jobs:
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
@@ -445,18 +568,20 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-1-npu-a3
-      - nightly-2-npu-a3
-      - nightly-4-npu-a3
-      - nightly-8-npu-a3
-      - nightly-16-npu-a3
-      - nightly-perf-2-npu-a3
-      - nightly-perf-4-npu-a3
-      - nightly-perf-16-npu-a3
-      - nightly-acc-2-npu-a3
-      - nightly-acc-16-npu-a3
-      - nightly-acc-4-npu-a5
+      - nightly-test-1-npu-a3
+      - nightly-test-2-npu-a3
+      - nightly-test-4-npu-a3
+      - nightly-test-8-npu-a3
+      - nightly-test-16-npu-a3
+      - nightly-perf-test-2-npu-a3
+      - nightly-perf-test-4-npu-a3
+      - nightly-perf-test-16-npu-a3
+      - nightly-acc-test-2-npu-a3
+      - nightly-acc-test-16-npu-a3
+      - nightly-acc-test-4-npu-a5
       - nightly-poc-multi-node-tests
+      - nightly-poc-multi-node-accuracy-odd-day
+      - nightly-poc-multi-node-accuracy-even-day
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
@@ -464,22 +589,31 @@ jobs:
         run: |
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
+          # Exactly one of the two date-gated accuracy jobs runs; the other is skipped.
+          accuracy_result="success"
+          for r in \
+            "${{ needs.nightly-poc-multi-node-accuracy-odd-day.result }}" \
+            "${{ needs.nightly-poc-multi-node-accuracy-even-day.result }}"; do
+            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
+              accuracy_result="failure"
+            fi
+          done
 
           # single-node suites are reported per suite; overall status is success if none failed
           single_result="success"
           for r in \
-            "${{ needs.nightly-1-npu-a3.result }}" \
-            "${{ needs.nightly-2-npu-a3.result }}" \
-            "${{ needs.nightly-4-npu-a3.result }}" \
-            "${{ needs.nightly-8-npu-a3.result }}" \
-            "${{ needs.nightly-16-npu-a3.result }}" \
-            "${{ needs.nightly-perf-2-npu-a3.result }}" \
-            "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "${{ needs.nightly-perf-16-npu-a3.result }}" \
-            "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "${{ needs.nightly-test-1-npu-a3.result }}" \
+            "${{ needs.nightly-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-test-4-npu-a3.result }}" \
+            "${{ needs.nightly-test-8-npu-a3.result }}" \
+            "${{ needs.nightly-test-16-npu-a3.result }}" \
+            "${{ needs.nightly-perf-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-perf-test-4-npu-a3.result }}" \
+            "${{ needs.nightly-perf-test-16-npu-a3.result }}" \
+            "${{ needs.nightly-acc-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-acc-test-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
-            # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            # "${{ needs.nightly-acc-test-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
             fi
@@ -500,28 +634,29 @@ jobs:
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           for entry in \
-            "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
-            "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
-            "nightly-4-npu-a3:${{ needs.nightly-4-npu-a3.result }}" \
-            "nightly-8-npu-a3:${{ needs.nightly-8-npu-a3.result }}" \
-            "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
-            "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
-            "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
-            "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "nightly-test-1-npu-a3:${{ needs.nightly-test-1-npu-a3.result }}" \
+            "nightly-test-2-npu-a3:${{ needs.nightly-test-2-npu-a3.result }}" \
+            "nightly-test-4-npu-a3:${{ needs.nightly-test-4-npu-a3.result }}" \
+            "nightly-test-8-npu-a3:${{ needs.nightly-test-8-npu-a3.result }}" \
+            "nightly-test-16-npu-a3:${{ needs.nightly-test-16-npu-a3.result }}" \
+            "nightly-perf-test-2-npu-a3:${{ needs.nightly-perf-test-2-npu-a3.result }}" \
+            "nightly-perf-test-4-npu-a3:${{ needs.nightly-perf-test-4-npu-a3.result }}" \
+            "nightly-perf-test-16-npu-a3:${{ needs.nightly-perf-test-16-npu-a3.result }}" \
+            "nightly-acc-test-2-npu-a3:${{ needs.nightly-acc-test-2-npu-a3.result }}" \
+            "nightly-acc-test-16-npu-a3:${{ needs.nightly-acc-test-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
-            # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            # "nightly-acc-test-4-npu-a5:${{ needs.nightly-acc-test-4-npu-a5.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
             echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
           done
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
+          echo "| multi-node-poc-accuracy | $(group_icon ${accuracy_result}) ${accuracy_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           FAIL=0
-          for r in "${single_result}" "${multi_result}" "${mix_result}"; do
+          for r in "${single_result}" "${multi_result}" "${accuracy_result}" "${mix_result}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
           done
           exit $FAIL

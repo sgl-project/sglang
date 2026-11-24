@@ -7,12 +7,12 @@
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
-use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MediaCounts, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
+use crate::tokenizer::prompt::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
+    ROUTING_KEY_HEADER,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -669,7 +670,7 @@ fn lower_openai(
     let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
     let headers = OpenAiHeaders {
         // The router owns DP ranks; a client's header is never forwarded.
-        routing_key: header_str(headers, "x-smg-routing-key"),
+        routing_key: header_str(headers, ROUTING_KEY_HEADER),
         custom_labels: settings
             .tokenizer_metrics_custom_labels_header
             .as_deref()

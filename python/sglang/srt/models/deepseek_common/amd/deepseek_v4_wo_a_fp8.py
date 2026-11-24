@@ -1,4 +1,4 @@
-"""DeepSeek-V4 ``wo_a`` (MLA output-absorb) fp8 GEMM for AMD gfx950.
+"""DeepSeek-V4 ``wo_a`` (MLA output-absorb) fp8 GEMM for AMD gfx950 and gfx1250.
 
 ``wo_a`` is the first half of the o_proj: it absorbs the attention output into
 the low-rank o space before ``wo_b`` projects back to the hidden size. On CUDA
@@ -7,11 +7,14 @@ DeepGEMM is CUDA-only, so ROCm falls back to a bf16 batched GEMM and pays for
 loading bf16 weights on a decode step that is bound by weight traffic.
 
 This module is the ROCm equivalent, built on aiter's microscaling (e8m0)
-block-scale batched GEMM ``batched_gemm_a8w8_mxscale``:
+block-scale batched GEMM: ``batched_gemm_a8w8_mxscale`` on gfx950, which reads
+a row-major weight, and ``batched_gemm_a8w8_mxscale_bpreshuffle`` on gfx1250,
+which reads a (16, 16)-preshuffled one:
 
 * a Triton quantizer for the post-inverse-RoPE attention output, emitting the
   per-token-group fp8 codes and uint8 e8m0 scales that kernel expects, and
-* the load-time conversion of the checkpoint's fp32 block scales to e8m0.
+* the load-time conversion of the checkpoint's fp32 block scales to e8m0,
+  which also lays the weight out the way the selected kernel reads it.
 
 Shapes per attention-TP rank, with ``G`` local o-groups and ``B``-wide blocks, ``B`` the
 checkpoint's weight block (128 for DeepSeek-V4, 32 for V4.1)::
@@ -44,7 +47,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +60,21 @@ _ABSMAX_EPS = 1e-10
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
-# The mxscale flatmm BMM is gfx950-only, so resolve availability once at import
-# rather than per decode step.
+# Resolve the mxscale BMM once at import rather than per decode step. gfx1250
+# only has the B-preshuffled one, so there every wo_a weight is shuffled at load.
 _batched_gemm_a8w8_mxscale = None
-if _is_hip and _is_gfx95_supported:
+if _is_hip and (_is_gfx95_supported or _is_gfx1250_supported):
     try:
-        from aiter.ops.batched_gemm_op_a8w8 import (
-            batched_gemm_a8w8_mxscale as _batched_gemm_a8w8_mxscale,
-        )
+        if _is_gfx1250_supported:
+            from aiter.ops.batched_gemm_op_a8w8 import (
+                batched_gemm_a8w8_mxscale_bpreshuffle as _batched_gemm_a8w8_mxscale,
+            )
+        else:
+            from aiter.ops.batched_gemm_op_a8w8 import (
+                batched_gemm_a8w8_mxscale as _batched_gemm_a8w8_mxscale,
+            )
     except Exception as err:  # pragma: no cover - env-dependent
         logger.warning(
             "aiter batched_gemm_a8w8_mxscale import failed; the DSV4 wo_a fp8 "
@@ -316,7 +325,8 @@ def wo_a_weight_scale_to_e8m0(
     """Convert checkpoint ``wo_a`` fp8 weight + fp32 block scales to e8m0.
 
     Returns ``(weight [G, R, D] fp8, scale [G, R/B, D/B] uint8)`` for the checkpoint's
-    B x B blocks; a 32x32-block weight comes back preshuffled for its BMM.
+    B x B blocks; a 32x32-block weight, and any weight on gfx1250, comes back
+    preshuffled for its BMM.
 
     DeepSeek-V4 checkpoints that carry fp4 experts already store their linear
     block scales as powers of two, so the conversion is exact and the weight
@@ -367,7 +377,7 @@ def wo_a_weight_scale_to_e8m0(
 
     exponent = (scale.contiguous().view(torch.int32) >> 23).to(torch.uint8)
     weight = weight.contiguous().view(G, R, D)
-    if block == WO_A_MXFP8_BLOCK32:
+    if block == WO_A_MXFP8_BLOCK32 or _is_gfx1250_supported:
         weight = _shuffle_weight(weight, layout=(16, 16))
     return weight, exponent.contiguous().view(G, R // block, D // block)
 
