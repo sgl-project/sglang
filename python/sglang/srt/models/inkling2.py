@@ -73,7 +73,11 @@ class Inkling2DecoderLayer(nn.Module):
         self.is_local = layer_id in config.local_layer_ids
         self.fused_norms = get_platform().is_hip
         self.attn = Inkling2Attention(
-            config, layer_id, self.is_local, prefix=add_prefix("attn", prefix)
+            config,
+            layer_id,
+            self.is_local,
+            prefix=add_prefix("attn", prefix),
+            quant_config=quant_config,
         )
         self.mlp = Inkling2MoE(
             config, layer_id, add_prefix("mlp", prefix), quant_config
@@ -642,6 +646,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 if f".attn.{projection}." in name:
                     name = name.replace(f".{projection}.", ".qkvr.")
                     shard = i
+                    if isinstance(self.quant_config, Inkling2QuarkLayout):
+                        name, shard = self.quant_config.attention_slot(
+                            name, projection, i
+                        )
                     break
             for leaf in ("w13_weight", "w2_weight"):
                 name = name.replace(f".mlp.{leaf}", f".mlp.experts.{leaf}")
@@ -672,6 +680,8 @@ class Inkling2ForConditionalGeneration(nn.Module):
         missing = set(params) - loaded
         for name, shards in packed_shards.items():
             expected = set(range(len(projections))) if name.endswith(".weight") else {0}
+            if isinstance(self.quant_config, Inkling2QuarkLayout):
+                expected = self.quant_config.expected_shards(name, expected)
             if not expected.issubset(shards):
                 missing.add(f"{name} shards {sorted(expected - shards)}")
         if missing:

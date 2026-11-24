@@ -2,6 +2,7 @@
 layer around them, and the real model built from the config.json of an export (CPU only).
 """
 
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from torch import nn
 
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
 from sglang.srt.layers.quantization.inkling2_quark import Inkling2QuarkLayout
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.inkling2 import Inkling2ForConditionalGeneration
 from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.srt.models.inkling_common import inkling2_moe_quark as quark_moe
@@ -20,8 +22,11 @@ from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.inkling2_quark_test_utils import (
     EXPERT_FORMAT,
+    MINI_CONFIG,
+    VARIANTS,
     Materialization,
     expert_checkpoint_tensors,
+    has_fp8_attention,
     native_quant_dict,
     quantization_config,
 )
@@ -295,6 +300,89 @@ def test_the_quark_path_never_reaches_native_expert_code(monkeypatch, variant):
     for combine in (True, False):
         assert layer(torch.randn(2, HIDDEN), combine=combine) == "kernel output"
     _target(monkeypatch, variant).load_weights(list(_export(variant).items()))
+
+
+# the experts of one layer of Inkling-2-Mini: 128 experts, hidden 2304, intermediate 1152
+REAL_EXPERT_PARAMETERS = {
+    "mxfp4": {
+        "w13_weight": ((128, 2304, 1152), U8),
+        "w13_scale": ((128, 2304, 72), U8),
+        "w2_weight": ((128, 2304, 576), U8),
+        "w2_scale": ((128, 2304, 36), U8),
+    },
+    "uint4_awq": {
+        "w13_weight": ((128, 2304, 288), I32),
+        "w13_scale": ((128, 18, 2304), F32),
+        "w13_weight_zero_point": ((128, 18, 288), I32),
+        "w2_weight": ((128, 1152, 288), I32),
+        "w2_scale": ((128, 9, 2304), F32),
+        "w2_weight_zero_point": ((128, 9, 288), I32),
+    },
+}
+
+
+@pytest.fixture
+def published_context():
+    from sglang.srt.runtime_context import reset_context
+    from sglang.srt.server_args import ServerArgs
+    from sglang.test.parallel_groups import publish
+
+    publish(ServerArgs(model_path="dummy"), role="test")
+    yield
+    reset_context()
+
+
+@pytest.mark.usefixtures("published_context")
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_config_json_to_layout_to_the_real_model(tmp_path, variant):
+    """config.json of an export -> generic Quark config -> layout -> the model on the
+    meta device, with the packed experts in every layer."""
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_loader.loader import _get_quantization_config
+    from sglang.srt.model_loader.weight_utils import get_quant_config
+    from sglang.srt.models.inkling2 import Inkling2LoopForConditionalGeneration
+    from sglang.test.parallel_groups import parallel_scope
+
+    config = {**MINI_CONFIG, "quantization_config": quantization_config(variant)}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model_config = ModelConfig(str(tmp_path), trust_remote_code=False)
+    assert model_config.quantization == "quark"
+    generic = get_quant_config(model_config, LoadConfig(), packed_modules_mapping={})
+    pipeline = SimpleNamespace(world_size=1, rank_in_group=0)
+    with parallel_scope(pp_group=pipeline), torch.device("meta"):
+        with set_default_torch_dtype(BF16):
+            model = Inkling2LoopForConditionalGeneration(
+                model_config.hf_config, generic
+            )
+    layout = model.quant_config
+    assert isinstance(layout, Inkling2QuarkLayout)
+    assert layout.expert_format == EXPERT_FORMAT[variant]
+    assert model.llm.logits_processor.use_fp32_lm_head
+    expected = REAL_EXPERT_PARAMETERS[layout.expert_format]
+    assert len(model.llm.layers) == 24
+    for layer in model.llm.layers:
+        assert isinstance(layer.mlp.experts, quark_moe.Inkling2QuarkExperts)
+        assert {
+            name: (tuple(p.shape), p.dtype)
+            for name, p in layer.mlp.experts.named_parameters()
+        } == expected
+        if has_fp8_attention(variant):
+            assert layer.attn.qkvr["fp8"].weight.dtype == E4M3
+            assert layer.attn.qkvr["bf16"].weight.dtype == BF16
+            assert layer.attn.wo_ud.weight.dtype == E4M3
+        else:
+            assert layer.attn.qkvr.weight.dtype == BF16
+            assert layer.attn.wo_ud.weight.dtype == BF16
+    # the bundled MTP head is BF16: the ModelConfig of the draft has no quantization
+    draft = ModelConfig(
+        str(tmp_path),
+        trust_remote_code=False,
+        is_draft_model=True,
+        speculative_algorithm="DSPARK",
+    )
+    assert draft.quantization is None
+    assert _get_quantization_config(draft, LoadConfig()) is None
 
 
 if __name__ == "__main__":

@@ -281,6 +281,43 @@ class _Fp8AttentionScheme(QuarkW8A8Fp8):
         print_info_once(f"Inkling2 Quark attention FP8 GEMM: {backend}")
 
 
+class Inkling2Fp8Qkvr(torch.nn.ModuleDict):
+    """AttnFP8 qkvr: an FP8 linear for q, k, v and gate and a BF16 one for r and sinks.
+    The outputs are joined back in merged order: the prologue kernels read q, k, v and r
+    with one row stride.
+    Called like MergedColumnParallelLinear: forward(x) -> (out, None)."""
+
+    # Inkling2Attention reads qkvr.bias; FP8 attention refuses biases.
+    bias = None
+
+    def __init__(self, input_size, output_sizes, *, quant_config, prefix, **kwargs):
+        super().__init__(
+            {
+                "fp8": linear.MergedColumnParallelLinear(
+                    input_size,
+                    [*output_sizes[:3], output_sizes[4]],
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fp8",
+                    **kwargs,
+                ),
+                "bf16": linear.MergedColumnParallelLinear(
+                    input_size,
+                    [output_sizes[3], *output_sizes[5:]],
+                    prefix=f"{prefix}.bf16",
+                    **kwargs,
+                ),
+            }
+        )
+        self.qkv = sum(self["fp8"].output_partition_sizes[:3])
+        self.r = self["bf16"].output_partition_sizes[0]
+
+    def forward(self, x):
+        fp8, bf16 = self["fp8"](x)[0], self["bf16"](x)[0]
+        qkv, r = self.qkv, self.r
+        out = torch.cat([fp8[:, :qkv], bf16[:, :r], fp8[:, qkv:], bf16[:, r:]], -1)
+        return out, None
+
+
 class Inkling2QuarkLayout(Inkling2QuantConfig):
     """Validated Quark export: expert format, attention precision and tensor dtype
     policy; built from config.json, not a registered method."""

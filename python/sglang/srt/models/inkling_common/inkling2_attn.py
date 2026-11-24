@@ -23,6 +23,10 @@ from sglang.kernels.ops.gemm.inkling2_linear import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.quantization.inkling2_quark import (
+    Inkling2Fp8Qkvr,
+    Inkling2QuarkLayout,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -118,7 +122,7 @@ class QKL2Clip(nn.Module):
 
 
 class Inkling2Attention(nn.Module):
-    def __init__(self, config, layer_id, is_local, prefix=""):
+    def __init__(self, config, layer_id, is_local, prefix="", quant_config=None):
         super().__init__()
         parallel = get_parallel()
         self.tp_rank, self.tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
@@ -155,10 +159,18 @@ class Inkling2Attention(nn.Module):
         qkvr_pad_size = -sum(self.split_sizes) % 8
         if qkvr_pad_size:
             self.split_sizes.append(qkvr_pad_size)
-        self.qkvr = MergedColumnParallelLinear(
+        # An AttnFP8 export has q, k, v, gate and wo_ud in FP8 and r and sinks in BF16
+        fp8 = (
+            isinstance(quant_config, Inkling2QuarkLayout)
+            and quant_config.attention_fp8 is not None
+        )
+        if fp8 and (config.q_bias or config.o_bias):
+            raise ValueError("FP8 attention does not support attention biases")
+        self.qkvr = (Inkling2Fp8Qkvr if fp8 else MergedColumnParallelLinear)(
             config.hidden_size,
             [size * self.tp_size for size in self.split_sizes],
             bias=config.q_bias,
+            quant_config=quant_config if fp8 else None,
             parallel_group="attn_tp",
             prefix=add_prefix("qkvr", prefix),
         )
@@ -168,6 +180,7 @@ class Inkling2Attention(nn.Module):
             self.head_dim * self.num_total_heads,
             config.hidden_size,
             bias=config.o_bias,
+            quant_config=quant_config if fp8 else None,
             parallel_group="attn_tp",
             reduce_results=False,
             use_dp_attention_reduce=True,
