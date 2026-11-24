@@ -937,7 +937,7 @@ class FP8MQALogitsKernel:
         # ===== COMMON SCHEDULER STATE (before warp branches) =====
         # Each warp role independently maintains its own copy of these
         # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task
+        # Initial task
         next_q_idx = current_q_idx
         next_kv_idx = current_kv_idx
         next_num_kv = current_num_kv
