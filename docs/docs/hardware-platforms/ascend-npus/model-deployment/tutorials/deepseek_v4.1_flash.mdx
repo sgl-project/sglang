@@ -438,10 +438,36 @@ For evaluation tools and dataset workflows on Ascend NPUs, see [Accuracy Evaluat
 
 DeepSeek-V4.1 accuracy scores on Ascend A3 Series and 950PR/DT Series (A5):
 
-| Benchmark | Ascend A3 Series | Ascend A5 (950PR/DT Series) |
-| --- | ---: | ---: |
-| GPQA-Diamond | 91.9 | 91.4 |
-| AIME26 | 96.7 | 100 |
+<table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+  <colgroup>
+    <col style={{ width: "34%" }} />
+    <col style={{ width: "33%" }} />
+    <col style={{ width: "33%" }} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th style={{ textAlign: "left", padding: "10px 12px" }}>Benchmark</th>
+      <th style={{ textAlign: "center", whiteSpace: "nowrap", padding: "10px 12px" }}>
+        Ascend A3 Series
+      </th>
+      <th style={{ textAlign: "center", whiteSpace: "nowrap", padding: "10px 12px" }}>
+        Ascend A5 (950PR/DT Series)
+      </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{ padding: "10px 12px" }}>GPQA-Diamond</td>
+      <td style={{ textAlign: "center", padding: "10px 12px" }}>91.9</td>
+      <td style={{ textAlign: "center", padding: "10px 12px" }}>91.4</td>
+    </tr>
+    <tr>
+      <td style={{ padding: "10px 12px" }}>AIME26</td>
+      <td style={{ textAlign: "center", padding: "10px 12px" }}>96.7</td>
+      <td style={{ textAlign: "center", padding: "10px 12px" }}>100</td>
+    </tr>
+  </tbody>
+</table>
 
 The A5 results were obtained with DSPark and decode graph enabled.
 
