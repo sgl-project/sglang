@@ -1328,17 +1328,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     ),
                 )
                 end_time = time.perf_counter()
+                for i, res in zip(missing_idx, put_results):
+                    io_results[i] = res
                 if self.enable_storage_metrics:
+                    # Only objects the store confirmed count; a failed put
+                    # moved no bytes.
+                    stored_idx = [i for i in missing_idx if io_results[i] == 0]
                     self._record_v2_io_metrics(
-                        num_pages=self._count_v2_missing_pages(prepared, missing_idx),
+                        num_pages=self._count_v2_io_pages(
+                            prepared,
+                            delivered_idx=[
+                                i for i, res in enumerate(io_results) if res == 0
+                            ],
+                            moved_idx=stored_idx,
+                        ),
                         num_bytes=self._sum_v2_io_bytes(
-                            [all_sizes[i] for i in missing_idx]
+                            [all_sizes[i] for i in stored_idx]
                         ),
                         elapsed=end_time - start_time,
                         is_set=True,
                     )
-                for i, res in zip(missing_idx, put_results):
-                    io_results[i] = res
         else:
             start_time = time.perf_counter()
             io_results = self._get_batch_zero_copy_impl(
@@ -1346,13 +1355,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             end_time = time.perf_counter()
             if self.enable_storage_metrics:
+                # batch_get_into* reports bytes read per object and negative
+                # on failure; a failed read moved no data.
+                read_idx = [i for i, res in enumerate(io_results) if res > 0]
                 self._record_v2_io_metrics(
-                    # One logical page fetched through several pools counts
-                    # once, matching the v1 pages metric.
-                    num_pages=len(
-                        {key for _, _, _, _, page_keys in prepared for key in page_keys}
+                    num_pages=self._count_v2_io_pages(
+                        prepared, delivered_idx=read_idx, moved_idx=read_idx
                     ),
-                    num_bytes=self._sum_v2_io_bytes(all_sizes),
+                    num_bytes=sum(io_results[i] for i in read_idx),
                     elapsed=end_time - start_time,
                     is_set=False,
                 )
@@ -1380,18 +1390,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     @staticmethod
-    def _count_v2_missing_pages(prepared, missing_idx) -> int:
-        # The put list is filtered per object, so a partly-stored page puts
-        # only its missing components; a page counts as backed up when any
-        # of its component objects was put. The same logical page in several
-        # pools counts once, matching the v1 pages metric.
-        missing = set(missing_idx)
+    def _count_v2_io_pages(prepared, delivered_idx, moved_idx) -> int:
+        # A page counts as moved only when every component object landed (the
+        # caller sees a hit) and at least one of them was moved by this batch.
+        # The same logical page in several pools counts once, matching v1.
+        delivered = set(delivered_idx)
+        moved = set(moved_idx)
         pages = set()
         for _, key_multiplier, start, end, page_keys in prepared:
             for page_idx, page_start in enumerate(range(start, end, key_multiplier)):
-                if any(
-                    i in missing
-                    for i in range(page_start, min(page_start + key_multiplier, end))
+                components = range(page_start, min(page_start + key_multiplier, end))
+                if any(i in moved for i in components) and all(
+                    i in delivered for i in components
                 ):
                     pages.add(page_keys[page_idx])
         return len(pages)
@@ -1400,8 +1410,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, num_pages: int, num_bytes: int, elapsed: float, is_set: bool
     ):
         # Same units as the v1 path: logical pages per batch (deduped across
-        # pools) and GB/s of bytes moved.
-        if elapsed <= 0 or num_bytes <= 0:
+        # pools) and GB/s of bytes moved. A batch that completed no page is
+        # not a bandwidth sample.
+        if elapsed <= 0 or num_pages <= 0 or num_bytes <= 0:
             return
         bandwidth_gbps = num_bytes / elapsed / (1 << 30)
         if is_set:
