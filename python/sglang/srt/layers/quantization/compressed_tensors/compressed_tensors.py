@@ -1311,9 +1311,9 @@ class CompressedTensorsConfig(QuantizationConfig):
     # Calibration-only QuantizationArgs fields; the loader never reads them.
     _CALIBRATION_ONLY_ARGS = frozenset({"observer", "observer_kwargs"})
 
+    # What the loader builds for a target: the group format with its top-level
+    # fallback resolved, and the args without calibration-only fields.
     def _loaded_scheme_key(self, target: str) -> tuple:
-        """What the loader builds for ``target``: the group format with its
-        top-level fallback resolved, and the args without calibration fields."""
         scheme = self.target_scheme_map[target]
 
         def args_key(args: Optional[QuantizationArgs]):

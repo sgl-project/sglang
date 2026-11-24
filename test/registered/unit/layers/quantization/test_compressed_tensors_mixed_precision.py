@@ -624,8 +624,9 @@ def _declared_fused_mappings():
             for stmt in cls.body:
                 if not (
                     isinstance(stmt, ast.Assign)
-                    and [getattr(t, "id", None) for t in stmt.targets]
-                    == ["packed_modules_mapping"]
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and stmt.targets[0].id == "packed_modules_mapping"
                 ):
                     continue
                 try:
@@ -667,9 +668,15 @@ class TestDeclaredFusedMappingSweep(CustomTestCase):
     def test_ignore_list_follows_the_shards(self):
         """All shards listed: ignored. None: kept. The fused name itself: ignored."""
         for layer, shard_names, mapping in self._cases():
-            self.assertTrue(should_ignore_layer(layer, shard_names, mapping))
-            self.assertFalse(should_ignore_layer(layer, ["lm_head"], mapping))
-            self.assertTrue(should_ignore_layer(layer, [layer], mapping))
+            self.assertTrue(
+                should_ignore_layer(layer, ignore=shard_names, fused_mapping=mapping)
+            )
+            self.assertFalse(
+                should_ignore_layer(layer, ignore=["lm_head"], fused_mapping=mapping)
+            )
+            self.assertTrue(
+                should_ignore_layer(layer, ignore=[layer], fused_mapping=mapping)
+            )
 
     def test_some_shards_ignored_raises(self):
         """A literal entry or a regex on one shard only is a mixed scheme, even
@@ -684,7 +691,7 @@ class TestDeclaredFusedMappingSweep(CustomTestCase):
                 [f"re:.*{last}$"],
             ):
                 with self.assertRaisesRegex(ValueError, "same scheme"):
-                    should_ignore_layer(layer, ignore, mapping)
+                    should_ignore_layer(layer, ignore=ignore, fused_mapping=mapping)
 
     @staticmethod
     def _scheme(mapping, *groups):

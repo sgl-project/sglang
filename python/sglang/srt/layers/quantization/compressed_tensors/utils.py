@@ -79,12 +79,15 @@ def should_ignore_layer(
     # holds even if a regex also matches the fused name: `re:.*v_proj$` matches
     # qkv_proj too, but the checkpoint's q/k shards are packed.
     if len(shards_ignored) > 1:
-        raise ValueError(
-            f"Found different quantization schemes for "
-            f"{shard_proj_names} in {layer_name}. SGLang "
-            "requires all to use the same scheme."
-        )
+        raise _mixed_shard_schemes_error(shard_proj_names, layer_name)
     return fused_name_ignored or shards_ignored.pop()
+
+
+def _mixed_shard_schemes_error(shards: List[str], layer_name: str) -> ValueError:
+    return ValueError(
+        f"Found different quantization schemes for {shards} in {layer_name}. "
+        "SGLang requires all to use the same scheme."
+    )
 
 
 def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
@@ -151,7 +154,12 @@ def find_matched_target(
     matched_target = (
         _find_first_match(layer_name, targets)
         or _find_first_match(module.__class__.__name__, targets, True)
-        or _match_fused_layer(layer_name, targets, fused_mapping, scheme_key)
+        or _match_fused_layer(
+            layer_name=layer_name,
+            target_layers=targets,
+            fused_mapping=fused_mapping,
+            scheme_key=scheme_key,
+        )
     )
 
     if matched_target is None:
@@ -255,9 +263,5 @@ def _match_fused_layer(
         scheme_key(match) != scheme_key(unfused_matches[0])
         for match in unfused_matches[1:]
     ):
-        raise ValueError(
-            f"Found different quantization schemes for "
-            f"{fused_mapping[fused]} in {layer_name}. SGLang "
-            "requires all to use the same scheme."
-        )
+        raise _mixed_shard_schemes_error(fused_mapping[fused], layer_name)
     return unfused_matches[0]
