@@ -101,18 +101,29 @@ class TestCanApprove(unittest.TestCase):
 
 
 class TestIsApproved(unittest.TestCase):
-    def test_bot_success_status_and_live_label(self):
+    def test_label_plus_approver_author_or_bot_status(self):
         cases = [
-            ([_status()], {"run-ci"}, True),
-            ([_status(login="someone")], {"run-ci"}, False),
-            ([_status(login=None)], {"run-ci"}, False),
-            ([_status(state="failure")], {"run-ci"}, False),
-            ([_status()], {"run-ci-nv-extra"}, False),
+            ("maint", [], {"run-ci"}, True),  # an approver's PR: the label is enough
+            ("maint", [], set(), False),
+            ("listed", [], {"run-ci"}, True),  # can_tag_run_ci_label in the file
+            ("ext", [_status()], {"run-ci"}, True),
+            ("ext", [], {"run-ci"}, False),
+            ("ext", [_status(login="someone")], {"run-ci"}, False),
+            ("ext", [_status(login=None)], {"run-ci"}, False),
+            ("ext", [_status(state="failure")], {"run-ci"}, False),
+            ("ext", [_status()], {"run-ci-nv-extra"}, False),
         ]
-        for statuses, labels, expected in cases:
-            with self.subTest(statuses=statuses, labels=labels):
-                repo = FakeRepo(statuses=statuses)
-                self.assertEqual(rca.is_approved(repo, HEAD, labels), expected)
+        listed = {"listed": {"can_tag_run_ci_label": True}}
+        with mock.patch.object(rca, "load_permissions", side_effect=listed.get):
+            for author, statuses, labels, expected in cases:
+                with self.subTest(author=author, statuses=statuses, labels=labels):
+                    repo = FakeRepo(
+                        permissions={"maint": "write", "listed": "read", "ext": 404},
+                        statuses=statuses,
+                    )
+                    self.assertEqual(
+                        rca.is_approved(repo, HEAD, labels, author), expected
+                    )
 
 
 class TestHeadSeenBy(unittest.TestCase):

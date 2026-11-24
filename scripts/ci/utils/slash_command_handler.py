@@ -7,7 +7,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -32,7 +32,7 @@ sys.path.insert(
 import ci_register as _ci_register  # noqa: E402
 from run_ci_approval import (  # noqa: E402
     APPROVAL_WORKFLOWS,
-    APPROVE_WORKFLOW,
+    APPROVER_REPO_PERMISSIONS,
     approval_workflows_for,
     can_approve,
     head_seen_by,
@@ -368,9 +368,9 @@ def handle_tag_run_ci(
     must pass run_ci_approval.can_approve, for every tier.
 
     Adding `run-ci` here also approves the PR's head commit for the workflows
-    that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), as
-    adding the label in the UI does, but only a head the commenter could have
-    seen: one pushed before the comment was posted.
+    that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), but
+    only a head the commenter could have seen: one pushed before the comment
+    was posted. Adding the label in the UI approves nothing.
 
     Labels added here start no run (GITHUB_TOKEN label events trigger no
     workflow); the callers re-run the gated runs.
@@ -403,6 +403,7 @@ def handle_tag_run_ci(
     for label in labels:
         pr.add_to_labels(label)
     record_approval(gh_repo, head_sha, user_login)
+    pr.create_issue_comment(f"✅ Approved by {user_login}: CI runs on {head_sha}.")
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -529,15 +530,10 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   (`run-ci`, an approved head commit for the approval workflows, not a draft, the
     #   workflow's opt-in labels), since rerun_failed_jobs() would rerun at most the
     #   finish job. This command never approves.
-    # - pr-gate-approve.yml runs are left out: re-running one does nothing.
-    runs = [
-        run
-        for run in latest_run_per_workflow(pr_workflow_runs(gh_repo, pr))
-        if workflow_file(run) != APPROVE_WORKFLOW
-    ]
+    runs = latest_run_per_workflow(pr_workflow_runs(gh_repo, pr))
     labels = {label.name for label in pr.get_labels()}
     can_run = "run-ci" in labels and not pr.draft
-    head_approved = is_approved(gh_repo, head_sha, labels)
+    head_approved = is_approved(gh_repo, head_sha, labels, pr.user.login)
     tiers = load_opt_in_tiers().values()
 
     rerun_count = 0
@@ -611,12 +607,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 ),
                 (
                     left_unapproved,
-                    "have a maintainer approve this commit (`/tag-and-rerun-ci`, "
-                    + (
-                        "or remove and re-add `run-ci`)"
-                        if "run-ci" in labels
-                        else "or add `run-ci`)"
-                    ),
+                    "have a maintainer approve this commit (`/tag-and-rerun-ci`)",
                 ),
             )
             if lacking
@@ -2066,7 +2057,7 @@ def main():
 
     # Write access grants every CI permission; CI_PERMISSIONS.json lists only
     # users without it (update_ci_permission.py drops write-access users).
-    if repo.get_collaborator_permission(user_login) in ("admin", "maintain", "write"):
+    if repo.get_collaborator_permission(user_login) in APPROVER_REPO_PERMISSIONS:
         print(f"User {user_login} has write access. Granting all CI permissions.")
         user_perms = dict(WRITE_ACCESS_CI_PERMISSIONS)
 

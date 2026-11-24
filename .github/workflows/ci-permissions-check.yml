@@ -2,7 +2,7 @@ name: CI Permissions Check
 
 # Warns about CI_PERMISSIONS.json entries that update_ci_permission.py would
 # drop or change (write-access users, users inactive for 90 days). Report only:
-# it never fails, so a stale entry never blocks a PR.
+# continue-on-error keeps a stale entry or an API error from blocking a PR.
 
 on:
   pull_request:
@@ -34,4 +34,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           pip install requests
-          python .github/update_ci_permission.py --check || true
+          python .github/update_ci_permission.py --check
