@@ -20,6 +20,37 @@ register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 
 class TestGemma4FusedRouting(CustomTestCase):
+    def test_post_topk_preserves_input_order(self):
+        generator = torch.Generator().manual_seed(7)
+        topk, num_experts = 19, 32
+        for dtype, index_dtype in (
+            (torch.bfloat16, torch.int64),
+            (torch.float16, torch.int32),
+            (torch.float32, torch.int64),
+        ):
+            with self.subTest(dtype=dtype, index_dtype=index_dtype):
+                logits = torch.randn(4, topk + 3, generator=generator, dtype=dtype)[
+                    :, :topk
+                ]
+                logits[:, -1] = -torch.inf
+                ids = torch.stack(
+                    [torch.randperm(num_experts, generator=generator) for _ in range(4)]
+                ).to(index_dtype)[:, :topk]
+                scales = torch.linspace(0.5, 2, num_experts, dtype=dtype)
+                expected = logits.float().softmax(-1) * scales.float()[ids.long()]
+
+                weights, out_ids = torch.ops.sgl_kernel.gemma_routing_post_topk_cpu(
+                    logits, ids, scales
+                )
+                torch.testing.assert_close(out_ids, ids.int())
+                torch.testing.assert_close(weights, expected)
+
+    def test_post_topk_rejects_out_of_range_ids(self):
+        with self.assertRaisesRegex(RuntimeError, "Expert ID out of range"):
+            torch.ops.sgl_kernel.gemma_routing_post_topk_cpu(
+                torch.zeros(1, 1), torch.tensor([[2**32]]), torch.ones(1)
+            )
+
     def test_topk_softmax_then_scale(self):
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             with self.subTest(dtype=dtype):

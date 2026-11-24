@@ -611,6 +611,9 @@ fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Ten
 std::tuple<at::Tensor, at::Tensor>
 gemma4_fused_routing_cpu(const at::Tensor& gating_output, const at::Tensor& per_expert_scale, int64_t topk);
 
+std::tuple<at::Tensor, at::Tensor> gemma_routing_post_topk_cpu(
+    const at::Tensor& topk_logits, const at::Tensor& topk_ids, const at::Tensor& per_expert_scale);
+
 void gemma_qkv_rmsnorm_cpu(
     at::Tensor q,
     const std::optional<at::Tensor>& k,
@@ -1082,6 +1085,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("gemma4_fused_routing_cpu(Tensor gating_output, Tensor per_expert_scale, int topk) -> (Tensor, Tensor)");
   m.impl("gemma4_fused_routing_cpu", torch::kCPU, &gemma4_fused_routing_cpu);
+
+  m.def(
+      "gemma_routing_post_topk_cpu(Tensor topk_logits, Tensor topk_ids, Tensor per_expert_scale) -> (Tensor, Tensor)");
+  m.impl("gemma_routing_post_topk_cpu", torch::kCPU, &gemma_routing_post_topk_cpu);
 
   m.def(
       "gemma_qkv_rmsnorm_cpu(Tensor(a!) q, Tensor(b!)? k, Tensor(c!)? v, Tensor q_weight, Tensor? k_weight, "

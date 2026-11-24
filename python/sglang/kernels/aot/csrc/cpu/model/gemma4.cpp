@@ -1,4 +1,5 @@
 #include <bit>
+#include <limits>
 
 #include "common.h"
 #include "vec.h"
@@ -13,6 +14,33 @@ struct Entry {
   int32_t expert_id;
 };
 
+template <bool post_topk, typename scalar_t>
+void routing_softmax_scale_row(
+    float* weights, const int32_t* ids, const scalar_t* per_expert_scale, int64_t topk, float max_logit) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = fVec::size();
+  const fVec max_fvec(max_logit), zero_fvec(0.f);
+  fVec sum_fvec(0.f);
+  int64_t rank = 0;
+  // Consider exp_u20() when shifted logits are guaranteed finite.
+  for (; rank <= topk - kVecSize; rank += kVecSize) {
+    const fVec exp_fvec = (fVec::loadu(weights + rank) - max_fvec).exp();
+    exp_fvec.store(weights + rank);
+    sum_fvec += exp_fvec;
+  }
+  if (rank < topk) {
+    const int64_t count = topk - rank;
+    const fVec exp_fvec = (fVec::loadu(weights + rank, count) - max_fvec).exp();
+    exp_fvec.store(weights + rank, count);
+    sum_fvec += fVec::set(zero_fvec, exp_fvec, count);
+  }
+  const float sum = vec_reduce_sum(sum_fvec);
+  const float denom = post_topk || sum > 0.f ? sum : 1.f;
+  for (int64_t rank = 0; rank < topk; ++rank) {
+    weights[rank] = (weights[rank] / denom) * static_cast<float>(per_expert_scale[ids[rank]]);
+  }
+}
+
 template <typename scalar_t>
 void gemma4_fused_routing_kernel_impl(
     float* __restrict__ topk_weights,
@@ -23,8 +51,6 @@ void gemma4_fused_routing_kernel_impl(
     int64_t num_experts,
     int64_t logits_strideT,
     int64_t topk) {
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = fVec::size();
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     Entry queue[kMaxRoutingExperts];
     for (int64_t row = begin; row < end; ++row) {
@@ -47,25 +73,39 @@ void gemma4_fused_routing_kernel_impl(
         weights[rank] = queue[rank].logit;
         ids[rank] = queue[rank].expert_id;
       }
-      const fVec max_fvec(max_logit), zero_fvec(0.f);
-      fVec sum_fvec(0.f);
-      int64_t rank = 0;
-      for (; rank <= topk - kVecSize; rank += kVecSize) {
-        const fVec exp_fvec = (fVec::loadu(weights + rank) - max_fvec).exp_u20();
-        exp_fvec.store(weights + rank);
-        sum_fvec += exp_fvec;
-      }
-      if (rank < topk) {
-        const int64_t count = topk - rank;
-        const fVec exp_fvec = (fVec::loadu(weights + rank, count) - max_fvec).exp_u20();
-        exp_fvec.store(weights + rank, count);
-        sum_fvec += fVec::set(zero_fvec, exp_fvec, count);
-      }
-      const float sum = vec_reduce_sum(sum_fvec);
-      const float denom = sum > 0.f ? sum : 1.f;
+      routing_softmax_scale_row<false>(weights, ids, per_expert_scale, topk, max_logit);
+    }
+  });
+}
+
+template <typename scalar_t, typename index_t>
+void gemma_routing_post_topk_kernel_impl(
+    float* __restrict__ out_weights,
+    int32_t* __restrict__ out_ids,
+    const scalar_t* __restrict__ topk_logits,
+    const index_t* __restrict__ topk_ids,
+    const scalar_t* __restrict__ per_expert_scale,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t topk,
+    int64_t logits_strideT,
+    int64_t ids_strideT) {
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const auto* logits = topk_logits + row * logits_strideT;
+      const auto* expert_ids = topk_ids + row * ids_strideT;
+      auto* weights = out_weights + row * topk;
+      auto* ids = out_ids + row * topk;
+      float max_logit = -std::numeric_limits<float>::infinity();
       for (int64_t rank = 0; rank < topk; ++rank) {
-        weights[rank] = (weights[rank] / denom) * static_cast<float>(per_expert_scale[ids[rank]]);
+        const auto expert_id = expert_ids[rank];
+        TORCH_CHECK(expert_id >= 0 && expert_id < num_experts, "Expert ID out of range: ", expert_id);
+        const float logit = static_cast<float>(logits[rank]);
+        max_logit = std::max(max_logit, logit);
+        weights[rank] = logit;
+        ids[rank] = static_cast<int32_t>(expert_id);
       }
+      routing_softmax_scale_row<true>(weights, ids, per_expert_scale, topk, max_logit);
     }
   });
 }
@@ -342,6 +382,46 @@ void gemma_dual_rmsnorm_residual_scalar_kernel_impl(
 }
 
 }  // anonymous namespace
+
+// weights = topk_logits.float().softmax(-1)
+//   * per_expert_scale.float()[topk_ids]
+//
+// topk_logits, topk_ids : [num_tokens, topk];
+// per_expert_scale      : [num_experts]
+//
+std::tuple<at::Tensor, at::Tensor> gemma_routing_post_topk_cpu(
+    const at::Tensor& topk_logits, const at::Tensor& topk_ids, const at::Tensor& per_expert_scale) {
+  CHECK_DIM(2, topk_logits);
+  CHECK_DIM(1, per_expert_scale);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(topk_logits);
+  const auto st = topk_logits.scalar_type();
+  const int64_t num_tokens = topk_logits.size(0);
+  const int64_t topk = topk_logits.size(1);
+  const int64_t num_experts = per_expert_scale.size(0);
+  CHECK_INPUT_SHAPE_DTYPE<false>(per_expert_scale, {num_experts}, st);
+  TORCH_CHECK(topk <= num_experts, "topk must not exceed num_experts");
+
+  auto out_weights = at::empty(topk_logits.sizes(), topk_logits.options().dtype(at::kFloat));
+  auto out_ids = at::empty(topk_logits.sizes(), topk_logits.options().dtype(at::kInt));
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, st, "gemma_routing_post_topk_cpu", [&] {
+    AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "gemma_routing_post_topk_indices", [&] {
+      if (out_weights.numel() != 0) {
+        gemma_routing_post_topk_kernel_impl(
+            out_weights.data_ptr<float>(),
+            out_ids.data_ptr<int32_t>(),
+            topk_logits.data_ptr<scalar_t>(),
+            topk_ids.data_ptr<index_t>(),
+            per_expert_scale.data_ptr<scalar_t>(),
+            num_tokens,
+            num_experts,
+            topk,
+            topk_logits.stride(0),
+            topk_ids.stride(0));
+      }
+    });
+  });
+  return std::make_tuple(out_weights, out_ids);
+}
 
 // The kernel's bitwise ordering also ranks +0.0 before -0.0.
 // CUDA:
