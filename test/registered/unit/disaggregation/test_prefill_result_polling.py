@@ -246,6 +246,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self._maybe_clear_mm_inputs = Mock()
         self.maybe_send_health_check_signal = Mock()
         self.disagg_prefill_transfer_queue = _sending()
+        self.disagg_prefill_kv_sent_reqs = {}
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(

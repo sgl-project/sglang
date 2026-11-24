@@ -1162,6 +1162,22 @@ class MoriKVManager(CommonKVManager):
             register_info.dst_port,
         )
 
+    def _kv_head_group(self, peer_info: KVArgsRegisterInfo) -> Optional[int]:
+        """The group of this stage's KV heads the decode rank holds; None when they are not grouped."""
+        grouping = self.kv_args.kv_head_groups
+        if grouping is None:
+            return None
+        if (
+            peer_info.decode_tp_size != grouping.count
+            or peer_info.dst_kv_item_len != self.kv_args.kv_item_lens[0]
+        ):
+            raise RuntimeError(
+                f"This prefill keeps its KV heads as {grouping.count} groups, one per decode "
+                f"attention-TP rank: the decode peer has attention TP {peer_info.decode_tp_size} and "
+                f"{peer_info.dst_kv_item_len}-byte pages (here {self.kv_args.kv_item_lens[0]})"
+            )
+        return peer_info.decode_tp_rank % grouping.count
+
     def _get_mha_mem_desc_slices(
         self,
         dst_mem_descs: List[MemoryDesc],
@@ -1448,6 +1464,27 @@ class MoriKVManager(CommonKVManager):
                 )
             return statuses
 
+        group = self._kv_head_group(peer_info)
+        if group is not None:
+            # Whole pages of the rank's head group, entries paired by model layer.
+            grouping = self.kv_args.kv_head_groups
+            dst_descs = peer_info.dst_kv_mem_descs
+            src_indices, src_layer_ids = grouping.select(grouping.kv_entries, group)
+            layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
+            for i, j in build_transfer_entry_pairs(
+                src_layer_ids,
+                peer_info.dst_kv_layer_ids
+                or grouping.peer_kv_layer_ids(len(dst_descs)),
+                len(src_indices),
+                len(dst_descs),
+            ):
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        self.kv_mem_descs[src_indices[i]], dst_descs[j], layer_plan
+                    )
+                )
+            return statuses
+
         (
             src_k_descs,
             src_v_descs,
@@ -1674,8 +1711,13 @@ class MoriKVManager(CommonKVManager):
         src_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
 
+        group = self._kv_head_group(peer_info)
         statuses: List[TransferStatus] = []
+        windows_seen = 0
         for i, st in enumerate(state_types):
+            # Which of the window states this is: the target's, then the draft's.
+            window_ordinal = windows_seen
+            windows_seen += st == StateType.SWA
             src_indices = src_state_indices[i] if i < len(src_state_indices) else None
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else None
             if src_indices is None or src_indices.size == 0:
@@ -1684,6 +1726,9 @@ class MoriKVManager(CommonKVManager):
                 continue
 
             src_descs = self.state_mem_descs[i]
+            if not src_descs:
+                # An entry this PP stage registers empty: another stage sends it.
+                continue
             dst_descs = peer_info.dst_state_mem_descs[i]
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
             dst_lens = (
@@ -1709,6 +1754,15 @@ class MoriKVManager(CommonKVManager):
                 if i < len(peer_info.dst_state_layer_ids)
                 else []
             )
+
+            if group is not None and st == StateType.SWA:
+                # The window entries of the rank's head group, paired by model layer.
+                grouping = self.kv_args.kv_head_groups
+                window_entries, peer_layers = grouping.window_state(window_ordinal)
+                entries, src_layer_ids = grouping.select(window_entries, group)
+                src_descs = [src_descs[n] for n in entries]
+                src_lens = [src_lens[n] for n in entries]
+                dst_layer_ids = dst_layer_ids or list(peer_layers)
 
             if st == "mamba":
                 if peer_info.decode_tp_size != self.state_tp_size and 0 in src_dims:
@@ -1890,6 +1944,7 @@ class MoriKVManager(CommonKVManager):
             state_type == "swa"
             and not self.is_mla_backend
             and peer_info.decode_tp_size != self.attn_tp_size
+            and self._kv_head_group(peer_info) is None
         ):
             raise RuntimeError(
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "

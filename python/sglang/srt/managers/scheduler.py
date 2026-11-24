@@ -1660,6 +1660,8 @@ class Scheduler(
         self.disagg_prefill_transfer_queue = IndexedReqList(
             ListKind.PD_SENDING, abort=self._abort_prefill_transfer
         )
+        # Requests whose KV went out ahead of their last result, by rid.
+        self.disagg_prefill_kv_sent_reqs: Dict[str, Req] = {}
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 

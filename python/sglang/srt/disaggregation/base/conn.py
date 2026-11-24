@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -65,6 +65,9 @@ class KVArgs:
     kv_data_lens: List[int]
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
+    # A prefill pipeline stage that keeps its KV heads as one group per decode attention-TP rank
+    # (rocm_muse_spark.kv_head_groups.KVHeadGroups); None otherwise.
+    kv_head_groups: Optional[Any] = None
     kv_cache_dtype_str: str
     # KV byte layout both PD roles must share; None for pools with only one.
     kv_layout: Optional[str] = None

@@ -78,6 +78,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.tree_cache = Mock()
         self.request_retirer = release_only_retirer(self.tree_cache)
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        self.disagg_prefill_kv_sent_reqs = {}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
         self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())

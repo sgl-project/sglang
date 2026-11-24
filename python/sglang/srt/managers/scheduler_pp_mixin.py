@@ -10,7 +10,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    TransferBackend,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -273,6 +276,30 @@ class SchedulerPPMixin:
                 self._sched_idled = True
                 self.on_idle()
 
+    @staticmethod
+    def _pp_batch_digest(batch: Optional[ScheduleBatch]) -> List[Tuple[str, int, int]]:
+        """What a stage scheduled, the same on every stage: each request's
+        (rid, prefix_len, extend_end) in row order."""
+        if not batch:
+            return []
+        return [(req.rid, req.prefix_len, req.extend_end) for req in batch.reqs]
+
+    def _pp_check_stage_batch(
+        self: Scheduler,
+        prev_digest: List[Tuple[str, int, int]],
+        digest: List[Tuple[str, int, int]],
+        iteration: int,
+    ) -> None:
+        if [tuple(row) for row in prev_digest] == digest:
+            return
+        raise RuntimeError(
+            f"Pipeline stage {get_parallel().pp_rank} scheduled {digest} in "
+            f"iteration {iteration} and the previous stage {prev_digest}, as "
+            "(rid, prefix_len, extend_end); waiting: "
+            f"{[req.rid for req in self.waiting_queue]}, between chunks: "
+            f"{self.chunked_req.rid if self.chunked_req else None}"
+        )
+
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
         """
@@ -298,13 +325,31 @@ class SchedulerPPMixin:
 
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
+
+        With SGLANG_PP_DISAGG_PREFILL_EARLY_KV_SEND, a stage sends the KV of
+        the prompts its (i-1)th batch finished right after launching the ith.
         """
         self.init_pp_loop_state()
+
+        send_kv_early = envs.SGLANG_PP_DISAGG_PREFILL_EARLY_KV_SEND.get()
+        if send_kv_early and self.transfer_backend != TransferBackend.MORI:
+            raise NotImplementedError(
+                "SGLANG_PP_DISAGG_PREFILL_EARLY_KV_SEND needs "
+                "--disaggregation-transfer-backend mori"
+            )
+        # The batch the previous iteration launched, the first tokens it gave
+        # (last stage only) and the event that ends its forward.
+        launched = None
+        check_batches = envs.SGLANG_PP_DISAGG_PREFILL_CHECK_STAGE_BATCHES.get()
+        send_batch_digest_work = []
+        prev_batch_digest = []
+        iteration = -1
 
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.increment_scheduler_iterations()
+                iteration += 1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -325,6 +370,10 @@ class SchedulerPPMixin:
 
                 self.process_bootstrapped_queue()
 
+                if check_batches and not self.pp_group.is_first_rank:
+                    prev_batch_digest = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_batch_digest_work)
+
                 self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -341,6 +390,12 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                if check_batches:
+                    batch_digest = self._pp_batch_digest(cur_batch)
+                    if not self.pp_group.is_first_rank:
+                        self._pp_check_stage_batch(
+                            prev_batch_digest, batch_digest, iteration
+                        )
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -363,6 +418,20 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if send_kv_early:
+                    if launched is not None:
+                        self.send_finished_prefill_kv(*launched)
+                    launched = None
+                    if cur_batch:
+                        launched = (
+                            cur_batch,
+                            (
+                                result.next_token_ids
+                                if self.pp_group.is_last_rank
+                                else None
+                            ),
+                            self.launch_event,
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -384,6 +453,10 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     self._pp_send_capacity_digest()
+                    if check_batches:
+                        send_batch_digest_work = self._pp_send_pyobj_to_next_stage(
+                            batch_digest, async_send=True
+                        )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_verdict_requests()

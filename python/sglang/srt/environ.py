@@ -791,6 +791,14 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP PD prefill: a stage checkpoints and sends a finished prompt's KV once
+    # its own forward of the last chunk is done, instead of when that forward's
+    # output has come round the ring. Needs the mori transfer backend.
+    SGLANG_PP_DISAGG_PREFILL_EARLY_KV_SEND = EnvBool(False)
+    # PP PD prefill: every stage compares the batch it scheduled with the previous
+    # stage's and stops at the first difference; stages that schedule differently
+    # otherwise wait for each other forever.
+    SGLANG_PP_DISAGG_PREFILL_CHECK_STAGE_BATCHES = EnvBool(False)
     # PP rank 0 posts its output recv only after its own forward. Enable it if PP
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
@@ -2419,6 +2427,9 @@ class Envs:
     # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
     # extend reuses the page tables / query offsets init_forward_metadata built.
     SGLANG_ROCM_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # KV heads of a pipeline stage kept as this many groups, each laid out as one attention-TP rank of the
+    # decode it feeds (0 / 1: one pool layer per model layer).
+    SGLANG_ROCM_MUSE_PP_KV_GROUPS = EnvInt(0)
     # target-verify KV lengths once per batch / per graph replay, not per layer.
     SGLANG_ROCM_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
     # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.

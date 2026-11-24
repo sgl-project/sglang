@@ -107,6 +107,11 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
+from sglang.srt.rocm_muse_spark.kv_head_groups import (
+    HeadGroupedMHATokenToKVPool,
+    grouped_layer_ids,
+    kv_head_groups,
+)
 from sglang.srt.runtime_context import (
     attention_backends,
     get_context,
@@ -2711,6 +2716,18 @@ class KVCacheConfigurator:
         )
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
+        head_num = self.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        head_groups = 1 if self.is_draft_worker else kv_head_groups()
+        if head_groups > 1:
+            swa_attention_layer_ids = grouped_layer_ids(
+                swa_attention_layer_ids, head_groups
+            )
+            full_attention_layer_ids = grouped_layer_ids(
+                full_attention_layer_ids, head_groups
+            )
+            head_num //= head_groups
         # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
@@ -2723,9 +2740,7 @@ class KVCacheConfigurator:
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
+            head_num=head_num,
             head_dim=self.model_config.head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
@@ -3081,16 +3096,34 @@ class KVCacheConfigurator:
             pool_cls = PageInterleaveMHATokenToKVPool
             pool_kwargs["shard_spec"] = self.kv_shard_spec
             pool_kwargs["shard_group"] = self.kv_shard_group
+        head_num = self.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        layer_num = self.layer_info.num_effective_layers
+        # The draft KV a PD prefill stage with grouped KV heads sends to its decode ranks.
+        head_groups = (
+            kv_head_groups()
+            if self.is_draft_worker and get_disagg().disaggregation_mode == "prefill"
+            else 1
+        )
+        if head_groups > 1:
+            if pool_cls is not MHATokenToKVPool or head_num % head_groups:
+                raise NotImplementedError(
+                    f"SGLANG_ROCM_MUSE_PP_KV_GROUPS={head_groups} with a {pool_cls.__name__} "
+                    f"draft KV pool of {head_num} heads"
+                )
+            pool_cls = HeadGroupedMHATokenToKVPool
+            pool_kwargs["head_groups"] = head_groups
+            head_num //= head_groups
+            layer_num *= head_groups
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
+            head_num=head_num,
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
+            layer_num=layer_num,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
