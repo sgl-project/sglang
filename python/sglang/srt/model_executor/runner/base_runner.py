@@ -272,6 +272,10 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_dcp_push_combine()
+        if envs.SGLANG_ENABLE_DCP_KV_PREFETCH.get():
+            from sglang.srt.layers.dcp import init_dcp_kv_prefetch_for_runner
+
+            init_dcp_kv_prefetch_for_runner(mr)
         self._pre_initialize_pcie_ipc_workspace()
         self._prepare_capture_state()
 
