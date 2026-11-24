@@ -560,9 +560,9 @@ _ONE_STEP_PER_CHUNK = "one step per chunk (#31915)"
 # (parser, mode) pairs that fail on main. Remove an entry when its fix lands.
 KNOWN_FAILURES = {
     ("deepseekv3", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("deepseekv3", "both_calls_in_one_chunk"): "#43523, #43544",
+    ("deepseekv3", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("deepseekv31", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("deepseekv31", "both_calls_in_one_chunk"): "#42137",
+    ("deepseekv31", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("flint", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("glm", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("glm47", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
@@ -574,7 +574,6 @@ KNOWN_FAILURES = {
     ("llama3", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
     ("llama3", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("mimo", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("minimax-m2", "both_calls_in_one_chunk"): "#36691",
     ("mistral", "one_call_per_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "both_calls_in_one_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "one_token_per_chunk"): _LATER_CALLS_TO_CONTENT,
