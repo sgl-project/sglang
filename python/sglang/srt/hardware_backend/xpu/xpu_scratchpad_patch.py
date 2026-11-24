@@ -20,6 +20,8 @@ memory-efficient, and compatible with both current and future sgl-kernel-xpu rel
    one dedicated, static graph workspace (reused across layers and batch sizes
    via narrow slice). Retired buffers during graph-capture expansion are
    retained to ensure physical memory addresses are never recycled.
+   Assumes single-stream sequential forward execution within a shared global
+   graph memory pool (get_or_create_global_graph_memory_pool).
 2. Eager mode: Retains sgl-kernel's native eager workspace behavior without
    altering it or imposing arbitrary thresholds.
 3. Forward/Backward compatibility:
@@ -31,6 +33,7 @@ memory-efficient, and compatible with both current and future sgl-kernel-xpu rel
 
 from __future__ import annotations
 
+import logging
 import weakref
 from collections.abc import Callable
 from typing import Any
@@ -38,9 +41,10 @@ from typing import Any
 import torch
 from torch._guards import detect_fake_mode
 
+logger = logging.getLogger(__name__)
+
 _GRAPH_SCRATCHPAD_STATE: dict[str, Any] = {
     "moe_cache": {},
-    "moe_views": {},
     "moe_retired": [],
     "gdn_cache": {},
     "gdn_retired": [],
@@ -71,8 +75,8 @@ def unregister_graph_scratchpad_owner(owner: object) -> None:
         fin = _ACTIVE_GRAPH_FINALIZERS.pop(id(owner), None)
         if fin is not None:
             fin.detach()
-        if len(_ACTIVE_GRAPH_FINALIZERS) == 0:
-            reset_sgl_kernel_graph_scratchpads()
+            if len(_ACTIVE_GRAPH_FINALIZERS) == 0:
+                reset_sgl_kernel_graph_scratchpads()
 
 
 def reset_sgl_kernel_graph_scratchpads() -> None:
@@ -108,16 +112,15 @@ _orig_gdn_ws: Callable | None = None
 def _get_shared_graph_moe_ws(
     name: str, shape: tuple, dtype: torch.dtype, dev: torch.device
 ) -> torch.Tensor:
-    numel = 1
-    for d in shape:
-        numel *= d
     shape_tuple = tuple(shape)
+    numel = 1
+    for d in shape_tuple:
+        numel *= d
     if numel == 0 or detect_fake_mode() is not None:
         return torch.empty(shape_tuple, dtype=dtype, device=dev)
 
     key = (name, dtype, dev)
     graph_moe_ws_cache = _GRAPH_SCRATCHPAD_STATE["moe_cache"]
-    graph_moe_ws_view_cache = _GRAPH_SCRATCHPAD_STATE["moe_views"]
     graph_moe_retired_buffers = _GRAPH_SCRATCHPAD_STATE["moe_retired"]
 
     cur = graph_moe_ws_cache.get(key)
@@ -128,16 +131,7 @@ def _get_shared_graph_moe_ws(
         if old_cur is not None:
             graph_moe_retired_buffers.append(old_cur)
 
-    cached_view = graph_moe_ws_view_cache.get(key)
-    if (
-        cached_view is None
-        or cached_view[0] is not cur
-        or cached_view[1] != shape_tuple
-    ):
-        view = cur.narrow(0, 0, numel).view(shape_tuple)
-        graph_moe_ws_view_cache[key] = (cur, shape_tuple, view)
-        return view
-    return cached_view[2]
+    return cur.narrow(0, 0, numel).view(shape_tuple)
 
 
 def _get_shared_graph_gdn_workspace(nbytes: int, dev: torch.device) -> torch.Tensor:
@@ -159,6 +153,7 @@ def _get_shared_graph_gdn_workspace(nbytes: int, dev: torch.device) -> torch.Ten
 
 # Custom ops for zero-break torch.compile integration.
 # torch.library.infer_schema maps `list[int]` -> `SymInt[]` and `int` -> `SymInt`.
+# Scratchpads are allocated for intra-stream sequential execution within a forward pass.
 @torch.library.custom_op("sgl_xpu::get_moe_ws_op", mutates_args=())
 def _get_moe_ws_op(
     name: str,
@@ -248,8 +243,10 @@ def patch_sgl_kernel_scratchpad_buffers() -> None:
             _orig_moe_ws = sk_moe._get_moe_ws
             sk_moe._get_moe_ws = safe_get_moe_ws
             sk_moe._xpu_graph_safe_ws_patched = True
-    except (ImportError, AttributeError, OSError):
+    except (ImportError, AttributeError):
         pass
+    except OSError as e:
+        logger.debug("Optional sgl_kernel.moe native library not loaded: %s", e)
 
     # 2. Independently patch sgl_kernel.gdn_attn
     try:
@@ -264,5 +261,7 @@ def patch_sgl_kernel_scratchpad_buffers() -> None:
             _orig_gdn_ws = sk_gdn._get_gdn_workspace
             sk_gdn._get_gdn_workspace = safe_get_gdn_workspace
             sk_gdn._xpu_graph_safe_ws_patched = True
-    except (ImportError, AttributeError, OSError):
+    except (ImportError, AttributeError):
         pass
+    except OSError as e:
+        logger.debug("Optional sgl_kernel.gdn_attn native library not loaded: %s", e)

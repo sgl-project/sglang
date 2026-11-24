@@ -9,6 +9,16 @@ import torch
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
     FullXPUGraphBackend,
 )
+from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
+    _ACTIVE_GRAPH_FINALIZERS,
+    _GRAPH_SCRATCHPAD_STATE,
+    patch_sgl_kernel_scratchpad_buffers,
+    register_graph_scratchpad_owner,
+    reset_sgl_kernel_graph_scratchpads,
+    safe_get_gdn_workspace,
+    safe_get_moe_ws,
+    unregister_graph_scratchpad_owner,
+)
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -264,9 +274,126 @@ class TestXPUGraphMetadata(CustomTestCase):
                 ):
                     PrefillCudaGraphRunner(_FakeModelRunner())
 
+    def test_sgl_kernel_scratchpad_custom_op_schema(self):
+        """Verify that scratchpad custom ops are registered with symbolic SymInt schemas."""
+        patch_sgl_kernel_scratchpad_buffers()
+        self.assertIn("SymInt[]", str(torch.ops.sgl_xpu.get_moe_ws_op.default._schema))
+        self.assertIn(
+            "SymInt nbytes", str(torch.ops.sgl_xpu.get_gdn_ws_op.default._schema)
+        )
+
+    def test_sgl_kernel_scratchpad_owner_refcount_and_gc(self):
+        """Verify multi-instance owner reference counting, idempotent unregister, and GC cleanup."""
+        gc.collect()
+        saved_finalizers = dict(_ACTIVE_GRAPH_FINALIZERS)
+        _ACTIVE_GRAPH_FINALIZERS.clear()
+        reset_sgl_kernel_graph_scratchpads()
+
+        def _restore():
+            reset_sgl_kernel_graph_scratchpads()
+            _ACTIVE_GRAPH_FINALIZERS.clear()
+            _ACTIVE_GRAPH_FINALIZERS.update(saved_finalizers)
+
+        self.addCleanup(_restore)
+
+        class DummyOwner:
+            pass
+
+        owner1 = DummyOwner()
+        owner2 = DummyOwner()
+        register_graph_scratchpad_owner(owner1)
+        register_graph_scratchpad_owner(owner2)
+        self.assertIn(id(owner1), _ACTIVE_GRAPH_FINALIZERS)
+        self.assertIn(id(owner2), _ACTIVE_GRAPH_FINALIZERS)
+
+        # Populate dummy cache
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"]["test_key"] = torch.empty(1)
+
+        # Discarding one owner does NOT clear containers
+        unregister_graph_scratchpad_owner(owner1)
+        self.assertNotIn(id(owner1), _ACTIVE_GRAPH_FINALIZERS)
+        self.assertIn(id(owner2), _ACTIVE_GRAPH_FINALIZERS)
+        self.assertEqual(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 1)
+
+        # Idempotent unregister on already-unregistered owner is a no-op
+        unregister_graph_scratchpad_owner(owner1)
+        self.assertEqual(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 1)
+
+        # Discarding all owners triggers reset
+        unregister_graph_scratchpad_owner(owner2)
+        self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
+        self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
+
+        # Idempotent unregister on empty finalizers does not falsely crash or reset
+        unregister_graph_scratchpad_owner(owner2)
+        unregister_graph_scratchpad_owner(DummyOwner())
+
+        # Implicit GC of last owner (without explicit unregister) also triggers reset
+        owner3 = DummyOwner()
+        register_graph_scratchpad_owner(owner3)
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"]["test_key3"] = torch.empty(1)
+        self.assertGreater(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 0)
+        del owner3
+        gc.collect()
+        self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
+        self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
+
+    def test_sgl_kernel_scratchpad_dual_compatibility_and_recursion_guard(self):
+        """Verify dual compatibility bypass when _XPU_GRAPH_SAFE=True and self-patch recursion guard."""
+        import sgl_kernel
+
+        import sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch as xpu_sp_patch
+
+        def orig_moe_fn(*a, **kw):
+            return None
+
+        def orig_gdn_fn(*a, **kw):
+            return None
+
+        mock_moe = SimpleNamespace(
+            _XPU_GRAPH_SAFE=True,
+            _get_moe_ws=orig_moe_fn,
+        )
+        mock_gdn = SimpleNamespace(
+            _XPU_GRAPH_SAFE=False,
+            _get_gdn_workspace=orig_gdn_fn,
+        )
+        saved_orig_moe = xpu_sp_patch._orig_moe_ws
+        saved_orig_gdn = xpu_sp_patch._orig_gdn_ws
+
+        try:
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "sgl_kernel.moe": mock_moe,
+                        "sgl_kernel.gdn_attn": mock_gdn,
+                    },
+                ),
+                patch.object(sgl_kernel, "moe", mock_moe),
+                patch.object(sgl_kernel, "gdn_attn", mock_gdn),
+            ):
+                patch_sgl_kernel_scratchpad_buffers()
+                # _XPU_GRAPH_SAFE=True on moe leaves it untouched without blocking gdn
+                self.assertIs(mock_moe._get_moe_ws, orig_moe_fn)
+                self.assertFalse(getattr(mock_moe, "_xpu_graph_safe_ws_patched", False))
+                self.assertIs(mock_gdn._get_gdn_workspace, safe_get_gdn_workspace)
+                self.assertTrue(getattr(mock_gdn, "_xpu_graph_safe_ws_patched", False))
+
+                # Self-patch guard: resetting _xpu_graph_safe_ws_patched must not bind
+                # _orig_gdn_ws to safe_get_gdn_workspace
+                mock_gdn._xpu_graph_safe_ws_patched = False
+                patch_sgl_kernel_scratchpad_buffers()
+                self.assertIs(xpu_sp_patch._orig_gdn_ws, orig_gdn_fn)
+                self.assertIsNot(xpu_sp_patch._orig_gdn_ws, safe_get_gdn_workspace)
+                self.assertIsNot(xpu_sp_patch._orig_moe_ws, safe_get_moe_ws)
+        finally:
+            xpu_sp_patch._orig_moe_ws = saved_orig_moe
+            xpu_sp_patch._orig_gdn_ws = saved_orig_gdn
+
     def test_sgl_kernel_scratchpad_realloc_safety_under_graph(self):
         """Verify that sgl_kernel internal scratchpad buffers (MoE and GDN)
-        are graph-safe, memory-efficient, and fully compatible:
+        are graph-safe, memory-efficient, and fully compatible under XPU Graph execution:
         1. Capture state (stream capturing): all graphs and layers share a single
            dedicated graph workspace buffer (reused via narrow slice).
         2. Capture expansion (small -> large capture): retired buffers are retained
@@ -274,23 +401,7 @@ class TestXPUGraphMetadata(CustomTestCase):
         3. GDN workspace coverage: small -> large capture retains retired GDN buffers.
         4. Real GPU replay test: verifies that graph execution accurately reads and writes
            tensors through the shared workspace and matches eager ground truth.
-        5. Multi-instance reference counting: tracks active graph owners so that cleaning up
-           one backend instance does not invalidate scratchpads still needed by other runners.
-        6. Dual compatibility bypass: _XPU_GRAPH_SAFE on one module does not block patching
-           on other modules.
         """
-        import sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch as xpu_sp_patch
-        from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
-            _ACTIVE_GRAPH_FINALIZERS,
-            _GRAPH_SCRATCHPAD_STATE,
-            patch_sgl_kernel_scratchpad_buffers,
-            register_graph_scratchpad_owner,
-            reset_sgl_kernel_graph_scratchpads,
-            safe_get_gdn_workspace,
-            safe_get_moe_ws,
-            unregister_graph_scratchpad_owner,
-        )
-
         # Isolate active finalizer / scratchpad state from prior tests in this process.
         gc.collect()
         saved_finalizers = dict(_ACTIVE_GRAPH_FINALIZERS)
@@ -304,12 +415,6 @@ class TestXPUGraphMetadata(CustomTestCase):
 
         self.addCleanup(_restore_scratchpad_test_state)
         patch_sgl_kernel_scratchpad_buffers()
-
-        # Verify custom ops are registered and infer symbolic schemas (SymInt[] / SymInt)
-        self.assertIn("SymInt[]", str(torch.ops.sgl_xpu.get_moe_ws_op.default._schema))
-        self.assertIn(
-            "SymInt nbytes", str(torch.ops.sgl_xpu.get_gdn_ws_op.default._schema)
-        )
 
         try:
             import sgl_kernel.gdn_attn as sk_gdn
@@ -482,92 +587,6 @@ class TestXPUGraphMetadata(CustomTestCase):
         joint_graph.replay()
         torch.xpu.synchronize()
         self.assertTrue(torch.allclose(joint_out, expected_joint, atol=1e-2, rtol=1e-2))
-
-        # 5. Multi-instance reference counting (explicit unregister + GC finalizer)
-        class DummyOwner:
-            pass
-
-        owner1 = DummyOwner()
-        owner2 = DummyOwner()
-        register_graph_scratchpad_owner(owner1)
-        register_graph_scratchpad_owner(owner2)
-        self.assertIn(id(owner1), _ACTIVE_GRAPH_FINALIZERS)
-        self.assertIn(id(owner2), _ACTIVE_GRAPH_FINALIZERS)
-
-        # Discarding one owner does NOT clear containers
-        unregister_graph_scratchpad_owner(owner1)
-        self.assertNotIn(id(owner1), _ACTIVE_GRAPH_FINALIZERS)
-        self.assertIn(id(owner2), _ACTIVE_GRAPH_FINALIZERS)
-        if not getattr(sk_moe, "_XPU_GRAPH_SAFE", False):
-            self.assertGreater(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 0)
-
-        # Discarding all owners triggers reset
-        unregister_graph_scratchpad_owner(owner2)
-        self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
-        self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
-
-        # Implicit GC of last owner (without explicit unregister) also triggers reset
-        owner3 = DummyOwner()
-        register_graph_scratchpad_owner(owner3)
-        if hasattr(sk_moe, "_get_moe_ws"):
-            g_gc = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g_gc):
-                sk_moe._get_moe_ws("test_gc_ws", (2, 32), torch.bfloat16, device)
-            if not getattr(sk_moe, "_XPU_GRAPH_SAFE", False):
-                self.assertGreater(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 0)
-        del owner3
-        gc.collect()
-        self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
-        self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
-
-        # 6. Dual compatibility bypass & self-patch recursion guard
-        def orig_moe_fn(*a, **kw):
-            return None
-
-        def orig_gdn_fn(*a, **kw):
-            return None
-
-        mock_moe = SimpleNamespace(
-            _XPU_GRAPH_SAFE=True,
-            _get_moe_ws=orig_moe_fn,
-        )
-        mock_gdn = SimpleNamespace(
-            _XPU_GRAPH_SAFE=False,
-            _get_gdn_workspace=orig_gdn_fn,
-        )
-        saved_orig_moe = xpu_sp_patch._orig_moe_ws
-        saved_orig_gdn = xpu_sp_patch._orig_gdn_ws
-        import sgl_kernel
-
-        try:
-            with (
-                patch.dict(
-                    sys.modules,
-                    {
-                        "sgl_kernel.moe": mock_moe,
-                        "sgl_kernel.gdn_attn": mock_gdn,
-                    },
-                ),
-                patch.object(sgl_kernel, "moe", mock_moe),
-                patch.object(sgl_kernel, "gdn_attn", mock_gdn),
-            ):
-                patch_sgl_kernel_scratchpad_buffers()
-                # _XPU_GRAPH_SAFE=True on moe leaves it untouched without blocking gdn
-                self.assertIs(mock_moe._get_moe_ws, orig_moe_fn)
-                self.assertFalse(getattr(mock_moe, "_xpu_graph_safe_ws_patched", False))
-                self.assertIs(mock_gdn._get_gdn_workspace, safe_get_gdn_workspace)
-                self.assertTrue(getattr(mock_gdn, "_xpu_graph_safe_ws_patched", False))
-
-                # Self-patch guard: resetting _xpu_graph_safe_ws_patched must not bind
-                # _orig_gdn_ws to safe_get_gdn_workspace
-                mock_gdn._xpu_graph_safe_ws_patched = False
-                patch_sgl_kernel_scratchpad_buffers()
-                self.assertIs(xpu_sp_patch._orig_gdn_ws, orig_gdn_fn)
-                self.assertIsNot(xpu_sp_patch._orig_gdn_ws, safe_get_gdn_workspace)
-                self.assertIsNot(xpu_sp_patch._orig_moe_ws, safe_get_moe_ws)
-        finally:
-            xpu_sp_patch._orig_moe_ws = saved_orig_moe
-            xpu_sp_patch._orig_gdn_ws = saved_orig_gdn
 
     def test_full_xpu_graph_backend_retains_capture_inputs_and_cleans_up(self):
         from contextlib import nullcontext

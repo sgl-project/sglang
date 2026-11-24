@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
+    patch_sgl_kernel_scratchpad_buffers,
+    register_graph_scratchpad_owner,
+    unregister_graph_scratchpad_owner,
+)
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import register_xpu_device_properties_for_dynamo
@@ -99,12 +104,6 @@ def register_fake_ops():
         )
 
 
-from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
-    patch_sgl_kernel_scratchpad_buffers,
-    register_graph_scratchpad_owner,
-)
-
-
 class XPUGraphRunner(DecodeCudaGraphRunner):
     """A XPUGraphRunner runs the forward pass of a model with xpu graph and torch.compile."""
 
@@ -134,7 +133,6 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         self._apply_xpu_compile_config()
         register_xpu_device_properties_for_dynamo()
         patch_sgl_kernel_scratchpad_buffers()
-        register_graph_scratchpad_owner(self)
         super().__init__(model_runner)
 
         assert not self.enable_two_batch_overlap, (
@@ -150,3 +148,9 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         assert not self.require_gathered_buffer, (
             "XPUGraphRunner does not support gathered buffer yet."
         )
+        register_graph_scratchpad_owner(self)
+
+    def cleanup(self) -> None:
+        unregister_graph_scratchpad_owner(self)
+        if hasattr(super(), "cleanup"):
+            super().cleanup()
