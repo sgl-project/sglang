@@ -309,10 +309,10 @@ class PrefillBudget:
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
 
-    def reserve_running_windows(self, req, max_new_tokens: float) -> None:
-        """Commit the window rows running request ``req`` may still add as it
-        decodes ``max_new_tokens`` more; pools of their own commit only its
-        token rows, which `total_offset` charges."""
+    def reserve_running_windows(self, reqs, max_new_tokens: Sequence[float]) -> None:
+        """Commit the window rows the running requests ``reqs`` may still add
+        as they decode ``max_new_tokens`` more each; pools of their own commit
+        only their token rows, which `total_offset` charges."""
 
 
 class SWAPrefillBudget(PrefillBudget):
@@ -616,6 +616,7 @@ class ChainPrefillBudget(PrefillBudget):
         request_rows=0,
         extra_tokens=0,
         cached_tokens=0,
+        held_window_tokens: Optional[Mapping[str, int]] = None,
     ) -> KVDemand:
         """What one request still needs over this pool's windows, built for
         ``purpose`` as every site builds it (`demand.demand_inputs`).
@@ -635,6 +636,7 @@ class ChainPrefillBudget(PrefillBudget):
             request_rows if self.has_request_rows else 0,
             extra_tokens,
             cached_tokens,
+            tuple(sorted(held_window_tokens.items())) if held_window_tokens else (),
         )
         demand = self._demands.get(key)
         if demand is None:
@@ -654,6 +656,7 @@ class ChainPrefillBudget(PrefillBudget):
                 cached_tokens=cached_tokens,
                 host_hit_lengths=host_hit_lengths,
                 extra_tokens=extra_tokens,
+                held_window_tokens=held_window_tokens,
             ).demand()
             demand = msgspec.structs.replace(
                 demand, window_tokens=MappingProxyType(demand.window_tokens)
@@ -1196,28 +1199,45 @@ class ChainPrefillBudget(PrefillBudget):
             self.window_offsets[name] += committed.window_tokens[name]
             self.window_current_offsets[name] += now.window_tokens[name]
 
-    def reserve_running_windows(self, req, max_new_tokens: float) -> None:
-        """Commit to each window what running request ``req`` may still add to
-        it (`DemandPurpose.RUNNING`); this pass's forward rows are unchanged."""
+    def reserve_running_windows(self, reqs, max_new_tokens: Sequence[float]) -> None:
+        """Commit to each window what the running requests ``reqs`` may still
+        add to it, decoding ``max_new_tokens`` more each (`DemandPurpose.RUNNING`);
+        this pass's forward rows are unchanged."""
         if not self.windows:
             return
-        # Window retirement slides over the rows past those the request may not
-        # free (`window_dead_lo`): they are window rows it holds, as a cached prefix.
-        held = max(0, req.kv.kv_allocated_len - req.kv.window_dead_lo(self.page_size))
-        growth = self.window_tokens(
-            0,
-            max_new_tokens,
-            purpose=DemandPurpose.RUNNING,
-            cached_tokens=held,
-        )
-        # With mixed chunked prefill, `__init__` already counts the row this
-        # request decodes in this pass (`num_mixed_decode_tokens`), and the
-        # growth counts it again: one row per mixed decode in each window.
-        # Accepted, as the token sub-pool counts it twice alike: `total_offset`
-        # takes both the mixed decode tokens and each running request's
-        # estimated decode.
-        for name, tokens in growth.items():
-            self.window_offsets[name] += tokens
+        for req, new_tokens in zip(reqs, max_new_tokens):
+            growth = self.request_demand(
+                0,
+                new_tokens,
+                purpose=DemandPurpose.RUNNING,
+                held_window_tokens=self._retiring_window_rows(req),
+            )
+            # With mixed chunked prefill, `__init__` already counts the row this
+            # request decodes in this pass (`num_mixed_decode_tokens`), and the
+            # growth counts it again: one row per mixed decode in each window.
+            # Accepted, as the token sub-pool counts it twice alike: `total_offset`
+            # takes both the mixed decode tokens and each running request's
+            # estimated decode.
+            for name, tokens in growth.window_tokens.items():
+                self.window_offsets[name] += tokens
+
+    def _retiring_window_rows(self, req) -> Dict[str, int]:
+        """The rows running request ``req`` holds in each window that its
+        decode's retirement slides over: past those it may not free
+        (`window_dead_lo`) and those the window retired (its own cursor)."""
+        # None before its first decode step, which retires nothing
+        # (`ScheduleBatch.maybe_evict_swa`); under overlap its prefill may still
+        # run, and a prefix-sharing tree takes that prompt once it is done.
+        if req.decode_batch_idx == 0:
+            return {}
+        kv = req.kv
+        dead_lo = kv.window_dead_lo(self.page_size)
+        return {
+            name: max(
+                0, kv.kv_allocated_len - max(dead_lo, kv.get_evicted_seqlen(name))
+            )
+            for name, _ in self.windows
+        }
 
     def _load_back_demand(
         self,

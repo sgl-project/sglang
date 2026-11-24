@@ -12,7 +12,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache import prefill_budget
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.advance import retire_window_rows
 from sglang.srt.mem_cache.kv.alloc.demand import (
     DemandPurpose,
     KVDemand,
@@ -33,6 +35,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import (
 )
 from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -898,6 +901,74 @@ class TestPassPricingReuse(unittest.TestCase):
         allocator.free(held)
 
 
+class _RetiringWindows(RadixCache):
+    """A prefix-sharing tree whose windows the scheduler retires by its own
+    rule (`ScheduleBatch.maybe_evict_swa`), each on its own cursor, counting
+    the rows each window frees."""
+
+    swa_retain_window = None
+
+    def __init__(self, windows, *, page_size, rows):
+        self.disable = False
+        self.windows = dict(windows)
+        self.freed = dict.fromkeys(self.windows, 0)
+        self.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(rows).reshape(1, -1)
+        )
+        cache = self
+
+        class Storage:
+            # As a unified pool's storage: retire each window into its own frees.
+            def advance(self, req, frontier, *, window, window_sub_pool, **kwargs):
+                def free(ids, start_pos):
+                    cache.freed[window_sub_pool] += len(ids)
+
+                retire_window_rows(
+                    req,
+                    frontier,
+                    window_sub_pool=window_sub_pool,
+                    sliding_window_size=window,
+                    page_size=page_size,
+                    req_to_token_pool=cache.req_to_token_pool,
+                    token_to_kv_pool_allocator=None,
+                    supports_prefix_sharing=kwargs["shares_prefixes"],
+                    retain_floor=kwargs["retain_floor"],
+                    eviction_interval=kwargs["eviction_interval"],
+                    free_segment=free,
+                )
+
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            storage=Storage(),
+            page_size=page_size,
+            mamba_allocator=None,
+            request_allocators={},
+            window_pool_names=lambda: tuple(self.windows),
+            free_group_begin=lambda: None,
+            free_group_end=lambda: None,
+        )
+
+    def supports_swa(self):
+        return True
+
+    def supports_prefix_sharing(self):
+        return True
+
+    def window_lengths(self):
+        return tuple(self.windows.items())
+
+    def window_sub_pools(self):
+        return self.window_lengths()
+
+    def window_retention(self, req):
+        return tuple((name, window, None) for name, window in self.windows.items())
+
+    def window_retain_size(self, name):
+        return self.windows[name]
+
+    def window_checkpoint_interval(self):
+        return 0
+
+
 class TestRunningDecodeReservation(CustomTestCase):
     def test_cached_admission_reserves_fixed_length_decode(self):
         # 900 tokens remain free. A new 600-token prompt with 100 output tokens
@@ -1002,6 +1073,66 @@ class TestRunningDecodeReservation(CustomTestCase):
                 self.assertEqual(bool(next_pass.can_run_list), should_admit)
                 if not should_admit:
                     self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def test_running_windows_cover_what_retirement_still_adds(self):
+        # A request decodes under the overlap scheduler, retiring two windows of
+        # distinct sizes every `interval` rows. Each pass commits to each window
+        # at least the most rows it still adds and at most two pages more,
+        # wherever the window is in its retirement cycle: rows the request holds
+        # count, but not rows the window retired or the prompt the tree takes.
+        page, interval, prompt, new_tokens = 1, 8, 12, 96
+        windows = {"near": 8, "far": 20}
+        cache = _RetiringWindows(windows, page_size=page, rows=prompt + new_tokens)
+        req = SimpleNamespace(
+            seqlen=0, decode_batch_idx=0, kv=ReqKvInfo(req_pool_idx=0)
+        )
+        req.kv.set_row_len(prompt)
+        batch = ScheduleBatch(
+            reqs=[req],
+            tree_cache=cache,
+            req_to_token_pool=cache.req_to_token_pool,
+            token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+            forward_mode=ForwardMode.DECODE,
+            enable_overlap=True,
+        )
+
+        def held():
+            rows = -(-req.kv.kv_allocated_len // page) * page
+            return {name: rows - freed for name, freed in cache.freed.items()}
+
+        states, commitments = [held()], []
+        with (
+            envs.SGLANG_SWA_EVICTION_INTERVAL.override(interval),
+            envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+            patch.object(
+                prefill_budget,
+                "window_retirement",
+                return_value=WindowRetirement(0, 1, interval),
+            ),
+        ):
+            for step in range(new_tokens):
+                # The last forward's token is pending: `step` tokens are out, and
+                # the last step runs ahead of the finish the pending token brings.
+                budget = ChainPrefillBudget(cache.token_to_kv_pool_allocator, cache)
+                budget.reserve_running_windows(
+                    [req], max_new_tokens=[new_tokens - step]
+                )
+                commitments.append(dict(budget.window_offsets))
+                if step == 0:
+                    # The prefill's result comes in after the first pass.
+                    req.kv.protect_prefix(prompt)
+                req.decode_batch_idx = step
+                req.seqlen = req.kv.kv_allocated_len
+                batch.maybe_evict_swa()
+                req.kv.allocate_decode(1)
+                req.decode_batch_idx = step + 1
+                states.append(held())
+        for step, committed in enumerate(commitments):
+            for name in windows:
+                adds = max(s[name] for s in states[step:]) - states[step][name]
+                at = f"window {name}, pass {step}"
+                self.assertGreaterEqual(committed[name], adds, at)
+                self.assertLessEqual(committed[name] - adds, 2 * page, at)
 
 
 class TestFixedPrefillMemoryBudget(unittest.TestCase):
