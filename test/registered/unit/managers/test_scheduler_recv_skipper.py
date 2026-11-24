@@ -1,14 +1,20 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.srt.runtime_context import get_context
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import scheduler as scheduler_module  # noqa: E402
 from sglang.srt.managers.scheduler_components.recv_skipper import (  # noqa: E402
     SchedulerRecvSkipper,
+)
+from sglang.srt.managers.scheduler_input_blocker import (  # noqa: E402
+    SchedulerInputBlocker,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
@@ -84,6 +90,28 @@ class TestSchedulerRecvSkipper(CustomTestCase):
         self.assertEqual(derive([decode, idle, decode]), ForwardMode.DECODE)
         self.assertEqual(derive([verify, verify]), ForwardMode.TARGET_VERIFY)
         self.assertEqual(derive([verify, decode]), ForwardMode.DECODE)
+
+
+class TestSchedulerInputBlockerSwitch(CustomTestCase):
+    def test_colocated_batch_gen_accepts_the_declared_boolean_spellings(self):
+        """SGLANG_ENABLE_COLOCATED_BATCH_GEN is a declared boolean, so "yes" turns
+        the scheduler's input blocker on just as "1" does."""
+        _publish(self, 1)
+        for value, enabled in (("1", True), ("yes", True), ("0", False)):
+            with (
+                self.subTest(value=value),
+                envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.override(value),
+                get_parallel().override(attn_tp_rank=0),
+                patch.object(scheduler_module, "create_scheduler_watchdog"),
+            ):
+                scheduler = scheduler_module.Scheduler.__new__(
+                    scheduler_module.Scheduler
+                )
+                scheduler.init_watch_dog_memory_saver_input_blocker()
+                self.assertEqual(
+                    isinstance(scheduler.input_blocker, SchedulerInputBlocker),
+                    enabled,
+                )
 
 
 if __name__ == "__main__":
