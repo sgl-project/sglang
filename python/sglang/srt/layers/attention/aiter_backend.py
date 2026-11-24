@@ -5486,7 +5486,6 @@ class AiterAttnBackend(AttentionBackend):
             )
             if (
                 gqa_repeat > 1
-                and envs.SGLANG_ENABLE_AITER_FP8_ASM_PREFILL_GQA_REPEAT.get()
                 and is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
