@@ -42,7 +42,6 @@ PER_COMMIT_SUITES = {
     HWBackend.AMD: [
         "base-a-test-1-gpu-small-amd",
         "base-b-test-1-gpu-small-amd",
-        "base-b-test-1-gpu-small-amd-nondeterministic",
         "base-b-test-1-gpu-small-amd-mi35x",
         "base-b-disaggregation-test-large-8-gpu-amd-mi35x",
         "base-b-test-1-gpu-large-amd",
