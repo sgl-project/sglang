@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -137,6 +138,8 @@ def test_page_rows_pack_components_at_aligned_offsets():
 class CopyingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _generic_entry_pairs = MooncakeKVManager._generic_entry_pairs
+    _transfer_copies = MooncakeKVManager._transfer_copies
     is_mla_backend = False
     is_hybrid_mla_backend = False
     enable_custom_mem_pool = False
@@ -144,7 +147,17 @@ class CopyingKVManager:
     max_transfer_batch_indices = 0
     kv_args = SimpleNamespace(prefill_start_layer=0)
 
-    def _transfer_data(self, session, blocks):
+    def __init__(self, src_ptrs, dst_ptrs):
+        attach_mooncake_transport(
+            self,
+            engine_writes(self._copy),
+            kv=src_ptrs,
+            peer_kv=dst_ptrs,
+            sessions=("cpu-test",),
+        )
+
+    @staticmethod
+    def _copy(session, blocks):
         for src, dst, size in blocks:
             ctypes.memmove(dst, src, size)
         return 0
@@ -202,12 +215,11 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     assert channels[0][3] == [0, 1]
     for (sp, sl, si), (dp, dl, di), flat, src_ids, dst_ids in channels:
         assert si == di and sl == dl
+        manager = CopyingKVManager(sp, dp)
         assert (
             MooncakeKVManager._send_kvcache_generic(
-                CopyingKVManager(),
+                manager,
                 mooncake_session_id="cpu-test",
-                src_data_ptrs=sp,
-                dst_data_ptrs=dp,
                 item_lens=si,
                 prefill_data_indices=source_pages,
                 dst_data_indices=destination_pages,
@@ -215,6 +227,8 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
                 force_flat=flat,
                 src_layer_ids=src_ids,
                 dst_layer_ids=dst_ids,
+                src_keys=manager._local_keys.kv,
+                dst_keys=manager._peers["cpu-test"].keys.kv,
             )
             == 0
         )

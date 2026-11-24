@@ -11,8 +11,8 @@ from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.config import load_watermark_config
-from sglang.srt.sampling.watermarking.interface import merge_watermark_rows
 from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.sampling.watermarking.synthid import adapter
 from sglang.srt.sampling.watermarking.synthid.adapter import SynthIDRows
@@ -191,16 +191,6 @@ class TestSynthIDRequestPolicy(CustomTestCase):
             adapter.build_rows(requests[1:3], features=_features(), device="cpu")
         )
 
-        kept = rows.filter([3, 1], torch.tensor([3, 1]))
-        self.assertEqual(
-            (kept.indices.tolist(), kept.candidates_host), ([0], [True, False])
-        )
-        self.assertIsNone(rows.filter([1, 2], torch.tensor([1, 2])))
-        merged = merge_watermark_rows(None, kept, 2, 2)
-        self.assertEqual(merged.indices.tolist(), [2])
-        merged = merge_watermark_rows(kept, None, 2, 1)
-        self.assertEqual(merged.candidates_host, [True, False, False])
-
 
 class TestSynthIDEngine(CustomTestCase):
     def test_seed_payload_covers_prefill_rows_only(self):
@@ -314,7 +304,7 @@ class TestSynthIDEngine(CustomTestCase):
 
         accept_tokens = torch.tensor([[1, 0, 0], [4, 5, 0], [10, 11, 12]])
         accept_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
-        engine.append_accept_tokens(rows, req_pool_indices, accept_tokens, accept_lens)
+        verify.commit(VerifyAccept(tokens=accept_tokens, accept_lens=accept_lens))
         twin.state.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
         assert_synthid_state_equal(
             synthid_state(watermark.state), synthid_state(twin.state)
