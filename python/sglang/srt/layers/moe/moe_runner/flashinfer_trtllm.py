@@ -1219,11 +1219,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     flashinfer_mxfp8_quantize,
                 )
 
-                a_q, a_sf = flashinfer_mxfp8_quantize(
-                    hidden_states,
-                    False,
-                    batch_invariant=use_flashinfer_bi_mxfp8_quantizer(hidden_states),
-                )
+                if use_flashinfer_bi_mxfp8_quantizer(hidden_states):
+                    a_q, a_sf = flashinfer_mxfp8_quantize(
+                        hidden_states, False, batch_invariant=True
+                    )
+                else:
+                    a_q, a_sf = flashinfer_mxfp8_quantize(hidden_states, False)
                 # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
                 # [num_tokens, hidden_size // 32] (no transpose).
                 a_sf_t = (

@@ -2525,13 +2525,14 @@ def flashinfer_mxfp8_blockscaled_linear(
     if mode_on and not device_ok:
         _log_mxfp8_device_fallback(input_2d.device)
     if input_scale is None:
-        q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
-            input_2d,
-            is_sf_swizzled_layout=True,
-            alignment=32,
-            batch_invariant=device_ok
-            and k * input_2d.element_size() <= bi.MXFP8_QUANT_MAX_ROW_BYTES,
-        )
+        if device_ok and k * input_2d.element_size() <= bi.MXFP8_QUANT_MAX_ROW_BYTES:
+            q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
+                input_2d, is_sf_swizzled_layout=True, alignment=32, batch_invariant=True
+            )
+        else:
+            q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
+                input_2d, is_sf_swizzled_layout=True, alignment=32
+            )
     else:
         q_input = input_2d
         x_scale_u8 = input_scale

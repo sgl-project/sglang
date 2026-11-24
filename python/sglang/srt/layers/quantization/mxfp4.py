@@ -92,26 +92,32 @@ def _prepare_flashinfer_mxfp8_activations(
 
         prepared = route_quant_handoff.take(x)
 
+    # The deterministic mode runs FlashInfer's batch-invariant kernel (fp32 too).
+    batch_invariant = use_flashinfer_bi_mxfp8_quantizer(x)
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
     # FlashInfer handles SM107 inputs unless K3 reaches this fallback with an
     # exact-width FP32 tensor, which its quantizer rejects. Use SGLang's compatible
     # MXFP8/UE8M0 quantizer for that case; padded inputs still need alignment.
-    # The deterministic mode runs FlashInfer's batch-invariant kernel (fp32 too).
     elif (
         x.shape[-1] != hidden_size
         or (_is_sm107_supported() and x.dtype != torch.float32)
-        or (batch_invariant := use_flashinfer_bi_mxfp8_quantizer(x))
+        or batch_invariant
     ):
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_quantize,
         )
 
         prepared_packed_topk = None
-        x_quant, x_scale = flashinfer_mxfp8_quantize(
-            x, False, alignment=hidden_size, batch_invariant=batch_invariant
-        )
+        if batch_invariant:
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
+                x, False, alignment=hidden_size, batch_invariant=True
+            )
+        else:
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
+                x, False, alignment=hidden_size
+            )
         x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         from sglang.kernels.ops.quantization.per_token_group_quant import (
