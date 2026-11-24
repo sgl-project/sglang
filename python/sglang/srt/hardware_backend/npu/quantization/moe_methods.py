@@ -647,12 +647,12 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Process weight
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        transposed = weight.data.transpose(1, 2).contiguous()
-        if prepare_mega_moe_arch22_weights(layer, weight_prefix, transposed):
+        weight.data = weight.data.transpose(1, 2).contiguous()
+        if prepare_mega_moe_arch22_weights(layer, weight_prefix, weight.data):
             # fused_op owns the per-expert list; the grouped-matmul copy is dead.
             release_mega_moe_stacked_weight(layer, weight_prefix)
         else:
-            weight.data = npu_format_cast(transposed)
+            weight.data = npu_format_cast(weight.data)
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
