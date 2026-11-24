@@ -1,8 +1,8 @@
 name: Build and Push CI Docker Images
 
 # Publishes docker/ci.Dockerfile, the job container for externally managed CUDA
-# runners, next to the dev image: lmsysorg/sglang:dev-ci-<gpu family> plus a dated
-# nightly-dev-ci-<gpu family>-<date>-<sha> tag. Nightly builds the scheduled defaults.
+# runners, to its own repo: lmsysorg/sglang-ci:<gpu family> plus a dated
+# nightly-<gpu family>-<date>-<sha> tag. Nightly builds the scheduled defaults.
 
 on:
   workflow_dispatch:
@@ -26,13 +26,13 @@ on:
         required: false
         default: "13.0.3"
       tag:
-        description: "Custom tag suffix, e.g. 'my-test' -> dev-ci-blackwell-my-test. Empty publishes the rolling and nightly tags."
+        description: "Custom tag suffix, e.g. 'my-test' -> blackwell-my-test. Empty publishes the rolling and nightly tags."
         required: false
         default: ""
       image_repo:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
-        default: "lmsysorg/sglang"
+        default: "lmsysorg/sglang-ci"
   schedule:
     # After the 00:00 UTC dev image, so both track the same day of main.
     - cron: "0 3 * * *"
@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_REPO: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+  IMAGE_REPO: ${{ inputs.image_repo || 'lmsysorg/sglang-ci' }}
   GPU_FAMILY: ${{ inputs.gpu_family || 'blackwell' }}
 
 jobs:
@@ -158,7 +158,7 @@ jobs:
           for f in /tmp/digests/*; do
             SOURCES+=("${IMAGE_REPO}@$(cat "${f}")")
           done
-          BASE="dev-ci-${GPU_FAMILY}"
+          BASE="${GPU_FAMILY}"
           if [ -n "${TAG_SUFFIX}" ]; then
             TAGS=(-t "${IMAGE_REPO}:${BASE}-${TAG_SUFFIX}")
           else
@@ -172,6 +172,6 @@ jobs:
     if: ${{ !inputs.tag }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev-ci-blackwell", "nightly-dev-ci-hopper"]'
-      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+      tag_prefixes: '["nightly-blackwell", "nightly-hopper"]'
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang-ci' }}
     secrets: inherit
