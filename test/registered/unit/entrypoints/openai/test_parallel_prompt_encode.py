@@ -806,7 +806,7 @@ class TestRenderedPrompt(_EncodeCase):
     def test_ids_equal_one_encode_of_the_prompt(self):
         for text in _EDGE_TEXTS + ["".join(s) for s in _fuzz_segments()]:
             self._assert_rendered_matches(text)
-        self.assertIsNot(ppe._rendered_checks(self.tokenizer), False)
+        self.assertFalse(ppe._rendered_checks(self.tokenizer).failed)
 
     def test_earlier_turns_are_encoded_once(self):
         history = "hello world " * 40
@@ -867,11 +867,133 @@ class TestRenderedPrompt(_EncodeCase):
             self.assertLogs(ppe.logger, "ERROR"),
         ):
             self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
-        self.assertIs(ppe._rendered_checks(self.tokenizer), False)
+        self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
         with unittest.mock.patch.object(
             ppe, "encode_prompt_segments", side_effect=AssertionError("split taken")
         ):
             self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
+
+    def _split_returning_wrong_ids_for(self, wrong, entered=None, proceed=None):
+        """`encode_prompt_segments` that returns [0] for the prompt `wrong`,
+        after signalling `entered` and waiting for `proceed`."""
+        split = ppe.encode_prompt_segments
+
+        def fake(tokenizer, segments, *args):
+            if "".join(segments) != wrong:
+                return split(tokenizer, segments, *args)
+            if entered is not None:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return [0]
+
+        return unittest.mock.patch.object(
+            ppe, "encode_prompt_segments", side_effect=fake
+        )
+
+    def test_a_concurrent_pass_does_not_overwrite_a_mismatch(self):
+        good, bad = "<|user|>good<|assistant|>", "<|user|>bad<|assistant|>"
+        ppe.encode_rendered_prompt(self.tokenizer, "<|user|>warm up")  # 1 passed
+        whole = self.tokenizer.encode
+        entered, proceed = threading.Event(), threading.Event()
+
+        def slow_whole_encode(text, **kwargs):
+            if text == good:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return whole(text, **kwargs)
+
+        results = {}
+        with (
+            unittest.mock.patch.object(
+                self.tokenizer, "encode", side_effect=slow_whole_encode
+            ),
+            self._split_returning_wrong_ids_for(bad),
+            self.assertLogs(ppe.logger, "ERROR"),
+        ):
+            # `good` is being checked when `bad` finds its mismatch.
+            thread = threading.Thread(
+                target=lambda: results.update(
+                    good=ppe.encode_rendered_prompt(self.tokenizer, good)
+                )
+            )
+            thread.start()
+            self.assertTrue(entered.wait(10))
+            results["bad"] = ppe.encode_rendered_prompt(self.tokenizer, bad)
+            proceed.set()
+            thread.join()
+        self.assertEqual(results, {"good": whole(good), "bad": whole(bad)})
+        self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
+        with unittest.mock.patch.object(
+            ppe, "encode_prompt_segments", side_effect=AssertionError("split taken")
+        ):
+            self.assertEqual(
+                ppe.encode_rendered_prompt(self.tokenizer, good), whole(good)
+            )
+
+    def test_prompts_in_flight_when_a_mismatch_is_found_return_the_whole_encode(self):
+        late, bad = "<|user|>late<|assistant|>", "<|user|>bad<|assistant|>"
+        ppe.encode_rendered_prompt(self.tokenizer, "<|user|>warm up")  # 1 passed
+        entered, proceed = threading.Event(), threading.Event()
+        results = {}
+        with self.assertLogs(ppe.logger, "ERROR"):
+            # `late` is split (wrongly) before `bad` is checked and returns after.
+            with self._split_returning_wrong_ids_for(late, entered, proceed):
+                thread = threading.Thread(
+                    target=lambda: results.update(
+                        late=ppe.encode_rendered_prompt(self.tokenizer, late)
+                    )
+                )
+                thread.start()
+                self.assertTrue(entered.wait(10))
+            with self._split_returning_wrong_ids_for(bad):
+                results["bad"] = ppe.encode_rendered_prompt(self.tokenizer, bad)
+            proceed.set()
+            thread.join()
+        self.assertEqual(
+            results,
+            {"late": self.tokenizer.encode(late), "bad": self.tokenizer.encode(bad)},
+        )
+
+    def test_prompts_arriving_while_a_check_runs_are_checked_too(self):
+        first, bad = "<|user|>first<|assistant|>", "<|user|>bad<|assistant|>"
+        whole = self.tokenizer.encode
+        for i in range(ppe._RENDERED_PROMPT_CHECKS - 1):
+            ppe.encode_rendered_prompt(self.tokenizer, f"<|user|>warm up {i}")
+        entered, proceed = threading.Event(), threading.Event()
+
+        def slow_whole_encode(text, **kwargs):
+            if text == first:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return whole(text, **kwargs)
+
+        results = {}
+        with (
+            unittest.mock.patch.object(
+                self.tokenizer, "encode", side_effect=slow_whole_encode
+            ),
+            self._split_returning_wrong_ids_for(bad),
+            self.assertLogs(ppe.logger, "ERROR"),
+        ):
+            thread = threading.Thread(
+                target=lambda: results.update(
+                    first=ppe.encode_rendered_prompt(self.tokenizer, first)
+                )
+            )
+            thread.start()
+            self.assertTrue(entered.wait(10))
+            # Enough prompts have now passed, but `first` is still being
+            # checked: `bad` cannot skip its own check.
+            ppe.encode_rendered_prompt(self.tokenizer, "<|user|>second")
+            self.assertEqual(
+                ppe._rendered_checks(self.tokenizer).passed,
+                ppe._RENDERED_PROMPT_CHECKS,
+            )
+            results["bad"] = ppe.encode_rendered_prompt(self.tokenizer, bad)
+            proceed.set()
+            thread.join()
+        self.assertEqual(results, {"first": whole(first), "bad": whole(bad)})
+        self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
 
     def test_gates_use_parallel_prompt_encode(self):
         text = "<|user|>" + "hello world " * 50 + "<|assistant|>"

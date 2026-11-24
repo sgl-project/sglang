@@ -480,37 +480,55 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=N
     return encoder.encode(segments, cache_salt)
 
 
-# Per tokenizer: prompts checked against a whole encode, or False after a mismatch.
+class _RenderedPromptChecks:
+    """Per tokenizer: prompts that passed the check against a whole encode,
+    checks still running, and whether one found a mismatch (terminal)."""
+
+    def __init__(self):
+        self.passed = 0
+        self.pending = 0
+        self.failed = False
+
+
 _rendered_prompt_checks = weakref.WeakKeyDictionary()
+_rendered_prompt_checks_lock = threading.Lock()
 _RENDERED_PROMPT_CHECKS = 2
 
 
 def _rendered_checks(tokenizer):
+    """The tokenizer's check state; call with the lock held."""
     try:
-        return _rendered_prompt_checks.get(tokenizer, 0)
+        state = _rendered_prompt_checks.get(tokenizer)
+        if state is None:
+            state = _rendered_prompt_checks[tokenizer] = _RenderedPromptChecks()
+        return state
     except TypeError:
-        return 0
+        # Nothing can be remembered for it, so every prompt is checked.
+        return _RenderedPromptChecks()
 
 
-def _set_rendered_checks(tokenizer, value):
+def _rendered_split_failed(tokenizer):
     try:
-        _rendered_prompt_checks[tokenizer] = value
+        state = _rendered_prompt_checks.get(tokenizer)
     except TypeError:
-        pass
+        return False
+    return state is not None and state.failed
 
 
 def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None):
     """Encode a rendered chat prompt, splitting it at added (special) tokens so
     the text between them goes through the segment cache; earlier turns of a
-    conversation are then encoded once. The first prompts per tokenizer are
-    checked against a whole encode, and a mismatch disables the split."""
+    conversation are then encoded once. The first prompts per tokenizer, and
+    any prompt that arrives while one of them is still being checked, are
+    checked against a whole encode and return it; a mismatch disables the
+    split for good, also for prompts already split but not yet returned."""
     encode_kwargs = encode_kwargs or {}
     plan = None
     if (
         envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
         and isinstance(text, str)
         and len(text) >= envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
-        and _rendered_checks(tokenizer) is not False
+        and not _rendered_split_failed(tokenizer)
     ):
         plan = _plan_for(tokenizer)
     if plan is None or plan[2] is None:
@@ -522,15 +540,33 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
         pos = m.end()
     segments.append(text[pos:])
     ids = encode_prompt_segments(tokenizer, segments, encode_kwargs, cache_salt)
-    checks = _rendered_checks(tokenizer)
-    if checks is not False and checks < _RENDERED_PROMPT_CHECKS:
+    with _rendered_prompt_checks_lock:
+        state = _rendered_checks(tokenizer)
+        failed = state.failed
+        # Unchecked only once enough prompts passed and no check is running:
+        # a mismatch a running check finds then reaches every prompt that has
+        # not returned yet.
+        check = not failed and (state.pending or state.passed < _RENDERED_PROMPT_CHECKS)
+        if check:
+            state.pending += 1
+    if failed:
+        return tokenizer.encode(text, **encode_kwargs)
+    if not check:
+        return ids
+    matched = None
+    try:
         expected = tokenizer.encode(text, **encode_kwargs)
-        if list(ids) != list(expected):
-            logger.error(
-                "encode_rendered_prompt: segment-cached ids differ from a whole encode for %s; using the whole encode from now on.",
-                type(tokenizer).__name__,
-            )
-            _set_rendered_checks(tokenizer, False)
-            return expected
-        _set_rendered_checks(tokenizer, checks + 1)
-    return ids
+        matched = list(ids) == list(expected)
+    finally:
+        with _rendered_prompt_checks_lock:
+            state.pending -= 1
+            if matched:
+                state.passed += 1
+            elif matched is False:
+                state.failed = True
+    if not matched:
+        logger.error(
+            "encode_rendered_prompt: segment-cached ids differ from a whole encode for %s; using the whole encode from now on.",
+            type(tokenizer).__name__,
+        )
+    return expected
