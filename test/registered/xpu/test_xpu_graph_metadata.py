@@ -324,9 +324,12 @@ class TestXPUGraphMetadata(CustomTestCase):
         self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
         self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
 
-        # Idempotent unregister on empty finalizers does not falsely crash or reset
+        # Idempotent unregister on empty finalizers does not falsely crash or reset non-empty cache
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"]["test_key2"] = torch.empty(1)
         unregister_graph_scratchpad_owner(owner2)
         unregister_graph_scratchpad_owner(DummyOwner())
+        self.assertEqual(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 1)
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"].clear()
 
         # Implicit GC of last owner (without explicit unregister) also triggers reset
         owner3 = DummyOwner()
