@@ -503,10 +503,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         else:
-            if hybrid_gdn_config(runner.model_config) is not None:
-                from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
-                    AscendGDNAttnBackend as GDNAttnBackend,
-                )
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                AscendGDNAttnBackend as GDNAttnBackend,
+            )
             from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
                 AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
             )
