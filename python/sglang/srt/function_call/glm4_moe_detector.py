@@ -487,7 +487,7 @@ class Glm4MoeDetector(BaseFormatDetector):
             if value.lstrip().startswith(('"', "'")):
                 parsed, _ = parse_arguments(value, "string")
                 if isinstance(parsed, str):
-                    return json.dumps(parsed, ensure_ascii=False)
+                    return json.dumps(parsed)
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
@@ -619,11 +619,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                         # A quoted JSON string must be parsed as a whole, just like
                         # the non-streaming path. Plain strings still stream as bytes.
                         if not self._value_started and not self._defer_quoted_value:
-                            candidate = self._current_value + content
-                            if candidate.lstrip().startswith(('"', "'")):
+                            if content.lstrip().startswith(('"', "'")):
                                 self._defer_quoted_value = True
-                            elif not candidate.strip():
-                                self._current_value = candidate
+                            elif not content.strip():
+                                self._current_value += content
                                 self._xml_tag_buffer = self._xml_tag_buffer[
                                     content_end:
                                 ]
@@ -879,7 +878,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                     arguments[arg_key] = parsed_value
                 elif isinstance(parsed_value, (dict, list)):
                     # If parsed as dict/list but schema says string, convert to JSON string
-                    arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
+                    arguments[arg_key] = json.dumps(parsed_value)
                 else:
                     arguments[arg_key] = str(parsed_value)
             elif arg_type is None:

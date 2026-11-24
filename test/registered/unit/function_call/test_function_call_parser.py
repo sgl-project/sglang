@@ -6260,6 +6260,132 @@ class TestGetSchemaProperties(unittest.TestCase):
         self.assertEqual(get_schema_properties({"oneOf": "not-a-list"}), {})
 
 
+class _ScanString(str):
+    def __new__(cls, value, scanned):
+        instance = super().__new__(cls, value)
+        instance.scanned = scanned
+        return instance
+
+    def _wrap(self, value):
+        return _ScanString(value, self.scanned)
+
+    def __add__(self, other):
+        return _ScanString(str(self) + other, self.scanned)
+
+    def __radd__(self, other):
+        return _ScanString(other + str(self), self.scanned)
+
+    def __getitem__(self, key):
+        return self._wrap(super().__getitem__(key))
+
+    def strip(self, *args):
+        self.scanned.append(len(self))
+        return self._wrap(super().strip(*args))
+
+    def lstrip(self, *args):
+        self.scanned.append(len(self))
+        return self._wrap(super().lstrip(*args))
+
+
+class TestGlmStreamingReviewRegressions(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="inspect",
+                    parameters={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+
+    def test_leading_space_classification_scans_only_new_content(self):
+        """Long leading whitespace must not be rescanned once per streamed character."""
+        size = 4096
+        for detector_type, separator in (
+            (Glm4MoeDetector, "\n"),
+            (Glm47MoeDetector, ""),
+        ):
+            with self.subTest(detector=detector_type.__name__):
+                detector = detector_type()
+                detector.parse_streaming_increment(
+                    "<tool_call>inspect"
+                    + separator
+                    + "<arg_key>value</arg_key><arg_value>",
+                    self.tools,
+                )
+                scanned = []
+                detector._current_value = _ScanString("", scanned)
+                detector._xml_tag_buffer = _ScanString("", scanned)
+                detector._process_xml_to_json_streaming(
+                    _ScanString(" " * size, scanned), "inspect", self.tools
+                )
+                self.assertEqual(detector._current_value, " " * size)
+                self.assertLessEqual(sum(scanned), size * 8)
+
+    def test_streamed_json_strings_never_contain_raw_surrogates(self):
+        """Escaped lone surrogates must remain escaped in every SSE argument chunk."""
+        cases = (
+            (Glm4MoeDetector, "typed"),
+            (Glm47MoeDetector, "typed"),
+            (Glm47MoeDetector, "auto"),
+            (Glm47MoeDetector, "buffered"),
+        )
+        fields = {
+            "typed": {"type": "string"},
+            "auto": {},
+            "buffered": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+        }
+        values = ((r'"\uD800"', json.loads(r'"\uD800"')), ('"😀"', "😀"))
+        for detector_type, field_kind in cases:
+            tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name="inspect",
+                        parameters={
+                            "type": "object",
+                            "properties": {"value": fields[field_kind]},
+                        },
+                    ),
+                )
+            ]
+            separator = "\n" if detector_type is Glm4MoeDetector else ""
+            for raw, expected in values:
+                text = (
+                    "<tool_call>inspect"
+                    + separator
+                    + "<arg_key>value</arg_key><arg_value>"
+                    + raw
+                    + "</arg_value></tool_call>"
+                )
+                for chunk_size in (1, 7, len(text)):
+                    with self.subTest(
+                        detector=detector_type.__name__,
+                        field=field_kind,
+                        raw=raw,
+                        chunk_size=chunk_size,
+                    ):
+                        detector = detector_type()
+                        calls = []
+                        for offset in range(0, len(text), chunk_size):
+                            calls.extend(
+                                detector.parse_streaming_increment(
+                                    text[offset : offset + chunk_size], tools
+                                ).calls
+                            )
+                        parameters = "".join(call.parameters for call in calls)
+                        self.assertFalse(
+                            any(0xD800 <= ord(char) <= 0xDFFF for char in parameters),
+                            "stream contains a raw surrogate code point",
+                        )
+                        parameters.encode("utf-8")
+                        self.assertEqual(json.loads(parameters), {"value": expected})
+
+
 class TestTopLevelCompositeToolSchema(unittest.TestCase):
     """Parsers must resolve argument types when tool ``parameters`` declares
     its properties under a top-level anyOf/oneOf/allOf instead of directly."""
