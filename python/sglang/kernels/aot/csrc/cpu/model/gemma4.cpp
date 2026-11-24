@@ -4,6 +4,79 @@
 namespace {
 
 template <typename scalar_t>
+void rmsnorm_residual_scalar_row(
+    scalar_t* out,
+    const scalar_t* input,
+    const scalar_t* weight,
+    const scalar_t* residual,
+    int size,
+    float scalar,
+    float eps) {
+  using fVec = at::vec::Vectorized<float>;
+  using bVec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = bVec::size();
+
+  fVec sum(0.f);
+  int d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [x_fvec0, x_fvec1] = load_float_vec2(input + d);
+    sum += x_fvec0 * x_fvec0;
+    sum += x_fvec1 * x_fvec1;
+  }
+  float sum_val = vec_reduce_sum(sum);
+#pragma GCC unroll 4
+  for (; d < size; ++d) {
+    const float x_val = static_cast<float>(input[d]);
+    sum_val += x_val * x_val;
+  }
+  const float inv = 1.f / std::sqrt(sum_val / size + eps);
+  const fVec inv_fvec(inv), s_fvec(scalar);
+
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [x_fvec0, x_fvec1] = load_float_vec2(input + d);
+    auto [w_fvec0, w_fvec1] = load_float_vec2(weight + d);
+    auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
+    const fVec out_fvec0 = (x_fvec0 * inv_fvec * w_fvec0 + r_fvec0) * s_fvec;
+    const fVec out_fvec1 = (x_fvec1 * inv_fvec * w_fvec1 + r_fvec1) * s_fvec;
+    store_float_vec2(out + d, out_fvec0, out_fvec1);
+  }
+#pragma GCC unroll 4
+  for (; d < size; ++d) {
+    const float norm_val = static_cast<float>(input[d]) * inv * static_cast<float>(weight[d]);
+    const float out_val = (norm_val + static_cast<float>(residual[d])) * scalar;
+    out[d] = static_cast<scalar_t>(out_val);
+  }
+}
+
+template <typename scalar_t>
+void gemma_rmsnorm_residual_scalar_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ residual,
+    int64_t num_tokens,
+    int64_t hidden_size,
+    int64_t x_strideT,
+    int64_t res_strideT,
+    float scalar,
+    float eps) {
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      rmsnorm_residual_scalar_row(
+          out + row * hidden_size,
+          input + row * x_strideT,
+          weight,
+          residual + row * res_strideT,
+          hidden_size,
+          scalar,
+          eps);
+    }
+  });
+}
+
+template <typename scalar_t>
 void fused_rmsnorm_residual_scalar_row(
     scalar_t* out,
     float* merged,
@@ -129,6 +202,42 @@ void gemma_dual_rmsnorm_residual_scalar_kernel_impl(
 }
 
 }  // anonymous namespace
+
+// output = (RMSNorm(input, weight, eps) + residual) * scalar
+// input, residual: [num_tokens, hidden_size]
+// weight: [hidden_size]
+// scalar: [1]
+at::Tensor gemma_rmsnorm_residual_scalar_cpu(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& residual,
+    const at::Tensor& scalar,
+    double eps) {
+  CHECK_DIM(2, input);
+  const auto st = input.scalar_type();
+  const int64_t num_tokens = input.size(0);
+  const int64_t hidden_size = input.size(1);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT_SHAPE_DTYPE<true>(residual, input.sizes(), st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(scalar, {1}, st);
+
+  at::Tensor output = at::empty(input.sizes(), input.options());
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "gemma_rmsnorm_residual_scalar_cpu", [&] {
+    gemma_rmsnorm_residual_scalar_kernel_impl(
+        output.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        weight.data_ptr<scalar_t>(),
+        residual.data_ptr<scalar_t>(),
+        num_tokens,
+        hidden_size,
+        input.stride(0),
+        residual.stride(0),
+        static_cast<float>(*scalar.data_ptr<scalar_t>()),
+        eps);
+  });
+  return output;
+}
 
 // merged = RMSNorm(x1, weight1, eps1) + RMSNorm(x2, weight2, eps2)
 // output = (RMSNorm(merged, weight3, eps3) + residual) * scalar

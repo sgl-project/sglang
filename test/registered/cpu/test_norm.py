@@ -150,6 +150,30 @@ class TestNorm:
         assert output.data_ptr() != x.data_ptr()
 
     @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("shape", [(0, 33), (1, 7), (5, 65)])
+    def test_gemma_rmsnorm_residual_scalar(self, shape, dtype):
+        generator = torch.Generator().manual_seed(1234)
+        rows, hidden_size = shape
+        x, residual = (
+            torch.randn(
+                (rows, hidden_size + padding), dtype=dtype, generator=generator
+            )[:, :hidden_size]
+            for padding in (3, 5)
+        )
+        weight = torch.randn(hidden_size, dtype=dtype, generator=generator)
+        scalar = torch.tensor([0.625], dtype=dtype)
+        epsilon = 0.125
+        norm = self._norm(x.float(), epsilon) * weight.float()
+        expected = ((norm + residual.float()) * scalar.float()).to(dtype)
+
+        actual = torch.ops.sgl_kernel.gemma_rmsnorm_residual_scalar_cpu(
+            x, weight, residual, scalar, epsilon
+        )
+        torch.testing.assert_close(
+            actual, expected, atol=precision[dtype], rtol=precision[dtype]
+        )
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
     @pytest.mark.parametrize("shape", [(0, 33), (1, 33), (5, 2048)])
     def test_gemma_dual_rmsnorm_residual_scalar(self, shape, dtype):
         generator = torch.Generator().manual_seed(1234)

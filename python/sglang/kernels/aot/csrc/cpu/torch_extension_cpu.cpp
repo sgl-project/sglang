@@ -608,6 +608,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
 std::tuple<at::Tensor, at::Tensor>
 fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni);
 
+at::Tensor gemma_rmsnorm_residual_scalar_cpu(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& residual,
+    const at::Tensor& scalar,
+    double eps);
+
 at::Tensor gemma_dual_rmsnorm_residual_scalar_cpu(
     const at::Tensor& x1,
     const at::Tensor& weight1,
@@ -1058,6 +1065,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_input_proj_cpu(Tensor hidden_states, Tensor qkvz_weight, Tensor ba_weight, bool is_vnni) -> (Tensor, "
       "Tensor)");
   m.impl("fused_input_proj_cpu", torch::kCPU, &fused_input_proj_cpu);
+
+  m.def(
+      "gemma_rmsnorm_residual_scalar_cpu(Tensor input, Tensor weight, Tensor residual, Tensor scalar, float eps) -> "
+      "Tensor");
+  m.impl("gemma_rmsnorm_residual_scalar_cpu", torch::kCPU, &gemma_rmsnorm_residual_scalar_cpu);
 
   m.def(
       "gemma_dual_rmsnorm_residual_scalar_cpu(Tensor x1, Tensor weight1, Tensor x2, Tensor weight2, "
