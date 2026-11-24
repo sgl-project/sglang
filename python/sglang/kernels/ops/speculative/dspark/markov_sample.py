@@ -263,11 +263,6 @@ class MarkovSampleStep:
     def execute(cls, **kwargs) -> torch.Tensor:
         if inputs_on_cuda(**kwargs):
             if _is_npu:
-                # Ascend's operator only handles the unmodified logits path.
-                softcap = kwargs.pop("softcap", None)
-                vocab_limit = kwargs.pop("vocab_limit", None)
-                if softcap is not None or vocab_limit is not None:
-                    return cls.torch(softcap=softcap, vocab_limit=vocab_limit, **kwargs)
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
                 return markov_sample_step_triton(**kwargs)
@@ -425,7 +420,7 @@ class MarkovSampleStep:
             value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
         if vocab_limit is not None:
             columns = vocab_start + torch.arange(value.shape[1], device=value.device)
-            value.masked_fill_(columns >= vocab_limit, float("-inf"))
+            value[:, columns >= vocab_limit] = float("-inf")
         if gather_logits is not None and logits_out is not None:
             full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
             return cls.torch(

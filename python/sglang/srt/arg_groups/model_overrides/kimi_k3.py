@@ -185,9 +185,10 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     platform = get_platform()
     overrides = {"decode_state_free_radix_default": True}
     if cfg.dcp_size > 1:
-        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
+        supported = ("DFLASH",) if platform.is_npu else ("DSPARK", "DFLASH")
+        if cfg.speculative_algorithm not in (None, *supported):
             raise ValueError(
-                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
+                f"Kimi-K3.1 DCP supports only {', '.join(supported)} speculative decoding."
             )
         pd_backends = ("mooncake", "mori") if platform.is_gfx95 else ("mooncake",)
         if (

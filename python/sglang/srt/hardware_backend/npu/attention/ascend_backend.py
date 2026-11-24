@@ -475,7 +475,7 @@ class AscendAttnBackend(AttentionBackend):
             and model_runner.spec_algorithm.is_dspark()
         )
         self.use_flash_mla = (
-            dense_mla
+            self.use_mla
             and not self.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
             and get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
