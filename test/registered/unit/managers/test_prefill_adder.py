@@ -2887,22 +2887,29 @@ class TestPrefillAdder(CustomTestCase):
     def test_delay_verdict_does_not_hold_back_requests_when_pass_prefills(self):
         """A delay verdict only saves a forward when nothing prefills this pass.
         A continuing chunk runs regardless, so a queued request that fits must
-        join it instead of sitting out the delayer's passes."""
-        delayer = _RecordingDelayer(allow=False)
-        adder = self._create_delayer_adder(
-            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
-        )
-        chunk = self._create_delayer_req(200, rid="chunk")
-        self.assertIsNone(adder.add_chunked_req(chunk))
-        req = self._create_delayer_req(50, rid="short")
+        join it instead of sitting out the delayer's passes. An ignore_eos request
+        without a radix cache takes its own admission path and must join too."""
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                self.mock_tree_cache.disable = ignore_eos
+                delayer = _RecordingDelayer(allow=False)
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
+                )
+                chunk = self._create_delayer_req(200, rid="chunk")
+                self.assertIsNone(adder.add_chunked_req(chunk))
+                req = self._create_delayer_req(50, rid="short")
+                req.sampling_params.ignore_eos = ignore_eos
+                for r in (chunk, req):
+                    r.origin_input_ids = r.full_untruncated_fill_ids
 
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
 
-        self.assertEqual(result, AddReqResult.CONTINUE)
-        self.assertEqual(adder.can_run_list, [chunk, req])
-        self.assertEqual(delayer.calls, [True])
+                self.assertEqual(result, AddReqResult.CONTINUE)
+                self.assertEqual(adder.can_run_list, [chunk, req])
+                self.assertEqual(delayer.calls, [True])
 
     def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
         self.mock_token_allocator.available_size.return_value = available_tokens
