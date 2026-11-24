@@ -2906,18 +2906,6 @@ def cli_main():
         help="JSON path for accuracy results (default: accuracy_<dataset>.json).",
     )
     parser.add_argument(
-        "--accuracy-num-threads",
-        type=int,
-        default=None,
-        help="Thread count for accuracy eval (default: max_concurrency or 64).",
-    )
-    parser.add_argument(
-        "--accuracy-max-tokens",
-        type=int,
-        default=2048,
-        help="Max generation tokens for accuracy evaluation.",
-    )
-    parser.add_argument(
         "--hf-endpoint",
         type=str,
         default=None,
