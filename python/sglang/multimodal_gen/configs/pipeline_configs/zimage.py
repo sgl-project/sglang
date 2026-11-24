@@ -118,6 +118,9 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             or sp_size != get_ulysses_parallel_world_size()
             or torch.is_grad_enabled()
             or torch.compiler.is_compiling()
+            # A trainer replays the saved denoising env with gradients enabled,
+            # where the model keeps the padded layout.
+            or (batch.rollout and batch.rollout_return_denoising_env)
             or batch.enable_teacache
             or batch.enable_spectrum
             or (

@@ -9,8 +9,12 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    _release_device_state,
+)
 from sglang.multimodal_gen.runtime.models.dits.zimage import (
     ZImageAttention,
+    ZImageHeadPaddingWorkspace,
     ZImageTransformer2DModel,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -105,6 +109,12 @@ class TestZImageSPPadding(CustomTestCase):
             self.assertFalse(self._plan()["image_sp_unpadded"])
         with torch.enable_grad():
             self.assertFalse(self._plan()["image_sp_unpadded"])
+        self.batch.rollout = True
+        self.batch.rollout_return_denoising_env = True
+        self.assertFalse(self._plan()["image_sp_unpadded"])
+        self.batch.rollout_return_denoising_env = False
+        self.assertTrue(self._plan()["image_sp_unpadded"])
+        self.batch.rollout = False
         for name in ("enable_teacache", "enable_spectrum", "enable_cache_dit"):
             setattr(self.batch, name, True)
             self.assertFalse(self._plan()["image_sp_unpadded"])
@@ -296,7 +306,7 @@ class TestZImageSPPadding(CustomTestCase):
     def test_head_padding_reuse_and_functional_gradients(self):
         attention = ZImageAttention.__new__(ZImageAttention)
         torch.nn.Module.__init__(attention)
-        attention._head_padding_buffers = [None, None, None]
+        attention._head_padding_workspace = ZImageHeadPaddingWorkspace()
         tensor = torch.arange(2 * 3 * 30 * 4).reshape(2, 3, 30, 4).float()
         padded = attention._pad_heads(tensor, slot=0, pad_heads=2, reuse=True)
         self.assertEqual(padded.shape, (2, 3, 32, 4))
@@ -315,7 +325,33 @@ class TestZImageSPPadding(CustomTestCase):
             torch.testing.assert_close(
                 source.grad, torch.ones_like(source), rtol=0, atol=0
             )
-        self.assertIs(attention._head_padding_buffers[0], resized)
+        self.assertIs(attention._head_padding_workspace._buffers[0], resized)
+
+    def test_head_padding_workspace_is_shared_and_released(self):
+        model = ZImageTransformer2DModel.__new__(ZImageTransformer2DModel)
+        torch.nn.Module.__init__(model)
+
+        def stack(count):
+            blocks = torch.nn.ModuleList()
+            for _ in range(count):
+                block = torch.nn.Module()
+                block.attention = ZImageAttention.__new__(ZImageAttention)
+                torch.nn.Module.__init__(block.attention)
+                blocks.append(block)
+            return blocks
+
+        model.noise_refiner, model.layers = stack(2), stack(3)
+        model._share_head_padding_workspaces()
+        tensor = torch.ones(1, 4, 30, 2)
+        first, last = model.layers[0].attention, model.layers[-1].attention
+        padded = first._pad_heads(tensor, slot=1, pad_heads=2, reuse=True)
+        self.assertIs(last._pad_heads(tensor, slot=1, pad_heads=2, reuse=True), padded)
+        refiner = model.noise_refiner[0].attention
+        refiner._pad_heads(tensor[:, :2], slot=1, pad_heads=2, reuse=True)
+        self.assertIs(first._pad_heads(tensor, slot=1, pad_heads=2, reuse=True), padded)
+        _release_device_state(model)
+        for workspace in model._head_padding_workspaces:
+            self.assertEqual(workspace._buffers, [None, None, None])
 
     def test_patchification_requires_explicit_admission(self):
         model = ZImageTransformer2DModel.__new__(ZImageTransformer2DModel)

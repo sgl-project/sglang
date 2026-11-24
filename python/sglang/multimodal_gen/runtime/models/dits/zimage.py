@@ -291,6 +291,34 @@ class FeedForward(nn.Module):
         return out
 
 
+class ZImageHeadPaddingWorkspace:
+    """Zero-padded Q/K/V buffers shared by attention layers that run in sequence.
+
+    A padded buffer is only read by the Ulysses all-to-all of the layer that
+    filled it, so the next layer can overwrite it.
+    """
+
+    def __init__(self) -> None:
+        self._buffers: list[torch.Tensor | None] = [None, None, None]
+
+    def pad(self, tensor: torch.Tensor, *, slot: int, pad_heads: int) -> torch.Tensor:
+        shape = (*tensor.shape[:2], tensor.shape[2] + pad_heads, tensor.shape[3])
+        buffer = self._buffers[slot]
+        if (
+            buffer is None
+            or buffer.shape != shape
+            or buffer.dtype != tensor.dtype
+            or buffer.device != tensor.device
+        ):
+            buffer = tensor.new_zeros(shape)
+            self._buffers[slot] = buffer
+        buffer[:, :, : tensor.shape[2]].copy_(tensor)
+        return buffer
+
+    def release(self) -> None:
+        self._buffers = [None, None, None]
+
+
 class ZImageAttention(nn.Module):
     def __init__(
         self,
@@ -309,7 +337,7 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
-        self._head_padding_buffers: list[torch.Tensor | None] = [None, None, None]
+        self._head_padding_workspace = ZImageHeadPaddingWorkspace()
         self.enable_zimage_qk_fusion = (
             quant_config is None and norm_cls is ZImageRMSNorm
         )
@@ -409,18 +437,7 @@ class ZImageAttention(nn.Module):
                 ],
                 dim=2,
             )
-        shape = (*tensor.shape[:2], tensor.shape[2] + pad_heads, tensor.shape[3])
-        buffer = self._head_padding_buffers[slot]
-        if (
-            buffer is None
-            or buffer.shape != shape
-            or buffer.dtype != tensor.dtype
-            or buffer.device != tensor.device
-        ):
-            buffer = tensor.new_zeros(shape)
-            self._head_padding_buffers[slot] = buffer
-        buffer[:, :, : tensor.shape[2]].copy_(tensor)
-        return buffer
+        return self._head_padding_workspace.pad(tensor, slot=slot, pad_heads=pad_heads)
 
     def forward(
         self,
@@ -1018,7 +1035,25 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # (image cos/sin, caption cos/sin) -> their [image, caption] concatenation
         self._unified_freqs_cis: tuple | None = None
         self._sharded_unified_freqs: tuple | None = None
+        self._share_head_padding_workspaces()
         self.layer_names = ["layers"]
+
+    def _share_head_padding_workspaces(self) -> None:
+        # One workspace per stack, because the two stacks attend over different
+        # sequence lengths and would otherwise reallocate on every step.
+        self._head_padding_workspaces = (
+            ZImageHeadPaddingWorkspace(),
+            ZImageHeadPaddingWorkspace(),
+        )
+        for workspace, blocks in zip(
+            self._head_padding_workspaces, (self.noise_refiner, self.layers)
+        ):
+            for block in blocks:
+                block.attention._head_padding_workspace = workspace
+
+    def release_workspaces(self) -> None:
+        for workspace in self._head_padding_workspaces:
+            workspace.release()
 
     def unpatchify(
         self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size
