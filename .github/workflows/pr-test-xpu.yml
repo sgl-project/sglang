@@ -1,6 +1,9 @@
 name: PR Test (XPU)
 
 on:
+  schedule:
+    # Full run on main every 6 hours from 10:00 UTC (04/10/16/22 UTC).
+    - cron: '0 4,10,16,22 * * *'
   push:
     branches: [ main ]
   pull_request:
@@ -20,8 +23,9 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xpu-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # Scheduled runs get a group of their own so pushes to main never cancel them.
+  group: pr-test-xpu-${{ github.event_name == 'schedule' && format('schedule-{0}', github.run_id) || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' && github.event_name != 'schedule' }}
 
 jobs:
   # ==================== Check Changes ==================== #
@@ -40,11 +44,11 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for workflow_call (when ref input is provided)
+          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -132,7 +136,8 @@ jobs:
   extra-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false'
-    runs-on: intel-bmg
+    # Scheduled runs need the pool label and sgl-ci-post-merge.
+    runs-on: ${{ github.event_name == 'schedule' && fromJSON('["intel-bmg", "sgl-ci-post-merge"]') || 'intel-bmg' }}
     env:
       # Per-job name so parallel runners on one host never touch each other's container.
       CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
@@ -201,7 +206,7 @@ jobs:
             --timeout-override kv_canary/test_self_unit_plan_input.py=120
             --timeout-override kernels/ops/kvcache/test_hisparse.py=120
         run: |
-          docker exec -e SGLANG_IS_IN_CI=true "${CONTAINER_NAME}" bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite extra-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
+          docker exec -e SGLANG_IS_IN_CI=true "${CONTAINER_NAME}" bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite extra-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES} ${{ github.event_name == 'schedule' && '--continue-on-error' || '' }}"
 
       - name: Cleanup container
         if: always()
@@ -246,7 +251,8 @@ jobs:
   multimodal-gen-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.multimodal_gen == 'true' && needs.pr-gate.outputs.opted-in != 'false'
-    runs-on: bmg-multigen-models
+    # Scheduled runs need the pool label and sgl-ci-post-merge.
+    runs-on: ${{ github.event_name == 'schedule' && fromJSON('["bmg-multigen-models", "sgl-ci-post-merge"]') || 'bmg-multigen-models' }}
     env:
       # Per-job name so parallel runners on one host never touch each other's container.
       CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
@@ -297,7 +303,7 @@ jobs:
         run: |
           # xpu_b60.json is seeded with this flag on; without it the SYCL queue
           # is deep enough that step timings record host enqueue, not device time.
-          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 "${CONTAINER_NAME}" bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
+          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 "${CONTAINER_NAME}" bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu ${{ github.event_name == 'schedule' && '--continue-on-error' || '' }}"
 
       - name: Cleanup container
         if: always()
