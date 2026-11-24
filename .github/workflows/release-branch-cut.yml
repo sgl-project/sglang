@@ -165,6 +165,13 @@ jobs:
 
   run-pr-tests-nvidia:
     needs: cut-release-branch
+    # What pr-test.yml asks for (statuses: read for its gate).
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: read
     uses: ./.github/workflows/pr-test.yml
     with:
       git_ref: ${{ needs.cut-release-branch.outputs.branch_name }}
