@@ -13,9 +13,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import attn_tp_size_of, get_platform
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -185,23 +183,30 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     platform = get_platform()
     overrides = {"decode_state_free_radix_default": True}
     if cfg.dcp_size > 1:
-        supported = ("DFLASH",) if platform.is_npu else ("DSPARK", "DFLASH")
-        if cfg.speculative_algorithm not in (None, *supported):
+        if platform.is_npu:
+            if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
+                overrides["speculative_attention_mode"] = "decode"
+            if (
+                cfg.speculative_algorithm == "DFLASH"
+                and cfg.speculative_draft_attention_backend is None
+            ):
+                overrides["speculative_draft_attention_backend"] = "ascend"
+            if cfg.kv_cache_dtype == "auto":
+                overrides["kv_cache_dtype"] = "bfloat16"
+            return overrides
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
-                f"Kimi-K3.1 DCP supports only {', '.join(supported)} speculative decoding."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
         pd_backends = ("mooncake", "mori") if platform.is_gfx95 else ("mooncake",)
         if (
             cfg.disaggregation_mode != "null"
-            and not platform.is_npu
             and cfg.disaggregation_transfer_backend not in pd_backends
         ):
             raise ValueError(
                 "Kimi-K3.1 DCP supports PD only over Mooncake (or MoRI on gfx950)."
             )
-        if cfg.speculative_algorithm == "DSPARK" or (
-            platform.is_npu and cfg.speculative_algorithm == "DFLASH"
-        ):
+        if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
@@ -209,17 +214,14 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
 
             if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    f"Kimi-K3.1 DCP + {cfg.speculative_algorithm} requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.speculative_algorithm == "DFLASH":
             from sglang.srt.speculative.dflash_draft_ring import (
                 dflash_dcp_mla_draft_backend,
             )
 
-            draft_backend = (
-                "ascend" if platform.is_npu else dflash_dcp_mla_draft_backend()
-            )
+            draft_backend = dflash_dcp_mla_draft_backend()
             if cfg.speculative_draft_attention_backend not in (None, draft_backend):
                 raise ValueError(
                     "Kimi-K3.1 DCP + DFLASH needs "
@@ -230,31 +232,6 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
             # rank attends over its KV shard and the (o, lse) partials are merged.
             overrides["speculative_attention_mode"] = "decode"
-        if platform.is_npu:
-            if attn_tp_size_of(cfg) % cfg.dcp_size != 0:
-                raise ValueError("Kimi-K3.1 Ascend DCP must divide attention TP size.")
-            if cfg.kv_cache_dtype not in ("auto", "bfloat16"):
-                raise ValueError("Kimi-K3.1 Ascend DCP requires bfloat16 KV cache.")
-            if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                raise ValueError(
-                    "Kimi-K3.1 Ascend DCP requires eager prefill. Set "
-                    "--disable-prefill-cuda-graph."
-                )
-            if (
-                cfg.disaggregation_mode != "null"
-                or cfg.enable_hierarchical_cache
-                or cfg.enable_hisparse
-                or cfg.enable_return_indexer_topk
-            ):
-                raise ValueError(
-                    "Kimi-K3.1 Ascend DCP currently supports unified serving "
-                    "without HiCache, HiSparse, or "
-                    "--enable-return-indexer-topk."
-                )
-            if envs.SGLANG_NPU_USE_MLAPO.get() or get_bool_env_var("SGLANG_USE_FIA_NZ"):
-                raise ValueError("Kimi-K3.1 Ascend DCP requires unfused ND KV writes.")
-            overrides["kv_cache_dtype"] = "bfloat16"
-            return overrides
         if (
             cfg.dsa_topk_backend != "sgl-kernel"
             or not envs.SGLANG_OPT_USE_TOPK_V2.get()
