@@ -54,6 +54,16 @@ MIN_GAIN = 0.005
 MAX_SWAPS_BLOCKS = 24
 
 
+def _attention_dp() -> bool:
+    from sglang.srt.rocm_muse_spark import dp_ep
+
+    return dp_ep.enabled()
+
+
+# Attention DP: forwards between two sums of the ranks' verify rows (an all-reduce on the CPU group).
+DP_CHECK_EVERY = 64
+
+
 def plan_swaps(
     load: np.ndarray, num_local: int, max_swaps: int = MAX_SWAPS
 ) -> list[tuple[int, int]]:
@@ -226,6 +236,7 @@ class ExpertPlacement:
         self.verify_rows = 0
         self.verify_steps = 0
         self.started = False
+        self.dp_forwards = 0
         self.placed = False
         self.verified = False
         self.done = not self.moes
@@ -241,6 +252,22 @@ class ExpertPlacement:
             self._zero_counts()
             return
         num_tokens = forward_batch.input_ids.shape[0]
+        if self.verify_blocks and _attention_dp():
+            # The re-placement is collective, but a DP rank runs its own batch (or an idle one). The ranks run their
+            # forwards in lockstep (MORI-EP is collective in every MoE layer), so each counts its own verify rows and
+            # every DP_CHECK_EVERY forwards they add them up: all see the same sum and re-place at the same forward.
+            if forward_batch.forward_mode.is_target_verify():
+                self.verify_rows += num_tokens
+                self.verify_steps += 1
+            self.dp_forwards += 1
+            if self.dp_forwards % DP_CHECK_EVERY == 0:
+                total = torch.tensor([self.verify_rows], dtype=torch.int64)
+                dist.all_reduce(total, group=get_parallel().tp_group.cpu_group)
+                if int(total.item()) >= self.min_verify_rows:
+                    self.verified = True
+                    self.rebalance_blocks()
+            self.done = self.verified
+            return
         if self.verify_blocks:
             mode = forward_batch.forward_mode
             if mode.is_target_verify():
