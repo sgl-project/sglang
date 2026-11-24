@@ -216,8 +216,11 @@ export const AgentX = ({ data: input }) => {
   };
   // SGLang 1.0 takes the linker's storage options only from --unified-cache-external-linker-config
   // and refuses --hicache-storage-backend-extra-config, which older submissions and kv.py record.
-  const withLinkerConfig = (b) => {
+  // Builds from before --unified-cache-external-linker-config existed (2026-09-07 to 2026-10-25) take
+  // only the old spelling: their cells carry kv.legacyLinkerConfig and keep it.
+  const withLinkerConfig = (b, cell) => {
     const args = b.args || [];
+    if ((cell.kv || {}).legacyLinkerConfig) return b;
     if (!args.some((a) => a[0] === "--enable-unified-cache-external-linker")
       || args.some((a) => a[0] === "--unified-cache-external-linker-config")) return b;
     return { ...b, args: args.map((a) => (a[0] === "--hicache-storage-backend-extra-config"
@@ -227,7 +230,7 @@ export const AgentX = ({ data: input }) => {
     const cell = data.cells[ci];
     const base = materialize(ci, router);
     const measured = pi === 0 ? base : applyPatch(base, ((cell.points[pi] || {}).patch || {})[router]);
-    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router).map(withLinkerConfig);
+    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router).map((b) => withLinkerConfig(b, cell));
     return blocks.some((b) => b.kind === "sgl-router") ? toSglRouter(blocks) : blocks;
   };
 
@@ -294,7 +297,11 @@ export const AgentX = ({ data: input }) => {
     if (b.kind === "mooncake-master") return "Start once on $MOONCAKE_MASTER_IP before the workers.";
     if (b.kind === "mooncake-store") {
       const ports = b.ports || [];
-      return `Start on each of the ${b.count_nodes || 1} decode node(s)${ports.length > 1 ? `, one instance per port (${ports.join(", ")}; change --port)` : ""}.`;
+      const per = ports.length > 1 ? `, one instance per port (${ports.join(", ")}; change --port)` : "";
+      // srt-slurm's store-infra instances (InfX #4695) run on a node with no worker, adding its DRAM to the store.
+      return b.placement === "infra"
+        ? `Start on ${b.count_nodes || 1} separate node(s) that run no worker${per}; they add that node's host memory to the store.`
+        : `Start on each of the ${b.count_nodes || 1} decode node(s)${per}.`;
     }
     if (b.kind === "dynamo-frontend") return (b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind nginx (previous tab; port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.") + " It finds the workers through etcd, so it can start before them.";
     if (b.kind === "nginx") return "Optional scale-out in front of the frontends (next tab): hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
@@ -381,6 +388,7 @@ export const AgentX = ({ data: input }) => {
     : t.file ? t.file.name
     : t.block.kind === "worker" ? (t.block.role === "agg" ? "worker" : t.block.role)
     : t.block.kind === "dynamo-sidecar" ? (t.block.role === "agg" ? "sidecar" : `${t.block.role}-sidecar`)
+    : t.block.kind === "mooncake-store" && t.block.placement && t.block.placement !== "decode" ? `mooncake-store-${t.block.placement}`
     : { "dynamo-frontend": "frontend", "sgl-router": "router" }[t.block.kind] || t.block.kind);
 
   // Provenance: values shared by every point of a deployment live once in cell.prov, and GitHub
@@ -479,6 +487,7 @@ export const AgentX = ({ data: input }) => {
   const sidecars = blocks.some((b) => b.kind === "dynamo-sidecar");
   const blockTitle = (b) => (b.kind === "worker" ? ROLE_TITLE[b.role]
     : b.kind === "dynamo-sidecar" ? `${ROLE_TITLE[b.role]} — Dynamo sidecar`
+    : b.kind === "mooncake-store" && b.placement === "infra" ? "Mooncake store (own node)"
     : KIND_TITLE[b.kind] || b.kind);
   const allText = blocks.map((b, i) => `# ${blockTitle(b)}\n${blockText[i]}`).join("\n\n");
   const usedPlaceholders = [...new Set((allText + JSON.stringify(fileIds.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
@@ -490,6 +499,7 @@ export const AgentX = ({ data: input }) => {
   const shortTitle = (b) => {
     const base = b.kind === "worker" ? { agg: "Worker", prefill: "Prefill", decode: "Decode" }[b.role]
       : b.kind === "dynamo-sidecar" ? { agg: "Sidecar", prefill: "Prefill sidecar", decode: "Decode sidecar" }[b.role]
+      : b.kind === "mooncake-store" && b.placement === "infra" ? "Store node"
       : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sgl-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
     const n = b.kind === "worker" || b.kind === "dynamo-sidecar" ? b.workers : b.count;
     return n > 1 ? `${base} ×${n}` : base;
@@ -499,7 +509,7 @@ export const AgentX = ({ data: input }) => {
   const looseFiles = fileList.filter((f) => !blockText.some((t) => t.includes(f.name)));
   const tabs = [
     ...(usedPlaceholders.length ? [{ id: "exports", label: "Env Vars" }] : []),
-    ...blocks.map((b, i) => ({ id: `block:${b.kind}:${b.role || ""}`, label: shortTitle(b), block: b, text: blockText[i], files: fileList.filter((f) => blockText[i].includes(f.name)) })),
+    ...blocks.map((b, i) => ({ id: `block:${b.kind}:${b.role || b.placement || ""}`, label: shortTitle(b), block: b, text: blockText[i], files: fileList.filter((f) => blockText[i].includes(f.name)) })),
     ...looseFiles.map((f) => ({ id: `file:${f.name}`, label: f.name, file: f })),
   ];
   tabs.forEach((t) => { t.slug = tabSlug(t); });

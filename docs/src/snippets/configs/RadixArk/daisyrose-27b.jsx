@@ -13,10 +13,10 @@
 export const config = {
   modelName: "DaisyRose-27B",
 
-  supportedHardware: ["gb300", "h200", "rtx6000", "rtx5090", "dgx-spark"],
+  supportedHardware: ["gb300", "h200", "rtxpro6000", "rtx5090", "dgx-spark"],
 
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
 
@@ -56,7 +56,7 @@ export const config = {
             "--speculative-num-steps 3",
             "--speculative-eagle-topk 1",
             "--speculative-num-draft-tokens 4",
-            ...(["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw)
+            ...(["rtx5090", "rtxpro6000", "dgx-spark"].includes(sel.hw)
               ? ["--enable-linear-replayssm-spec"]
               : []),
             ...(sel.hw === "rtx5090"
@@ -171,7 +171,7 @@ export const config = {
 
   dockerImages: {
     h200:    "lmsysorg/sglang:latest",
-    rtx6000: "lmsysorg/sglang:latest",
+    rtxpro6000: "lmsysorg/sglang:latest",
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
@@ -375,7 +375,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: false,
       verificationStatus: "unverified",
       env: [],
@@ -393,7 +393,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "default", quant: "fp8", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "fp8", nodes: "single" },
       verified: false,
       verificationStatus: "unverified",
       env: [],
@@ -411,7 +411,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "default", quant: "bf16", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "bf16", nodes: "single" },
       verified: false,
       verificationStatus: "unverified",
       env: [],
