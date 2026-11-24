@@ -41,7 +41,7 @@ def norm_residual_norm(
     pre_norm_bf16: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(output, new_stream)``; ``alpha``/``beta`` FP32 ``(H,)`` or ``(1,)``, both or neither."""
-    from sglang.kernels.tlx_ops.kernels.fused.norm_residual_norm.gfx950 import (
+    from sglang.kernels.ops.layernorm.tlx_norm_residual_norm import (
         norm_residual_norm as _norm_residual_norm,
     )
 

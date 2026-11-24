@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from sglang.kernels.tlx_ops.kernels.mm.gfx950 import _register_matmul_core
+from sglang.kernels.ops.gemm.tlx_mm import _register_matmul_core
 
 # Tuned on MI355X (gfx950) under HIP graph replay. Through ~3.5k tokens every tier streams expert weights
 # once, so B loads bypass L2 (.cg) to keep it for the gathered activations.

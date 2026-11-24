@@ -32,9 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.tlx_ops.kernels.router_gemm.gfx950 import (
-    router_gemm as tlx_router_gemm,
-)
+from sglang.kernels.ops.gemm.tlx_router_gemm import router_gemm as tlx_router_gemm
 from sglang.srt.utils import get_device_name, log_info_on_rank0
 
 logger = logging.getLogger(__name__)

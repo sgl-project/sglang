@@ -27,7 +27,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         add_missing_triton_knobs,
         inline_intra_wave_pipeline_stages,
     )
-    from sglang.kernels.tlx_ops.kernels.mm.gfx950 import mm
+    from sglang.kernels.ops.gemm.tlx_mm import mm
 
     add_missing_triton_knobs()
     add_missing_hip_options()

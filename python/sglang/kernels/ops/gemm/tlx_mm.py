@@ -20,7 +20,7 @@ import triton.language.extra.tlx as tlx
 from triton.runtime.driver import driver
 
 from sglang.kernels.jit.utils.tlx_runtime import InvalidInput
-from sglang.kernels.tlx_ops._invariance import gemm_fixed_split_k
+from sglang.kernels.ops.gemm.tlx_mm_invariance import gemm_fixed_split_k
 
 # Regular wave-grid implementation and dispatch policy.
 
