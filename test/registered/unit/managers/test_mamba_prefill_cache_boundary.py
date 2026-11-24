@@ -20,6 +20,7 @@ class Batch:
         self.name = name
         self.reqs = [req]
         self.decoding_reqs = None
+        self.chunked_req = None
         self.forward_mode = NS(is_extend=lambda: name == "prefill")
         self.is_extend_in_batch = name == "prefill"
 
@@ -64,6 +65,7 @@ class OverlapHarness:
         self.freed = []
         self.decode_mapping = None
         self.need_overlap_sync = False
+        self.middle_chunk = False
 
     def ingest_requests(self):
         self.iteration += 1
@@ -77,6 +79,8 @@ class OverlapHarness:
             batch = None
         elif self.scheduled == 0:
             batch = Batch("prefill", self.req)
+            if self.middle_chunk:
+                batch.chunked_req = self.req
             self.scheduled += 1
         else:
             # prepare_for_decode/verify captures the cache mapping here, before
@@ -215,6 +219,46 @@ class TestMambaPrefillCacheBoundary(unittest.TestCase):
                 else:
                     h.result_queue.clear()
                 self.assertFalse(h._has_pending_mamba_cache_update())
+
+    def test_middle_chunk_keeps_overlap(self):
+        h = OverlapHarness()
+        h.middle_chunk = True
+        self.run_loop(h)
+        self.assertLess(h.events.index("run:decode"), h.events.index("process:prefill"))
+
+    def test_last_chunk_synchronizes_even_if_it_finishes(self):
+        # Whether this result finishes the request is unknown until it is
+        # processed, and a finished request publishes at every checkpoint level.
+        for finish_in_prefill in (False, True):
+            with self.subTest(finish_in_prefill=finish_in_prefill):
+                h = OverlapHarness(finish_in_prefill=finish_in_prefill)
+                # Level 2 would hold the running checkpoint back; still no skip.
+                h.tree_cache.checkpoint_defers_mamba_state = lambda req: True
+                self.run_loop(h)
+                self.assertEqual(h.events.count("process:prefill"), 1)
+                if finish_in_prefill:
+                    self.assertNotIn("run:decode", h.events)
+                else:
+                    self.assertLess(
+                        h.events.index("process:prefill"),
+                        h.events.index("run:decode"),
+                    )
+
+    def test_middle_chunk_beside_a_last_chunk_synchronizes(self):
+        h = OverlapHarness()
+        other = NS(
+            kv=NS(mamba_last_track_seqlen=384),
+            is_retracted=False,
+            skip_radix_cache_insert=False,
+            finished=lambda: False,
+        )
+        batch = Batch("prefill", h.req)
+        batch.reqs = [h.req, other]
+        batch.chunked_req = h.req
+        h.result_queue = deque([(batch, object())])
+        self.assertTrue(h._has_pending_mamba_cache_update())
+        batch.reqs = [h.req]
+        self.assertFalse(h._has_pending_mamba_cache_update())
 
 
 if __name__ == "__main__":

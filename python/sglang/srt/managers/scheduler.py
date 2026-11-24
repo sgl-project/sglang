@@ -2338,8 +2338,11 @@ class Scheduler(
             or not getattr(self.tree_cache, "enable_mamba_extra_buffer", False)
         ):
             return False
+        # A middle chunk commits no output here and is checkpointed only when
+        # the next batch is selected (stash_chunked_request), so it needs no barrier.
         return any(
             req.kv.mamba_last_track_seqlen is not None
+            and req is not pending_batch.chunked_req
             and not req.finished()
             and not req.is_retracted
             and not req.skip_radix_cache_insert
