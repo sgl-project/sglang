@@ -3,12 +3,85 @@
 
 namespace {
 
+template <typename scalar_t, bool has_weight>
+void qkv_rmsnorm_head(scalar_t* __restrict__ input, const scalar_t* __restrict__ weight, int size, float eps) {
+  using fVec = at::vec::Vectorized<float>;
+  using bVec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = bVec::size();
+
+  fVec sum(0.f);
+  int d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [x_fvec0, x_fvec1] = load_float_vec2(input + d);
+    sum += x_fvec0 * x_fvec0;
+    sum += x_fvec1 * x_fvec1;
+  }
+  float sum_val = vec_reduce_sum(sum);
+#pragma GCC unroll 4
+  for (; d < size; ++d) {
+    const float x_val = static_cast<float>(input[d]);
+    sum_val += x_val * x_val;
+  }
+  const float inv = 1.f / std::sqrt(sum_val / size + eps);
+  const fVec inv_fvec(inv);
+
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [x_fvec0, x_fvec1] = load_float_vec2(input + d);
+    x_fvec0 *= inv_fvec;
+    x_fvec1 *= inv_fvec;
+    if constexpr (has_weight) {
+      auto [w_fvec0, w_fvec1] = load_float_vec2(weight + d);
+      x_fvec0 *= w_fvec0;
+      x_fvec1 *= w_fvec1;
+    }
+    store_float_vec2(input + d, x_fvec0, x_fvec1);
+  }
+#pragma GCC unroll 4
+  for (; d < size; ++d) {
+    float x_val = static_cast<float>(input[d]) * inv;
+    if constexpr (has_weight) {
+      x_val *= static_cast<float>(weight[d]);
+    }
+    input[d] = static_cast<scalar_t>(x_val);
+  }
+}
+
+template <typename scalar_t>
+void gemma_qkv_rmsnorm_kernel_impl(
+    scalar_t* q,
+    scalar_t* k,
+    scalar_t* v,
+    const scalar_t* q_weight,
+    const scalar_t* k_weight,
+    int64_t num_tokens,
+    int64_t num_heads,
+    int64_t num_heads_kv,
+    int64_t head_dim,
+    int64_t q_strideT,
+    int64_t k_strideT,
+    int64_t v_strideT,
+    float eps) {
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      for (int64_t head = 0; head < num_heads; ++head) {
+        qkv_rmsnorm_head<scalar_t, true>(q + row * q_strideT + head * head_dim, q_weight, head_dim, eps);
+      }
+      for (int64_t head = 0; head < num_heads_kv; ++head) {
+        qkv_rmsnorm_head<scalar_t, true>(k + row * k_strideT + head * head_dim, k_weight, head_dim, eps);
+        qkv_rmsnorm_head<scalar_t, false>(v + row * v_strideT + head * head_dim, nullptr, head_dim, eps);
+      }
+    }
+  });
+}
+
 template <typename scalar_t>
 void rmsnorm_residual_scalar_row(
-    scalar_t* out,
-    const scalar_t* input,
-    const scalar_t* weight,
-    const scalar_t* residual,
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ residual,
     int size,
     float scalar,
     float eps) {
@@ -78,14 +151,14 @@ void gemma_rmsnorm_residual_scalar_kernel_impl(
 
 template <typename scalar_t>
 void fused_rmsnorm_residual_scalar_row(
-    scalar_t* out,
-    float* merged,
-    const scalar_t* x1,
-    const scalar_t* x2,
-    const scalar_t* w1,
-    const scalar_t* w2,
-    const scalar_t* w3,
-    const scalar_t* residual,
+    scalar_t* __restrict__ out,
+    float* __restrict__ merged,
+    const scalar_t* __restrict__ x1,
+    const scalar_t* __restrict__ x2,
+    const scalar_t* __restrict__ w1,
+    const scalar_t* __restrict__ w2,
+    const scalar_t* __restrict__ w3,
+    const scalar_t* __restrict__ residual,
     int size,
     float scalar,
     float eps1,
@@ -202,6 +275,59 @@ void gemma_dual_rmsnorm_residual_scalar_kernel_impl(
 }
 
 }  // anonymous namespace
+
+// inplace update
+//   q = RMSNorm(q, q_weight, eps)
+//   k = RMSNorm(k, k_weight, eps);
+//   v = RMSNorm(v, no weight, eps)
+// if K and V are absent, only Q is updated.
+//
+// q    : [num_tokens, num_heads * head_dim]
+// k, v : [num_tokens, num_heads_kv * head_dim]
+// q_weight, k_weight: [head_dim]
+//
+void gemma_qkv_rmsnorm_cpu(
+    at::Tensor q,
+    const std::optional<at::Tensor>& k,
+    const std::optional<at::Tensor>& v,
+    const at::Tensor& q_weight,
+    const std::optional<at::Tensor>& k_weight,
+    int64_t num_heads,
+    int64_t num_heads_kv,
+    int64_t head_dim,
+    double eps) {
+  CHECK_DIM(2, q);
+  TORCH_CHECK(num_heads > 0 && head_dim > 0, "Expected positive num_heads and head_dim");
+  TORCH_CHECK(k.has_value() == v.has_value(), "K and V must both be present or both absent");
+  const bool has_kv = k.has_value();
+  const auto st = q.scalar_type();
+  const int64_t num_tokens = q.size(0);
+  CHECK_INPUT_SHAPE_DTYPE<true>(q, {num_tokens, num_heads * head_dim}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {head_dim}, st);
+  if (has_kv) {
+    TORCH_CHECK(num_heads_kv > 0 && k_weight.has_value(), "K/V require positive num_heads_kv and k_weight");
+    CHECK_INPUT_SHAPE_DTYPE<true>(*k, {num_tokens, num_heads_kv * head_dim}, st);
+    CHECK_INPUT_SHAPE_DTYPE<true>(*v, {num_tokens, num_heads_kv * head_dim}, st);
+    CHECK_INPUT_SHAPE_DTYPE<false>(*k_weight, {head_dim}, st);
+  }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "gemma_qkv_rmsnorm_cpu", [&] {
+    gemma_qkv_rmsnorm_kernel_impl(
+        q.data_ptr<scalar_t>(),
+        conditional_data_ptr<scalar_t>(k),
+        conditional_data_ptr<scalar_t>(v),
+        q_weight.data_ptr<scalar_t>(),
+        has_kv ? k_weight->data_ptr<scalar_t>() : nullptr,
+        num_tokens,
+        num_heads,
+        has_kv ? num_heads_kv : 0,
+        head_dim,
+        q.stride(0),
+        has_kv ? k->stride(0) : 0,
+        has_kv ? v->stride(0) : 0,
+        eps);
+  });
+}
 
 // output = (RMSNorm(input, weight, eps) + residual) * scalar
 // input, residual: [num_tokens, hidden_size]

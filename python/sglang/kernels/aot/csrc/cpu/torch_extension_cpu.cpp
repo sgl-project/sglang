@@ -608,6 +608,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
 std::tuple<at::Tensor, at::Tensor>
 fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni);
 
+void gemma_qkv_rmsnorm_cpu(
+    at::Tensor q,
+    const std::optional<at::Tensor>& k,
+    const std::optional<at::Tensor>& v,
+    const at::Tensor& q_weight,
+    const std::optional<at::Tensor>& k_weight,
+    int64_t num_heads,
+    int64_t num_heads_kv,
+    int64_t head_dim,
+    double eps);
+
 at::Tensor gemma_rmsnorm_residual_scalar_cpu(
     const at::Tensor& input,
     const at::Tensor& weight,
@@ -1065,6 +1076,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_input_proj_cpu(Tensor hidden_states, Tensor qkvz_weight, Tensor ba_weight, bool is_vnni) -> (Tensor, "
       "Tensor)");
   m.impl("fused_input_proj_cpu", torch::kCPU, &fused_input_proj_cpu);
+
+  m.def(
+      "gemma_qkv_rmsnorm_cpu(Tensor(a!) q, Tensor(b!)? k, Tensor(c!)? v, Tensor q_weight, Tensor? k_weight, "
+      "int num_heads, int num_heads_kv, int head_dim, float eps) -> ()");
+  m.impl("gemma_qkv_rmsnorm_cpu", torch::kCPU, &gemma_qkv_rmsnorm_cpu);
 
   m.def(
       "gemma_rmsnorm_residual_scalar_cpu(Tensor input, Tensor weight, Tensor residual, Tensor scalar, float eps) -> "
