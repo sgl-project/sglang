@@ -3812,7 +3812,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # Room IDs can be congruent with their DP rank, so mix all bits first.
+        # DP attention routes a room to rank bootstrap_room % dp_size,
+        # so rooms on one rank share a residue; mix all bits first.
         shard_idx = _mix_room_id(bootstrap_room) % len(self.transfer_queues)
 
         if trace_ctx is None:

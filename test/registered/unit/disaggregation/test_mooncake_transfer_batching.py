@@ -11,13 +11,9 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.common.utils import FastQueue, TransferKVChunk
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.disaggregation.mooncake.conn import (
-    MooncakeKVManager,
-    MooncakeKVSender,
-    TransferInfo,
-)
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.transport.base import Copy, Result, Status
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
@@ -93,84 +89,16 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
 
     def test_failed_session_skips_chunk_from_another_queue(self):
         """A session failed by one worker must be skipped by every other worker."""
-        session = "decode-host:15001"
         rooms = (101, 202)
-        requests = {
-            room: TransferInfo(
-                room=room,
-                endpoint="decode-host",
-                dst_port=15001,
-                mooncake_session_id=session,
-                dst_kv_indices=np.array([0], dtype=np.int32),
-                dst_aux_index=0,
-                dst_state_indices=[],
-                required_dst_info_num=1,
-                is_dummy=False,
-            )
-            for room in rooms
-        }
-        manager = SimpleNamespace(
-            enable_trace=False,
-            enable_staging=False,
-            enable_deferred_decode_kv_release=False,
-            _staging_outstanding=defaultdict(int),
-            request_status={room: KVPoll.WaitingForInput for room in rooms},
-            transfer_infos={room: {session: requests[room]} for room in rooms},
-            req_to_decode_prefix_len={},
-            failed_sessions=set(),
-            failed_session_probes={},
-            state_layout_rejections={},
-            session_failures=defaultdict(int),
-            session_lock=Lock(),
-            decode_kv_args_table={
-                session: SimpleNamespace(
-                    requires_dcp_relayout=False,
-                    dst_kv_ptrs=[2000],
-                    dst_kv_layer_ids=[],
-                    dst_kv_item_len=1,
-                    dst_attn_tp_size=1,
-                    dst_aux_ptrs=[3000],
-                    dst_aux_item_lens=[1],
-                    num_draft_entries=None,
-                )
-            },
-            validate_aux_buffers=MagicMock(),
-            kv_args=SimpleNamespace(kv_data_ptrs=[1000]),
-            is_mla_backend=True,
-            is_hybrid_mla_backend=False,
-            attn_tp_size=1,
-            _dcp_pack_buffers=[],
-            bootstrap_port=0,
-            send_kvcache=MagicMock(side_effect=[17, 0]),
-            conclude_failure=MagicMock(),
-            _poison_unsettled_send=MagicMock(),
-            note_send_finished=MagicMock(),
-        )
-        manager.check_status = lambda room: manager.request_status[room]
-        manager._prefill_unique_rank = lambda: 0
-        manager._get_dsa_cache_transfer_skip_flags = lambda _: (False, False)
+        manager, first_queue = TestMooncakeEarlySend._worker(None, rooms)
+        manager.send_kvcache.side_effect = [17, 0]
+        second_queue = SimpleQueue()
+        second_queue.put(TransferKVChunk(rooms[1], [0], slice(0, 1), False, None, None))
+        second_queue.put(None)
 
-        queues = [FastQueue(), FastQueue()]
-        for queue, room in zip(queues, rooms, strict=True):
-            queue.put(
-                TransferKVChunk(
-                    room=room,
-                    prefill_kv_indices=np.array([0], dtype=np.int32),
-                    index_slice=slice(None),
-                    is_last_chunk=False,
-                    prefill_aux_index=None,
-                    state_indices=None,
-                )
-            )
-            queue.put(None)
-
-        MooncakeKVManager.transfer_worker(
-            manager, queues[0], MagicMock(), worker_index=0
-        )
-        self.assertIn(session, manager.failed_sessions)
-        MooncakeKVManager.transfer_worker(
-            manager, queues[1], MagicMock(), worker_index=1
-        )
+        MooncakeKVManager.transfer_worker(manager, first_queue, MagicMock())
+        self.assertIn("peer", manager.failed_sessions)
+        MooncakeKVManager.transfer_worker(manager, second_queue, MagicMock())
 
         manager.send_kvcache.assert_called_once()
 
@@ -866,15 +794,18 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
 
-    def _worker(self, event):
+    @staticmethod
+    def _worker(event, rooms=(1,)):
         chunk = TransferKVChunk(
-            1, [0], slice(0, 1), False, None, None, wait_event=event
+            rooms[0], [0], slice(0, 1), False, None, None, wait_event=event
         )
         queue = SimpleQueue()
         queue.put(chunk)
         queue.put(None)
         peer = SimpleNamespace(
             is_dummy=False,
+            endpoint="127.0.0.1",
+            dst_port=80,
             mooncake_session_id="peer",
             dst_device_kv_indices=None,
             dst_kv_indices=[10],
@@ -894,14 +825,18 @@ class TestMooncakeEarlySend(CustomTestCase):
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
-            request_status={1: KVPoll.WaitingForInput},
-            transfer_infos={1: {"peer": peer}},
+            request_status={room: KVPoll.WaitingForInput for room in rooms},
+            transfer_infos={room: {"peer": peer} for room in rooms},
             _prefill_unique_rank=lambda: 0,
             session_lock=Lock(),
             failed_sessions=set(),
             # Read under session_lock alongside failed_sessions on every
             # non-dummy req, and invoked by the worker's except path.
             state_layout_rejections={},
+            failed_session_probes={},
+            session_failures=defaultdict(int),
+            conclude_failure=MagicMock(),
+            _poison_unsettled_send=MagicMock(),
             poison_deferred_ack_room=MagicMock(),
             decode_kv_args_table={"peer": registration},
             _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
