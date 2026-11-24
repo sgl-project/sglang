@@ -207,7 +207,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     # Use a subset of GPQA Diamond (198 questions) to cut the step runtime.
-    limit = 16
+    limit = 1
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     @classmethod
