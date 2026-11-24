@@ -58,12 +58,12 @@ jobs:
             part_id: 0
             part_size: 2
             nightly_part_lo: 0
-            nightly_part_hi: 2
+            nightly_part_hi: 3
           - name: gnr2
             part_id: 1
             part_size: 2
             nightly_part_lo: 1
-            nightly_part_hi: 3
+            nightly_part_hi: 2
     steps:
       - name: Cleanup workspace
         run: |
@@ -133,7 +133,8 @@ jobs:
       # phase 1 on the same box (serial docker exec), so only one server is ever
       # resident -> no dual-model OOM. Four balanced partitions run as two
       # serial batches per GNR, keeping each step below the 360-minute limit.
-      # Pair 0+2 and 1+3 so both machines get one larger and one smaller batch.
+      # Pair 0+3 and 1+2 to keep GPT-OSS and Phi-4 on separate machines.
+      # Model estimates balance partitions; each file has a separate 3-hour limit.
       # Continue after test failures once container and AMX setup succeeded.
       - name: Run nightly model accuracy + perf (batch 1)
         id: model_batch_1
@@ -148,7 +149,7 @@ jobs:
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/$REPORT_DIR/model-summary.md" \
             -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/$REPORT_DIR/metrics.jsonl" \
             ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_lo }} --auto-partition-size 4 --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_lo }} --auto-partition-size 4 --timeout-per-file 10800 $CONTINUE_ON_ERROR_FLAG" \
             2>&1 | tee "$REPORT_DIR/model-batch-1.log"
 
       - name: Run nightly model accuracy + perf (batch 2)
@@ -163,7 +164,7 @@ jobs:
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/$REPORT_DIR/model-summary.md" \
             -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/$REPORT_DIR/metrics.jsonl" \
             ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_hi }} --auto-partition-size 4 --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_hi }} --auto-partition-size 4 --timeout-per-file 10800 $CONTINUE_ON_ERROR_FLAG" \
             2>&1 | tee "$REPORT_DIR/model-batch-2.log"
 
       - name: Collect evaluation reports

@@ -15,9 +15,8 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
-# Full GSM8K takes around 45 minutes, and CustomTestCase may retry the whole
-# method after a failed performance gate. Allow two complete attempts.
-register_cpu_ci(est_time=6000, suite="nightly-test-cpu-intel")
+# Estimated from a complete run including the automatic retry.
+register_cpu_ci(est_time=9900, suite="nightly-test-cpu-intel")
 
 MODEL_PATH = "openai/gpt-oss-20b"
 BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]

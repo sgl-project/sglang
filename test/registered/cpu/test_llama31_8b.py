@@ -14,7 +14,7 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
-register_cpu_ci(est_time=3600, suite="nightly-test-cpu-intel")
+register_cpu_ci(est_time=900, suite="nightly-test-cpu-intel")
 
 MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]

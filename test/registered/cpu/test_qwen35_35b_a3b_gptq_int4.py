@@ -15,9 +15,8 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
-# The full GSM8K evaluation exceeded the previous 90-minute file timeout.
-# With --timeout-from-est-time, this estimate gives the file a 3-hour budget.
-register_cpu_ci(est_time=7200, suite="nightly-test-cpu-intel")
+# Estimated from the complete GPTQ performance and GSM8K run.
+register_cpu_ci(est_time=4200, suite="nightly-test-cpu-intel")
 
 MODEL_PATH = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
 BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
