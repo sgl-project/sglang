@@ -977,14 +977,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
 
-        # Mirror the grammars-population behavior previously done in
-        # ScheduleBatch.get_model_worker_batch.
-        if batch.sampling_info is not None:
-            if batch.has_grammar:
-                batch.sampling_info.grammars = [req.grammar for req in batch.reqs]
-            else:
-                batch.sampling_info.grammars = None
-
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
