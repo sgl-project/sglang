@@ -192,7 +192,7 @@ class Inkling2QuarkExperts(nn.Module):
                 forward_experts,
             )
         else:
-            raise NotImplementedError(
-                f"no forward for {self.expert_format} experts in this build"
+            from sglang.srt.models.inkling_common.inkling2_moe_quark_uint4 import (
+                forward_experts,
             )
         return forward_experts(self, x, weights, ids, combine)

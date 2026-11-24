@@ -3,6 +3,7 @@ layer around them, and the real model built from the config.json of an export (C
 """
 
 import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -181,6 +182,53 @@ def test_experts_run_on_gfx950_only(monkeypatch):
         experts._check_platform()
 
 
+# the modules that provide forward_experts for each expert format
+FORWARD_MODULES = {
+    "mxfp4": "sglang.srt.models.inkling_common.inkling2_moe_quark_mxfp4",
+    "uint4_awq": "sglang.srt.models.inkling_common.inkling2_moe_quark_uint4",
+}
+
+
+def _kernels(monkeypatch, expert_format, forward_experts):
+    name = FORWARD_MODULES[expert_format]
+    module = types.ModuleType(name)
+    module.forward_experts = forward_experts
+    monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize("variant", ["MXFP4-RTN", "UINT4-AWQ"])
+def test_moe_forward_routes_unquantized_input(monkeypatch, variant):
+    monkeypatch.setattr(moe, "get_parallel", _parallel())
+    monkeypatch.setattr(quark_moe, "get_parallel", _parallel())
+    layer = moe.Inkling2MoE(_config(), 0, "llm.layers.0.mlp", _layout(variant))
+    experts = layer.experts
+    other = "uint4_awq" if experts.expert_format == "mxfp4" else "mxfp4"
+    calls, routed = [], []
+
+    def forward_experts(module, x, weights, ids, combine):
+        calls.append((module, x, weights, ids, combine))
+        return f"kernel output, combine={combine}"
+
+    def route(x):
+        routed.append(x)
+        return "weights", "ids"
+
+    def wrong_format(*args):
+        raise AssertionError("dispatched to the kernels of the other format")
+
+    _kernels(monkeypatch, experts.expert_format, forward_experts)
+    _kernels(monkeypatch, other, wrong_format)
+    monkeypatch.setattr(layer.gate, "forward", route)
+    x = torch.randn(3, HIDDEN)
+    for combine in (True, False):
+        assert layer(x, combine=combine) == f"kernel output, combine={combine}"
+        assert routed[-1] is x
+        module, seen_x, *rest = calls[-1]
+        assert module is experts and seen_x is x and rest == ["weights", "ids", combine]
+    # a prefill step on this rank reads every input row
+    assert layer.local_input_rows(4096, combine=True) is None
+
+
 def test_expert_parallel_sums_are_reduced_over_the_expert_group(monkeypatch):
     reduced = []
     group = SimpleNamespace(
@@ -212,6 +260,41 @@ def _native_config():
             "mxfp8", [f"{EXPERT_PREFIX}{leaf}_weight" for leaf in ("w13", "w2")]
         )
     )
+
+
+def _poison_native_experts(monkeypatch):
+    """Make every method of Inkling2Experts and of the HIP MoE raise: the native experts
+    read uint8 weights as NVFP4, and MXFP4 weights are uint8 too."""
+
+    def boom_for(name):
+        def boom(*args, **kwargs):
+            raise AssertionError(f"the Quark path reached native expert code: {name}")
+
+        return boom
+
+    for method, value in list(vars(moe.Inkling2Experts).items()):
+        if callable(value):
+            monkeypatch.setattr(moe.Inkling2Experts, method, boom_for(method))
+    name = "sglang.srt.models.inkling_common.inkling2_moe_hip"
+    hip = types.ModuleType(name)
+    for function in ("moe_forward", "forward_experts", "prepare_experts"):
+        setattr(hip, function, boom_for(f"inkling2_moe_hip.{function}"))
+    monkeypatch.setitem(sys.modules, name, hip)
+
+
+@pytest.mark.parametrize("variant", ["MXFP4-RTN", "UINT4-AWQ"])
+def test_the_quark_path_never_reaches_native_expert_code(monkeypatch, variant):
+    _poison_native_experts(monkeypatch)
+    monkeypatch.setattr(moe, "get_parallel", _parallel())
+    monkeypatch.setattr(quark_moe, "get_parallel", _parallel())
+    with pytest.raises(AssertionError, match="native expert code"):
+        moe.Inkling2MoE(_config(), 0, "llm.layers.0.mlp", _native_config())
+    layer = moe.Inkling2MoE(_config(), 0, "llm.layers.0.mlp", _layout(variant))
+    _kernels(monkeypatch, layer.experts.expert_format, lambda *args: "kernel output")
+    monkeypatch.setattr(layer.gate, "forward", lambda x: ("weights", "ids"))
+    for combine in (True, False):
+        assert layer(torch.randn(2, HIDDEN), combine=combine) == "kernel output"
+    _target(monkeypatch, variant).load_weights(list(_export(variant).items()))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import inkling2_quark_gemm_hip as G
+from sglang.kernels.ops.moe import inkling2_swiglu_bf16_hip as swiglu_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.inkling2_quark_test_utils import Materialization
 
@@ -101,6 +102,19 @@ def test_launcher_makes_no_weight_copy(monkeypatch, fmt):
             x, weight, scale, zero_point, route, N, 8, torch.float32, rows,
             fmt=fmt, num_experts=experts, config=config,
         )  # fmt: skip
+    assert not watch.copies, watch.copies
+
+
+@pytest.mark.parametrize("splits", (1, 3))
+def test_the_swiglu_launcher_materializes_only_its_output(monkeypatch, splits):
+    monkeypatch.setattr(swiglu_hip, "_swiglu_bf16", _NoKernel())
+    rows, width = 64, 1152
+    acc = torch.zeros(splits, rows, 2 * width)
+    ids = torch.zeros(rows, dtype=torch.int32)
+    gammas = torch.zeros(rows)
+    with Materialization(acc, ids, gammas) as watch:
+        y = swiglu_hip.swiglu_bf16(acc, ids, gammas, 0, 8, (4.0, 25.0))
+    assert y.shape == (rows, width) and y.dtype == torch.bfloat16
     assert not watch.copies, watch.copies
 
 
