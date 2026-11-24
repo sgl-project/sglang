@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    handle_moe_kernel_config,
     resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
@@ -1071,6 +1072,119 @@ class TestPrepareServerArgs(CustomTestCase):
                 reconstructed, "_speculative_draft_quantization_explicitly_set"
             )
         )
+
+    def test_moe_runner_backend_explicitness_ignores_resolved_defaults(self):
+        # NVFP4 MoE layers refuse what FlashInfer CUTLASS cannot run yet only
+        # when the user did not pick it, so the modelopt_fp4 default on SM120,
+        # declared over auto by the MoE hook, must not count as a choice.
+        def resolve(**kwargs):
+            args = ServerArgs(model_path="dummy", **kwargs)
+            handle_missing_default_values(args)
+            handle_moe_kernel_config(args)
+            return args
+
+        with override_platform(is_sm120=True):
+            for kwargs, backend, explicit in (
+                (dict(quantization="modelopt_fp4"), "flashinfer_cutlass", False),
+                (
+                    dict(
+                        quantization="modelopt_fp4",
+                        moe_runner_backend="flashinfer_cutlass",
+                    ),
+                    "flashinfer_cutlass",
+                    True,
+                ),
+                ({}, "auto", False),
+            ):
+                with self.subTest(**kwargs):
+                    args = resolve(**kwargs)
+                    self.assertEqual(
+                        resolution_result(args, "moe_runner_backend"), backend
+                    )
+                    self.assertIs(
+                        resolution_result(args, "_moe_runner_backend_explicitly_set"),
+                        explicit,
+                    )
+
+            # A child process rebuilds the record from the published fields,
+            # which carry the resolved backend, and resolves it again.
+            published = resolve(quantization="modelopt_fp4")
+            rebuilt = resolve(
+                quantization="modelopt_fp4",
+                moe_runner_backend=resolution_result(published, "moe_runner_backend"),
+                _moe_runner_backend_explicitly_set=resolution_result(
+                    published, "_moe_runner_backend_explicitly_set"
+                ),
+            )
+            self.assertIs(
+                resolution_result(rebuilt, "_moe_runner_backend_explicitly_set"),
+                False,
+            )
+
+    def test_draft_moe_runner_backend_explicitness(self):
+        # The draft's NVFP4 MoE layers take their own answer under
+        # speculative_moe_backend_context: a draft backend the user passed is
+        # explicit, an unset one inherits the target's only when it keeps the
+        # target's backend.
+        def resolve(**kwargs):
+            args = ServerArgs(model_path="dummy", **kwargs)
+            handle_missing_default_values(args)
+            handle_moe_kernel_config(args)
+            handle_speculative_decoding(args)
+            return args
+
+        fp4 = dict(quantization="modelopt_fp4")
+        explicit_cutlass = dict(fp4, moe_runner_backend="flashinfer_cutlass")
+        with override_platform(is_sm120=True):
+            for kwargs, draft_backend, explicit in (
+                (explicit_cutlass, "flashinfer_cutlass", True),
+                (
+                    dict(explicit_cutlass, speculative_moe_runner_backend="auto"),
+                    "auto",
+                    False,
+                ),
+                (
+                    dict(fp4, speculative_moe_runner_backend="flashinfer_cutlass"),
+                    "flashinfer_cutlass",
+                    True,
+                ),
+                (fp4, "flashinfer_cutlass", False),
+                (dict(moe_runner_backend="lora_marlin"), "auto", False),
+            ):
+                with self.subTest(**kwargs):
+                    args = resolve(**kwargs)
+                    self.assertEqual(
+                        resolution_result(args, "speculative_moe_runner_backend"),
+                        draft_backend,
+                    )
+                    self.assertIs(
+                        resolution_result(
+                            args, "_speculative_moe_runner_backend_explicitly_set"
+                        ),
+                        explicit,
+                    )
+
+            # A child process rebuilds the record from the published fields,
+            # where the draft backend is no longer unset, and resolves again.
+            published = resolve(**fp4)
+            rebuilt = resolve(
+                **fp4,
+                **{
+                    name: resolution_result(published, name)
+                    for name in (
+                        "moe_runner_backend",
+                        "_moe_runner_backend_explicitly_set",
+                        "speculative_moe_runner_backend",
+                        "_speculative_moe_runner_backend_explicitly_set",
+                    )
+                },
+            )
+            self.assertIs(
+                resolution_result(
+                    rebuilt, "_speculative_moe_runner_backend_explicitly_set"
+                ),
+                False,
+            )
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:

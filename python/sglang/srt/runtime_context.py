@@ -593,7 +593,10 @@ class MoeFlags(_FlagGroupBase):
 
     a2a_backend: Any = None
     runner_backend: Any = None
+    # Whether the user passed runner_backend; swapped with it for the draft.
+    runner_backend_explicit: bool = False
     speculative_runner_backend: Any = None
+    speculative_runner_backend_explicit: bool = False
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
     deepep_config: str | None = None

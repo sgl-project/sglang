@@ -572,6 +572,10 @@ def initialize_moe_config():
         if spec.speculative_moe_runner_backend is not None
         else _default_speculative_moe_runner_backend(moe.runner_backend)
     )
+    moe.runner_backend_explicit = bool(exec_moe._moe_runner_backend_explicitly_set)
+    moe.speculative_runner_backend_explicit = bool(
+        spec._speculative_moe_runner_backend_explicitly_set
+    )
     moe.speculative_a2a_backend = (
         MoeA2ABackend(spec.speculative_moe_a2a_backend)
         if spec.speculative_moe_a2a_backend is not None
@@ -606,6 +610,20 @@ def get_moe_runner_backend() -> MoeRunnerBackendLike:
     if moe.runner_backend is None:
         moe.runner_backend = MoeRunnerBackend.AUTO
     return moe.runner_backend
+
+
+def is_moe_runner_backend_explicit(backend: MoeRunnerBackendLike) -> bool:
+    """Whether the user passed ``backend`` for the model whose layers are being
+    built. A draft's layers count only if the draft's own runner (passed, or the
+    target's it inherits) is ``backend``: a STANDALONE or DFlash draft is built
+    with the target's runner, which the user may not have picked for the draft."""
+    moe = get_flags().moe
+    if moe.in_speculative_scope:
+        return (
+            moe.speculative_runner_backend_explicit
+            and moe.speculative_runner_backend == backend
+        )
+    return moe.runner_backend_explicit
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
@@ -761,14 +779,6 @@ def uses_per_rank_fused_shared_slots() -> bool:
 def has_per_rank_fused_shared_slots(num_shared: int) -> bool:
     """Whether the backend gives each rank its own fused shared-expert slots."""
     return num_shared > 0 and uses_per_rank_fused_shared_slots()
-
-
-def is_flashinfer_cutedsl_v1_path() -> bool:
-    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
-    return (
-        get_moe_runner_backend().is_flashinfer_cutedsl()
-        and get_moe_a2a_backend().is_deepep()
-    )
 
 
 def get_tbo_token_distribution_threshold() -> float:
@@ -1035,11 +1045,14 @@ def speculative_moe_backend_context():
     """
     moe = get_flags().moe
     original_backend = moe.runner_backend
+    original_explicit = moe.runner_backend_explicit
     try:
         moe.runner_backend = get_speculative_moe_runner_backend()
+        moe.runner_backend_explicit = moe.speculative_runner_backend_explicit
         yield
     finally:
         moe.runner_backend = original_backend
+        moe.runner_backend_explicit = original_explicit
 
 
 @contextmanager

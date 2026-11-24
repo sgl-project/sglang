@@ -1079,7 +1079,19 @@ class Scheduler(
             "moe_top_k",
             "moe_topk",
         )
-        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+        uses_moe = any(hasattr(config_to_check, attr) for attr in moe_topk_attrs)
+        spec = get_spec()
+        if not uses_moe and spec.speculative_draft_model_path is not None:
+            # A dense target can run an MoE draft (e.g. STANDALONE), whose
+            # layers read the same MoE flags.
+            draft_config = ModelConfig.from_server_args(
+                self.server_args,
+                model_path=spec.speculative_draft_model_path,
+                model_revision=spec.speculative_draft_model_revision,
+                is_draft_model=True,
+            ).hf_text_config
+            uses_moe = any(hasattr(draft_config, attr) for attr in moe_topk_attrs)
+        if uses_moe:
             initialize_moe_config()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.

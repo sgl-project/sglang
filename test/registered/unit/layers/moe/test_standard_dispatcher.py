@@ -48,6 +48,27 @@ def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0):
     return dispatcher
 
 
+_MODELOPT = "sglang.srt.layers.quantization.modelopt_quant"
+
+
+def _nvfp4_method_on_sm100():
+    """A ModelOpt NVFP4 MoE method built under auto on an SM100 worker."""
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptNvFp4FusedMoEMethod,
+    )
+
+    with (
+        get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
+        patch(f"{_MODELOPT}.is_cuda", return_value=True),
+        patch(f"{_MODELOPT}.get_cuda_version", return_value=(12, 8)),
+        patch(f"{_MODELOPT}.get_device_capability", return_value=(10, 0)),
+        patch(f"{_MODELOPT}.torch.cuda.current_device", return_value=0),
+    ):
+        return ModelOptNvFp4FusedMoEMethod(
+            SimpleNamespace(is_w4a16=False, use_per_token_activation=False)
+        )
+
+
 class _LazyDispatcher(BaseDispatcher):
     # No ``prebuild`` override: builds its state at the first dispatch.
 
@@ -621,9 +642,6 @@ class TestLayerRunnerDispatch(CustomTestCase):
 
     def test_auto_nvfp4_preserves_undeclared_routing_policy(self):
         """An AUTO-selected FP4 kernel must preserve renormalization and custom routes."""
-        from sglang.srt.layers.quantization.modelopt_quant import (
-            ModelOptNvFp4FusedMoEMethod,
-        )
 
         logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
         hidden = torch.ones((1, 4))
@@ -661,7 +679,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 ),
                 patch.object(topk_module, "fused_topk", side_effect=cpu_router),
             ):
-                method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+                method = _nvfp4_method_on_sm100()
                 layer = self._build_layer(
                     method, routing_method_type=routing_method_type
                 )
@@ -821,9 +839,6 @@ class TestLayerRunnerDispatch(CustomTestCase):
 
     def test_model_constructors_preserve_materialized_routed_scale(self):
         """Bailing and normal LLaDA2 routing must retain scale when AUTO selects an FP4 kernel."""
-        from sglang.srt.layers.quantization.modelopt_quant import (
-            ModelOptNvFp4FusedMoEMethod,
-        )
         from sglang.srt.models import bailing_moe, bailing_moe_linear, llada2
 
         logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
@@ -855,7 +870,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 # Grouped softmax still requires materialized routes.
                 config.n_group = 2
                 config.topk_group = 1
-            method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+            method = _nvfp4_method_on_sm100()
             with (
                 self.subTest(model=block_type.__name__),
                 get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),

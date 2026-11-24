@@ -206,6 +206,12 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    # Recorded by the speculative hook: a draft backend the user passed, or the
+    # target's explicit one the draft inherits unchanged.
+    _speculative_moe_runner_backend_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(

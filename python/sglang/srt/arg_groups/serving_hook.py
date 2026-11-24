@@ -594,6 +594,14 @@ def handle_missing_default_values(server_args: Any):
             _speculative_draft_quantization_explicitly_set=cfg.speculative_draft_model_quantization
             is not None,
         )
+    if cfg._moe_runner_backend_explicitly_set is None:
+        # The record, not the view: hooks and passes declare backends over auto
+        # later; a rebuilt record keeps the first resolution's answer.
+        declare_resolution(
+            server_args,
+            "_handle_missing_default_values",
+            _moe_runner_backend_explicitly_set=server_args.moe_runner_backend != "auto",
+        )
     if cfg.speculative_draft_model_quantization is None:
         declare_resolution(
             server_args,

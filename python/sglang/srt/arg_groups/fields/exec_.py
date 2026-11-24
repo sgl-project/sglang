@@ -1023,6 +1023,12 @@ class ExecMoe(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    # Recorded from the raw input: a backend resolved from auto, the
+    # quantization or a model default leaves it False.
+    _moe_runner_backend_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     flashinfer_mxfp4_moe_precision: A[
         Literal["default", "bf16", "fp8"],
         "Choose the computation precision of flashinfer mxfp4 moe. "

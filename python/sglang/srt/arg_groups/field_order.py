@@ -591,5 +591,7 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "_moe_runner_backend_explicitly_set",
+    "_speculative_moe_runner_backend_explicitly_set",
 )
 # fmt: on

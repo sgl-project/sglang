@@ -220,6 +220,8 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_model_revision=None,
             speculative_moe_runner_backend=None,
             moe_runner_backend="auto",
+            _moe_runner_backend_explicitly_set=False,
+            _speculative_moe_runner_backend_explicitly_set=None,
             speculative_algorithm="my_handle_args",
             speculative_use_block_verification=False,
             decrypted_draft_config_file=None,
