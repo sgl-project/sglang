@@ -136,7 +136,7 @@ metatags:
   <Card
     title="InclusionAI"
     mode="card"
-    href="/cookbook/autoregressive/InclusionAI/Ling-3.1-flash"
+    href="/cookbook/autoregressive/InclusionAI/Ling-3.2-air"
     img="/cards/logos/inclusionai.png"
   />
   <Card
