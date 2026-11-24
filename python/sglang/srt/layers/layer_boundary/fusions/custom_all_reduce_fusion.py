@@ -1,4 +1,4 @@
-"""TP all-reduce + residual add + RMSNorm on the CustomAllReduceV2 push plane.
+"""TP all-reduce + residual add + RMSNorm on the TP symmetric workspace push plane.
 
 One kernel per boundary, with the MoE finalize and the shared-expert add folded
 in when the runner hands back a MoeDeferredFinalize: at the FFN input (the

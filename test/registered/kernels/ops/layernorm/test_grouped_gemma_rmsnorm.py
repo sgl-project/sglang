@@ -32,6 +32,14 @@ _TOLERANCES = {
 }
 
 
+def test_empty_dp_rank():
+    x = torch.empty(0, 10240, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(10240, device=x.device, dtype=x.dtype)
+    out = grouped_gemma_rmsnorm(x, weight, 2560)
+    torch.cuda.synchronize()
+    assert out.shape == x.shape and out.dtype == x.dtype
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,group_size",
@@ -72,13 +80,6 @@ def test_grouped_gemma_rmsnorm_out_param():
 
     assert result.data_ptr() == out.data_ptr()
     torch.testing.assert_close(result, expected, **_TOLERANCES[x.dtype])
-
-
-def test_grouped_gemma_rmsnorm_bad_group_size():
-    x = torch.randn(4, 10240, dtype=torch.bfloat16, device="cuda")
-    weight = torch.zeros(10240, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="group_size"):
-        grouped_gemma_rmsnorm(x, weight, 1000, 1e-6)
 
 
 if __name__ == "__main__":

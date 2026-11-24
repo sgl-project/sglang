@@ -107,9 +107,6 @@ class Trie {
   // Resolve a cached NodeRef back to a live trie node. nullptr means the
   // cached location went stale and the caller should rebuild from context.
   const TrieNode* resolve(const MatchState& state, const NodeRef& ref) const;
-  NodeRef rootRef() const {
-    return NodeRef{root_, root_->version};
-  }
   NodeRef capture(TrieNode* node) const {
     if (node == nullptr) {
       return {};

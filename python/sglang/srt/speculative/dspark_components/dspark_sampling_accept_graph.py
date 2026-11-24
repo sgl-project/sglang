@@ -18,7 +18,7 @@ accept draws at the same generator state; with block-wise rejection they come fr
 worker's one RejectionNoise, whose device step counter a replay advances like an eager
 call. The DSPARK_ACCEPT_SAMPLE broadcast stays in
 the region (pynccl inside the graph), so TP ranks agree as in the eager path. With the
-deferred context-KV commit, the verify graph already joined this step's projection, so
+deferred draft KV store, the verify graph already joined this step's projection, so
 the region stages the stores from it.
 
 The caller routes only all-sampled steps without top-k / top-p, logit adjustments or
@@ -54,13 +54,14 @@ logger = logging.getLogger(__name__)
 
 class GraphSamplingInfo(msgspec.Struct, frozen=True):
     """The SamplingBatchInfo fields the sampling accept reads, for an all-sampled
-    batch without top-k / top-p."""
+    batch without top-k / top-p / min-p."""
 
     temperatures: torch.Tensor
     is_all_greedy: bool = False
     is_any_greedy: bool = False
     need_top_k_sampling: bool = False
     need_top_p_sampling: bool = False
+    need_min_p_sampling: bool = False
 
 
 def sampling_accept_commit_lens(
