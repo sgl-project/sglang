@@ -86,6 +86,16 @@ USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
 TEST_LOOP = 16
 
+# hier_2shot_push in bytes: pair chunks on both sides of the unrolled pair kernel's
+# 2 MB cutoff, one with a partial hunk, and a large one
+HIER_TEST_BYTES = [
+    4 * 1024 * 1024 - 32,
+    4 * 1024 * 1024,
+    4 * 1024 * 1024 + 32,
+    16 * 1024 * 1024,
+]
+HIER_MAX_BYTES = 32 * 1024 * 1024
+
 TEST_SIZES = get_ci_test_range(TEST_SIZES, [16, 1024, 32 * 1024, 2 * 1024 * 1024])
 TEST_DTYPES = get_ci_test_range(TEST_DTYPES, [torch.bfloat16])
 
@@ -314,6 +324,54 @@ def test_hier_ring_simple(
     )
 
 
+@cache_once
+def _init_hier_comm_once() -> CustomAllReduceV2 | None:
+    """A communicator whose table takes hier_2shot_push from 256 KB to 32 MB."""
+    from sglang.srt.distributed.device_communicators import custom_all_reduce_v2 as v2
+    from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+        Range,
+    )
+
+    cpu_group = _init_cpu_group_once()
+    world_size = dist.get_world_size(cpu_group)
+    if world_size < 4:  # the cross plane needs at least two accelerators
+        return None
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    base = v2.get_all_reduce_config(world_size)
+    hier = Range(256 * 1024, HIER_MAX_BYTES)
+    config = base._replace(
+        graph=base.graph._replace(hier_2shot_push=hier),
+        eager=base.eager._replace(hier_2shot_push=hier),
+    )
+    get_config = v2.get_all_reduce_config
+    v2.get_all_reduce_config = lambda ws: config if ws == world_size else get_config(ws)
+    try:
+        comm = CustomAllReduceV2(cpu_group, device, max_size=HIER_MAX_BYTES // 2)
+    finally:
+        v2.get_all_reduce_config = get_config
+    if comm.disabled:
+        return None
+    register_comm_cleanup(comm)
+    return comm
+
+
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("nbytes", HIER_TEST_BYTES)
+@torch.inference_mode()
+def test_hier_2shot_push(nbytes: int, dtype: torch.dtype, use_graph: bool) -> None:
+    comm = _init_hier_comm_once()
+    if comm is None or comm._hier is None:
+        pytest.skip(
+            "hier_2shot_push needs both DPX partitions of every gfx1250 "
+            "accelerator in the group"
+        )
+    size = nbytes // torch.tensor([], dtype=dtype).element_size()
+    _check_custom_all_reduce(
+        size, dtype, None, use_graph, comm, reduce=comm._hier.all_reduce
+    )
+
+
 def _check_custom_all_reduce(
     size: int,
     dtype: torch.dtype,
@@ -322,7 +380,7 @@ def _check_custom_all_reduce(
     comm: CustomAllReduceV2,
     reduce=None,
 ) -> None:
-    """With ``reduce`` (a ring all-reduce, not a forced-algo choice), ``algo`` is None."""
+    """With ``reduce`` (a ring or hier all-reduce, not a forced-algo choice), ``algo`` is None."""
     if reduce is not None:
         comm.forced_algo = None
     else:

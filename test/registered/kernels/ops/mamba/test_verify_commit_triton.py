@@ -77,5 +77,47 @@ def test_verify_commit_steps_matches_eager(bs, track_interval, tree_depth):
         assert got_track is None
 
 
+def _chain_reference(commit_lens, pre, track_interval):
+    last = commit_lens.to(torch.int64) - 1
+    if track_interval <= 0:
+        return last, None
+    post = pre + commit_lens.to(pre.dtype)
+    mask = pre // track_interval != post // track_interval
+    point = post // track_interval * track_interval
+    ith = torch.clamp(point - pre - 1, min=0)
+    can_track = mask & (ith < commit_lens.to(ith.dtype))
+    track = torch.where(can_track, ith.to(torch.int64), torch.full_like(ith, -1))
+    return last, track
+
+
+@pytest.mark.parametrize("bs", [1, 3, 48, 257])
+@pytest.mark.parametrize("track_interval", [0, 64])
+@pytest.mark.parametrize("commit_dtype", [torch.int32, torch.int64])
+def test_chain_commit_steps_matches_eager(bs, track_interval, commit_dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    torch.manual_seed(bs + track_interval)
+    device = "cuda"
+    draft_token_num = 9
+    commit_lens = torch.randint(
+        1, draft_token_num + 1, (bs,), device=device, dtype=commit_dtype
+    )
+    seq_lens = torch.randint(55, 70, (bs,), device=device, dtype=torch.int64)
+
+    exp_last, exp_track = _chain_reference(commit_lens, seq_lens, track_interval)
+    got_last, got_track = fused_commit_track_indices(
+        None,
+        commit_lens,
+        seq_lens if track_interval > 0 else None,
+        draft_token_num,
+        track_interval,
+    )
+    assert torch.equal(got_last, exp_last)
+    if track_interval > 0:
+        assert torch.equal(got_track, exp_track)
+    else:
+        assert got_track is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

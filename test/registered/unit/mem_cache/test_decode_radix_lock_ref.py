@@ -600,6 +600,10 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             model_config=None,
             enable_overlap=False,
             spec_algorithm=None,
+            sampler_params_pool=SimpleNamespace(write=lambda reqs: None),
+            penalty_status_pool=SimpleNamespace(
+                alloc=lambda reqs: None, reset_history=lambda reqs: None
+            ),
         )
         with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(

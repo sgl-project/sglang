@@ -106,6 +106,77 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+def _pp_held_key(bootstrap_room: int) -> str:
+    return f"held:{bootstrap_room}"
+
+
+class _PPStagingOutstanding(defaultdict):
+    """_staging_outstanding under PP: also replicates whether each live room's
+    Success is held, because PP0 decides the release for every stage. Every
+    mutator syncs the rooms it touches."""
+
+    def __init__(self, kv_mgr: CommonKVManager):
+        super().__init__(int)
+        self._kv_mgr = kv_mgr
+        self._lock = threading.RLock()
+
+    def __setitem__(self, room: int, count: int) -> None:
+        with self._lock:
+            super().__setitem__(room, count)
+            self._sync(room)
+
+    def __delitem__(self, room: int) -> None:
+        with self._lock:
+            super().__delitem__(room)
+            self._sync(room)
+
+    def pop(self, room: int, *default):
+        with self._lock:
+            value = super().pop(room, *default)
+            self._sync(room)
+            return value
+
+    def setdefault(self, room: int, default: int = 0) -> int:
+        with self._lock:
+            value = super().setdefault(room, default)
+            self._sync(room)
+            return value
+
+    def update(self, *args, **kwargs) -> None:
+        with self._lock:
+            counts = dict(*args, **kwargs)
+            super().update(counts)
+            for room in counts:
+                self._sync(room)
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def popitem(self):
+        with self._lock:
+            room, count = super().popitem()
+            self._sync(room)
+            return room, count
+
+    def clear(self) -> None:
+        with self._lock:
+            rooms = list(self)
+            super().clear()
+            for room in rooms:
+                self._sync(room)
+
+    def _sync(self, room: int) -> None:
+        store = self._kv_mgr.request_status
+        # Staging chunks are counted only after the room's status exists, and a
+        # cleared room drops its held key with its status.
+        if room not in store:
+            return
+        held = int(self._kv_mgr.staging_holds_success(room))
+        if store.get(_pp_held_key(room)) != held:
+            store[_pp_held_key(room)] = held
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -336,6 +407,10 @@ class CommonKVManager(BaseKVManager):
     # shard group. Each rank owns a subset of logical KV pages.
     kv_shard_rank: int = 0
     kv_shard_size: int = 1
+    # QSA prefill KV sharding under CP-TP group sharing: decode pulls KV pages from
+    # every CP rank, but GDN/QSA/PLE state and aux only from its rank-matched
+    # one (see _is_request_peer).
+    kv_shard_state_peer_only: bool = False
 
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
@@ -426,6 +501,13 @@ class CommonKVManager(BaseKVManager):
             # No sharded rank holds a full page, so every CP rank sends.
             or self.kv_shard_size > 1
         )
+        # QSA state is whole or head-sharded on each rank. DSA indexer pages
+        # instead need every owner, even when CP and TP share a group.
+        self.kv_shard_state_peer_only = (
+            self.kv_shard_size > 1
+            and cp_tp_group_sharing
+            and StateType.QSA_COMPRESSED in args.state_types
+        )
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -491,6 +573,7 @@ class CommonKVManager(BaseKVManager):
                 self.request_status = PPConsensusStore(
                     self.pp_size, self.pp_rank, self.pp_group
                 )
+                self._staging_outstanding = _PPStagingOutstanding(self)
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -563,6 +646,51 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
+        )
+
+    # The three helpers below hold under ``kv_shard_state_peer_only`` only;
+    # callers check that flag first, so unsharded transfers read nothing new.
+
+    def _is_request_peer(self, dst_tp_rank: int) -> bool:
+        """Whether this prefill rank sends the per-request state and aux to
+        decode global TP rank ``dst_tp_rank``.
+
+        Under KV sharding with CP-TP group sharing every prefill rank sends its
+        KV pages to every decode rank, but only one sends the rest. The GDN
+        heads are split over the TP group here and over attention TP on decode,
+        so head shard r lives on prefill TP rank r (``engine_rank``) and on
+        decode attention-TP rank r. QSA and PLE state and the aux are identical
+        on every rank and travel with it, so each decode slot has one writer.
+        ``_kv_shard_peer_mismatch`` rejects decode peers of another width, so
+        the ranks pair one to one within each decode attention-DP group.
+        Decode registers its global TP rank, so reduce it by the validated
+        attention-TP width before matching the GDN head shard.
+        """
+        return dst_tp_rank % self.state_tp_size == self.kv_args.engine_rank
+
+    def _kv_shard_peer_mismatch(self, dst_attn_tp_size: int) -> Optional[str]:
+        """Why a decode peer cannot pair with this prefill, if it cannot. Every
+        prefill rank checks it, not only the state peer, so it holds even
+        without the decode-side assert in ``_resolve_rank_mapping``."""
+        if dst_attn_tp_size == self.state_tp_size:
+            return None
+        return (
+            "KV cache sharding sends the request state from prefill rank r to "
+            "decode attention-TP rank r, so the sizes must match: "
+            f"prefill={self.state_tp_size} decode={dst_attn_tp_size}"
+        )
+
+    def _kv_shard_fan_in_mismatch(self, required_dst_info_num: int) -> Optional[str]:
+        """Why a decode cannot read this prefill's KV pages, if it cannot:
+        each prefill rank owns only a subset of them, so every decode
+        attention-TP rank must pull from every prefill rank."""
+        if required_dst_info_num == self.kv_shard_size:
+            return None
+        return (
+            "KV cache sharding needs every decode attention-TP rank to pull "
+            f"from every prefill rank, but {required_dst_info_num} of "
+            f"{self.kv_shard_size} decode ranks registered for a request; the "
+            "decode may predate KV-shard fan-in for CP-TP group sharing"
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -655,6 +783,29 @@ class CommonKVManager(BaseKVManager):
             return KVPoll.Bootstrapping
         return min(statuses)
 
+    def check_status_pp_release(self, bootstrap_room: int) -> KVPoll:
+        """PP0 only. Like check_status_pp_consensus, but a room concludes only
+        once every stage has concluded and no stage holds Success for staging,
+        so no stage frees pages its own transfer still uses."""
+        statuses = self.request_status.collect(bootstrap_room)
+        if any(status is None for status in statuses):
+            return KVPoll.Bootstrapping
+        pending = [s for s in statuses if s not in (KVPoll.Success, KVPoll.Failed)]
+        if pending:
+            return min(pending)
+        if min(statuses) == KVPoll.Success and any(
+            self.request_status.collect(_pp_held_key(bootstrap_room))
+        ):
+            return KVPoll.Transferring
+        return min(statuses)
+
+    def staging_holds_success(self, bootstrap_room: int) -> bool:
+        # With deferred allocation, also wait for worker cleanup (the zero
+        # entry is only removed after cleanup) before the room can be reused.
+        return self._staging_outstanding.get(bootstrap_room, 0) > 0 or (
+            self.defer_decode_allocation and bootstrap_room in self._staging_outstanding
+        )
+
     def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
         """Aux (metadata) buffers pair up positionally, so a peer that
         registered a different number of them gets only the leading ones, and
@@ -743,6 +894,8 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
                 self._forget_sends(bootstrap_room)
+                if isinstance(self.request_status, PPConsensusStore):
+                    self.request_status.pop(_pp_held_key(bootstrap_room), None)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -1585,16 +1738,11 @@ class CommonKVManager(BaseKVManager):
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
         # TP rank mapping
-        # Only MLA shards across attn-TP, so non-MLA never reads the sharding flag.
-        if (
-            self.is_mla_backend
-            and info.enable_kv_cache_sharding
-            and info.attn_cp_size == 1
-        ):
-            # MLA KV sharded across prefill attn-TP: every decode rank pulls
-            # from all prefill TP ranks (None marks them all as real senders).
+        if info.attn_cp_size == 1 and info.enable_kv_cache_sharding:
+            # KV pages striped over the registered TP ranks (MLA attn-TP, or CP-TP
+            # group sharing's CP ranks): pull from all (None marks every real sender).
             assert self.attn_tp_size == info.attn_tp_size, (
-                "MLA KV cache sharding requires equal prefill/decode attn TP "
+                "KV cache sharding requires equal prefill/decode attn TP "
                 f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
             )
             target_tp_rank = None
@@ -2177,7 +2325,11 @@ class CommonKVManager(BaseKVManager):
                         response = session.get(
                             f"http://{bootstrap_addr}/health",
                             timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
+                            # The Rust server's /health skips its generation probe for this.
+                            headers={
+                                "Connection": "keep-alive",
+                                "X-SGLang-Bootstrap-Heartbeat": "1",
+                            },
                         )
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
@@ -2507,6 +2659,9 @@ class CommonKVSender(BaseKVSender):
     def poll_pp_consensus(self) -> KVPoll:
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
+    def poll_pp_release(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_release)
+
     def _poll_with_status(self, check_status) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -2515,15 +2670,9 @@ class CommonKVSender(BaseKVSender):
             status = check_status(self.bootstrap_room)
         else:
             status = KVPoll.Failed
-        # Hold Success until all staging chunks transferred. With deferred
-        # allocation also wait for worker cleanup (the zero entry is only
-        # removed after cleanup), before permitting the room to be reused.
-        if status == KVPoll.Success and (
-            self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-            or (
-                self.kv_mgr.defer_decode_allocation
-                and self.bootstrap_room in self.kv_mgr._staging_outstanding
-            )
+        # Hold Success until all staging chunks transferred.
+        if status == KVPoll.Success and self.kv_mgr.staging_holds_success(
+            self.bootstrap_room
         ):
             return KVPoll.Transferring
         if status == KVPoll.Bootstrapping:
@@ -2584,6 +2733,8 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if isinstance(self.kv_mgr.request_status, PPConsensusStore):
+            self.kv_mgr.request_status.pop(_pp_held_key(self.bootstrap_room), None)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -3390,12 +3541,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
+            if pp_rank not in tp_group_table:
+                self._registered_count += 1
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
             )
-
-            self._registered_count += 1
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(
