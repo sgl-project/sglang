@@ -12,7 +12,6 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mori_stub import mori_stub
@@ -187,36 +186,29 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
         manager.send_kv_status_message.assert_not_called()
 
-    def test_room_stuck_on_one_pp_stage_is_released_as_failed_on_every_stage(self):
-        # TODO(YAMY1234): with #47618 PP0 decides the release; rework for that path.
-        stages = [self._stuck_sender(KVPoll.Transferring)[0] for _ in range(2)]
-        stages[0].kv_mgr.request_status[42] = KVPoll.Success
-        stages[1]._last_chunk_time -= 61
+    def test_stage_deadline_fails_the_room_without_concluding_the_sender(self):
+        # Every stage runs it before PP0 decides; only the decision concludes.
+        sender, manager = self._stuck_sender(KVPoll.Transferring)
+        sender.check_transfer_timeout()
+        self.assertEqual(manager.request_status[42], KVPoll.Transferring)
+        sender._last_chunk_time -= 61
+        sender.check_transfer_timeout()
+        sender.check_transfer_timeout()
+        self.assertEqual(manager.request_status[42], KVPoll.Failed)
+        self.assertIsNone(sender.conclude_state)
+        manager.send_kv_status_message.assert_called_once()
+        self.assertEqual(sender.poll(), KVPoll.Failed)
 
-        consensus = None
-        for k, sender in enumerate(stages):
-            poll = sender.poll()
-            stage = SimpleNamespace(
-                pp_group=SimpleNamespace(is_first_rank=k == 0),
-                disagg_prefill_transfer_queue=[],
-                get_rids=lambda queue, is_send, *groups, poll=poll: (
-                    ["r"] if poll == KVPoll.Success else [],
-                    ["r"] if poll == KVPoll.Failed else [],
-                ),
-                _pp_recv_pyobj_from_prev_stage=lambda consensus=consensus: consensus,
-            )
-            consensus = SchedulerPPMixin._pp_pd_get_prefill_transferred_ids(stage)
-        self.assertEqual(consensus, {"r": True})
-
-    def test_pp_consensus_poll_does_not_time_out_a_later_stage(self):
+    def test_pp_release_poll_does_not_time_out_a_later_stage(self):
         # PP0's last chunk is long queued, but stage 1 has not finished its
-        # forward: the consensus poll must not count that against the timeout.
+        # forward: PP0's release poll must not count that against the timeout.
         sender, manager = self._stuck_sender(KVPoll.Success)
         manager.request_status = FakePPStatus(
             manager.request_status, {42: KVPoll.WaitingForInput}
         )
         sender._last_chunk_time -= 61
-        self.assertEqual(sender.poll_pp_consensus(), KVPoll.WaitingForInput)
+        sender.check_transfer_timeout()
+        self.assertEqual(sender.poll_pp_release(), KVPoll.WaitingForInput)
         self.assertEqual(sender.poll(), KVPoll.Success)
         manager.send_kv_status_message.assert_not_called()
 

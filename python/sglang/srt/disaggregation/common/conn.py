@@ -2684,7 +2684,8 @@ class CommonKVSender(BaseKVSender):
         )
 
     def poll_pp_consensus(self) -> KVPoll:
-        # Only propagates: each PP stage times out its own transfer in poll().
+        # Like poll_pp_release, only propagates: each PP stage times out its own
+        # transfer in check_transfer_timeout().
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
     def poll_pp_release(self) -> KVPoll:
@@ -2752,6 +2753,23 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
+
+    def check_transfer_timeout(self) -> None:
+        # Local status only, and never concludes: under PP, PP0's release
+        # decision then sees this stage's Failed once every stage has concluded.
+        if (
+            self.conclude_state is not None
+            or self.kv_mgr.transfer_timeout <= 0
+            or self._last_chunk_time is None
+        ):
+            return
+        status = self.kv_mgr.request_status.get(self.bootstrap_room)
+        if status == KVPoll.Success and self.kv_mgr.staging_holds_success(
+            self.bootstrap_room
+        ):
+            status = KVPoll.Transferring
+        if status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            self._check_transfer_timeout(status)
 
     def _check_transfer_timeout(self, status: KVPoll) -> Optional[KVPoll]:
         # Only the transfer is left once the last chunk is queued.

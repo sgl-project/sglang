@@ -1062,13 +1062,15 @@ class TestPrefillResultPolling(CustomTestCase):
                         else KVPoll.Transferring
                     ),
                     clear=Mock(),
+                    check_transfer_timeout=Mock(),
                 )
                 scheduler.disagg_prefill_transfer_queue = _sending([prior])
                 first.reqs[0].metadata_buffer_index = allocator.alloc()
                 for req in (first.reqs[0], second.reqs[0]):
                     req.pending_bootstrap = False
                     req.disagg_kv_sender = SimpleNamespace(
-                        poll=lambda: KVPoll.Transferring
+                        poll=lambda: KVPoll.Transferring,
+                        check_transfer_timeout=Mock(),
                     )
                 released = []
                 scheduler.request_retirer = leaving_retirer()
