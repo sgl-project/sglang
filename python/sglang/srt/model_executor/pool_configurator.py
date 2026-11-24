@@ -713,12 +713,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             dtype = kvc.kv_cache_dtype
-            # NPU KPool keeps BF16 index keys with packed FP8 main KV.
-            index_kpool = get_dsa_index_kpool(kvc.model_config.hf_config)
-            if dtype == torch.float8_e4m3fn and index_kpool > 1:
-                indexer_size_per_token = ceil_div(index_head_dim, index_kpool)
-                element_size = torch._utils._element_size(torch.bfloat16)
-            elif dtype != torch.float8_e4m3fn:
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            if dtype != torch.float8_e4m3fn:
                 indexer_quant_mode = resolve_indexer_quant_mode(
                     kvc.server_args.indexer_kv_cache_dtype, dtype
                 )
