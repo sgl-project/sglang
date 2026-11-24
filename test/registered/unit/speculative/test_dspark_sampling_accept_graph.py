@@ -16,10 +16,15 @@ from sglang.srt.speculative.dspark_components import (
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 STRIDE = 6
 GAMMA = STRIDE - 1
@@ -37,11 +42,11 @@ def _sampling_info(**overrides):
         is_all_greedy=False,
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
         has_custom_logit_processor=False,
-        acc_linear_penalties=None,
-        penalizer_orchestrator=None,
-        grammar_mask=None,
+        step_penalties=None,
         logit_bias=None,
+        watermark=None,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -71,6 +76,8 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, _sampling_info(is_any_greedy=True))
     assert not _eligible(worker, _sampling_info(need_top_k_sampling=True))
     assert not _eligible(worker, _sampling_info(need_top_p_sampling=True))
+    assert not _eligible(worker, _sampling_info(need_min_p_sampling=True))
+    assert not _eligible(worker, _sampling_info(watermark=object()))
     assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
     assert not _eligible(worker, _sampling_info(), folded=False)
     assert not _eligible(worker, _sampling_info(), grammar=True)

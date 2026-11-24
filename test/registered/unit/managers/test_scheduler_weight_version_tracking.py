@@ -12,6 +12,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -308,10 +309,18 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
-        patcher = patch("torch.distributed.barrier")
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
-        # a single TP rank, whose gather returns its own outcome
+        # a single rank, whose gathers return its own outcome
+        group_gather = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            side_effect=lambda obj: [obj],
+        )
+        group_gather.start()
+        self.addCleanup(group_gather.stop)
         gather = patch(
             "torch.distributed.all_gather_object",
             side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
@@ -413,7 +422,9 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
-        with patch("torch.distributed.barrier"):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        ):
             output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
@@ -533,22 +544,12 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertIsNone(manager._session)
 
     def test_end_reports_other_ranks_incomplete_update_once(self):
-        """Only rank 0 replies: halves left unpaired on ranks 1 and 2 fail its reply, named once."""
-        gathered = [
-            (0, None),
-            (0, "target: only one half"),
-            (0, "target: only one half"),
-        ]
+        """Only one rank of the group replies: halves left unpaired on its peers fail its reply, named once."""
         manager = self._manager(_runner())
 
-        with (
-            patch(
-                "torch.distributed.all_gather_object",
-                side_effect=lambda outputs, obj, group: outputs.__setitem__(
-                    slice(None), gathered
-                ),
-            ),
-            get_parallel().override(tp_rank=0, tp_size=3),
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[None, "target: only one half", "target: only one half"],
         ):
             output = manager.end_weight_update(EndWeightUpdateReqInput())
 
@@ -764,16 +765,61 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
         manager.scheduler = None
         manager.memory_saver_adapter = Mock()
 
-        def a_peer_is_busy(busy, **kwargs):
-            busy.fill_(1)
-
-        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[True, False],
+        ):
             output = manager.release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
             )
 
         self.assertFalse(output.success)
         manager.memory_saver_adapter.pause.assert_not_called()
+
+
+class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):
+    def test_a_failed_release_retries_only_unreleased_tags(self):
+        """A tag released before a later tag failed is not released again on retry."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.pause.side_effect = [None, RuntimeError, None]
+        manager.flush_cache = Mock()
+        request = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+
+        with (
+            patch("torch.distributed.all_reduce"),
+            patch("torch.distributed.barrier"),
+            patch("torch.get_device_module"),
+        ):
+            with self.assertRaises(RuntimeError):
+                manager.release_memory_occupation(request)
+            manager.release_memory_occupation(request)
+
+        self.assertEqual(
+            [c.args[0] for c in manager.memory_saver_adapter.pause.call_args_list],
+            ["kv_cache", "cuda_graph", "cuda_graph"],
+        )
+        self.assertEqual(manager.offload_tags, {"kv_cache", "cuda_graph"})
+
+    def test_a_failed_resume_retries_only_released_tags(self):
+        """A tag resumed before a later tag failed is not resumed again on retry."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.resume.side_effect = [None, RuntimeError, None]
+        manager.offload_tags.update({"kv_cache", "cuda_graph"})
+        request = ResumeMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+
+        with self.assertRaises(RuntimeError):
+            manager.resume_memory_occupation(request)
+        manager.resume_memory_occupation(request)
+
+        self.assertEqual(
+            [c.args[0] for c in manager.memory_saver_adapter.resume.call_args_list],
+            ["cuda_graph", "kv_cache", "kv_cache"],
+        )
+        self.assertEqual(manager.offload_tags, set())
 
 
 class _RecordingStream:
