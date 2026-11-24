@@ -172,6 +172,18 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
 
+    @property
+    def quant_description(self) -> list:
+        # Quant surface as flat name list: all group targets + ignore entries.
+        # VLM wrapper models (e.g. KimiK3) probe this to detect checkpoints saved
+        # with wrapper-prefixed quant names ("language_model.") and pick the matching
+        # inner-LM module prefix. Empty when nothing is configured.
+        names = []
+        for targets in self.target_scheme_map:
+            names.extend(targets if isinstance(targets, (list, tuple)) else [targets])
+        names.extend(self.ignore)
+        return names
+
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 

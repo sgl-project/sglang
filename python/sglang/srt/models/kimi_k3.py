@@ -3772,6 +3772,9 @@ class KimiK3LinearForCausalLM(nn.Module):
     packed_modules_mapping = {
         "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
         "fused_qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        # MLA layers fuse q_a_proj + kv_a_proj_with_mqa (deepseek_v2 attention);
+        # both shards are enumerated separately in llm-compressor ignore lists.
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
 
     def __init__(
