@@ -330,6 +330,9 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.runtime_switch_agreement import (
+    agree_runtime_switches,
+)
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     RPC_METHODS,
@@ -615,6 +618,7 @@ class Scheduler(
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
+        self.check_runtime_switches_agree()
 
         # Init metrics stats
         self.init_metrics_collector()
@@ -2874,6 +2878,17 @@ class Scheduler(
             freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
 
+    def check_runtime_switches_agree(self) -> None:
+        """On a megakernel server, fail startup unless every rank resolves the NVIDIA
+        runtime switches alike; without the megakernel flag nothing is checked."""
+        # Elastic EP joiners cannot enter a WORLD collective during startup.
+        if get_exec().moe.is_ep_joiner:
+            return
+        agree_runtime_switches(
+            group=get_parallel().world_group,
+            megakernel=get_exec().kernel.enable_nvidia_megakernel,
+        )
+
     def init_rank_consensus_checker(self) -> None:
         groups = []
         if self.attn_cp_group is not None and self.attn_tp_group is not None:
@@ -3931,6 +3946,31 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def _l3vt_refetch_on_loss(self, req: Req) -> bool:
+        """SGLANG_OPT_HICACHE_L3_VICTIM_TIER: a storage hit inserted for this
+        request was evicted from the host tier before admission (an unpinned
+        hit, past the pin cap). Look it up again rather than recompute it."""
+        expected = req.l3vt_expected_match_len
+        req.l3vt_expected_match_len = None
+        current = req.prefix_len + req.host_hit_length
+        if current + self.tree_cache.prefetch_threshold > expected:
+            return False
+        if (
+            req.storage_prefetch_retry_attempts
+            >= get_memory().hicache_storage_prefetch_retry_max_attempts
+        ):
+            return False
+        logger.info(
+            "HiCache storage hit lost before admission req=%s expected_match=%d "
+            "current_match=%d; reissuing storage lookup",
+            req.rid,
+            expected,
+            current,
+        )
+        self.tree_cache.l3vt_note_refetch()
+        self._retry_storage_prefetch(req)
+        return True
+
     def _add_request_to_queue(
         self,
         req: Req,
@@ -4876,6 +4916,13 @@ class Scheduler(
                     # Cache-mode host memory is a resident L2 tier. Buffer mode
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
+                if self.enable_hicache_storage and self.tree_cache.l3vt_pin_active:
+                    # The match end this poll's popped storage hit should reach.
+                    req.l3vt_expected_match_len = (
+                        loaded_start + loaded_tokens
+                        if loaded_tokens > 0 and loaded_start is not None
+                        else None
+                    )
 
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
@@ -4888,6 +4935,17 @@ class Scheduler(
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
+            ):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
+                continue
+            if (
+                self.enable_hicache_storage
+                and self.tree_cache.l3vt_pin_active
+                and req.l3vt_expected_match_len is not None
+                and self._l3vt_refetch_on_loss(req)
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
@@ -4967,6 +5025,8 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
+        if self.enable_hicache_storage and self.tree_cache.l3vt_pin_active:
+            self.tree_cache.release_l3_pins(can_run_list)
         # Every other request of the batch comes from the waiting queue.
         admitted = [req for req in can_run_list if req is not resumed_req]
         self.invariant_checker.check_admitted(admitted)
@@ -6265,6 +6325,7 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
+                    idle &= tc.l3vt_puts_in_flight() == 0
                     if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging

@@ -676,6 +676,9 @@ class Req(ReqDllmMixin):
         # Device/host prefix used to plan the latest L3 lookup. Admission uses
         # it to detect newly exposed storage demand after queue-time eviction.
         self.storage_prefetch_last_match_len: Optional[int] = None
+        # SGLANG_OPT_HICACHE_L3_VICTIM_TIER: the match end a popped storage hit
+        # should reach at admission; None when there is nothing to check.
+        self.l3vt_expected_match_len: Optional[int] = None
         # Logical-page KV sharding: rotation base of the chain this request
         # extends (owner of position-page P is (base + P) % shard_size).
         # Refreshed at every sharded alloc — read through last_node, or drawn

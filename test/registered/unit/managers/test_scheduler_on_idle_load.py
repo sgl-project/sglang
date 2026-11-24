@@ -231,5 +231,57 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         self.assertEqual(progress_wait.call_count, 2)
 
 
+class TestHiCacheIdleAccounting(CustomTestCase):
+    def test_l3_victim_puts_in_flight_keep_the_scheduler_busy(self):
+        """A cache flush or a storage detach needs a fully idle scheduler. An L3
+        victim put holds its host pages until the ack frees them, so one in flight
+        keeps the scheduler non-idle, as a storage backup in flight does."""
+        s = Scheduler.__new__(Scheduler)
+        s.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            request_retirer=None,
+            send_abort=None,
+        )
+        s.running_batch = MagicMock()
+        s.running_batch.is_empty.return_value = True
+        s.last_batch = None
+        s.enable_overlap = False
+        s._pp_microbatches_drained = MagicMock(return_value=True)
+        s.waiting_queue = []
+        s.grammar_manager = SimpleNamespace(grammar_queue=[])
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        s.running_reqs = []
+        s.dllm_config = None
+        s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        s.disagg_decode_prealloc_queue = None
+        s.disagg_decode_transfer_queue = None
+        s.hisparse_coordinator = None
+        s.decode_offload_manager = None
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        s.pause_state = PauseState()
+        s.request_receiver = object.__new__(SchedulerRequestReceiver)
+        s.enable_lmcache = False
+        s.enable_unified_cache_external_linker = False
+        s.enable_hierarchical_cache = True
+        in_flight = [1]
+        s.tree_cache = SimpleNamespace(
+            ongoing_write_through={},
+            ongoing_load_back={},
+            enable_storage=True,
+            ongoing_prefetch={},
+            ongoing_backup={},
+            l3vt_puts_in_flight=lambda: in_flight[0],
+        )
+        memory = SimpleNamespace(hicache_host_memory_mode="cache")
+        with patch("sglang.srt.managers.scheduler.get_memory", return_value=memory):
+            self.assertFalse(s.is_fully_idle())
+            self.assertTrue(s.is_fully_idle(for_health_check=True))
+            in_flight[0] = 0
+            self.assertTrue(s.is_fully_idle())
+
+
 if __name__ == "__main__":
     unittest.main()

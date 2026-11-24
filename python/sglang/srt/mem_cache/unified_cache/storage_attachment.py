@@ -311,6 +311,7 @@ class StorageAttachment:
         )
         cache.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         cache.enable_storage_metrics = enable_storage_metrics
+        cache.init_l3_victim_tier()
 
         if enable_storage_metrics:
             cache.storage_metrics_collector = self._resolve_metrics_collector(
@@ -460,6 +461,7 @@ class StorageAttachment:
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
         cache._backup_requested_tokens.clear()
+        cache.release_l3_victim_tier()
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)

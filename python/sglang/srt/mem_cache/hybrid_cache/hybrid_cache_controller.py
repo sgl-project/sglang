@@ -196,6 +196,13 @@ class StorageOperation(BaseStorageOperation):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        # L3 victim tier (l3_victim_tier.py): a backup lease-touches what it wrote
+        # once written; the touch's counts. A lookup's re-charged budget span and
+        # the start of its storage read.
+        self.l3vt_touch = False
+        self.l3vt_touch_result: Optional[dict] = None
+        self.l3vt_charged: Optional[int] = None
+        self.l3vt_io_t0: Optional[float] = None
 
 
 class PrefetchOperation(StorageOperation):
@@ -1674,6 +1681,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        lease_touch: bool = False,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1682,6 +1690,8 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        # Set before the op is queued, so the backup thread sees it.
+        operation.l3vt_touch = lease_touch
         self.backup_queue.put(operation)
         return operation.id
 
@@ -2140,9 +2150,26 @@ class HybridCacheController(BaseHiCacheController):
                 if operation is None:
                     continue
                 self._page_backup_or_log(operation)
+                if operation.l3vt_touch:
+                    self._l3vt_touch_after_put(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
+
+    def _l3vt_touch_after_put(self, operation) -> None:
+        """L3 victim tier lease touch: one existence check over what a victim
+        put (or chain close) wrote, before the op is acked. Never fails the op:
+        a touch error only loses the lease."""
+        hashes = list(operation.hash_value or [])
+        done = min(len(hashes), operation.completed_tokens // self.page_size)
+        try:
+            operation.l3vt_touch_result = self.storage_backend.l3vt_touch(
+                hashes[:done],
+                [t for t in operation.pool_transfers or [] if t.keys],
+            )
+        except Exception:  # noqa: BLE001 - a lost lease is not a lost write
+            operation.l3vt_touch_result = {"failed": 1}
+            logger.warning("HiCache L3 victim tier: lease touch failed", exc_info=True)
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
