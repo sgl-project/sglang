@@ -1,6 +1,7 @@
 """ROCm GQA DSpark draft KV ring: where the DSpark worker places draft KV is where the
 window reads it (a placement and readback test; the KV writes themselves are stubbed)."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -138,3 +139,7 @@ def test_window_reads_what_the_dspark_worker_wrote():
         read = kv[indices[indptr[b] : indptr[b + 1]]]
         expected = _value(slots[b].expand(positions.numel()), positions)
         assert torch.equal(read, expected)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
