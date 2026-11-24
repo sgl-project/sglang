@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="nightly", runner_config="1-gpu-large")
 # backend-specific: MUSA uses the native weighting operator in its serving path.
-register_musa_ci(est_time=6, suite="nightly-musa-1-gpu", nightly=True)
+register_musa_ci(est_time=6, suite="nightly-test-1-gpu-musa", nightly=True)
 
 
 class TestGgufMoeWeights(CustomTestCase):

@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="full-2-npu-a3",
+    suite="full-test-2-npu-a3",
     nightly=True,
 )
 
@@ -60,7 +60,8 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "--max-total-tokens",
                 "1024",
                 "--disable-radix-cache",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
             env={
                 "TRANSFORMERS_VERBOSITY": "error",

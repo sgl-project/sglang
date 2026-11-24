@@ -15,7 +15,11 @@ import torch
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="base-a-test-npu")
+register_npu_ci(est_time=4, suite="extra-a-test-npu")
+
+# The backend imports ragged_verify at module level, so load the REAL module
+# before the stub block below shadows its package parent.
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode  # noqa: F401
 
 for mod in (
     "torch_npu",
@@ -1107,6 +1111,99 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
         quant_cache.assert_not_called()
+
+
+class TestMirrorlessReplayWidthHint(unittest.TestCase):
+    """max_seq_len_host bounds the mirrorless replay-prep copy widths."""
+
+    _PAGE = 128
+    _WIDTH = 64  # captured block-table width, in pages
+
+    @staticmethod
+    def _verify_mode():
+        mode = MagicMock()
+        mode.is_target_verify.return_value = True
+        mode.is_draft_extend_v2.return_value = False
+        mode.is_idle.return_value = False
+        return mode
+
+    def _replay_backend(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.page_size = self._PAGE
+        backend._dsv4_has_c4 = True
+        backend._dsv4_has_c128 = False
+        backend._dsv4_graph_tokens_per_req = 8
+        backend._is_dspark_algorithm = False
+        backend._is_dspark_draft_worker = False
+        backend.graph_metadata = {
+            "block_tables": torch.zeros((2, self._WIDTH), dtype=torch.int32)
+        }
+        return backend
+
+    def _replay_batch(self, hint):
+        seq_lens = torch.tensor([300, 660], dtype=torch.int32)
+        return SimpleNamespace(
+            forward_mode=self._verify_mode(),
+            batch_size=2,
+            num_padding=0,
+            spec_info=None,
+            seq_lens=seq_lens,
+            seq_lens_cpu=None,  # mirrorless
+            req_pool_indices=torch.tensor([0, 1]),
+            out_cache_loc=torch.zeros(16, dtype=torch.int64),
+            max_seq_len_host=hint,
+        )
+
+    def test_replay_ctx_caps_compress_width_at_hint(self):
+        backend = self._replay_backend()
+        ctx = backend._build_dsv4_graph_replay_ctx(self._replay_batch(hint=300))
+        # hint 300 -> ceil(300/128)+1 = 4 pages of slack -> 512 tokens, well
+        # under the captured 64-page width.
+        self.assertTrue(ctx.mirrorless)
+        self.assertEqual(ctx.compress_seq_lens_max, 4 * self._PAGE)
+
+    def test_replay_ctx_caps_compress_width_at_captured_width(self):
+        backend = self._replay_backend()
+        ctx = backend._build_dsv4_graph_replay_ctx(self._replay_batch(hint=None))
+        self.assertEqual(ctx.compress_seq_lens_max, self._WIDTH * self._PAGE)
+
+    def test_replay_ctx_hint_above_captured_width_never_overshoots(self):
+        backend = self._replay_backend()
+        ctx = backend._build_dsv4_graph_replay_ctx(self._replay_batch(hint=10**9))
+        self.assertEqual(ctx.compress_seq_lens_max, self._WIDTH * self._PAGE)
+
+    def _swa_refresh_copied_width(self, hint):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.page_size = self._PAGE
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda locs: locs
+        )
+        copied = {}
+        backend._copy_page_table_into_graph = lambda key, src: copied.setdefault(
+            "src", src
+        )
+        fm = SimpleNamespace(
+            swa_loc=torch.zeros(4, dtype=torch.int64),
+            block_tables_swa=torch.arange(16, dtype=torch.int32).reshape(2, 8),
+        )
+        ctx = SimpleNamespace(
+            fm=fm,
+            mirrorless=True,
+            bs=2,
+            forward_batch=SimpleNamespace(
+                max_seq_len_host=hint,
+                out_cache_loc=torch.zeros(4, dtype=torch.int64),
+            ),
+        )
+        backend._refresh_graph_swa_metadata_direct(ctx)
+        return copied["src"].shape[1]
+
+    def test_swa_refresh_sliced_to_hint_plus_one_page(self):
+        # hint 100 (+1 page slack) -> 2 of the 8 captured pages.
+        self.assertEqual(self._swa_refresh_copied_width(100), 2)
+
+    def test_swa_refresh_without_hint_copies_full_width(self):
+        self.assertEqual(self._swa_refresh_copied_width(None), 8)
 
 
 if __name__ == "__main__":

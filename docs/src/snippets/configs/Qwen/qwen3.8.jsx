@@ -86,16 +86,16 @@ export const config = {
   },
 
   // Per-hardware image for Docker mode. The two ROCm images are not
-  // interchangeable: MI300X (gfx942) takes the mi30x build on ROCm 7.00,
-  // MI350X/MI355X (gfx950) the mi35x build on ROCm 7.20.
+  // interchangeable: MI300X (gfx942) takes the mi30x build, MI350X/MI355X
+  // (gfx950) the mi35x build.
   dockerImages: {
-    h200:   "lmsysorg/sglang:qwen38",
-    b200:   "lmsysorg/sglang:qwen38",
-    b300:   "lmsysorg/sglang:qwen38",
-    gb300:  "lmsysorg/sglang:qwen38",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813",
-    mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
+    h200:   "lmsysorg/sglang:latest",
+    b200:   "lmsysorg/sglang:latest",
+    b300:   "lmsysorg/sglang:latest",
+    gb300:  "lmsysorg/sglang:latest",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113",
   },
 
   // Per-hardware notes shown above a multi-node command. Every multi-node recipe
@@ -404,7 +404,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -414,6 +413,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--attention-backend trtllm_mha",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-ssm-dtype bfloat16",
         "--mamba-radix-cache-strategy extra_buffer",
         "--speculative-algorithm NEXTN",
@@ -480,7 +480,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -495,6 +494,7 @@ export const config = {
         "--attention-backend trtllm_mha",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm NEXTN",
@@ -570,7 +570,6 @@ export const config = {
       // The sizing is derived, not measured.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -584,6 +583,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -663,14 +663,13 @@ export const config = {
       // back to Triton.
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm NEXTN",
@@ -809,7 +808,6 @@ export const config = {
       // DeepEP v2 a2a rules DSpark out under DP-attention.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "dspark", nodes: "multi-4" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -823,6 +821,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -834,7 +833,6 @@ export const config = {
       // model in place of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "multi-2" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -849,6 +847,7 @@ export const config = {
         "--attention-backend trtllm_mha",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
@@ -869,7 +868,6 @@ export const config = {
       // of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "dspark", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -882,6 +880,7 @@ export const config = {
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -898,7 +897,6 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_ENABLE_MOE_DEFERRED_FINALIZE=1",
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -911,6 +909,7 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",

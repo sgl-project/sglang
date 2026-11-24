@@ -18,6 +18,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
@@ -230,11 +231,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
-    is_sm100 = (
-        torch.cuda.is_available()
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    is_sm100 = current_arch().is_sm(10)
     if _is_hip:
         supported = (
             is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
@@ -1373,7 +1370,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     self.sliding_window,
                     online_mtp_max_draft_tokens or 0,
                 ),
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
             )
             self.request_window_memory = RequestWindowMemory(
                 window_spec,
@@ -1397,7 +1394,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
         elif self._unified_kv:
@@ -1442,7 +1439,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
 
@@ -2022,6 +2019,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             global_page_size=global_page_size,
             kv_layout=kv_layout,
         )
+
+    def _window_kv_layout(self) -> KVLayout:
+        """kv_layout of the non-compressed (full/swa/window) pools. Mirrors
+        :func:`compressed_kv_layout` so backends resolve their row format per
+        pool role; the default keeps the model-level value."""
+        return self.kv_layout
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
         """Layout of the compressed cache of ``compress_ratio``, see
@@ -2636,17 +2639,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
-        )
-
-    def set_index_k_fused(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-    ) -> None:
-        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        return self._indexer_pool(compress_ratio).set_index_fused(
-            compress_layer_id, loc, cache_k
         )
 
     def set_index_k_fp4(
