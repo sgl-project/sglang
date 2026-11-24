@@ -23,22 +23,13 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.common import add_prefix
-from sglang.srt.layers.utils.layer_list import make_pp_layers
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.gigachat35 import (
     GigaChat35DecoderLayer,
     GigaChat35ForCausalLM,
     GigaChat35Model,
-    build_norm,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
 
 
@@ -114,47 +105,15 @@ class GigaChat4DecoderLayer(GigaChat35DecoderLayer):
 
 
 class GigaChat4Model(GigaChat35Model):
+    decoder_layer_cls = GigaChat4DecoderLayer
+
     def __init__(
         self,
         config: GigaChat4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        nn.Module.__init__(self)
-        self.config = config
-        self.padding_idx = getattr(config, "pad_token_id", None)
-        self.vocab_size = config.vocab_size
-        self.pp_group = get_parallel().pp_group
-
-        if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                prefix=add_prefix("embed_tokens", prefix),
-            )
-        else:
-            self.embed_tokens = None
-
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: GigaChat4DecoderLayer(
-                config=config,
-                layer_id=idx,
-                quant_config=quant_config,
-                prefix=prefix,
-                alt_stream=self.alt_stream,
-            ),
-            prefix=add_prefix("layers", prefix),
-            stage_facts=lambda idx: GigaChat4DecoderLayer.stage_facts(config, idx),
-        )
-
-        if self.pp_group.is_last_rank:
-            self.norm = build_norm(config, config.hidden_size)
-        else:
-            self.norm = None
-
+        super().__init__(config, quant_config, prefix)
         self.layers_to_capture: list[int] = []
 
     def forward(
@@ -215,32 +174,7 @@ class GigaChat4Model(GigaChat35Model):
 
 
 class GigaChat4ForCausalLM(GigaChat35ForCausalLM):
-    def __init__(
-        self,
-        config: GigaChat4Config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        nn.Module.__init__(self)
-        self.config = config
-        self.quant_config = quant_config
-        self.pp_group = get_parallel().pp_group
-        self.num_fused_shared_experts = 0
-
-        self.model = GigaChat4Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
-        if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
-            )
-        else:
-            self.lm_head = None
-        self.logits_processor = LogitsProcessor(config)
+    model_cls = GigaChat4Model
 
     @torch.no_grad()
     def forward(

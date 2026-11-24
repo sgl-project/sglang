@@ -522,6 +522,8 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
 
 
 class GigaChat35Model(nn.Module):
+    decoder_layer_cls = GigaChat35DecoderLayer
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -547,7 +549,7 @@ class GigaChat35Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: GigaChat35DecoderLayer(
+            lambda idx, prefix: self.decoder_layer_cls(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -555,7 +557,7 @@ class GigaChat35Model(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
-            stage_facts=lambda idx: GigaChat35DecoderLayer.stage_facts(config, idx),
+            stage_facts=lambda idx: self.decoder_layer_cls.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:
@@ -608,6 +610,7 @@ class GigaChat35Model(nn.Module):
 
 class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
     hf_to_sglang_mapper = _GIGACHAT_WEIGHT_MAPPER
+    model_cls = GigaChat35Model
 
     def __init__(
         self,
@@ -621,7 +624,7 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
 
-        self.model = GigaChat35Model(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:

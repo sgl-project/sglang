@@ -46,6 +46,8 @@ from sglang.srt.utils import BumpAllocator
 
 
 class GigaChat35ModelNextN(nn.Module):
+    decoder_layer_cls = GigaChat35DecoderLayer
+
     def __init__(
         self,
         config: GigaChat35Config,
@@ -69,7 +71,7 @@ class GigaChat35ModelNextN(nn.Module):
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         with layer_stack():
-            self.decoder = GigaChat35DecoderLayer(
+            self.decoder = self.decoder_layer_cls(
                 config=config,
                 layer_id=0,
                 quant_config=quant_config,
@@ -136,6 +138,7 @@ class GigaChat35ModelNextN(nn.Module):
 
 class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
     hf_to_sglang_mapper = _GIGACHAT_WEIGHT_MAPPER
+    model_cls = GigaChat35ModelNextN
 
     def __init__(
         self,
@@ -154,7 +157,7 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         )
         self.quant_config = quant_config
 
-        self.model = GigaChat35ModelNextN(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(

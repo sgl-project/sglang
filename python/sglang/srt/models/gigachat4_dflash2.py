@@ -99,6 +99,7 @@ class GigaChat4DFlash2DraftModel(DFlash2DraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.shift_label = bool(config.dflash_config.get("shift_label", True))
         self.num_stages = int(config.num_hidden_layers)
         self.norm = build_norm(config, config.hidden_size)
         self.hidden_norm = build_norm(config, config.hidden_size)

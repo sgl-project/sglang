@@ -1023,7 +1023,6 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
@@ -1474,6 +1473,12 @@ class DeepseekSparseAttnBackend(
 
     def update_verify_buffers_to_fill_after_draft(self, *args, **kwargs):
         return None
+
+    def _with_draft_chain(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        # A chain draft step attends to the prefix plus its own earlier drafts.
+        if self.draft_decode_len:
+            return seq_lens + self.draft_decode_len
+        return seq_lens
 
     def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
         """Column count to scan req_to_token during graph replay. Reads the wide
@@ -2166,9 +2171,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
-            draft_decode_len = self.draft_decode_len
-            if draft_decode_len:
-                seq_lens = seq_lens + draft_decode_len
+            seq_lens = self._with_draft_chain(seq_lens)
             cache_seqlens_int32 = seq_lens.to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
 
@@ -2359,10 +2362,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
-            # A chain draft step's metadata covers the prefix plus its own chain.
-            draft_decode_len = self.draft_decode_len
-            if draft_decode_len:
-                seq_lens = seq_lens + draft_decode_len
+            seq_lens = self._with_draft_chain(seq_lens)
 
             if (
                 (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
