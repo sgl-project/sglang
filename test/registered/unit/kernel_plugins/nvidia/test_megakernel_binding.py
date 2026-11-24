@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.kernel_plugins.nvidia import binding as mb
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -195,6 +196,10 @@ class TestMegakernelBindingDsa(CustomTestCase):
         self.assertEqual(view.set_mla_kv_buffer(1, 2, 3, 4), (1, 2, 3, 4))
         # a pool without index-K pages
         self.assertIsNone(mb.KvPoolView(SimpleNamespace()).index_page_size)
+
+    def test_the_pool_view_offers_the_swa_key_layout(self):
+        pool = SimpleNamespace(get_swa_key_layout=lambda: KVLayout.V41_NEW)
+        self.assertIs(mb.KvPoolView(pool).get_swa_key_layout(), KVLayout.V41_NEW)
 
     def test_a_replaced_dsa_buffer_fails_assert_live(self):
         for attr, name in (
