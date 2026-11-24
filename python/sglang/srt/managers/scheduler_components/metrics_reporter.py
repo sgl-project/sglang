@@ -251,6 +251,7 @@ class SchedulerMetricsReporter:
             and parallel.attn_cp_rank == 0
         )
         self._init_metrics()
+        self._init_hicache_window_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
         # not synchronize the model stream once per generated token.
@@ -1202,6 +1203,17 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer._report()
             self.scheduler._fpm_publisher.shutdown()
 
+    def _init_hicache_window_metrics(self) -> None:
+        # The host window series exist only for a host tier with window pools.
+        if (
+            self.metrics_collector is None
+            or not self.scheduler.enable_hierarchical_cache
+        ):
+            return
+        tree_cache = self.scheduler.tree_cache
+        if isinstance(tree_cache, UnifiedRadixCache) and tree_cache.window_host_pools():
+            self.metrics_collector.init_hicache_window_metrics()
+
     def _log_hicache_stats(self):
         """Populate HiCache host-tier stats on self.stats.
 
@@ -1217,14 +1229,23 @@ class SchedulerMetricsReporter:
         self.stats.hicache_host_total_tokens = host_total
 
         mamba_host_pool = None
+        window_host_pools = {}
         if (
             isinstance(self.scheduler.tree_cache, UnifiedRadixCache)
             and self.scheduler.tree_cache.host_pool_group is not None
         ):
-            entry = self.scheduler.tree_cache.host_pool_group.entry_map.get(
-                PoolName.MAMBA
-            )
+            entry_map = self.scheduler.tree_cache.host_pool_group.entry_map
+            entry = entry_map.get(PoolName.MAMBA)
             mamba_host_pool = None if entry is None else entry.host_pool
+            window_host_pools = self.scheduler.tree_cache.window_host_pools()
+        if window_host_pools:
+            self.stats.hicache_host_window_total_tokens = {
+                name: pool.logical_size for name, pool in window_host_pools.items()
+            }
+            self.stats.hicache_host_window_used_tokens = {
+                name: pool.logical_size - pool.available_size()
+                for name, pool in window_host_pools.items()
+            }
         if mamba_host_pool is not None:
             mamba_total = mamba_host_pool.logical_size
             self.stats.hicache_host_mamba_used_states = (

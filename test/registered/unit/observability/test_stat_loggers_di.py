@@ -32,6 +32,8 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -89,6 +91,11 @@ class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
 
 
 class _RecordingStorageMetricsCollector(StorageMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
+
+
+class _RecordingRadixCacheMetricsCollector(RadixCacheMetricsCollector):
     _counter_cls = _RecordingMetric
     _histogram_cls = _RecordingMetric
 
@@ -527,6 +534,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
             logical_size=1000, available_size=lambda: 400
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
+        tree_cache.window_host_pools.return_value = {}
         reporter.scheduler = SimpleNamespace(
             enable_hierarchical_cache=True,
             tree_cache=tree_cache,
@@ -539,6 +547,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         collector = MagicMock()
         collector.labels = self.labels
         collector.enable_hierarchical_cache = True
+        collector.enable_hicache_window_metrics = False
         collector.hicache_host_mamba_used_states = _RecordingMetric(
             name="sglang:hicache_host_mamba_used_states",
             labelnames=self.labels.keys(),
@@ -627,6 +636,145 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 0)
         self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 138)
         collector.log_stats.assert_called_once_with(reporter.stats)
+
+
+class TestHiCacheHostWindowMetrics(CustomTestCase):
+    """A hybrid-SWA prefix can be loaded back only while its window is on host,
+    so a full window host pool silently disables the host tier although its KV
+    is still there. The window host pools and host evictions are exported for
+    such a host tier only: other deployments must not grow new series."""
+
+    def setUp(self):
+        self.labels = {"model_name": "test"}
+
+    def _reporter(self, window_host_pools, *, collector=None):
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        tree_cache = MagicMock(spec=UnifiedRadixCache)
+        tree_cache.full_kv_pool_host = SimpleNamespace(
+            logical_size=1000, available_size=lambda: 400
+        )
+        tree_cache.host_pool_group = SimpleNamespace(entry_map={})
+        tree_cache.window_host_pools.return_value = window_host_pools
+        reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True, tree_cache=tree_cache
+        )
+        reporter.metrics_collector = collector
+        reporter.stats = SchedulerStats()
+        return reporter
+
+    def _collector(self):
+        # A scheduler collector with only the series this test reads.
+        collector = SimpleNamespace(
+            labels=self.labels,
+            _gauge_cls=_RecordingMetric,
+            enable_hicache_window_metrics=False,
+        )
+        collector.init_hicache_window_metrics = lambda: (
+            SchedulerMetricsCollector.init_hicache_window_metrics(collector)
+        )
+        collector._log_pool_gauge = lambda gauge, data: (
+            SchedulerMetricsCollector._log_pool_gauge(collector, gauge, data)
+        )
+        return collector
+
+    def test_window_host_pools_are_reported_by_pool(self):
+        swa_pool = SimpleNamespace(logical_size=200, available_size=lambda: 50)
+        collector = self._collector()
+        reporter = self._reporter({"swa": swa_pool}, collector=collector)
+
+        reporter._init_hicache_window_metrics()
+        reporter._log_hicache_stats()
+
+        self.assertTrue(collector.enable_hicache_window_metrics)
+        self.assertEqual(reporter.stats.hicache_host_window_used_tokens, {"swa": 150})
+        self.assertEqual(reporter.stats.hicache_host_window_total_tokens, {"swa": 200})
+        self.assertEqual(
+            collector.hicache_host_window_used_tokens.labelnames,
+            ("model_name", "pool"),
+        )
+        for gauge, value in (
+            (collector.hicache_host_window_used_tokens, 150),
+            (collector.hicache_host_window_total_tokens, 200),
+        ):
+            SchedulerMetricsCollector._log_pool_gauge(collector, gauge, {"swa": value})
+            self.assertEqual(gauge.sets, [({**self.labels, "pool": "swa"}, value)])
+
+    def test_reporter_registers_window_series_only_with_window_host_pools(self):
+        swa_pool = SimpleNamespace(logical_size=200, available_size=lambda: 50)
+        with_windows = MagicMock()
+        self._reporter(
+            {"swa": swa_pool}, collector=with_windows
+        )._init_hicache_window_metrics()
+        with_windows.init_hicache_window_metrics.assert_called_once_with()
+
+        without_windows = MagicMock()
+        reporter = self._reporter({}, collector=without_windows)
+        reporter._init_hicache_window_metrics()
+        reporter._log_hicache_stats()
+        without_windows.init_hicache_window_metrics.assert_not_called()
+        self.assertEqual(reporter.stats.hicache_host_window_total_tokens, {})
+
+        no_hicache = MagicMock()
+        reporter = self._reporter({"swa": swa_pool}, collector=no_hicache)
+        reporter.scheduler.enable_hierarchical_cache = False
+        reporter._init_hicache_window_metrics()
+        no_hicache.init_hicache_window_metrics.assert_not_called()
+
+    def test_radix_cache_collector_has_no_host_eviction_series_by_default(self):
+        collector = _RecordingRadixCacheMetricsCollector(labels=self.labels)
+        self.assertFalse(hasattr(collector, "hicache_host_evicted_tokens"))
+
+        collector.init_host_window_metrics()
+        collector.increment_host_evicted_tokens(num_tokens=7, pool="swa")
+        self.assertEqual(
+            collector.hicache_host_evicted_tokens.increments,
+            [({**self.labels, "pool": "swa"}, 7)],
+        )
+
+    def _cache(self, window_host_pools):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.metrics_collector = MagicMock()
+        cache._host_window_metrics = False
+        cache.window_host_pools = lambda: window_host_pools
+
+        def component(family, name, pool_name=None):
+            return SimpleNamespace(
+                slot=SimpleNamespace(family=family, component=name),
+                pool_name=pool_name,
+            )
+
+        cache.components = {
+            ComponentType.FULL: component(TREE_TOKEN, "full"),
+            ComponentType.SWA: component(TREE_WINDOW, "swa", PoolName.SWA),
+            ComponentType.MAMBA: component(TREE_STATE, "mamba"),
+        }
+        return cache
+
+    def test_cache_counts_host_evictions_by_pool_only_with_window_host_pools(self):
+        tracker = {
+            ComponentType.FULL: 1152,
+            ComponentType.SWA: 76032,
+            ComponentType.MAMBA: 0,
+        }
+
+        cache = self._cache({"swa": object()})
+        cache.init_host_window_metrics()
+        cache.init_host_window_metrics()  # a second attach must not re-register
+        cache._record_host_evicted_tokens(tracker)
+        cache.metrics_collector.init_host_window_metrics.assert_called_once_with()
+        self.assertEqual(
+            cache.metrics_collector.increment_host_evicted_tokens.call_args_list,
+            [
+                ((), {"num_tokens": 1152, "pool": "kv"}),
+                ((), {"num_tokens": 76032, "pool": "swa"}),
+            ],
+        )
+
+        cache = self._cache({})
+        cache.init_host_window_metrics()
+        cache._record_host_evicted_tokens(tracker)
+        cache.metrics_collector.init_host_window_metrics.assert_not_called()
+        cache.metrics_collector.increment_host_evicted_tokens.assert_not_called()
 
 
 if __name__ == "__main__":

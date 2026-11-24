@@ -181,6 +181,10 @@ class SchedulerStats:
     # Host Mamba state pool of hybrid-SSM models; stays 0/0 when there is none.
     hicache_host_mamba_used_states: int = 0
     hicache_host_mamba_total_states: int = 0
+    # Host sliding-window pools of hybrid-SWA models, by host pool name; empty
+    # when there is none.
+    hicache_host_window_used_tokens: Dict[str, int] = field(default_factory=dict)
+    hicache_host_window_total_tokens: Dict[str, int] = field(default_factory=dict)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -363,6 +367,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        # Set by init_hicache_window_metrics, for a host tier with window pools.
+        self.enable_hicache_window_metrics = False
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
@@ -1456,6 +1462,34 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             collector=collector,
         )
 
+    def init_hicache_window_metrics(self) -> None:
+        """Create the host sliding-window pool series; only a HiCache host tier
+        that has window pools calls this, so other deployments never export them."""
+        from prometheus_client import Gauge as _PromGauge
+
+        Gauge = self._gauge_cls or _PromGauge
+        labelnames = list(self.labels.keys()) + ["pool"]
+        self.hicache_host_window_used_tokens = Gauge(
+            name="sglang:hicache_host_window_used_tokens",
+            documentation="Number of tokens currently used in each host "
+            "sliding-window KV pool, by host pool (hybrid-SWA models only).",
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_host_window_total_tokens = Gauge(
+            name="sglang:hicache_host_window_total_tokens",
+            documentation="Token capacity of each host sliding-window KV pool, "
+            "by host pool (hybrid-SWA models only).",
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.enable_hicache_window_metrics = True
+
+    def _log_pool_gauge(self, gauge: Gauge, data: Mapping[str, float]) -> None:
+        # One sample per host pool, under the pool's name.
+        for pool, value in data.items():
+            gauge.labels(**self.labels, pool=pool).set(value)
+
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
@@ -1811,6 +1845,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self._log_gauge(
                     self.hicache_host_mamba_total_states,
                     stats.hicache_host_mamba_total_states,
+                )
+            if self.enable_hicache_window_metrics:
+                self._log_pool_gauge(
+                    self.hicache_host_window_used_tokens,
+                    stats.hicache_host_window_used_tokens,
+                )
+                self._log_pool_gauge(
+                    self.hicache_host_window_total_tokens,
+                    stats.hicache_host_window_total_tokens,
                 )
 
         # Streaming session metrics
@@ -2761,6 +2804,28 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_backup_duration(self, duration_seconds: float) -> None:
         self.backup_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def init_host_window_metrics(self) -> None:
+        """Create the host-tier eviction series; only a HiCache host tier that
+        has window pools calls this, so other deployments never export it."""
+        from prometheus_client import Counter as _PromCounter
+
+        Counter = self._counter_cls or _PromCounter
+        self.hicache_host_evicted_tokens = Counter(
+            name="sglang:hicache_host_evicted_tokens_total",
+            documentation="Tokens (state slots for mamba) evicted from the host "
+            "(L2) tier by LRU, by host pool (hybrid-SWA models only). A prefix "
+            "whose window was evicted from host can no longer be loaded back, "
+            "even while its kv stays on host: a growing window series with flat "
+            "sglang:load_back_tokens_total means the window host pool is too "
+            "small for the kv host pool.",
+            labelnames=list(self.labels.keys()) + ["pool"],
+        )
+
+    def increment_host_evicted_tokens(self, num_tokens: int, pool: str) -> None:
+        self.hicache_host_evicted_tokens.labels(**self.labels, pool=pool).inc(
+            num_tokens
+        )
 
     def increment_dropped_tokens(self, num_tokens: int, reason: str, pool: str) -> None:
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
