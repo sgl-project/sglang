@@ -205,6 +205,23 @@ class TestServerInfoTransportParity(CustomTestCase):
                         name if name in {"kimi_k3", "glm4v"} else None,
                     )
 
+            for mode, backend in (
+                ("prefill", "nixl"),
+                ("null", "zmq_to_scheduler"),
+                ("decode", "nixl"),
+            ):
+                with self.subTest(mode=mode, backend=backend):
+                    scheduler.server_args = ServerArgs(
+                        model_path="dummy",
+                        disaggregation_mode=mode,
+                        encoder_transfer_backend=backend,
+                    )
+                    info = json.loads(rust_config._launch_server_info(scheduler))
+                    self.assertEqual(
+                        info.get("staged_transfer_backend"),
+                        None if mode == "decode" else backend,
+                    )
+
     def test_rust_launch_info_redacts_the_api_keys(self):
         # Only the API key (or nothing) guards /server_info, so reporting the
         # keys would hand the admin key to every API-key holder.

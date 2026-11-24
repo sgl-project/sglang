@@ -290,6 +290,8 @@ message GetServerInfoResponse {
   optional bool supports_staged_images = 21;
   // Fingerprint of the deployment key this language worker uses to verify E.
   optional string encoder_handoff_key_id = 22;
+  // Resolved receiver backend on P/PD. Decode only consumes the layout.
+  optional string staged_transfer_backend = 23;
 }
 
 message DeploymentInfo {

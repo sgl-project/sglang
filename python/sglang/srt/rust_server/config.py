@@ -506,6 +506,8 @@ def _launch_server_info(scheduler: Scheduler) -> str:
 
         info["accepts_encoder_handoff"] = True
         info["encoder_handoff_key_id"] = handoff_key_id(require_handoff_key())
+        if info["disaggregation_mode"] != "decode":
+            info["staged_transfer_backend"] = info["encoder_transfer_backend"]
         model_type = scheduler.model_config.hf_config.model_type
         layout = staged_layout_for(model_type)
         info["supports_staged_images"] = bool(layout and layout.images)

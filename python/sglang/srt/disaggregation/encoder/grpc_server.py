@@ -147,6 +147,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 native_model_type=encoder.model_type
                 if (images_enabled or videos_enabled) and not layout.legacy_vision
                 else "",
+                staged_transfer_backend=encoder.transfer_backend,
                 supports_staged_images=images_enabled,
                 staged_audio_model_type=encoder.model_type if audio_enabled else "",
                 supports_staged_video=videos_enabled,

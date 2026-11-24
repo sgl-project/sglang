@@ -638,6 +638,7 @@ class TestStagedNativeTransfer(CustomTestCase):
         async def run(backend, model, images):
             with self.native_encoder(backend, model) as (svc, enc, receivers, _, image):
                 info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
+                self.assertEqual(info.staged_transfer_backend, backend)
                 self.assertTrue(info.supports_staged_video)
                 transfer = (
                     await svc.Stage(

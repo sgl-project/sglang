@@ -3942,6 +3942,9 @@ pub struct GetServerInfoResponse {
     /// Fingerprint of the deployment key this language worker uses to verify E.
     #[prost(string, optional, tag = "22")]
     pub encoder_handoff_key_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Resolved receiver backend on P/PD. Decode only consumes the layout.
+    #[prost(string, optional, tag = "23")]
+    pub staged_transfer_backend: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

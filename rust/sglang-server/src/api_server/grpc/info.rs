@@ -74,6 +74,10 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("internal_states are not JSON: {error}"))?;
     Ok(api::GetServerInfoResponse {
+        staged_transfer_backend: launch_fields
+            .get("staged_transfer_backend")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         encoder_handoff_key_id: launch_fields
             .get("encoder_handoff_key_id")
             .and_then(serde_json::Value::as_str)
