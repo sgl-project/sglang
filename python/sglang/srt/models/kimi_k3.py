@@ -2477,6 +2477,7 @@ class KimiK3DeltaAttention(nn.Module):
                 isinstance(
                     getattr(m, "quant_method", None), UnquantizedLinearMethod
                 )
+                and not hasattr(m, "base_layer")
                 and getattr(m, "bias", None) is None
                 and not hasattr(m, "weight_scale")
                 and not hasattr(m, "weight_scale_inv")
@@ -2713,16 +2714,22 @@ class KimiK3DeltaAttention(nn.Module):
 
                 qkvgbfa_layer = getattr(self, "_qkvgbfa_layer", None)
                 qkvgbfa_sizes = getattr(self, "_qkvgbfa_sizes", None)
+                qkvg_proj = getattr(self, "fused_qkvg_proj", None)
+                qkvg_qm = getattr(qkvg_proj, "quant_method", None)
                 if (
                     not _is_hip
                     and qkvgbfa_layer is not None
                     and qkvgbfa_sizes is not None
+                    and qkvg_qm is not None
+                    and not hasattr(qkvg_proj, "base_layer")
+                    and not hasattr(getattr(self, "f_a_proj", None), "base_layer")
+                    and not hasattr(getattr(self, "b_proj", None), "base_layer")
                     and hidden_states.shape[0] > 0
                 ):
                     # CUDA fallback when side-stream overlap is inactive
                     # (M > _bfa_bs_limit, eager, or prefill): read hidden_states
                     # once through the merged [q,k,v,g | f_a | b] buffer.
-                    fused_states = self.fused_qkvg_proj.quant_method.apply(
+                    fused_states = qkvg_qm.apply(
                         qkvgbfa_layer, hidden_states, None
                     )
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
@@ -3074,6 +3081,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         mods = (qkv_a, g_proj)
         if not all(
             isinstance(getattr(m, "quant_method", None), UnquantizedLinearMethod)
+            and not hasattr(m, "base_layer")
             and getattr(m, "bias", None) is None
             and not hasattr(m, "weight_scale")
             and not hasattr(m, "weight_scale_inv")
@@ -3125,6 +3133,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         qkv_a_gate_layer = getattr(self, "_qkv_a_gate_layer", None)
+        qkv_a_proj = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        g_proj = getattr(self, "g_proj", None)
+        qkv_a_qm = getattr(qkv_a_proj, "quant_method", None)
         max_tokens = getattr(
             self,
             "_MERGED_QKV_A_GATE_MAX_TOKENS",
@@ -3133,15 +3144,16 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if (
             getattr(self, "_use_merged_qkv_a_gate", False)
             and qkv_a_gate_layer is not None
+            and qkv_a_qm is not None
+            and not hasattr(qkv_a_proj, "base_layer")
+            and not hasattr(g_proj, "base_layer")
             and hidden_states is getattr(self, "_gate_hidden_states", None)
             and 0 < hidden_states.shape[0] <= max_tokens
         ):
             from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
             if not get_attn_tp_context().input_scattered:
-                merged = self.fused_qkv_a_proj_with_mqa.quant_method.apply(
-                    qkv_a_gate_layer, hidden_states, None
-                )
+                merged = qkv_a_qm.apply(qkv_a_gate_layer, hidden_states, None)
                 qkv_a, gate, _pad = merged.split(self._qkv_a_gate_sizes, dim=-1)
                 self._precomputed_output_gate = gate
                 return qkv_a
