@@ -231,8 +231,8 @@ from sglang.srt.runtime_context import (
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
 from sglang.srt.sampling.watermarking.interface import WatermarkEngine
 from sglang.srt.sampling.watermarking.runtime import make_watermark_engine
 from sglang.srt.server_args import ServerArgs
@@ -254,9 +254,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     get_available_gpu_memory,
-    is_host_cpu_arm64,
     is_npu,
     set_cuda_arch,
     slow_rank_detector,
@@ -268,8 +266,6 @@ from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -277,8 +273,6 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
-
-# Detect stragger ranks in model loading
 
 
 logger = logging.getLogger(__name__)
@@ -424,9 +418,6 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
-        self.is_multimodal_chunked_prefill_supported = (
-            model_config.is_multimodal_chunked_prefill_supported
-        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -675,6 +666,11 @@ class ModelRunner:
             )
             if not self.is_draft_worker
             else None
+        )
+
+    def init_sampling_pipeline(self):
+        self.sampling_pipeline = SamplingPipeline(
+            sampler=self.sampler, watermark=self.watermark
         )
 
     def init_kv_cache_configurator(
@@ -1072,6 +1068,7 @@ class ModelRunner:
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
         self.maybe_init_watermark()
+        self.init_sampling_pipeline()
 
         self.maybe_init_hisparse_coordinator()
 
@@ -1501,11 +1498,7 @@ class ModelRunner:
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.model_config,
-            logger,
-        )
+        reserve_rope_cache_for_long_sequences(self.model, self.model_config)
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
@@ -2200,34 +2193,6 @@ class ModelRunner:
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-    def _preprocess_logits(
-        self,
-        logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
-        observer: Optional[SamplingObserver] = None,
-    ):
-        # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
-        #       was executed after we processed last batch's results.
-
-        # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
-        observer_state = None
-        if observer is not None:
-            observer_state = sampling_info.apply_logits_bias_with_observer(
-                logits_output.next_token_logits,
-                observer=observer,
-            )
-        else:
-            sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
-        # Release the vocab_mask GPU tensor immediately after it has been applied
-        # to the logits. In overlap scheduling, the sampling_info (and its
-        # grammar_mask) can be kept alive by the delay_sample_func closure and
-        # batch_record_buf until the next iteration, causing a steady VRAM leak
-        # when structured output (grammar) is used.
-        sampling_info.grammar_mask = None
-        return observer_state
-
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -2246,65 +2211,16 @@ class ModelRunner:
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
-        observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
-
-        watermark = (
-            self.watermark.bind_sample(forward_batch)
-            if self.watermark is not None
-            else None
+        next_token_ids = self.sampling_pipeline.sample(
+            logits_output,
+            forward_batch,
+            observer=self.sampling_observer,
+            graph_token_ids=(
+                self.uocr_greedy_graph.recorded_ids(logits_output, forward_batch)
+                if self.uocr_greedy_graph is not None
+                else None
+            ),
         )
-        sampling_info = forward_batch.sampling_info
-        logprob_logits = None
-        next_token_ids = None
-        if watermark is not None:
-            step = watermark.apply(
-                logits_output.next_token_logits,
-                keep_logits=forward_batch.return_logprob,
-            )
-            sampling_info = step.sampling_info
-            logprob_logits = step.logprob_logits
-            next_token_ids = step.token_ids
-
-        # Sample the next tokens
-        if next_token_ids is None and self.uocr_greedy_graph is not None:
-            next_token_ids = self.uocr_greedy_graph.recorded_ids(
-                logits_output, forward_batch
-            )
-        if next_token_ids is None:
-            next_token_ids = self.sampler(
-                logits_output,
-                sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-                **(
-                    {"logprob_logits": logprob_logits}
-                    if logprob_logits is not None
-                    else {}
-                ),
-            )
-        if observer_state is not None:
-            logits_output.auxiliary_device_output = observer.after_sample(
-                observer_state,
-                next_token_ids,
-            )
         if (c := self.canary_manager) is not None:
             c.on_sampled(
                 logits_output=logits_output,
@@ -2315,8 +2231,6 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
-        if watermark is not None:
-            watermark.commit(next_token_ids)
         return next_token_ids
 
     def compute_logprobs_only(
@@ -2336,19 +2250,7 @@ class ModelRunner:
             forward_batch: The forward batch that generates logits_output
         """
         logits_output.auxiliary_device_output = None
-        if not forward_batch.token_ids_logprobs:
-            return
-
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
-        # Delegate to sampler for logprob-only computation
-        # This populates logits_output with requested token probabilities
-        self.sampler.compute_logprobs_only(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-        )
+        self.sampling_pipeline.compute_logprobs_only(logits_output, forward_batch)
 
     def check_weights(
         self,

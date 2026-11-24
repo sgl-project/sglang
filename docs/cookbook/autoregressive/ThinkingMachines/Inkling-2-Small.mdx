@@ -3,6 +3,19 @@ title: Inkling-2-Small
 description: "Deploy Inkling-2-Small with SGLang — verified launch commands, with and without DSpark speculative decoding, for Thinking Machines' NVFP4 / MXFP8 Mixture-of-Experts model on GB300, GB200, B300, B200, Vera Rubin, H200, AMD MI350X / MI355X, and TPU7x."
 ---
 
+<Callout icon="rocket" color="#d55816">
+SGLang supports Inkling-2-Small from day 0. See the launch blog post: [SGLang and Miles Add Day-0 Support for Inkling 2](https://www.sglang.io/blog/inkling-2-small-day0-support).
+</Callout>
+
+| Hardware | Supported | Docker image |
+| --- | --- | --- |
+| B300 / GB300 | Yes | `lmsysorg/sglang:dev-inkling-2-small` |
+| B200 / GB200 | Yes | `lmsysorg/sglang:dev-inkling-2-small` |
+| VR200 | Yes | `lmsysorg/sglang:dev-inkling-2-small-cu134` |
+| H200 | Yes | `lmsysorg/sglang:dev-inkling-2-small` |
+| MI350X / MI355X | Yes | `lmsysorg/sglang:dev-inkling-2-small-mi35x` |
+| TPU7x | Yes | `lmsysorg/sglang:dev-inkling-2-small-tpu` |
+
 ## Deployment
 
 <a id="install" />
@@ -61,7 +74,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
 
-{/* §1 Model Introduction: to be added with the model card. */}
+## 1. Model Introduction
+
+**Inkling-2-Small** is a Mixture-of-Experts model from Thinking Machines with **594B total and 17B active parameters** per token and a **1M-token** context window. It takes text and image input. Its 48 layers use Block Attention Residuals, and each has 384 routed experts (top-8, no shared experts). A 5-layer DSpark draft head is bundled for speculative decoding. SGLang serves it from day 0 on NVIDIA, AMD and Google hardware.
+
+**Resources:** HuggingFace — [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (NVFP4 + MXFP8) · [Inkling-2-Small-MXFP8](https://huggingface.co/thinkingmachines/Inkling-2-Small-MXFP8).
 
 ## 2. Configuration Tips
 
