@@ -9,7 +9,6 @@ from sglang.kernels.ops.diffusion import (
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fused_layernorm_modulate_raw,
     norm_infer,
-    xpu_layernorm_modulate,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
@@ -214,30 +213,6 @@ def bench_residual_layernorm_scale_shift_gate_select01(
     return run_benchmark_no_cudagraph(fn)
 
 
-def bench_layernorm_modulate_xpu():
-    from triton.runtime import driver
-
-    cache = driver.active.get_empty_cache_for_benchmark()
-    assert cache.numel() * cache.element_size() > (
-        4 * torch.xpu.get_device_properties().last_level_cache_size
-    )
-    torch.manual_seed(42)
-    print("B,S,D,torch_us,xpu_kernel_us")
-    for seq_len in (17, 256, 257, 1024, 4096):
-        x = torch.randn(1, seq_len, 4096, device="xpu", dtype=torch.bfloat16)
-        params = torch.randn(1, 1, 6 * 4096, device=x.device, dtype=x.dtype)
-        scale = params.chunk(6, dim=-1)[0]
-        norm = torch.nn.LayerNorm(4096, eps=EPS, elementwise_affine=False).to(x.device)
-        expected = norm(x) * (1 + scale)
-        actual = xpu_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
-        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
-        reference_us = run_benchmark_no_cudagraph(lambda: norm(x) * (1 + scale))[0]
-        xpu_kernel_us = run_benchmark_no_cudagraph(
-            lambda: xpu_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
-        )[0]
-        print(f"1,{seq_len},4096,{reference_us:.3f},{xpu_kernel_us:.3f}")
-
-
 if __name__ == "__main__":
     # The bit-exact LayerNorm kernel uses CUDA inline PTX; keep the shared
     # Qwen modulation benchmark runnable on its registered ROCm lane.
@@ -256,8 +231,3 @@ if __name__ == "__main__":
     print("Benchmark: qwen_image residual + layernorm + scale_shift_gate_select01")
     print(f"{'=' * 80}\n")
     bench_residual_layernorm_scale_shift_gate_select01.run(print_data=True)
-
-    print(f"\n{'=' * 80}")
-    print("Benchmark: qwen_image layernorm on xpu")
-    print(f"{'=' * 80}\n")
-    bench_layernorm_modulate_xpu()
