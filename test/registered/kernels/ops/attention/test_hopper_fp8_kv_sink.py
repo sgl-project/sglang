@@ -45,7 +45,7 @@ class TestHopperFP8KVSink(unittest.TestCase):
                     softmax_scale=1.0,
                     is_fp8_kvcache=True,
                     indices=indices,
-                    kv_format="fp8_ds_mla",
+                    kv_format="V32",
                 )
                 actual = _apply_flashmla_kv_sink(out[:, :, :16], lse, sink)
                 logits = values[:width].float().expand(16, -1)
