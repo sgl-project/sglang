@@ -16,10 +16,12 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.jit.utils import parallel_compile
 from sglang.kernels.ops.gemm import tiny_gemm as tg
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
+register_cuda_ci(
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
 )
 
 
@@ -84,7 +86,7 @@ def _build_all():
     """Build every module the benchmark reaches in parallel, before timing."""
     builders = []
     for (n, k), out_dtype in itertools.product(
-        CI_SHAPES if is_in_ci() else SHAPES, OUT_DTYPES
+        CI_SHAPES if marker.CI_MODE else SHAPES, OUT_DTYPES
     ):
         for impl in ("simt", "mma"):
             if _supported(impl, n, k):
@@ -99,7 +101,9 @@ def _build_all():
 @marker.parametrize("out_dtype", OUT_DTYPES)
 @marker.parametrize("shape", SHAPES, CI_SHAPES)
 @marker.parametrize("num_tokens", [1, 2, 4, 8, 16, 32], [1, 8, 32])
-@marker.benchmark("provider", ["jit", "simt", "mma", "torch"])
+@marker.benchmark(
+    "provider", ["jit", "simt", "mma", "torch"], gate=["jit", "simt", "mma"]
+)
 def benchmark(shape, num_tokens, out_dtype, provider):
     n, k = shape
     x = create_random(num_tokens, k)

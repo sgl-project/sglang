@@ -75,6 +75,8 @@ _REPACK_SOURCES = (
 )
 # Reads of a file's batches in flight at once (they release the GIL).
 _READERS = 4
+# Single-expert reads of the disk tier in flight at once: a few keep an NVMe queue busy.
+_READ_WORKERS = 6
 # Segments one preadv takes at most (IOV_MAX).
 _MAX_SEGMENTS = 1024
 # Reads and writes bypass the page cache: an entry is read once per start, and caching it
@@ -281,6 +283,7 @@ class ExpertCache:
     def __init__(self, path: str, header: dict):
         self.path = path
         self.header = header  # what the entry must declare, besides its layout
+        self._building = None  # (staging path, fd, mapping) of an entry being built
 
     @classmethod
     def for_layer(
@@ -347,6 +350,116 @@ class ExpertCache:
             "tensors": layout.describe(),
         }
 
+    def exists(self, num_experts: int) -> bool:
+        """Whether the entry exists for this layer (its tensors are checked when read)."""
+        try:
+            with open(self.path, "rb") as f:
+                header = _decode_header(f.read(_HEADER_BYTES))
+                size = os.fstat(f.fileno()).st_size
+            return (
+                header is not None
+                and all(header.get(k) == v for k, v in self.header.items())
+                and header.get("num_experts") == num_experts
+                and size == _HEADER_BYTES + header["object_bytes"] * num_experts
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def map(self, rows, num_experts: int) -> Optional[Dict[str, torch.Tensor]]:
+        """The entry as ``[E, ...]`` views of each tensor of ``rows`` (row shape, dtype), on a
+        private mapping of the file, for the disk tier: pages are read when touched, writes
+        stay in memory. None when there is no entry or it does not fit."""
+        layout = ObjectLayout.of(rows)
+        if not os.path.exists(self.path):
+            return None
+        try:
+            with open(self.path, "rb") as f:
+                header = _decode_header(f.read(_HEADER_BYTES))
+                size = os.fstat(f.fileno()).st_size
+                if header != self._expected(
+                    layout, num_experts
+                ) or size != layout.file_bytes(num_experts):
+                    self._does_not_fit()
+                    return None
+                mapped = mmap.mmap(f.fileno(), size, flags=mmap.MAP_PRIVATE)
+        except Exception as e:  # noqa: BLE001
+            self._cannot("read", e)
+            return None
+        return _views(mapped, layout, num_experts)
+
+    def create(self, rows, num_experts: int) -> Dict[str, torch.Tensor]:
+        """A new entry, being built, for the disk tier: ``[E, ...]`` views of each tensor of
+        ``rows`` on a shared mapping of a staging file, so that what is written into them is
+        the only write; ``publish`` puts it in place. The tier cannot do without it: failures
+        raise."""
+        layout = ObjectLayout.of(rows)
+        nbytes = layout.file_bytes(num_experts)
+        directory = os.path.dirname(self.path)
+
+        def cannot(e: BaseException) -> RuntimeError:
+            return RuntimeError(
+                f"Paged experts: cannot build the disk tier's file under {directory} "
+                f"({nbytes / (1 << 30):.1f} GiB, keeping {_FREE_MARGIN_BYTES >> 30} GiB "
+                f"free): {e}; free space, set SGLANG_CACHE_DIR to a larger disk or raise "
+                "--paged-experts-host-memory-gb"
+            )
+
+        try:
+            os.makedirs(directory, exist_ok=True)
+            # What this process never reads goes first, so that it can make the space.
+            self._prune_layer_other_keys()
+            _prune_other_keys(directory)
+            free = shutil.disk_usage(directory).free
+            if free < nbytes + _FREE_MARGIN_BYTES:
+                raise OSError(errno.ENOSPC, f"{free / (1 << 30):.1f} GiB free")
+            name = (
+                f"{_staging_prefix()}{uuid.uuid4().hex}-{os.path.basename(self.path)}"
+            )
+            staging = os.path.join(directory, name)
+            fd = os.open(staging, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        except OSError as e:
+            raise cannot(e) from e
+        try:
+            # Reserve the space first: a full disk fails here, not as SIGBUS on a write.
+            os.posix_fallocate(fd, 0, nbytes)
+            header = _encode_header(self._expected(layout, num_experts))
+            if os.pwrite(fd, header, 0) != _HEADER_BYTES:
+                raise OSError("short write of the header")
+            mapped = mmap.mmap(fd, nbytes)
+        except OSError as e:
+            os.close(fd)
+            os.unlink(staging)
+            raise cannot(e) from e
+        except BaseException:
+            os.close(fd)
+            os.unlink(staging)
+            raise
+        self._building = (staging, fd, mapped)
+        return _views(mapped, layout, num_experts)
+
+    def abandon(self) -> None:
+        """Drop the entry being built (``create``) after a failed build: its staging file and
+        descriptor go now, the mapping with the last view of it."""
+        if self._building is None:
+            return
+        staging, fd, _ = self._building
+        self._building = None
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(staging)
+
+    def publish(self) -> None:
+        """Put the entry being built (``create``) in place: flushed, then renamed over the
+        old one."""
+        staging, fd, mapped = self._building
+        self._building = None
+        mapped.flush()
+        os.fsync(fd)
+        os.close(fd)
+        os.replace(staging, self.path)
+        self._written(os.path.getsize(self.path))
+
     def read(self, host: Dict[str, torch.Tensor]) -> bool:
         """Fill ``host`` (``[E, ...]`` per tensor) from the entry; False when there is none or
         it does not fit (a later ``write`` then replaces it)."""
@@ -360,13 +473,7 @@ class ExpertCache:
             if _decode_header(header) != self._expected(
                 layout, num_experts
             ) or os.fstat(fd).st_size != layout.file_bytes(num_experts):
-                _once(
-                    logging.WARNING,
-                    "invalid",
-                    "Paged experts: the expert cache %s does not fit its layer (another "
-                    "layout or a broken file); rebuilding it",
-                    self.path,
-                )
+                self._does_not_fit()
                 return False
             read_experts(fd, layout, host)
             if not direct:
@@ -432,6 +539,10 @@ class ExpertCache:
             with contextlib.suppress(OSError):
                 os.unlink(staging)
             return
+        self._written(nbytes)
+
+    def _written(self, nbytes: int) -> None:
+        directory = os.path.dirname(self.path)
         with contextlib.suppress(OSError):  # published; only its durability is unsure
             _fsync_dir(directory)
         _outcomes["written"] += 1
@@ -455,6 +566,15 @@ class ExpertCache:
             )
         wait_for_writes()
         _pending = _writer.submit(self.write, host)
+
+    def _does_not_fit(self) -> None:
+        _once(
+            logging.WARNING,
+            "invalid",
+            "Paged experts: the expert cache %s does not fit its layer (another layout or a "
+            "broken file); rebuilding it",
+            self.path,
+        )
 
     def warn_stale(self, experts: Sequence[int]) -> None:
         _once(
@@ -498,6 +618,136 @@ def _end_writes() -> None:
     if _writer is not None:
         writer, _writer = _writer, None
         writer.shutdown(wait=True)
+
+
+def _views(mapped, layout: ObjectLayout, num_experts: int) -> Dict[str, torch.Tensor]:
+    """``[E, ...]`` views of each tensor of ``layout`` on a mapping of an entry's file."""
+    flat = torch.frombuffer(mapped, dtype=torch.uint8)
+    views = {}
+    for name, (shape, dtype, offset, nbytes) in layout.tensors.items():
+        if not nbytes:
+            views[name] = torch.empty((num_experts, *shape), dtype=dtype)
+            continue
+        strides = torch.empty(shape, device="meta").stride()
+        views[name] = (
+            flat[_HEADER_BYTES + offset :]
+            .view(dtype)
+            .as_strided(
+                (num_experts, *shape),
+                (layout.object_bytes // dtype.itemsize, *strides),
+            )
+        )
+    return views
+
+
+class ExpertReader:
+    """Reads single experts of a layer's entry into host rows, for the disk tier. The file
+    stays open while the layer is served: a start under another key may unlink it."""
+
+    def __init__(self, cache: ExpertCache, host: Dict[str, torch.Tensor]):
+        self.path = cache.path
+        self.layout = ObjectLayout.of_host(host)
+        self.fd, _, _ = _open_direct(self.path, os.O_RDONLY, _read_header)
+        self._staging = None  # page-aligned, for rows a read cannot place directly
+        self._staging_address = 0
+
+    def __del__(self):
+        if getattr(self, "fd", None) is not None:
+            os.close(self.fd)
+
+    def drop_staging(self) -> None:
+        """Give back the staging buffer, which is as large as the largest read so far; the
+        next read that needs one maps one of its own size."""
+        self._staging = None
+        self._staging_address = 0
+
+    def jobs(self, requests: List[Tuple[int, Dict[str, int]]]):
+        """For ``(expert, {tensor: destination address})``: one read per expert, ``(reader,
+        offset, [(address, bytes)])``, straight into page-aligned rows of whole pages, the
+        others into staging; and the copies out of staging ``(dest, src, bytes)``."""
+        need = len(requests) * self.layout.object_bytes
+        if need and (self._staging is None or len(self._staging) < need):
+            self._staging = mmap.mmap(-1, need)
+            self._staging_address = ctypes.addressof(
+                (ctypes.c_char * need).from_buffer(self._staging)
+            )
+        jobs, copies = [], []
+        for k, (expert, dests) in enumerate(requests):
+            stage = self._staging_address + k * self.layout.object_bytes
+            segments = []  # contiguous in the file
+            for name, (_, _, offset, nbytes) in self.layout.tensors.items():
+                if not nbytes:
+                    continue
+                padded = -(-nbytes // _ROW_ALIGN) * _ROW_ALIGN
+                dest = dests.get(name)
+                if dest is not None and dest % _ROW_ALIGN == 0 and nbytes == padded:
+                    segments.append((dest, nbytes))
+                    continue
+                segments.append((stage + offset, padded))
+                if dest is not None:
+                    copies.append((dest, stage + offset, nbytes))
+            if segments:
+                offset = _HEADER_BYTES + expert * self.layout.object_bytes
+                jobs.append((self, offset, segments))
+        return jobs, copies
+
+    def preadv(self, offset: int, segments) -> None:
+        buffers = [
+            memoryview((ctypes.c_char * n).from_address(address)).cast("B")
+            for address, n in segments
+        ]
+        expected = sum(n for _, n in segments)
+        if os.preadv(self.fd, buffers, offset) != expected:
+            raise OSError(f"Paged experts: short read at {offset} of {self.path}")
+
+
+_reads: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _jobs(batches):
+    jobs, copies = [], []
+    for reader, requests in batches:
+        j, c = reader.jobs(requests)
+        jobs += j
+        copies += c
+    return jobs, copies
+
+
+def read_many(batches) -> None:
+    """The reads of several layers' ``(reader, requests)`` together, several in flight."""
+    jobs, copies = _jobs(batches)
+    if len(jobs) == 1:
+        reader, offset, segments = jobs[0]
+        reader.preadv(offset, segments)
+        _copy(copies)
+    elif jobs:
+        wait_reads(_submit(jobs, copies))
+    else:
+        _copy(copies)
+
+
+def wait_reads(started) -> None:
+    """Wait for every read, then copy; a failed read raises once all of them are done (none
+    may still write into a row after the error reaches the caller)."""
+    futures, copies = started
+    concurrent.futures.wait(futures)
+    for future in futures:
+        future.result()
+    _copy(copies)
+
+
+def _submit(jobs, copies):
+    global _reads
+    if _reads is None:
+        _reads = concurrent.futures.ThreadPoolExecutor(
+            _READ_WORKERS, thread_name_prefix="paged-experts-disk"
+        )
+    return [_reads.submit(r.preadv, o, g) for r, o, g in jobs], copies
+
+
+def _copy(copies) -> None:
+    for dest, src, n in copies:
+        ctypes.memmove(dest, src, n)
 
 
 # -- filling a layer's store ----------------------------------------------------------------
@@ -841,6 +1091,7 @@ def _prune_other_keys(directory: str) -> None:
                 or other.group(1) != mine.group(1)
                 or entry.path == directory
                 or not entry.is_dir(follow_symlinks=False)
+                or _building_there(entry.path)
             ):
                 continue
             for file in os.scandir(entry.path):
@@ -890,13 +1141,27 @@ def _sweep_staging(directory: str) -> None:
     """Remove staging files a killed start left behind: those of a process of this PID
     namespace that is gone, and, of another namespace (another container), those older than
     ``_STALE_STAGING_S``."""
-    namespace, now = _pid_namespace(), time.time()
     for path in glob.glob(os.path.join(directory, ".staging-*")):
         with contextlib.suppress(OSError):
-            found = _STAGING.match(os.path.basename(path))
-            if found and found.group(1) == namespace:
-                gone = not _alive(int(found.group(2)))
-            else:
-                gone = now - os.stat(path).st_mtime > _STALE_STAGING_S
-            if gone:
+            if _writer_gone(path):
                 os.unlink(path)
+
+
+def _writer_gone(path: str) -> bool:
+    """Whether the start writing staging file ``path`` is gone: a process of this PID
+    namespace that no longer runs, or, of another namespace (another container), a file older
+    than ``_STALE_STAGING_S``."""
+    found = _STAGING.match(os.path.basename(path))
+    if found and found.group(1) == _pid_namespace():
+        return not _alive(int(found.group(2)))
+    return time.time() - os.stat(path).st_mtime > _STALE_STAGING_S
+
+
+def _building_there(directory: str) -> bool:
+    """Whether a running start is building a file in ``directory`` (another key's entries of
+    the model): a disk tier's first build needs its directory until it publishes."""
+    for path in glob.glob(os.path.join(directory, ".staging-*")):
+        with contextlib.suppress(OSError):
+            if not _writer_gone(path):
+                return True
+    return False

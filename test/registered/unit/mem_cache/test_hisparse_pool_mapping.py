@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
     HiSparseMHAMainPool,
 )
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MiniMaxSparseKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -73,7 +73,9 @@ class TestHiSparsePoolMapping(CustomTestCase):
         mha = object.__new__(HiSparseMHAMainPool)
         minimax = object.__new__(MiniMaxSparseKVPool)
         minimax.main_pool = mha
-        for kvcache, expected in ((dsa, dsa), (minimax, mha)):
+        hybrid = object.__new__(HybridLinearKVPool)
+        hybrid.full_kv_pool = dsa
+        for kvcache, expected in ((dsa, dsa), (minimax, mha), (hybrid, dsa)):
             with self.subTest(kvcache=type(kvcache)):
                 allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
                 allocator._kvcache = kvcache

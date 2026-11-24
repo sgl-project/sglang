@@ -32,7 +32,7 @@ C++-side).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 
@@ -42,6 +42,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.communication.comm_registry import CommRegistry
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -72,30 +73,20 @@ def _jit_module(world_size: int) -> Module:
 # Storage plane: the CustomAllReduceV2 Communicator
 
 
-_COMM_MAP: dict[int, Communicator] = {}
+_COMMS = CommRegistry("all_reduce_residual")
 
 
-def register_comm(comm: Communicator) -> None:
-    """Register the CustomAllReduceV2 communication planes.
-
-    The push kernels use the push plane, the pull kernels the barrier plane;
-    both carry their own multicast base, so nothing else has to be threaded
-    through here.
+def register_comm(provider: Callable[[], Communicator], *, world_size: int) -> None:
+    """Register the provider of the communicator these ops launch over; it runs on
+    first launch (see ``CommRegistry``). The push kernels launch over its push plane, the pull kernels over its barrier plane.
     """
-    # world_size is the whole key, so at most one communicator per size can be
-    # registered in a process. That matches how these ops are called -- the custom
-    # ops below take world_size and nothing else, so a second group of the same
-    # size would silently inherit the first one's peer pointers and semaphores,
-    # and the symptom would be a hang or corruption rather than an error. Assert
-    # it instead of letting the overwrite happen; widening to per-group handles
-    # means changing the custom-op signatures, which is a separate change.
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}; these ops key only on world_size, so two groups of "
-        f"the same size cannot coexist in one process"
-    )
-    _COMM_MAP[comm.world_size] = comm
+    _COMMS.register(provider, world_size=world_size)
+
+
+def get_comm(world_size: int) -> Communicator:
+    """The registered communicator, resolved on first use; shared with the K3
+    ops that stage through the same plane (gemm_ag, moe_front_ag)."""
+    return _COMMS.get(world_size)
 
 
 class PullTuning(NamedTuple):
@@ -158,7 +149,7 @@ def _push_res_op(
     x: torch.Tensor,
     residual: Optional[torch.Tensor],
 ) -> None:
-    _jit_module(world_size).push_res(_COMM_MAP[world_size], x.view(-1), residual)
+    _jit_module(world_size).push_res(_COMMS.get(world_size), x.view(-1), residual)
 
 
 @register_custom_op(mutates_args=["x"])
@@ -170,7 +161,7 @@ def _push_norm_op(
     num_norm_rows: int,
 ) -> None:
     _jit_module(world_size).push_norm(
-        _COMM_MAP[world_size], x.view(-1), weight, eps, num_norm_rows
+        _COMMS.get(world_size), x.view(-1), weight, eps, num_norm_rows
     )
 
 
@@ -185,7 +176,7 @@ def _finalize_push_norm_op(
     eps: float,
 ) -> None:
     _jit_module(world_size).finalize_push_norm(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         out.view(-1),
         gemm2_out,
         expanded_idx_to_permuted_idx,
@@ -205,7 +196,7 @@ def _pull_res_op(
     unroll: int,
 ) -> None:
     _jit_module(world_size).pull_res(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         x.view(-1),
         residual,
         input_mc_ptr,
@@ -226,7 +217,7 @@ def _pull_norm_op(
     unroll: int,
 ) -> None:
     _jit_module(world_size).pull_norm(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         x.view(-1),
         weight,
         eps,

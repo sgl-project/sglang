@@ -150,7 +150,6 @@ class JointImageInfo:
 class TokenizerEncodeOutput:
     tokens: torch.Tensor = None
     timestep_scatter_index: torch.Tensor = None
-    guidance_scatter_index: torch.Tensor = None
     text_slices: list = None
     gen_image_slices: list = None
     text_mask: torch.Tensor = None
@@ -319,7 +318,6 @@ class HunyuanImage3TokenizerWrapper:
     ):
         """Assemble token sequence from *template* (e.g. ``text-text-gen_image-text``)."""
         keys = template.split("-")
-        modal_length = len(keys)
         index_indicator = {k: 0 for k in token_source}
         for v in token_source.values():
             assert isinstance(v, (list, tuple))
