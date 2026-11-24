@@ -1318,53 +1318,44 @@ class TestInflightAnchorStillLoads(CustomTestCase):
         )
         self.assertEqual(loaded, (2, 7))
 
-
-class TestHostOnlyConcurrentFetch(CustomTestCase):
-    def _init_load_back(self, *, evicted, host_hit, window_hit):
+    def test_host_only_inflight_anchor_waits_unless_state_only_loads(self):
+        """Beside an in-flight host-only anchor, a fetch that needs the evicted
+        anchor's KV or a window host hit waits, and so does a state-only fetch whose
+        load is refused; the suite above covers the state-only and needs-KV rows."""
         from types import SimpleNamespace
 
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        loads = []
-        cache = SimpleNamespace(
-            buffer_pipeline=None,
-            linker=None,
-            _mamba_host_only_checkpoint=lambda: True,
-            ongoing_load_back={7: [object()]},
-            tree_core=SimpleNamespace(
-                is_full_device_evicted=lambda _node_id: evicted,
-                collect_full_device_indices=lambda *_a, **_k: torch.tensor([1, 2]),
-            ),
-            load_back=lambda *a, **k: loads.append(a) or True,
-        )
-        req = SimpleNamespace(
-            last_node=3,
-            rid="r",
-            mamba_host_hit_length=1,
-            window_host_hit_lengths={"swa": window_hit},
-        )
-        loaded = UnifiedRadixCache.init_load_back(
-            cache,
-            InitLoadBackParams(best_match_node=7, host_hit_length=host_hit, req=req),
-        )
-        return loaded, loads
-
-    def test_only_a_state_only_fetch_goes_beside_the_inflight_anchor(self):
-        cases = [
-            (dict(evicted=False, host_hit=0, window_hit=0), True),
-            (dict(evicted=True, host_hit=0, window_hit=0), False),
-            (dict(evicted=False, host_hit=1, window_hit=0), False),
-            (dict(evicted=False, host_hit=0, window_hit=1), False),
-        ]
-        for kwargs, state_only in cases:
-            with self.subTest(**kwargs):
-                loaded, loads = self._init_load_back(**kwargs)
-                if state_only:
-                    self.assertEqual(loaded, (2, 7))
-                    self.assertEqual(len(loads), 1)
-                else:
-                    self.assertIsNone(loaded)
-                    self.assertEqual(loads, [])
+        for evicted, window_hit, load_ok in (
+            (True, 0, True),
+            (False, 1, True),
+            (False, 0, False),
+        ):
+            loads = []
+            cache = SimpleNamespace(
+                buffer_pipeline=None,
+                linker=None,
+                _mamba_host_only_checkpoint=lambda: True,
+                ongoing_load_back={7: [object()]},
+                tree_core=SimpleNamespace(
+                    is_full_device_evicted=lambda _node_id, e=evicted: e,
+                    collect_full_device_indices=lambda *_a, **_k: torch.tensor([1]),
+                ),
+                load_back=lambda *a, ok=load_ok, **_k: loads.append(a) or ok,
+            )
+            req = SimpleNamespace(
+                last_node=3,
+                rid="r",
+                mamba_host_hit_length=1,
+                window_host_hit_lengths={"swa": window_hit},
+            )
+            with self.subTest(evicted=evicted, window_hit=window_hit, load_ok=load_ok):
+                loaded = UnifiedRadixCache.init_load_back(
+                    cache,
+                    InitLoadBackParams(best_match_node=7, host_hit_length=0, req=req),
+                )
+                self.assertIsNone(loaded)
+                self.assertEqual(len(loads), int(not evicted and not window_hit))
 
 
 define_config_test_classes(UnifiedRadixCacheLoadBackSuite, globals())
