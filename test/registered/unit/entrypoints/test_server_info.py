@@ -376,7 +376,7 @@ class TestModelInfoTransportParity(CustomTestCase):
             weight_version="v1",
             load_format="dummy",
             reasoning_parser="deepseek-r1",
-            tool_call_parser="qwen25",
+            tool_call_parser="qwen",
             disaggregation_mode="decode",
         )
         architectures = ["TestForCausalLM"]
