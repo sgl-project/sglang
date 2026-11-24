@@ -109,6 +109,108 @@ class _Worker:
 
 
 class TestSchedulerVPP(CustomTestCase):
+    def test_prefix_match_respects_vpp_frontier_and_existing_caps(self):
+        """A local cache hit cannot advance past the agreed pipeline frontier."""
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        req = Req(
+            rid="prefix",
+            origin_input_text="",
+            origin_input_ids=array("q", range(16)),
+            sampling_params=SamplingParams(max_new_tokens=2),
+        )
+        self.assertEqual(req._compute_max_prefix_len(16), 15)
+        for limit, expected in ((8, 8), (0, 0), (32, 15)):
+            with self.subTest(limit=limit):
+                req.vpp_prefix_limit = limit
+                self.assertEqual(req._compute_max_prefix_len(16), expected)
+        req.vpp_prefix_limit = 8
+        req.return_logprob = True
+        req.logprob_start_len = 4
+        self.assertEqual(req._compute_max_prefix_len(16), 4)
+        req.vpp_prefix_limit = None
+        self.assertEqual(req._compute_max_prefix_len(16), 4)
+
+    def test_bootstrap_consensus_holds_unconfirmed_requests_and_failure_wins(self):
+        """Consensus success still needs local readiness; missing RIDs stay queued."""
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.managers.scheduler_components.request_list import (
+            IndexedReqList,
+            ListKind,
+            move,
+        )
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        for outcomes in (
+            {},
+            {"ready": False, "pending": False, "failed": True},
+        ):
+            with self.subTest(outcomes=outcomes):
+                queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+                queue.scheduler_stage_metrics = None
+                queue.pp_size = 2
+                failed = []
+                queue.scheduler = SimpleNamespace(
+                    attn_cp_cpu_group=None,
+                    attn_tp_cpu_group=None,
+                    processed_tokens_counter=7,
+                    handle_bootstrap_failure=failed.append,
+                    token_to_kv_pool_allocator=SimpleNamespace(page_size=4),
+                )
+                queue.ensure_metadata_buffer = lambda req: True
+                reqs = [
+                    Req(
+                        rid=rid,
+                        origin_input_text="",
+                        origin_input_ids=array("q", range(12)),
+                        sampling_params=SamplingParams(max_new_tokens=2),
+                    )
+                    for rid in ("ready", "unconfirmed", "pending", "failed")
+                ]
+                for req in reqs:
+                    req.pending_bootstrap = True
+                    req.metadata_buffer_index = 0
+                    req.disagg_kv_sender = SimpleNamespace(
+                        pop_decode_prefix_len=lambda: 4,
+                        init=lambda num_pages, metadata_index: None,
+                    )
+                queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
+                move(reqs, queue.queue)
+                dst = IndexedReqList(ListKind.WAITING)
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                        return_value=[
+                            KVPoll.WaitingForInput,
+                            KVPoll.WaitingForInput,
+                            KVPoll.Bootstrapping,
+                            KVPoll.WaitingForInput,
+                        ],
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.prefill.poll_and_all_reduce_prefill_pp",
+                        side_effect=AssertionError("Consensus must not poll PP again"),
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.prefill.should_force_retry",
+                        return_value=False,
+                    ),
+                ):
+                    admitted = queue.move_bootstrapped(dst, outcomes=outcomes)
+                expected = [reqs[0]] if outcomes else []
+                self.assertEqual(admitted, expected)
+                self.assertEqual(list(dst), expected)
+                self.assertEqual(failed, [reqs[3]] if outcomes else [])
+                self.assertEqual(list(queue.queue), reqs[1:] if outcomes else reqs)
+                self.assertTrue(all(req.pending_bootstrap for req in reqs[1:]))
+                if outcomes:
+                    self.assertFalse(reqs[0].pending_bootstrap)
+                    self.assertEqual(reqs[0].start_send_idx, 4)
+                    self.assertEqual(reqs[0].arrival_processed_tokens, 7)
+
     def test_manifest_tracks_real_request_chunk_boundaries(self):
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams

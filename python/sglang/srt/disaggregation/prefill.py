@@ -608,7 +608,9 @@ class PrefillBootstrapQueue:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def move_bootstrapped(self, dst: ReqList) -> List[Req]:
+    def move_bootstrapped(
+        self, dst: ReqList, *, outcomes: Optional[Dict[str, bool]] = None
+    ) -> List[Req]:
         """Move the reqs which have finished bootstrapping into `dst`, and
         return them."""
 
@@ -619,7 +621,7 @@ class PrefillBootstrapQueue:
 
         # The polls are reduced across ranks in this order.
         queue = list(self.queue)
-        if self.pp_size > 1:
+        if self.pp_size > 1 and outcomes is None:
             polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in queue],
                 self.scheduler.attn_cp_cpu_group,
@@ -637,6 +639,13 @@ class PrefillBootstrapQueue:
             )
 
         for req, poll in zip(queue, polls):
+            if outcomes is not None:
+                if req.rid not in outcomes:
+                    continue
+                if outcomes[req.rid]:
+                    poll = KVPoll.Failed
+                elif poll != KVPoll.WaitingForInput:
+                    continue
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
             elif poll == KVPoll.Bootstrapping:

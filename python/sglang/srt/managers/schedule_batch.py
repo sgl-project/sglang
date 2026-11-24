@@ -1266,6 +1266,9 @@ class Req(ReqDllmMixin):
             committed_len = len(self.origin_input_ids) + len(self.output_ids)
             max_prefix_len = min(max_prefix_len, committed_len)
             max_prefix_len = max_prefix_len // block_size * block_size
+        vpp_prefix_limit = getattr(self, "vpp_prefix_limit", None)
+        if vpp_prefix_limit is not None:
+            max_prefix_len = min(max_prefix_len, vpp_prefix_limit)
         return max(max_prefix_len, 0)
 
     def take_detokenize_header_due(self) -> bool:

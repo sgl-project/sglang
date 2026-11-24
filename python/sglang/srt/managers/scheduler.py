@@ -4693,7 +4693,12 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
+        vpp_manifest = getattr(self, "_vpp_admit_manifest", None)
+        if (
+            vpp_manifest is None
+            and self.chunked_req is not None
+            and self.dynamic_chunk_sizer is not None
+        ):
             history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
@@ -4737,6 +4742,17 @@ class Scheduler(
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
+        if vpp_manifest is not None:
+            # Match main's compute charge: ordinary admission bills whole pages,
+            # while exact-chunk-fill bills raw tokens.
+            adder.rem_chunk_tokens = sum(
+                (
+                    end - start
+                    if adder.exact_chunk_fill
+                    else adder.ceil_paged_tokens(end - start)
+                )
+                for _, start, end in vpp_manifest["requests"]
+            )
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
         resumed_req = self.chunked_req
@@ -4803,6 +4819,11 @@ class Scheduler(
             if bounded_active
             else self.waiting_queue
         )
+        if vpp_manifest is not None:
+            by_rid = {req.rid: req for req in candidates}
+            candidates = [
+                by_rid[rid] for rid, _, _ in vpp_manifest["requests"] if rid in by_rid
+            ]
         for req in candidates:
             if bounded_active and not self.policy.allows_admission(req):
                 break

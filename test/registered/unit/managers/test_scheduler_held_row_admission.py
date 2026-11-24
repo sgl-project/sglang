@@ -202,6 +202,68 @@ class TestHeldRowAdmission(CustomTestCase):
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
 
+    def test_vpp_manifest_preserves_order_and_page_charges(self):
+        """Remote admission must reproduce the leader's batch, not local priority."""
+        for exact_chunk_fill in (False, True):
+            for use_manifest in (False, True):
+                with self.subTest(exact=exact_chunk_fill, manifest=use_manifest):
+                    chunk = _Req(True, rid="chunk")
+                    first = _Req(False, rid="first")
+                    second = _Req(False, rid="second")
+                    unselected = _Req(False, rid="unselected")
+                    s = self._scheduler(
+                        DisaggregationMode.NULL,
+                        [],
+                        chunk,
+                        [first, second, unselected],
+                    )
+                    s.page_size = 4
+                    s.dynamic_chunk_sizer = SimpleNamespace(predict=lambda _: 64)
+                    if use_manifest:
+                        s._vpp_admit_manifest = {
+                            "requests": [
+                                ("chunk", 0, 5),
+                                ("second", 4, 9),
+                                ("first", 0, 3),
+                            ]
+                        }
+                    adders = []
+
+                    def make_adder(*args, **kwargs):
+                        adder = _LimitsAdder(False, *args, **kwargs)
+                        adder.page_size = s.page_size
+                        adder.exact_chunk_fill = exact_chunk_fill
+                        adders.append(adder)
+                        return adder
+
+                    def capture(can_run_list, *args, **kwargs):
+                        raise _BatchBuilt(list(can_run_list))
+
+                    s.get_prefill_adder_class = lambda: make_adder
+                    with (
+                        get_context().override_server_args(
+                            pp_max_micro_batch_size=NUM_ROWS
+                        ),
+                        patch.object(ScheduleBatch, "init_new", side_effect=capture),
+                        patch("sglang.srt.managers.scheduler.set_time_batch"),
+                    ):
+                        with self.assertRaises(_BatchBuilt) as built:
+                            s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=[]))
+                    if use_manifest:
+                        self.assertEqual(
+                            built.exception.args[0], [chunk, second, first]
+                        )
+                        self.assertEqual(
+                            adders[0].rem_chunk_tokens, 13 if exact_chunk_fill else 20
+                        )
+                        self.assertEqual(list(s.waiting_queue), [unselected])
+                    else:
+                        self.assertEqual(
+                            built.exception.args[0],
+                            [chunk, first, second, unselected],
+                        )
+                        self.assertEqual(adders[0].rem_chunk_tokens, 64)
+
     def test_parked_chunk_admits_no_waiting_request(self):
         running = [_Req(holds_row=True)]
         parked = _Req(holds_row=True)
