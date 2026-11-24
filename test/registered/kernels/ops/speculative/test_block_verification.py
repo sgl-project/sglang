@@ -2,12 +2,15 @@ import itertools
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.kernels.ops.speculative import reject_sampling
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
+    speculative_sampling_classic_kernel,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -15,7 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
 
@@ -137,6 +140,109 @@ def test_matches_reference(steps, vocab, block):
     assert (upper > lower).all()
     assert (final_coins >= lower - 1e-6).all()
     assert (final_coins <= upper + 1e-6).all()
+
+
+def _classic_block_verify(*args, target, draft):
+    """The single-program kernel, launched with the launcher's block-verification
+    configuration."""
+    candidates, indices, coins = args[3:6]
+    batch, slots, vocab = target.shape
+    block_reduce = min(1 << (vocab - 1).bit_length(), 32768)
+    speculative_sampling_classic_kernel[(batch,)](
+        *args,
+        target,
+        draft,
+        *candidates.stride(),
+        *indices.stride(),
+        *coins.stride(),
+        *target.stride(),
+        *draft.stride(),
+        NUM_SLOTS=slots,
+        VOCAB_SIZE=vocab,
+        BLOCK_V=4096,
+        BLOCK_VERIFICATION=True,
+        BLOCK_REDUCE=block_reduce,
+        num_warps=8 if block_reduce > 4096 else 4,
+    )
+
+
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
+@pytest.mark.parametrize("batch", [1, 4, 8, 32, 64])
+@pytest.mark.parametrize("vocab", [163840, 152064, 128256, 32000, 50257])
+@pytest.mark.parametrize("slots", [2, 3, 5, 8, 9])
+def test_vocab_split_matches_classic_bitwise(slots, vocab, batch):
+    """The vocabulary-tiled block accept must reproduce the single-program kernel bit
+    for bit on the same draws: it adds the same tiles in the same order."""
+    g = torch.Generator(device=DEVICE).manual_seed(slots * 1_000_003 + vocab + batch)
+    target = torch.rand((batch, slots, vocab), device=DEVICE, generator=g)
+    target /= target.sum(-1, keepdim=True)
+    draft = torch.rand((batch, slots - 1, vocab), device=DEVICE, generator=g)
+    draft /= draft.sum(-1, keepdim=True)
+    candidates = torch.randint(0, vocab, (batch, slots), device=DEVICE, generator=g)
+    coins = torch.rand((batch, slots), device=DEVICE, generator=g)
+    final_coins = torch.rand((batch,), device=DEVICE, generator=g)
+    # Rows cycle through random draws, q = 0 at the last draft, p = q, p = q with a
+    # rejected first draft (zero residual), all-accept coins and none-accept coins.
+    kind = torch.arange(batch, device=DEVICE) % 6
+    rows = torch.nonzero(kind == 1).squeeze(1)
+    draft[rows, -1, candidates[rows, -1]] = 0.0
+    draft[(kind == 2) | (kind == 3)] = target[(kind == 2) | (kind == 3), :-1]
+    coins[(kind == 3) | (kind == 5)] = 1.0
+    coins[kind == 4] = 0.0
+    indices = torch.arange(batch * slots, device=DEVICE).flip(0).view(batch, slots)
+
+    def run(split):
+        outputs = (
+            torch.full((batch * slots,), -1, dtype=torch.int32, device=DEVICE),
+            torch.full((batch, slots), -1, dtype=torch.int32, device=DEVICE),
+            torch.full((batch,), -1, dtype=torch.int32, device=DEVICE),
+        )
+        args = (*outputs, candidates, indices)
+        if split:
+            chain_speculative_sampling_triton(
+                *args,
+                None,
+                None,
+                coins,
+                final_coins,
+                target,
+                draft,
+                1.0,
+                1.0,
+                True,
+                block_verification=True,
+            )
+        else:
+            _classic_block_verify(*args, coins, final_coins, target=target, draft=draft)
+        return outputs
+
+    classic, split = run(split=False), run(split=True)
+    for name, a, b in zip(
+        ("predicts", "accept_index", "accept_token_num"), classic, split
+    ):
+        assert torch.equal(a, b), f"{name} differs between the classic and split paths"
+    predicts, _, lengths = split
+    assert (lengths[kind == 4] == slots - 1).all()
+    assert (lengths[(kind == 3) | (kind == 5)] == 0).all()
+    assert (predicts[indices[kind == 3, 0]] == vocab - 1).all()
+
+
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
+@pytest.mark.parametrize("batch, split", [(127, True), (128, False)])
+def test_block_accept_takes_the_classic_kernel_from_128_requests(batch, split):
+    vocab, slots = 4096, 5
+    target = torch.full((batch, slots, vocab), 1 / vocab, device=DEVICE)
+    draft = torch.full((batch, slots - 1, vocab), 1 / vocab, device=DEVICE)
+    candidates = torch.zeros((batch, slots), dtype=torch.long, device=DEVICE)
+    coins = torch.rand((batch, slots), device=DEVICE)
+    final_coins = torch.rand((batch,), device=DEVICE)
+    with patch.object(
+        reject_sampling,
+        "_chain_speculative_sampling_block_split",
+        wraps=reject_sampling._chain_speculative_sampling_block_split,
+    ) as block_split:
+        _verify(target, draft, candidates, coins, final_coins)
+    assert block_split.called == split
 
 
 def test_accepts_longer_prefix_after_rejection():
@@ -367,6 +473,7 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
                 is_any_greedy=any_greedy,
                 need_top_k_sampling=False,
                 need_top_p_sampling=False,
+                need_min_p_sampling=False,
                 temperatures=torch.ones(batch, 1, device=DEVICE),
             ),
             draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
@@ -423,6 +530,7 @@ def test_ragged_cutoff_preserves_distribution(block):
             is_any_greedy=False,
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
             temperatures=torch.ones(batch, 1, device=DEVICE),
         ),
         draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),

@@ -5,7 +5,7 @@ import logging
 import os
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import msgspec
 
@@ -29,6 +29,11 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_probability: float | None = None
     default_enabled: bool | None = None
     enforce_all: bool | None = None
+    keys: list[int] | None = None
+    ngram_len: int | None = None
+    num_candidates: int | None = None
+    context_history_size: int | None = None
+    skip_first_ngram_calls: bool | None = None
 
     def __repr__(self) -> str:
         return (
@@ -37,8 +42,34 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"mixing_probability={self.mixing_probability!r}, "
             f"max_probability={self.max_probability!r}, "
             f"default_enabled={self.default_enabled!r}, "
-            f"enforce_all={self.enforce_all!r})"
+            f"enforce_all={self.enforce_all!r}, "
+            f"keys={'<redacted>' if self.keys is not None else None}, "
+            f"ngram_len={self.ngram_len!r}, num_candidates={self.num_candidates!r}, "
+            f"context_history_size={self.context_history_size!r}, "
+            f"skip_first_ngram_calls={self.skip_first_ngram_calls!r})"
         )
+
+
+_SHARED_CONFIG_FIELDS = ("default_enabled", "enforce_all")
+_GUMBEL_CONFIG_FIELDS = (
+    "key",
+    "key_b",
+    "context_window",
+    "mixing_probability",
+    "max_probability",
+)
+SYNTHID_CONFIG_FIELDS = (
+    "keys",
+    "ngram_len",
+    "num_candidates",
+    "context_history_size",
+    "skip_first_ngram_calls",
+)
+# The config fields of each --watermark-algorithm; its keys are the choices.
+ALGORITHM_CONFIG_FIELDS = {
+    "gumbel": frozenset((*_SHARED_CONFIG_FIELDS, *_GUMBEL_CONFIG_FIELDS)),
+    "synthid": frozenset((*_SHARED_CONFIG_FIELDS, *SYNTHID_CONFIG_FIELDS)),
+}
 
 
 def parse_watermark_key(value: Any) -> int:
@@ -74,7 +105,7 @@ def _read_config_file(path: str) -> str:
         raise WatermarkConfigError("failed to read watermark config JSON") from None
 
 
-def load_watermark_config(source: str) -> WatermarkServerConfig:
+def load_watermark_config(source: str, *, algorithm: str) -> WatermarkServerConfig:
     if source.lstrip().startswith("{"):
         payload = source
     else:
@@ -89,6 +120,14 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
         raise WatermarkConfigError("watermark config must be a JSON object")
     if set(raw) - set(WatermarkServerConfig.__struct_fields__):
         raise WatermarkConfigError("watermark config contains unknown fields")
+    # None for an unknown algorithm, which server-argument validation rejects.
+    allowed = ALGORITHM_CONFIG_FIELDS.get(algorithm)
+    set_fields = {name for name, value in raw.items() if value is not None}
+    if allowed is not None and set_fields - allowed:
+        raise WatermarkConfigError(
+            f"watermark config fields {sorted(set_fields - allowed)} are not "
+            f"supported with --watermark-algorithm {algorithm}"
+        )
 
     try:
         for name in ("key", "key_b"):
@@ -111,7 +150,65 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
             isinstance(value, bool) or not isinstance(value, (int, float))
         ):
             raise WatermarkConfigError(f"watermark config {name} must be a number")
-    for name in ("default_enabled", "enforce_all"):
+    for name in ("default_enabled", "enforce_all", "skip_first_ngram_calls"):
         if raw.get(name) is not None and not isinstance(raw[name], bool):
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")
+    keys = raw.get("keys")
+    if keys is not None and (
+        not isinstance(keys, list) or not all(_is_int(key) for key in keys)
+    ):
+        raise WatermarkConfigError("watermark config keys must be a list of integers")
+    for name in ("ngram_len", "num_candidates", "context_history_size"):
+        value = raw.get(name)
+        if value is not None and not _is_int(value):
+            raise WatermarkConfigError(f"watermark config {name} must be an integer")
     return WatermarkServerConfig(**raw)
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):
+    enabled: Optional[bool] = None
+    key: Optional[str] = None
+    context_window: Optional[int] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"WatermarkRequestConfig(enabled={self.enabled!r}, key=<redacted>, "
+            f"context_window={self.context_window!r})"
+        )
+
+
+def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
+    if value is None:
+        return None
+    if isinstance(value, WatermarkRequestConfig):
+        enabled = value.enabled
+        key = value.key
+        context_window = value.context_window
+    else:
+        if not isinstance(value, dict):
+            raise ValueError("watermark must be an object")
+        unknown = set(value) - {"enabled", "key", "context_window"}
+        if unknown:
+            raise ValueError("watermark contains unknown fields")
+        enabled = value.get("enabled")
+        key = value.get("key")
+        context_window = value.get("context_window")
+    if enabled is not None and type(enabled) is not bool:
+        raise ValueError("watermark enabled must be a boolean")
+    if key is not None:
+        parse_watermark_key(key)
+    if context_window is not None and (
+        isinstance(context_window, bool)
+        or not isinstance(context_window, int)
+        or context_window < 1
+    ):
+        raise ValueError("watermark context_window must be a positive integer")
+    return WatermarkRequestConfig(
+        enabled=enabled,
+        key=key,
+        context_window=context_window,
+    )

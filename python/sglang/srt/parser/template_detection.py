@@ -604,16 +604,14 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
+    DetectionRule(name="glm45", value="glm", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
-    DetectionRule(
-        name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
-    ),
+    DetectionRule(name="xml_kv_tool_call", value="glm", predicate=_is_xml_kv_tool_call),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(
         name="granite_toolcall_parser",
