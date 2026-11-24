@@ -152,6 +152,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         host.page_num = 4
         host.v_head_dim = 8
         buffer_info = SimpleNamespace(
+            buffers=SimpleNamespace(k=(), v=()),
             device=torch.device("cuda"),
             head_num=host.head_num,
             head_dim=host.head_dim,

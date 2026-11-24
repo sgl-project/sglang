@@ -5,6 +5,7 @@ from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
 import torch
 
 from sglang.srt import runtime_context
@@ -489,6 +490,33 @@ class TestMHAPageFirstStaging(CustomTestCase):
             self.assertEqual(host.page_num, host_pages)
             self.assertEqual(host.staging_page_capacity, host_pages)
             self.assertEqual(host.staging_k_buffer.data_ptr(), prepared[0].data_ptr())
+
+    def test_strided_device_rows_do_not_reserve_staging(self):
+        """Strided device rows (unified-pool views) bypass the staged kernel,
+        so no scratch may be reserved for them."""
+        with _mha_page_first_environment():
+            info = _device_pool(is_mla=False).get_device_pool_infos()[0].buffer_info
+            self.assertIsNotNone(
+                mha.prepare_mha_write_back_staging(
+                    info, layer_num=4, page_size=PAGE_SIZE
+                )
+            )
+            rows = torch.zeros(
+                PAGE_SIZE * 8, 2 * info.head_num, info.head_dim, dtype=info.dtype
+            )
+            strided = tuple(rows[:, : info.head_num] for _ in info.buffers.k)
+            info = msgspec.structs.replace(
+                info,
+                buffers=msgspec.structs.replace(info.buffers, k=strided, v=strided),
+            )
+            with mock.patch.object(
+                torch, "empty", side_effect=AssertionError("staging allocation")
+            ):
+                self.assertIsNone(
+                    mha.prepare_mha_write_back_staging(
+                        info, layer_num=4, page_size=PAGE_SIZE
+                    )
+                )
 
 
 if __name__ == "__main__":

@@ -143,6 +143,13 @@ def prepare_mha_write_back_staging(
     """
     if not (_is_cuda or _is_hip) or layer_num == 0:
         return None
+    # The staged kernel reads whole packed device pages; strided rows (unified
+    # pool views) take the stride-aware copy and never touch this scratch.
+    if not all(
+        buffer.is_contiguous()
+        for buffer in (*buffer_info.buffers.k, *buffer_info.buffers.v)
+    ):
+        return None
     head_num = buffer_info.head_num
     if not all(
         can_use_write_back_jit_kernel(
