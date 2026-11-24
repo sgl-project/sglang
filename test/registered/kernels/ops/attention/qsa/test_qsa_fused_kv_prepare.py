@@ -494,6 +494,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         spec_info=SimpleNamespace(draft_token_num=width, topk=1),
         input_ids=torch.zeros(width, device="cuda", dtype=torch.int32),
         extend_seq_lens=torch.tensor([width], device="cuda", dtype=torch.int32),
+        extend_seq_lens_cpu=[width],
         _original_forward_mode=None,
         mrope_positions=None,
     )
