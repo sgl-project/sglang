@@ -21,7 +21,7 @@ VOCAB_SIZE = 248_320
 
 
 @marker.parametrize("batch_size", BATCH_SIZES, CI_BATCH_SIZES)
-@marker.benchmark("provider", ["transform", "fused"])
+@marker.benchmark("provider", ["transform", "fused"], gate=["fused"])
 def benchmark_stochastic(batch_size: int, provider: str):
     config = SynthIDConfig(keys=SYNTHID_TEST_KEYS, num_candidates=1024)
     watermark = SynthIDWatermark(config, max(BATCH_SIZES), "cuda")
