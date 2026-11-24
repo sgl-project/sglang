@@ -216,6 +216,7 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "HYV4FlashForConditionalGeneration",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
         )
@@ -837,6 +838,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "Inkling2ForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -1280,6 +1282,19 @@ class ModelConfig:
                 )
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "Inkling2ForConditionalGeneration"
+        ):
+            from sglang.srt.configs.inkling2 import Inkling2MTPConfig
+
+            if self.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("Inkling2 MTP requires --speculative-algorithm DSPARK")
+            if self.quantization is not None and self.is_draft_quantization_explicit:
+                raise ValueError("Inkling2 MTP uses its checkpoint BF16 precision")
+            self.quantization = None
+            self.hf_config = Inkling2MTPConfig.from_target(self.hf_config)
+            self.hf_text_config = self.hf_config
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
@@ -1421,6 +1436,7 @@ class ModelConfig:
             "EmbeddingGemma2Model",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
+            "Inkling2ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
@@ -1541,6 +1557,7 @@ class ModelConfig:
                 setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
+        configured_v_head_dim = self.v_head_dim
         if self.v_head_dim is None or self.v_head_dim == 0:
             self.v_head_dim = self.head_dim
             setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
@@ -1571,6 +1588,7 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4FlashForConditionalGeneration" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
@@ -1716,6 +1734,9 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
+        elif getattr(self.hf_text_config, "use_mla", False) is True:
+            # External models can opt in without extending the architecture list.
+            self._init_configured_mla(v_head_dim=configured_v_head_dim)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1818,6 +1839,44 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+        self.token_id_vocab_size = self.vocab_size
+        if _hf_arch(self.hf_config) in {
+            "Inkling2ForConditionalGeneration",
+            "Inkling2ForConditionalGenerationMTP",
+        }:
+            self.vocab_size = self.hf_text_config.padded_vocab_size
+
+    def _init_configured_mla(self, *, v_head_dim: Optional[int]) -> None:
+        dimensions = {
+            "kv_lora_rank": getattr(self.hf_text_config, "kv_lora_rank", None),
+            "qk_nope_head_dim": getattr(self.hf_text_config, "qk_nope_head_dim", None),
+            "qk_rope_head_dim": getattr(self.hf_text_config, "qk_rope_head_dim", None),
+            # Check the checkpoint value before the generic MHA default filled it.
+            "v_head_dim": v_head_dim,
+        }
+        for name, value in dimensions.items():
+            minimum = 0 if name in ("qk_nope_head_dim", "qk_rope_head_dim") else 1
+            if type(value) is not int or value < minimum:
+                raise ValueError(
+                    f"use_mla=True requires {name} to be an integer >= {minimum}; "
+                    f"got {value!r}"
+                )
+        if dimensions["qk_nope_head_dim"] + dimensions["qk_rope_head_dim"] == 0:
+            raise ValueError(
+                "use_mla=True requires qk_nope_head_dim + qk_rope_head_dim > 0"
+            )
+
+        for name, value in dimensions.items():
+            setattr(self, name, value)
+        self.attention_arch = AttentionArch.MLA
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.swa_kv_lora_rank = self.kv_lora_rank
+        self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+        self.index_head_dim = None
+        rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
+            self.hf_text_config, "rope_scaling", None
+        )
+        self._init_mla_scaling(rope_scaling)
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
@@ -1933,6 +1992,8 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
+        if self.hf_config.architectures == ["Inkling2ForConditionalGenerationMTP"]:
+            return None
         quant_cfg = _quant_config_to_dict(
             getattr(self.hf_config, "quantization_config", None)
         )
@@ -2055,6 +2116,8 @@ class ModelConfig:
 
             {"quant_algo": "FP8", "quant_method": "modelopt", ...}
         """
+        if quant_config_dict.get("quant_method") == "inkling2":
+            return quant_config_dict
         json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
         if not json_quant_configs:
             return None
@@ -2624,6 +2687,7 @@ multimodal_model_archs = [
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
+    "HYV4FlashForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -2666,6 +2730,7 @@ multimodal_model_archs = [
     "KimiVLForConditionalGeneration",
     "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
+    "Inkling2ForConditionalGeneration",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",

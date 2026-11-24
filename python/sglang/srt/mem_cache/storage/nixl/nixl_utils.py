@@ -11,6 +11,10 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
 
 logger = logging.getLogger(__name__)
 
+# O_DIRECT needs each transfer's address and length in whole blocks. 4 KiB covers
+# the logical block size of every filesystem in use (512 B or 4 KiB).
+O_DIRECT_ALIGN_BYTES = 4096
+
 _SGLANG_NIXL_CONFIG_KEYS = {
     "use_direct_io",
     "l3_cleaner_enabled",
@@ -46,6 +50,14 @@ class NixlBackendConfig:
             return bool(self.config["use_direct_io"])
         return envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
 
+    def needs_page_alignment(self) -> bool:
+        """Return True if transfers must be whole O_DIRECT blocks: O_DIRECT is on
+        and the plugin opens files (OBJ plugins open none)."""
+        return (
+            self.get_use_direct_io()
+            and self.get_specified_plugin() not in NixlBackendSelection.OBJ_PLUGINS
+        )
+
     def get_l3_cleaner_config(self) -> dict:
         """Return typed NIXL FILE L3 cleaner options from top-level config."""
         config = {
@@ -70,6 +82,9 @@ class NixlBackendConfig:
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
 
+        # config is empty, in flat form {'param1': 'value1', 'param2': 'value2', ...},
+        # or in fully qualified form with no active plugin
+        plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
         if "plugin" in self.config:
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
             # choose the FIRST active plugin
@@ -77,9 +92,6 @@ class NixlBackendConfig:
                 if item.get("active", False) in [True, "true", "True"]:
                     plugin = key.upper()
                     break
-        else:
-            # config is empty, or in flat form {'param1': 'value1', 'param2': 'value2', ...}
-            plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
 
         return plugin
 
@@ -115,6 +127,14 @@ class NixlBackendConfig:
         return initparams
 
 
+def host_page_align(extra_config: Optional[dict]) -> int:
+    """Bytes a host pool rounds each page's stride up to, so that HiCacheNixl can
+    move its pages in place: O_DIRECT_ALIGN_BYTES under O_DIRECT, otherwise 1."""
+    if NixlBackendConfig(extra_config).needs_page_alignment():
+        return O_DIRECT_ALIGN_BYTES
+    return 1
+
+
 class NixlBackendSelection:
     """Handles NIXL backend selection and creation."""
 
@@ -139,6 +159,8 @@ class NixlBackendSelection:
 
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
+        plugin_list = []
+        initparams = {}
         try:
             plugin_list = agent.get_plugin_list()
             logger.debug(f"Available NIXL plugins: {plugin_list}")
