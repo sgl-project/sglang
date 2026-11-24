@@ -756,6 +756,13 @@ class Envs:
     # Shared-context attention kernel: "default", "split_kv" (prompt split across
     # CTAs) or "stream_k" (persistent grid).
     SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
+    # Replay decode batches made only of beam requests as CUDA graphs.
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
+    # The requests' beam width for those graphs under shared-context attention;
+    # required there.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
+    # Tokens such a graph holds per request; required when the model has no trie.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS = EnvInt(None)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
