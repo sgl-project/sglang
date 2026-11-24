@@ -581,8 +581,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
         self.assertFalse(scheduler.is_fully_idle())
-        room_waiters = scheduler.disagg_prefill_bootstrap_queue.room_waiters
-        room_waiters._leave(list(room_waiters))
+        self._abort(scheduler, "req-retract1")
         self.assertTrue(scheduler.is_fully_idle())
 
 

@@ -64,6 +64,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import (
     FakeReq,
     decode_queue,
+    leaving_retirer,
     release_only_retirer,
 )
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -879,7 +880,7 @@ class TestAllocationIntegration(CustomTestCase):
                 move([req], scheduler.waiting_queue)
             # Like the real handler, whose retirer takes it out of its list.
             scheduler.handle_bootstrap_failure = Mock(
-                side_effect=lambda failed: failed.owner_list._leave([failed])
+                side_effect=leaving_retirer().release
             )
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
             queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
