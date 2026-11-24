@@ -96,7 +96,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
             path=str(progress), sha256=hashlib.sha256(b"{}").hexdigest()
         ),
     )
-    monkeypatch.setattr(sdk.PerfDatabase, "open_fidb", lambda *a, **k: database)
+    monkeypatch.setattr(sdk, "PerfDB", lambda *a, **k: database, raising=False)
     monkeypatch.setattr(
         simopus_dspark,
         "_bind_local_model_config",

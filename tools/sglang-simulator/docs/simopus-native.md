@@ -18,7 +18,11 @@ Source-binding roots are opaque SDK inputs. Configuration resolution delegates t
 validation and profile loading remain with `sdk.load_native_region_assets`.
 The adapter does not inspect SQLite paths or PerfDB metadata layouts. A compatible
 SDK providing both interfaces is required; unsupported SDKs are not replaced by
-filesystem readers. Explicit external capture/analytic assets remain checksummed
+filesystem readers. The factory opens `simopus.sdk.PerfDB` with the configured
+`systems_root` value passed as `perfdb_dir`; the SDK owns the stored schema and
+queries. Descriptor entries in `native_source_binding` use `{path}`. Execution
+profiles omit the former `profile_id` and `runtime_compatibility_manifest_sha256`
+fields. Explicit external capture/analytic assets remain checksummed
 configuration files and are separate from the database storage contract.
 
 
@@ -45,11 +49,10 @@ Unavailable cold cost cells remain explicit data gaps.
 
 ## Configuration
 
-Install SimOpus with its native prepared-region public API. The original
-structured integration was checked against SDK commit
-`e1e0d7a2a89bcd5d1098e2807f591394c020ac21`; this historical check does not
-establish support for later optional numeric APIs. Pin the actual installed
-revision in `provider_revision`. Use a reviewed local model config
+Use a compatible SimOpus SDK exposing the public `PerfDB` and native
+prepared-region APIs. Use SDK commit
+`2a78cfd2cbc0757605322791497ed4ce095832b7` for the integration checks below.
+Pin the actual installed revision in `provider_revision`. Use a reviewed local model config
 matching the SDK's authoritative model revision, without downloading weights.
 
 The `predictor` object selects these inputs:
@@ -58,8 +61,8 @@ The `predictor` object selects these inputs:
 | --- | --- |
 | `name`, `model_id` | `simopus`, `deepseek-ai/DeepSeek-V4.1-Flash` |
 | `model_revision`, `provider_revision` | Full lowercase checkpoint and installed SDK commits |
-| `systems_root`, `database_mode` | Explicit slice root; `SILICON`, or explicit `HYBRID` with its matching analytic asset |
-| `native_segment_profile_id` | Exact original native region profile SHA256 |
+| `systems_root`, `database_mode` | PerfDB file or directory; `SILICON`, or explicit `HYBRID` with its matching analytic asset |
+| `native_segment_profile_id` | PerfDB run ID or the retained published profile name |
 | `native_capture_profile` | Original capture profile `{path, sha256}` |
 | `native_source_binding` | Optional SDK-verified `{root, profile, cohort, stack}` originals |
 | `native_analytic_model` | Optional original `{path, sha256}`; required only for `HYBRID` |
