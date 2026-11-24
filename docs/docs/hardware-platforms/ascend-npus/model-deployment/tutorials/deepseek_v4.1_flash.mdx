@@ -433,7 +433,18 @@ rank-0 node (`MASTER_ADDR`). The service output is displayed in the terminal on 
 ## Accuracy evaluation
 
 For evaluation tools and dataset workflows on Ascend NPUs, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
-This tutorial does not provide DeepSeek-V4.1-Flash A5 accuracy results.
+
+### Accuracy Tests
+
+DeepSeek-V4.1 accuracy scores on Ascend A3 Series and 950PR/DT Series (A5):
+
+| Benchmark | Ascend A3 Series | Ascend A5 (950PR/DT Series) |
+| --- | ---: | ---: |
+| GPQA-Diamond | 91.9 | 91.4 |
+| AIME26 | 96.7 | 100 |
+
+The A5 results were obtained with DSPark and decode graph enabled.
+
 
 ## Performance
 
