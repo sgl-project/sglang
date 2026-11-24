@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      actions: write # re-run the gated pr-test.yml / pr-test-extra.yml run
+      actions: write # re-run the gated runs of run_ci_approval.APPROVAL_WORKFLOWS
       contents: read
       pull-requests: read
       statuses: write # record ci/run-ci-approved

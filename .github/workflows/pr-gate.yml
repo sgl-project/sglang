@@ -12,7 +12,7 @@ on:
       approval-mode:
         description: >-
           'label' (default): the run-ci label on the PR opts it in.
-          'commit' (pr-test.yml, pr-test-extra.yml): a run passes only if the PR has run-ci
+          'commit' (pr-test.yml, pr-test-extra.yml, pr-test-sgl-router.yml): a run passes only if the PR has run-ci
           now and its head commit carries a ci/run-ci-approved status. pr-gate-approve.yml
           records one when run-ci is added, and the slash command handler when a command adds
           it (scripts/ci/utils/run_ci_approval.py), so every push needs a new approval and

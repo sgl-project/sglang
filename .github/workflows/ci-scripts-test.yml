@@ -5,6 +5,8 @@ on:
     paths:
       - "scripts/ci/**"
       - ".github/workflows/pr-test.yml"
+      - ".github/workflows/pr-test-extra.yml"
+      - ".github/workflows/pr-test-sgl-router.yml"
       - ".github/workflows/pr-gate.yml"
       - ".github/workflows/pr-gate-approve.yml"
       - ".github/workflows/ci-scripts-test.yml"

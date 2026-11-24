@@ -30,7 +30,8 @@ without `run-ci`, or on a draft PR, the gate passes with `opted-in=false` and
 the caller's test jobs skip. `pr-test-finish` then fails, so a PR cannot merge
 without running Base CI.
 
-`pr-test.yml` and `pr-test-extra.yml` call the gate with `approval-mode: commit`:
+`pr-test.yml`, `pr-test-extra.yml` and `pr-test-sgl-router.yml` call the gate with
+`approval-mode: commit`:
 besides the `run-ci` label they need a `ci/run-ci-approved` status on the PR's
 head commit. `pr-gate-approve.yml` records it when an approver adds `run-ci`,
 and the slash command handler when an approver runs a command that adds it

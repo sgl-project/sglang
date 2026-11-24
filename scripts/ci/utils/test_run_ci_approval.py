@@ -149,5 +149,60 @@ class TestRerunGatedRuns(unittest.TestCase):
         self.assertEqual(run.reruns, 0)
 
 
+class TestApprovalWorkflows(unittest.TestCase):
+    """Every workflow the approval reruns is gated the way pr-gate-approve.yml assumes."""
+
+    ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+    def _load(self, path):
+        import yaml
+
+        with open(os.path.join(self.ROOT, path), encoding="utf-8") as f:
+            workflow = yaml.safe_load(f)
+        # yaml 1.1 parses the `on:` key as boolean True
+        return workflow, workflow.get("on", workflow.get(True)) or {}
+
+    def test_pull_request_target_without_labeled(self):
+        for path in rca.APPROVAL_WORKFLOWS:
+            with self.subTest(workflow=path):
+                _, triggers = self._load(path)
+                self.assertNotIn("pull_request", triggers)
+                self.assertIn("pull_request_target", triggers)
+                types = (triggers["pull_request_target"] or {}).get("types") or []
+                self.assertNotIn("labeled", types)
+
+    def test_gate_in_commit_mode(self):
+        for path in rca.APPROVAL_WORKFLOWS:
+            with self.subTest(workflow=path):
+                workflow, _ = self._load(path)
+                gates = [
+                    job
+                    for job in workflow["jobs"].values()
+                    if job.get("uses") == "./.github/workflows/pr-gate.yml"
+                ]
+                self.assertTrue(gates)
+                for job in gates:
+                    self.assertEqual(
+                        (job.get("with") or {}).get("approval-mode"), "commit"
+                    )
+
+    def test_pr_checkouts_do_not_persist_credentials(self):
+        """A checkout of the PR head (PR code) leaves no token in .git/config."""
+        for path in rca.APPROVAL_WORKFLOWS:
+            with self.subTest(workflow=path):
+                workflow, _ = self._load(path)
+                for name, job in workflow["jobs"].items():
+                    for step in job.get("steps") or []:
+                        inputs = step.get("with") or {}
+                        if str(step.get("uses", "")).startswith(
+                            "actions/checkout@"
+                        ) and "pull_request.head.sha" in str(inputs.get("ref", "")):
+                            self.assertIs(
+                                inputs.get("persist-credentials"),
+                                False,
+                                f"{name}: checkout of the PR head persists the token",
+                            )
+
+
 if __name__ == "__main__":
     unittest.main()

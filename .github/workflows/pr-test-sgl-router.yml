@@ -1,23 +1,34 @@
 name: PR Test (sgl-router)
 
 # Like pr-test.yml: no trigger-level `paths:` filter, so the `changes` job and
-# the `run-ci` gate show up as checks; and no `labeled` trigger, since every
-# label event would cancel the run in progress. Adding `run-ci` after a push
-# takes a rerun (`/tag-and-rerun-ci`).
+# the gate show up as checks. The workflow file comes from the base branch, so a
+# PR cannot edit the gate (pr-gate.yml, approval-mode commit) or the jobs that
+# reach the GPU runners. No `labeled` type: a label event would cancel the run
+# in progress through the concurrency group; pr-gate-approve.yml reruns the
+# gated run instead.
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:
-  group: sgl-router-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}
+  # A PR keys on its number: two forks can share a head_ref and would cancel each other.
+  group: sgl-router-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}
   cancel-in-progress: true
 
 env:
   SGLANG_IS_IN_CI: true
+
+# Read-only for every job that runs PR code; called workflows inherit it.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: read
 
 jobs:
   sgl-router-changes:
@@ -27,7 +38,12 @@ jobs:
     outputs:
       should_run: ${{ github.event_name == 'workflow_dispatch' || steps.paths.outputs.sgl_router == 'true' }}
     steps:
+      # On a PR event dorny/paths-filter lists the files through the API and needs
+      # no checkout, so no PR code runs; a push diffs a checkout of main.
       - uses: actions/checkout@v4
+        if: github.event_name == 'push'
+        with:
+          persist-credentials: false
       - name: Detect sgl-router path changes
         id: paths
         if: github.event_name != 'workflow_dispatch'
@@ -48,13 +64,17 @@ jobs:
               - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
 
-  # pr-gate.yml reads the labels live and skips the tests without `run-ci`,
-  # so a rerun after the label is added (`/tag-and-rerun-ci`) picks it up.
+  # pr-gate.yml reads the label and the approval live and skips the tests unless
+  # the head commit is approved, so the rerun pr-gate-approve.yml (or
+  # `/tag-and-rerun-ci`) starts after an approval picks it up.
   sgl-router-gate:
     name: gate
     needs: sgl-router-changes
     if: needs.sgl-router-changes.outputs.should_run == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      approval-mode: commit
+    secrets: inherit
 
   # Every job below needs the gate and skips when it skips the tests.
 
@@ -76,9 +96,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Data only (the fixture JSON); nothing from the PR runs in this job.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           sparse-checkout: sgl-router/tests/fixtures/tokenizer_parity
 
       - name: Fetch the parity matrix tokenizers
@@ -103,15 +125,20 @@ jobs:
     timeout-minutes: 60
     env:
       # Scoped to this job: on self-hosted runners it breaks pip installs that
-      # compile Rust extensions.
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
+      # compile Rust extensions. Not on PR runs: a pull_request_target run's cache
+      # writes count as the default branch's.
+      RUSTC_WRAPPER: ${{ github.event_name != 'pull_request_target' && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: ${{ github.event_name != 'pull_request_target' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Best effort: the sccache release CDN fails intermittently.
       - name: Configure sccache
         id: sccache
+        if: github.event_name != 'pull_request_target'
         continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
@@ -119,7 +146,7 @@ jobs:
           disable_annotations: true
 
       - name: Disable sccache if install failed
-        if: steps.sccache.outcome != 'success'
+        if: github.event_name != 'pull_request_target' && steps.sccache.outcome != 'success'
         run: |
           echo "::warning::sccache install failed (${{ steps.sccache.outcome }}); proceeding without compile caching"
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -131,7 +158,8 @@ jobs:
           shared-key: "sgl-router-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Pushes to main only: a pull_request_target run also has refs/heads/main.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: cargo fmt
         working-directory: sgl-router
@@ -192,6 +220,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
@@ -234,17 +265,24 @@ jobs:
     needs: [sgl-router-test, sgl-router-build]
     runs-on: 4-gpu-h100  # the PD dp-aware test holds a dp2 prefill and a dp2 decode
     timeout-minutes: 45
+    # HF_TOKEN reaches this job only on pushes and dispatches from main, never on a
+    # PR run (PR code); the runner's model cache serves PR runs.
+    env:
+      HOLDS_HF_TOKEN: ${{ github.event_name != 'pull_request_target' && secrets.HF_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
-      # Holds HF_TOKEN: build from source, since a pull_request_target run could have
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # Holding HF_TOKEN: build from source, since a pull_request_target run could have
       # written the cache.
       - uses: ./.github/actions/download-rust-ext
         with:
-          from_source: ${{ secrets.HF_TOKEN != '' }}
+          from_source: ${{ env.HOLDS_HF_TOKEN }}
       - uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
-          from_source: ${{ secrets.HF_TOKEN != '' }}
+          from_source: ${{ env.HOLDS_HF_TOKEN }}
 
       # SGLang from this checkout, so the e2e runs against the branch's server.
       - name: Install SGLang dependencies
@@ -257,7 +295,7 @@ jobs:
       - name: Run e2e
         working-directory: sgl-router
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ github.event_name != 'pull_request_target' && secrets.HF_TOKEN || '' }}
         run: |
           export SGL_ROUTER_BINARY="${SGLANG_TEST_PD_ROUTER_BINARY}"
           python3 -m pytest tests/e2e/ -v -s --tb=short \

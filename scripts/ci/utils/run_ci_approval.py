@@ -26,6 +26,7 @@ APPROVER_REPO_PERMISSIONS = ("write", "maintain", "admin")
 APPROVAL_WORKFLOWS = (
     ".github/workflows/pr-test.yml",
     ".github/workflows/pr-test-extra.yml",
+    ".github/workflows/pr-test-sgl-router.yml",
 )
 APPROVE_WORKFLOW = ".github/workflows/pr-gate-approve.yml"
 # pr-test.yml runs on every push to a PR, so its newest run at a commit postdates the
