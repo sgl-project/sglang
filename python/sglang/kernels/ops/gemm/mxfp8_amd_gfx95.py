@@ -133,16 +133,6 @@ def _run_mxfp8_linear_kernel(
     return out
 
 
-def _mxfp8_dot_scaled_linear(
-    x: torch.Tensor,  # [M, K] bf16/fp16
-    w: torch.Tensor,  # [N, K] fp8 e4m3
-    w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
-) -> torch.Tensor:
-    """bf16/fp16 input -> per-token MXFP8 quant -> dot_scaled GEMM."""
-    x_q, x_scale = mxfp8_e4m3_quantize(x)
-    return _run_mxfp8_linear_kernel(x_q, x_scale, w, w_scale, x.dtype)
-
-
 def dot_scaled_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

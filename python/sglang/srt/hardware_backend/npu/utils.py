@@ -37,6 +37,24 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
+# SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
+# SoCs report higher values and share the same capability gates.
+ASCEND_950_SOC_VERSION = 260
+
+
+def is_ascend_950() -> bool:
+    """Whether the runtime SoC is Ascend 950 (Atlas A5) or a later aclnn-only SoC.
+
+    The SoC query initializes NPU state, so this must not be called before
+    device selection (see the deferred setup in ``init_npu_backend``).
+    """
+    if not _is_npu:
+        return False
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() >= ASCEND_950_SOC_VERSION
+
+
 def use_npu_arch35_mxfp8_wo_a(
     quant_config, wo_a_keeps_quant_config: Optional[bool] = None
 ) -> bool:
@@ -240,6 +258,18 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
+    try:
+        # Registers the ds41 (DeepSeek-V4.1) Python operators under the
+        # vendor operator extension's ds41 namespace. Absent for DSV4-only
+        # deployments.
+        import cann_ops_transformer  # noqa: F401
+    except ImportError as e:
+        logger.warning(
+            "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
+            "operators will not be registered: %s",
+            e,
+        )
+
     import torch_npu
 
     # These imports lead to unpredictable behavior in diffusion models
@@ -249,8 +279,14 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
         torch.cuda.get_device_capability = lambda device=None: (0, 0)
+
+        def configure_internal_format():
+            if not is_ascend_950():
+                torch_npu.npu.config.allow_internal_format = True
+
+        # The SoC query initializes NPU state; defer it until device selection.
+        torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
