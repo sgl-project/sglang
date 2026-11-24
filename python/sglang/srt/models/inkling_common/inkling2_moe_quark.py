@@ -183,3 +183,16 @@ class Inkling2QuarkExperts(nn.Module):
     def mega_local_input_rows(self, tokens: int) -> None:
         # No MegaMoE exchange: every rank needs every input row.
         return None
+
+    def forward(self, x, weights, ids, combine=True):
+        """``weights, ids`` were routed from the unquantized ``x`` by ``Inkling2MoE``."""
+        self._check_platform()
+        if self.expert_format == "mxfp4":
+            from sglang.srt.models.inkling_common.inkling2_moe_quark_mxfp4 import (
+                forward_experts,
+            )
+        else:
+            raise NotImplementedError(
+                f"no forward for {self.expert_format} experts in this build"
+            )
+        return forward_experts(self, x, weights, ids, combine)

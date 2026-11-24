@@ -1,8 +1,13 @@
 """Reference dequantizers and synthetic packed experts for Inkling-2 Quark GPU tests."""
 
+import contextlib
+import gc
+from types import SimpleNamespace
+
 import torch
 
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
+from sglang.srt.runtime_context import get_parallel
 
 AWQ_NIBBLE_TO_COL = (0, 2, 4, 6, 1, 3, 5, 7)
 AWQ_COL_TO_NIBBLE = tuple(AWQ_NIBBLE_TO_COL.index(c) for c in range(8))
@@ -146,6 +151,11 @@ def canonical_bits(t: torch.Tensor) -> torch.Tensor:
 
 def count_bit_mismatches(a: torch.Tensor, b: torch.Tensor) -> int:
     return int((canonical_bits(a) != canonical_bits(b)).sum())
+
+
+def rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+    a, b = a.double(), b.double()
+    return float((a - b).norm() / b.norm())
 
 
 def triton_gap(*features: str) -> str:
@@ -308,3 +318,85 @@ def routed_case(
                 float(slab_diff.norm() / slab_ref[local].norm())
             )
     return result
+
+
+@contextlib.contextmanager
+def ep_group(ep_size=1, ep_rank=0, all_reduce=None):
+    """get_parallel() of one rank of an expert-parallel group."""
+    group = SimpleNamespace(
+        world_size=ep_size,
+        rank_in_group=ep_rank,
+        all_reduce=all_reduce or (lambda tensor: tensor),
+    )
+    with get_parallel().override(
+        moe_tp_rank=0,
+        moe_tp_size=1,
+        moe_ep_rank=ep_rank,
+        moe_ep_size=ep_size,
+        moe_ep_group=group,
+    ):
+        yield
+
+
+def experts_slice(experts):
+    return slice(
+        experts.ep_rank * experts.num_local_experts,
+        (experts.ep_rank + 1) * experts.num_local_experts,
+    )
+
+
+def build_experts(
+    config, layout, num_experts, w13, w2, prefix="model.llm.layers.0.mlp.experts."
+):
+    """The loaded Inkling2QuarkExperts of the current ep_group() on cuda."""
+    from sglang.srt.models.inkling_common import inkling2_moe_quark
+
+    experts = inkling2_moe_quark.Inkling2QuarkExperts(
+        config, num_experts, prefix, layout
+    ).to("cuda")
+    part = experts_slice(experts)
+    for name, data in (("w13", w13), ("w2", w2)):
+        for param, key in (
+            ("weight", "weight"),
+            ("scale", "weight_scale"),
+            ("weight_zero_point", "weight_zero_point"),
+        ):
+            if key in data:
+                getattr(experts, f"{name}_{param}").data.copy_(data[key][part])
+    experts.finalize_load()
+    return experts
+
+
+def make_inputs(
+    tokens, hidden, num_experts, seed=0, x_scale=1.0, route_scale=8.0, outliers=False
+):
+    """BF16 hidden states, FP32 route weights summing to route_scale and int32 ids."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(tokens, hidden, generator=g, device="cuda") * x_scale
+    if outliers:
+        x = x * torch.exp(torch.randn(hidden, generator=g, device="cuda"))
+    weights = torch.rand(tokens, TOP_K, generator=g, device="cuda") + 0.25
+    weights = route_scale * weights / weights.sum(1, keepdim=True)
+    return (
+        x.bfloat16().contiguous(),
+        weights.contiguous(),
+        make_routing(tokens, num_experts, seed=seed),
+    )
+
+
+def assert_no_weight_sized_allocation(run, packed_bytes, share=0.05):
+    """`run()` peaks below `share` of `packed_bytes` and frees everything."""
+    gc.collect()  # garbage of earlier tests must not be freed inside the window
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = run()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    del result
+    kept = torch.cuda.memory_allocated() - base
+    assert peak < share * packed_bytes, (
+        f"the peak is {peak} bytes over the start, {peak / packed_bytes:.1%} of the "
+        f"{packed_bytes} packed bytes (limit {share:.0%})"
+    )
+    assert kept == 0, f"{kept} bytes stay allocated after the result is dropped"
