@@ -106,6 +106,7 @@ jobs:
               - "python/sglang/multimodal_gen/test/server/!(test_server_1_gpu_5090|test_server_4_gpu_h100|test_server_b200|test_server_2_gpu|test_request_logger).py"
               - "python/sglang/multimodal_gen/test/server/common/**/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/test/server/perf_baselines/xpu_b60.json"
+              - "python/sglang/multimodal_gen/test/server/perf_baselines/xpu_b70.json"
               - "python/pyproject_xpu.toml"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
@@ -123,14 +124,18 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-xpu-extra
     secrets: inherit
 
   # Runs the entire per-commit XPU test suite in one job (single install, single queue).
-  stage-a-test-1-gpu-xpu:
+  extra-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: intel-bmg
     env:
+      # Per-job name so parallel runners on one host never touch each other's container.
+      CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
     steps:
@@ -152,7 +157,7 @@ jobs:
       - name: Start CI container
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --container-name "${CONTAINER_NAME}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -163,24 +168,24 @@ jobs:
           # JIT build of hicache_hash_cpp (needs <openssl/sha.h>) succeeds.
           # Can be dropped once intel/sglang-dev:latest is rebuilt from a
           # docker/xpu.Dockerfile that already ships libssl-dev.
-          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
-          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
+          docker exec -e DEBIAN_FRONTEND=noninteractive "${CONTAINER_NAME}" apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive "${CONTAINER_NAME}" apt-get install -y libssl-dev
           # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
-          docker exec ci_sglang_xpu bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
-          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
-          docker exec ci_sglang_xpu uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
-          docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
+          docker exec "${CONTAINER_NAME}" bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
+          docker exec "${CONTAINER_NAME}" uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
+          docker exec "${CONTAINER_NAME}" cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
           # falling back to 0.0.0 on a shallow/tag-less checkout.
-          docker exec -w /sglang-checkout ci_sglang_xpu git fetch origin '+refs/tags/*:refs/tags/*' --force
-          docker exec -w /sglang-checkout/python ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache .
-          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+          docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
+          docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
+          docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
+          docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
         continue-on-error: true
         run: |
-          docker exec -w /sglang-checkout/python ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache ".[checkpoint-engine]"
+          docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache ".[checkpoint-engine]"
 
       - name: Run tests
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
@@ -196,7 +201,7 @@ jobs:
             --timeout-override kv_canary/test_self_unit_plan_input.py=120
             --timeout-override kernels/ops/kvcache/test_hisparse.py=120
         run: |
-          docker exec -e SGLANG_IS_IN_CI=true ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
+          docker exec -e SGLANG_IS_IN_CI=true "${CONTAINER_NAME}" bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite extra-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
 
       - name: Cleanup container
         if: always()
@@ -222,8 +227,8 @@ jobs:
           # SIGTERM sglang and drain GPU context before `docker rm -f`;
           # SIGKILL leaves the xe/GuC exec queue registered and triggers a
           # GT reset (+ devcoredump) on B580.
-          if docker ps --format '{{.Names}}' | grep -qx ci_sglang_xpu; then
-            docker exec ci_sglang_xpu bash -c '
+          if docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+            docker exec "${CONTAINER_NAME}" bash -c '
               pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
               for _ in $(seq 1 30); do
                 pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
@@ -232,7 +237,7 @@ jobs:
               pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
             ' || true
           fi
-          docker rm -f ci_sglang_xpu || true
+          docker rm -f "${CONTAINER_NAME}" || true
           if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
@@ -240,9 +245,11 @@ jobs:
   # ==================== Multimodal Gen ==================== #
   multimodal-gen-test-1-gpu-xpu:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: needs.check-changes.outputs.multimodal_gen == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: bmg-multigen-models
     env:
+      # Per-job name so parallel runners on one host never touch each other's container.
+      CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
     steps:
@@ -260,7 +267,7 @@ jobs:
       - name: Start CI container
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --container-name "${CONTAINER_NAME}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -271,26 +278,26 @@ jobs:
           # JIT build of hicache_hash_cpp (needs <openssl/sha.h>) succeeds.
           # Can be dropped once intel/sglang-dev:latest is rebuilt from a
           # docker/xpu.Dockerfile that already ships libssl-dev.
-          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
-          docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
+          docker exec -e DEBIAN_FRONTEND=noninteractive "${CONTAINER_NAME}" apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive "${CONTAINER_NAME}" apt-get install -y libssl-dev
           # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
-          docker exec ci_sglang_xpu bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
-          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
-          docker exec ci_sglang_xpu uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
-          docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
+          docker exec "${CONTAINER_NAME}" bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
+          docker exec "${CONTAINER_NAME}" uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
+          docker exec "${CONTAINER_NAME}" cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
           # falling back to 0.0.0 on a shallow/tag-less checkout.
-          docker exec -w /sglang-checkout ci_sglang_xpu git fetch origin '+refs/tags/*:refs/tags/*' --force
-          docker exec -w /sglang-checkout/python ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache .
-          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+          docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
+          docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
+          docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
+          docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60
         run: |
           # xpu_b60.json is seeded with this flag on; without it the SYCL queue
           # is deep enough that step timings record host enqueue, not device time.
-          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
+          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 "${CONTAINER_NAME}" bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
@@ -311,8 +318,8 @@ jobs:
           # SIGTERM sglang and drain GPU context before `docker rm -f`;
           # SIGKILL leaves the xe/GuC exec queue registered and triggers a
           # GT reset (+ devcoredump) on B580.
-          if docker ps --format '{{.Names}}' | grep -qx ci_sglang_xpu; then
-            docker exec ci_sglang_xpu bash -c '
+          if docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+            docker exec "${CONTAINER_NAME}" bash -c '
               pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
               for _ in $(seq 1 30); do
                 pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
@@ -321,27 +328,22 @@ jobs:
               pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
             ' || true
           fi
-          docker rm -f ci_sglang_xpu || true
+          docker rm -f "${CONTAINER_NAME}" || true
           if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
   finish:
-    if: always()
-    needs: [stage-a-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
+    if: always() && needs.pr-gate.outputs.opted-in != 'false'
+    needs: [extra-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
-      - name: Check job status
+      - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          stage_a="${{ needs.stage-a-test-1-gpu-xpu.result }}"
-          multimodal_gen="${{ needs.multimodal-gen-test-1-gpu-xpu.result }}"
-          if [ "$stage_a" != "success" ] && [ "$stage_a" != "skipped" ]; then
-            echo "stage-a failed with result: $stage_a"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
             exit 1
           fi
-          if [ "$multimodal_gen" != "success" ] && [ "$multimodal_gen" != "skipped" ]; then
-            echo "multimodal-gen failed with result: $multimodal_gen"
-            exit 1
-          fi
-          echo "All jobs completed successfully"
-          exit 0

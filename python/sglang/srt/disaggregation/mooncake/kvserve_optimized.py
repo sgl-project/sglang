@@ -19,6 +19,9 @@ from sglang.srt.disaggregation.mooncake.kvserve_pipeline import (
     EncodedTransferPipeline,
     RestorePipeline,
 )
+from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+    TransferIntent,
+)
 
 
 class OptimizedKVServeAdapter(KVServeAdapter):
@@ -243,12 +246,20 @@ class OptimizedKVServeAdapter(KVServeAdapter):
             meta["digest"] = job["digest"]
         blocks = self._frame_blocks(lease.buffers, peer, lengths)
         start = time.perf_counter()
-        with torch.cuda.device(self.device):
-            status = self.manager._transfer_data(
-                job["request"].mooncake_session_id, blocks
-            )
-        if status != 0:
-            raise RuntimeError(f"Mooncake compressed payload write failed: {status}")
+        if blocks:
+            src_addrs, dst_addrs, sizes = zip(*blocks)
+            with torch.cuda.device(self.device):
+                status = self.manager.engine.batch_transfer_sync(
+                    job["request"].mooncake_session_id,
+                    list(src_addrs),
+                    list(dst_addrs),
+                    list(sizes),
+                    TransferIntent.FOREGROUND,
+                )
+            if status != 0:
+                raise RuntimeError(
+                    f"Mooncake compressed payload write failed: {status}"
+                )
         elapsed_ms = (time.perf_counter() - start) * 1000
         self.notifier.put(
             endpoint(job["request"].endpoint, job["request"].dst_port), READY, meta

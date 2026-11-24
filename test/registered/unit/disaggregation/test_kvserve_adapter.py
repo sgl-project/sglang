@@ -228,6 +228,7 @@ class TestAdapterProtocol(unittest.TestCase):
             engine_rank=0,
             kv_item_lens=[64],
             draft_rows_dcp_collapsed=True,
+            num_draft_entries=2,
         )
         for profile in (None, {"version": 3, "profile": "default"}):
             with self.subTest(profile=profile):
@@ -237,12 +238,15 @@ class TestAdapterProtocol(unittest.TestCase):
                     else SimpleNamespace(registration=lambda: profile)
                 )
                 msg = manager.build_receiver_registration_message()
-                self.assertEqual(msg[21], b"1")
+                self.assertEqual(msg[21:23], [b"1", b"2"])
+                self.assertEqual(len(msg), 23 if profile is None else 24)
                 parsed = KVArgsRegisterInfo.from_zmq(msg)
                 self.assertTrue(parsed.dst_draft_rows_dcp_collapsed)
+                self.assertEqual(parsed.num_draft_entries, 2)
                 self.assertEqual(parsed.kvserve, profile)
                 legacy = KVArgsRegisterInfo.from_zmq(msg[:21])
                 self.assertFalse(legacy.dst_draft_rows_dcp_collapsed)
+                self.assertIsNone(legacy.num_draft_entries)
                 self.assertIsNone(legacy.kvserve)
 
     def test_enqueue_records_native_send_and_owns_source_until_done(self):
@@ -307,6 +311,7 @@ class TestRequestOwnership(unittest.TestCase):
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+        scheduler._release_mm_inputs = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
         scheduler.output_streamer = SimpleNamespace(stream_output=Mock())

@@ -59,18 +59,6 @@ from .tokenizer import (
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
 
 
-def resolve_image_processor_backend(mm_config) -> str:
-    """Resolve the new backend option while honoring the legacy disable flag.
-
-    Takes the `mm` config bag (`get_mm()`): both leaves are resolved config, and
-    every caller is past publish. `getattr` with a default keeps it working for a
-    stand-in that carries only one of the two.
-    """
-    if getattr(mm_config, "disable_fast_image_processor", False):
-        return "pil"
-    return getattr(mm_config, "image_processor_backend", "auto")
-
-
 def _normalize_image_processor_backend(
     image_processor_backend: Optional[str], use_fast: Optional[bool]
 ) -> str:
@@ -330,6 +318,18 @@ def _get_processor(
         return get_tokenizer(
             tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
         )
+    if config.model_type == "inkling2":
+        from sglang.srt.multimodal.inkling2.processor import Inkling2Processor
+
+        return Inkling2Processor.from_pretrained(
+            model_name or tokenizer_name,
+            tokenizer_path=tokenizer_name,
+            revision=revision,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=trust_remote_code,
+            tokenizer_backend=tokenizer_backend,
+            **kwargs,
+        )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
         config.model_type = "deepseek-ocr"
@@ -459,7 +459,9 @@ def _get_processor(
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
-            tokenizer_name, allow_patterns=["*.json", "*.jinja", "*.model"]
+            tokenizer_name,
+            allow_patterns=["*.json", "*.jinja", "*.model"],
+            revision=revision,
         )
         jinja_path = Path(local_path) / "chat_template.jinja"
         if jinja_path.is_file():

@@ -193,6 +193,7 @@ class TestHybridTransfer(unittest.TestCase):
         room = 1
         manager.enable_trace = False
         manager.enable_staging = False
+        manager.kv_shard_state_peer_only = False
         manager.enable_deferred_decode_kv_release = True
         manager.kvserve_enabled = True
         manager._send_records = None
