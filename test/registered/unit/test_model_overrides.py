@@ -267,6 +267,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
                     "enable_flashmla_prefill_token_packing",
+                    "hicache_host_memory_mode",
+                    "hicache_size",
                 }
             ),
         )
