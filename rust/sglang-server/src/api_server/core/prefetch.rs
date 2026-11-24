@@ -21,7 +21,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use bytes::Bytes;
-use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
+use sglang_mm::common::fetch::{
+    ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted, is_local_path,
+};
 use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
@@ -191,9 +193,13 @@ async fn fetch_ordered(
                         });
                     }
                 }
-                let fetched = if src.starts_with('/') || src.starts_with("file://") {
+                let fetched = if src.starts_with("file://") || is_local_path(&src) {
                     fetch_local_file_budgeted(&src, &budget)
-                } else if src.starts_with("http://") || src.starts_with("https://") {
+                } else if src.starts_with('/')
+                    || src.starts_with("http://")
+                    || src.starts_with("https://")
+                {
+                    // A '/' source that names no file decodes as bare base64.
                     fetch_bytes_budgeted(&src, &budget)
                 } else {
                     Err(format!("media fetch: unsupported URI: {src}"))
@@ -365,6 +371,17 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![b"one".as_ref(), b"two".as_ref(), b"zzz".as_ref()]);
         assert!(requests[1].mm.is_none());
+    }
+
+    /// Every JPEG's base64 starts "/9j/": a '/' source that names no file
+    /// decodes as bare base64, as in Python.
+    #[tokio::test]
+    async fn slash_leading_base64_decodes_when_no_file_exists() {
+        let fetched = fetch_for_test(vec!["/9j/4A==".into()], MAX_REQUEST_BYTES).await;
+        assert_eq!(
+            fetched.unwrap(),
+            [Bytes::from_static(&[0xFF, 0xD8, 0xFF, 0xE0])]
+        );
     }
 
     #[tokio::test]

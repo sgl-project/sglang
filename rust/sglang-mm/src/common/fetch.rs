@@ -2,8 +2,8 @@
 //!
 //! Mirrors the Python `get_image_bytes` source handling (and its precedence):
 //! raw bytes, `http(s)://` (bounded download, `REQUEST_TIMEOUT` and the proxy
-//! env vars like Python), `file://` / absolute path, `data:` URL, else bare
-//! base64.
+//! env vars like Python), `file://` / existing absolute path, `data:` URL, else
+//! bare base64.
 
 use std::io::Read;
 use std::sync::OnceLock;
@@ -103,7 +103,7 @@ pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, S
     if let Some(path) = src.strip_prefix("file://") {
         return read_file(path, budget);
     }
-    if src.starts_with('/') {
+    if is_local_path(src) {
         return read_file(src, budget);
     }
     if let Some(rest) = src.strip_prefix("data:") {
@@ -114,7 +114,19 @@ pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, S
         return decode_base64_budgeted(encoded, budget);
     }
     // Python treats any other string as bare base64.
-    decode_base64_budgeted(src, budget)
+    decode_base64_budgeted(src, budget).map_err(|error| {
+        if src.starts_with('/') {
+            format!("{error} (and no file exists at {src:.100})")
+        } else {
+            error
+        }
+    })
+}
+
+/// An absolute path that exists. Bare base64 can start with '/' too (every
+/// JPEG's starts "/9j/"), so Python reads a '/' source as a file only then.
+pub fn is_local_path(src: &str) -> bool {
+    src.starts_with('/') && std::path::Path::new(src).exists()
 }
 
 /// Reserve the maximum decoded size before allocating. The reservation is
@@ -310,6 +322,8 @@ mod tests {
             b"hello"
         );
         assert_eq!(fetch_bytes(&b64).unwrap(), b"hello");
+        // Every JPEG's base64 starts "/9j/"; with no such file it is base64.
+        assert_eq!(fetch_bytes("/9j/4A==").unwrap(), [0xFF, 0xD8, 0xFF, 0xE0]);
     }
 
     #[test]
@@ -320,7 +334,11 @@ mod tests {
     #[test]
     fn missing_file_fails() {
         assert!(fetch_bytes("file:///definitely/not/here.jpg").is_err());
-        assert!(fetch_bytes("/definitely/not/here.jpg").is_err());
+        let err = fetch_bytes("/definitely/not/here.jpg").err().unwrap();
+        assert!(
+            err.contains("no file exists at /definitely/not/here.jpg"),
+            "{err}"
+        );
     }
 
     #[test]

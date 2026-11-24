@@ -123,8 +123,8 @@ pub trait MmProcessor: Send + Sync {
 
     /// Fetch one I/O-backed source, charging its bytes to `budget`; runs on
     /// the API runtime's blocking pool. `Ok(None)` leaves the source to the
-    /// built-in fetcher (`http(s)://`, `file://` and absolute paths), which
-    /// rejects every other URI scheme.
+    /// built-in fetcher (`http(s)://`, `file://`, and a '/' source: an existing
+    /// path, else bare base64), which rejects every other URI scheme.
     fn fetch_media(
         &self,
         _source: &str,
