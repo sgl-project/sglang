@@ -29,9 +29,6 @@ def _make_decode_batch():
     batch.model_config = types.SimpleNamespace(is_encoder_decoder=False)
     batch.enable_overlap = False
     batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
-    batch.sampling_info = types.SimpleNamespace(
-        penalizer_orchestrator=types.SimpleNamespace(is_required=False)
-    )
     batch.hisparse_coordinator = None
     batch.seq_lens = torch.tensor([3, 5], dtype=torch.int64)
     batch.seq_lens_cpu = torch.tensor([3, 5], dtype=torch.int64)

@@ -211,6 +211,36 @@ fn core_output(output: &Value) -> CoreOutput {
     }
 }
 
+/// The halves of a long string are Python's `s[:half]` and `s[-half:]` in
+/// characters (all of `s` for `s[-0:]`), found without walking all of it.
+#[test]
+fn long_strings_cut_as_python_slices() {
+    let python = |s: &str, max_length: usize| {
+        let len = s.chars().count();
+        (len > max_length).then(|| {
+            let (head, tail) = halves(len, max_length);
+            let head: String = s.chars().take(head).collect();
+            (head, s.chars().skip(tail).collect::<String>())
+        })
+    };
+    for s in [
+        "",
+        "a",
+        "ab",
+        "abc",
+        "héllo wörld",
+        "é",
+        "éé",
+        "日本語テキスト",
+        "a😀b😀c",
+    ] {
+        for max_length in 0..12 {
+            let cut = str_halves(s, max_length).map(|(h, t)| (h.to_owned(), t.to_owned()));
+            assert_eq!(cut, python(s, max_length), "{s:?} at {max_length}");
+        }
+    }
+}
+
 /// Python `repr(float)` for the values a request or `meta_info` carries.
 #[test]
 fn floats_print_as_python_repr() {
@@ -294,7 +324,8 @@ fn terminal_output_logs_finish_and_keeps_the_request() {
 }
 
 /// With `--incremental-streaming-output`, a stream's `Finish` shows its
-/// terminal frame: the last delta, with the cumulative completion count.
+/// terminal frame: the last delta, with the cumulative completion count and
+/// the cached tokens by tier an earlier frame reported.
 #[test]
 fn incremental_stream_logs_last_delta() {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
@@ -312,13 +343,24 @@ fn incremental_stream_logs_last_delta() {
     let body = serde_json::json!({"rid": "r-inc", "text": "hi", "stream": true});
     let mut record = receive_body(&log, &body, &http::HeaderMap::new()).remove(0);
     let rid = Rid::from_client("r-inc");
-    record.observe(&ResponseItem::Frame(chunk(&rid, "a", &[1], None)));
+    let mut first = chunk(&rid, "a", &[1], None);
+    first.extras = Some(Box::new(crate::message::response::ChunkExtras {
+        cached_tokens_details: Some(crate::message::response::CachedTokensDetails {
+            device: 1,
+            host: 2,
+            storage: None,
+            storage_backend: None,
+        }),
+        ..Default::default()
+    }));
+    record.observe(&ResponseItem::Frame(first));
     record.observe(&ResponseItem::Done(chunk(&rid, "b", &[2], None)));
 
     let finish = log.logged_lines().remove(1);
     assert!(
         finish.contains(", out={'text': 'b', 'output_ids': [2], 'meta_info': {'id': 'r-inc', ")
-            && finish.contains("'completion_tokens': 2, "),
+            && finish.contains("'completion_tokens': 2, ")
+            && finish.contains("'cached_tokens_details': {'device': 1, 'host': 2}"),
         "{finish}"
     );
 }
@@ -527,8 +569,8 @@ fn recorder_keeps_five_minutes_and_the_unfinished() {
     let _running = recorder.register(dump_request(&recorder, "running"), 1.0, partial);
     let dropped = recorder.register(dump_request(&recorder, "dropped"), 1.0, output());
 
-    recorder.finish(first, true, &Map::new(), 10.0);
-    recorder.finish(probe, false, &Map::new(), 10.0);
+    recorder.finish(first, Some(&Map::new()), 10.0);
+    recorder.finish(probe, None, 10.0);
     recorder.unregister(dropped);
     let (finished, unfinished) = recorded(&recorder);
     assert_eq!(finished, ["first"]);
@@ -541,10 +583,10 @@ fn recorder_keeps_five_minutes_and_the_unfinished() {
 
     // Just inside the window, then out of it once a later request finishes.
     let second = recorder.register(dump_request(&recorder, "second"), 2.0, output());
-    recorder.finish(second, true, &Map::new(), 309.9);
+    recorder.finish(second, Some(&Map::new()), 309.9);
     assert_eq!(recorded(&recorder).0, ["first", "second"]);
     let third = recorder.register(dump_request(&recorder, "third"), 3.0, output());
-    recorder.finish(third, true, &Map::new(), 310.0);
+    recorder.finish(third, Some(&Map::new()), 310.0);
     assert_eq!(recorded(&recorder).0, ["second", "third"]);
 }
 
@@ -639,14 +681,15 @@ fn dump_keeps_the_raw_body() {
 }
 
 /// A request an adapter built keeps its media in the dump, in the fields
-/// Python's request takes them in.
+/// Python's request takes them in; its log line summarizes the media a level
+/// does not show, with or without the dump.
 #[test]
 fn built_request_keeps_its_media() {
     use crate::message::multimodal::MediaHints;
     use crate::message::request::MmData;
 
-    let log = RequestLog::for_test(None, true);
-    let request = GenerateRequest {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let request = || GenerateRequest {
         rid: Rid::from_client("with-media"),
         text: Some("look".into()),
         mm: Some(Box::new(MmData {
@@ -673,9 +716,19 @@ fn built_request_keeps_its_media() {
         })),
         ..Default::default()
     };
+    let summary = ", multimodal={'image': {'count': 2, 'payload_len': 39}, \
+                   'video': {'count': 1, 'payload_len': 13}}";
+    let unrecorded = RequestLog::for_test(Some(level1(&fixture)), false);
+    let _record = unrecorded.receive(&[request()], ReceivedAs::without_headers(), false, true);
+    let received = &unrecorded.logged_lines()[0];
+    assert!(received.contains(summary), "{received}");
+
+    let log = RequestLog::for_test(Some(level1(&fixture)), true);
     let _record = log
-        .receive(&[request], ReceivedAs::without_headers(), false, true)
+        .receive(&[request()], ReceivedAs::without_headers(), false, true)
         .remove(0);
+    let received = &log.logged_lines()[0];
+    assert!(received.contains(summary), "{received}");
     let snapshot: Value = serde_json::from_slice(&log.crash_dump_snapshot().unwrap()).unwrap();
     let body = &snapshot["bodies"][snapshot["unfinished"][0]["body"].to_string()];
     assert_eq!(
@@ -799,4 +852,97 @@ fn rollover_keeps_archives_and_survives_a_deleted_file() {
         .unwrap();
     assert_eq!(file.rollover_at, later + ROTATE_INTERVAL);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A writer output that takes no line until it is released.
+struct StuckSink {
+    released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    written: Arc<Mutex<Vec<String>>>,
+}
+
+impl std::io::Write for StuckSink {
+    fn write(&mut self, line: &[u8]) -> std::io::Result<usize> {
+        let (released, wake) = &*self.released;
+        drop(wake.wait_while(lock(released), |released| !*released));
+        lock(&self.written).push(String::from_utf8(line.to_vec()).unwrap());
+        Ok(line.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes `count` numbered lines from another thread to a writer whose output
+/// is stuck, then releases it and stops the writer. Returns whether every
+/// write returned while the output was stuck, the lines written out in the
+/// end, and the lines dropped.
+fn write_past_a_stuck_sink(full_buffer: FullBuffer, count: usize) -> (bool, Vec<String>, usize) {
+    let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let targets = Arc::new(Targets {
+        stdout: false,
+        paths: Vec::new(),
+        files: Mutex::default(),
+    });
+    let sink = StuckSink {
+        released: released.clone(),
+        written: written.clone(),
+    };
+    let writer = Writer::with_output(targets, full_buffer, sink);
+    let mut lines = writer.writer.clone();
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        for i in 0..count {
+            lines.write_all(format!("{i}\n").as_bytes()).unwrap();
+        }
+        done.send(()).unwrap();
+    });
+    let returned_while_stuck = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+    *lock(&released.0) = true;
+    released.1.notify_all();
+    if !returned_while_stuck {
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+    let dropped = writer.writer.error_counter().dropped_lines();
+    drop(writer);
+    let written = std::mem::take(&mut *lock(&written));
+    (returned_while_stuck, written, dropped)
+}
+
+/// Under `drop`, a stuck sink holds up no write: a line that does not fit is
+/// dropped whole, and the drops reach the metric when the writer stops. The
+/// lines kept are written out in order.
+#[test]
+fn a_full_buffer_drops_lines_without_waiting() {
+    let before = dropped_lines_metric().value(&[]).unwrap_or(0);
+    let count = BUFFERED_LINES + 100;
+    let (returned_while_stuck, written, dropped) = write_past_a_stuck_sink(FullBuffer::Drop, count);
+    assert!(returned_while_stuck);
+    // The writer thread holds one line; the buffer holds the rest it keeps.
+    assert!(dropped >= count - BUFFERED_LINES - 1, "{dropped} dropped");
+    assert_eq!(written.len() + dropped, count);
+    let numbers: Vec<usize> = written
+        .iter()
+        .map(|line| line.strip_suffix('\n').unwrap().parse().unwrap())
+        .collect();
+    assert!(numbers.is_sorted());
+    // The reporter reports the last drops from its own thread.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dropped_lines_metric().value(&[]) != Some(before + dropped as u64) {
+        assert!(Instant::now() < deadline, "drops not reported");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Under `wait`, a write waits for room while the sink is stuck, and no line
+/// is lost.
+#[test]
+fn a_full_buffer_waits_until_the_sink_drains() {
+    let count = BUFFERED_LINES + 2;
+    let (returned_while_stuck, written, dropped) = write_past_a_stuck_sink(FullBuffer::Wait, count);
+    assert!(!returned_while_stuck);
+    assert_eq!(dropped, 0);
+    let expected: Vec<String> = (0..count).map(|i| format!("{i}\n")).collect();
+    assert_eq!(written, expected);
 }

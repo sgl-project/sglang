@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -274,9 +274,7 @@ class TestRowStateResetOnReuse(CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestStaticRowStateReset(CustomTestCase):
-    def test_reused_row_cursors_reset_in_next_forward(self):
-        """A static pool's reused row keeps its ReplaySSM cursors when handed
-        out; the next `ModelRunner.forward` resets them."""
+    def _static_pools(self):
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=64,
@@ -300,18 +298,38 @@ class TestStaticRowStateReset(CustomTestCase):
             enable_linear_replayssm_spec=True,
         )
         allocator = SimpleNamespace(storage=None, state=table.state)
+        return table, allocator
+
+    def _reuse_dirty_row(self, table, allocator):
         storage = kv_storage_of(table, allocator)
         cursors = [getattr(table.state.pool, name) for name in _CURSORS]
-
         (row,) = storage.take_rows(1)
         _forward(table, allocator)
         for cursor in cursors:
             cursor[row] = 5
         storage.release_rows([row])
         self.assertEqual(storage.take_rows(1), [row])
+        return row, cursors
+
+    def test_reused_row_cursors_reset_in_next_forward(self):
+        """A static pool's reused row keeps its ReplaySSM cursors when handed
+        out; the next `ModelRunner.forward` resets them."""
+        table, allocator = self._static_pools()
+        row, cursors = self._reuse_dirty_row(table, allocator)
         torch.cuda.synchronize()
         # Handing the row out writes nothing on the scheduling stream.
         self.assertTrue(all(int(cursor[row]) == 5 for cursor in cursors))
+        _forward(table, allocator)
+        torch.cuda.synchronize()
+        self.assertTrue(all(int(cursor[row]) == 0 for cursor in cursors))
+
+    def test_reused_row_cursors_reset_when_a_draft_table_forwards_first(self):
+        table, allocator = self._static_pools()
+        draft_table = ReqToTokenPool(
+            size=4, max_context_len=64, device="cuda", enable_memory_saver=False
+        )
+        row, cursors = self._reuse_dirty_row(table, allocator)
+        _forward(draft_table, allocator)
         _forward(table, allocator)
         torch.cuda.synchronize()
         self.assertTrue(all(int(cursor[row]) == 0 for cursor in cursors))
