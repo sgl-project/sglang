@@ -468,6 +468,28 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertEqual(events[0].event_type, "tool_call")
         self.assertEqual(events[0].content, '{"query": "SGLang"}')
 
+    def test_built_in_tool_call_streaming(self):
+        """Streamed analysis tool-call arguments arrive in the tool_call event,
+        not as reasoning before <|call|>."""
+        headers = {
+            "recipient_after_channel": ["<|channel|>analysis to=browser.search"],
+            "recipient_before_channel": [
+                "<|start|>assistant to=browser.search",
+                "<|channel|>analysis",
+            ],
+        }
+        body = ["<|message|>", '{"query":', ' "SGLang"}', "<|call|>"]
+
+        for name, header in headers.items():
+            with self.subTest(header=name):
+                chunks = header + body
+                parser = HarmonyParser()
+                events = [e for chunk in chunks for e in parser.parse(chunk)]
+
+                self.assertEqual([e.event_type for e in events], ["tool_call"])
+                self.assertEqual(events[0].content, '{"query": "SGLang"}')
+                self.assertEqual(events[0].raw_text, "".join(chunks))
+
     def test_streaming_property_canonical(self):
         """Test streaming property: chunked parsing produces same semantic content as one-shot parsing."""
         full_text = (
