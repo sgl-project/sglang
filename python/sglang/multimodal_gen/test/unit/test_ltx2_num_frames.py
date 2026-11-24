@@ -8,6 +8,7 @@ audio length comes from ``num_frames / fps``. CPU only -- no weights, no GPU.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
     JoyEchoPipelineConfig,
@@ -78,6 +79,35 @@ def test_audio_length_matches_decoded_video(config_cls, num_frames):
     assert _audio_latent_length(config, adjusted, fps) == _audio_latent_length(
         config, decoded, fps
     )
+
+
+@pytest.mark.parametrize("config_cls", CONFIGS)
+@pytest.mark.parametrize("num_frames, fps", [(1, 60), (8, 60), (1, 24), (128, 60)])
+def test_audio_latents_round_trip(config_cls, num_frames, fps):
+    """Preparation and unpacking use one audio length, and it is never 0.
+
+    8 frames at 60 fps round down to a single video frame, which is shorter
+    than one audio latent; a zero-length audio sequence breaks the audio RoPE.
+    """
+    config = config_cls()
+    adjusted = config.adjust_num_frames(num_frames, log_adjustment=False)
+    batch = SimpleNamespace(height=64, width=64, num_frames=adjusted, fps=fps)
+
+    audio_shape = config.prepare_audio_latent_shape(batch, 1, adjusted)
+    assert audio_shape[2] >= 1
+    latent_frames = (adjusted - 1) // config.vae_temporal_compression + 1
+    video = torch.randn(config.prepare_latent_shape(batch, 1, latent_frames))
+    audio = torch.randn(audio_shape)
+
+    out_video, out_audio = config._unpad_and_unpack_latents(
+        config.maybe_pack_latents(video, 1, batch),
+        config.maybe_pack_audio_latents(audio, 1, batch),
+        batch,
+        None,
+        None,
+    )
+    torch.testing.assert_close(out_video, video)
+    torch.testing.assert_close(out_audio, audio)
 
 
 def test_adjustment_logs_only_when_requested(monkeypatch):
