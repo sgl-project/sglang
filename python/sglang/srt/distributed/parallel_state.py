@@ -1882,6 +1882,10 @@ class GroupCoordinator:
 
                 # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
+                if _is_xpu and not tensor.is_cpu:
+                    # CRI TP+PP stalls in all-reduce while an irecv is pending (sgl-project/sglang#52883).
+                    # Workaround; drop once the root cause of the stall is fixed.
+                    torch.xpu.synchronize()
                 work = torch.distributed.irecv(
                     tensor, src=self.ranks[src], group=comm_group
                 )
