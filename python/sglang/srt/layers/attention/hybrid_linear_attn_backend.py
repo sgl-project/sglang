@@ -299,8 +299,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 slots = mamba_cache_indices.to(torch.long)
                 # Padded rows point at the reserved padding slot 0; the clamp keeps
                 # a -1 sentinel in bounds (the kernel zeroes rows with state_idx < 0).
-                safe_slots = slots.clamp(min=0)
-                replayssm_write_pos = write_pos_buf[safe_slots].clone()
+                cursor_idx = self._replayssm_cursor_indices(
+                    slots, forward_batch.req_pool_indices
+                )
+                replayssm_write_pos = write_pos_buf[cursor_idx].clone()
                 L = mamba_pool.linear_replayssm_cache_len
                 # KDA has no radix coordination: flush only on the natural write_pos
                 # == L-1 wrap. GDN adds the radix-aligned force-flush below.
@@ -317,7 +319,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # Advance only valid slots, scattered over unique slots (dup-index
                 # race; padded rows share slot 0); a forced flush -> next write_pos 0.
                 valid_mask = slots >= 0
-                valid_slots = slots[valid_mask]
+                valid_slots = cursor_idx[valid_mask]
                 if valid_slots.numel() > 0:
                     flushed = replayssm_write_pos == (L - 1)
                     if replayssm_force_flush is not None:
@@ -669,6 +671,17 @@ class MambaAttnBackendBase(AttentionBackend):
             return False
         return pool.replayssm_request_ring
 
+    def _replayssm_cursor_indices(
+        self, slots: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Index of each decode row's ReplaySSM write cursor: its (translated)
+        request row under the request-row ring, else its state slot. Padded
+        rows (negative slot) use the reserved row/slot 0."""
+        if not self._replayssm_request_ring():
+            return slots.clamp(min=0)
+        rows = self._ring_ids.ids(req_pool_indices[: slots.shape[0]]).to(torch.long)
+        return torch.where(slots >= 0, rows, torch.zeros_like(rows))
+
     def _fill_replayssm_ring_indices(
         self,
         bs: int,
@@ -932,10 +945,12 @@ class MambaAttnBackendBase(AttentionBackend):
             if write_pos_buf is not None:
                 # this replay's per-row physical slots (padded rows == -1)
                 slots = mamba_indices.to(torch.long)
-                safe_slots = slots.clamp(min=0)
+                cursor_idx = self._replayssm_cursor_indices(
+                    slots, req_pool_indices[: len(mamba_indices)]
+                )
                 # Snapshot this step's cursor into the captured buffer in-place
                 # (copy_, never reassign the object).
-                static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
+                static_wp[: len(mamba_indices)].copy_(write_pos_buf[cursor_idx])
                 # Refresh the force-flush buffer in-place from this step's seq_lens
                 # (same condition as the radix track). Zeroed during capture.
                 force_flush_dev = None
@@ -959,9 +974,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     # Advance only valid (non-padded) slots; a forced flush empties
                     # the ring -> next write_pos 0, like the natural L-1 wrap.
                     valid_mask = slots >= 0
-                    valid_slots = slots[valid_mask]
+                    valid_slots = cursor_idx[valid_mask]
                     if valid_slots.numel() > 0:
-                        cur_pos = write_pos_buf[safe_slots]
+                        cur_pos = write_pos_buf[cursor_idx]
                         flushed = cur_pos == (L - 1)
                         if force_flush_dev is not None:
                             flushed = flushed | (force_flush_dev != 0)

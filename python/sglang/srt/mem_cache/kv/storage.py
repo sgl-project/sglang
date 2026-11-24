@@ -714,22 +714,30 @@ class KVStorage:
     def free_checkpoints(self, sub_pool: str, checkpoints: torch.Tensor) -> None:
         self._allocator.state.ckpt_pool.free(checkpoints)
 
-    def settle_replay(self, sub_pool: str, slot: torch.Tensor) -> int:
+    def settle_replay(self, sub_pool: str, slot: torch.Tensor, row: int) -> int:
         """At a request's finish: the tokens its slot's state lags behind the
         request (its replay ring's unflushed depth, 0 without one); the lag
-        restarts at zero."""
-        write_pos = self._allocator.state.pool.replayssm_write_pos
+        restarts at zero. With the request-row decode ring the cursor lives on
+        the request's ``row`` instead of its slot."""
+        pool = self._allocator.state.pool
+        write_pos = pool.replayssm_write_pos
         if write_pos is None:
             return 0
-        slot = self._allocator.state_ids(sub_pool).ids(slot)
-        lag = int(write_pos[slot].item())
-        write_pos[slot] = 0
+        if pool.replayssm_request_ring:
+            cursor = row
+        else:
+            cursor = self._allocator.state_ids(sub_pool).ids(slot)
+        lag = int(write_pos[cursor].item())
+        write_pos[cursor] = 0
         return lag
 
     def restart_replay(self, sub_pool: str, slots: torch.Tensor) -> None:
-        """A loaded state is current: its replay lag restarts at zero."""
-        write_pos = self._allocator.state.pool.replayssm_write_pos
-        if write_pos is not None:
+        """A loaded state is current: its replay lag restarts at zero. The
+        request-row ring keeps no per-slot lag (`reset_request_rows` restarts
+        the row before its first forward)."""
+        pool = self._allocator.state.pool
+        write_pos = pool.replayssm_write_pos
+        if write_pos is not None and not pool.replayssm_request_ring:
             write_pos[self._allocator.state_ids(sub_pool).ids(slots)] = 0
 
     @property

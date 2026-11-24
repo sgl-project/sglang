@@ -121,6 +121,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 write_pos=replayssm_write_pos,
                 force_flush=replayssm_force_flush,
                 use_qk_l2norm_in_kernel=True,
+                # Request-row ring; None keys the ring by the state slot.
+                replay_indices=kwargs.get("replayssm_ring_indices"),
             )
             return out.transpose(0, 1)
 

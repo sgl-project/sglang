@@ -698,7 +698,9 @@ class ExecMamba(msgspec.Struct):
         "but its per-K gate ring is larger and ReplaySSM is typically slower "
         "than packed KDA decode; benchmark before enabling it. Requires the "
         "Triton linear-attn decode backend, or Helion for KDA, and "
-        "--mamba-radix-cache-strategy no_buffer (the default).",
+        "--mamba-radix-cache-strategy no_buffer (the default). The ring is kept "
+        "per mamba slot; for GDN, SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING=1 "
+        "keeps it per request row instead, which also allows extra_buffer.",
     ] = False
     linear_replayssm_cache_len: A[
         int,

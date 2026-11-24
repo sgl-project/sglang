@@ -71,6 +71,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     k_cache,  # [num_slots, H,  L, K] ring: (normed/scaled) keys
     g_cache,  # GDN: [num_slots, HV, L] ; KDA: [num_slots, HV, L, K] log-decay gates (fp32)
     ssm_state_indices,  # [B] physical state slot per decode row
+    replay_indices,  # [B] ring row per decode row; read only when HAS_REPLAY_INDICES
     write_pos,  # [B] int32 per-row ring cursor (0..L-1)
     force_flush,  # [B] int32: !=0 forces a flush this step (radix track boundary)
     scale,
@@ -97,6 +98,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     HAS_FORCE_FLUSH: tl.constexpr,
     IS_KDA: tl.constexpr,
+    HAS_REPLAY_INDICES: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -117,6 +119,14 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             mask=mask_v,
         )
         return
+
+    # The checkpoint (h0/ht) is keyed by the physical state slot. The (d, k, g)
+    # ring is keyed by `ring_idx`: the request row when the caller passes
+    # replay_indices (request-row ring), else the state slot.
+    if HAS_REPLAY_INDICES:
+        ring_idx = tl.load(replay_indices + i_n).to(tl.int64)
+    else:
+        ring_idx = state_idx
 
     # Per-row buffer cursor and flush flag (device-side branch, no host branch),
     # plus the set of valid (already committed) cache positions.
@@ -148,7 +158,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
 
         # Replay decay over the committed cache, from the cached per-step gates.
         # b_replay_decay[j] = exp(sum_i g_i - cumsum_inclusive_j) = prod_{i>j} alpha_i
-        p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
+        p_g_main = g_cache + ring_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
         b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
         b_g_prefix = tl.cumsum(b_g_all, axis=0)
         b_g_total = tl.sum(b_g_all, axis=0)
@@ -158,7 +168,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     # Cached corrected-delta vectors d (K-independent).  Layout
     # d_cache[slot, hv, L, V] -> index [V, BC] tile.
     p_d_main = d_cache + (
-        state_idx * stride_d_slot
+        ring_idx * stride_d_slot
         + (i_hv * MAX_CACHE_LEN + o_c[None, :]) * V
         + o_v[:, None]
     )
@@ -245,7 +255,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         )
         p_k_c = (
             k_cache
-            + state_idx * stride_k_slot
+            + ring_idx * stride_k_slot
             + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K
             + o_kt[None, :]
         )
@@ -264,7 +274,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             # keys and the total decay onto S0.
             p_g_c = (
                 g_cache
-                + state_idx * stride_g_slot
+                + ring_idx * stride_g_slot
                 + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * K
                 + o_kt[None, :]
             )
@@ -304,7 +314,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             if write_g_kda:
                 p_cur_g = (
                     g_cache
-                    + state_idx * stride_g_slot
+                    + ring_idx * stride_g_slot
                     + (i_hv * MAX_CACHE_LEN + b_write_pos) * K
                     + o_kt
                 )
@@ -317,7 +327,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         if write_k:
             p_cur_k = (
                 k_cache
-                + state_idx * stride_k_slot
+                + ring_idx * stride_k_slot
                 + (i_h * MAX_CACHE_LEN + b_write_pos) * K
                 + o_kt
             )
@@ -365,7 +375,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             ).to(tl.float32)
             p_k_c = (
                 k_cache
-                + state_idx * stride_k_slot
+                + ring_idx * stride_k_slot
                 + (i_h * MAX_CACHE_LEN + o_c[:, None]) * K
                 + o_kt[None, :]
             )
@@ -380,7 +390,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             else:
                 p_g_c = (
                     g_cache
-                    + state_idx * stride_g_slot
+                    + ring_idx * stride_g_slot
                     + (i_hv * MAX_CACHE_LEN + o_c[:, None]) * K
                     + o_kt[None, :]
                 )
@@ -432,7 +442,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         # scalar g is appended here.
         p_cur_d = (
             d_cache
-            + state_idx * stride_d_slot
+            + ring_idx * stride_d_slot
             + (i_hv * MAX_CACHE_LEN + b_write_pos) * V
             + o_v
         )
@@ -443,7 +453,7 @@ def fused_recurrent_linear_replayssm_decode_kernel(
         )
         if (not IS_KDA) and (i_v == 0):
             p_cur_g = (
-                g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + b_write_pos
+                g_cache + ring_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + b_write_pos
             )
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
@@ -469,8 +479,13 @@ def fused_recurrent_linear_replayssm_decode(
     num_warps: int = 1,
     num_stages: int = 3,
     nk: int = 2,
+    replay_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Buffered output-only linear-attention autoregressive decode (1 token/seq).
+
+    ``replay_indices`` ([B] int, optional): ring row per decode row for
+    ``d_cache/k_cache/g_cache``; the checkpoint ``initial_state`` stays on
+    ``ssm_state_indices``, which also keys the ring when this is None.
 
     One kernel for both gate granularities, selected by ``is_kda``:
       * ``is_kda=False`` (GDN): per-head SCALAR gate.  ``a``=[B, HV],
@@ -573,6 +588,13 @@ def fused_recurrent_linear_replayssm_decode(
             "`write_pos` and `ssm_state_indices` must both have length B="
             f"{B} (got {write_pos.shape[0]}, {ssm_state_indices.shape[0]})."
         )
+    if replay_indices is not None and (
+        replay_indices.ndim != 1 or replay_indices.shape[0] < B
+    ):
+        raise ValueError(
+            "`replay_indices` must be 1D with length >= B="
+            f"{B} (got shape {tuple(replay_indices.shape)})."
+        )
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
@@ -604,6 +626,9 @@ def fused_recurrent_linear_replayssm_decode(
         k_cache=k_cache,
         g_cache=g_cache,
         ssm_state_indices=ssm_state_indices,
+        replay_indices=(
+            replay_indices if replay_indices is not None else ssm_state_indices
+        ),
         write_pos=write_pos,
         force_flush=force_flush if force_flush is not None else write_pos,
         scale=scale,
@@ -630,6 +655,7 @@ def fused_recurrent_linear_replayssm_decode(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         HAS_FORCE_FLUSH=force_flush is not None,
         IS_KDA=is_kda,
+        HAS_REPLAY_INDICES=replay_indices is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -1995,6 +1995,10 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # Opt-in: key the GDN decode ReplaySSM ring (--enable-linear-replayssm) and
+    # its write cursor by request row instead of mamba slot, which shrinks the
+    # ring to the running requests and lets it run with extra_buffer.
+    SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
