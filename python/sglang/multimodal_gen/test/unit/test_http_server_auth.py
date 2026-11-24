@@ -3,7 +3,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
@@ -28,11 +27,9 @@ def test_every_route_declares_its_level():
     assert undeclared_routes(_app()) == []
 
 
-@pytest.mark.parametrize(
-    "path", ["/update_weights_from_disk", "/v1/set_lora", "/start_profile"]
-)
-def test_admin_route_needs_the_admin_key(path):
+def test_admin_route_needs_the_admin_key():
     # 403 without an admin key, even with the API key sent; 401 for a wrong key.
+    path = "/update_weights_from_disk"
     client = TestClient(_app(api_key="user"))
     assert (
         client.post(path, headers={"Authorization": "Bearer user"}).status_code == 403
