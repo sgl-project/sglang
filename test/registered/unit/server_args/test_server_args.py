@@ -3553,14 +3553,19 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
             self._check()
 
     def test_the_reader_rope_width_and_compute_dtype_are_required(self):
-        """The sparse attention reading the INT8 record takes a 64-wide RoPE
-        and a BF16 query: a NoPE DSA model or an FP16 run fails at startup,
-        not on the first forward."""
-        with override_platform(is_npu=True):
-            with self.assertRaisesRegex(ValueError, "qk_rope_head_dim=0"):
-                self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
+        """The packed readers accept RoPE0 and RoPE64 with a BF16 query."""
+        with override_platform(is_npu=True), envs.SGLANG_NPU_USE_MLAPO.override(False):
+            self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
+            with self.assertRaisesRegex(ValueError, "qk_rope_head_dim=32"):
+                self._check(qk_rope_head_dim=32)
             with self.assertRaisesRegex(ValueError, "bfloat16 model dtype"):
                 self._check(dtype=torch.float16)
+
+    def test_rope0_requires_the_regular_int8_kv_writer(self):
+        with override_platform(is_npu=True), envs.SGLANG_NPU_USE_MLAPO.override(True):
+            self._check()
+            with self.assertRaisesRegex(ValueError, "SGLANG_NPU_USE_MLAPO"):
+                self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
 
     def test_mlapo_is_accepted(self):
         """MLAProlog writes the INT8 record; it checks the projection weights

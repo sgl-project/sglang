@@ -1970,7 +1970,7 @@ class AscendAttnBackend(AttentionBackend):
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            return self._forward_fp8_sparse(
+            return self._forward_packed_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -2035,7 +2035,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out[:, :num_q_heads] if head_padding else attn_out
 
-    def _forward_fp8_sparse(
+    def _forward_packed_sparse(
         self,
         q_nope,
         q_pe,
@@ -2045,32 +2045,35 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+        actual_seq_qlen = actual_seq_qlen.to(device=q_nope.device, dtype=torch.int32)
+        actual_seq_lengths_kv = actual_seq_lengths_kv.to(
+            device=q_nope.device, dtype=torch.int32
+        )
+        block_table = self.forward_metadata.block_tables
+
+        if self.qk_rope_head_dim == 0:
             from sgl_kernel_npu.operators.attention import (
                 kv_quant_sparse_flash_attention,
             )
 
-            # RoPE0 uses Q512 and packed KV528. The operator fills the
-            # missing RoPE lanes without widening the physical KV cache.
-            # DSA supplies indices that already encode causal visibility.
-            output, _, _ = kv_quant_sparse_flash_attention(
+            # The custom reader accepts Q512 and compact KV528. It takes
+            # INT8 directly and reads E4M3 FP8 through a uint8 byte view.
+            if packed_kv.dtype == torch.float8_e4m3fn:
+                packed_kv = packed_kv.view(torch.uint8)
+            attn_out, _, _ = kv_quant_sparse_flash_attention(
                 query=q_nope,
                 query_rope=q_pe,
-                packed_kv=packed_kv.view(torch.uint8),
+                packed_kv=packed_kv,
                 sparse_indices=topk_indices,
-                block_table=self.forward_metadata.block_tables,
-                actual_seq_lengths_query=actual_seq_qlen.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
+                block_table=block_table,
+                actual_seq_lengths_query=actual_seq_qlen,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
                 scale_value=layer.scaling,
                 return_softmax_lse=False,
             )
-            return output
+            return attn_out
 
-        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
         # A packed pool hands back its K buffer in the record's one-byte dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
@@ -2082,13 +2085,9 @@ class AscendAttnBackend(AttentionBackend):
             value_quant_mode=2,
             key_dequant_scale=None,
             value_dequant_scale=None,
-            actual_seq_lengths_query=actual_seq_qlen.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
+            actual_seq_lengths_query=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            block_table=block_table,
             sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
@@ -2212,20 +2211,17 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # The BF16 MLA interface needs an explicit zero RoPE tensor.
-        if self.qk_rope_head_dim == 0 and is_npu_arch35():
-            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+        # The BF16 MLA interface needs explicit zero RoPE tensors.
+        if (
+            self.qk_rope_head_dim == 0
+            and not self.token_to_kv_pool.dsa_kv_cache_store_fp8
+        ):
+            if is_npu_arch35():
                 k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
                 q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
-        elif self.qk_rope_head_dim == 0:
-            k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
-            q_pe = q_nope.new_zeros(
-                (
-                    q.shape[0],
-                    layer.tp_q_head_num,
-                    64,
-                )
-            )
+            else:
+                k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
+                q_pe = q_nope.new_zeros((q.shape[0], layer.tp_q_head_num, 64))
 
         # The token shard replaces the query lengths, built once per forward.
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
@@ -2328,7 +2324,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # The pool decides the layout: k_nope is then the packed record.
             if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-                attn_out = self._forward_fp8_sparse(
+                attn_out = self._forward_packed_sparse(
                     q_nope,
                     q_pe,
                     k_nope,
