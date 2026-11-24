@@ -3,16 +3,12 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.arch.triton_portability import (
-    IS_HIP,
-    gdc_launch_dependents,
-    gdc_wait,
-    pdl_launch,
-)
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe.gate_topk import fpval_to_key, key_to_indx
+from sglang.srt.utils import is_hip
 
 PDL = is_arch_support_pdl()
+_is_hip = is_hip()
 
 ROUTE_MAX_ROWS = 512
 ROUTE_MAX_IDS = 4096
@@ -38,9 +34,11 @@ def _route_topk(
     TOPK_POW2: tl.constexpr,
     BLOCK_N: tl.constexpr,
     RENORM: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    gdc_wait()
-    gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     _topk_row(
         P, Bias, Logits, Ids, Weights, GlobalScale, route_scale, M,
         tl.program_id(0), N, GROUPS, HAS_BIAS, TOPK, TOPK_POW2, BLOCK_N, RENORM,
@@ -150,7 +148,7 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
             triton.next_power_of_2(n),
             fuse_renorm,
             enable_fp_fusion=False,
-            **pdl_launch(PDL),
+            **({"USE_PDL": True, "launch_pdl": True} if PDL else {}),
         )
     if fuse_renorm:
         return logits, ids, weights
@@ -179,9 +177,11 @@ def _route_metadata(
     BLOCK_M: tl.constexpr,
     SEARCH_N: tl.constexpr,
     SEARCH_E: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    gdc_wait()
-    gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     _metadata(
         Ids, Weights, SortedIds, Src2Dst, Dst2Src, Gammas, Counts, Offsets,
         BlockOffsets, Schedule, n, start, max_blocks, E, BLOCK_N, BLOCK_E, BLOCK_S,
@@ -289,7 +289,7 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
     offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     block_offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     schedule = torch.empty(max_blocks, device=device, dtype=torch.int32)
-    if n > ROUTE_CUDA_MIN_IDS and not IS_HIP:
+    if n > ROUTE_CUDA_MIN_IDS and not _is_hip:
         _route_module().route_metadata(
             ids,
             weights,
@@ -330,8 +330,8 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
             block_n.bit_length(),
             block_e.bit_length(),
             # ROCm workgroups hold at most 16 wavefronts.
-            num_warps=min(16 if IS_HIP else 32, max(4, block_n // 128)),
-            **pdl_launch(PDL),
+            num_warps=min(16 if _is_hip else 32, max(4, block_n // 128)),
+            **({"USE_PDL": True, "launch_pdl": True} if PDL else {}),
         )
     return (
         src2dst,
