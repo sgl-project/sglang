@@ -106,9 +106,8 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
-    # Per side state: its device pointer for the Mamba transfer kernel, or None
-    # (blocking copy); resolved on the first transfer.
-    _slot_state_ptrs: Optional[list] = None
+    # Per side state: its device pointer for the Mamba transfer kernel, or None (blocking copy).
+    slot_state_device_ptrs: tuple = ()
 
     def __init__(
         self,
@@ -247,6 +246,7 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.kv_buffer = self.init_kv_buffer()
+        self._init_slot_state_device_ptrs()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
@@ -744,7 +744,9 @@ class MambaPoolHost(HostKVCache):
         # before that layer's completion event, which is what every reader of a
         # restored slot waits on.
         if layer_id == 0:
-            self._transfer_slot_states(host_indices, device_indices, to_device=True)
+            self._transfer_slot_states(
+                host_indices, device_indices, to_device=True, io_backend=io_backend
+            )
         if (
             io_backend == "kernel_ascend"
             and transfer_mamba_state is not None
@@ -837,35 +839,41 @@ class MambaPoolHost(HostKVCache):
                 can_use_jit=self._conv_can_use_jit[conv_idx],
                 src_ptrs=self.conv_device_ptrs[conv_idx],
             )
-        self._transfer_slot_states(host_indices, device_indices, to_device=False)
+        self._transfer_slot_states(
+            host_indices, device_indices, to_device=False, io_backend=io_backend
+        )
 
-    def _transfer_slot_states(self, host_indices, device_indices, *, to_device):
+    def _init_slot_state_device_ptrs(self):
+        self.slot_state_device_ptrs = [
+            (
+                torch.tensor(
+                    [state.data_ptr()], dtype=torch.uint64, device=state.device
+                )
+                if self._slot_rows_fit_kernel(state, host_buf)
+                else None
+            )
+            for state, host_buf in zip(
+                self.slot_state_device_tensors, self.slot_state_buffers
+            )
+        ]
+
+    def _transfer_slot_states(
+        self, host_indices, device_indices, *, to_device, io_backend="kernel"
+    ):
         """Copy the registered side-state rows for these slots, one leg or the
-        other. Rows the Mamba transfer kernel can move are copied on the current
-        stream, ahead of the completion event that the conv/temporal rows of the
-        same slots ride on; any other side state takes a blocking copy."""
+        other. With the kernel backend, rows the Mamba transfer kernel can move are
+        copied on the current stream, ahead of the completion event that the
+        conv/temporal rows of the same slots ride on; any other side state or
+        backend takes a blocking copy."""
         if not self.slot_state_device_tensors:
             return
-        if self._slot_state_ptrs is None:
-            self._slot_state_ptrs = [
-                (
-                    torch.tensor(
-                        [state.data_ptr()], dtype=torch.uint64, device=state.device
-                    )
-                    if self._slot_rows_fit_kernel(state, host_buf)
-                    else None
-                )
-                for state, host_buf in zip(
-                    self.slot_state_device_tensors, self.slot_state_buffers
-                )
-            ]
         kernel_indices = None
         for state, host_buf, state_ptr in zip(
             self.slot_state_device_tensors,
             self.slot_state_buffers,
-            self._slot_state_ptrs,
+            self.slot_state_device_ptrs or [None] * len(self.slot_state_buffers),
         ):
-            if state_ptr is not None:
+            if state_ptr is not None and io_backend == "kernel":
                 if kernel_indices is None:
                     kernel_indices = [
                         self._kernel_slot_indices(indices, state.device)

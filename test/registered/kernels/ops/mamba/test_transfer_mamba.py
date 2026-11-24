@@ -450,15 +450,17 @@ def test_slot_side_states_take_the_transfer_kernel():
         torch.zeros((8,) + tuple(s.shape[1:]), dtype=s.dtype).pin_memory()
         for s in states
     ]
+    host._init_slot_state_device_ptrs()
     dev_idx, host_idx = torch.tensor([4, 1], device=DEVICE), torch.tensor([7, 0])
     host._transfer_slot_states(host_idx, dev_idx, to_device=False)
     torch.cuda.synchronize()
     on_cuda = torch.version.hip is None
-    assert [p is not None for p in host._slot_state_ptrs] == [on_cuda, on_cuda, False]
+    fits = [p is not None for p in host.slot_state_device_ptrs]
+    assert fits == [on_cuda, on_cuda, False]
     for state, buf in zip(states, host.slot_state_buffers):
         assert torch.equal(buf[[7, 0]], state[[4, 1]].cpu())
     host.slot_state_device_tensors = [torch.zeros_like(s) for s in states]
-    host._slot_state_ptrs = None
+    host._init_slot_state_device_ptrs()
     host._transfer_slot_states(
         host_idx, torch.tensor([2, 5], device=DEVICE), to_device=True
     )
