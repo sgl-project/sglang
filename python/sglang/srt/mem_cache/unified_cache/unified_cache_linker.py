@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -202,6 +204,9 @@ class UnifiedCacheLinker(ABC):
     pools: dict[PoolName, object]
     load_mode = "layer_wise"
     prefetch_policy = "timeout"
+    # Whether the pipeline stages of one worker can share the store: stage 0
+    # answers lookups for every stage, the others block on their own offloads.
+    supports_pp = False
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
@@ -286,6 +291,15 @@ class UnifiedCacheLinker(ABC):
     def pop_completed_offload(self) -> bool:
         """Consume the oldest completed offload and return its result."""
 
+    def wait_completed_offload(self) -> bool:
+        """`pop_completed_offload`, blocking until the oldest offload completes."""
+        raise NotImplementedError
+
+    def settle_failed_offload(self, *, rewrite: bool) -> bool:
+        """Drop the oldest failed offload, writing it again first when
+        ``rewrite``; False when the rewrite failed too."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset(self) -> None:
         """Quiesce all transfers and reset backend state before returning."""
@@ -354,6 +368,10 @@ class UnifiedCacheLinkerWrapper:
         self.load_mode = cache_linker.load_mode
         if self.load_mode == "prefetch" and cache.pp_size > 1:
             raise ValueError("External linker prefetch currently requires PP=1.")
+        if cache.pp_size > 1 and not cache_linker.supports_pp:
+            raise ValueError(
+                f"{type(cache_linker).__name__} does not support pipeline parallelism."
+            )
         self._windows = tuple(cache.components[slot] for slot in windows)
         # A window whose pages the store lacks tombstones restored tails instead.
         self._skipped_windows = tuple(
@@ -379,6 +397,11 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # Pipeline stage 0: when each completed offload was first seen, oldest first.
+        self.completed_offload_times: deque[float] = deque()
+        self.offload_settle_s = (
+            envs.SGLANG_UNIFIED_CACHE_LINKER_PP_SETTLE_MS.get() / 1e3
+        )
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -421,8 +444,13 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        # A later pipeline stage takes stage 0's answer, which covers its objects.
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            (
+                self.cache_linker.lookup(req.rid, lookup_transfers)
+                if cache.pp_rank == 0
+                else ()
+            ),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -689,9 +717,20 @@ class UnifiedCacheLinkerWrapper:
             mask[torch.tensor(valid, dtype=torch.long)] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
-        if common.numel() == 0:
-            return 0
-        return int(common[-1].item())
+        pages = int(common[-1].item()) if common.numel() else 0
+        if self.cache.pp_size > 1:
+            # Stage 0's length, with the tail it was matched against: a stage
+            # that matched a different tail has lost step with the pipeline.
+            relayed = torch.tensor([pages, num_pages], dtype=torch.int)
+            self.cache._pp_sync(relayed)
+            pages, relayed_num_pages = relayed.tolist()
+            if relayed_num_pages != num_pages:
+                raise RuntimeError(
+                    f"Pipeline stage {self.cache.pp_rank} matched a {num_pages}-page "
+                    f"tail against the external store where stage 0 matched "
+                    f"{relayed_num_pages} pages."
+                )
+        return pages
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
@@ -926,9 +965,42 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
         )
 
-    def take_completed_offloads(self, finish_count: int) -> list[bool]:
+    def num_settled_offloads(self) -> int:
+        """Completed offloads pipeline stage 0 lets every stage commit now: those
+        it has seen completed for the settle time."""
+        now = time.perf_counter()
+        seen = self.completed_offload_times
+        seen.extend([now] * (self.num_completed_offloads() - len(seen)))
+        return sum(
+            1 for first_seen in seen if now - first_seen >= self.offload_settle_s
+        )
+
+    def take_completed_offloads(
+        self, finish_count: int, *, wait: bool = False
+    ) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
-        return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
+        for _ in range(min(finish_count, len(self.completed_offload_times))):
+            self.completed_offload_times.popleft()
+        pop = (
+            self.cache_linker.wait_completed_offload
+            if wait
+            else self.cache_linker.pop_completed_offload
+        )
+        return [pop() for _ in range(finish_count)]
+
+    def settle_stage_offloads(
+        self, landed: Sequence[bool], verdicts: Sequence[bool]
+    ) -> None:
+        """Bring a later pipeline stage's writes in line with stage 0's verdicts:
+        one that stage 0 landed and this stage did not is written again."""
+        for local, verdict in zip(landed, verdicts, strict=True):
+            if local:
+                continue
+            if not self.cache_linker.settle_failed_offload(rewrite=verdict):
+                raise RuntimeError(
+                    f"Pipeline stage {self.cache.pp_rank} could not write an "
+                    "external-cache node that stage 0 has stored."
+                )
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
@@ -988,6 +1060,13 @@ class UnifiedCacheLinkerWrapper:
             if self.metrics is not None:
                 self.metrics.increment_linker_load_tokens(loaded_tokens, "layer_wise")
             return []
+        if self.cache.pp_size > 1:
+            # The other stages learn of it iterations later, after a chunked
+            # request has put the restored prefix into their prefix caches.
+            raise RuntimeError(
+                f"External linker load failed on pipeline stage {self.cache.pp_rank} "
+                f"for {len(rids)} request(s): {rids}"
+            )
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
         )
@@ -1006,6 +1085,7 @@ class UnifiedCacheLinkerWrapper:
             state.stop_reason = state.stop_reason or "released"
             self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
+        self.completed_offload_times.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1

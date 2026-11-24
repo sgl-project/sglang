@@ -822,6 +822,10 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Allow the UMBP direct external linker with --pp-size > 1.
+    SGLANG_UNIFIED_CACHE_LINKER_PP = EnvBool(False)
+    # How long pipeline stage 0 holds a finished offload back before every stage commits it.
+    SGLANG_UNIFIED_CACHE_LINKER_PP_SETTLE_MS = EnvInt(300)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
