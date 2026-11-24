@@ -191,8 +191,6 @@ def maybe_register_hicache_draft(
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
     if not isinstance(tree_cache, UnifiedRadixCache):
         raise NotImplementedError("HiCache draft pools require UnifiedRadixCache.")
 
@@ -360,7 +358,7 @@ def validate_decode_radix_cache(
             "requires the unified KV layout "
             "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
         )
-    if getattr(model_config, "is_hybrid_swa_compress", False):
+    if model_config.is_hybrid_swa_compress:
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache does not support "
             "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
