@@ -252,11 +252,8 @@ class MambaPoolHost(HostKVCache):
         self.clear()
 
     def _warm_up_split_copies(self) -> None:
-        if not _is_cuda or self.layout != "page_first":
-            return
-        load_quota = warm_up_mamba_split_kernels()
-        if load_quota is not None:
-            logger.info("HiCache Mamba split load kernel built: quota=%s", load_quota)
+        if _is_cuda and self.layout == "page_first":
+            warm_up_mamba_split_kernels()
 
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()

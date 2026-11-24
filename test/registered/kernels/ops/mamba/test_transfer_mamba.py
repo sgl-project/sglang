@@ -436,6 +436,9 @@ def test_captured_mamba_state_round_trip(layout, io_backend, kind):
         host.destroy()
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None, reason="the split load is disabled on HIP"
+)
 @pytest.mark.parametrize("block_quota", [1, 3, 8, 64])
 @pytest.mark.parametrize(
     "item_size,num_items",

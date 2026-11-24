@@ -56,12 +56,10 @@ def _jit_transfer_mamba_split_module() -> Module:
     )
 
 
-def warm_up_mamba_split_kernels() -> int | None:
+def warm_up_mamba_split_kernels() -> None:
     """Build the split kernel now if the quota is set (else the first load compiles it)."""
-    quota = mamba_split_load_block_quota()
-    if quota is not None:
+    if mamba_split_load_block_quota() is not None:
         _jit_transfer_mamba_split_module()
-    return quota
 
 
 _split_logged: set[str] = set()
