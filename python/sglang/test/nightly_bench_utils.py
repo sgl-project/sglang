@@ -19,6 +19,7 @@ class BenchmarkResult(BaseModel):
     batch_size: int
     input_len: int
     output_len: int
+    total_output_tokens: Optional[int] = None
     latency: float
     input_throughput: float
     output_throughput: float
@@ -173,6 +174,7 @@ def save_results_as_pydantic_models(
             batch_size=res.batch_size,
             input_len=res.input_len,
             output_len=res.output_len,
+            total_output_tokens=getattr(res, "total_output_tokens", None),
             latency=res.latency,
             input_throughput=res.input_throughput,
             output_throughput=res.output_throughput,

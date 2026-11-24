@@ -173,6 +173,22 @@ def run_performance_test(
                     f"{max(batch_sizes)}; cannot validate performance baselines"
                 )
 
+            if any(
+                baseline is not None
+                for baseline in (
+                    baseline_output_throughput,
+                    baseline_ftl_s,
+                    baseline_itl_ms,
+                )
+            ):
+                expected_tokens = largest_batch_result.batch_size * output_lens[0]
+                actual_tokens = largest_batch_result.total_output_tokens
+                if actual_tokens is None or actual_tokens != expected_tokens:
+                    raise ValueError(
+                        f"Expected {expected_tokens} generated tokens for the "
+                        f"performance baseline, got {actual_tokens}"
+                    )
+
             # Validate output throughput against baseline if provided
             if baseline_output_throughput is not None:
                 measured = largest_batch_result.output_throughput
