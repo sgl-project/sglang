@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx impo
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -78,35 +79,53 @@ def _batches(seed):
         yield pos, mates[:pos] + [0] + mates[pos:]
 
 
+def _decode_topk(q, k, v, req_to_token, seq_lens, slots):
+    ids = torch.tensor(slots, dtype=torch.int64, device="cuda")
+    lens = seq_lens[ids]
+    _, topk_idx, _ = flash_decode_with_topk_idx(
+        q[ids],
+        None,
+        k,
+        v,
+        req_to_token,
+        lens,
+        int(lens.max().item()),
+        ids,
+        BLOCK_SIZE,
+        TOPK,
+        0,
+        1,
+        disable_index_value=True,
+    )
+    return topk_idx
+
+
 # MiniMax-M3's sparse-layer indexer at TP1 / TP2 / TP8: index heads per KV head, scores
 # only (its sparse layers disable the index-value output).
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(4, 4), (2, 2), (8, 1)])
 def test_flash_decode_with_topk_idx_batch_invariant(num_q_heads, num_kv_heads):
-    q, k, v, req_to_token, seq_lens = _pool(num_q_heads, num_kv_heads, seed=0)
-
-    def run(slots):
-        ids = torch.tensor(slots, dtype=torch.int64, device="cuda")
-        lens = seq_lens[ids]
-        _, topk_idx, _ = flash_decode_with_topk_idx(
-            q[ids],
-            None,
-            k,
-            v,
-            req_to_token,
-            lens,
-            int(lens.max().item()),
-            ids,
-            BLOCK_SIZE,
-            TOPK,
-            0,
-            1,
-            disable_index_value=True,
-        )
-        return topk_idx
-
-    alone = run([0])
+    pool = _pool(num_q_heads, num_kv_heads, seed=0)
+    alone = _decode_topk(*pool, [0])
     for pos, slots in _batches(seed=1):
-        assert torch.equal(run(slots)[:, pos], alone[:, 0]), f"batch of {len(slots)}"
+        assert torch.equal(_decode_topk(*pool, slots)[:, pos], alone[:, 0]), (
+            f"batch of {len(slots)}"
+        )
+
+
+def test_topk_fallback_score_ties_batch_invariant():
+    """The Triton top-k fallback (radix top-k off) chunks each row by the batch size and
+    the batch's longest sequence; tied block scores at the top-k cutoff must still pick
+    the same blocks in every batch."""
+    q, k, v, req_to_token, seq_lens = _pool(4, 4, seed=5)
+    period = 4 * BLOCK_SIZE  # request 0's blocks repeat four contents: scores tie
+    k[:MAX_KV_LEN] = k[:period].repeat(MAX_KV_LEN // period, 1, 1)
+    pool = (q, k, v, req_to_token, seq_lens)
+    with envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.override(False):
+        alone = _decode_topk(*pool, [0])
+        for pos, slots in _batches(seed=6):
+            assert torch.equal(_decode_topk(*pool, slots)[:, pos], alone[:, 0]), (
+                f"batch of {len(slots)}"
+            )
 
 
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(64, 4), (32, 2), (16, 1)])

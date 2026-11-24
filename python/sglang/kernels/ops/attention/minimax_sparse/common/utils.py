@@ -102,6 +102,11 @@ def _is_deterministic_inference() -> bool:
     return _deterministic_inference
 
 
+def topk_tie_by_id() -> bool:
+    """Whether the Triton top-k breaks score ties by block id (deterministic inference)."""
+    return _is_deterministic_inference()
+
+
 def grid_batch_size(batch_size: int) -> int:
     """The batch size the decode kernels size their grids and tiles for."""
     if _is_deterministic_inference():
@@ -266,6 +271,7 @@ def _compare_and_swap(
     flip,
     i: tl.constexpr,
     n_dims: tl.constexpr,
+    TIE_BY_ID: tl.constexpr = False,
 ):
     n_outer: tl.constexpr = x.numel >> n_dims
     shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
@@ -288,7 +294,15 @@ def _compare_and_swap(
     iright = right.to(idtype, bitcast=True)
     ix = x.to(idtype, bitcast=True)
 
-    cond = (left > right) != flip
+    if TIE_BY_ID:
+        # Score ties go to the lower id (the radix top-k's order), so the selected set
+        # does not depend on how a row is chunked. Ids are 1-indexed; 0 loses every tie.
+        left_key = tl.where(left_idx == 0, 0x7FFFFFFF, left_idx)
+        right_key = tl.where(right_idx == 0, 0x7FFFFFFF, right_idx)
+        greater = (left > right) | ((left == right) & (left_key < right_key))
+    else:
+        greater = left > right
+    cond = greater != flip
     ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
     new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
     return ret.to(x.dtype, bitcast=True), new_ids
@@ -301,6 +315,7 @@ def _bitonic_merge(
     stage: tl.constexpr,
     order: tl.constexpr,
     n_dims: tl.constexpr,
+    TIE_BY_ID: tl.constexpr = False,
 ):
     n_outer: tl.constexpr = x.numel >> n_dims
     tl.static_assert(stage <= n_dims)
@@ -322,7 +337,9 @@ def _bitonic_merge(
         flip = order
     # perform `stage` rounds of `compare-and-swap`
     for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+        x, ids = _compare_and_swap(
+            x, ids, flip, i + (n_dims - stage), n_dims, TIE_BY_ID
+        )
     return x, ids
 
 
