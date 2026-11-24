@@ -78,12 +78,18 @@ def _peer_writes(kv_score):
         kv_score[ROW, PEER_SLICE].fill_(PEER)
 
 
-def _publish(queue, entry, kv_indices):
+def _publish(queue, pool, entry, kv_indices, *, slow_reset=False):
     """What `_publish_destination` does once the payloads are built."""
-    send_waits = queue._send_waits_for_forward(non_blocking=False, to_device=True)
-    queue._clear_request_state(ROW, send_waits_for_forward=send_waits)
-    queue._send_kv_metadata(entry, kv_indices, 1, state_indices=[[0]])
-    return send_waits
+
+    def reset_state():
+        if slow_reset:
+            # The reset is still running on the device when the host moves on.
+            torch.cuda._sleep(SLEEP_CYCLES)
+        pool.clear_request_scoped_state(ROW)
+
+    queue._send_kv_metadata(
+        entry, kv_indices, 1, state_indices=[[0]], reset_state=reset_state
+    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
@@ -118,40 +124,51 @@ class TestRequestStateClearOrder(CustomTestCase):
         # Unlike the legacy default stream, the scheduler's own stream does not
         # wait for the forward stream implicitly.
         with torch.cuda.stream(schedule):
-            self.assertTrue(_publish(queue, entry, kv_indices))
+            _publish(queue, pool, entry, kv_indices)
 
         # The held send goes out once its event is done (`publish_pending_metadata`).
-        ready = entry.pending_metadata[0]
-        while not ready.query():
-            pass
+        entry.pending_metadata[0].synchronize()
+        entry.kv_receiver.send_metadata.assert_not_called()
         _peer_writes(kv_score)
         self.assert_reset_then_peer(kv_score)
 
     def test_an_unheld_send_goes_out_after_the_reset_ran(self):
-        """No overlap, and a deferred publish: the destination is sent at once.
-        Its page indices are empty, as for a HiSparse request of 1-3 tokens, so
-        reading them back does not wait for the device."""
+        """No overlap, and a deferred publish: the destination is sent at once,
+        while the reset still runs on the device. Reading back device page
+        indices after the reset waits for it; empty indices (a HiSparse request
+        of 1-3 tokens) and host indices read nothing back, so the send must
+        wait."""
+        indices = {
+            "empty device indices": lambda: torch.empty(
+                0, dtype=torch.int64, device="cuda"
+            ),
+            "device indices": lambda: torch.arange(4, device="cuda"),
+            "host indices": lambda: torch.arange(4),
+        }
         for enable_overlap, defer_publish in ((False, False), (True, True)):
-            with self.subTest(overlap=enable_overlap, deferred=defer_publish):
-                pool, kv_score = _pool()
-                queue = _queue(
-                    pool,
-                    enable_overlap=enable_overlap,
-                    defer_publish=defer_publish,
-                    forward_stream=torch.cuda.Stream(),
-                )
-                entry = _entry(on_send=lambda: _peer_writes(kv_score))
-                publishing = torch.cuda.Stream()
-                with torch.cuda.stream(publishing):
-                    # Work queued earlier keeps this stream busy.
-                    torch.cuda._sleep(SLEEP_CYCLES)
-                    send_waits = _publish(
-                        queue, entry, torch.empty(0, dtype=torch.int64, device="cuda")
+            for kind, make_indices in indices.items():
+                with self.subTest(
+                    overlap=enable_overlap, deferred=defer_publish, indices=kind
+                ):
+                    pool, kv_score = _pool()
+                    queue = _queue(
+                        pool,
+                        enable_overlap=enable_overlap,
+                        defer_publish=defer_publish,
+                        forward_stream=torch.cuda.Stream(),
                     )
+                    entry = _entry(on_send=lambda: _peer_writes(kv_score))
+                    publishing = torch.cuda.Stream()
+                    with torch.cuda.stream(publishing):
+                        kv_indices = make_indices()
+                        torch.empty(1 << 20, device="cuda")
+                    torch.cuda.synchronize()
+                    with torch.cuda.stream(publishing):
+                        _publish(queue, pool, entry, kv_indices, slow_reset=True)
 
-                self.assertFalse(send_waits)
-                entry.kv_receiver.send_metadata.assert_called_once()
-                self.assert_reset_then_peer(kv_score)
+                    self.assertIsNone(entry.pending_metadata)
+                    entry.kv_receiver.send_metadata.assert_called_once()
+                    self.assert_reset_then_peer(kv_score)
 
 
 if __name__ == "__main__":
