@@ -153,6 +153,7 @@ from sglang.srt.speculative.spec_utils import (
     simulated_acc_len_generator,
 )
 from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     async_h2d,
@@ -4015,7 +4016,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             and not (
                 batch.has_grammar or batch.return_logprob or batch.return_hidden_states
             )
+            # per-request captures assume one row layout per forward
             and get_global_experts_capturer() is None
+            and get_global_indexer_capturer() is None
             and batch.seq_lens_cpu is not None
             and self._target_logits_processor is not None
             and batch.hisparse_coordinator is None
@@ -4200,4 +4203,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             speculative_num_draft_tokens=block_size,
             new_seq_lens=new_seq_lens,
+            kv_weight_version_record=target_out.kv_weight_version_record,
         )
