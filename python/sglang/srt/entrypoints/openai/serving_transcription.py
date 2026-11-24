@@ -805,6 +805,5 @@ class OpenAIServingTranscription(OpenAIServingBase):
             websocket,
             tokenizer_manager=self.tokenizer_manager,
             adapter=self._adapter,
-            server_args=self.tokenizer_manager.server_args,
             session_semaphore=self._session_semaphore,
         )

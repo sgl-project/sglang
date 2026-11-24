@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
 from typing import (
@@ -452,6 +451,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             == "minimax_m3_vl"
         )
+        self.is_gigachat4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gigachat4"
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -640,6 +644,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
+                inkling2_tool_call_author_name_mode=get_model().inkling2_tool_call_author_name_mode,
             )
         )
 
@@ -999,6 +1004,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.tool_call_parser or request._response_parser_json_response_format:
             return False
+        if request._drops_unlisted_tool_calls:
+            # The model may call a tool it cannot call now, under `none` or before
+            # the tool loads; parsing drops the call, where skipping it leaks markup.
+            return True
         if not self._effective_tools(request):
             # With no tools declared, tool_choice only holds its default and limits nothing.
             detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
@@ -1343,13 +1352,13 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
-            images_config=getattr(request, "images_config", None),
+            images_config=request.images_config,
             video_config=_build_video_config(request),
             mm_processor_kwargs=request.mm_processor_kwargs,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
-            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
-            use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            max_dynamic_patch=request.max_dynamic_patch,
+            use_audio_in_video=request.use_audio_in_video,
             return_prompt_token_ids=(
                 request.return_prompt_token_ids
                 or request.return_token_ids
@@ -1740,25 +1749,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        if self.is_minimax_m3:
-            # Settle the request's own thinking and effort first; server defaults
-            # only fill what it left unset.
-            _normalize_minimax_m3_request(request)
-        if self.default_chat_template_kwargs:
-            ctk = dict(request.chat_template_kwargs or {})
-            for k, v in self.default_chat_template_kwargs.items():
-                ctk.setdefault(k, v)
-            request.chat_template_kwargs = ctk
-            effort = ctk.get("reasoning_effort")
-            if effort is not None and request.reasoning_effort is None:
-                request.reasoning_effort = effort
-
-        if self.is_minimax_m3:
-            _normalize_minimax_m3_request(request)
-
-        normalize_hunyuan_reasoning_effort(
-            request, self.reasoning_parser, self.template_manager.reasoning_config
-        )
+        self._apply_request_defaults(request)
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1900,7 +1891,7 @@ class OpenAIServingChat(OpenAIServingBase):
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
+                image_data=request._input_image_data,
                 audio_data=None,
                 video_data=None,
                 modalities=[],
@@ -1959,6 +1950,69 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _apply_request_defaults(self, request: ChatCompletionRequest) -> None:
+        """Settle the thinking and effort that rendering reads; repeating it
+        changes nothing."""
+        if self.is_minimax_m3:
+            # Settle the request's own thinking and effort first; server defaults
+            # only fill what it left unset.
+            _normalize_minimax_m3_request(request)
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
+        if self.is_minimax_m3:
+            _normalize_minimax_m3_request(request)
+
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
+
+    @property
+    def native_tool_loading(self) -> bool:
+        """Whether Responses and Messages requests that load tools mid-conversation
+        render from their own wire form (see `prepare_native_prompt`)."""
+        return (
+            self._encoding_adapter is not None
+            and self._encoding_adapter.native_encoder is not None
+        )
+
+    def prepare_native_prompt(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        protocol: chat_encoding_adapters.NativeProtocol,
+        body: dict[str, Any],
+    ) -> chat_encoding_adapters.NativePrompt:
+        """Render `body`, the Responses or Messages form of `request`, into its
+        `input_ids` and images, and set its `tools` to the tools the model can call
+        after the history; rendering then keeps only grammar, stops and parsing."""
+        self._apply_request_defaults(request)
+        response_format = request.response_format
+        prompt = self._encoding_adapter.native_encoder.encode_native(
+            protocol=protocol,
+            body=body,
+            thinking=self._get_reasoning_from_request(request),
+            effort=request.reasoning_effort,
+            response_schema=(
+                response_format.json_schema.schema_
+                if response_format is not None and response_format.json_schema
+                else None
+            ),
+        )
+        if prompt.image_data and not self.tokenizer_manager.model_config.is_multimodal:
+            raise ValueError("image input is not supported for this model")
+        request.input_ids = prompt.prompt_ids
+        request.tools = prompt.tools or None
+        request._input_image_data = prompt.image_data or None
+        request._drops_unlisted_tool_calls = True
+        return prompt
 
     def _apply_jinja_template(
         self,
@@ -2073,13 +2127,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            # The M3 template renders tool results by position, not by tool_call_id.
+            # These templates pair tool results by position.
+            sort_text_runs = self.is_minimax_m3 or self.is_gigachat4
             if (
                 self.template_manager.jinja_template_may_reorder_tool_results
-                or self.is_minimax_m3
+                or sort_text_runs
             ):
                 messages = self._canonicalize_tool_message_order(
-                    messages, sort_text_runs=self.is_minimax_m3
+                    messages, sort_text_runs=sort_text_runs
                 )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
@@ -2095,9 +2150,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
-                processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
-                )
+                if not self.is_gigachat4:
+                    processed_msg["content"] = normalize_tool_content(
+                        processed_msg["role"], processed_msg.get("content")
+                    )
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -2348,6 +2404,8 @@ class OpenAIServingChat(OpenAIServingBase):
         stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
 
         if request.stop:
+            # A template declares stop_str as a string, a tuple or a list.
+            stop = [stop] if isinstance(stop, str) else list(stop)
             if isinstance(request.stop, str):
                 stop.append(request.stop)
             else:
@@ -3452,6 +3510,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
+        elif self.reasoning_parser == "gigachat4" and request.separate_reasoning:
+            request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder or template takes history as ``reasoning_content``
@@ -3497,7 +3557,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return config.toggle_param
 
         mode = self._reasoning_default_mode()
-        if mode in ("thinking", "enable_thinking"):
+        if mode in ("thinking", "enable_thinking", "reasoning"):
             return mode
         if mode in ("explicit_thinking", "explicit_enable_thinking"):
             return mode.replace("explicit_", "")
@@ -3647,7 +3707,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.reasoning_effort is not None
                     and request.reasoning_effort != "none"
                 )
-            if mode in ("thinking", "enable_thinking"):
+            if mode in ("thinking", "enable_thinking", "reasoning"):
                 return (
                     not request.chat_template_kwargs
                     or request.chat_template_kwargs.get(mode) is not False
@@ -3747,105 +3807,28 @@ class OpenAIServingChat(OpenAIServingBase):
 
         parser = parser_dict[index]
 
-        # Handle both FunctionCallParser and JsonArrayParser
+        # Handle both FunctionCallParser and JsonArrayParser. Each segment is
+        # sent text first, then calls; segments are in generation order.
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
+            results = parser.parse_streaming_segments(delta, effective_tools)
             if flush:
-                end = parser.finish(effective_tools)
-                normal_text = (normal_text or "") + end.normal_text
-                calls = list(calls) + end.calls
+                results.append(parser.finish(effective_tools))
+            segments = [(result.normal_text, result.calls) for result in results]
         else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
+            segments = parser.parse_stream_segments(delta)
             if flush:
-                end_text, end_calls = parser.parse_stream_end()
-                normal_text = (normal_text or "") + end_text
-                calls = list(calls) + end_calls
+                segments.append(parser.parse_stream_end())
 
-        # Yield normal text
-        if normal_text:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(content=normal_text),
-                internal_content=wire.internal_content(
-                    index, normal_text, kind="content"
-                ),
-                finish_reason=None,
-            )
-            chunk = ChatCompletionStreamResponse(
-                id=wire.response_id(content["meta_info"]["id"]),
-                created=created,
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
-                )
-
-            yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
-
-        # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-        for call_item in calls:
-            # Mark that this choice has tool calls
-            has_tool_calls[index] = True
-
-            call_internal = wire.internal_content(
-                index, call_item.source_text, kind="tool"
-            )
-
-            # Tool call ID should be generated only once per tool call
-            if call_item.name:
-                # First chunk: include ID and function name
-                tool_call_id = self._process_tool_call_id(
-                    call_item, history_tool_calls_cnt
-                )
-                function_name = call_item.name
-            else:
-                # Subsequent chunks: null ID and name for argument deltas
-                tool_call_id = None
-                function_name = None
-
-            tool_call = ToolCall(
-                id=tool_call_id,
-                index=call_item.tool_index,
-                function=FunctionResponse(
-                    name=function_name,
-                    arguments=call_item.parameters,
-                ),
-            )
-            tool_call_deltas = [tool_call]
-            if wire.split_tool_call_opening and function_name is not None:
-                tool_call_deltas = [
-                    ToolCall(
-                        id=tool_call_id,
-                        index=call_item.tool_index,
-                        function=FunctionResponse(name=function_name, arguments=""),
-                    )
-                ]
-                if call_item.parameters:
-                    tool_call_deltas.append(
-                        ToolCall(
-                            index=call_item.tool_index,
-                            function=FunctionResponse(arguments=call_item.parameters),
-                        )
-                    )
-
-            for position, tool_call in enumerate(tool_call_deltas):
+        for normal_text, calls in segments:
+            # Yield normal text
+            if normal_text:
                 choice_data = ChatCompletionResponseStreamChoice(
                     index=index,
-                    delta=DeltaMessage(tool_calls=[tool_call]),
-                    # The tokens behind this call delta go out once.
-                    internal_content=call_internal if position == 0 else None,
+                    delta=DeltaMessage(content=normal_text),
+                    internal_content=wire.internal_content(
+                        index, normal_text, kind="content"
+                    ),
                     finish_reason=None,
                 )
                 chunk = ChatCompletionStreamResponse(
@@ -3868,6 +3851,91 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
                 yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
+
+            # Yield tool calls
+            for call_item in calls:
+                # Mark that this choice has tool calls
+                has_tool_calls[index] = True
+
+                call_internal = wire.internal_content(
+                    index, call_item.source_text, kind="tool"
+                )
+
+                # Tool call ID should be generated only once per tool call
+                if call_item.name:
+                    # First chunk: include ID and function name
+                    tool_call_id = self._process_tool_call_id(
+                        call_item, history_tool_calls_cnt
+                    )
+                    function_name = call_item.name
+                else:
+                    # Subsequent chunks: null ID and name for argument deltas
+                    tool_call_id = None
+                    function_name = None
+
+                tool_call = ToolCall(
+                    id=tool_call_id,
+                    index=call_item.tool_index,
+                    function=FunctionResponse(
+                        name=function_name,
+                        arguments=call_item.parameters,
+                    ),
+                )
+                tool_call_deltas = [tool_call]
+                if wire.split_tool_call_opening and function_name is not None:
+                    tool_call_deltas = [
+                        ToolCall(
+                            id=tool_call_id,
+                            index=call_item.tool_index,
+                            function=FunctionResponse(name=function_name, arguments=""),
+                        )
+                    ]
+                    if call_item.parameters:
+                        tool_call_deltas.append(
+                            ToolCall(
+                                index=call_item.tool_index,
+                                function=FunctionResponse(
+                                    arguments=call_item.parameters
+                                ),
+                            )
+                        )
+
+                for position, tool_call in enumerate(tool_call_deltas):
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(tool_calls=[tool_call]),
+                        # The tokens behind this call delta go out once.
+                        internal_content=call_internal if position == 0 else None,
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=wire.response_id(content["meta_info"]["id"]),
+                        created=created,
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+
+                    # Add usage stats if continuous_usage_stats is enabled
+                    if continuous_usage_stats:
+                        prompt_tokens = self._reported_prompt_tokens(
+                            content["meta_info"]
+                        )
+                        completion_tokens = content["meta_info"].get(
+                            "completion_tokens", 0
+                        )
+                        reasoning_tokens = content["meta_info"].get(
+                            "reasoning_tokens", 0
+                        )
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                            cached_tokens=self._continuous_usage_cached_details(
+                                content
+                            ),
+                        )
+
+                    yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,

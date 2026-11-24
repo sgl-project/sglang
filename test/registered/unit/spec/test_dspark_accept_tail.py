@@ -4,17 +4,23 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 BS, STRIDE, VOCAB = 3, 5, 50
 
@@ -94,6 +100,7 @@ class TestAcceptTailParity(CustomTestCase):
                 greedy_draft=True,
             ),
             sampling_info=None,
+            route=VerifyRoute.derive(None, has_grammar=False, has_watermark=False),
             draft_input=None,
             layout=None
             if verify_lens is None

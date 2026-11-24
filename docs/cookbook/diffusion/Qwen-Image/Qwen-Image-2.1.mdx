@@ -1,7 +1,6 @@
 ---
 title: Qwen-Image 2.1 and Turbo
 description: "Run Qwen-Image 2.1 and its eight-step Turbo variant with SGLang Diffusion: text-to-image, reference-image editing, and transparent RGBA output."
-tag: NEW
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';

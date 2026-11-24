@@ -10,8 +10,8 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::ModelId;
-use sgl_router::policies::request_tokens_for;
 use sgl_router::tokenizer::chat_formatter::{ChatFormatter, ChatTemplateKwargs};
+use sgl_router::tokenizer::prompt::request_tokens_for;
 use sgl_router::tokenizer::{adapter, TokenizerRegistry};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -139,6 +139,7 @@ fn registry_with_defaults(
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            decode_dp_rank_policy: None,
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),
@@ -214,10 +215,79 @@ fn chat_render_parity_matrix() {
     eprintln!("chat render parity: {checked} cases checked");
 }
 
+/// Whether SGLang refused the case only because a text-only server got image parts.
+fn refuses_images_as_text_only(case: &serde_json::Value) -> bool {
+    case["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("only supports text input"))
+        && image_parts(&case["request"]) > 0
+}
+
+fn image_parts(request: &serde_json::Value) -> usize {
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .count()
+}
+
+/// A chat with images that SGLang's text-only server refuses, on a model whose
+/// image chats the router renders for prefix routing. Each image renders as one
+/// placeholder token where its part was, so the prompt reads as the same chat
+/// with each image part a text part spelling the placeholder, which the text
+/// path renders as plain text (the fixtures check that spelling against SGLang).
+fn check_image_chat(
+    reg: &TokenizerRegistry,
+    model: &str,
+    name: &str,
+    request: &serde_json::Value,
+    ids: Option<Vec<u32>>,
+) {
+    let ids = ids.unwrap_or_else(|| panic!("{name}: image chat not rendered"));
+    let placeholders = reg.media_token_ids();
+    let images: Vec<u32> = ids
+        .iter()
+        .copied()
+        .filter(|id| placeholders.contains(id))
+        .collect();
+    assert_eq!(
+        images.len(),
+        image_parts(request),
+        "{name}: image placeholders"
+    );
+    let tokenizer = reg.get(model).unwrap();
+    let decode = |ids: &[u32]| adapter::decode_complete(&tokenizer, ids, false).unwrap();
+    let mut spelled = request.clone();
+    for message in spelled["messages"].as_array_mut().unwrap() {
+        for part in message["content"].as_array_mut().into_iter().flatten() {
+            if part["type"] == "image_url" {
+                *part = serde_json::json!({"type": "text", "text": decode(&images[..1])});
+            }
+        }
+    }
+    let spelled = reg
+        .encode_chat(model, &spelled)
+        .unwrap_or_else(|| panic!("{name}: placeholder spelled as text not rendered"));
+    assert!(
+        !spelled.iter().any(|id| placeholders.contains(id)),
+        "{name}: placeholder text parsed as the image token"
+    );
+    assert_eq!(
+        decode(&ids),
+        decode(&spelled),
+        "{name}: image chat vs the placeholder spelled as text"
+    );
+}
+
 /// The router's own render and tokenization (`encode_chat`, continuation prefixes
 /// included) reproduce `rust/sglang-processor`'s parity fixtures, which SGLang's
 /// Python serving path wrote: the ids of every case it renders, and no ids where it
-/// fails. Checks only the fixtures whose pinned snapshot is cached.
+/// fails. The exception is a chat with images on a model whose image chats the
+/// router renders, which SGLang's text-only server refuses (see
+/// [`check_image_chat`]). Checks only the fixtures whose pinned snapshot is cached.
 #[test]
 fn processor_fixture_parity() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -257,7 +327,11 @@ fn processor_fixture_parity() {
             let name = format!("{model} {}", case["name"]);
             let ids = reg.encode_chat(model, &case["request"]);
             if !case["error"].is_null() {
-                assert!(ids.is_none(), "{name}: SGLang rejects this request");
+                if refuses_images_as_text_only(case) && !reg.media_token_ids().is_empty() {
+                    check_image_chat(reg, model, &name, &case["request"], ids);
+                } else {
+                    assert!(ids.is_none(), "{name}: SGLang rejects this request");
+                }
                 continue;
             }
             if case.get("known_gap").is_some() {

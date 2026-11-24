@@ -3,7 +3,7 @@ use crate::cache_action::{
 };
 use std::sync::Mutex;
 
-use tch::Tensor;
+use tch::{Device, Tensor};
 
 use super::*;
 use crate::components::{ComponentSet, FULL, Family, MAMBA, SWA, native_family};
@@ -2170,6 +2170,57 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         session_id: None,
         track_adopted_ranges: false,
     }
+}
+
+#[test]
+fn rotation_phase_counts_the_pages_above_the_node() {
+    for page_size in [1, 4, 64] {
+        for rotation_base in [0, 2] {
+            let params = CacheInitParams {
+                page_size,
+                ..Default::default()
+            };
+            let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL]);
+            let tokens: Vec<i64> = (0..4 * page_size as i64).collect();
+            let mut sibling = tokens[..3 * page_size].to_vec();
+            sibling.extend((1000..).take(page_size));
+            let mut short_branch = tokens[..page_size].to_vec();
+            short_branch.extend((2000..).take(page_size));
+            for key in [&tokens, &sibling, &short_branch] {
+                tc.insert(&InsertParams {
+                    rotation_base: Some(rotation_base),
+                    ..insert_params(key, key)
+                });
+            }
+            for (key, prefix_pages) in [
+                (tokens[..page_size].to_vec(), 0),
+                (tokens[..3 * page_size].to_vec(), 1),
+                (tokens.clone(), 3),
+                (sibling.clone(), 3),
+                (short_branch.clone(), 1),
+            ] {
+                let node = tc.match_prefix(&match_params(&key)).last_device_node_id;
+                assert_eq!(
+                    tc.rotation_phase_of(node).unwrap(),
+                    Some(rotation_base + prefix_pages),
+                    "page_size={page_size} rotation_base={rotation_base}"
+                );
+            }
+            assert_eq!(
+                tc.rotation_phase_of(tc.root_node_handle(None)).unwrap(),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn unsharded_node_has_no_rotation_phase() {
+    let mut tc = core();
+    let key = vec![1, 2, 3];
+    tc.insert(&insert_params(&key, &[10, 11, 12]));
+    let node = tc.match_prefix(&match_params(&key)).last_device_node_id;
+    assert_eq!(tc.rotation_phase_of(node).unwrap(), None);
 }
 
 fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
