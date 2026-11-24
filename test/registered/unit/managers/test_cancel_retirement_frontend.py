@@ -287,6 +287,41 @@ class TestCancelRetirementFrontend(unittest.IsolatedAsyncioTestCase):
         self._receipt(request)
         self.assertEqual((await self._cancel()).status_code, 200)
 
+    async def test_completed_receipts_keep_their_binding_until_expiry(self):
+        registry = CancellationRetirementRegistry(capacity=1)
+        clock = SimpleNamespace(now=10.0)
+        with patch(
+            "sglang.srt.managers.cancellation_retirement.time",
+            SimpleNamespace(monotonic=lambda: clock.now),
+        ):
+            completed = registry.create("done", "request", "instance")
+            registry.resolve(
+                CancellationRetirementOutput(
+                    rid="request",
+                    cancellation_id="done",
+                    request_instance_id="instance",
+                    status="retired",
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "capacity"):
+                registry.create("other", "other-request", "other-instance")
+            self.assertIs(registry.lookup("done", "request"), completed)
+            self.assertEqual((await registry.wait(completed, 0)).status, "retired")
+            clock.now += registry.ttl_seconds
+            self.assertIsNone(registry.lookup("done", "request"))
+            self.assertFalse(
+                registry.create(
+                    "other", "other-request", "other-instance"
+                ).result.done()
+            )
+
+    async def test_unresolved_receipts_at_capacity_still_reject(self):
+        registry = CancellationRetirementRegistry(capacity=256, ttl_seconds=300.0)
+        for i in range(256):
+            registry.create(f"pending-{i}", f"req-{i}", f"inst-{i}")
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            registry.create("pending-256", "req-256", "inst-256")
+
     async def test_expiry_returns_unknown_to_a_waiting_http_caller(self):
         self.tm._cancel_retirement_registry = CancellationRetirementRegistry(
             capacity=1, ttl_seconds=0
