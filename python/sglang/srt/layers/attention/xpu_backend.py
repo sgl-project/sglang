@@ -1743,9 +1743,6 @@ class XPUAttentionBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors reused across XPU graph captures."""
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
-        page_table_cols = (
-            self.max_context_len if self.is_encoder_decoder else max_num_pages
-        )
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.arange(
@@ -1755,7 +1752,7 @@ class XPUAttentionBackend(AttentionBackend):
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             "page_table": torch.zeros(
-                max_bs, page_table_cols, dtype=torch.int32, device=self.device
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
             ),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
@@ -1926,17 +1923,16 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
 
             encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
-            encoder_live_max = int(encoder_lens.max().item())
-            metadata.encoder_max_seq_len_k = (
-                metadata.encoder_page_table.shape[1] if in_capture else encoder_live_max
-            )
+            metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
             metadata.encoder_lens_int32.copy_(encoder_lens)
             metadata.encoder_cu_seqlens_k[0] = 0
             metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
                 torch.cumsum(encoder_lens, dim=0, dtype=torch.int32)
             )
-            metadata.encoder_page_table[:bs, :encoder_live_max].copy_(
-                self.req_to_token[req_pool_indices, :encoder_live_max].to(torch.int32)
+            metadata.encoder_page_table[:bs, : metadata.encoder_max_seq_len_k].copy_(
+                self.req_to_token[
+                    req_pool_indices, : metadata.encoder_max_seq_len_k
+                ].to(torch.int32)
             )
             # Self-attention (text) page_table: decoder tokens start after encoder tokens.
             text_max = metadata.max_seq_len_k
