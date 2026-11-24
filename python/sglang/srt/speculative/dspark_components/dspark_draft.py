@@ -460,7 +460,6 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
-        anchor_prepared: bool = False,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -476,7 +475,6 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
-            anchor_prepared=anchor_prepared,
         )
         draft_block_ids = fwd.draft_block_ids
 
@@ -606,7 +604,6 @@ class DraftBlockProposer:
         embed_module,
         draft_sampler=None,
         sampling_info=None,
-        anchor_prepared: bool = False,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
@@ -614,9 +611,8 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
+        # Column 0 (the anchor) was written with the verify window.
         draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-        if not anchor_prepared:
-            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 

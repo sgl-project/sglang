@@ -170,7 +170,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     _rejection_noise = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
-    _prepare_inputs_once = False
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
@@ -298,10 +297,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
-        )
-        # Verify-window positions, cache locs and the draft anchor column in one launch.
-        self._prepare_inputs_once = (
-            envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
         )
         self.num_folded_verify_ids_steps = 0
         self.num_relayed_in_graph_steps = 0
@@ -467,10 +462,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
                 accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
                 deferred_draft_kv=self._deferred_draft_kv,
-                post_fold=(
-                    static_epilogue_supported
-                    and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
-                ),
+                post_fold=static_epilogue_supported,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -1033,10 +1025,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        anchor_ids = (
-            self._proposer.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-            if self._prepare_inputs_once
-            else None
+        # Verify-window positions, cache locs and the draft anchor column in one launch.
+        anchor_ids = self._proposer.draft_block_ids_view(
+            bs=bs, device=prefix_lens.device
         )
         window_seq_lens_cpu = (
             batch.seq_lens_cpu
@@ -1051,7 +1042,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
             seq_lens_cpu=window_seq_lens_cpu,
-            bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
+            bonus=draft_input.bonus_tokens.view(-1),
             anchor_ids=anchor_ids,
         )
         if self._verify_inputs_ready is not None:
@@ -1090,7 +1081,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
-                anchor_prepared=anchor_ids is not None,
             )
         if self._verify_inputs_ready is not None:
             self._stage_target_verify_metadata(
@@ -1429,7 +1419,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):
         """The FutureMap relay this step's static graph already scattered into
-        (SGLANG_OPT_DSV41_DSPARK_POST_FOLD), or None for the host scatter."""
+        (the static epilogue's post fold), or None for the host scatter."""
         epilogue = self._verify_executor.verify_epilogue
         if epilogue is None or run_compact or not folded_accept:
             return None

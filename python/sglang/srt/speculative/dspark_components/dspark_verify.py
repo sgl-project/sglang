@@ -612,8 +612,8 @@ class DsparkVerifyEpilogue:
         post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
-        # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
-        # and the bonus into the FutureMap's slots; built at the first warmup.
+        # Static graphs also scatter new seq lens and the bonus into the FutureMap's
+        # slots; built at the first warmup.
         self._post_fold = bool(post_fold)
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and

@@ -327,8 +327,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
-        # SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: the (input_ids, positions)
-        # tensors the plan-time load already copied into this runner's buffers.
+        # The (input_ids, positions) tensors the plan-time load already copied into
+        # this runner's buffers (DSpark target verify).
         self._prefilled_inputs: Optional[tuple] = None
         self.num_prefilled_input_skips = 0
         # SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: (stream, event) the draft graph's
@@ -2099,8 +2099,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """The DSpark target verify runner, whose verify batches are pre-planned by
         prepare_for_verify and then replayed from the same tensors."""
         return (
-            envs.SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS.get()
-            and not self.model_runner.is_draft_worker
+            not self.model_runner.is_draft_worker
             and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
             and self.model_runner.spec_algorithm.is_dspark()
         )
