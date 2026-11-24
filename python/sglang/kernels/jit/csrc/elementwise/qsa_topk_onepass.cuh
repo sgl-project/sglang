@@ -30,9 +30,18 @@ namespace sglang {
 
 namespace qsa_topk_onepass_detail {
 
+// CTAs per SM and float4 loads in flight per thread, overridable at JIT build (prefill_select.py).
+#ifndef QSA_TOPK_ONEPASS_MIN_BLOCKS
+#define QSA_TOPK_ONEPASS_MIN_BLOCKS 2
+#endif
+#ifndef QSA_TOPK_ONEPASS_UNROLL
+#define QSA_TOPK_ONEPASS_UNROLL 4
+#endif
 constexpr int kThreads = 512;
-constexpr int kMinBlocks = 2;  // two CTAs per SM: 64 registers for kUnroll float4 loads in flight
-constexpr int kUnroll = 4;     // VR200 (mb-h559-a1): 2 CTAs x 4 loads beat 4 CTAs x 2 at 192-3328 rows
+// VR200 (mb-h559-a1): 2 CTAs x 4 loads beat 4 CTAs x 2 at 192-3328 rows. GB300, 4560-4864 rows of 8K-51K
+// keys: 4 CTAs x 2 is 4-27% faster (more rows' barrier-separated phases overlap on an SM).
+constexpr int kMinBlocks = QSA_TOPK_ONEPASS_MIN_BLOCKS;
+constexpr int kUnroll = QSA_TOPK_ONEPASS_UNROLL;
 constexpr int kWarps = kThreads / 32;
 constexpr int kStockThreads = 1024;  // fast_topk's block: its emission order's unit
 constexpr int kStockWarps = kStockThreads / 32;

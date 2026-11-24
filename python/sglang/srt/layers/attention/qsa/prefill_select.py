@@ -71,6 +71,11 @@ _WIDE_MIN_KEYS = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS", 24576)
 # Both top-k kernels run one 1024-thread CTA per row, two per SM; 0 turns the row
 # alignment off (stock's chunk sizes).
 _TOPK_SLOTS = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_TOPK_SLOTS", -1)
+# "onepass": CTAs per SM (its __launch_bounds__ minimum) and float4 loads per thread in flight.
+# 2 and 4 are the VR200-fitted build; on GB300 4 and 2 measured 4-27% faster, same output. The
+# row chunks then align to 4 CTAs per SM.
+_ONEPASS_CTAS = _env_int("SGLANG_QSA_TOPK_ONEPASS_CTAS_PER_SM", 2)
+_ONEPASS_UNROLL = _env_int("SGLANG_QSA_TOPK_ONEPASS_UNROLL", 4)
 # "stock": fast_topk's JIT kernel; "sampled": qsa_prefill_topk.cuh, the same
 # output from one pass over each long row (fast_topk's own select for the rest).
 # "half": the sampled select on 512-thread blocks (qsa_prefill_topk_half.cuh), the same output.
@@ -218,7 +223,7 @@ def _split_tag(device_index: int) -> torch.Tensor:
 def _topk_slots(device_index: int) -> int:
     if _TOPK_SLOTS >= 0:
         return _TOPK_SLOTS
-    return 2 * _num_sms(device_index)
+    return (_ONEPASS_CTAS if _TOPK_IMPL == "onepass" else 2) * _num_sms(device_index)
 
 
 def _budget_for(width: int) -> int:
@@ -473,12 +478,20 @@ def _topk_launcher(impl: str):
 
     args = make_cpp_args(is_arch_support_pdl())
     if impl == "onepass":
+        tuned = (_ONEPASS_CTAS, _ONEPASS_UNROLL) != (2, 4)
         return _onepass_runner(
             load_jit(
                 "qsa_topk_onepass",
                 *args,
+                *((f"ctas{_ONEPASS_CTAS}", f"unroll{_ONEPASS_UNROLL}") if tuned else ()),
                 cuda_files=["elementwise/qsa_topk_onepass.cuh"],
                 cuda_wrappers=[("topk", f"QsaTopKOnePassKernel<{args}>::run")],
+                extra_cuda_cflags=[
+                    f"-DQSA_TOPK_ONEPASS_MIN_BLOCKS={_ONEPASS_CTAS}",
+                    f"-DQSA_TOPK_ONEPASS_UNROLL={_ONEPASS_UNROLL}",
+                ]
+                if tuned
+                else None,
             )
         )
     if impl == "half":
