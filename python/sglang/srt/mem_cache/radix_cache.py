@@ -383,9 +383,8 @@ class RadixCache(BasePrefixCache):
         Args:
             params (MatchPrefixParams): Parameters containing the lookup key
                 with a list of token ids and an optional ``extra_key`` namespace tag.
-                If ``page_size > 1`` the length is internally truncated to a multiple
-                of ``page_size`` before matching. Passing an empty key returns an
-                empty result with the root as the last node.
+                Only complete pages participate in matching. A key shorter than
+                one page returns an empty result with the root as the last node.
 
         Returns:
             MatchResult: ``device_prefix_len`` is the length of the longest
@@ -405,12 +404,7 @@ class RadixCache(BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
-        if self.disable or len(key) == 0:
-            return self._empty_match_result
-
-        key = key.page_aligned(self.page_size)
-
-        if len(key) == 0:
+        if self.disable or len(key) < self.page_size:
             return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
@@ -423,10 +417,7 @@ class RadixCache(BasePrefixCache):
 
     def touch_prefix(self, key: RadixKey) -> None:
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        if self.disable or len(key) == 0:
-            return
-        key = key.page_aligned(self.page_size)
-        if len(key) == 0:
+        if self.disable or len(key) < self.page_size:
             return
         self._match_prefix_helper(self.root_node, key)
 
@@ -659,13 +650,15 @@ class RadixCache(BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
-        child_key = key.child_key(self.page_size)
+        key_len = len(key)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
 
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -674,10 +667,11 @@ class RadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
-
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                key_offset += prefix_len
+                # Edge matches are page-aligned. A shorter tail has no child key.
+                if key_len - key_offset < self.page_size:
+                    break
+                child_key = key.child_key_at(key_offset, self.page_size)
 
         return value, node
 
