@@ -41,6 +41,8 @@ _DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
 logger = logging.getLogger(__name__)
 
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+# Buffers a growth replaced: a CUDA graph captured on them keeps writing there.
+_DFLASH_CHAIN_VERIFY_RETIRED: list[dict[str, Any]] = []
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -264,6 +266,9 @@ def _get_or_create_chain_verify_buffers(
             "accept_index": accept_index,
             "accept_token_num": accept_token_num,
         }
+        old = _DFLASH_CHAIN_VERIFY_BUFFERS.get(key)
+        if old is not None:
+            _DFLASH_CHAIN_VERIFY_RETIRED.append(old)
         _DFLASH_CHAIN_VERIFY_BUFFERS[key] = cached
 
     assert cached is not None

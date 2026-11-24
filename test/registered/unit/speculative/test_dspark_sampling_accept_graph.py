@@ -198,6 +198,39 @@ def test_replay_equals_eager_at_same_seed(monkeypatch, bs):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_replay_survives_the_chain_buffers_growing(monkeypatch):
+    """A region captured at batch 1 keeps writing the chain verify buffers it captured.
+    A later eager accept at batch 8 grows the cache; the replay must still equal the
+    eager accept and must not write into the memory that growth gave back."""
+    from sglang.srt.speculative import dflash_utils
+
+    monkeypatch.setattr(dflash_utils, "_DFLASH_CHAIN_VERIFY_BUFFERS", {})
+    io, sampler, epi = _gpu_case(bs=1, graph_bs=1, vocab=2048, seed=21)
+    graph = _graph(epi, sampler, monkeypatch)
+    for step in range(2):  # eager warm-up, then capture + replay at capacity 1
+        torch.cuda.manual_seed(4321 + step)
+        graph.run(bs=1, target_logits=io.logits)
+    dflash_utils._get_or_create_chain_verify_buffers(
+        bs=8, draft_token_num=STRIDE, device=io.logits.device
+    )
+    # Small blocks that would take over whatever the growth gave back.
+    sentinels = [
+        torch.full((64,), -7, dtype=torch.int64, device="cuda") for _ in range(256)
+    ]
+    for step in range(2, 4):
+        torch.cuda.manual_seed(4321 + step)
+        ref = _eager_reference(io, sampler, 1)
+        torch.cuda.manual_seed(4321 + step)
+        out = graph.run(bs=1, target_logits=io.logits)
+        torch.cuda.synchronize()
+        got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
+        for name in _FIELDS:
+            assert torch.equal(got[name], want[name]), (step, name)
+    assert graph.num_replays == 3
+    assert all(bool((s == -7).all()) for s in sentinels)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("bs", [3])
 def test_blockwise_replay_equals_eager_at_same_counter(monkeypatch, bs):
     """SGLANG_OPT_DSV41_BLOCKWISE_REJECTION in the region: its draws depend only on (seed,
