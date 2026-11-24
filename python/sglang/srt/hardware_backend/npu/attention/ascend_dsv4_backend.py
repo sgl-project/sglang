@@ -189,7 +189,7 @@ def _build_explicit_state_block_table(
     if compress_ratio == 4:
         # Masked history/ragged columns are still indexed before torch.where.
         safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
-        # A single flat index avoids the broadcasted multi-index AI_CPU path on A3.
+        # A single flat index avoids the broadcasted multi-index AI_CPU path.
         flat_indices = (
             req_pool_indices[:, None] * req_to_token.shape[1] + safe_positions
         )
@@ -2649,6 +2649,10 @@ class DeepseekV4AscendAttnBackend(
             and self._supports_shared_read_metadata(model_runner)
             and get_disagg().disaggregation_mode != "prefill"
         )
+        # Host metadata planning must still run outside capture on every replay.
+        self._prepare_device_metadata_in_graph = (
+            self.prepare_in_graph and not self.needs_cpu_seq_lens
+        )
 
         # The prefill graph records compressor / indexer kernels, so their
         # metadata must live in stable, capacity-sized buffers.  See
@@ -3157,6 +3161,12 @@ class DeepseekV4AscendAttnBackend(
             return
         fm = self.forward_metadata
         bs = fm.block_tables.shape[0]
+        ctx = SimpleNamespace(fm=fm, bs=bs, forward_batch=forward_batch)
+        # Keep device planning before the final shared-map reads and read-done.
+        if self._prepare_device_metadata_in_graph:
+            fm.actual_seq_lengths_kv.clamp_(min=1)
+            self._refresh_graph_kernel_metadata(ctx)
+        self._refresh_cycle_state_block_table(ctx)
         req_pool_indices = forward_batch.req_pool_indices[:bs]
         # Fixed-width snapshots avoid host length reads and keep replay addresses fixed.
         pages = min(
@@ -3189,9 +3199,7 @@ class DeepseekV4AscendAttnBackend(
             fm.c128_page_table[:, :pages].copy_(sidecar[req_pool_indices, :pages])
             fm.c128_page_table[:, pages:].fill_(-1)
 
-        self._refresh_graph_explicit_state_block_tables(
-            SimpleNamespace(fm=fm, bs=bs, forward_batch=forward_batch)
-        )
+        self._refresh_graph_explicit_state_block_tables(ctx)
         # Draft steps pass their view of the runner-owned cache-location buffer.
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
@@ -3683,7 +3691,11 @@ class DeepseekV4AscendAttnBackend(
             else:
                 mask = ctx.live_seq_lens_cpu[: ctx.bs].to(torch.int64) > 0
             mask_buf.copy_(mask.to(mask_buf.dtype))
-        fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
+        if self._prepare_device_metadata_in_graph:
+            # The graph clamps these staged lengths before device planning.
+            fm.actual_seq_lengths_kv.copy_(attn_seq_lens)
+        else:
+            fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
     def _refresh_cycle_state_block_table(self, ctx) -> None:
         """Arch35 cache_mode=2 request-bank table: one bank id per request."""
@@ -4058,7 +4070,8 @@ class DeepseekV4AscendAttnBackend(
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
         # Shared: request bank + sequence lengths/masks (both generations).
-        self._refresh_cycle_state_block_table(ctx)
+        if not self.prepare_in_graph:
+            self._refresh_cycle_state_block_table(ctx)
         self._refresh_graph_seq_metadata(ctx)
 
         # Generation page tables.
@@ -4079,7 +4092,8 @@ class DeepseekV4AscendAttnBackend(
             self._refresh_graph_explicit_state_block_tables(ctx)
             self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_dspark_sparse_metadata(ctx)
-        self._refresh_graph_kernel_metadata(ctx)
+        if not self._prepare_device_metadata_in_graph:
+            self._refresh_graph_kernel_metadata(ctx)
 
         self.forward_metadata = ctx.fm
 
