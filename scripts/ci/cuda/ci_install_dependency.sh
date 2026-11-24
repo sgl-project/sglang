@@ -5,6 +5,20 @@
 # index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
+# Hugging Face tokens on self-hosted runners come from the runner environment,
+# not from GitHub secrets, so GitHub does not mask them. Register them as
+# masks so later steps print *** instead. Tracing is off here: with -x on,
+# the echo line itself would print the token before GitHub masks it.
+{ set +x; } 2>/dev/null
+for _hf_token in "${HF_TOKEN:-}" "${HUGGING_FACE_HUB_TOKEN:-}" \
+    "$(cat "${HF_HOME:-${HOME}/.cache/huggingface}/token" 2>/dev/null || true)"; do
+    if [ -n "${_hf_token}" ]; then
+        echo "::add-mask::${_hf_token}"
+    fi
+done
+unset _hf_token
+set -x
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
@@ -220,6 +234,10 @@ install_apt_packages() {
         libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        # gpu worker NUMA discovery needs the numactl executable, not just libnuma
+        CI_APT_PACKAGES+=(numactl)
+    fi
 
     # The images bake these in, so the usual run pays apt-get update's round
     # trips to install nothing. Skipping it costs no currency either: apt-get
@@ -642,9 +660,9 @@ install_sglang() {
 }
 
 install_nccl() {
-    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # DeepEP needs NCCL 2.31.2 whatever torch pins, so this must run
     # after every command that resolves Python dependencies (including lmms-eval).
-    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+    $PIP_CMD install "nvidia-nccl-cu13==2.31.2" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
@@ -935,17 +953,17 @@ import ctypes
 import importlib.metadata
 import os
 
-if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.31.2":
     raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
 nccl = ctypes.CDLL("libnccl.so.2")
 nccl_version = ctypes.c_int()
 status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
-if status != 0 or nccl_version.value != 23007:
+if status != 0 or nccl_version.value != 23102:
     raise SystemExit(
-        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"expected NCCL runtime 2.31.2, got status={status}, "
         f"raw_version={nccl_version.value}"
     )
-print("NCCL package and runtime versions are 2.30.7")
+print("NCCL package and runtime versions are 2.31.2")
 
 import torch
 print(torch.version.cuda)

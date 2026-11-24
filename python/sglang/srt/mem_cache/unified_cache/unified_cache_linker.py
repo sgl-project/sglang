@@ -155,6 +155,17 @@ class LayerWiseLoadCounter:
         self.blocked_seconds.clear()
 
 
+class OffsetLayerCounter:
+    """Layer wait hook for a pool whose layer ``i`` rides transfer layer ``offset + i``."""
+
+    def __init__(self, counter: object, offset: int):
+        self.counter = counter
+        self.offset = offset
+
+    def wait_until(self, threshold: int) -> None:
+        self.counter.wait_until(self.offset + threshold)
+
+
 class TransferReady(NamedTuple):
     """What a transfer waits on: the page indices, then the forward using the pages."""
 
@@ -207,6 +218,16 @@ class UnifiedCacheLinker(ABC):
         forward_done = device_module.Event()
         forward_done.record(self.forward_stream)
         return TransferReady(indices_ready, forward_done)
+
+    def draft_layer_counter(self) -> OffsetLayerCounter:
+        """Layer wait hook for the sidecar draft pool.
+
+        The offset comes from the DRAFT entry's transfer layers, so the wait
+        follows wherever the pool assembler placed the draft bytes.
+        """
+        return OffsetLayerCounter(
+            self.layer_done_counter, min(self.pools[PoolName.DRAFT].layer_mapping)
+        )
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
@@ -290,6 +311,7 @@ class _ExternalCachePrefetch:
     key: RadixKey
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
+    req: Req
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
     future: Future[bool] | None = None
     timeout_s: float = 0.0
@@ -482,6 +504,7 @@ class UnifiedCacheLinkerWrapper:
             key[:end],
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            req,
             [],
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
@@ -634,6 +657,11 @@ class UnifiedCacheLinkerWrapper:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
+            # Otherwise the published KV holds no session ref until the request
+            # finishes, and session-aware eviction drops it first while queued.
+            self.cache.session_refs.register_session_ref(
+                state.req, inserted.last_device_node
+            )
             if self.metrics is not None:
                 self.metrics.increment_linker_load_tokens(len(full), "prefetch")
         finally:
@@ -654,9 +682,11 @@ class UnifiedCacheLinkerWrapper:
         makes the reduction an intersection.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        # A lookup reports up to one candidate per page; a per-element tensor
+        # store costs microseconds each on the scheduler's critical path.
+        valid = [pages for pages in restorable if device_hit_pages < pages <= num_pages]
+        if valid:
+            mask[torch.tensor(valid, dtype=torch.long)] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:

@@ -9,6 +9,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
+register_cuda_ci(
+    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 
 HEAD_DIM = 128
 
@@ -40,7 +43,7 @@ def _inputs(num: int):
 
 # 707 = 101 frames x 7 heads: the paper workload per rank (8 x B200, Ulysses 8)
 @marker.parametrize("num_matrices", [64, 707], [64])
-@marker.benchmark("impl", ["jit", "eager"], unit="us")
+@marker.benchmark("impl", ["jit", "eager"], unit="us", gate=["jit"])
 def benchmark(num_matrices: int, impl: str):
     A, B, alpha = _inputs(num_matrices)
     # both eager: graph replay on one side only is not a like-for-like comparison
