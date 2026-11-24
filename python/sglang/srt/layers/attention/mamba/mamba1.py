@@ -31,8 +31,9 @@ as ``num_heads == intermediate_size`` and ``head_dim == 1`` (see
     which already supports a full-rank ``A`` of shape ``(nheads, dim, dstate)``
     and applies the ``silu(z)`` output gate;
   - multi-token **prefill** runs the fused Triton varlen scan
-    ``mamba1_scan_prefill`` on XPU (one launch per batch); other devices, or
-    ``SGLANG_DISABLE_MAMBA1_TRITON_SCAN=1``, use the per-token pure-torch scan.
+    ``mamba1_scan_prefill`` (one launch per batch); with
+    ``SGLANG_DISABLE_MAMBA1_TRITON_SCAN=1`` it falls back to the per-token
+    pure-torch scan.
 
 Falcon-Mamba adds a weightless RMSNorm to ``B``, ``C`` and ``dt`` (the "Falcon"
 stabilization trick), applied here via :func:`rms_normalize` gated on
@@ -66,7 +67,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -189,10 +189,7 @@ class MambaMixer1(nn.Module):
             torch.zeros(self.intermediate_size_per_tp, 1),
             persistent=False,
         )
-        # Validated on XPU only; other devices keep the per-token PyTorch loop.
-        self.use_triton_scan = (
-            is_xpu() and not envs.SGLANG_DISABLE_MAMBA1_TRITON_SCAN.get()
-        )
+        self.use_triton_scan = not envs.SGLANG_DISABLE_MAMBA1_TRITON_SCAN.get()
 
         # out_proj: intermediate -> hidden (input sharded, RowParallel reduces).
         self.out_proj = RowParallelLinear(
