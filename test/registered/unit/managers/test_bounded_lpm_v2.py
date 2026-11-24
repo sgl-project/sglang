@@ -171,7 +171,9 @@ class TestBoundedLPMV2(CustomTestCase):
         for req in q[:64]:
             req.init_next_round_input.assert_not_called()
         for req in q[64:]:
-            req.init_next_round_input.assert_called_once_with(self.p.tree_cache)
+            req.init_next_round_input.assert_called_once_with(
+                self.p.tree_cache, probe=True
+            )
 
     def test_stock_candidates_unchanged(self):
         q = make_requests(200)
