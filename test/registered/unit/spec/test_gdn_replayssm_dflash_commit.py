@@ -317,7 +317,7 @@ class TestGDNReplaySSMGenericCommit(CustomTestCase):
         self.assertIsNone(track_arg)
 
 
-class TestGDNRaggedVerifyRefusal(CustomTestCase):
+class TestGDNRaggedVerifySupport(CustomTestCase):
     @staticmethod
     def _runner(ragged_verify=True, is_draft_worker=False):
         # The check keys on supports_ragged_verify(), not on algorithm names.
@@ -326,23 +326,27 @@ class TestGDNRaggedVerifyRefusal(CustomTestCase):
             spec_algorithm=algorithm, is_draft_worker=is_draft_worker
         )
 
-    def test_gdn_target_refuses_compact_verify(self):
+    def test_gdn_target_accepts_compact_verify_on_varlen_backends(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _validate_gdn_target_verify_layout(self._runner())
+            _validate_gdn_target_verify_layout(self._runner(ragged_verify=False))
+            _validate_gdn_target_verify_layout(self._runner(is_draft_worker=True))
+
+    def test_gdn_target_refuses_compact_verify_on_aiter(self):
         with (
             envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
             self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE=compact"),
         ):
-            _validate_gdn_target_verify_layout(self._runner())
+            _validate_gdn_target_verify_layout(
+                self._runner(), verify_kernel_is_aiter=True
+            )
 
     def test_dense_verify_layouts_pass(self):
-        # Cap-accept verifies the dense window and only trims acceptance.
         for mode in ("static", "cap-accept"):
             with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
-                _validate_gdn_target_verify_layout(self._runner())
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-            # Only ragged-verify algorithms build ragged layouts, and only
-            # the target runs the verify.
-            _validate_gdn_target_verify_layout(self._runner(ragged_verify=False))
-            _validate_gdn_target_verify_layout(self._runner(is_draft_worker=True))
+                _validate_gdn_target_verify_layout(
+                    self._runner(), verify_kernel_is_aiter=True
+                )
 
 
 if __name__ == "__main__":

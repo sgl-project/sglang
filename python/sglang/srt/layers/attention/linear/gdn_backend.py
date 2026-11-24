@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
     pp_spec_stable_rows_enabled,
+    ragged_verify_dense_scatter_indices,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -347,19 +348,26 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
         )
 
 
-def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
-    """Compact verify packs per-request verify lengths into one token list,
-    but GDN target verify views a dense [batch, draft tokens] window from the
-    conv on. Cap-accept verifies the dense window and only trims acceptance."""
+def _validate_gdn_target_verify_layout(
+    model_runner: ModelRunner, *, verify_kernel_is_aiter: bool = False
+) -> None:
+    """Validate compact ragged verify layout compatibility on GDN targets.
+
+    GDN scatters ragged tokens into dense [batch, draft_token_num] conv1d slots
+    and runs varlen Triton / ReplaySSM verify kernels, so compact ragged verify
+    is supported on CUDA/HIP Triton and FlashInfer (via varlen Triton fallback),
+    excluding backends whose verify conv/SSM kernels require fixed layouts.
+    """
     if model_runner.is_draft_worker:
         return
     if not model_runner.spec_algorithm.supports_ragged_verify():
         return
-    if ragged_verify_compact_enabled():
+    if ragged_verify_compact_enabled() and (
+        verify_kernel_is_aiter or is_cpu() or is_npu() or is_xpu()
+    ):
         raise ValueError(
-            "SGLANG_RAGGED_VERIFY_MODE=compact is not supported on GDN models: "
-            "GDN target verify views a dense [batch, draft tokens] window. Use "
-            "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
+            "SGLANG_RAGGED_VERIFY_MODE=compact is not supported with this GDN "
+            "verify backend. Use SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
         )
 
 
@@ -620,10 +628,12 @@ class GDNKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        ragged_layout: Optional[object] = None,
         **kwargs,
     ) -> torch.Tensor:
         verify_kernel = self._get_target_verify_kernel(
-            kwargs.get("retrieve_parent_token")
+            kwargs.get("retrieve_parent_token"),
+            ragged_layout=ragged_layout,
         )
         return verify_kernel.target_verify(
             A_log=A_log,
@@ -640,18 +650,32 @@ class GDNKernelDispatcher:
         )
 
     def target_verify_supports_strided_qkv(
-        self, retrieve_parent_token: Optional[torch.Tensor]
+        self,
+        retrieve_parent_token: Optional[torch.Tensor],
+        *,
+        ragged_layout: Optional[object] = None,
     ) -> bool:
-        verify_kernel = self._get_target_verify_kernel(retrieve_parent_token)
+        verify_kernel = self._get_target_verify_kernel(
+            retrieve_parent_token, ragged_layout=ragged_layout
+        )
         return (
             getattr(verify_kernel, "supports_strided_target_verify_qkv", False) is True
         )
 
-    def _get_target_verify_kernel(self, retrieve_parent_token: Optional[torch.Tensor]):
-        # Tree drafts use Triton even when linear MTP verification uses FlashInfer.
+    def _get_target_verify_kernel(
+        self,
+        retrieve_parent_token: Optional[torch.Tensor],
+        *,
+        ragged_layout: Optional[object] = None,
+    ):
+        # Tree drafts and compact ragged verify use varlen Triton even when
+        # static linear MTP verification uses FlashInfer.
         return (
             self.tree_verify_kernel
-            if retrieve_parent_token is not None
+            if (
+                retrieve_parent_token is not None
+                or (ragged_layout is not None and self.verify_kernel_is_flashinfer)
+            )
             else self.verify_kernel
         )
 
@@ -659,6 +683,10 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    # The Triton and ReplaySSM verify kernels are varlen and the conv path
+    # scatters ragged tokens to its dense layout, so ragged verify graphs are
+    # supported on CUDA/HIP (excluding aiter verify).
+    supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
@@ -671,8 +699,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
 
     def __init__(self, model_runner: ModelRunner):
-        _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
-        _validate_gdn_target_verify_layout(model_runner)
+        backends = model_runner.linear_attn_backends
+        _validate_gdn_linear_attn_backends(backends)
+        _validate_gdn_target_verify_layout(
+            model_runner, verify_kernel_is_aiter=backends.verify.is_aiter()
+        )
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
@@ -682,10 +713,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
             )
 
-        backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        if (
+            self.kernel_dispatcher.verify_kernel_is_aiter
+            or is_cpu()
+            or is_npu()
+            or is_xpu()
+        ):
+            self.supports_ragged_verify_graph = False
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -994,6 +1031,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             use_replayssm_spec=use_replayssm_spec,
             ssm_dtype=mamba_cache.temporal.dtype,
             draft_token_num=forward_batch.spec_info.draft_token_num,
+            ragged_layout=forward_batch.ragged_verify_layout,
         )
 
     def _replayssm_fold_uses_cutedsl(
@@ -1013,14 +1051,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         use_replayssm_spec: bool,
         ssm_dtype: torch.dtype,
         draft_token_num: int,
+        ragged_layout: Optional[object] = None,
     ) -> bool:
         # ReplaySSM Triton routes accept strides; the CuTeDSL fold does not.
         if use_replayssm_fold:
-            return not self._replayssm_fold_uses_cutedsl(ssm_dtype, draft_token_num)
+            return ragged_layout is not None or not self._replayssm_fold_uses_cutedsl(
+                ssm_dtype, draft_token_num
+            )
         if use_replayssm_spec:
             return True
         return self.kernel_dispatcher.target_verify_supports_strided_qkv(
-            retrieve_parent_token
+            retrieve_parent_token, ragged_layout=ragged_layout
         )
 
     def forward_decode(
@@ -1493,12 +1534,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
+        ragged_layout = forward_batch.ragged_verify_layout if is_target_verify else None
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            if ragged_layout is None:
+                batch_size = seq_len // draft_token_num
+                dense_token_indices = None
+                mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+            else:
+                # Conv update and its per-step scratch want the dense
+                # [bs, draft_token_num] layout: scatter ragged tokens to their
+                # step slots, gather back after (pad steps are never committed).
+                batch_size = query_start_loc.shape[0] - 1
+                num_dense_tokens = batch_size * draft_token_num
+                dense_token_indices = forward_metadata.ragged_dense_token_indices
+                if (
+                    dense_token_indices is None
+                    or dense_token_indices.shape[0] != seq_len
+                ):
+                    dense_token_indices = ragged_verify_dense_scatter_indices(
+                        query_start_loc=query_start_loc,
+                        seq_len=seq_len,
+                        draft_token_num=draft_token_num,
+                    )
+                    forward_metadata.ragged_dense_token_indices = dense_token_indices
+                dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+                dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                mixed_qkv_dense = dense[:num_dense_tokens].view(
+                    batch_size, draft_token_num, -1
+                )
+            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
             mixed_qkv_processed = self.kernel_dispatcher.verify_conv_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -1512,7 +1577,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                batch_size * draft_token_num, -1
+            )
+            if dense_token_indices is None:
+                mixed_qkv = mixed_qkv_flat
+            else:
+                padded_flat = mixed_qkv_flat.new_zeros(
+                    batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+                )
+                padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
+                mixed_qkv = padded_flat[dense_token_indices]
         else:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
@@ -1573,6 +1648,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
                     retrieve_parent_token=retrieve_parent_token,
+                    ragged_layout=ragged_layout,
                 )
             elif use_replayssm_spec:
                 core_attn_out = self._replayssm_target_verify(
@@ -1588,6 +1664,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=self.forward_metadata.replayssm_ring_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    ragged_layout=ragged_layout,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1615,6 +1692,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
+                    ragged_layout=ragged_layout,
                 )
         else:
             if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
@@ -1847,11 +1925,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         retrieve_parent_token: Optional[torch.Tensor],
+        ragged_layout: Optional[object] = None,
     ) -> torch.Tensor:
         """Ring-writing verify; the commit fold replays the accepted prefix
         into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
-        dispatcher selected the FlashInfer bf16-state verify, else the Triton
-        recurrent kernel (both store the same raw window)."""
+        dispatcher selected the FlashInfer bf16-state verify (dense layout),
+        else the varlen Triton recurrent kernel (both store the same raw window)."""
         from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
@@ -1862,8 +1941,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         seq_len = query.shape[1]
         batch_size = query_start_loc.shape[0] - 1
-        draft_token_num = seq_len // batch_size
-        if self._replayssm_fold_uses_cutedsl(ssm_states.dtype, draft_token_num):
+        draft_token_num = seq_len // batch_size if ragged_layout is None else 0
+        if ragged_layout is None and self._replayssm_fold_uses_cutedsl(
+            ssm_states.dtype, draft_token_num
+        ):
             from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
                 gated_delta_rule_mtp,
             )
@@ -1927,6 +2008,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        ragged_layout: Optional[object] = None,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1958,7 +2040,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b = b.reshape(seq_len, HV)
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
-        out = q.new_empty(seq_len, HV, V)
+        out = (
+            q.new_zeros(seq_len, HV, V)
+            if ragged_layout is not None
+            else q.new_empty(seq_len, HV, V)
+        )
         gdn_replayssm_spec_decode(
             q=q,
             k=k,

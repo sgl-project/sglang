@@ -101,6 +101,9 @@ class ForwardMetadata:
     # GDN prefill on packed copies of a strided state pool: built by the first
     # layer that stages and shared by the rest of the forward.
     prefill_state_staging: Optional["PoolStaging"] = None
+    # Compact ragged verify: dense [bs, draft_token_num] scatter indices built
+    # once by the first linear-attention layer of a verify step and shared.
+    ragged_dense_token_indices: Optional[torch.Tensor] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
