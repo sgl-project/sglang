@@ -1118,9 +1118,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         draft_kv_ring_unsupported_reason,
     )
 
-    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
-    if not switch.get():
-        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+    if not envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get():
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
@@ -1139,10 +1137,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         is_cuda=current_platform.is_cuda(),
     )
     if reason is not None:
-        if switch.is_set():
-            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-        logger.info("DFLASH draft KV ring: off, %s.", reason)
-        return
+        raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
     logger.info("DFLASH draft KV ring: on.")
     declare_resolution(
         server_args,
@@ -1648,23 +1643,6 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)
-    elif model_arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     elif model_arch == ERNIE5_5_MOE_ARCH:

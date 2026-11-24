@@ -76,6 +76,23 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
 
+        # One grouped read carries every mapped layer of a component item.
+        pointers, sizes, offsets = pool.get_prepared_layers_range_meta(
+            locations, range(3)
+        )
+        self.assertEqual(
+            pointers,
+            [
+                [k0[0].data_ptr(), k2[0].data_ptr()],
+                [v0[0].data_ptr(), v2[0].data_ptr()],
+                [k0[4].data_ptr(), k2[4].data_ptr()],
+                [v0[4].data_ptr(), v2[4].data_ptr()],
+            ],
+        )
+        self.assertEqual(sizes, [[6, 10], [14, 22]] * 2)
+        self.assertEqual(offsets, [[0, 6], [0, 14]] * 2)
+        self.assertIsNone(pool.get_prepared_layers_range_meta(locations, [1, 3]))
+
     def test_layer_ranges_preserve_layout_and_row_order(self):
         buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
         for packed in (True, False):
@@ -101,6 +118,70 @@ class TestDevicePoolEntry(CustomTestCase):
                         self.assertEqual(
                             pool.get_prepared_layer_range_meta(locations, 0), expected
                         )
+
+    def test_grouped_ranges_match_per_layer_concatenation(self):
+        def make_buffers(widths):
+            return [torch.zeros((6, width), dtype=torch.uint8) for width in widths]
+
+        cases = {
+            # Layer 2 maps two buffers; layer 3 is a sharer hole.
+            "packed": (
+                [make_buffers((3, 4, 5, 6))],
+                {0: 0, 1: 1, 2: (2, 3), 4: 0},
+                True,
+            ),
+            "unpacked": (
+                [make_buffers((3, 4, 5)), make_buffers((7, 8, 9))],
+                {0: 0, 1: 1, 2: 2},
+                False,
+            ),
+        }
+        for name, (components, layer_mapping, packed) in cases.items():
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=components,
+                layer_mapping=layer_mapping,
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            locations = [5, 0, 3, 0]
+            for group in (range(0, 3), range(2, 5), range(3, 4)):
+                expected = None
+                for layer in group:
+                    meta = pool.get_prepared_layer_range_meta(locations, layer)
+                    if meta is None:
+                        continue
+                    if expected is None:
+                        expected = tuple([list(row) for row in rows] for rows in meta)
+                        continue
+                    for merged_rows, rows in zip(expected, meta):
+                        for merged_row, row in zip(merged_rows, rows):
+                            merged_row.extend(row)
+                with self.subTest(name=name, group=group):
+                    self.assertEqual(
+                        pool.get_prepared_layers_range_meta(locations, group),
+                        expected,
+                    )
+
+    def test_grouped_ranges_reject_unpacked_buffer_count_mismatch(self):
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[
+                [torch.zeros((4, width), dtype=torch.uint8) for width in (3, 4, 5)]
+            ],
+            layer_mapping={0: 0, 1: (1, 2)},
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+        )
+        self.assertIsNotNone(pool.get_prepared_layers_range_meta([0], [1]))
+        with self.assertRaisesRegex(ValueError, "different number of buffers"):
+            pool.get_prepared_layers_range_meta([0], [0, 1])
 
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
@@ -1036,6 +1117,96 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
 
+    def test_mamba_swa_packs_hybrid_sidecar_draft_kv(self):
+        """A hybrid-SWA sidecar draft rides the target pages: its full layers on
+        KV, its SWA layers on SWA, both after the last target transfer layer."""
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        def mha(rows, layers, width):
+            pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+            pool.page_size, pool.layer_num = 2, layers
+            pool.k_scale_buffer = pool.native_k_scale_buffer = None
+            pool.k_buffer = [torch.zeros((rows, width), dtype=torch.uint8)] * layers
+            pool.v_buffer = [torch.zeros((rows, width), dtype=torch.uint8)] * layers
+            return pool
+
+        def hybrid_draft(full_layers, swa_layers):
+            draft = SWAKVPool.__new__(SWAKVPool)
+            draft.full_kv_pool = mha(8, full_layers, 5)
+            draft.swa_kv_pool = mha(4, swa_layers, 3)
+            draft.swa_uses_full_indices = False
+            return draft
+
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            layers_mapping={0: (0, True), 1: (0, False), 2: (1, True)},
+            full_kv_pool=mha(8, 1, 5),
+            swa_kv_pool=mha(4, 2, 3),
+        )
+        state = SimpleNamespace(
+            pool=SimpleNamespace(
+                num_mamba_layers=2,
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros((2, 4, 0), dtype=torch.uint8),
+                    conv=[torch.zeros((2, 4, 2), dtype=torch.uint8)],
+                ),
+            ),
+            layer_map={0: 0, 2: 1},
+            ckpt_pool=None,
+            short_conv_pool=SimpleNamespace(enabled=False),
+            ngram_pool=SimpleNamespace(enabled=False),
+        )
+
+        def build(drafts):
+            params = SimpleNamespace(
+                mtp_draft_device_pools=(),
+                mtp_draft_mamba_pools=(),
+                sidecar_draft_device_pools=drafts,
+                token_to_kv_pool_allocator=SimpleNamespace(state=state),
+            )
+            with patch.object(
+                linker_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=False),
+            ):
+                return linker_pool_assembler._build_mamba_swa_device_pool_group(
+                    kvcache, params, page_size=2
+                )
+
+        draft = hybrid_draft(full_layers=1, swa_layers=2)
+        group = build((draft,))
+        self.assertTrue(group.restores_sidecar_drafts)
+        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: (0, 1, 2, 3)})
+        self.assertEqual(
+            group.entry_map[PoolName.SWA].layer_mapping,
+            {0: (0, 2), 2: (1, 3, 4, 5, 6, 7)},
+        )
+
+        def page_ptrs(name):
+            entry = group.entry_map[name]
+            return set(entry.get_page_buffer_meta(torch.tensor([2, 3]))[0])
+
+        kv_ptrs, swa_ptrs = page_ptrs(PoolName.KV), page_ptrs(PoolName.SWA)
+        for buffer in (draft.full_kv_pool.k_buffer[0], draft.full_kv_pool.v_buffer[0]):
+            self.assertIn(buffer[2].data_ptr(), kv_ptrs)
+        for buffer in (draft.swa_kv_pool.k_buffer[0], draft.swa_kv_pool.v_buffer[0]):
+            self.assertIn(buffer[2].data_ptr(), swa_ptrs)
+
+        # A draft layout the linker cannot pack must not claim a restore.
+        self.assertFalse(build((object(),)).restores_sidecar_drafts)
+
+        # A dense draft on the target's SWA ids has SWA-pool rows; copying it
+        # with full-attention page ids reads the wrong rows or past its end.
+        swa_id_draft = mha(4, 1, 3)
+        swa_id_draft.follows_target_swa_ids = True
+        group = build((swa_id_draft,))
+        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: (0, 1)})
+        self.assertEqual(
+            group.entry_map[PoolName.SWA].layer_mapping, {0: (0, 2), 2: (1, 3, 4, 5)}
+        )
+
     def test_minimax_m31_nvfp4_maps_page_rows_and_draft(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
@@ -1153,6 +1324,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params = SimpleNamespace(
             mtp_draft_device_pools=drafts,
             mtp_draft_mamba_pools=draft_mamba,
+            sidecar_draft_device_pools=(),
             token_to_kv_pool_allocator=SimpleNamespace(
                 state=SimpleNamespace(
                     pool=mamba(2),
