@@ -1728,6 +1728,11 @@ class Req(ReqDllmMixin):
         self.origin_input_ids = array(
             "q", [0]
         )  # set it to one token to skip the long prefill
+        # The boundary indexed the dropped prompt; the one-token stub runs causal,
+        # so it goes back to the caller's key, the namespace's last component.
+        if self.bidir_prefix_len >= 0:
+            self.extra_key = self.extra_key.split("|", 2)[2] or None
+        self.bidir_prefix_len = -1
         self.return_logprob = False
         self.logprob_start_len = -1
         self.routed_experts_start_len = 0

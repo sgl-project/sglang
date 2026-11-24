@@ -50,7 +50,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import PlainValidator, StrictInt
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
@@ -342,7 +342,8 @@ class GenerateReqInput:
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     # Block-bidirectional attention boundary for decision models; None/-1 = causal.
-    bidir_prefix_len: Optional[Union[List[int], int]] = None
+    # Strict, so a JSON false or a null entry is refused, not read as 0 or causal.
+    bidir_prefix_len: Optional[Union[List[StrictInt], StrictInt]] = None
     # Embedding overrides to place at specific token positions.
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).

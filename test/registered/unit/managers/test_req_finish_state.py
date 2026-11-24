@@ -85,6 +85,7 @@ class TestReqFinishMethods(CustomTestCase):
             return_logprob=True,
             return_routed_experts=True,
             routed_experts_start_len=-1,
+            bidir_prefix_len=2,
         )
         req.logprob_start_len = 2
         with patch("sglang.srt.managers.schedule_batch.get_parallel") as parallel:
@@ -93,6 +94,28 @@ class TestReqFinishMethods(CustomTestCase):
         self.assertEqual(list(req.origin_input_ids), [0])
         self.assertEqual(req.logprob_start_len, -1)
         self.assertEqual(req.routed_experts_start_len, 0)
+        # A kept boundary would give the stub a (2, 1) block past its prompt.
+        self.assertEqual(req.bidir_prefix_len, -1)
+
+    def test_abort_returns_a_bidir_stub_to_the_caller_key(self):
+        # The causal stub must not share radix nodes with the state's requests.
+        for extra_key in (None, "tenant|a"):
+            with self.subTest(extra_key=extra_key):
+                req = Req(
+                    rid="r",
+                    origin_input_text="",
+                    origin_input_ids=[1, 2, 3],
+                    sampling_params=SamplingParams(),
+                    extra_key=extra_key,
+                    bidir_prefix_len=2,
+                )
+                self.assertNotEqual(req.extra_key, extra_key)
+                with patch(
+                    "sglang.srt.managers.schedule_batch.get_parallel"
+                ) as parallel:
+                    parallel().tp_rank = 0
+                    req.set_finish_with_abort("rejected at intake")
+                self.assertEqual(req.extra_key, extra_key)
 
 
 if __name__ == "__main__":

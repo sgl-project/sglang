@@ -100,6 +100,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         return SimpleNamespace(
             rid="test-req",
             origin_input_ids=[0] * input_len,
+            bidir_prefix_len=-1,
             sampling_params=SimpleNamespace(
                 max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens
             ),

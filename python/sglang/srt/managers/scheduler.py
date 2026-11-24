@@ -1997,6 +1997,33 @@ class Scheduler(
             f"helps."
         )
 
+    def validate_bidir_prompt_cut(self, req: Req) -> Optional[str]:
+        """Admission waits rather than split a block-bidirectional prompt, so
+        refuse one it could come to cut only inside the prompt. Window pools,
+        a speculative draft's too, price a retracted request's re-prefill by its
+        chunk; and that re-prefill is cut on the chunk alignment."""
+        if req.bidir_prefix_len < 0:
+            return None
+        if self.token_to_kv_pool_allocator.window_pool_names():
+            return (
+                "bidir_prefix_len cannot run with sliding-window KV pools "
+                "(the model's or a speculative draft's)."
+            )
+        align = self.truncation_align_size
+        if align is None:
+            return None
+        chunk = self.chunked_prefill_size
+        if chunk is None:
+            return None
+        max_len = chunk // align * align
+        if len(req.origin_input_ids) <= max_len:
+            return None
+        return (
+            f"A bidir_prefix_len prompt may have at most {max_len} tokens on this "
+            f"server, the chunked prefill size {chunk} rounded down to its "
+            f"{align}-token chunk alignment; got {len(req.origin_input_ids)}."
+        )
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -3076,14 +3103,18 @@ class Scheduler(
         # before the clamps, which could only lower it to a dummy prefill-only
         # 0. Constant output: every PP rank must derive the same
         # sampling_params (rank consensus hashes them).
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        prefill_handoff = self.disaggregation_mode == DisaggregationMode.PREFILL
+        if prefill_handoff:
             req.sampling_params.max_new_tokens = 1
             # min <= max invariant; EOS stays legal as the handoff token
             # unless the user set min_new_tokens.
             req.sampling_params.min_new_tokens = min(
                 req.sampling_params.min_new_tokens, 1
             )
-            return
+            # A block-bidirectional prompt is never split, so it and the handoff
+            # token must still fit the empty pool whole (priced below).
+            if req.bidir_prefix_len < 0:
+                return
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
             req.sampling_params.max_new_tokens
@@ -3128,10 +3159,12 @@ class Scheduler(
         )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
-            max_new_tokens,
+            # A PD prefill server decodes exactly the handoff token.
+            1 if prefill_handoff else max_new_tokens,
             token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
-            chunk_size=self.chunked_prefill_size,
+            # Admission never splits a block-bidirectional prompt: price it whole.
+            chunk_size=None if req.bidir_prefix_len >= 0 else self.chunked_prefill_size,
             prefill_retire_lag=retirement.prefill_retire_lag,
             decode_retire_lag=retirement.decode_retire_lag,
             eviction_interval=retirement.eviction_interval,
@@ -3139,7 +3172,7 @@ class Scheduler(
             # Admission cuts a chunk on this alignment, so no smaller chunk runs.
             chunk_align=self.truncation_align_size,
         )
-        if max_new_tokens is None:
+        if max_new_tokens is None or (prefill_handoff and max_new_tokens < 1):
             req.set_finish_with_abort(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."
             )
@@ -3702,6 +3735,10 @@ class Scheduler(
             self._embedding_preserve_last_token_id,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+        if error_msg := self.validate_bidir_prompt_cut(req):
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return

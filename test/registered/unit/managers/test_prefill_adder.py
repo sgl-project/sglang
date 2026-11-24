@@ -460,6 +460,80 @@ class TestPrefillAdder(CustomTestCase):
                         64 if chunk and not prefix else 100 - prefix,
                     )
 
+    def _bidir_req(self, ignore_eos, boundary, prompt, output=0):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_tree_cache.disable = ignore_eos
+        self.mock_token_allocator.available_size.return_value = 32768
+        req = self.create_shared_req("bidir", max_new_tokens=256)
+        req.sampling_params.ignore_eos = ignore_eos
+        req.origin_input_ids = list(range(prompt))
+        req.output_ids = [0] * output
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.bidir_prefix_len = boundary
+        return req
+
+    def test_bidir_prompt_waits_instead_of_being_split(self):
+        """On both admission paths a prompt over the chunk budget stays whole and
+        queued when it has a boundary; without one the same prompt is cut."""
+        for ignore_eos in (False, True):
+            for boundary in (-1, 0):
+                with self.subTest(ignore_eos=ignore_eos, boundary=boundary):
+                    req = self._bidir_req(ignore_eos, boundary, prompt=128)
+                    adder = self.create_adder(
+                        self.create_running_batch(), rem_chunk_tokens=64
+                    )
+                    result = adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                    if boundary < 0:
+                        self.assertIs(adder.new_chunked_req, req)
+                        self.assertEqual(req.extend_end, 64)
+                    else:
+                        self.assertEqual(result, AddReqResult.OTHER)
+                        self.assertEqual(adder.can_run_list, [])
+                        self.assertIsNone(adder.new_chunked_req)
+                        self.assertIsNone(req.extend_end)
+
+    def test_retracted_bidir_request_is_cut_after_its_prompt(self):
+        """Only the prompt is indivisible: a retracted request replays its
+        output causally, so a re-prefill longer than the chunk is cut past the
+        prompt instead of waiting forever."""
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                req = self._bidir_req(ignore_eos, 0, prompt=4000, output=128)
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=4096
+                )
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertIs(adder.new_chunked_req, req)
+                self.assertEqual(req.extend_end, 4096)
+
+    def test_aligned_cut_bounds_a_retracted_bidir_prompt(self):
+        """On a 64-token grid a re-prefill is cut at chunk // 64 * 64 tokens on
+        both paths: a prompt up to that cut continues past it, while a longer
+        one waits on every pass, so the scheduler refuses it at intake."""
+        for ignore_eos in (False, True):
+            for chunk, prompt in ((100, 64), (100, 100), (130, 128), (130, 129)):
+                with self.subTest(ignore_eos=ignore_eos, chunk=chunk, prompt=prompt):
+                    req = self._bidir_req(ignore_eos, 0, prompt=prompt, output=64)
+                    adder = self.create_adder(
+                        self.create_running_batch(), rem_chunk_tokens=chunk
+                    )
+                    adder.mamba_chunk_grid = 64
+                    adder.strict_chunk_grid = True
+                    result = adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=64
+                    )
+                    if prompt == chunk // 64 * 64:
+                        self.assertIs(adder.new_chunked_req, req)
+                        self.assertEqual(req.extend_end, prompt)
+                    else:
+                        self.assertEqual(result, AddReqResult.OTHER)
+                        self.assertIsNone(req.extend_end)
+
     def test_continuation_without_limit_keeps_normal_chunk_size(self):
         adder = self.create_shortest_prefill_adder()
         req = self.create_shared_req("continuation")

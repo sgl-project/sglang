@@ -1341,6 +1341,13 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    @staticmethod
+    def _cuts_bidir_prompt(req: Req, cut: int) -> bool:
+        """Whether a chunk ending at `cut` splits a block-bidirectional prompt.
+        Only the prompt is indivisible: a retracted request's re-prefilled
+        output attends causally, so it may continue in a later chunk."""
+        return req.bidir_prefix_len >= 0 and cut < len(req.origin_input_ids)
+
     def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
         """Round a *truncated* chunk down to the mamba kernel chunk grid.
 
@@ -1920,6 +1927,16 @@ class PrefillAdder:
             )
             if not can_admit:
                 return self._refused()
+        if (
+            chunk_limit is not None
+            and cand_extend_input_len > chunk_limit
+            and self._cuts_bidir_prompt(
+                req,
+                req.prefix_len
+                + self.floor_chunked_tokens(chunk_limit, cand_extend_input_len),
+            )
+        ):
+            return AddReqResult.OTHER
         fits = self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
@@ -2359,13 +2376,6 @@ class PrefillAdder:
             if extend_len <= 0:
                 return AddReqResult.OTHER
             max_new_tokens = 0
-        elif (
-            req.bidir_prefix_len >= 0
-            and chunk_tokens_limit is not None
-            and chunk_fit_tokens > chunk_tokens_limit
-        ):
-            # A block-bidirectional prompt cannot be split across chunks.
-            return AddReqResult.OTHER
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
             if has_chunked_req:
                 # Only one unfinished chunked request can be tracked; a
@@ -2390,7 +2400,7 @@ class PrefillAdder:
                     )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
-            if extend_len <= 0:
+            if extend_len <= 0 or self._cuts_bidir_prompt(req, prefix_len + extend_len):
                 return AddReqResult.OTHER
             is_chunked = True
             max_new_tokens = 0

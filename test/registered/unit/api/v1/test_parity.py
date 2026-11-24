@@ -50,6 +50,7 @@ FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.j
 PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
+        "bidir_prefix_len",
         "conversation_id",
         "encoder_urls",
         "external_trace_header",

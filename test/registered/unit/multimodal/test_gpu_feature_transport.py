@@ -1076,6 +1076,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         req.session = None
         req.grammar = object()
         req.origin_input_ids = [1, 2]
+        req.bidir_prefix_len = -1
         req.return_logprob = True
         req.logprob_start_len = 0
         req.to_finish = None

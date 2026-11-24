@@ -356,7 +356,8 @@ def validate_input_length(
         Error message if validation fails, None if successful
     """
     if len(req.origin_input_ids) >= max_req_input_len:
-        if allow_auto_truncate:
+        # A block-bidirectional boundary indexes the whole prompt: never cut it.
+        if allow_auto_truncate and req.bidir_prefix_len < 0:
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated. "
@@ -374,12 +375,16 @@ def validate_input_length(
             # sentence; without it this is a generic 400 to them.
             # Both sentences quote the largest accepted prompt.
             max_prompt_len = max_req_input_len - 1
+            remedy = (
+                "Use a shorter input; a bidir_prefix_len prompt is never truncated."
+                if req.bidir_prefix_len >= 0
+                else "Use a shorter input or enable --allow-auto-truncate."
+            )
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
                 f"the maximum allowed length ({max_prompt_len} tokens). "
                 f"This model's maximum context length is {max_prompt_len} "
-                f"tokens on this server. "
-                f"Use a shorter input or enable --allow-auto-truncate."
+                f"tokens on this server. {remedy}"
             )
             return error_msg
 

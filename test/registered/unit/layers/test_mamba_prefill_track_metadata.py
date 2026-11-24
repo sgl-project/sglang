@@ -278,6 +278,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     rid="one",
                     lora_id=None,
                     token_type_ids=None,
+                    bidir_prefix_len=-1,
                     kv=SimpleNamespace(kv_committed_len=64),
                     extend_end=65,
                     full_untruncated_fill_ids=[3] * 65,

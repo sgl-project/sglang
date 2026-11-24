@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -1983,8 +1984,10 @@ class TestBidirStateBlockCheckpoint(
     )
     STATE_LEN, PROMPT_LEN, CHECKPOINT = 12, 16, 8
 
-    def _finish(self, bidir_prefix_len, checkpoint=CHECKPOINT):
-        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+    def _request(self, bidir_prefix_len, checkpoint=CHECKPOINT, cfg=None):
+        cache, allocator, pool = build_fixture(
+            cfg or self.cfg, mamba_cache_chunk_size=4
+        )
         req, _ = self._build_req(allocator, pool, None)
         tokens = list(range(self.PROMPT_LEN))
         req.origin_input_ids = array("q", tokens)
@@ -1996,6 +1999,10 @@ class TestBidirStateBlockCheckpoint(
         req.kv.mamba_last_track_seqlen = checkpoint
         req.bidir_prefix_len = bidir_prefix_len
         req.last_node = cache.root_node_handle()
+        return cache, allocator, req, tokens
+
+    def _finish(self, bidir_prefix_len, checkpoint=CHECKPOINT, cfg=None):
+        cache, allocator, req, tokens = self._request(bidir_prefix_len, checkpoint, cfg)
         avail_before = allocator.available_size()
         finish_req(cache, req, len(tokens))
         cache.sanity_check()
@@ -2019,6 +2026,88 @@ class TestBidirStateBlockCheckpoint(
         self.assertEqual(state.full_kv_hit_length, self.STATE_LEN)
         self.assertEqual(state.device_prefix_len, 0)
         self.assertEqual(freed, self.PROMPT_LEN - self.STATE_LEN)
+
+    def test_int8_checkpoint_pool_balanced_without_a_mamba_checkpoint(self):
+        """With int8 checkpoints, Mamba commits a checkpoint slot even when it
+        has none to donate; keeping the state block must not orphan that slot."""
+        cfg = replace(self.cfg, enable_int8_mamba_checkpoint=True, mamba_cache_size=8)
+        cache, tokens, _ = self._finish(self.STATE_LEN, checkpoint=None, cfg=cfg)
+        state = match_prefix(cache, tokens[: self.STATE_LEN])
+        self.assertEqual(state.full_kv_hit_length, self.STATE_LEN)
+        ckpt_pool = cache.req_to_token_pool.mamba_ckpt_pool
+        self.assertEqual(
+            ckpt_pool.available_size()
+            + cache.mamba_evictable_size()
+            + cache.mamba_protected_size(),
+            ckpt_pool.num_slots,
+        )
+
+    def test_state_block_inside_the_protected_prefix_is_kept(self):
+        """At level 3 a running request's prefill checkpoint can protect past
+        P; finishing with no checkpoint left to donate keeps that prefix instead
+        of reinserting the shorter state block."""
+        cfg = replace(self.cfg, hybrid_cache_checkpoints_level=3)
+        cache, _, req, tokens = self._request(
+            self.STATE_LEN, checkpoint=self.STATE_LEN + 2, cfg=cfg
+        )
+        req.refresh_fill_ids()
+        cache.checkpoint(req, up_to=len(tokens))
+        self.assertGreater(req.kv.cache_protected_len, self.STATE_LEN)
+        req.kv.mamba_last_track_seqlen = None
+        finish_req(cache, req, len(tokens))
+        cache.sanity_check()
+        state = match_prefix(cache, tokens[: self.STATE_LEN])
+        self.assertEqual(state.full_kv_hit_length, self.STATE_LEN)
+
+    def test_every_insert_keeps_the_delegated_offload_skip(self):
+        """When another writer (a PD prefill worker) stores the prompt, decode
+        must not upload it again: the state-block insert, like the checkpoint
+        insert, runs under the request's linker offload skip."""
+        cache, _, req, tokens = self._request(self.STATE_LEN)
+        skipping, inserts = [], []
+
+        @contextmanager
+        def skip(req, token_ids):
+            skipping.append(True)
+            yield
+            skipping.pop()
+
+        insert = cache.insert
+
+        def spy(params):
+            inserts.append(bool(skipping))
+            return insert(params)
+
+        with (
+            mock.patch.object(cache, "_linker_offload_skip_prefix", skip),
+            mock.patch.object(cache, "insert", spy),
+        ):
+            finish_req(cache, req, len(tokens))
+        self.assertEqual(inserts, [True, True])
+
+    def test_state_only_prefill_keeps_its_end_state(self):
+        """A state-only prefill (P == L, max_new_tokens=0) publishes its live
+        state at P, so a question resumes with no recompute; the same request
+        sent causal keeps only its tracked checkpoint."""
+        for bidir_prefix_len, depth in (
+            (self.PROMPT_LEN, self.PROMPT_LEN),
+            (-1, self.CHECKPOINT),
+        ):
+            with self.subTest(bidir_prefix_len=bidir_prefix_len):
+                cache, _, req, tokens = self._request(bidir_prefix_len)
+                req.sampling_params.max_new_tokens = 0
+                conv = cache.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
+                conv[:, req.kv.mamba_pool_idx] = 7
+                finish_req(cache, req, len(tokens))
+                cache.sanity_check()
+                match = match_prefix(cache, tokens)
+                self.assertEqual(match.device_prefix_len, depth)
+                state = node_device_value(
+                    cache, match.last_device_node, ComponentType.MAMBA
+                )
+                self.assertEqual(
+                    bool(torch.all(conv[:, state] == 7)), depth == self.PROMPT_LEN
+                )
 
     def test_causal_request_is_unchanged(self):
         cache, tokens, freed = self._finish(-1)

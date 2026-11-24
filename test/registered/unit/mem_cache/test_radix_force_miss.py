@@ -141,20 +141,25 @@ class TestMatchKvCacheBidirPartialState(CustomTestCase):
         self.assertEqual(req.host_hit_length, 0)
 
     def test_partial_state_hit_resets_mamba_cow(self):
-        tree = self._tree()
-        req = _StubReq(list(range(10, 14)) + [99, 100])
-        req.bidir_prefix_len = 6
-        req.kv = SimpleNamespace(
-            cache_protected_len=None,
-            holds_mamba=True,
-            mamba_cow_src_index=7,
-            mamba_needs_clear=False,
-        )
+        """A deferred CoW (shared memory) is staged before the request holds a
+        slot; the zeroed hit must drop it too, or the slot starts from the
+        partially matched checkpoint."""
+        for holds_mamba in (True, False):
+            with self.subTest(holds_mamba=holds_mamba):
+                tree = self._tree()
+                req = _StubReq(list(range(10, 14)) + [99, 100])
+                req.bidir_prefix_len = 6
+                req.kv = SimpleNamespace(
+                    cache_protected_len=None,
+                    holds_mamba=holds_mamba,
+                    mamba_cow_src_index=7,
+                    mamba_needs_clear=False,
+                )
 
-        match_kv_cache(req, tree)
+                match_kv_cache(req, tree)
 
-        self.assertIsNone(req.kv.mamba_cow_src_index)
-        self.assertTrue(req.kv.mamba_needs_clear)
+                self.assertIsNone(req.kv.mamba_cow_src_index)
+                self.assertEqual(req.kv.mamba_needs_clear, holds_mamba)
 
     def test_full_state_hit_is_kept(self):
         tree = self._tree()

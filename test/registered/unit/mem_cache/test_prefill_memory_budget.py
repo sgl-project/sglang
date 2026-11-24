@@ -12,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
@@ -637,6 +638,102 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(adder.can_run_list, [req])
+
+    def test_bidir_prompt_the_pool_holds_only_in_chunks_is_refused(self):
+        """Admission never splits a block-bidirectional prompt, so one an empty
+        pool holds only in chunks is refused at intake, on a PD prefill server
+        too. Priced in chunks it got through, and then the budget cut it below
+        its end on every pass."""
+        allocator = _shared_allocator(page_size=1, pool_tokens=32, window=4)
+        clip = dict(
+            token_capacity=allocator.size_full, sliding_window_size=4, **RETIRE_AT_ONCE
+        )
+        # Whole, the 40-token prompt's window rows overflow the pool; in 64-token
+        # chunks, the smallest chunk admission may cut fits.
+        self.assertIsNone(
+            allocator.max_new_tokens_for_memory(40, 1, chunk_size=None, **clip)
+        )
+        self.assertEqual(
+            allocator.max_new_tokens_for_memory(40, 1, chunk_size=64, **clip), 1
+        )
+        # A PD prefill server keeps its one handoff token for a prompt that fits.
+        for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
+            for prompt_len, boundary, granted in (
+                (40, -1, 1),
+                (40, 0, None),
+                (20, 0, 1),
+            ):
+                with self.subTest(mode=mode, prompt_len=prompt_len, boundary=boundary):
+                    req = self._intake(allocator, mode, prompt_len, boundary)
+                    self._assert_granted(req, granted)
+
+    def test_pd_prefill_bidir_prompt_must_fit_beside_its_handoff_token(self):
+        """A PD prefill server decodes one handoff token beside the prompt, so a
+        block-bidirectional prompt the empty pool holds only without it is
+        refused, not handed the token and then cut below its end forever."""
+        allocator = _shared_allocator(page_size=1, pool_tokens=32, window=4)
+        clip = dict(
+            token_capacity=allocator.size_full,
+            sliding_window_size=4,
+            chunk_size=None,
+            **RETIRE_AT_ONCE,
+        )
+        # The longest prompt the pool holds whole fits alone but not beside a
+        # decode token, which costs what one more prompt token does.
+        tight = max(
+            n
+            for n in range(1, 64)
+            if allocator.max_new_tokens_for_memory(n, 1, **clip) is not None
+        )
+        self.assertEqual(allocator.max_new_tokens_for_memory(tight, 1, **clip), 0)
+        for mode, prompt_len, granted in (
+            (DisaggregationMode.PREFILL, tight, None),
+            (DisaggregationMode.PREFILL, 20, 1),
+            # Without PD the same prompt runs prefill-only, as before.
+            (DisaggregationMode.NULL, tight, 0),
+        ):
+            with self.subTest(mode=mode, prompt_len=prompt_len):
+                req = self._intake(allocator, mode, prompt_len, boundary=0)
+                self._assert_granted(req, granted)
+
+    def _intake(self, allocator, mode, prompt_len, boundary):
+        """Scheduler intake of a request for one new token on an empty pool."""
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = mode
+        scheduler.max_req_len = 128
+        scheduler.max_total_num_tokens = allocator.size_full
+        scheduler.page_size = 1
+        scheduler.max_new_tokens_limit = None
+        scheduler.sliding_window_size = 4
+        scheduler.chunked_prefill_size = 64
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.tree_cache = SimpleNamespace(
+            supports_prefix_sharing=lambda: False,
+            window_checkpoint_interval=lambda: 0,
+            transfers_in_flight=lambda: False,
+        )
+        req = Req(
+            rid="prompt",
+            origin_input_text=None,
+            origin_input_ids=array("q", [1] * prompt_len),
+            sampling_params=SamplingParams(max_new_tokens=1),
+            bidir_prefix_len=boundary,
+        )
+        # The refusal logs on rank 0 (`set_finish_with_abort`).
+        with get_parallel().override(attn_dcp_size=1, tp_rank=0):
+            scheduler.init_req_max_new_tokens(req)
+        return req
+
+    def _assert_granted(self, req, max_new_tokens):
+        """Intake granted `max_new_tokens`, or with None requested the abort
+        for the memory budget, which lands at the request's next commit."""
+        if max_new_tokens is None:
+            self.assertIsInstance(req.to_finish, FINISH_ABORT)
+            self.assertIn("KV memory budget", req.to_finish.message)
+            self.assertEqual(req.sampling_params.max_new_tokens, 0)
+        else:
+            self.assertIsNone(req.to_finish)
+            self.assertEqual(req.sampling_params.max_new_tokens, max_new_tokens)
 
 
 def _state_cache():

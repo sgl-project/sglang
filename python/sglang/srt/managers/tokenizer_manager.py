@@ -1515,9 +1515,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
-        # Validate input length
+        # Validate input length. A block-bidirectional boundary indexes the whole
+        # prompt, so such a prompt is refused rather than truncated.
         if input_token_num >= self.context_len:
-            if self.allow_auto_truncate:
+            if self.allow_auto_truncate and (
+                isinstance(obj, EmbeddingReqInput) or obj.bidir_prefix_len in (None, -1)
+            ):
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
@@ -1608,17 +1611,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+            if obj.bidir_prefix_len is not None and (
+                type(obj.bidir_prefix_len) is not int or obj.bidir_prefix_len < -1
+            ):
+                raise ValueError(
+                    "bidir_prefix_len must be an integer >= -1 for each prompt; "
+                    f"got {obj.bidir_prefix_len!r}."
+                )
             if obj.bidir_prefix_len is not None and obj.bidir_prefix_len >= 0:
+                # The shortest-prefill budget can cap every pass below the whole
+                # prompt; an unset ratio resolves to 1/8, as in
+                # ShortestPrefillLoadScaling.resolve.
+                budget_ratio = get_schedule().shortest_prefill_budget_min_ratio
                 if (
                     attention_backends()[0] != "triton"
                     or get_schedule().page_size != 1
+                    # Hybrid SWA window pools price and cut a prompt by its
+                    # chunks, never validated with block boundaries.
+                    or self.model_config.is_hybrid_swa
                     or get_exec().deterministic.enable_deterministic_inference
                     or get_parallel().attn_dcp_size > 1
+                    # Two-batch overlap cannot split the block boundaries.
+                    or get_exec().overlap.enable_two_batch_overlap
+                    or (
+                        get_schedule().shortest_prefill_boundary_halving_chunks
+                        and (budget_ratio is None or 0 < budget_ratio < 1)
+                    )
                 ):
                     raise ValueError(
                         "bidir_prefix_len requires --attention-backend triton with "
-                        "--page-size 1, without --enable-deterministic-inference "
-                        "or DCP."
+                        "--page-size 1 and no hybrid sliding-window (SWA) KV pools, "
+                        "without --enable-deterministic-inference, DCP, "
+                        "--enable-two-batch-overlap or a "
+                        "--shortest-prefill-boundary-halving-chunks prefill token "
+                        "budget."
                     )
                 if obj.session_params is not None:
                     # Legacy sessions prepend history, which would shift the

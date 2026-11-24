@@ -209,8 +209,9 @@ def match_kv_cache(
             match_result = zero_match_result(
                 tree_cache, match_result, extra_key=req.extra_key
             )._replace(mamba_branching_seqlen=None, cache_protected_len=None)
+            # A deferred CoW can be staged before the request holds a slot.
+            req.kv.mamba_cow_src_index = None
             if req.kv.holds_mamba:
-                req.kv.mamba_cow_src_index = None
                 req.kv.mamba_needs_clear = True
     req.prefix_len = match_result.device_prefix_len
     (

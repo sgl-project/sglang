@@ -1696,16 +1696,23 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
-        if is_finished and effective_cache_len <= 0 < req.bidir_prefix_len <= len(
-            token_ids
+        cleanup_params = insert_params
+        if (
+            is_finished
+            and effective_cache_len <= 0 < req.bidir_prefix_len <= len(token_ids)
+            and req.kv.cache_protected_len < req.bidir_prefix_len
         ):
             # No component checkpoint to donate (the Mamba state ran past the
-            # key after decoding); keep the state block on its own.
+            # key after decoding); keep the state block on its own. Insert from
+            # a copy so cleanup still frees what the components prepared.
             effective_cache_len = req.bidir_prefix_len
-            insert_params.mamba_value = None
-            insert_params.mamba_host_value = None
-            insert_params.mamba_host_src = None
-            insert_params.allow_missing_mamba = True
+            insert_params = replace(
+                insert_params,
+                mamba_value=None,
+                mamba_host_value=None,
+                mamba_host_src=None,
+                allow_missing_mamba=True,
+            )
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -1769,7 +1776,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # prefix.
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=is_finished, insert_params=insert_params
+                    req, is_finished=is_finished, insert_params=cleanup_params
                 )
             return
         req.kv.record_insert(page_aligned_len)
@@ -1785,21 +1792,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 is_bigram=self.tree_core.is_eagle,
                 cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
-            state_result = self.insert(
-                replace(
-                    insert_params,
-                    key=state_key,
-                    value=kv_indices_orig[: len(state_key)].to(
-                        dtype=torch.int64, copy=True
-                    ),
-                    mamba_value=None,
-                    mamba_host_value=None,
-                    mamba_host_src=None,
-                    allow_missing_mamba=True,
-                    prev_prefix_len=page_aligned_len,
-                    inserted_len=page_aligned_len,
+            with self._linker_offload_skip_prefix(req, token_ids):
+                state_result = self.insert(
+                    replace(
+                        insert_params,
+                        key=state_key,
+                        value=kv_indices_orig[: len(state_key)].to(
+                            dtype=torch.int64, copy=True
+                        ),
+                        mamba_value=None,
+                        mamba_host_value=None,
+                        mamba_host_src=None,
+                        allow_missing_mamba=True,
+                        prev_prefix_len=page_aligned_len,
+                        inserted_len=page_aligned_len,
+                    )
                 )
-            )
             if not state_result.rotation_tail_declined:
                 page_aligned_len = len(state_key)
                 req.kv.record_insert(page_aligned_len)
@@ -1875,7 +1883,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req,
                 is_finished=is_finished,
                 insert_result=result,
-                insert_params=insert_params,
+                insert_params=cleanup_params,
             )
 
         if self.enable_session_radix_cache and is_finished:
