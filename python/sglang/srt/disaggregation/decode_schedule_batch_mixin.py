@@ -114,10 +114,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.extend_input_logprob_token_ids = None
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
-        # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
+        # Per-request sampling state is built at each launch.
+        self.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=self.device
         )
 
     def process_prebuilt(

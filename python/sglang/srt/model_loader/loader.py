@@ -49,6 +49,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
+    trigger_transferring_weights_request,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -98,9 +99,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    trigger_transferring_weights_request,
-)
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -169,8 +167,6 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
     ):
         yield module
 
-
-logger = logging.getLogger(__name__)
 
 # The checkpoint files the default loader read, as (folder, files), by the weight source's
 # (model id or path, revision): state derived from the loaded weights (Paged Experts' expert
@@ -480,9 +476,6 @@ class DefaultModelLoader(BaseModelLoader):
         weight_files: Tuple[str, ...]
         use_safetensors: bool
 
-    counter_before_loading_weights: float = 0.0
-    counter_after_loading_weights: float = 0.0
-
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         _validate_default_loader_extra_config(
@@ -788,8 +781,6 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator, source.prefix, self.load_config.draft_model_idx
             )
 
-        if self.counter_before_loading_weights == 0.0:
-            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -960,7 +951,6 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator(),
                 target_device,
             )
-        self.counter_after_loading_weights = time.perf_counter()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -1074,7 +1064,6 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
-        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
@@ -1254,7 +1243,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         logger.info("[QuantizedRL] Profile-free FP8 quantization enabled")
-        self._initial_load_complete = False
 
     def _prepare_weights(
         self,
@@ -1351,7 +1339,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     quant_method.process_weights_after_loading(module)
 
         model.flash_rl_initial_load_complete = True
-        self._initial_load_complete = True
         logger.info("[QuantizedRL] Initial load complete")
 
     @staticmethod
@@ -1585,6 +1572,13 @@ class DummyModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _checkpoint_shard_rank() -> int:
+    """The shard index of this rank's weights in a sharded or remote checkpoint:
+    the TP rank, offset by the pipeline stage so stages do not collide."""
+    parallel = get_parallel()
+    return parallel.pp_rank * parallel.tp_size + parallel.tp_rank
+
+
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -1692,7 +1686,7 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             pattern = os.path.join(
                 local_model_path,
                 self.pattern.format(rank=rank, part="*"),
@@ -1745,7 +1739,7 @@ class ShardedStateLoader(BaseModelLoader):
 
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -2201,7 +2195,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             del extras
             gc.collect()
 
-        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     def _dump_state_to_disk(
@@ -2612,7 +2605,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
-        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
 
@@ -2959,8 +2951,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             self.column_parallel_weights_modules = model.column_parallel_weights_modules
         else:
             self.column_parallel_weights_modules = []
-
-        self.model_type = type(model).__name__
 
         logger.info(
             "Loading weights with BitsAndBytes quantization.  May take a while ..."
@@ -3445,7 +3435,7 @@ class RemoteModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
         assert get_connector_type(client) == ConnectorType.KV
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         return client.weight_iterator(rank)
 
     def _get_weights_iterator_fs(
@@ -3468,7 +3458,7 @@ class RemoteModelLoader(BaseModelLoader):
         with create_remote_connector(url) as client:
             assert get_connector_type(client) == ConnectorType.KV
             model_name = parse_model_name(url)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
@@ -3617,9 +3607,6 @@ class IncModelLoader(DefaultModelLoader):
     Model loader that applies Intel AutoRound quantization
     """
 
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-
     def load_model(
         self,
         *,
@@ -3720,10 +3707,6 @@ class ModelOptModelLoader(DefaultModelLoader):
     """
     Model loader that applies NVIDIA Model Optimizer quantization
     """
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        # Any ModelOpt specific initialization if needed
 
     def _setup_modelopt_quantization(
         self,
