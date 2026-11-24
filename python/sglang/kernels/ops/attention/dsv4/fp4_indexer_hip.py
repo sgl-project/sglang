@@ -556,7 +556,10 @@ def _opus_scale_index(rows_per_group: int, device: torch.device) -> torch.Tensor
     k_scale [1, 4 (block), 64 ((row % 16) * 4 + row / 16)] (row = key of the 64-row page)."""
     tiles = rows_per_group // 32
     g, m, kt, tile = torch.meshgrid(
-        torch.arange(2), torch.arange(32), torch.arange(2), torch.arange(tiles),
+        torch.arange(2),
+        torch.arange(32),
+        torch.arange(2),
+        torch.arange(tiles),
         indexing="ij",
     )
     row = tile * 32 + m

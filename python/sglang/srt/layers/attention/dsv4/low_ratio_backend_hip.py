@@ -128,11 +128,20 @@ def _log_opus_vs_flydsl(
         inside = cols < row_ends[lo:hi, None].to(torch.int64)
         a, b = opus[lo:hi, :width], flydsl[lo:hi, :width]
         nans += int((torch.isnan(a) & inside).sum())
-        diff = max(diff, float(torch.where(inside, (a - b).abs(), 0.0).nan_to_num(0.0).amax()))
-        scale = max(scale, float(torch.where(inside, b.abs(), 0.0).nan_to_num(0.0).amax()))
+        diff = max(
+            diff, float(torch.where(inside, (a - b).abs(), 0.0).nan_to_num(0.0).amax())
+        )
+        scale = max(
+            scale, float(torch.where(inside, b.abs(), 0.0).nan_to_num(0.0).amax())
+        )
     logger.info(
         "[opus debug] layer %d rows %d:%d max|d|/max %.3e nan %d (width %d)",
-        layer_id, rows.start, rows.stop, diff / max(scale, 1e-30), nans, width,
+        layer_id,
+        rows.start,
+        rows.stop,
+        diff / max(scale, 1e-30),
+        nans,
+        width,
     )
 
 
