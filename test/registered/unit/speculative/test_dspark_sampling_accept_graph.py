@@ -1,4 +1,4 @@
-"""SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH: the captured sampling accept must equal the
+"""The captured sampling accept must equal the
 eager one at the same generator state, and greedy / ineligible steps never route to it."""
 
 import contextlib

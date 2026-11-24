@@ -1,5 +1,5 @@
 """Defers the draft KV store of a static verify's committed tokens to the next
-draft graph (SGLANG_DSPARK_DEFER_CONTEXT_KV).
+draft graph.
 
 The projection of the committed rows' target hidden forks onto a side stream at the
 target's logits processor, overlapping the LM head and the accept; the static
@@ -19,7 +19,6 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 
@@ -52,11 +51,8 @@ class DeferredDraftKVStore:
         self.state_slot = torch.zeros((rows,), dtype=torch.int64, device=device)
         # Host, set at the first staging: the injector writes a per-request SWA ring.
         self._with_state_slot = False
-        # SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE: stage() in one Triton launch.
-        self._one_launch_stage = (
-            envs.SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE.get()
-            and torch.device(device).type == "cuda"
-        )
+        # stage() in one Triton launch.
+        self._one_launch_stage = torch.device(device).type == "cuda"
         # Side streams and events, made at the first use.
         self._proj_stream: Optional[torch.cuda.Stream] = None
         self._proj_done: Optional[torch.cuda.Event] = None
@@ -248,8 +244,8 @@ class DeferredDraftKVStore:
             if isinstance(b, DeepseekV4AttnBackend):
                 b.pre_kv_store_hook = self.join
         logger.info(
-            "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft KV store runs at the "
-            "head of the next draft graph, joined at its first KV store."
+            "Deferred draft KV store: the draft KV store runs at the head of the "
+            "next draft graph, joined at its first KV store."
         )
 
     def capture_head_hook(self, graph_runner, forward_batch) -> None:
@@ -307,10 +303,8 @@ def maybe_build_deferred_draft_kv(
     kv_injector,
     target_model,
 ) -> Optional[DeferredDraftKVStore]:
-    """SGLANG_DSPARK_DEFER_CONTEXT_KV: only where nothing moves or reads draft KV
-    between a verify and the next draft forward but this worker's forwards."""
-    if not envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get():
-        return None
+    """Only where nothing moves or reads draft KV between a verify and the next
+    draft forward but this worker's forwards."""
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
@@ -327,9 +321,8 @@ def maybe_build_deferred_draft_kv(
         attn_dp=get_parallel().attn_dp_enabled,
     )
     if refusal:
-        logger.warning(
-            "SGLANG_DSPARK_DEFER_CONTEXT_KV refused, the draft KV store stays "
-            "in the verify graph: %s",
+        logger.info(
+            "Deferred draft KV store off, the store stays in the verify graph: %s",
             refusal,
         )
         return None

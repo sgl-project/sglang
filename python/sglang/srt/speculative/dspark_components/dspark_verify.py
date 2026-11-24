@@ -36,7 +36,6 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
-from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import (
     FutureRelayBuffers,
@@ -568,7 +567,7 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_pool: object
     resolve_req_to_token: object
     kv_injector: Optional[TargetHiddenKvInjector] = None
-    # SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH: returns the target's engram hasher
+    # Returns the target's engram hasher
     # (or None), whose history commit the static epilogue then records in-graph.
     resolve_engram_hasher: Optional[object] = None
 
@@ -606,8 +605,6 @@ class DsparkVerifyEpilogue:
         simulated_correct_len: Optional[torch.Tensor] = None,
         simulate_fold: bool = False,
         fused_accept_tail: bool = False,
-        accept_tail_min_bs: int = 1,
-        accept_tail_max_bs: int = 0,
         deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
     ) -> None:
@@ -616,7 +613,7 @@ class DsparkVerifyEpilogue:
         # slots; built at the first warmup.
         self._post_fold = bool(post_fold)
         self.future_relay: Optional[FutureRelayBuffers] = None
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
+        # The deferred draft KV store: static graphs join its forked projection and
         # stage its stores; the next draft forward runs them.
         self.deferred_draft_kv = deferred_draft_kv
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
@@ -665,15 +662,12 @@ class DsparkVerifyEpilogue:
             logger.info(
                 "DSpark fused accept tail off: the accept-site TP broadcast is selected."
             )
-        self._accept_tail_bs = (int(accept_tail_min_bs), int(accept_tail_max_bs))
         self._accept_tail_logged: set[int] = set()
         self.gated_commit_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
-        self.block_accept_lens_buf = (
-            torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
-            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
-            else None
+        self.block_accept_lens_buf = torch.zeros(
+            (self.max_bs,), dtype=torch.int32, device=device
         )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
         self.simulated_correct_len = simulated_correct_len
@@ -859,8 +853,7 @@ class DsparkVerifyEpilogue:
         return None if hasher is None else hasher.history
 
     def _serves_accept_tail(self, bs: int) -> bool:
-        low, high = self._accept_tail_bs
-        return self._fused_accept_tail and low <= bs and (high == 0 or bs <= high)
+        return self._fused_accept_tail
 
     def _static_accept_tail(
         self, *, candidates, logits, seq_lens, verify_lens, gated: bool

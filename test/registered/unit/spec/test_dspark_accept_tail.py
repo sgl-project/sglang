@@ -168,7 +168,7 @@ def _verify_batch(candidates, prefix_lens):
 
 
 class TestFusedStaticAcceptTail(CustomTestCase):
-    """SGLANG_DSPARK_FUSED_ACCEPT_TAIL: the one-launch accept tail (the Triton kernel on
+    """The one-launch accept tail (the Triton kernel on
     CUDA) writes what the static epilogue's separate ops write."""
 
     def _static_accept(self, *, fused, simulated, tp_sync, device="cpu"):

@@ -392,7 +392,7 @@ class DraftBlockProposer:
                 )
             )
         )
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
+        # The deferred draft KV store, set by its attach_draft.
         self.deferred_draft_kv = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.

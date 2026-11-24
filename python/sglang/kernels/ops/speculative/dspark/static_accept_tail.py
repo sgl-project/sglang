@@ -1,5 +1,5 @@
 """DSpark static greedy verify: the accept and its bookkeeping in one launch
-(SGLANG_DSPARK_FUSED_ACCEPT_TAIL), one program per request row.
+(the fused accept tail), one program per request row.
 
 Per row, from the target's argmax ids: the leading draft matches and the bonus
 (AcceptGreedy; ``bonus_parts`` replaces the bonus with the in-graph simulated

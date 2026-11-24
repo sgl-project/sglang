@@ -458,9 +458,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
-                fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
-                accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
-                accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
+                fused_accept_tail=True,
                 deferred_draft_kv=self._deferred_draft_kv,
                 post_fold=static_epilogue_supported,
                 commit_ctx=CommitInjectCtx(
@@ -471,14 +469,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                     kv_injector=self._kv_injector,
-                    resolve_engram_hasher=(
-                        (
-                            lambda: (
-                                self.model_runner.ngram_embedding_manager.engram_hasher
-                            )
-                        )
-                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
-                        else None
+                    resolve_engram_hasher=lambda: (
+                        self.model_runner.ngram_embedding_manager.engram_hasher
                     ),
                 ),
             )
