@@ -6,9 +6,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
-from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_verify import (
-    _residual_draft_args,
     sample_simulated_bonus,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -104,7 +102,7 @@ def _residual_draw(target, draft, correct_len, rows, t, td, seed, width=None):
 
 
 class TestResidualSimulatedBonus(unittest.TestCase):
-    """SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: a stop row draws max(p - q, 0)."""
+    """Simulated acceptance: a stop row draws max(p - q, 0)."""
 
     def test_residual_matches_torch_reference(self):
         torch.manual_seed(3)
@@ -173,10 +171,6 @@ class TestResidualSimulatedBonus(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(out, eager))
         self.assertTrue(torch.all((out >= 0) & (out < vocab)))
-
-    def test_residual_args_empty_when_switch_off(self):
-        with envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.override(False):
-            self.assertEqual(_residual_draft_args(None, 1), {})
 
 
 if __name__ == "__main__":

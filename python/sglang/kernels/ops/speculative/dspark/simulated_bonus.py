@@ -356,8 +356,8 @@ def simulated_bonus_partials_graph(
     part_val = torch.empty((bs, nsplit), dtype=torch.float32, device=device)
     part_idx = torch.empty((bs, nsplit), dtype=torch.int32, device=device)
     if draft_logits is not None:
-        # SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: draft_logits [bs, gamma, width] (width <= vocab),
-        # the draft step logits that proposed each verify row.
+        # Residual bonus: draft_logits [bs, gamma, width] (width <= vocab), the draft
+        # step logits that proposed each verify row.
         assert (
             draft_logits.stride(2) == 1
             and draft_logits.shape[1] == rows_per_request - 1

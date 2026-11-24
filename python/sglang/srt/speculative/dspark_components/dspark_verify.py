@@ -629,8 +629,8 @@ class DsparkVerifyEpilogue:
             (self.max_bs,), dtype=torch.float32, device=device
         )
         self.sim_seed_buf = torch.zeros((1,), dtype=torch.int32, device=device)
-        # SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: the draft sampler whose static step logits
-        # and temperatures the simulated stop row's residual reads (set by the worker).
+        # The draft sampler whose static step logits and temperatures the simulated
+        # stop row's residual reads (set by the worker).
         self.residual_draft_sampler = None
         self._sim_greedy_bs: Optional[int] = None
         self.stride = int(verify_num_draft_tokens)
@@ -913,8 +913,6 @@ class DsparkVerifyEpilogue:
         )
 
     def _residual_args(self, bs: int) -> dict:
-        if not envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get():
-            return {}
         sampler = self.residual_draft_sampler
         if (
             sampler is None
@@ -923,13 +921,11 @@ class DsparkVerifyEpilogue:
             or sampler.sharded_accept
         ):
             print_warning_once(
-                "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: no static draft step logits here; "
+                "Simulated acceptance: no static draft step logits here; "
                 "the simulated bonus stays a plain target draw"
             )
             return {}
-        print_info_once(
-            "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: residual stop token on (graph)"
-        )
+        print_info_once("Simulated acceptance: residual stop token on (graph)")
         return dict(
             draft_logits=sampler.step_logits[:bs],
             draft_temperatures=sampler.params.temperatures[:bs],
@@ -1263,8 +1259,6 @@ def build_accept_outs(
 
 
 def _residual_draft_args(draft_block: Optional[DraftBlockResult], bs: int) -> dict:
-    if not envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get():
-        return {}
     if (
         draft_block is None
         or draft_block.greedy_draft
@@ -1272,13 +1266,11 @@ def _residual_draft_args(draft_block: Optional[DraftBlockResult], bs: int) -> di
         or getattr(draft_block, "vocab_shard", None) is not None
     ):
         print_warning_once(
-            "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: no draft step logits here; "
+            "Simulated acceptance: no draft step logits here; "
             "the simulated bonus stays a plain target draw"
         )
         return {}
-    print_info_once(
-        "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS: residual stop token on (eager)"
-    )
+    print_info_once("Simulated acceptance: residual stop token on (eager)")
     return dict(
         draft_logits=draft_block.corrected_logits[:bs],
         draft_temperatures=draft_block.temperatures[:bs].reshape(-1).contiguous(),
@@ -1298,15 +1290,14 @@ def sample_simulated_bonus(
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
     distribution the sampling accept uses: temperature, then top-k / top-p / min-p.
-    With SGLANG_SIMULATE_ACC_RESIDUAL_BONUS and a sampled draft, a stop row draws from
-    max(p - q, 0) instead, as the rejection it simulates would. The residual bonus
+    With a sampled draft, a stop row draws from max(p - q, 0) instead, as the
+    rejection it simulates would. The residual bonus
     applies only to unfiltered sampling; truncated rows still draw from the target."""
     if need_truncated_sampling(sampling_info):
-        if envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get():
-            print_warning_once(
-                "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS only applies to unfiltered sampling; "
-                "top-k / top-p / min-p rows still draw the simulated bonus from the target distribution"
-            )
+        print_warning_once(
+            "Simulated acceptance: the residual bonus only applies to unfiltered sampling; "
+            "top-k / top-p / min-p rows still draw the simulated bonus from the target distribution"
+        )
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
