@@ -260,8 +260,7 @@ def _dsa_mha_one_shot_runtime_options_supported(
     # sparse FlashInfer skip-softmax threshold scale factor. Keep those SM120
     # batches on the existing sparse path instead.
     return (
-        not return_indexer_topk
-        and skip_softmax_prefill_threshold_scale_factor is None
+        not return_indexer_topk and skip_softmax_prefill_threshold_scale_factor is None
     )
 
 
