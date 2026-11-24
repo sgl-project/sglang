@@ -402,9 +402,6 @@ class MambaPoolHost(HostKVCache):
 
     @synchronized
     def clear(self):
-        self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
-        )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
