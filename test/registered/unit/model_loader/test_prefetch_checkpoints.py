@@ -8,6 +8,7 @@ to weights loaded without prefetch.
 import os
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -17,13 +18,18 @@ import safetensors.torch
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     _checkpoint_tensor_readers,
 )
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    _parse_lru_max_age_s,
+    _planned_prefetch_bytes,
     _prefetch_all_checkpoints,
+    _prefetch_lead_s,
+    _PrefetchPacer,
     buffered_multi_thread_safetensors_weights_iterator,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
@@ -510,6 +516,171 @@ class TestPrefetchCheckpoints(CustomTestCase):
             list(fastsafetensors_weights_iterator(["model.safetensors"]))
 
         self.assertEqual(devices, [torch.device("cuda", 1)])
+
+
+_WU = "sglang.srt.model_loader.weight_utils"
+
+
+def _wait_until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+class TestPrefetchPacing(CustomTestCase):
+    """Paced prefetch keeps each rank's prefetch a bounded distance ahead of
+    its loader on Lustre, and leaves other filesystems unpaced."""
+
+    def _pacer(self, sizes, lead_s=0.0, min_lead_bytes=0):
+        files = [f"model-{i:05d}.safetensors" for i in range(len(sizes))]
+        return files, _PrefetchPacer(files, sizes, lead_s, min_lead_bytes)
+
+    def test_files_beyond_the_window_wait_for_the_loader(self):
+        files, pacer = self._pacer([10] * 4, min_lead_bytes=20)
+        self.assertTrue(pacer._allowed(0))
+        self.assertTrue(pacer._allowed(1))  # Files 0-1 are 20 bytes.
+        self.assertFalse(pacer._allowed(2))
+        pacer.advance(files[1])
+        self.assertTrue(pacer._allowed(2))
+        self.assertFalse(pacer._allowed(3))
+
+    def test_window_follows_the_loaders_measured_rate(self):
+        files, pacer = self._pacer([10] * 10, lead_s=3.0, min_lead_bytes=10)
+        with patch(f"{_WU}.time.monotonic", return_value=100.0):
+            pacer.advance(files[0])
+            self.assertTrue(pacer._allowed(0))
+            self.assertFalse(pacer._allowed(1))  # No rate yet: 10 bytes ahead.
+        with patch(f"{_WU}.time.monotonic", return_value=100.2):
+            pacer.advance(files[2])  # Too soon to measure the rate (0.3 s).
+            self.assertFalse(pacer._allowed(4))
+        with patch(f"{_WU}.time.monotonic", return_value=102.0):
+            pacer.advance(files[2])  # 20 bytes in 2 s: 30 bytes in 3 s.
+            self.assertTrue(pacer._allowed(4))  # Files 2-4 are 30 bytes.
+            self.assertFalse(pacer._allowed(5))
+
+    def test_waiting_threads_are_released_when_loading_ends(self):
+        files, pacer = self._pacer([10] * 4, min_lead_bytes=10)
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(pacer.wait(files[3], threading.Event()))
+        )
+        thread.start()
+        time.sleep(0.05)
+        self.assertEqual(results, [])
+        pacer.finish()
+        thread.join(timeout=5)
+        self.assertEqual(results, [False])  # Not read after loading ended.
+
+    def test_files_the_loader_passed_are_not_prefetched(self):
+        files, pacer = self._pacer([10] * 4, min_lead_bytes=40)
+        pacer.advance(files[2])
+        self.assertFalse(pacer.wait(files[1], threading.Event()))
+        self.assertTrue(pacer.wait(files[2], threading.Event()))
+        self.assertTrue(pacer.wait(files[3], threading.Event()))
+
+    def test_parses_lru_max_age_in_either_unit(self):
+        for value, seconds in (
+            ("600000\n", 600.0),  # Lustre >= 2.11 prints milliseconds.
+            ("3900", 3900.0),  # Older clients print seconds.
+            ("600s", 600.0),
+            ("65000ms", 65.0),
+            ("bogus", None),
+        ):
+            self.assertEqual(_parse_lru_max_age_s(value), seconds, value)
+
+    def test_lead_is_a_fraction_of_the_lustre_lock_age(self):
+        lustre = patch(f"{_WU}._statfs_type", return_value=0x0BD00BD0)
+        with lustre, patch(f"{_WU}._lustre_lru_max_age_s", return_value=600.0):
+            self.assertAlmostEqual(_prefetch_lead_s("x")[0], 180.0)
+        with lustre, patch(f"{_WU}._lustre_lru_max_age_s", return_value=None):
+            self.assertAlmostEqual(_prefetch_lead_s("x")[0], 1170.0)
+        with patch(f"{_WU}._statfs_type", return_value=0xEF53):  # ext4
+            self.assertIsNone(_prefetch_lead_s("x"))
+        with envs.SGLANG_PREFETCH_PACE_LEAD_S.override(0):
+            with lustre:
+                self.assertIsNone(_prefetch_lead_s("x"))
+        with envs.SGLANG_PREFETCH_PACE_LEAD_S.override(50):
+            self.assertEqual(_prefetch_lead_s("x")[0], 50.0)
+
+    def test_planned_bytes_count_only_selected_tensors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "model.safetensors")
+            safetensors.torch.save_file(
+                {"a": torch.zeros(16), "b": torch.zeros(4)}, path
+            )
+            self.assertEqual(
+                _planned_prefetch_bytes(path, lambda name, n: name == "a"), 64
+            )
+            self.assertEqual(_planned_prefetch_bytes(path, None), os.path.getsize(path))
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_prefetch_follows_the_loader_and_stops_with_it(self, _):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for i in range(6):
+                paths.append(os.path.join(tmpdir, f"model-{i:05d}.safetensors"))
+                with open(paths[-1], "wb") as f:
+                    f.write(b"\0" * 1000)
+            read = []
+            with (
+                patch(f"{_WU}._statfs_type", return_value=0x0BD00BD0),
+                patch(f"{_WU}._lustre_lru_max_age_s", return_value=600.0),
+                envs.SGLANG_PREFETCH_PACE_MIN_LEAD_GB.override(2000 / (1 << 30)),
+                patch(
+                    f"{_WU}._prefetch_checkpoint_file",
+                    side_effect=lambda path, cancel_event: read.append(path),
+                ),
+            ):
+                handle = _prefetch_all_checkpoints(paths, num_threads=2, pace=True)
+                self.assertTrue(_wait_until(lambda: len(read) == 2))
+                time.sleep(0.05)
+                self.assertEqual(read, paths[:2])  # 2000 bytes ahead.
+                handle.advance(paths[1])
+                self.assertTrue(_wait_until(lambda: len(read) == 3))
+                self.assertEqual(read, paths[:3])
+                handle.stop(timeout=5)
+
+        self.assertTrue(handle.done)
+        self.assertEqual(read, paths[:3])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_unpaced_off_lustre(self, _):
+        with patch(f"{_WU}._statfs_type", return_value=0xEF53):
+            handle = _prefetch_all_checkpoints(["x"], num_threads=1, pace=True)
+            handle.stop(timeout=5)
+        self.assertIsNone(handle._pacer)
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_iterators_report_each_file_and_release_prefetch(self, _):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for i in range(3):
+                paths.append(os.path.join(tmpdir, f"model-{i:05d}.safetensors"))
+                safetensors.torch.save_file({f"w{i}": torch.zeros(4)}, paths[-1])
+            for iterator, kwargs in (
+                (safetensors_weights_iterator, {}),
+                (
+                    buffered_multi_thread_safetensors_weights_iterator,
+                    {"max_workers": 2},
+                ),
+            ):
+                handle = MagicMock()
+                with patch(f"{_WU}._prefetch_all_checkpoints", return_value=handle):
+                    list(iterator(paths, prefetch=True, **kwargs))
+                self.assertEqual(
+                    [c.args[0] for c in handle.advance.call_args_list], paths
+                )
+                handle.stop.assert_called_once()
+
+                handle = MagicMock()
+                with patch(f"{_WU}._prefetch_all_checkpoints", return_value=handle):
+                    weights = iterator(paths, prefetch=True, **kwargs)
+                    next(weights)
+                    weights.close()  # The caller stops early.
+                handle.cancel.assert_called_once()
 
 
 class TestPrefetchDispatch(CustomTestCase):
