@@ -280,10 +280,19 @@ def _big_workspace(device_index: int) -> dict:
 
 def init_runtime(device: torch.device, max_tokens: int) -> None:
     global _BIG_MAXT
-    _BIG_MAXT = max(_BIG_MAXT, max_tokens)
+    if max_tokens > _BIG_MAXT:
+        _BIG_MAXT = max_tokens
+        _big_workspace.cache_clear()  # rev / ucnt are sized by _BIG_MAXT
     _module(device.index)
     _workspace(device.index)
     _big_workspace(device.index)
+
+
+def _local_ids(ids: torch.Tensor) -> torch.Tensor:
+    """int32 local ids; wider ids are clamped first so none wraps into [0, _BIG_NE)."""
+    if ids.dtype != torch.int32:
+        ids = ids.clamp(-1, _BIG_NE)
+    return ids.to(torch.int32).contiguous()
 
 
 def _config(num_tokens: int, sp: bool):
@@ -418,7 +427,7 @@ def nvfp4_w4a16_moe_with_post_norm(
 ) -> torch.Tensor:
     """``local_ids`` -1: remote."""
     x = hidden_states.contiguous()
-    ids = local_ids.to(torch.int32).contiguous()
+    ids = _local_ids(local_ids)
     tw = topk_weights.to(torch.float32).contiguous()
     M = x.shape[0]
     if out is None:
@@ -474,7 +483,7 @@ def nvfp4_w4a16_moe_sp(
     dg: Optional[DynamicGuests] = None,
 ) -> None:
     """Route j of token t (row t % R of rank t // R's ``shard``) -> row j * R + t % R of that rank's recv."""
-    ids = local_ids.to(torch.int32).contiguous()
+    ids = _local_ids(local_ids)
     tw = topk_weights.to(torch.float32).contiguous()
     M, R = ids.shape[0], shard.shape[0]
     assert (

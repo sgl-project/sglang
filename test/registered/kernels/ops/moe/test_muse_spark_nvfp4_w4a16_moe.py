@@ -254,5 +254,16 @@ def test_kernels_complete_on_sm_partition():
     assert res.returncode == 0, res.stderr[-4000:]
 
 
+def test_wide_ids_stay_skipped():
+    """int64 ids are narrowed to int32 for the kernels; one that would wrap into a
+    valid local id (2**32 + e -> e) must stay outside [0, 32 + guests)."""
+    wide = [2**32, 2**32 + 3, -(2**32), -(2**32) + 1, 2**31, -(2**31) - 1, 2**63 - 1]
+    ids = torch.tensor([wide + [5], [0, 1, 31, 32, 33, -1, 7, 2]], dtype=torch.int64)
+    out = m._local_ids(ids)
+    valid = (ids >= -1) & (ids < m._BIG_NE)
+    assert out.dtype == torch.int32 and torch.equal(out[valid], ids[valid].int())
+    assert bool(((out[~valid] < 0) | (out[~valid] >= m._BIG_NE)).all())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
