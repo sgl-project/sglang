@@ -24,10 +24,10 @@ def _time(hour):
 
 
 class FakeRepo:
-    def __init__(self, permissions=None, merged_prs=0, statuses=(), runs=(), head=HEAD):
+    def __init__(self, permissions=None, commits=0, statuses=(), runs=(), head=HEAD):
         self.full_name = "sgl-project/sglang"
         self.permissions = permissions or {}
-        self.merged_prs = merged_prs
+        self.commits = commits
         self.statuses = list(statuses)
         self.runs = list(runs)
         self.head = head
@@ -35,8 +35,8 @@ class FakeRepo:
         self.requester = SimpleNamespace(requestJsonAndCheck=self._request)
 
     def _request(self, verb, url, parameters):
-        self.queries.append(parameters["q"])
-        return {}, {"total_count": self.merged_prs}
+        self.queries.append((url, parameters))
+        return {}, [{"sha": "c"}] * self.commits
 
     def get_collaborator_permission(self, login):
         permission = self.permissions.get(login, 404)
@@ -133,7 +133,7 @@ class TestCanApprove(unittest.TestCase):
     def test_no_write_access_and_no_permission_entry(self):
         for permission in ("read", "triage", 403, 404):
             with self.subTest(permission=permission):
-                repo = FakeRepo(permissions={"u": permission}, merged_prs=5)
+                repo = FakeRepo(permissions={"u": permission}, commits=5)
                 ok, reason = rca.can_approve(repo, "u", {"can_rerun_failed_ci": True})
                 self.assertFalse(ok)
                 self.assertIn("neither write access nor can_tag_run_ci_label", reason)
@@ -144,19 +144,26 @@ class TestCanApprove(unittest.TestCase):
         with self.assertRaises(GithubException):
             rca.can_approve(repo, "u", {"can_tag_run_ci_label": True})
 
-    def test_ci_permissions_user_needs_a_recent_merged_pr(self):
+    def test_ci_permissions_user_needs_a_recent_commit(self):
         perms = {"can_tag_run_ci_label": True}
-        repo = FakeRepo(permissions={"u": "read"}, merged_prs=1)
+        repo = FakeRepo(permissions={"u": "read"}, commits=1)
         self.assertEqual(rca.can_approve(repo, "u", perms), (True, ""))
         self.assertEqual(
             repo.queries,
-            ["repo:sgl-project/sglang is:pr is:merged author:u merged:>=2026-08-25"],
+            [
+                (
+                    "/repos/sgl-project/sglang/commits",
+                    {"author": "u", "since": "2026-08-25T00:00:00Z", "per_page": 1},
+                )
+            ],
         )
 
-        repo = FakeRepo(permissions={"u": 404}, merged_prs=0)
+        repo = FakeRepo(permissions={"u": 404}, commits=0)
         ok, reason = rca.can_approve(repo, "u", perms)
         self.assertFalse(ok)
-        self.assertIn("no PR merged into sgl-project/sglang since 2026-08-25", reason)
+        self.assertIn(
+            "no commit on sgl-project/sglang's default branch since 2026-08-25", reason
+        )
 
 
 class TestIsApproved(unittest.TestCase):

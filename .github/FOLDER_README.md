@@ -12,7 +12,7 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, and approving a commit for NVIDIA PR Test Base and Extra (adding `run-ci`), the last only while the user has a PR merged into the repo in the last 90 days; write access to the repo grants the same, with no activity check |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci`, and approving a commit for NVIDIA PR Test Base and Extra (adding `run-ci`), the last only while the user has a commit on `main` in the last 90 days; write access to the repo grants the same, with no activity check |
 | `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
