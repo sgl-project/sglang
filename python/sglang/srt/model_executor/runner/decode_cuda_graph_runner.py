@@ -2142,16 +2142,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.attn_backend, forward_batch.forward_mode
             )
         with self.model_context(), timer_ctx, self.backend.replay_session():
-            if (
-                hasattr(self.backend, "try_target_graph")
-                and not self.ragged_verify_mode
-                and self.uocr_graph_io is None
-                and self._resolve_logits_variant(forward_batch) != VERIFY_VOCAB_SHARDS
-            ):
-                result = self.backend.try_target_graph(forward_batch, pp_proxy_tensors)
-                if result is not None:
-                    self.bs = forward_batch.batch_size
-                    return result
             if not self.backend.prepare_replay(forward_batch):
                 self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
@@ -2173,7 +2163,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            output = self.backend.replay(
+                self._replay_graph_key,
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

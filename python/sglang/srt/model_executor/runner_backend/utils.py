@@ -84,11 +84,6 @@ def resolve_decode_backend(
             NPUCudaGraphBackend,
         )
 
-        binding = getattr(model_runner, "ascend_binding", None)
-        if binding is not None:
-            backend = binding.graph_backend(cuda_graph_runner, enable_memory_saver)
-            if backend is not None:
-                return backend
         return NPUCudaGraphBackend(
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )

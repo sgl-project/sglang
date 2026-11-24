@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Callable, Literal, Optional, Protocol
+from typing import Any, Callable, Literal, Optional, Protocol, Union
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,19 @@ class DraftLoopIO:
     positions: Any
     previous_hidden_states: Any
     per_step_out_cache_loc: Any
+
+
+@dataclass(frozen=True)
+class Decline:
+    """``prepare`` returns this when it refuses to install.
+
+    ``expected`` marks an intentional off switch. The host logs that at info
+    and any other refusal at warning. The reason is this object, not an
+    attribute of the prepare function and not a phrase in the text.
+    """
+
+    reason: str
+    expected: bool = False
 
 
 class NpuBinding(Protocol):
@@ -38,7 +51,9 @@ class NpuBinding(Protocol):
 @dataclass(frozen=True)
 class MegakernelSpec:
     role: Literal["target", "nextn"]
-    prepare: Callable[[PreparationView, Any], Optional[NpuBinding]]
+    prepare: Callable[
+        [PreparationView, Any], Union[NpuBinding, Decline, None]
+    ]
 
 
 _registry: dict[str, str] = {}
