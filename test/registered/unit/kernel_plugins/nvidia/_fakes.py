@@ -29,6 +29,10 @@ class FakeBuilt:
     """Covers steps of 1-4 rows and records the steps it ran."""
 
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, widths):
         self.widths = tuple(w for w in widths if w <= 4)
@@ -63,12 +67,40 @@ SPEC = MegakernelSpec(
 )
 # an empty field accepts any value
 ANY_TP = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
+# specs that need the replicated input embedding, which the flag sets when it is unset
+# (FLAG_SETS_ENV); the second also needs a variable the flag never sets
+REPLICATION = "SGLANG_ENABLE_EMBED_REPLICATION"
+REPLICATED = replace(SPEC, requires=replace(SPEC.requires, env={REPLICATION: True}))
+REPLICATED_AND_BROADCAST = replace(
+    SPEC,
+    requires=replace(
+        SPEC.requires, env={REPLICATION: True, "SGLANG_DSA_TOPK_BROADCAST": True}
+    ),
+)
 # a draft spec: builds no width, offers only the draft sampler
 DRAFT = replace(
     SPEC,
     max_rows=0,
     build=lambda model, hf, ctx: SimpleNamespace(
-        widths=(), summary=lambda: "draft sampler", draft_sampler=print
+        widths=(),
+        summary=lambda: "draft sampler",
+        draft_sampler=print,
+        draft_loop=None,
+        draft_extend=None,
+        begin_draft_round=None,
+        graph_variants=None,
+    ),
+)
+# a draft spec offering two of the EAGLE entries
+EAGLE_DRAFT = replace(
+    DRAFT,
+    build=lambda model, hf, ctx: SimpleNamespace(
+        widths=(),
+        draft_sampler=None,
+        draft_loop=print,
+        draft_extend=None,
+        begin_draft_round=repr,
+        graph_variants=None,
     ),
 )
 
@@ -93,3 +125,13 @@ def server_args(**kw):
         "cuda_graph_config": default_cuda_graph_config(),
     }
     return ServerArgs(**{**defaults, **kw})
+
+
+class FakeDFlashRuntime:
+    """A DFLASH runtime (kimi_k31_dflash_binding.py) recording what it was built with."""
+
+    bindings = frozenset({"block_size", "mask_token_id"})
+    guards = {"block_size": 8, "selector_sampling": True, "tp_size": 4}
+
+    def __init__(self, binding, built):
+        self.binding, self.built = binding, built

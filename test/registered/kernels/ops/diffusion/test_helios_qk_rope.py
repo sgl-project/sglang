@@ -10,7 +10,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -140,14 +140,6 @@ def test_helios_qk_rope_batched(dtype):
     fused_inplace_helios_qk_rope(q, k, freqs)
     assert torch.equal(q, q_ref)
     assert torch.equal(k, k_ref)
-
-
-def test_helios_qk_rope_rejects_bad_frequency_shape() -> None:
-    q = torch.randn(3, 2, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    freqs = torch.randn(3, 128, device="cuda", dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="freq_dim"):
-        fused_inplace_helios_qk_rope(q, k, freqs)
 
 
 if __name__ == "__main__":

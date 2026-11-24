@@ -12,6 +12,7 @@ This test launches a server with the feature enabled and asserts that:
 import os
 import re
 import unittest
+from types import SimpleNamespace
 
 import requests
 
@@ -23,12 +24,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
     popen_launch_server,
 )
 
 # CI Registration
-register_cuda_ci(est_time=75, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=78, stage="base-b", runner_config="1-gpu-large")
 
 STDOUT_FILENAME = "post_capture_kv_sizing_stdout.log"
 STDERR_FILENAME = "post_capture_kv_sizing_stderr.log"

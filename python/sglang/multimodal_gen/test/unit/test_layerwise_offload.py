@@ -207,6 +207,7 @@ class _TestServerArgs(SimpleNamespace):
     )
     _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
     layerwise_tuning_for = ServerArgs.layerwise_tuning_for
+    node_local_gpu_worker_count = ServerArgs.node_local_gpu_worker_count
 
 
 def _server_args(**kwargs):
@@ -234,6 +235,8 @@ def _server_args(**kwargs):
         layerwise_residency_policy={},
         layerwise_residency_lifetime={},
         pin_cpu_memory=False,
+        num_gpus=1,
+        nnodes=1,
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
         pipeline_class_name=None,
@@ -481,7 +484,7 @@ def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
+def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget(monkeypatch):
     transformer = _NestedDummyModel()
     vae = torch.nn.Linear(4, 4, bias=False)
     encoder = torch.nn.Linear(32, 32, bias=False)
@@ -496,9 +499,16 @@ def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
             "text_encoder": "snapshot-offload",
         },
         pin_cpu_memory=True,
+        num_gpus=8,
+        nnodes=2,
+    )
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: 32 * 1024**3
     )
     manager = ComponentResidencyManager(pipeline, args)
     budget = manager.host_pin_budget
+    assert args.node_local_gpu_worker_count == 4
+    assert budget.available_bytes == 8 * 1024**3
     budget.available_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
     budget.reserve_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES
     configured = configure_layerwise_offload_modules(modules, args, pin_budget=budget)
@@ -3139,3 +3149,67 @@ def test_finish_offload_writeback_is_noop_when_idle():
     )
 
     finish_offload_writeback()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="ROCm PyTorch rejects Event(external=True), so the capture runs eager",
+)
+@torch.no_grad()
+def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        BaseBreakableCudaGraphRunner,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+
+    @eager_on_graph(output_factory=torch.empty_like, pass_output=True)
+    def boundary(x, out=None):
+        if out is None:
+            return x
+        out.copy_(x)
+        return out
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(
+                [torch.nn.Linear(256, 256) for _ in range(4)]
+            )
+            self.offset = torch.nn.Parameter(torch.randn(256))
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = boundary(block(x).relu())
+            return x + self.offset
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    model = Model().to(device)
+    inputs = [torch.randn(n, 256, device=device) for n in (8, 16)]
+    expected = [model(x).clone() for x in inputs]
+    manager = LayerwiseOffloadManager(
+        model, layers_attr_str="blocks", num_layers=4, enabled=True
+    )
+    model.layerwise_offload_managers = [manager]
+    copy_stream = manager.copy_stream
+    runner = BaseBreakableCudaGraphRunner(model, device)
+    try:
+        for x in inputs:
+            assert runner.capture(x=x)
+        assert len(runner.entries) == 2
+        # Rebinding component weights must not invalidate captured storage.
+        model.offset.data = model.offset.data.clone()
+        for x, reference in zip(inputs * 2, expected * 2):
+            torch.testing.assert_close(runner(x=x), reference, rtol=0, atol=0)
+        assert manager.copy_stream is copy_stream
+        assert manager._graph_capture_keepalive is None
+        assert not manager._gpu_layers
+        runner.reset()
+        torch.testing.assert_close(model(inputs[0]), expected[0], rtol=0, atol=0)
+    finally:
+        runner.reset()
+        manager.release_all()
+        manager.remove_forward_hooks()

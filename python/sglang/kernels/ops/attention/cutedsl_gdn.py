@@ -1,6 +1,7 @@
 """CuTe DSL Fused Sigmoid Gating Delta Rule Kernel for GDN Decode."""
 
 import logging
+import math
 from typing import Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -85,7 +86,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP_SMALL
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -218,7 +219,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -237,7 +238,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -317,7 +318,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP_SMALL
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -450,7 +451,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -469,7 +470,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -543,7 +544,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -673,7 +674,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -689,7 +690,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -760,7 +761,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -890,7 +891,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -906,7 +907,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -1370,6 +1371,24 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
     return compiled_kernel
 
 
+def _check_compiled_constants(
+    *, K, scale, use_qk_l2norm_in_kernel, softplus_beta, softplus_threshold
+):
+    # _get_compiled_kernel bakes these values in; reject any it would ignore.
+    if (
+        (scale is not None and not math.isclose(scale, K**-0.5, rel_tol=1e-6))
+        or not use_qk_l2norm_in_kernel
+        or softplus_beta != 1.0
+        or softplus_threshold != 20.0
+    ):
+        raise ValueError(
+            "CuTe DSL GDN decode only supports scale=K**-0.5, "
+            "use_qk_l2norm_in_kernel=True, softplus_beta=1.0 and "
+            f"softplus_threshold=20.0; got {scale=}, {use_qk_l2norm_in_kernel=}, "
+            f"{softplus_beta=}, {softplus_threshold=}"
+        )
+
+
 def cutedsl_fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -1397,8 +1416,13 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
     N = initial_state_indices.shape[0]
 
     is_varlen_decode = B_q == 1 and T_q == N and N > 1
-    if scale is None:
-        scale = K**-0.5
+    _check_compiled_constants(
+        K=K,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+    )
 
     use_small_batch = N < SMALL_BATCH_THRESHOLD
 

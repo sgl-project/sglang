@@ -25,7 +25,7 @@ from typing import Any
 import msgspec
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult as ToolStreamingParseResult,
@@ -34,10 +34,20 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.response_template_structural_tag import (
+    holds_arguments,
+    message_start_anchors,
+    message_start_openers,
+    typed_parameters,
+)
 from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
-from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
+from sglang.srt.parser.chat_parsing.response_parser import (
+    ResponseParser,
+    _json_valued,
+)
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
+    ResponseTemplateField,
     load_response_template,
 )
 
@@ -52,8 +62,10 @@ _SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
     {_THINKING_FIELD, _CONTENT_FIELD, _TOOL_FIELD}
 )
 # Where JSON-schema output replaces the template's framing, following the
-# reasoning gate of ReasonerGrammarBackend.
+# reasoning gate of ReasonerGrammarBackend; at the answer opener when the
+# grammar frames the JSON as the answer.
 GRAMMAR_AFTER_REASONING = "after_reasoning"
+GRAMMAR_AT_ANSWER = "at_answer"
 GRAMMAR_FROM_START = "from_start"
 
 
@@ -63,7 +75,9 @@ class _ServingTemplates(msgspec.Struct, frozen=True):
     source: ResponseTemplate
     streaming: ResponseTemplate
     reasoning_only: ResponseTemplate | None
+    reasoning_to_answer: ResponseTemplate | None
     tool_extraction: ResponseTemplate | None
+    tool_to_answer: ResponseTemplate | None
 
 
 def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
@@ -81,17 +95,30 @@ def _derive_serving_templates_from_json(template_json: str) -> _ServingTemplates
     template = json.loads(template_json)
     loaded = load_response_template(template)
     _check_serving_fields(loaded)
+    content = loaded.fields.get(_CONTENT_FIELD)
+    answer_opens = content is not None and content.open_re is not None
     return _ServingTemplates(
         source=loaded,
         streaming=_streaming_template(template),
         reasoning_only=(
-            _reasoning_only_template(template)
+            _reasoning_only_template(template, ends_at_answer=False)
             if _THINKING_FIELD in loaded.fields
+            else None
+        ),
+        # Only an answer with an opener can end the reasoning-only parse.
+        reasoning_to_answer=(
+            _reasoning_only_template(template, ends_at_answer=True)
+            if _THINKING_FIELD in loaded.fields and answer_opens
             else None
         ),
         tool_extraction=(
             _tool_extraction_template(template)
             if _TOOL_FIELD in loaded.fields
+            else None
+        ),
+        tool_to_answer=(
+            _tool_extraction_template(template, ends_at_answer=True)
+            if _TOOL_FIELD in loaded.fields and answer_opens
             else None
         ),
     )
@@ -151,12 +178,20 @@ def configure_response_template_request(request: Any) -> None:
     request.chat_template_kwargs = template_kwargs
 
 
+def grammar_holds_calls(tool_grammar: bool, grammar_start: str | None) -> bool:
+    """Whether a template grammar holds the output's calls: the tool-call
+    grammar, or the JSON answer's, which admits calls before the answer."""
+    return tool_grammar or grammar_start == GRAMMAR_AT_ANSWER
+
+
 def _load_serving_templates(
     tokenizer: Any | None, template: dict | None, fallback: dict | None
 ) -> tuple[dict, _ServingTemplates]:
     """Use the explicit template, then checkpoint metadata, then the detector's
     built-in fallback."""
-    template = resolve_response_template(tokenizer, template) or fallback
+    template = resolve_response_template(tokenizer, template)
+    if template is None:
+        template = fallback
     if template is None:
         raise ValueError("response_template is required")
     return template, _derive_serving_templates(template)
@@ -174,18 +209,30 @@ def _streaming_template(template: dict[str, Any]) -> ResponseTemplate:
     return load_response_template(result)
 
 
-def _reasoning_only_template(template: dict[str, Any]) -> ResponseTemplate:
-    thinking = copy.deepcopy(template["fields"][_THINKING_FIELD])
-    thinking["optional"] = True
+def _reasoning_only_template(
+    template: dict[str, Any], *, ends_at_answer: bool
+) -> ResponseTemplate:
+    fields = {_THINKING_FIELD: copy.deepcopy(template["fields"][_THINKING_FIELD])}
+    if ends_at_answer:
+        # Text between thinking and the answer, like a tool call, stays normal.
+        fields[_PASSTHROUGH_FIELD] = {}
+        fields[_CONTENT_FIELD] = copy.deepcopy(template["fields"][_CONTENT_FIELD])
+        if _TOOL_FIELD in template["fields"]:
+            # A call's own text can hold markers that open no region.
+            fields[_TOOL_FIELD] = copy.deepcopy(template["fields"][_TOOL_FIELD])
+    for field in fields.values():
+        field["optional"] = True
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
     return load_response_template(
-        {anchor_name: template[anchor_name], "fields": {_THINKING_FIELD: thinking}}
+        {anchor_name: template[anchor_name], "fields": fields}
     )
 
 
-def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
+def _tool_extraction_template(
+    template: dict[str, Any], *, ends_at_answer: bool = False
+) -> ResponseTemplate:
     tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
     tool_field["optional"] = True
     # The detector transforms each member itself, so a malformed member drops alone;
@@ -193,14 +240,20 @@ def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
     # coercion, which must only see the call each member's transform produces.
     if tool_field.pop("transform_each", False):
         tool_field["transform"] = {_RAW_MEMBERS_KEY: "{content}"}
+    fields = {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field}
+    if ends_at_answer:
+        # The answer opens only outside the reasoning, which stays text.
+        for name in (_THINKING_FIELD, _CONTENT_FIELD):
+            if name in template["fields"]:
+                fields[name] = {
+                    **copy.deepcopy(template["fields"][name]),
+                    "optional": True,
+                }
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
     return load_response_template(
-        {
-            anchor_name: template[anchor_name],
-            "fields": {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field},
-        }
+        {anchor_name: template[anchor_name], "fields": fields}
     )
 
 
@@ -226,8 +279,13 @@ class ResponseTemplateStreamAdapter:
         prefix: str = "",
         grammar_start: str | None = None,
         each_transform: Any = None,
+        constrained: bool = False,
+        held_by: ResponseTemplateField | None = None,
     ):
         self._template = template
+        self._constrained = constrained
+        # Only constrained parsing reads held values as JSON.
+        self._held_by = held_by if constrained else None
         self._prefix = prefix
         self._parser: ResponseParser | None = None
         self._prefix_end = 0
@@ -238,9 +296,14 @@ class ResponseTemplateStreamAdapter:
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
         self._open_tool_captures: dict = {}
+        self._open_region: dict | None = None
+        # Where the output ends, before finalize completes a cut-off closer.
+        self._output_end: int | None = None
         self._grammar_start = grammar_start
         # Once JSON-schema output has started, text passes through unparsed.
         self._verbatim = grammar_start == GRAMMAR_FROM_START
+        # Whether the output wrote the answer's opener.
+        self.answer_opened = False
 
     def _start(self, tools: Sequence[Any] | None) -> list[dict]:
         """Create the parser and replay a tool region left open by the prefix."""
@@ -250,11 +313,25 @@ class ResponseTemplateStreamAdapter:
             self._template,
             prefix=self._prefix,
             tools=[
-                tool if isinstance(tool, dict) else tool.model_dump()
+                _typed_tool(
+                    tool if isinstance(tool, dict) else tool.model_dump(),
+                    self._held_by,
+                )
                 for tool in tools or []
             ],
+            constrained=self._constrained,
         )
         self._prefix_end = len(self._parser.input_text)
+        self._track(self._parser.initial_events)
+        if (
+            self._grammar_start == GRAMMAR_AT_ANSWER
+            and self._open_region is not None
+            and self._open_region["field"] == _CONTENT_FIELD
+        ):
+            # The prompt opened the answer, so all generated text is answer
+            # text, and none of the prompt's passes through.
+            self._verbatim = True
+            return []
         for event in reversed(self._parser.initial_events):
             if event.get("field") == _TOOL_FIELD and event["type"] != "region_chunk":
                 return [event] if event["type"] == "region_open" else []
@@ -266,7 +343,9 @@ class ResponseTemplateStreamAdapter:
         if self._verbatim:
             return [_passthrough_chunk(text)] if text else []
         events = self._start(tools)
-        return self._end_reasoning(events + self._parser.feed(text))
+        if self._verbatim:
+            return [_passthrough_chunk(text)] if text else []
+        return self._end_reasoning(events + self._track(self._parser.feed(text)))
 
     def finalize(self, tools: Sequence[Any] | None = None) -> list[dict]:
         if self._finalized:
@@ -275,18 +354,47 @@ class ResponseTemplateStreamAdapter:
         self._finalized = True
         if self._verbatim:
             return events
+        self._output_end = len(self._parser.input_text)
+        events += self._parser.feed(self._closer_rest())
         return self._end_reasoning(events + self._parser.finalize()[1])
 
+    def _track(self, events: list[dict]) -> list[dict]:
+        for event in events:
+            if event["type"] == "region_open":
+                self._open_region = event
+                if event["field"] == _CONTENT_FIELD and event["end"] > event["start"]:
+                    self.answer_opened = True
+            elif event["type"] in ("region_close", "region_malformed"):
+                self._open_region = None
+        return events
+
+    def _closer_rest(self) -> str:
+        """The rest of a closer the output stopped in after ending its region,
+        when only the next message's start anchor is missing."""
+        if self._open_region is None:
+            return ""
+        field = self._template.fields[self._open_region["field"]]
+        text = self._parser.input_text[self._open_region["end"] :]
+        for closer in field.close_literals or ():
+            for anchor in message_start_anchors(self._template):
+                if not anchor or not closer.endswith(anchor) or closer == anchor:
+                    continue
+                for cut in range(len(closer) - 1, len(closer) - len(anchor) - 1, -1):
+                    if text.endswith(closer[:cut]):
+                        return closer[cut:]
+        return ""
+
     def _end_reasoning(self, events: list[dict]) -> list[dict]:
-        # Stop parsing at the reasoning closer, where the grammar backend starts
+        # Stop parsing at the reasoning end, where the grammar backend starts
         # the JSON schema, and pass the rest through unchanged.
-        if self._grammar_start != GRAMMAR_AFTER_REASONING:
+        if self._grammar_start not in (GRAMMAR_AFTER_REASONING, GRAMMAR_AT_ANSWER):
             return events
+        if _CONTENT_FIELD in self._template.fields:
+            end_field, end_types = _CONTENT_FIELD, ("region_open",)
+        else:
+            end_field, end_types = _THINKING_FIELD, ("region_close", "region_malformed")
         for index, event in enumerate(events):
-            if event.get("field") == _THINKING_FIELD and event["type"] in (
-                "region_close",
-                "region_malformed",
-            ):
+            if event.get("field") == end_field and event["type"] in end_types:
                 self._verbatim = True
                 text = self._parser.input_text[event["end"] :]
                 return events[: index + 1] + (
@@ -300,6 +408,13 @@ class ResponseTemplateStreamAdapter:
     def _generated_text(self, event: dict) -> str:
         start = max(event["start"], self._prefix_end)
         return self._parser.input_text[start : event["end"]]
+
+    def _output_text(self, event: dict) -> str:
+        """The generated text of `event`, without closer bytes finalize added."""
+        end = event["end"] if self._output_end is None else self._output_end
+        return self._parser.input_text[
+            max(event["start"], self._prefix_end) : min(event["end"], end)
+        ]
 
     def _open_tool_name(self, captures: dict | None) -> str | None:
         """Name already fixed by the opener, before the region body exists."""
@@ -372,6 +487,16 @@ class ResponseTemplateStreamAdapter:
             etype = event["type"]
             if field == _PASSTHROUGH_FIELD and etype == "region_chunk":
                 normal_parts.append(event["text"])
+            elif field == _CONTENT_FIELD and etype == "region_open":
+                # The answer's opener stays text, like the answer after it.
+                normal_parts.append(self._generated_text(event))
+            elif field == _THINKING_FIELD:
+                # Unseparated output keeps its reasoning as it was written.
+                normal_parts.append(
+                    event["text"]
+                    if etype == "region_chunk"
+                    else self._output_text(event)
+                )
             elif field != _TOOL_FIELD or etype == "region_chunk":
                 continue
             elif etype == "region_open":
@@ -406,12 +531,15 @@ class ResponseTemplateStreamAdapter:
         if not isinstance(value, list):
             logger.warning("response_template: malformed tool call value: %r", value)
             return []
+        json_values = _json_valued(self._template.fields[_TOOL_FIELD])
         members = []
         for member in value:
             try:
                 scope = {**self._open_tool_captures, **member}
                 call = _apply_transform(self._each_transform, scope)
-                members.append(self._parser._coerce_tool_calls(call))
+                members.append(
+                    self._parser._coerce_tool_calls(call, json_values=json_values)
+                )
             except (KeyError, TypeError, ValueError):
                 logger.warning(
                     "response_template: malformed tool call value: %r", member
@@ -442,6 +570,7 @@ class ResponseTemplateReasoningDetector:
     _default_think_end = ""
     thinks_internally = False
     reasoning_default = "explicit_enable_thinking"
+    strict_arguments = False
 
     def __init__(
         self,
@@ -451,6 +580,8 @@ class ResponseTemplateReasoningDetector:
         prefix: str = "",
         force_nonempty_content: bool = False,
         grammar_start: str | None = None,
+        tools: Sequence[Any] | None = None,
+        constrained: bool = False,
         **_kwargs,
     ):
         template, templates = _load_serving_templates(
@@ -472,24 +603,84 @@ class ResponseTemplateReasoningDetector:
             if thinking and thinking.close_literals
             else self._default_think_end
         )
+        self._thinking_field = thinking
+        self._content_field = templates.source.fields.get(_CONTENT_FIELD)
+        self._tool_field = templates.source.fields.get(_TOOL_FIELD)
+        self._message_start = message_start_anchors(templates.source)
+        # Thinking openers of output that starts the assistant message.
+        self.message_start_think_openers = (
+            message_start_openers(thinking, self._message_start) if thinking else []
+        )
         self.think_start_self_label = ""
-        if grammar_start == GRAMMAR_AFTER_REASONING and thinking is None:
+        reasoning_gated = (GRAMMAR_AFTER_REASONING, GRAMMAR_AT_ANSWER)
+        if grammar_start in reasoning_gated and thinking is None:
             grammar_start = GRAMMAR_FROM_START
         self._grammar_start = grammar_start
-        if grammar_start == GRAMMAR_AFTER_REASONING:
+        if grammar_start == GRAMMAR_AT_ANSWER:
+            self._template = templates.reasoning_to_answer
+        elif grammar_start == GRAMMAR_AFTER_REASONING:
             self._template = templates.reasoning_only
         else:
             self._template = templates.streaming
         self._prefix = prefix
+        self._tools = tools
+        self._constrained = constrained
         self._adapter = self._new_adapter()
+        # Whether the parsed output opened the answer that the grammar admits
+        # instead of calls, so that none of its text is a call.
+        self.answer_started = False
 
     def _new_adapter(self) -> ResponseTemplateStreamAdapter:
         return ResponseTemplateStreamAdapter(
-            self._template, prefix=self._prefix, grammar_start=self._grammar_start
+            self._template,
+            prefix=self._prefix,
+            grammar_start=self._grammar_start,
+            constrained=self._constrained,
+            held_by=self._tool_field if self.strict_arguments else None,
         )
 
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
+    def get_self_opened_think_start_token_ids(self, tokenizer) -> list[int] | None:
+        return None
+
+    def starts_message(self, prefix: str) -> bool:
+        """Whether output after `prefix` starts the assistant message, and so
+        may skip the reasoning."""
+        return _starts_message(self._template, prefix)
+
+    def answer_opener(self, prefix: str) -> str:
+        """The literal opener of an answer right after `prefix`, or "" unless
+        `prefix` starts the assistant message."""
+        if self._content_field is None or not self.starts_message(prefix):
+            return ""
+        openers = message_start_openers(self._content_field, self._message_start)
+        return openers[0] if openers else ""
+
+    def answer_rest_structural_tag(self, prefix: str) -> dict[str, Any] | None:
+        """A structural tag for the rest of an answer that `prefix` leaves open,
+        or `None` if none applies."""
+        return None
+
+    def json_answer_structural_tag(
+        self,
+        json_schema: Any,
+        *,
+        tools: list[dict[str, Any]],
+        parallel_tool_calls: bool = True,
+        message_start: bool = False,
+    ) -> dict[str, Any] | None:
+        """A structural tag for JSON framed as the answer, after the reasoning
+        or, at the `message_start`, from the first token, or `None` to apply the
+        JSON schema directly. Calls to `tools` may come first."""
+        return None
+
+    def json_output_started(self, text: str) -> bool:
+        """Whether generated `text` reaches the start of JSON-schema output."""
+        adapter = self._new_adapter()
+        adapter.parse(text, self._tools)
+        return adapter._verbatim
 
     def get_answer_frame(self) -> None:
         return None
@@ -497,14 +688,16 @@ class ResponseTemplateReasoningDetector:
     def detect_and_parse(self, text: str) -> _ReasoningResult:
         adapter = self._new_adapter()
         result = adapter.route_reasoning_events(
-            adapter.parse(text), stream_reasoning=True
+            adapter.parse(text, self._tools), stream_reasoning=True
         )
+        self._record_answer(adapter)
         if self._force_nonempty_content and not result.normal_text:
             result.normal_text, result.reasoning_text = result.reasoning_text, ""
         return result
 
     def parse_streaming_increment(self, new_text: str) -> _ReasoningResult:
-        events = self._adapter.feed(new_text)
+        events = self._adapter.feed(new_text, self._tools)
+        self._record_answer(self._adapter)
         if self._force_nonempty_content:
             self._track_open_reasoning(events)
         return self._adapter.route_reasoning_events(
@@ -512,7 +705,8 @@ class ResponseTemplateReasoningDetector:
         )
 
     def finish(self) -> _ReasoningResult:
-        events = self._adapter.finalize()
+        events = self._adapter.finalize(self._tools)
+        self._record_answer(self._adapter)
         result = self._adapter.route_reasoning_events(
             events, stream_reasoning=self.stream_reasoning
         )
@@ -524,6 +718,11 @@ class ResponseTemplateReasoningDetector:
                 result.normal_text += unclosed_reasoning
                 result.reasoning_text = ""
         return result
+
+    def _record_answer(self, adapter: ResponseTemplateStreamAdapter) -> None:
+        # A grammar that holds the calls admits them or an answer, so no call
+        # follows the answer's opener.
+        self.answer_started = self._constrained and adapter.answer_opened
 
     def _track_open_reasoning(self, events: list[dict]) -> str | None:
         """Accumulate open thinking text; return the text of a region `events` close."""
@@ -542,12 +741,16 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     """Tool-call detector driven by a `response_template` grammar."""
 
     response_template: dict | None = None
+    constrains_every_turn = False
+    strict_arguments = False
 
     def __init__(
         self,
         tokenizer=None,
         response_template: dict | None = None,
         prefix: str = "",
+        tools: list[Tool] | None = None,
+        constrained: bool = False,
     ):
         super().__init__()
         template, templates = _load_serving_templates(
@@ -556,23 +759,43 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         self.response_template = template
         if templates.tool_extraction is None:
             raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
-        self._template = templates.tool_extraction
+        # Under a grammar that admits calls or an answer, no call follows the
+        # answer's opener, so the parse ends there.
+        self._ends_at_answer = constrained and templates.tool_to_answer is not None
+        self._template = (
+            templates.tool_to_answer
+            if self._ends_at_answer
+            else templates.tool_extraction
+        )
         self._prefix = prefix
-        tool_field = templates.source.fields[_TOOL_FIELD]
+        self._tools = tools
+        self._constrained = constrained
+        self._tool_field = templates.source.fields[_TOOL_FIELD]
         self._each_transform = (
-            tool_field.transform if tool_field.transform_each else None
+            self._tool_field.transform if self._tool_field.transform_each else None
         )
-        self._adapter = ResponseTemplateStreamAdapter(
-            self._template, prefix=prefix, each_transform=self._each_transform
-        )
-        self.tool_close_literals = tool_field.close_literals or []
+        self._adapter = self._new_adapter()
+        self._thinking_field = templates.source.fields.get(_THINKING_FIELD)
+        self._content_field = templates.source.fields.get(_CONTENT_FIELD)
+        self._message_start = message_start_anchors(templates.source)
+        self.tool_close_literals = self._tool_field.close_literals or []
         if self.tool_close_literals:
             self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
         self._tool_indices: dict[str, int] | None = None
 
+    def _new_adapter(self) -> ResponseTemplateStreamAdapter:
+        return ResponseTemplateStreamAdapter(
+            self._template,
+            prefix=self._prefix,
+            grammar_start=GRAMMAR_AT_ANSWER if self._ends_at_answer else None,
+            each_transform=self._each_transform,
+            constrained=self._constrained,
+            held_by=self._tool_field if self.strict_arguments else None,
+        )
+
     def has_tool_call(self, text: str) -> bool:
-        adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
+        adapter = self._new_adapter()
         return any(
             event["type"] == "region_open" and event.get("field") == _TOOL_FIELD
             for event in adapter.parse(text)
@@ -670,9 +893,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     def detect_and_parse(
         self, text: str, tools: list[Tool]
     ) -> ToolStreamingParseResult:
-        adapter = ResponseTemplateStreamAdapter(
-            self._template, prefix=self._prefix, each_transform=self._each_transform
-        )
+        adapter = self._new_adapter()
         tool_indices = self._get_tool_indices(tools)
         calls: list[ToolCallItem] = []
 
@@ -731,12 +952,41 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return False
 
+    def open_call_closer(self, text: str) -> str | None:
+        """The closer for a call that `text` leaves open at its end."""
+        if not self.tool_close_literals:
+            return None
+        adapter = self._new_adapter()
+        for event in reversed(adapter.parse(text, self._tools)):
+            if event.get("field") == _TOOL_FIELD and event["type"] != "region_chunk":
+                open_at_end = event["type"] == "region_close" and event["start"] == len(
+                    adapter._parser.input_text
+                )
+                return self.tool_close_literals[0] if open_at_end else None
+        return None
+
+    def get_structural_tag(
+        self,
+        tools: list[Tool] | None = None,
+        tool_choice: Any = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+        message_start: bool = False,
+    ):
+        return None
+
     def validate_structure_constraint_request(
         self,
         tool_choice: Any,
         parallel_tool_calls: bool,
         strict_requested: bool,
-    ) -> None:
+        *,
+        tools: list[Tool],
+        thinking_mode: bool = False,
+    ):
+        """Raise for a requested constraint the template cannot hold. Return
+        the template's own tag for this request's tool calls, or `None` to
+        leave them to the generic constraint."""
         if tool_choice == "auto" and not parallel_tool_calls:
             raise ValueError(
                 f"{type(self).__name__} cannot enforce "
@@ -751,6 +1001,31 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         raise NotImplementedError(
             "structure_info not used with the response_template tool parser"
         )
+
+
+def _typed_tool(tool: dict, held_by: ResponseTemplateField | None = None) -> dict:
+    """`tool`, in either API's shape, as template grammars constrain it, strict
+    where `held_by` holds its arguments."""
+    function = tool.get("function", tool)
+    if not isinstance(function, dict):
+        return tool
+    function = dict(function)
+    parameters = function.get("parameters")
+    if isinstance(parameters, dict):
+        function["parameters"] = parameters = typed_parameters(parameters)
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() >= ToolStrictLevel.PARAMETER or (
+        held_by is not None
+        and not function.get("strict")
+        and isinstance(parameters, dict)
+        and holds_arguments(held_by, parameters)
+    ):
+        function["strict"] = True
+    return {**tool, "function": function} if "function" in tool else function
+
+
+def _starts_message(template: ResponseTemplate, prefix: str) -> bool:
+    ends = [match.end() for match in template.start_anchor_re.finditer(prefix)]
+    return bool(ends) and ends[-1] == len(prefix)
 
 
 def tool_close_tokens(

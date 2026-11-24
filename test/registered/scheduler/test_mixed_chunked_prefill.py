@@ -12,8 +12,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=176, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=184, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=180, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):

@@ -11,10 +11,8 @@ from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 LATENT_SHIFT = (
     0.01984364,

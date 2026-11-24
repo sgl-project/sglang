@@ -39,10 +39,13 @@ def _threads_per_row(H: int) -> int:
 
 
 class RMSNormInterleavedRope:
-    def __init__(self, dtype: cutlass.Numeric, H: int, head_dim: int):
+    def __init__(self, dtype: cutlass.Numeric, H: int, head_dim: int, blocked: bool):
         self.dtype = dtype
         self.H = H
         self.head_dim = head_dim
+        # store each thread column run (block_cols columns) to its own [M, block_cols]
+        # destination block instead of to ``mY``
+        self.blocked = blocked
         elem_bytes = dtype.width // 8
         self.vec_size = min(H & (-H), COPY_BITS // 8 // elem_bytes)
         self.copy_bits = self.vec_size * dtype.width
@@ -74,6 +77,7 @@ class RMSNormInterleavedRope:
         mW: cute.Tensor,
         mY: cute.Tensor,
         mCS: cute.Tensor,
+        mDst: cute.Tensor,
         M: Int64,
         seq_len: Int64,
         eps: Float32,
@@ -92,7 +96,7 @@ class RMSNormInterleavedRope:
         )
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
-        self.kernel(mX, mW, mY, mCS, M, seq_len, eps, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mW, mY, mCS, mDst, M, seq_len, eps, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
@@ -106,6 +110,7 @@ class RMSNormInterleavedRope:
         mW: cute.Tensor,
         mY: cute.Tensor,
         mCS: cute.Tensor,
+        mDst: cute.Tensor,
         M: Int64,
         seq_len: Int64,
         eps: Float32,
@@ -242,7 +247,27 @@ class RMSNormInterleavedRope:
                 tXrO[(v, blk), 0, 0] = (a * c + (-b) * s).to(mY.element_type)
                 tXrO[(v + 1, blk), 0, 0] = (b * c + a * s).to(mY.element_type)
 
-        if row_in_bounds:
+        if cutlass.const_expr(self.blocked):
+            # column run ``blk`` of row ``row`` goes to row ``row`` of block mDst[blk]
+            block_cols = self.vec_size * threads_per_row
+            elem_bytes = mY.element_type.width // 8
+            if row_in_bounds:
+                offset = (
+                    Int64(row_coord[0]) * block_cols
+                    + tXcX[(0, 0), 0, 0][1] % block_cols
+                ) * elem_bytes
+                for blk in cutlass.range_constexpr(self.num_vec_blocks):
+                    dst = cute.make_tensor(
+                        cute.make_ptr(
+                            mY.element_type,
+                            mDst[blk] + offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((self.vec_size,)),
+                    )
+                    cute.autovec_copy(tXrO[(None, blk), 0, 0], dst)
+        elif row_in_bounds:
             cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
 
@@ -275,6 +300,61 @@ def can_use_fused_rmsnorm_interleaved_rope(
     )
 
 
+def rmsnorm_interleaved_rope_block_cols(H: int) -> int:
+    """Columns of one destination block of ``fused_rmsnorm_interleaved_rope_into_blocks``"""
+    return 8 * _threads_per_row(H)
+
+
+def _launch(x, weight, cos_sin_cache, eps, head_dim, out, dst_table) -> None:
+    M, H = x.shape
+    blocked = dst_table is not None
+    key = (x.dtype, H, head_dim, blocked)
+    compiled = _COMPILE_CACHE.get(key)
+    if compiled is None:
+        dtype = _TORCH_TO_CUTE[x.dtype]
+        sym_m = cute.sym_int(64)
+        x_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (cute.sym_int64(divisibility=8), 1), assumed_align=16
+        )
+        w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+        cs_fake = cute.runtime.make_fake_compact_tensor(
+            Float32, (cute.sym_int(64), head_dim), stride_order=(1, 0), assumed_align=16
+        )
+        dst_fake = cute.runtime.make_fake_compact_tensor(
+            Int64, (cute.sym_int(64),), assumed_align=8
+        )
+        compiled = _COMPILE_CACHE[key] = cute.compile(
+            RMSNormInterleavedRope(dtype, H, head_dim, blocked),
+            x_fake,
+            w_fake,
+            x_fake,
+            cs_fake,
+            dst_fake,
+            Int64(1),
+            Int64(1),
+            Float32(1e-6),
+            cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
+            options="--enable-tvm-ffi",
+        )
+    if dst_table is None:
+        dst_table = _no_blocks(x.device)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled(
+        x, weight, out, cos_sin_cache, dst_table, M, cos_sin_cache.shape[0], eps, stream
+    )
+
+
+_NO_BLOCKS: dict[torch.device, torch.Tensor] = {}
+
+
+def _no_blocks(device: torch.device) -> torch.Tensor:
+    # the in-place variant never reads its destination table
+    table = _NO_BLOCKS.get(device)
+    if table is None:
+        table = _NO_BLOCKS[device] = torch.zeros(1, dtype=torch.int64, device=device)
+    return table
+
+
 def fused_rmsnorm_interleaved_rope_(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -287,31 +367,19 @@ def fused_rmsnorm_interleaved_rope_(
     ``cos_sin_cache`` is [seq_len, head_dim] fp32 (cos | sin of each pair); bit-identical
     to ``flashinfer.norm.rmsnorm`` then FlashInfer's interleaved cos/sin-cache RoPE.
     """
-    M, H = x.shape
-    key = (x.dtype, H, head_dim)
-    compiled = _COMPILE_CACHE.get(key)
-    if compiled is None:
-        dtype = _TORCH_TO_CUTE[x.dtype]
-        sym_m = cute.sym_int(64)
-        x_fake = cute.runtime.make_fake_tensor(
-            dtype, (sym_m, H), (cute.sym_int64(divisibility=8), 1), assumed_align=16
-        )
-        w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
-        cs_fake = cute.runtime.make_fake_compact_tensor(
-            Float32, (cute.sym_int(64), head_dim), stride_order=(1, 0), assumed_align=16
-        )
-        compiled = _COMPILE_CACHE[key] = cute.compile(
-            RMSNormInterleavedRope(dtype, H, head_dim),
-            x_fake,
-            w_fake,
-            x_fake,
-            cs_fake,
-            Int64(1),
-            Int64(1),
-            Float32(1e-6),
-            cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
-            options="--enable-tvm-ffi",
-        )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled(x, weight, x, cos_sin_cache, M, cos_sin_cache.shape[0], eps, stream)
+    _launch(x, weight, cos_sin_cache, eps, head_dim, x, None)
     return x
+
+
+def fused_rmsnorm_interleaved_rope_into_blocks(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    dst_table: torch.Tensor,
+) -> None:
+    """``fused_rmsnorm_interleaved_rope_`` written elsewhere, ``x`` untouched: columns
+    [i * B, (i + 1) * B) go to the contiguous [M, B] block at address ``dst_table[i]``
+    (int64, CUDA), B = ``rmsnorm_interleaved_rope_block_cols(H)``."""
+    _launch(x, weight, cos_sin_cache, eps, head_dim, x, dst_table)

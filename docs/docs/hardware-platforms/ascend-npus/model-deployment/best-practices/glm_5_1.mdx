@@ -14,17 +14,17 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Ascend A3 Series Products | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
+| GLM-5.1 | A3 Series Products | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -34,7 +34,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -104,8 +104,7 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 32 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --chunked-prefill-size 65536 \
         --max-prefill-tokens 280000 \
         --trust-remote-code \
@@ -134,7 +133,7 @@ done
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -153,7 +152,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -251,7 +250,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -296,9 +295,8 @@ do
         --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.85 \
         --max-running-requests 64 \
         --attention-backend ascend \
@@ -332,13 +330,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -346,7 +346,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -363,7 +363,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -456,7 +456,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -495,9 +495,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -534,10 +533,10 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --policy round_robin
@@ -548,7 +547,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -565,7 +564,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -664,7 +663,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -708,8 +707,7 @@ do
         --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
-        --enable-dp-attention \
+        --attn-dp-size 32 \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 64 \
@@ -744,13 +742,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -758,7 +758,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -775,7 +775,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -869,7 +869,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --speculative-draft-model-quantization unquant \
         --enable-prefill-cp \
@@ -908,8 +908,7 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
-        --enable-dp-attention \
+        --attn-dp-size 32 \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 32 \
@@ -947,13 +946,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -961,7 +962,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -978,7 +979,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -1071,7 +1072,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -1110,9 +1111,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -1149,13 +1149,15 @@ done
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
-    --policy round_robin
+    --policy round_robin \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
 #### Benchmark
@@ -1166,7 +1168,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \

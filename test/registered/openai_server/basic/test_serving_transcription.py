@@ -14,7 +14,8 @@ import numpy as np
 import requests
 import soundfile as sf
 
-from sglang.srt.utils import kill_process_tree, load_audio
+from sglang.srt.multimodal.media_io import load_audio
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=59, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=119, stage="extra-a", runner_config="1-gpu-small")
 
 WHISPER_MODEL = "openai/whisper-large-v3"
 AUDIO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3"

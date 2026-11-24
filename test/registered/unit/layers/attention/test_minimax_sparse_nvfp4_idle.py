@@ -6,8 +6,8 @@ import torch
 
 import sglang.srt.layers.radix_attention as radix_attention_module
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cuda_ci
