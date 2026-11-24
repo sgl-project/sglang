@@ -127,17 +127,18 @@ jobs:
   #   secrets: inherit
 
   collect:
-    name: test_npu_deepseek_v4_flash_fp8_4p_mooncake_a5
+    name: test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5
     needs: [metadata]
-    # Single-machine case (Ascend 950/a5, 4 NPUs) run directly on the runner.
+    # Single-machine PD separation (Ascend 950/a5): 4-card prefill + 4-card
+    # decode with Mooncake KV transfer, run directly on the runner.
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-amd64-a5-4
+      runner: linux-amd64-a5-8
       test_type: accuracy
       # test_suite names the persisted output/metrics directory; the case file
       # itself is handed over through test_case.
-      test_suite: test_npu_deepseek_v4_flash_fp8_4p_mooncake_a5
-      test_case: test/registered/npu/basic_function/mooncake/test_npu_deepseek_v4_flash_fp8_4p_mooncake_a5.py
+      test_suite: test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5
+      test_case: test/registered/npu/basic_function/mooncake/test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5.py
       image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
       use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
