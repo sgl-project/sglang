@@ -1201,6 +1201,171 @@ class TestFixSpecialTokensPattern(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
+# _fix_v5_tokenizer_components
+# ---------------------------------------------------------------------------
+
+# A tokenizer.json whose declared normalizer has one step more than the class builds:
+# "collapse runs of 2+ spaces". XLM-R checkpoints ship this shape with a Precompiled
+# first element; a BertNormalizer keeps the fixture small (a real charsmap is ~240 KB)
+# while exercising the same repair.
+_WHITESPACE_COLLAPSING_TOKENIZER_JSON = {
+    "version": "1.0",
+    "truncation": None,
+    "padding": None,
+    "added_tokens": [
+        {
+            "id": i,
+            "content": tok,
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+        for i, tok in enumerate(("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"))
+    ],
+    "normalizer": {
+        "type": "Sequence",
+        "normalizers": [
+            {
+                "type": "BertNormalizer",
+                "clean_text": True,
+                "handle_chinese_chars": True,
+                "strip_accents": None,
+                "lowercase": False,
+            },
+            {"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "},
+        ],
+    },
+    "pre_tokenizer": {
+        "type": "Metaspace",
+        "replacement": "\u2581",
+        "add_prefix_space": True,
+        "prepend_scheme": "always",
+        "split": True,
+    },
+    "post_processor": None,
+    "decoder": {
+        "type": "Metaspace",
+        "replacement": "\u2581",
+        "add_prefix_space": True,
+        "prepend_scheme": "always",
+        "split": True,
+    },
+    "model": {
+        "type": "WordPiece",
+        "unk_token": "[UNK]",
+        "continuing_subword_prefix": "##",
+        "max_input_chars_per_word": 100,
+        "vocab": {
+            "[PAD]": 0,
+            "[UNK]": 1,
+            "[CLS]": 2,
+            "[SEP]": 3,
+            "[MASK]": 4,
+            "\u2581": 5,
+            "\u2581a": 6,
+            "\u2581b": 7,
+        },
+    },
+}
+
+# A Llama-2 shaped tokenizer.json: it declares a sentencepiece normalizer but no
+# pre_tokenizer, and the loaded LlamaTokenizer has no normalizer.
+_LLAMA_STYLE_TOKENIZER_JSON = {
+    "version": "1.0",
+    "truncation": None,
+    "padding": None,
+    "added_tokens": [
+        {
+            "id": i,
+            "content": tok,
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+        for i, tok in enumerate(("<unk>", "<s>", "</s>"))
+    ],
+    "normalizer": {
+        "type": "Sequence",
+        "normalizers": [
+            {"type": "Prepend", "prepend": "\u2581"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "\u2581"},
+        ],
+    },
+    "pre_tokenizer": None,
+    "post_processor": None,
+    "decoder": None,
+    "model": {
+        "type": "BPE",
+        "dropout": None,
+        "unk_token": "<unk>",
+        "continuing_subword_prefix": None,
+        "end_of_word_suffix": None,
+        "fuse_unk": False,
+        "byte_fallback": False,
+        "ignore_merges": False,
+        "vocab": {
+            "<unk>": 0,
+            "<s>": 1,
+            "</s>": 2,
+            "\u2581": 3,
+            "\u2581a": 4,
+            "\u2581b": 5,
+            "\u2581padded": 6,
+            "a": 7,
+            "b": 8,
+            "\u2581\u2581": 9,
+        },
+        "merges": [],
+    },
+}
+
+
+def _write_tokenizer_dir(model_path, tokenizer_json, tokenizer_class):
+    Path(model_path, "tokenizer.json").write_text(json.dumps(tokenizer_json))
+    Path(model_path, "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": tokenizer_class})
+    )
+
+
+class TestFixV5TokenizerComponents(CustomTestCase):
+    def test_restores_normalizer_the_class_dropped(self):
+        """The declared whitespace-collapsing normalizer survives the v5 class rebuild."""
+        from tokenizers import Tokenizer
+
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
+
+        with tempfile.TemporaryDirectory() as model_path:
+            _write_tokenizer_dir(
+                model_path, _WHITESPACE_COLLAPSING_TOKENIZER_JSON, "BertTokenizer"
+            )
+            declared = Tokenizer.from_file(str(Path(model_path, "tokenizer.json")))
+            self.assertEqual(declared.encode("a  b").ids, [6, 7])
+
+            tokenizer = get_tokenizer(model_path)
+            self.assertEqual(
+                tokenizer("a  b", add_special_tokens=False)["input_ids"], [6, 7]
+            )
+
+    def test_leaves_a_checkpoint_without_a_declared_pre_tokenizer_alone(self):
+        """A tokenizer.json with no pre_tokenizer is left as the class built it."""
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
+
+        with tempfile.TemporaryDirectory() as model_path:
+            _write_tokenizer_dir(
+                model_path, _LLAMA_STYLE_TOKENIZER_JSON, "LlamaTokenizer"
+            )
+            tokenizer = get_tokenizer(model_path)
+            self.assertIsNone(tokenizer._tokenizer.normalizer)
+            self.assertEqual(
+                type(tokenizer._tokenizer.pre_tokenizer).__name__, "Metaspace"
+            )
+
+
+# ---------------------------------------------------------------------------
 # __init__.py re-exports
 # ---------------------------------------------------------------------------
 

@@ -304,15 +304,19 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
     if raw_pre and loaded_pre and raw_pre != loaded_pre:
         logger.info(
             "Fixing v5 tokenizer component mismatch for %s: "
-            "pre_tokenizer %s -> %s, decoder %s -> %s",
+            "pre_tokenizer %s -> %s, decoder %s -> %s, normalizer %s -> %s",
             model_name_or_path,
             loaded_pre,
             raw_pre,
             type(backend.decoder).__name__ if backend.decoder else None,
             type(raw.decoder).__name__ if raw.decoder else None,
+            type(backend.normalizer).__name__ if backend.normalizer else None,
+            type(raw.normalizer).__name__ if raw.normalizer else None,
         )
         backend.pre_tokenizer = raw.pre_tokenizer
         backend.decoder = raw.decoder
+        # The class rebuild also drops normalizer steps (XLM-R collapses runs of spaces).
+        backend.normalizer = raw.normalizer
 
 
 def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
