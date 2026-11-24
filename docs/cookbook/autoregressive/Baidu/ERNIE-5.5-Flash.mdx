@@ -1,6 +1,6 @@
 ---
 title: ERNIE-5.5-Flash
-description: "Deploy ERNIE-5.5-Flash with SGLang — Baidu's 280B-total / 14B-active Mixture-of-Experts model with hybrid HCA + MLA-DSA attention, ECHO speculative decoding and up to 1M context. FP8 and BF16 recipes for B300, GB300, B200, GB200 and H100, with HiCache and PD disaggregation."
+description: "Deploy ERNIE-5.5-Flash with SGLang — Baidu's 280B-total / 14B-active Mixture-of-Experts model with hybrid HCA + MLA-DSA attention, DSpark speculative decoding and up to 1M context. FP4, FP8 and BF16 recipes for B300, GB300, B200, GB200 and H100, with HiCache and PD disaggregation."
 tag: NEW
 ---
 
@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-ernie-55-flash
+docker pull lmsysorg/sglang:dev-ernie-55-flash-pr51236-fe204897
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -40,9 +40,9 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware, precision and strategy to generate the launch command. Every recipe runs on the recommended (smallest) GPU count with SGLang's defaults plus `--max-running-requests 256`; size `--max-running-requests` and `--context-length` to your own workload.
+Pick your hardware, precision and strategy to generate the launch command. Every recipe runs on the recommended (smallest) GPU count with SGLang's defaults plus `--max-running-requests 256`; size `--max-running-requests` and `--context-length` to your own workload. Every recipe serves an ERNIE-5.5-Flash-Preview checkpoint: `baidu/ERNIE-5.5-Flash-Preview` (FP4), `baidu/ERNIE-5.5-Flash-Preview-FP8` or `baidu/ERNIE-5.5-Flash-Preview-BF16`.
 
-- **Low-Latency**: a speculative draft for the fastest replies under a single user or light load — ECHO (2 draft steps) on FP8 / BF16, the bundled DSpark draft on the FP4 w4a8 recipe.
+- **Low-Latency**: a speculative draft for the fastest replies under a single user or light load — the DSpark draft bundled in the checkpoint.
 - **High-Throughput**: attention DP without a draft. Most tokens per second across many concurrent requests.
 
 | GPU | FP4 (~155 GB) | FP8 (~280 GB) | BF16 (~560 GB) |
@@ -52,7 +52,7 @@ Pick your hardware, precision and strategy to generate the launch command. Every
 | GB200 (192 GB) | 4 GPUs | 4 GPUs | 2 trays × 4 GPUs |
 | H100 (80 GB) | — (SM100 only) | 8 GPUs | 2 nodes × 8 GPUs |
 
-The single-node FP8 recipes are verified on B300, GB300, B200, GB200 and H100, as is the BF16 recipe on B300. FP4 (MXFP4 routed experts, SM100 only) runs its experts as **w4a8 through DeepGEMM MegaMoE**, which needs expert parallelism and so uses the FP8 GPU counts (B300 2, B200 4, GB200 4). The other BF16 recipes and the FP4 recipes follow from the same memory budget and are not yet verified.
+On B300 every recipe (FP4, FP8 and BF16) is verified; the FP8 high-throughput recipe is also verified on GB300, B200, GB200 and H100. FP4 (MXFP4 routed experts, SM100 only) runs its experts as **w4a8 through DeepGEMM MegaMoE**, which needs expert parallelism and so uses the FP8 GPU counts (B300 2, B200 4, GB200 4). The other recipes follow from the same memory budget and are not yet verified.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/baidu/ernie-5.5-flash.jsx";
