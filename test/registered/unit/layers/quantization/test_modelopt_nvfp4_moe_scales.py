@@ -3,6 +3,7 @@
 w13 fuses the gate (w1) and up (w3) projections, which can carry separate NVFP4
 weight scales. These tests cover their checkpoint loading, the gate/up split
 in _compute_gemm1_alphas, the TRT-LLM up-half output scalar in _compute_g1_scale_c,
+the fold onto one scale for the runners that take one (_share_w13_scale),
 and the post-load SwiGLU/SiTU parameters. GPU weight packing is stubbed.
 
 The full TRT-LLM path only runs on Blackwell, and most checkpoints ship
@@ -81,7 +82,7 @@ def _global_scales(num_experts: int, num_cols: int, seed: int) -> torch.Tensor:
     return scales if num_cols > 1 else scales.squeeze(1)
 
 
-def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0, hidden_size=4096):
+def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0, hidden_size=4096, num_experts=1):
     """Small CPU buffers with the real quant method and checkpoint loader.
 
     `hidden_size` is the model dim the layer reports; the buffers stay small.
@@ -106,19 +107,21 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0, hidden_size=4096):
     layer.moe_tp_size = 2
     layer.moe_tp_rank = tp_rank
     layer.hidden_size = hidden_size
+    layer.num_experts = layer.num_local_experts = num_experts
+    layer.moe_ep_size, layer.moe_ep_rank = 1, 0
     layer.dispatcher = SimpleNamespace(set_quant_config=lambda config: None)
     num_shards = 2 if is_gated else 1
     for name, data in {
-        "w13_weight": torch.zeros(1, num_shards * 64, 32, dtype=torch.uint8),
+        "w13_weight": torch.zeros(num_experts, num_shards * 64, 32, dtype=torch.uint8),
         "w13_weight_scale": torch.zeros(
-            1, num_shards * 64, 4, dtype=torch.float8_e4m3fn
+            num_experts, num_shards * 64, 4, dtype=torch.float8_e4m3fn
         ),
-        "w13_weight_scale_2": torch.zeros(1, num_shards),
-        "w13_input_scale": torch.full((1, num_shards), 0.5),
-        "w2_weight": torch.zeros(1, 64, 32, dtype=torch.uint8),
-        "w2_weight_scale": torch.zeros(1, 64, 4, dtype=torch.float8_e4m3fn),
-        "w2_weight_scale_2": torch.ones(1),
-        "w2_input_scale": torch.ones(1),
+        "w13_weight_scale_2": torch.zeros(num_experts, num_shards),
+        "w13_input_scale": torch.full((num_experts, num_shards), 0.5),
+        "w2_weight": torch.zeros(num_experts, 64, 32, dtype=torch.uint8),
+        "w2_weight_scale": torch.zeros(num_experts, 64, 4, dtype=torch.float8_e4m3fn),
+        "w2_weight_scale_2": torch.ones(num_experts),
+        "w2_input_scale": torch.ones(num_experts),
     }.items():
         layer.register_parameter(name, torch.nn.Parameter(data, requires_grad=False))
     return layer
@@ -479,6 +482,117 @@ class TestGemm1Alphas(CustomTestCase):
 
                 self.assertEqual(g1_alphas.dtype, torch.float32)
                 self.assertEqual(g1_alphas_up.dtype, torch.float32)
+
+
+class TestShareW13Scale(CustomTestCase):
+    """Runners that take one GEMM1 scale (or clamp) for w1 and w3 fold the two
+    halves onto the larger scale; each half must still dequantize as loaded."""
+
+    # Per expert: w1 > w3, w3 > w1, equal, both zero.
+    W1_SCALE = (0.03, 0.01, 0.02, 0.0)
+    W3_SCALE = (0.01, 0.03, 0.02, 0.0)
+
+    def _load(self, layer, interleaved: bool):
+        """Distinct per-expert block and global scales through the real loader;
+        returns each expert's per-block dequant scales (w1, w3) as loaded."""
+        torch.manual_seed(0)
+        experts = len(self.W1_SCALE)
+        expected = []
+        for e in range(experts):
+            # 128 rows per shard; the loader keeps TP rank 0's 64.
+            w1_blocks, w3_blocks = (
+                (torch.rand(128, 4) * 400 + 1).to(torch.float8_e4m3fn) for _ in range(2)
+            )
+            if interleaved:
+                # Inkling loads its fused w13 as is, rows alternating w1, w3.
+                fused = torch.stack([w1_blocks[:64], w3_blocks[:64]], dim=1)
+                layer.w13_weight_scale.data[e] = fused.flatten(0, 1)
+            for shard, blocks, scale in (
+                ("w1", w1_blocks, self.W1_SCALE[e]),
+                ("w3", w3_blocks, self.W3_SCALE[e]),
+            ):
+                if not interleaved:
+                    layer._weight_loader_impl(
+                        layer.w13_weight_scale, blocks, "w13_weight_scale", shard, e
+                    )
+                layer._weight_loader_impl(
+                    layer.w13_weight_scale_2,
+                    torch.tensor(scale),
+                    "w13_weight_scale_2",
+                    shard,
+                    e,
+                )
+            expected.append(
+                (
+                    w1_blocks[:64].float() * self.W1_SCALE[e],
+                    w3_blocks[:64].float() * self.W3_SCALE[e],
+                )
+            )
+        return expected
+
+    def test_each_half_dequantizes_as_loaded(self):
+        class _Stop(Exception):
+            pass
+
+        runners, a2as = MoeRunnerBackend, MoeA2ABackend
+        cases = (
+            # runner, a2a, w13 interleaved, w3 rows first, folds
+            (runners.FLASHINFER_CUTLASS, a2as.NONE, False, True, True),
+            (runners.FLASHINFER_CUTLASS, a2as.NONE, True, False, True),
+            (runners.FLASHINFER_CUTEDSL, a2as.NONE, False, True, True),
+            (runners.FLASHINFER_CUTEDSL, a2as.DEEPEP, False, False, True),
+            # TRT-LLM folds only for its clamp, and splits the halves otherwise.
+            (runners.FLASHINFER_TRTLLM, a2as.NONE, False, True, True),
+            (runners.FLASHINFER_TRTLLM, a2as.NONE, False, True, False),
+        )
+        for runner, a2a, interleaved, up_first, folds in cases:
+            with (
+                self.subTest(
+                    runner=runner.value, a2a=a2a.value, interleaved=interleaved
+                ),
+                get_flags().moe.override(runner_backend=runner, a2a_backend=a2a),
+            ):
+                layer = _nvfp4_loader_layer(num_experts=len(self.W1_SCALE))
+                layer.inference_moe_w13_interleaved = interleaved
+                if runner.is_flashinfer_trtllm() and folds:
+                    layer.moe_runner_config.swiglu_limit = 7.0
+                expected = self._load(layer, interleaved)
+                # Stop after the scale handling, before layout and packing.
+                layer.dispatcher = SimpleNamespace(
+                    set_quant_config=mock.Mock(side_effect=_Stop)
+                )
+                with self.assertRaises(_Stop):
+                    layer.quant_method.process_weights_after_loading(layer)
+                # Every expert's input scale is 0.5.
+                gate_scale = layer.g1_alphas / 0.5
+                up_scale = layer.g1_alphas_up / 0.5
+                if folds:
+                    torch.testing.assert_close(gate_scale, up_scale, rtol=0, atol=0)
+                for e, (w1, w3) in enumerate(expected):
+                    halves = layer.w13_weight_scale[e].float().chunk(2)
+                    w3_blocks, w1_blocks = halves if up_first else halves[::-1]
+                    with self.subTest(expert=e):
+                        # One more E4M3 rounding (3 mantissa bits) at most.
+                        torch.testing.assert_close(
+                            w1_blocks * gate_scale[e], w1, rtol=2**-4, atol=0
+                        )
+                        torch.testing.assert_close(
+                            w3_blocks * up_scale[e], w3, rtol=2**-4, atol=0
+                        )
+
+    def test_marlin_weight_prep_needs_no_method_runner_config(self):
+        """Muse Spark runs this weight prep on Marlin without ever calling
+        create_moe_runner, so the method has no runner config of its own."""
+        with (
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.MARLIN),
+            mock.patch.object(
+                modelopt_quant, "prepare_moe_nvfp4_layer_for_marlin"
+            ) as prepare,
+        ):
+            layer = _nvfp4_loader_layer()
+            del layer.quant_method.moe_runner_config
+            layer.quant_method.process_weights_after_loading(layer)
+        prepare.assert_called_once_with(layer)
 
 
 class TestG1ScaleC(CustomTestCase):

@@ -117,9 +117,9 @@ def resolve_cutedsl_standard_scales(
         alpha = alpha.to(torch.float32)
         if scale.ndim == 0:
             return scale
-        # Gated weight scales may be (num_experts, 2) with separate gate/up
-        # columns. Collapse to 1D by taking the first column (gate == up for
-        # well-formed checkpoints; mismatch is warned in process_weights_after_loading).
+        # Gated weight scales may be (num_experts, 2) with gate/up columns.
+        # Collapse to 1D by taking the first column (CUTLASS and CuTe DSL weight
+        # prep fold w1 and w3 onto one scale; see _share_w13_scale).
         if scale.ndim == 2 and scale.shape[1] <= 2:
             scale = scale[:, 0]
         if scale.numel() == alpha.numel():

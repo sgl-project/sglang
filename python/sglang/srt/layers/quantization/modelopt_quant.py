@@ -2405,6 +2405,50 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+_w13_scale_fold_warned = False
+
+
+def _share_w13_scale(
+    layer: torch.nn.Module,
+    gate_scale: torch.Tensor,
+    up_scale: torch.Tensor,
+    *,
+    up_first: bool,
+) -> torch.Tensor:
+    """Fold w13's halves onto one per-expert scale, the larger of
+    ``gate_scale`` and ``up_scale``, and return it.
+
+    The smaller half's E4M3 block scales absorb the ratio, which is at most 1,
+    so none overflows; each takes one more E4M3 rounding, keeps fewer bits
+    below E4M3's normal range, and rounds to zero below its smallest subnormal.
+    An expert whose two scales are equal, zero included, keeps its block
+    scales. ``up_first``: w3's block-scale rows come first.
+    """
+    global _w13_scale_fold_warned
+    shared = torch.maximum(gate_scale, up_scale)
+    untied = gate_scale != up_scale
+    if not untied.any():
+        return shared
+    halves = (up_scale, gate_scale) if up_first else (gate_scale, up_scale)
+    ratios = torch.where(
+        untied[:, None], torch.stack(halves, dim=1) / shared[:, None], 1.0
+    )
+    if not _w13_scale_fold_warned:
+        _w13_scale_fold_warned = True
+        smallest = (torch.minimum(gate_scale, up_scale) / shared)[untied].min()
+        logger.warning(
+            "w1 and w3 scales differ in %d of %d experts (the smaller down to "
+            "%.3g of the larger); the runner takes one, so the smaller half's "
+            "E4M3 block scales absorb the ratio.",
+            int(untied.sum()),
+            untied.numel(),
+            smallest.item(),
+        )
+    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
+    block_scales.copy_(block_scales.float().mul_(ratios[:, :, None, None]))
+    return shared
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2764,9 +2808,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
-        if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
-            layer, "_w13_deinterleaved", False
-        ):
+        w13_interleaved = getattr(layer, "inference_moe_w13_interleaved", False)
+        if w13_interleaved and not getattr(layer, "_w13_deinterleaved", False):
             up_first = self.use_flashinfer_trtllm_weight_layout
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
@@ -2790,8 +2833,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
-            # the gate/up columns to the gate scale here. Other backends keep the
-            # raw scale and split the halves later (see _compute_gemm1_alphas).
+            # the gate/up columns to the gate scale here. FlashInfer CUTLASS and
+            # CuTe DSL fold the halves onto one scale below (_share_w13_scale);
+            # TRT-LLM splits them (see _compute_gemm1_alphas).
             if layer.moe_runner_config.is_gated:
                 if layer.w13_weight_scale_2.dim() == 1:
                     # Some checkpoints store a shared scale for w1/w3.
@@ -2816,6 +2860,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
+
+        # Where w3's block-scale rows are: the de-interleave's order, or where
+        # the loader put the w1 and w3 shards. Muse Spark's Marlin path, which
+        # sets no method runner config, returns above.
+        w3_rows_first = (
+            self.use_flashinfer_trtllm_weight_layout
+            if w13_interleaved
+            else self.load_up_proj_weight_first
+        )
+        if layer.moe_runner_config.is_gated and (
+            self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_cutedsl_moe
+        ):
+            # These runners take one GEMM1 scale (g1_alphas) for w1 and w3.
+            # Fold before the CuTe DSL interleave, while the halves are contiguous.
+            scale_2 = layer.w13_weight_scale_2
+            shared = _share_w13_scale(
+                layer, scale_2[:, 0], scale_2[:, 1], up_first=w3_rows_first
+            )
+            scale_2.data.copy_(shared[:, None].expand_as(scale_2))
 
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
@@ -2874,7 +2937,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
         # Create shared parameters. g1_alphas / g1_alphas_up are the gate (w1)
-        # and up (w3) GEMM1 scales (equal for shared-scale checkpoints).
+        # and up (w3) GEMM1 scales (equal for shared-scale checkpoints and
+        # after the CUTLASS / CuTe DSL fold above).
         g1_alphas, g1_alphas_up = _compute_gemm1_alphas(
             layer.w13_weight_scale_2,
             w13_input_scale,
@@ -2908,21 +2972,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             if gemm1_clamp_limit is not None:
                 # The kernel clamps both raw halves with one limit, so move both onto
-                # the larger alpha by rescaling the smaller half's E4M3 block scales.
-                untied = layer.g1_alphas != layer.g1_alphas_up
-                if untied.any():
-                    shared_alphas = torch.maximum(layer.g1_alphas, layer.g1_alphas_up)
-                    # Block-scale rows are [up, gate] in the TRT-LLM weight layout.
-                    ratios = torch.stack([layer.g1_alphas_up, layer.g1_alphas], dim=1)
-                    ratios = torch.where(
-                        untied[:, None], ratios / shared_alphas[:, None], 1.0
-                    )
-                    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
-                    block_scales.copy_(
-                        block_scales.float().mul_(ratios[:, :, None, None])
-                    )
-                    copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
-                    copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
+                # the larger alpha. Both alphas carry w13_input_scale, so their
+                # ratio is the w1 and w3 weight scales' ratio.
+                shared_alphas = _share_w13_scale(
+                    layer,
+                    layer.g1_alphas,
+                    layer.g1_alphas_up,
+                    up_first=w3_rows_first,
+                )
+                copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
+                copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
                 copy_or_rebind_param(
                     layer,
                     "gemm1_clamp_limit",
