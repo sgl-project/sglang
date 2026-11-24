@@ -13,20 +13,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-
-# Re-exported for back-compat: callers import these names from this module path.
-from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # noqa: F401
-    _CACHE_TYPE_CONCAT,
-    _CACHE_TYPE_STATE,
-    _INT32_SAFE_CONV_ELEMENTS,
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     _NUM_STREAM_CACHE_SLOTS,
-    _SLOT_CAM_K,
-    _SLOT_CAM_V,
     _SLOT_FFN_TCONV,
-    _SLOT_K,
-    _SLOT_SHORTCONV,
-    _SLOT_TYPE_FLAG,
-    _SLOT_V,
     BidirectionalGDNUCPESinglePathLiteLA,
     CaptionEmbedder,
     GLUMBConvTemp,
@@ -35,46 +24,9 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     T2IFinalLayer,
     TimestepEmbedder,
     WanRotaryPosEmbed,
-    _apply_block_diagonal,
-    _apply_complex_rope,
-    _apply_ray_projmat,
-    _apply_rotary_emb_bhnd,
-    _apply_rotary_emb_dn,
-    _bidirectional_short_conv,
     _build_ucpe_apply_fns,
-    _compute_fov_from_focal,
-    _compute_frame_gates,
-    _ConvLayer,
-    _downscale_to_reference_rms,
-    _flip_and_shift,
-    _gdn_chunk_scan_forward,
-    _gdn_scan_bidirectional,
-    _gdn_scan_cached,
-    _gdn_scan_forward,
-    _gdn_scan_forward_stateful,
-    _invert_SE3,
-    _log_sana_wm_triton_cam_gdn_fallback,
-    _log_sana_wm_triton_gdn_fallback,
     _RMSNorm,
-    _sana_wm_chunk_boundaries_for_attention,
-    _sana_wm_chunk_index_from_chunk_size,
-    _sana_wm_chunked_attention,
-    _sana_wm_normalize_chunk_index,
-    _sana_wm_padded_scale,
-    _sana_wm_sdpa,
-    _ShortConvolution,
-    _single_path_delta_chunk_scan_forward,
-    _single_path_delta_scan_bidirectional,
-    _single_path_delta_scan_cached,
-    _single_path_delta_scan_forward,
-    _single_path_delta_scan_forward_stateful,
-    _sinusoidal_timestep_embedding,
-    _slice_rope_for_cam,
-    _slice_rope_to_current_chunk,
-    _temporal_short_conv_cached,
     _tensor_cache_key,
-    _UpstreamMlp,
-    compute_chunk_plucker,
     process_camera_conditions_ucpe,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -354,9 +306,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.out_channels = arch.out_channels
         self.num_channels_latents = arch.num_channels_latents
         self.vae_temporal_stride = arch.vae_temporal_stride
-        self.timestep_norm_scale_factor = getattr(
-            arch, "timestep_norm_scale_factor", 1.0
-        )
+        self.timestep_norm_scale_factor = arch.timestep_norm_scale_factor
 
         # --- Embedders ---
         self.x_embedder = PatchEmbedMS3D(
@@ -377,11 +327,11 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             hidden_size=self.inner_dim,
             token_num=arch.model_max_length,
         )
-        self.y_norm = bool(getattr(arch, "y_norm", True))
+        self.y_norm = bool(arch.y_norm)
         self.attention_y_norm = _RMSNorm(
             self.inner_dim,
-            scale_factor=getattr(arch, "y_norm_scale_factor", 1.0),
-            eps=getattr(arch, "y_norm_eps", 1e-5),
+            scale_factor=arch.y_norm_scale_factor,
+            eps=arch.y_norm_eps,
         )
 
         # 3-channel raymap embedder -- kept for state_dict compatibility but
@@ -408,8 +358,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.plucker_embedder = None
         self.use_chunk_plucker_post_attn = arch.use_chunk_plucker_post_attn
         self.use_chunk_plucker_input = arch.use_chunk_plucker_input
-        self.chunk_size = getattr(arch, "chunk_size", None)
-        self.chunk_split_strategy = getattr(arch, "chunk_split_strategy", "uniform")
+        self.chunk_size = arch.chunk_size
+        self.chunk_split_strategy = arch.chunk_split_strategy
 
         # --- RoPE ---
         self.rope = WanRotaryPosEmbed(
@@ -449,13 +399,11 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ),
                     chunk_size=self.chunk_size,
                     chunk_split_strategy=self.chunk_split_strategy,
-                    update_rule=getattr(arch, "update_rule", "torch_chunk"),
-                    cam_update_rule=getattr(arch, "cam_update_rule", "torch_chunk"),
-                    chunk_gdn_chunk_size=getattr(arch, "chunk_gdn_chunk_size", 21),
-                    use_chunked_softmax_attention=getattr(
-                        arch, "use_chunked_softmax_attention", False
-                    ),
-                    gdn_backend=getattr(arch, "gdn_backend", "auto"),
+                    update_rule=arch.update_rule,
+                    cam_update_rule=arch.cam_update_rule,
+                    chunk_gdn_chunk_size=arch.chunk_gdn_chunk_size,
+                    use_chunked_softmax_attention=arch.use_chunked_softmax_attention,
+                    gdn_backend=arch.gdn_backend,
                 )
                 for i in range(depth)
             ]

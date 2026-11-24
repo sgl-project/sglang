@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -24,8 +25,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 import msgspec
 from typing_extensions import Self
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     EncoderMetricsCollector,
     SchedulerMetricsCollector,
@@ -81,6 +82,56 @@ def convert_time_to_realtime_ns(time_value: float) -> int:
 
 def convert_realtime_to_time(realtime_value: float) -> float:
     return realtime_value - global_diff_realtime_monotonic
+
+
+def compute_ttft_breakdown(
+    *,
+    received: Optional[float],
+    forward_entry: Optional[float],
+    prefill_finished: Optional[float],
+    queue_time: Optional[float],
+    prefetch_wait: Optional[float],
+    ttft: Optional[float],
+    num_retractions: Optional[int],
+) -> Dict[str, float]:
+    """Compute phase durations in seconds; omit unavailable or invalid phases.
+
+    Timestamps must share a clock. Prefill includes inter-chunk gaps, and
+    after_prefill is elapsed time until the first output, not a KV-transfer timer.
+    """
+
+    def measured(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+
+    phases = {}
+    if measured(prefetch_wait) and prefetch_wait >= 0:
+        phases["storage_prefetch_wait"] = prefetch_wait
+        if measured(queue_time) and queue_time >= prefetch_wait:
+            phases["other_queue"] = queue_time - prefetch_wait
+    if (
+        measured(forward_entry)
+        and measured(prefill_finished)
+        and prefill_finished >= forward_entry
+    ):
+        phases["prefill_latency"] = prefill_finished - forward_entry
+    if (
+        num_retractions == 0
+        and "prefill_latency" in phases
+        and measured(received)
+        and measured(queue_time)
+        and queue_time >= 0
+        and measured(ttft)
+    ):
+        before_queue = forward_entry - received - queue_time
+        after_prefill = ttft - (prefill_finished - received)
+        if before_queue >= 0 and after_prefill >= 0:
+            phases["before_queue"] = before_queue
+            phases["after_prefill"] = after_prefill
+    return phases
 
 
 @dataclass
@@ -197,20 +248,10 @@ class RequestStage:
         level=3,
         metrics_is_observed=True,
     )
-    DECODE_QUICK_FINISH = RequestStageConfig(
-        "quick_finish",
-        level=1,
-        metrics_is_observed=True,
-    )
 
     # speculative decode
     SPEC_DRAFT = RequestStageConfig(
         "spec_draft",
-        level=2,
-    )
-
-    SPEC_VERIFY = RequestStageConfig(
-        "spec_verify",
         level=2,
     )
 
@@ -219,9 +260,6 @@ class RequestStage:
         "run_batch_cpu",
         level=4,
     )
-
-    # other
-    ANONYMOUS = RequestStageConfig("")
 
 
 @dataclass
@@ -482,7 +520,33 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
 
-    def convert_to_output_meta_info(self, completion_tokens=0):
+    def get_ttft_breakdown(
+        self,
+        scheduler_time_stats: SchedulerOutputTimeStats,
+        num_retractions: Optional[int],
+    ) -> Dict[str, float]:
+        scheduler = scheduler_time_stats
+        return compute_ttft_breakdown(
+            received=(
+                convert_time_to_realtime(self.created_time)
+                if self.created_time > 0
+                else None
+            ),
+            forward_entry=scheduler.forward_entry_time,
+            prefill_finished=scheduler.prefill_finished_time,
+            queue_time=scheduler.queue_time,
+            prefetch_wait=scheduler.storage_prefetch_wait,
+            ttft=(
+                self.get_first_token_latency()
+                if self.first_token_time > self.created_time > 0
+                else None
+            ),
+            num_retractions=num_retractions,
+        )
+
+    def convert_to_output_meta_info(
+        self, scheduler_time_stats=None, completion_tokens=0, num_retractions=None
+    ):
         meta_info = {}
         if self.created_time > 0.0:
             meta_info["request_received_ts"] = convert_time_to_realtime(
@@ -506,6 +570,10 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         decode_throughput = self.get_decode_throughput(completion_tokens)
         if decode_throughput is not None:
             meta_info["decode_throughput"] = decode_throughput
+        if scheduler_time_stats is not None:
+            meta_info.update(
+                self.get_ttft_breakdown(scheduler_time_stats, num_retractions)
+            )
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
@@ -652,7 +720,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     # speculative decoding
     spec_draft_start_time: float = 0.0
-    spec_verify_start_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -699,10 +766,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.trace_ctx.tracing_enable:
             stage = RequestStage.SPEC_DRAFT
             self.trace_slice(stage, self.spec_draft_start_time, ts)
-
-    def set_spec_verify_start_time(self, ts=None):
-        ts = ts or time.perf_counter()
-        self.spec_verify_start_time = ts
 
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
@@ -1284,8 +1347,4 @@ def flush_trace_batch(reqs: List[Any]):
     if reqs is None or not get_global_tracing_enabled():
         return
     for req in reqs:
-        time_stats = getattr(req, "time_stats", None)
-        if time_stats is not None:
-            trace_ctx = getattr(time_stats, "trace_ctx", None)
-            if trace_ctx is not None:
-                trace_ctx.flush()
+        req.time_stats.trace_ctx.flush()

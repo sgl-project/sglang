@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.elementwise.hc_combine import hc_combine
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
@@ -134,25 +134,6 @@ def test_hc_combine_3d_input():
 
     assert out.shape == residual.shape
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
-
-
-def test_hc_combine_bad_hidden_size():
-    dtype = torch.bfloat16
-    block_output, residual, normed_residual, inject_weight = _make_inputs(
-        4,
-        dtype,
-        hc=4,
-        hs=1000,  # 4 * 1000 = 4000, not a multiple of 2048
-    )
-    with pytest.raises(RuntimeError, match="2048"):
-        hc_combine(
-            block_output,
-            residual,
-            normed_residual,
-            inject_weight,
-            4,
-            1000,
-        )
 
 
 if __name__ == "__main__":

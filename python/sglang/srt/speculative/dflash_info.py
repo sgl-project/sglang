@@ -9,11 +9,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_npu
 
@@ -105,6 +102,16 @@ class DFlashVerifyInput(SpecInput):
             # before init_new snapshots them into the verify ForwardBatch.
             # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
             prepare_mamba_track_for_verify(batch)
+            # Host upper bound of this batch's final KV lengths: bounds the
+            # backend's replay page-table copies in mirrorless mode without a
+            # D2H sync (mirrors eagle_utils.eagle_prepare_for_verify). Test
+            # batches may be bare namespaces without reqs; consumers fall back
+            # to full-width when the hint is absent.
+            reqs = getattr(batch, "reqs", None)
+            if reqs:
+                batch.max_seq_len_host = (
+                    max((req.seqlen for req in reqs), default=0) + self.draft_token_num
+                )
         verify_forward_batch = ForwardBatch.init_new(
             batch,
             target_worker.model_runner,

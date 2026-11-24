@@ -5,15 +5,13 @@ from argparse import Namespace
 from dataclasses import dataclass
 from typing import List, Optional
 
-import numpy as np
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import (
-    ASSISTANT_SUFFIX,
     BaseDataset,
     DatasetRow,
+    tokenize_and_filter_turn_pairs,
 )
-from sglang.benchmark.utils import remove_suffix
 
 
 @dataclass
@@ -91,57 +89,12 @@ def sample_custom_requests(
     dataset = processed_dataset
     random.shuffle(dataset)
 
-    # Filter out sequences that are too long or too short
-    filtered_dataset: List[DatasetRow] = []
-
-    for i in range(len(dataset)):
-        if len(filtered_dataset) == num_requests:
-            break
-
-        # Tokenize the prompts and completions.
-        prompt = dataset[i][0]
-
-        if prompt_suffix:
-            prompt = (
-                remove_suffix(prompt, ASSISTANT_SUFFIX)
-                + prompt_suffix
-                + ASSISTANT_SUFFIX
-            )
-
-        if apply_chat_template:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-                return_dict=False,
-            )
-            if tokenizer.bos_token:
-                prompt = prompt.replace(tokenizer.bos_token, "")
-
-        prompt_token_ids = tokenizer.encode(prompt)
-        completion = dataset[i][1]
-        completion_token_ids = tokenizer.encode(completion)
-        prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
-
-        if prompt_len < 2 or output_len < 2:
-            # Prune too short sequences.
-            continue
-
-        if context_len and prompt_len + output_len > context_len:
-            # Prune too long sequences.
-            continue
-
-        filtered_dataset.append(
-            DatasetRow(
-                prompt=prompt,
-                prompt_len=prompt_len,
-                output_len=output_len,
-            )
-        )
-
-    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
-    return filtered_dataset
+    return tokenize_and_filter_turn_pairs(
+        dataset,
+        num_requests=num_requests,
+        tokenizer=tokenizer,
+        fixed_output_len=fixed_output_len,
+        context_len=context_len,
+        prompt_suffix=prompt_suffix,
+        apply_chat_template=apply_chat_template,
+    )

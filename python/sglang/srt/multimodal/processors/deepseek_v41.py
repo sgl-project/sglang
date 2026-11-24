@@ -7,11 +7,7 @@ from functools import partial
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
@@ -20,6 +16,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     patchify_image_rust,
     prepare_image_gpu,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -40,7 +37,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         self.preprocess_backend = "cpu"
         self.cpu_patchify = patchify_image
         backend = get_mm().image_processor_backend
-        if backend == "pil" or get_mm().disable_fast_image_processor:
+        if backend == "pil":
             self.preprocess_backend = "cpu"
         elif envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get():
             self.preprocess_backend = "gpu"
@@ -76,14 +73,22 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, *args, **kwargs
     ):
-        base = await self.load_mm_data(
-            input_text, image_data=image_data, multimodal_tokens=self.mm_tokens
-        )
-        ids = (
-            input_text
-            if isinstance(input_text, list)
-            else self._processor.encode(input_text)
-        )
+        if isinstance(input_text, list):
+            # Decoded text spells image-token text like a placeholder; the IDs
+            # tell them apart, so the count below is the alignment check.
+            ids = input_text
+            self.validate_mm_data(image_data)
+            base = await self.fast_load_mm_data(
+                input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                input_ids=ids,
+            )
+        else:
+            ids = self._processor.encode(input_text)
+            base = await self.load_mm_data(
+                input_text, image_data=image_data, multimodal_tokens=self.mm_tokens
+            )
         if ids.count(self.image_token_id) != len(base.images):
             raise ValueError("Image placeholders and images must match")
         images = iter(base.images)

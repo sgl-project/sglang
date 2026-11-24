@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import upload_without_sync
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision_override,
@@ -509,8 +510,6 @@ class TextEncodingStage(ConditionEncodingStage):
         max_length: int | None = None,
         truncation: bool | None = None,
         padding: bool | str | None = None,
-        return_overflowing_tokens=None,
-        return_length=None,
     ):
         """
         Encode plain text using selected text encoder(s) and return embeddings.
@@ -622,6 +621,10 @@ class TextEncodingStage(ConditionEncodingStage):
                 server_args.pipeline_config, i
             ):
                 tok_kwargs["max_length"] = max_length
+            if truncation is not None:
+                tok_kwargs["truncation"] = truncation
+            if padding is not None:
+                tok_kwargs["padding"] = padding
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
@@ -637,7 +640,7 @@ class TextEncodingStage(ConditionEncodingStage):
             )
 
             def encode_conditioning():
-                text_inputs = host_inputs.to(target_device, non_blocking=True)
+                text_inputs = upload_without_sync(host_inputs, target_device)
 
                 input_ids = text_inputs["input_ids"]
                 attention_mask = (

@@ -129,6 +129,17 @@ _OWNER_SITES = {
         "SchedulerDllmMixin._stash_dllm_context",
         "set_row_len",
     ): 1,
+    # document reuse owns the retained row and the appended copied tokens
+    (
+        "models/unlimited_ocr_v2_support/document_reuse.py",
+        "DocReuse._retain_finished",
+        "truncate",
+    ): 1,
+    (
+        "models/unlimited_ocr_v2_support/document_reuse.py",
+        "DocReuse._splice_text",
+        "allocate_decode",
+    ): 1,
     # streaming session tail trimming
     (_SS, "StreamingSession._free_tail", "truncate"): 1,
     (_SS, "StreamingSession._trim_overshoot", "truncate"): 1,

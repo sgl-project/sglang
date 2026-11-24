@@ -639,7 +639,7 @@ Historical results below use the removed harness and are not measurements of the
 We use SGLang's built-in `bench_serving` tool with the `random` dataset (input 8192, output 1024, range ratio 0.8). For each concurrency `C`, `--num-prompts` is set to `C × 5`.
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model amd/Kimi-K2.7-Code-MXFP4 \
   --dataset-name random \

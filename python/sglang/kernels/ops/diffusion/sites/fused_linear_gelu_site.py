@@ -33,7 +33,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.diffusion.common.platform import platform_key
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -131,8 +132,7 @@ _VERDICTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _input_independent_ok(linear: Any) -> bool:
-    arch = get_jit_cuda_arch()
-    if arch.major * 10 + arch.minor >= 120:
+    if current_arch().is_sm_at_least(12):
         # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
         # builds is slower than GEMM + the native GELU kernel for the FLUX
         # production shape (1, 512, 3072 -> 12288).  Keep quality-gated sites
@@ -167,6 +167,12 @@ def _site_reject_reason(site: nn.Module) -> str | None:
 
 
 class _LinearGeluFusion(QualityGatedFusion):
+    def mark(self, module: nn.Module, metadata: Any = True) -> None:
+        # The cublasLt GELU epilogue is CUDA-only.
+        if platform_key() == "npu":
+            return
+        super().mark(module, metadata)
+
     def mount(self, root: nn.Module) -> bool:
         _VERDICTS.clear()
         return super().mount(root)

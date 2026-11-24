@@ -92,6 +92,11 @@ class LoraMergeCache:
         for meta in entries.values():
             if not os.path.exists(os.path.join(self.root, meta.get("file", ""))):
                 return False
+        try:
+            os.utime(self.root)  # most recently used: evicted last
+        except OSError:
+            # Evicted by another instance after the file checks: a cache miss.
+            return False
         self._entries = entries
         return True
 
@@ -108,7 +113,12 @@ class LoraMergeCache:
         meta = self._entries.get(name)
         if meta is None:
             return None
-        mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
+        try:
+            mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
+        except FileNotFoundError:
+            # Another instance evicted this store after is_complete().
+            self._entries = {}
+            return None
         tensor = mapped.get("weight")
         if (
             tensor is None
@@ -126,13 +136,29 @@ class LoraMergeCache:
 
     # -- capture (first run) --------------------------------------------------
 
+    def _evict_for(self, need: float) -> None:
+        """Drop the least recently used other stores until `need` bytes are free."""
+        parent = os.path.dirname(self.root)
+        others = [
+            e.path for e in os.scandir(parent) if e.is_dir() and e.path != self.root
+        ]
+        for stale in sorted(others, key=os.path.getmtime):
+            if shutil.disk_usage(parent).free >= need:
+                break
+            shutil.rmtree(stale, ignore_errors=True)
+            logger.info("Evicted old LoRA merge cache %s", stale)
+
     def _ensure_writable(self) -> bool:
         if self._writable is not None:
             return self._writable
         try:
             os.makedirs(self.root, exist_ok=True)
+            need = self.expected_bytes * _DISK_HEADROOM
             usage = shutil.disk_usage(self.root)
-            if usage.free < self.expected_bytes * _DISK_HEADROOM:
+            if usage.free < need:
+                self._evict_for(need)
+                usage = shutil.disk_usage(self.root)
+            if usage.free < need:
                 logger.warning(
                     "LoRA merge cache needs %.1f GiB free under %s but only "
                     "%.1f GiB is available; merged weights stay in anonymous "

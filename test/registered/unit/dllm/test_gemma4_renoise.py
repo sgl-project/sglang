@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.arg_groups.overrides import _dllm_attention_backend, resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import _dllm_attention_backend
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise, _sample_denoiser
 from sglang.srt.dllm.config import DllmConfig
@@ -13,7 +14,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")

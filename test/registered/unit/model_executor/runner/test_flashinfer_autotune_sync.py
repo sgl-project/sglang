@@ -8,8 +8,8 @@ cover that gate and the digest it decides on.
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=68, suite="base-a-test-cpu")
-register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cuda_ci(est_time=22, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 import json
 import multiprocessing
@@ -26,6 +26,7 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
@@ -38,8 +39,8 @@ from sglang.test.test_utils import CustomTestCase, find_available_port
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
 
 
-def _gate_worker(rank, world_size, master_port, cache_path, writer):
-    """Run the entry gate on one rank; report whether the cache survived."""
+def _gate_worker(rank, world_size, master_port, cache_paths, writer):
+    """Run the entry gate on one rank per cache; report which caches survived."""
     try:
         os.environ.update(
             RANK=str(rank),
@@ -48,8 +49,11 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
             MASTER_PORT=str(master_port),
         )
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        _drop_diverged_autotune_cache(Path(cache_path), dist.group.WORLD, ENV)
-        writer.send(("ok", Path(cache_path).is_file()))
+        kept = []
+        for cache_path in cache_paths:
+            _drop_diverged_autotune_cache(Path(cache_path), dist.group.WORLD, ENV)
+            kept.append(Path(cache_path).is_file())
+        writer.send(("ok", kept))
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         writer.send(("error", f"{e}"))
@@ -128,7 +132,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                     patch.multiple(
                         autotune,
                         flashinfer_autotune_cache_path=lambda _: cache_path,
-                        get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
+                        get_flashinfer_autotune_skip_ops=lambda: skip_ops,
                         get_exec=lambda: SimpleNamespace(
                             moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
                         ),
@@ -179,7 +183,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 patch.multiple(
                     autotune,
                     flashinfer_autotune_cache_path=lambda _: cache_path,
-                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_flashinfer_autotune_skip_ops=lambda: set(),
                     get_exec=lambda: SimpleNamespace(
                         moe=SimpleNamespace(moe_runner_backend="triton")
                     ),
@@ -260,18 +264,23 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
 
-    def _run_gate(self, per_rank_configs) -> list:
-        world_size = len(per_rank_configs)
+    def _run_gate(self, scenarios) -> list:
+        """Gate each scenario's per-rank caches in one spawn; return what each
+        rank kept, per scenario."""
+        world_size = len(scenarios[0])
         port = find_available_port(23456)
         ctx = multiprocessing.get_context("spawn")
         procs, readers = [], []
-        for rank, configs in enumerate(per_rank_configs):
-            path = self.dir / f"rank{rank}.json"
-            path.write_text(json.dumps(configs))
+        for rank in range(world_size):
+            paths = []
+            for index, per_rank_configs in enumerate(scenarios):
+                path = self.dir / f"scenario{index}_rank{rank}.json"
+                path.write_text(json.dumps(per_rank_configs[rank]))
+                paths.append(str(path))
             reader, writer = ctx.Pipe(duplex=False)
             proc = ctx.Process(
                 target=_gate_worker,
-                args=(rank, world_size, port, str(path), writer),
+                args=(rank, world_size, port, paths, writer),
             )
             proc.start()
             writer.close()
@@ -282,30 +291,16 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
             proc.join(timeout=120)
         for status, value in results:
             self.assertEqual(status, "ok", msg=value)
-        return [value for _, value in results]
+        return [list(kept) for kept in zip(*(value for _, value in results))]
 
-    def test_matching_caches_are_kept(self):
-        entries = {"_metadata": {"cublas": "12.8"}, "op": 7}
-        self.assertEqual(self._run_gate([entries, entries]), [True, True])
-
-    def test_diverged_caches_are_dropped_on_every_rank(self):
-        # A rank that kept its cache would skip profiles its peer still runs.
+    def test_matching_caches_are_kept_and_diverged_ones_dropped_everywhere(self):
+        # A rank that kept a diverged cache would skip profiles its peer still runs.
         meta = {"_metadata": {"cublas": "12.8"}}
-        self.assertEqual(
-            self._run_gate([{**meta, "op": 7}, {**meta, "op": 8}]), [False, False]
+        matching = {**meta, "op": 7}
+        kept = self._run_gate(
+            [[matching, matching], [{**meta, "op": 7}, {**meta, "op": 8}]]
         )
-
-    def test_caches_diverging_only_in_metadata_are_dropped(self):
-        # Same desync, reached through the stamp instead of the tactics.
-        self.assertEqual(
-            self._run_gate(
-                [
-                    {"_metadata": {"cublas": "12.8"}, "op": 7},
-                    {"_metadata": {"cublas": "12.9"}, "op": 7},
-                ]
-            ),
-            [False, False],
-        )
+        self.assertEqual(kept, [[True, True], [False, False]])
 
 
 class TestModelPrefillAutotune(CustomTestCase):
@@ -358,6 +353,55 @@ class TestModelPrefillAutotune(CustomTestCase):
                 self.flashinfer_autotune_context.assert_not_called()
 
 
+class TestExtendAutotuneDummy(CustomTestCase):
+    """SGLANG_FLASHINFER_AUTOTUNE_EXTEND must tune exactly the per-rank prefill
+    ceiling: speculative targets were skipped, and a request-pool-capped dummy
+    rounded past the ceiling overflows FlashInfer A2A dispatch workspaces."""
+
+    def _run_extend_pass(self, *, speculative: bool):
+        mr = SimpleNamespace(
+            model=SimpleNamespace(),
+            is_generation=True,
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: speculative),
+            attn_backend=SimpleNamespace(extend_dummy_seqs_capped_by_req_pool=True),
+            req_to_token_pool=SimpleNamespace(size=12),
+        )
+        runner = SimpleNamespace(
+            model_runner=mr,
+            _alloc_dummy_decode_buffers=Mock(return_value=SimpleNamespace()),
+            _dummy_run=Mock(),
+        )
+        with (
+            patch.object(autotune, "max_prefill_buffer_tokens", return_value=4096),
+            patch.object(
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                autotune,
+                "run_flashinfer_autotune_forward",
+                side_effect=lambda mr, forward_fn, run_lm_head: forward_fn(),
+            ),
+            patch.object(autotune, "autotune_dummy_run_ctx"),
+            patch.object(autotune.torch.cuda, "empty_cache"),
+        ):
+            autotune.maybe_flashinfer_autotune_extend(runner, decode_num_tokens=48)
+        return runner._dummy_run.call_args.kwargs
+
+    def test_dummy_is_an_even_split_of_the_prefill_ceiling(self):
+        for speculative in (False, True):
+            with self.subTest(speculative=speculative):
+                kwargs = self._run_extend_pass(speculative=speculative)
+                self.assertEqual(kwargs["forward_mode_override"], ForwardMode.EXTEND)
+                # 4096 tokens over at most 12 request slots: 8 seqs x 512.
+                self.assertEqual(
+                    (kwargs["batch_size"], kwargs["extend_num_tokens_per_req"]),
+                    (8, 512),
+                )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
 class TestAutotuneCachePhases(CustomTestCase):
     """Loaded target tactics survive draft warmup, unless cache reuse is off."""
@@ -383,6 +427,12 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 )
             with (
+                # The per-rank JSON cache, which multi-rank and MegaMoE keep.
+                patch.object(
+                    autotune,
+                    "uses_flashinfer_managed_autotune_cache",
+                    return_value=False,
+                ),
                 patch.object(
                     autotune,
                     "flashinfer_autotune_cache_path",

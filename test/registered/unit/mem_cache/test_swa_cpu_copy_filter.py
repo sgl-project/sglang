@@ -43,16 +43,6 @@ class TestSWACpuCopyFilter(unittest.TestCase):
             expected = _rows(t)[row_mask]
             self.assertTrue(torch.equal(tensor, expected))
 
-    def test_unquantized_chunk_is_unchanged(self):
-        row_mask = torch.tensor([False, True, True, False])
-
-        filtered = filter_window_cpu_copy(
-            _window(), swa_kv_cpu=_chunk(2), row_mask=row_mask
-        )
-
-        self.assertEqual(len(filtered[0][0]), 2)
-        self.assertEqual(filtered[0][0][0].shape[0], 2)
-
     def test_all_rows_kept_returns_the_input(self):
         original = _chunk(4)
 
@@ -65,7 +55,8 @@ class TestSWACpuCopyFilter(unittest.TestCase):
 
 
 class TestUnifiedSWATransfers(CustomTestCase):
-    def test_offload_uses_physical_swa_pages(self):
+    def test_offload_names_live_window_pages_by_owner_ids(self):
+        # The copy translates them when it is submitted, after any page move.
         from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
             DecodeKVCacheOffloadManager,
         )
@@ -87,10 +78,17 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 if tombstone_tokens == len(indices):
                     self.assertEqual(transfers, [])
                     continue
+                self.assertTrue(
+                    torch.equal(transfers[0].device_indices, indices[tombstone_tokens:])
+                )
                 expected_pages = allocator.swa_v2p_page_table[
                     indices[tombstone_tokens::4] // 4
                 ]
-                pages = transfers[0].device_indices[::4] // 4
+                rows = allocator.storage.window_ids(
+                    allocator.swa_attn_allocator.sub_pool_name,
+                    transfers[0].device_indices,
+                )
+                pages = rows[::4] // 4
                 buffer = manager.kv_cache.layer_router.view(
                     "swa"
                 ).get_page_envelope_buffer()
@@ -128,7 +126,9 @@ class TestUnifiedSWATransfers(CustomTestCase):
 
         self.assertTrue(torch.equal(full_buffer[full_pages], expected_full))
         self.assertTrue(torch.equal(swa_buffer[swa_pages], expected_swa))
-        self.assertEqual(saved["swa_mask"].tolist(), [False] * 4 + [True] * 8)
+        # Only the window rows still mapped are saved: the tombstoned four are not.
+        window = saved.bands[allocator.swa_attn_allocator.sub_pool_name]
+        self.assertEqual(window.positions.tolist(), list(range(4, 12)))
 
 
 if __name__ == "__main__":

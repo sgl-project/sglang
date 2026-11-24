@@ -15,6 +15,7 @@ Notes:
 """
 
 import logging
+import math
 from typing import Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -1239,7 +1240,9 @@ def _get_jit_functions():
     return _jit_functions
 
 
-def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_decode):
+def _get_compiled_kernel(
+    N, H, HV, K, V, h0_source, dt_bias_dtype, use_small_batch, is_varlen_decode
+):
     """Get or compile the KDA kernel for given dimensions.
 
     ``h0_source`` is the caller's real state pool: ``from_dlpack`` bakes its
@@ -1258,6 +1261,7 @@ def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_d
         V,
         pool_size,
         tuple(h0_source.stride()),
+        dt_bias_dtype,
         use_small_batch,
         is_varlen_decode,
     )
@@ -1282,7 +1286,8 @@ def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_d
         o = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
 
     A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
-    dt_bias = torch.zeros(HV, K, dtype=torch.bfloat16, device="cuda")
+    # CuTe launches skip dtype checks; a mismatched dt_bias is silently reinterpreted.
+    dt_bias = torch.zeros(HV, K, dtype=dt_bias_dtype, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
@@ -1382,6 +1387,24 @@ def _normalize_kda_a(a, *, is_varlen_decode, N, HV, K):
         raise ValueError(f"Unexpected a shape for dense: {a.shape}")
 
 
+def _check_compiled_constants(
+    *, K, scale, use_qk_l2norm_in_kernel, softplus_beta, softplus_threshold
+):
+    # _get_compiled_kernel bakes these values in; reject any it would ignore.
+    if (
+        (scale is not None and not math.isclose(scale, K**-0.5, rel_tol=1e-6))
+        or not use_qk_l2norm_in_kernel
+        or softplus_beta != 1.0
+        or softplus_threshold != 20.0
+    ):
+        raise ValueError(
+            "CuTe DSL KDA decode only supports scale=K**-0.5, "
+            "use_qk_l2norm_in_kernel=True, softplus_beta=1.0 and "
+            f"softplus_threshold=20.0; got {scale=}, {use_qk_l2norm_in_kernel=}, "
+            f"{softplus_beta=}, {softplus_threshold=}"
+        )
+
+
 def cutedsl_fused_sigmoid_gating_kda_update(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -1439,10 +1462,13 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     )
 
     is_varlen_decode = B_q == 1 and T_q == N and N > 1
-    if scale is None:
-        scale = K**-0.5
-    else:
-        assert scale > 0, f"scale must be positive, got {scale}"
+    _check_compiled_constants(
+        K=K,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+    )
 
     use_small_batch = N < SMALL_BATCH_THRESHOLD
 
@@ -1541,7 +1567,7 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = _get_compiled_kernel(
-        N, H, HV, K, V, h0_source, use_small_batch, is_varlen_decode
+        N, H, HV, K, V, h0_source, dt_bias.dtype, use_small_batch, is_varlen_decode
     )
 
     compiled_kernel(

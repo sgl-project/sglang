@@ -8,10 +8,8 @@ import torch
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    _stable_hash_str_to_i64,
-)
+from sglang.srt.model_executor.forward_batch_info import _stable_hash_str_to_i64
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mock_model.utils import mock_model_server_args, mock_model_server_env
 from sglang.test.test_utils import CustomTestCase

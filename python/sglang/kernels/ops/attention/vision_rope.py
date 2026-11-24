@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 PreparedInplaceComplexRoPE = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -90,8 +92,8 @@ def can_use_fused_qk_complex_rope(
         and freqs_cis.dtype == torch.complex64
     ):
         return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 9
+    # props.major is the gfx major on ROCm, which also selects the fused path.
+    return current_arch().props.major >= 9
 
 
 def apply_fused_qk_complex_rope(
