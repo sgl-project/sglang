@@ -53,7 +53,6 @@ from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    is_tp_head_owner,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
 )
@@ -1521,23 +1520,9 @@ class MoriKVManager(CommonKVManager):
             src_page_offset=src_page_offset,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
-            src_dcp_size=self.dcp_size,
-            src_dcp_rank=self.dcp_rank,
-            src_draft_rows_collapsed=getattr(
-                self.kv_args, "draft_rows_dcp_collapsed", False
-            ),
-            send_replicated_draft=self._should_send_replicated_dcp_draft(
-                peer_info.dst_dcp_size, peer_info.dst_dcp_rank
-            ),
         )
-        if plan.empty():
-            return []
-        target_plan = (
-            GroupedIndexPlan.from_indices(
-                plan.target_src_token_indices, plan.target_dst_token_indices
-            )
-            if plan.target_src_token_indices.size
-            else None
+        target_plan = GroupedIndexPlan.from_indices(
+            plan.target_src_token_indices, plan.target_dst_token_indices
         )
         num_draft = self.kv_args.num_draft_entries
         num_target = len(self.kv_args.kv_item_lens) - num_draft
@@ -1545,7 +1530,7 @@ class MoriKVManager(CommonKVManager):
             GroupedIndexPlan.from_indices(
                 plan.draft_src_token_indices, plan.draft_dst_token_indices
             )
-            if num_draft and plan.draft_src_token_indices.size
+            if num_draft
             else None
         )
         token_item_lens = peer_info.dcp_token_item_lens
@@ -1563,11 +1548,9 @@ class MoriKVManager(CommonKVManager):
         for entry_idx, (src_desc, dst_desc) in enumerate(desc_pairs):
             item_len = token_item_lens[entry_idx]
             is_draft = entry_idx >= num_target
-            grouped_plan = draft_plan if is_draft else target_plan
-            if grouped_plan is None:
-                continue
             cache_key = (is_draft, item_len)
             if cache_key not in plan_cache:
+                grouped_plan = draft_plan if is_draft else target_plan
                 plan_cache[cache_key] = grouped_plan.materialize(item_len)
             transfer_plan = plan_cache[cache_key]
             statuses.extend(
@@ -1822,13 +1805,6 @@ class MoriKVManager(CommonKVManager):
 
         local_tp_rank = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
-        if not is_tp_head_owner(
-            src_attn_tp_size=self.state_tp_size,
-            dst_attn_tp_size=peer_info.decode_tp_size,
-            local_tp_rank_in_group=local_tp_rank,
-            dst_tp_rank_in_group=dst_tp_rank,
-        ):
-            return []
 
         pairs = build_transfer_entry_pairs(
             src_layer_ids,
@@ -2103,19 +2079,16 @@ class MoriKVManager(CommonKVManager):
 
             if not info.is_dummy:
                 if peer_info.requires_dcp_relayout:
-                    if not self._should_skip_duplicate_hybrid_mla_kv(
-                        peer_info.decode_tp_size
-                    ):
-                        result_statuses.extend(
-                            self.send_kvcache_dcp(
-                                peer_info,
-                                kv_indices,
-                                info.dst_kv_indices,
-                                src_page_offset=index_slice.start or 0,
-                                decode_prefix_len=info.decode_prefix_len or 0,
-                                num_kv_tokens=num_kv_tokens,
-                            )
+                    result_statuses.extend(
+                        self.send_kvcache_dcp(
+                            peer_info,
+                            kv_indices,
+                            info.dst_kv_indices,
+                            src_page_offset=index_slice.start or 0,
+                            decode_prefix_len=info.decode_prefix_len or 0,
+                            num_kv_tokens=num_kv_tokens,
                         )
+                    )
                 else:
                     result_statuses.extend(
                         self.send_kvcache(
