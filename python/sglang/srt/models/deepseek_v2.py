@@ -667,10 +667,14 @@ def _check_router_row_ids(input_ids_global, router_rows):
     if input_ids_global is None:
         # Next-token layers are not hash-routed and carry no token ids.
         return
+    # Keep the diagnostic dependent on the arguments alone: reading runtime
+    # config here (e.g. `get_parallel().attn_cp_size`) raises before the assert
+    # message is built whenever the `parallel` namespace is not published, which
+    # replaces this AssertionError with a ValueError and hides the real signal.
     assert input_ids_global.shape[0] == router_rows, (
         "vision_topk ids do not describe the router rows: "
-        f"ids={tuple(input_ids_global.shape)} rows={router_rows} "
-        f"cp_size={get_parallel().attn_cp_size}."
+        f"ids={tuple(input_ids_global.shape)} rows={router_rows}. "
+        "A caller bypassed the transport alignment (_align_cp_router_ids)."
     )
 
 

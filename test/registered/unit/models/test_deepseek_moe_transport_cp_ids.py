@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.models import deepseek_v2
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.srt.models.deepseek_v2 import _check_router_row_ids
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -120,6 +121,17 @@ class TestCheckRouterRowIds(CustomTestCase):
     def test_mismatch_raises(self):
         with self.assertRaisesRegex(AssertionError, r"do not describe the router rows"):
             _check_router_row_ids(torch.arange(16), 128)
+
+    def test_mismatch_message_does_not_read_runtime_state(self):
+        # The diagnostic must be buildable from its arguments alone. Reading a
+        # config namespace here raises whenever that namespace is not published
+        # (CPU runs, for one), which replaces the AssertionError with a
+        # ValueError and hides the mismatch this helper exists to surface.
+        with patch.object(
+            deepseek_v2, "get_parallel", side_effect=RuntimeError("not published")
+        ):
+            with self.assertRaisesRegex(AssertionError, r"ids=\(16,\) rows=128"):
+                _check_router_row_ids(torch.arange(16), 128)
 
 
 class TestMoeRowTransportCpIds(CustomTestCase):
