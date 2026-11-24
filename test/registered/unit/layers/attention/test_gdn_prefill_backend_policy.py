@@ -197,6 +197,37 @@ class TestAiterGDNPrefillConvFallback(CustomTestCase):
                 else:
                     triton_conv.assert_not_called()
 
+    def test_only_an_aiter_backend_routes_prefill_through_the_dispatcher(self):
+        """Without AITER the prefill conv must call causal_conv1d_fn directly,
+        adding no per-layer dispatch on CUDA or non-gfx950 ROCm."""
+        layer = SimpleNamespace(
+            conv_weights=sentinel.weight, bias=None, activation="silu"
+        )
+        batch = SimpleNamespace(
+            extend_prefix_lens=torch.zeros(1), extend_seq_lens_cpu=[3]
+        )
+        x = torch.zeros(3, 4)
+        for use_aiter in (False, True):
+            backend = object.__new__(GDNAttnBackend)
+            backend.use_aiter_prefill_conv = use_aiter
+            backend.forward_metadata = SimpleNamespace(
+                query_start_loc=sentinel.starts, conv_block_table=None
+            )
+            with (
+                self.subTest(use_aiter=use_aiter),
+                patch.object(
+                    gdn_backend, "_prefill_causal_conv1d", return_value=x.T
+                ) as dispatcher,
+                patch.object(
+                    gdn_backend, "causal_conv1d_fn", return_value=x.T
+                ) as direct,
+            ):
+                backend._convolve_prefill(
+                    layer, batch, x, torch.zeros(1, 4, 2), sentinel.indices
+                )
+                self.assertEqual(dispatcher.called, use_aiter)
+                self.assertEqual(direct.called, not use_aiter)
+
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_prefill_conv_table_covers_only_nonempty_chunks(self):

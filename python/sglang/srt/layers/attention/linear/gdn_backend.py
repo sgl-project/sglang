@@ -722,6 +722,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+    # Resolved once in __init__ so the default path calls causal_conv1d_fn directly.
+    use_aiter_prefill_conv: bool = False
 
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
@@ -742,6 +744,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        self.use_aiter_prefill_conv = _aiter_gdn_prefill_conv() is not None
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -1350,8 +1353,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if not conv_states.is_contiguous() and not is_cpu():
             # The compiled CUDA conv assumes packed slots; Triton follows the strides.
             conv_fn = causal_conv1d_fn_triton
-        elif block_table is not None:
-            # The block-table launch is Triton-only; the AITER conv never sees it.
+        elif block_table is not None or not self.use_aiter_prefill_conv:
+            # The block-table launch is Triton-only, so AITER never sees it either.
             conv_fn = causal_conv1d_fn
         else:
             conv_fn = _prefill_causal_conv1d
