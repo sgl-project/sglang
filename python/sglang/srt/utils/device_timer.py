@@ -107,39 +107,6 @@ class DeviceTimer:
                 observer.on_interval_ready(interval)
 
 
-class GapTimer(DeviceTimer):
-    """Measures GPU idle gaps between consecutive uses of a stream.
-
-    Where DeviceTimer.wrap() measures the duration *inside* a block,
-    GapTimer.wrap() measures the time *between* consecutive blocks
-    (gap = next_block_start - last_block_end).
-    """
-
-    def __init__(self, reporter: Callable):
-        super().__init__(reporter)
-        self._pending: Optional[_TimingInterval] = None
-
-    @contextmanager
-    def wrap(self, metadata: Dict):
-        if not self.timing_supported:
-            yield
-            return
-
-        if self._pending is not None:
-            self._pending.end(device_module=self._device_module, metadata=metadata)
-            self._intervals.append(self._pending)
-            self._pending = None
-            self._report()
-        try:
-            yield
-        finally:
-            self._pending = _TimingInterval.create(device_module=self._device_module)
-
-    def cancel(self):
-        """Discard a pending gap (e.g. server went idle)."""
-        self._pending = None
-
-
 @dataclass
 class _TimingInterval:
     start_event: torch.Event

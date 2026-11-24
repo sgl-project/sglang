@@ -26,7 +26,10 @@ from sglang.kernels.ops.gemm.bf16_fp32 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=5,
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
+    disabled="HPC-Ops is only built in docker/Dockerfile; not installed in CI",
 )
 
 mark_hpc_bf16xfp32_gemm_enabled()
@@ -55,7 +58,7 @@ FN_MAP = {
 @marker.parametrize(
     "n,k", [(768, 6144), (384, 3072), (256, 4096)], [(768, 6144), (256, 4096)]
 )
-@marker.benchmark("provider", ["cublas", "hpc"])
+@marker.benchmark("provider", ["cublas", "hpc"], gate=["hpc"])
 def benchmark(m, n, k, provider):
     x = create_random(m, k, dtype=torch.bfloat16)
     w = create_random(n, k, dtype=torch.float32)

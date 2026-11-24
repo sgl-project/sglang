@@ -47,7 +47,7 @@ On an Apple Silicon Mac with macOS 14 or newer, first follow the [Apple Silicon 
 SGLANG_USE_MLX=1 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-0.6B \
   --quantization mlx_q4 \
-  --disable-cuda-graph \
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
   --host 127.0.0.1 --port 30000
 ```
 

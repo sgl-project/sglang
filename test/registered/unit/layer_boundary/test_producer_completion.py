@@ -430,7 +430,7 @@ class TestProducerCompletion(CustomTestCase):
 
         config = SimpleNamespace(**vars(k3_fixture.CONFIG), attn_res_block_size=4)
         with (
-            fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True),
+            k3_fixture.k3_planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True),
             patch.object(kimi_k3, "_shards_moe_rows", return_value=True),
         ):
             declarations = kimi_k3._stage_facts(config, 2, sp_collective=True)
@@ -447,7 +447,7 @@ class TestProducerCompletion(CustomTestCase):
         config = SimpleNamespace(**vars(k3_fixture.CONFIG), attn_res_block_size=4)
         gather = Mock(side_effect=lambda value: torch.cat((value, value + 10)))
         with (
-            fixture.planning(
+            k3_fixture.k3_planning(
                 fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=2), a2a=True
             ),
             patch.object(kimi_k3, "_shards_moe_rows", return_value=True),

@@ -263,14 +263,18 @@ DEVI IntraItem intra_decode(int item, const int* __restrict__ cu, int T, int H, 
   int ci = it.cs;
   long acc = 0;
   int found = 0;
+  const long total = (long)cu[N];
   for (int m = 0; m < N; ++m) {
     long b0 = (long)cu[m], b1 = (long)cu[m + 1];
+    // the rest are empty (a captured batch's padding)
+    if (b0 >= total) break;
     long cnt = (b1 - b0 + KC - 1) / KC;
-    if (!found && it.cs < acc + cnt) {
+    if (it.cs < acc + cnt) {
       bos = b0;
       eos = b1;
       ci = (int)(it.cs - acc);
       found = 1;
+      break;
     }
     acc += cnt;
   }
@@ -314,8 +318,9 @@ DEVI void intra_load_qkg(
   }
 }
 DEVI int intra_nreal(const int* __restrict__ cu, int T, int H, int N) {
+  const long total = (long)cu[N];
   long tot = 0;
-  for (int m = 0; m < N; ++m)
+  for (int m = 0; m < N && (long)cu[m] < total; ++m)
     tot += ((long)cu[m + 1] - (long)cu[m] + KC - 1) / KC;
   return (int)(tot * H);
 }
@@ -1227,6 +1232,11 @@ struct RecurSeq {
   int n, nch;
   long bos, len, pre;
 };
+// A captured batch pads to its bound with empty sequences on PAD_SLOT_ID (-1) after the real ones, which are
+// never empty; recur_seq's rank p is one of them iff cu[p] == cu[N]. Their state is neither read nor written.
+DEVI bool recur_padded(int p, const int* __restrict__ cu, int N) {
+  return p >= N || cu[p] >= cu[N];
+}
 DEVI RecurSeq recur_seq(int p, const int* __restrict__ cu, int N) {
   RecurSeq s;
   s.n = p;
@@ -1296,7 +1306,9 @@ DEVI void kda_recur_body_t(
   const int p = ph / H;
   const int h = ph - p * H;
   const int sw = w + (8 / VS) * hf;
+  if (recur_padded(p, cu, N)) return;
   const RecurSeq sq = recur_seq(p, cu, N);
+  if (slots[sq.n] < 0) return;
   const int n = sq.n;
   const long bos = sq.bos;
   const long pre = sq.pre;
@@ -1433,7 +1445,9 @@ DEVI void kda_recur_body_ws(
   recur_wg_map<VS>(bid, nmap, H, ph, pt);
   const int p = ph / H;
   const int h = ph - p * H;
+  if (recur_padded(p, cu, N)) return;
   const RecurSeq sq = recur_seq(p, cu, N);
+  if (slots[sq.n] < 0) return;
   const int n = sq.n;
   const long bos = sq.bos;
   const int len = (int)sq.len;
@@ -1694,6 +1708,7 @@ DEVI void kda_recur_body_grp(
   const int lg = lane >> 4;
   const int lr = lane & 15;
   int ph, pt;
+  if (slots[0] < 0) return;
   recur_wg_map<VS>(bid, pass ? G - 1 : 2 * G - 3, H, ph, pt);
   const int it = ph / H;
   const int h = ph - it * H;
@@ -2282,7 +2297,9 @@ DEVI void kda_fused_body_pipe(
   const int h = bid - p * H;
   if (p >= N) return;
   opq_init(smem, wu);
+  if (recur_padded(p, cu, N)) return;
   const RecurSeq sq = recur_seq(p, cu, N);
+  if (slots[sq.n] < 0) return;
   const int n = sq.n;
   const long bos = sq.bos;
   const int len = (int)sq.len;
@@ -2573,7 +2590,9 @@ static int64_t kda_grp_state_bytes(int64_t T, int64_t H, int64_t N, int ncu) {
 enum KdaPath { KDA_FUSED, KDA_GRP, KDA_WS4, KDA_WS2, KDA_VS2, KDA_VS1 };
 
 // The thresholds are tuned on MI355X (256 CUs) for 1..128 sequences of 64..64K tokens with 12 and 24 heads.
-static KdaPath kda_recur_path(int64_t T, int64_t H, int64_t N, int64_t max_seqlen, bool tracking, int ncu) {
+// N is the sequence count the path is chosen for; allow_grp is false when the batch may hold more than one sequence
+static KdaPath
+kda_recur_path(int64_t T, int64_t H, int64_t N, int64_t max_seqlen, bool tracking, bool allow_grp, int ncu) {
   const int64_t pairs = N * H;
   const int64_t chain = (max_seqlen + KC - 1) / KC;
   // the longest chunk chain is at most twice the chunk work per CU
@@ -2582,7 +2601,7 @@ static KdaPath kda_recur_path(int64_t T, int64_t H, int64_t N, int64_t max_seqle
   // pipelined fused kernel: balanced batches with at least 3/4 pair per CU, or short sequences
   if (!tracking && balanced && (4 * pairs >= 3 * ncu || chain <= 1 || (chain <= 2 && 2 * pairs >= ncu)))
     return KDA_FUSED;
-  if (kda_grp_groups(T, H, N, ncu)) return KDA_GRP;
+  if (allow_grp && kda_grp_groups(T, H, N, ncu)) return KDA_GRP;
   if (tracking) return 2 * pairs <= ncu ? KDA_VS2 : KDA_VS1;
   // a long chain dominates: split its value columns over two or four workgroups
   if (!balanced) return chain * ncu > 4 * work ? KDA_WS4 : KDA_WS2;
@@ -2611,11 +2630,14 @@ static void kda_fwd_launch(
     int H,
     int N,
     int max_seqlen,
+    int path_seqs,
     float scale,
     int ncu,
     hipStream_t stream) {
   if (N <= 0 || H <= 0) return;
-  const KdaPath path = kda_recur_path(T, H, N, max_seqlen, track_state != nullptr, ncu);
+  // path_seqs > 0: N is a padded bound (a captured batch), pick the path for path_seqs real sequences
+  const KdaPath path = path_seqs > 0 ? kda_recur_path(T, H, path_seqs, max_seqlen, track_state != nullptr, false, ncu)
+                                     : kda_recur_path(T, H, N, max_seqlen, track_state != nullptr, true, ncu);
   const int nwork = (T / KC + N) * H;
   // rows past the end of a sequence are stored to this scratch slot, right after the per-(chunk, head) blocks
   char* trash = gbuf + (size_t)nwork * GB_BYTES;
@@ -2812,7 +2834,8 @@ torch::Tensor kda_prefill_gfx950(
     int64_t max_seqlen,
     torch::Tensor track_state,
     torch::Tensor track_chunk_idx,
-    double scale) {
+    double scale,
+    int64_t path_seqs) {
   TORCH_CHECK(q.is_cuda(), "q must be on a GPU");
   TORCH_CHECK(q.scalar_type() == at::ScalarType::BFloat16, "q must be bf16");
   TORCH_CHECK(
@@ -2887,6 +2910,7 @@ torch::Tensor kda_prefill_gfx950(
       (int)H,
       (int)N,
       (int)max_seqlen,
+      (int)path_seqs,
       (float)scale,
       ncu,
       stream);

@@ -27,6 +27,7 @@ import pickle
 import signal
 import sys
 import threading
+import traceback
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
@@ -75,7 +76,6 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -231,6 +231,7 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "input_top_logprobs_val_flat",
         "input_top_logprobs_idx_flat",
         "input_top_logprobs_flat_null_prefix",
+        "input_top_logprobs_weights",
         "output_top_logprobs_val",
         "output_top_logprobs_idx",
         "input_token_ids_logprobs_val",
@@ -429,7 +430,7 @@ class MultiTokenizerRouter:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._task = asyncio.run_coroutine_threadsafe(
-            self.router_worker_obj(), self._loop
+            print_exception_wrapper(self.router_worker_obj), self._loop
         )
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
@@ -456,6 +457,15 @@ class MultiTokenizerRouter:
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
+
+    def dispatch_to_scheduler(self, obj: BaseReq) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                async_sock_send(self.send_to_scheduler, obj, flags=zmq.NOBLOCK),
+                self._loop,
+            ).result()
+        except zmq.Again:
+            logger.warning(f"No scheduler is connected; dropped {type(obj).__name__}.")
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -620,8 +630,9 @@ def run_multi_detokenizer_router_process(
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
+        logger.error(
+            f"MultiDetokenizerRouter hit an exception: {traceback.format_exc()}"
+        )
         if router is not None:
             router.socket_mapping.clear_all_sockets()
         parent_process.send_signal(signal.SIGQUIT)
@@ -635,12 +646,7 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiTokenizerRouter hit an exception: {traceback}")
-        if hasattr(func, "__self__") and isinstance(
-            func.__self__, MultiTokenizerRouter
-        ):
-            func.__self__.dump_requests_before_crash()
+        logger.error(f"MultiTokenizerRouter hit an exception: {traceback.format_exc()}")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 

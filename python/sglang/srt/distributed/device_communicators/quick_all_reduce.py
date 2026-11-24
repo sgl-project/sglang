@@ -175,10 +175,10 @@ class QuickAllReduce:
         regime_str = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
             logger.warning(
-                "Custom quick allreduce:",
+                "Custom quick allreduce: "
                 f"Invalid quantization level: {regime_str}. "
                 "Supported levels: "
-                f"{list(QuickReduceRegime.__members__.keys())}",
+                f"{list(QuickReduceRegime.__members__.keys())}"
             )
             return
 
@@ -197,13 +197,8 @@ class QuickAllReduce:
         # ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
         qr_max_size = int(os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
         if qr_max_size > 0:
-            if qr_max_size < 1:
-                logger.info(
-                    "You should not set a max_size smaller than 1MB, which can "
-                    "lead to error or degradation to custom allreduce or rccl."
-                )
             qr_max_size = qr_max_size * MB
-        # If qr_max_size is None, then 2GB is used by default.
+        # A qr_max_size of 0 keeps the kernel default (2GB).
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
@@ -227,6 +222,9 @@ class QuickAllReduce:
         if self.disabled:
             return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
+        # the JIT build behind SGLANG_ROCM_QUICK_ALL_REDUCE_JIT reduces bf16 only
+        if not ops.qr_supports(self._ptr, inp.dtype):
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom quick allreduce requires input byte size to be

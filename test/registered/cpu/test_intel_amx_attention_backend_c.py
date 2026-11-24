@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     requires_intel_amx,
 )
 
-register_cpu_ci(est_time=477, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=477, suite="extra-tp-test-cpu-intel")
 
 
 @requires_intel_amx()
