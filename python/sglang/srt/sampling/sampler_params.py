@@ -9,7 +9,7 @@ request slot, addressed by its `req_pool_idx`.
   without a pass over its requests or a device sync.
 - A launch over the same slots as the previous gather, with no write since,
   reuses that gather's params: a decode batch whose requests did not change
-  keeps one set of tensors, as it did before the per-step build.
+  keeps one set of tensors. Callers must not write them in place.
 """
 
 from __future__ import annotations
@@ -75,9 +75,8 @@ class SamplerParamsPool:
         self.top_ks_host = np.full(num_rows, TOP_K_ALL, dtype=np.int64)
         self.uses_top_p_host = np.zeros(num_rows, dtype=bool)
         self.uses_min_p_host = np.zeros(num_rows, dtype=bool)
-        # The last gather's (slots, write count) and result; a write invalidates it.
-        self._num_writes = 0
-        self._last_gather: Optional[tuple[bytes, int, SamplerParams]] = None
+        # The last gather's slots and result; a write invalidates it.
+        self._last_gather: Optional[tuple[bytes, SamplerParams]] = None
 
     def write(self, reqs: Sequence[Req]) -> None:
         slots = [r.kv.req_pool_idx for r in reqs]
@@ -96,7 +95,7 @@ class SamplerParamsPool:
         rows = async_h2d(slots, dtype=torch.int64, device=self.table.device)
         values = async_h2d_tensor(torch.from_numpy(host_values), self.table.device)
         self.table.index_copy_(1, rows, values)
-        self._num_writes += 1
+        self._last_gather = None
 
     def gather(
         self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor
@@ -105,9 +104,10 @@ class SamplerParamsPool:
         if slots.size == 0:
             return SamplerParams.empty(self.table.device)
         key = slots.tobytes()
-        last = self._last_gather
-        if last is not None and last[0] == key and last[1] == self._num_writes:
-            return last[2]
+        if self._last_gather is not None:
+            last_key, last_params = self._last_gather
+            if last_key == key:
+                return last_params
         top_ks = self.top_ks_host[slots]
         lo, hi = int(top_ks.min()), int(top_ks.max())
         # Each row of the [4, bs] result is a contiguous [bs] tensor.
@@ -126,5 +126,5 @@ class SamplerParamsPool:
             npu_top_k_top_p_eligible=lo >= 1 and hi <= 1024,
             max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,
         )
-        self._last_gather = (key, self._num_writes, params)
+        self._last_gather = (key, params)
         return params

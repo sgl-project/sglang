@@ -66,6 +66,7 @@ class TestSamplerParamsPool(CustomTestCase):
         self.assertIsNot(_gather(pool, [4, 1]), first)
 
         after_slot_change = _gather(pool, [1, 4])
+        self.assertIsNot(after_slot_change, first)
         pool.write([_req(4, temperature=1.2)])
         params = _gather(pool, [1, 4])
         self.assertIsNot(params, after_slot_change)
