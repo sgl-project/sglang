@@ -1,6 +1,8 @@
 """Inkling2's ROCm kernels against float64 / torch references, and their run-to-run
 determinism (two ROCm Triton miscompilations showed up only as nondeterminism)."""
 
+import sys
+
 import pytest
 import torch
 
@@ -616,3 +618,7 @@ def test_verify_indptrs_matches_torch(bs, dtype, window):
     assert lens.dtype == ref_lens.dtype and torch.equal(lens, ref_lens)
     assert start.dtype == ref_start.dtype and torch.equal(start, ref_start)
     assert torch.equal(win, ref_win) and torch.equal(offsets, ref_offsets)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
