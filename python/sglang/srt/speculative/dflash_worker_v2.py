@@ -32,7 +32,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule, mamba_track_grid
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+    get_spec,
+    mamba_track_grid,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -198,10 +203,13 @@ class _SelectorDraftSampler:
     greedy_mask selects the argmax per row.
     """
 
-    def __init__(self, *, draft_model, block_size, max_bs, device):
+    def __init__(
+        self, *, draft_model, block_size, max_bs, device, stage_uniforms=False
+    ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
+        self.stage_uniforms = stage_uniforms
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
@@ -209,6 +217,8 @@ class _SelectorDraftSampler:
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
+        if stage_uniforms:
+            self.uniforms.zero_()
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device
         )
@@ -233,17 +243,22 @@ class _SelectorDraftSampler:
                 bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
             )
         )
+        if self.stage_uniforms:
+            self.uniforms[:bs].uniform_()
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
-        # In-graph philox draw: each replay advances the generator and redraws.
+        # Ascend stages fresh coins before replay; other backends draw in the graph.
+        uniforms = self.uniforms[:bs]
+        if not self.stage_uniforms:
+            uniforms.uniform_()
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
-            uniforms=self.uniforms[:bs].uniform_(),
+            uniforms=uniforms,
             temperatures=self.temperatures[:bs],
             greedy_mask=self.greedy_mask[:bs],
         )
@@ -301,6 +316,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
+        self._npu_selector_sampler = None
+        if _is_npu and get_spec().speculative_use_rejection_sampling:
+            if self.selector is None:
+                raise ValueError(
+                    "Ascend DFLASH rejection sampling requires a DFlash2 selector draft."
+                )
+            from sglang.srt.hardware_backend.npu.dflash_sampling import (
+                NpuDFlashSelectorSampler,
+            )
+
+            self._npu_selector_sampler = NpuDFlashSelectorSampler()
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -505,6 +531,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_size=self.block_size,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
+                stage_uniforms=self._npu_selector_sampler is not None,
             )
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
@@ -990,7 +1017,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        """Scatter the selector's sparse q into the chain sampler's dense layout."""
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
@@ -1005,22 +1032,42 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
-                candidates=candidates,
-                target_logits=next_token_logits,
-                draft_probs=draft_probs,
-                sampling_info=sampling_info,
-                draft_input=draft_input,
-                gamma=gamma,
-                verify_num_draft_tokens=block,
-                cutoff_verify_lens=None,
-            )
+            if self._npu_selector_sampler is not None:
+                accept_len, bonus = self._npu_selector_sampler.accept(
+                    candidates, next_token_logits, draft_probs, sampling_info
+                )
+            else:
+                accept_len, bonus, _ = accept_sampling(
+                    candidates=candidates,
+                    target_logits=next_token_logits,
+                    draft_probs=draft_probs,
+                    sampling_info=sampling_info,
+                    draft_input=draft_input,
+                    gamma=gamma,
+                    verify_num_draft_tokens=block,
+                    cutoff_verify_lens=None,
+                )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
         return accept_len.to(torch.int32), bonus.to(torch.int64)
+
+    def _accept_npu_selector_batch(self, *, candidates, **selector_inputs):
+        tp_group = get_tp_group()
+        bs = candidates.shape[0]
+        decision = candidates.new_empty((2, bs), dtype=torch.int64)
+        # Only TP0 consumes the conditional q paired with its broadcast proposal.
+        if tp_group.rank_in_group == 0:
+            num_correct_drafts, bonus_tokens = self._selector_sampling_accept(
+                candidates=candidates, **selector_inputs
+            )
+            decision[0].copy_(num_correct_drafts)
+            decision[1].copy_(bonus_tokens)
+        tp_group.broadcast(decision, src=0)
+        self._npu_selector_sampler.log_batch(bs, tp_group.rank_in_group)
+        return decision[0].to(torch.int32), decision[1]
 
     def _greedy_sample_from_quantized_head(
         self,
@@ -1937,6 +1984,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        if self._npu_selector_sampler is not None and self._selector_sample is not None:
+            get_tp_group().broadcast(draft_tokens, src=0)
+
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
@@ -1982,7 +2032,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            # Ascend prepares verify attention metadata after graph selection.
+            skip_attn_backend_init=None if _is_npu else True,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
@@ -2013,7 +2064,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_predict = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
+            accept = (
+                self._accept_npu_selector_batch
+                if self._npu_selector_sampler is not None
+                else self._selector_sampling_accept
+            )
+            accept_len, bonus = accept(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 candidate_ids=selector_candidate_ids,
