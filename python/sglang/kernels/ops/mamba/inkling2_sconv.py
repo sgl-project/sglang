@@ -406,6 +406,134 @@ def _cuda_sconv(
     return True
 
 
+def _sconv_cpu_fallback(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dynamic_weights: torch.Tensor | None,
+    cache: torch.Tensor,
+    metadata: dict,
+    *,
+    width: int,
+    head_dim: int,
+    decode: bool,
+    use_residual: bool,
+    scale: float,
+    track_mask: torch.Tensor | None = None,
+    track_indices: torch.Tensor | None = None,
+    src2dst: torch.Tensor | None = None,
+    top_k: int = 0,
+    partial: torch.Tensor | None = None,
+    attention: torch.Tensor | None = None,
+    window: torch.Tensor | None = None,
+    round_bf16: bool = False,
+) -> torch.Tensor:
+    is_epilogue = attention is not None
+    rows, d = (attention if is_epilogue else x).shape
+    out_dtype = (
+        (attention.dtype if partial is None else partial.dtype)
+        if is_epilogue
+        else x.dtype
+    )
+    if rows == 0:
+        return torch.empty((0, d), dtype=out_dtype, device=cache.device)
+
+    dynamic = dynamic_weights is not None
+    if top_k > 0:
+        gathered = x[src2dst.long().view(rows, top_k)].float().sum(dim=1)
+        all_inputs = gathered.to(x.dtype).float()
+        if round_bf16:
+            all_inputs = all_inputs.to(torch.bfloat16).float()
+    else:
+        all_inputs = x.float()
+
+    safe_idx = metadata["safe_idx"].long()
+    cache_mask = metadata["cache_mask"].reshape(-1).bool()
+    cu = metadata["cu"].long()
+    si = metadata["si"].long()
+
+    row_idx = torch.arange(rows, dtype=torch.long)
+    seq = row_idx if decode else si[:rows]
+    bos = row_idx if decode else cu[seq]
+    slot = safe_idx[seq]
+    in_pool = cache_mask[seq]
+    has_cache = in_pool & (slot > 0)
+
+    acc = torch.zeros((rows, d), dtype=torch.float32)
+    for tap in range(width):
+        lag = tap if dynamic else (width - 1 - tap)
+        src_pos = row_idx - lag
+        from_x = src_pos >= bos
+        x_val = all_inputs[src_pos.clamp(min=0)]
+        c_pos = (src_pos - bos + (width - 1)).clamp(min=0, max=max(width - 2, 0))
+        c_val = cache[slot, c_pos].float()
+        val = torch.where(
+            from_x[:, None], x_val, torch.where(has_cache[:, None], c_val, 0.0)
+        )
+        if window is not None and lag < width - 1:
+            raw_val = torch.where(
+                from_x[:, None], x_val, torch.where(in_pool[:, None], c_val, 0.0)
+            )
+            if in_pool.any():
+                window[seq[in_pool], (row_idx - bos)[in_pool], width - 2 - lag] = (
+                    raw_val[in_pool].to(window.dtype)
+                )
+        if dynamic:
+            w = (
+                weight[lag].float()[None, :]
+                + dynamic_weights[:, :, lag].repeat_interleave(head_dim, dim=1).float()
+            )
+        else:
+            w = weight[:, tap].to(x.dtype).float()[None, :]
+        acc = acc + val * w
+
+    if use_residual:
+        acc = acc + all_inputs
+    acc = acc * scale
+
+    if is_epilogue:
+        y_val = acc.to(x.dtype).float()
+        total = attention.float() + y_val
+        if partial is not None:
+            total = total + partial.float()
+        out = total.to(out_dtype)
+    else:
+        out = acc.to(out_dtype)
+
+    if decode and has_cache.any():
+        active_slots = slot[has_cache]
+        if width > 2:
+            new_win = torch.cat(
+                (
+                    cache[active_slots, 1:],
+                    all_inputs[has_cache].to(cache.dtype).unsqueeze(1),
+                ),
+                dim=1,
+            )
+        else:
+            new_win = all_inputs[has_cache].to(cache.dtype).unsqueeze(1)
+        cache[active_slots] = new_win
+        if track_mask is not None and track_indices is not None:
+            tm = track_mask.reshape(-1)[seq].bool() & has_cache
+            if tm.any():
+                tm_slots = slot[tm]
+                if width > 2:
+                    t_win = torch.cat(
+                        (
+                            cache[tm_slots, 1:],
+                            all_inputs[tm].to(cache.dtype).unsqueeze(1),
+                        ),
+                        dim=1,
+                    )
+                else:
+                    t_win = all_inputs[tm].to(cache.dtype).unsqueeze(1)
+                # Note: cache[active_slots] already updated tm_slots, so slice[:-1] was shifted!
+                # Reuse new_win indexed by tm[has_cache]
+                cache[track_indices.reshape(-1)[seq[tm]].long()] = new_win[
+                    tm[has_cache]
+                ]
+    return out
+
+
 def short_convolution(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -427,6 +555,43 @@ def short_convolution(
     head_dim = x.shape[1] // dynamic_weights.shape[1] if dynamic else x.shape[1]
     scale = (width * (2 if dynamic else 1) + int(use_residual)) ** -0.5
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
+    if not x.is_cuda:
+        if x.shape[0] == 0:
+            return output
+        assert x.stride(-1) == 1
+        assert cache.ndim == 3 and cache.shape[1:] == (width - 1, x.shape[1])
+        assert (track_mask is None) == (track_indices is None)
+        if hasattr(torch.ops.sgl_kernel, "inkling2_short_convolution_cpu"):
+            return torch.ops.sgl_kernel.inkling2_short_convolution_cpu(
+                x,
+                weight,
+                cache,
+                metadata["safe_idx"],
+                metadata["cache_mask"],
+                metadata["cu"],
+                metadata["si"],
+                dynamic_weights=dynamic_weights,
+                decode=decode,
+                use_residual=use_residual,
+                track_mask=track_mask,
+                track_indices=track_indices,
+                window=window,
+            )
+        return _sconv_cpu_fallback(
+            x,
+            weight,
+            dynamic_weights,
+            cache,
+            metadata,
+            width=width,
+            head_dim=head_dim,
+            decode=decode,
+            use_residual=use_residual,
+            scale=scale,
+            track_mask=track_mask,
+            track_indices=track_indices,
+            window=window,
+        )
     if x.shape[0]:
         assert x.is_cuda and x.stride(-1) == 1
         assert cache.ndim == 3 and cache.shape[1:] == (width - 1, x.shape[1])
@@ -543,6 +708,50 @@ def routed_sconv_epilogue(
     rows, width = attention.shape
     out = torch.empty_like(attention if partial is None else partial)
     scale = (weight.shape[1] + 1) ** -0.5
+    if not attention.is_cuda:
+        if rows == 0:
+            return out
+        assert down.stride(-1) == 1 and weight.ndim == 2
+        assert cache.ndim == 3 and cache.shape[1:] == (weight.shape[1] - 1, width)
+        assert (track_mask is None) == (track_indices is None)
+        if hasattr(torch.ops.sgl_kernel, "inkling2_routed_sconv_epilogue_cpu"):
+            return torch.ops.sgl_kernel.inkling2_routed_sconv_epilogue_cpu(
+                down,
+                src2dst,
+                top_k,
+                weight,
+                cache,
+                metadata["safe_idx"],
+                metadata["cache_mask"],
+                metadata["cu"],
+                metadata["si"],
+                attention,
+                partial=partial,
+                track_mask=track_mask,
+                track_indices=track_indices,
+                window=window,
+                round_bf16=round_bf16,
+            )
+        return _sconv_cpu_fallback(
+            down,
+            weight,
+            None,
+            cache,
+            metadata,
+            width=weight.shape[1],
+            head_dim=width,
+            decode=window is None,
+            use_residual=True,
+            scale=scale,
+            track_mask=track_mask,
+            track_indices=track_indices,
+            src2dst=src2dst,
+            top_k=top_k,
+            partial=partial,
+            attention=attention,
+            window=window,
+            round_bf16=round_bf16,
+        )
     if rows:
         assert down.stride(-1) == 1 and weight.ndim == 2
         assert cache.ndim == 3 and cache.shape[1:] == (weight.shape[1] - 1, width)

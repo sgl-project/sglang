@@ -552,7 +552,9 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
-        elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+        elif (
+            self.use_table_qk_norm_rope and qkv.is_cuda and qkv.dtype == torch.bfloat16
+        ):
             from sglang.kernels.ops.attention.table_qk_norm_rope import (
                 table_qk_norm_rope_,
             )

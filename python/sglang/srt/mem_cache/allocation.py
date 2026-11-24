@@ -125,10 +125,11 @@ def get_last_loc(
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
     prefill_backend, decode_backend = attention_backends()
-    uses_triton_dispatch = prefill_backend not in (
-        "ascend",
-        "torch_native",
-    ) and decode_backend not in ("ascend", "torch_native")
+    uses_triton_dispatch = (
+        prefill_backend not in ("ascend", "torch_native")
+        and decode_backend not in ("ascend", "torch_native")
+        and not _is_cpu
+    )
 
     if (_is_hip or _is_npu) and uses_triton_dispatch:
         # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a

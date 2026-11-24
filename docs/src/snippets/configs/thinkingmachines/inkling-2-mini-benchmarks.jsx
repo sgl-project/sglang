@@ -5,6 +5,8 @@ export const benchmarks = [
   { match: { hw: "h200" , quant: "nvfp4", strategy: "dspark"   } },
   { match: { hw: "tpu7x", quant: "nvfp4", strategy: "balanced" } },
   { match: { hw: "tpu7x", quant: "nvfp4", strategy: "dspark"   } },
+  { match: { hw: "xeon",  quant: "nvfp4", strategy: "balanced" } },
+  { match: { hw: "xeon",  quant: "nvfp4", strategy: "dspark"   } },
   // SM12x, TP1 / EP1: gsm8k on each recipe command as shown (sgl-eval 0.1.3, 1319 questions, temperature 0).
   { match: { hw: "rtx6000", quant: "nvfp4", strategy: "balanced" },
     sglang_version: "lmsysorg/sglang:inkling-2-mini", accuracy: { gsm8k_pct: 94.24 } },

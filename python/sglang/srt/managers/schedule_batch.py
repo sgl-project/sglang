@@ -3376,9 +3376,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = [
                 req.decode_batch_idx for req in self.reqs
             ]
-            # async H2D
-            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
-                device=self.device, non_blocking=True
+            # async H2D (plain copy where pinning is unavailable, e.g. CPU)
+            pin = is_pin_memory_available(self.device)
+            if pin:
+                track_mask_cpu = track_mask_cpu.pin_memory()
+            self.mamba_track_mask = track_mask_cpu.to(
+                device=self.device, non_blocking=pin
             )
 
     def filter_batch(

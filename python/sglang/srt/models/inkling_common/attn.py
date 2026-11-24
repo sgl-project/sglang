@@ -746,7 +746,7 @@ class InklingAttention(nn.Module):
         # The kwargs below must describe the backend `self.attn` dispatches
         # this forward to.
         attention_backend = serving_attention_backend(forward_batch)
-        assert attention_backend in ("fa4", "triton")
+        assert attention_backend in ("fa4", "triton", "intel_amx", "torch_native")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
@@ -961,6 +961,16 @@ class InklingAttention(nn.Module):
                     save_kv_cache=not prologue_did_store,
                     score_mod=get_inkling_relative_attention_score_mod(self.rel_extent),
                     aux_tensors=[rel_logits],
+                    **extra_attn_kwargs,
+                )
+            elif attention_backend == "intel_amx":
+                attn_output = self.attn(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    save_kv_cache=not prologue_did_store,
+                    rel_bias=rel_logits,
                     **extra_attn_kwargs,
                 )
             else:

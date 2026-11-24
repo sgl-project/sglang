@@ -102,7 +102,22 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
         if fuse_renorm
         else None
     )
-    if m:
+    if m and not partials.is_cuda:
+        logits.copy_(partials.float().sum(dim=0))
+        selection = torch.sigmoid(logits)
+        if bias is not None:
+            selection = selection + bias.float()
+        _, order = torch.sort(-selection, dim=-1, stable=True)
+        ids.copy_(order[:, :topk].to(torch.int32))
+        if fuse_renorm:
+            topk_logits = torch.gather(logits, 1, ids.long())
+            log_probs = torch.nn.functional.logsigmoid(topk_logits)
+            weights.copy_(
+                torch.softmax(log_probs, dim=-1)
+                * float(route_scale)
+                * global_scale.float()
+            )
+    elif m:
         _route_topk[(m,)](
             partials,
             bias,
@@ -229,7 +244,41 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
     offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     block_offsets = torch.empty(num_local + 1, device=device, dtype=torch.int32)
     schedule = torch.empty(max_blocks, device=device, dtype=torch.int32)
-    if n > ROUTE_CUDA_MIN_IDS:
+    if not ids.is_cuda:
+        flat_ids = ids.reshape(-1)
+        flat_weights = weights.reshape(-1)
+        if n == 0:
+            counts.zero_()
+            offsets.zero_()
+            block_offsets.zero_()
+            schedule.fill_(-1)
+        else:
+            s_ids, d2s_long = torch.sort(flat_ids, stable=True)
+            sorted_ids.copy_(s_ids)
+            dst2src.copy_(d2s_long.to(torch.int32))
+            src2dst[d2s_long] = torch.arange(n, device=device, dtype=torch.int32)
+            gammas.copy_(flat_weights[d2s_long])
+            boundaries = torch.arange(
+                start, start + num_local + 1, device=device, dtype=torch.int32
+            )
+            offsets.copy_(
+                torch.searchsorted(sorted_ids, boundaries, side="left").to(torch.int32)
+            )
+            counts.copy_(offsets[1:] - offsets[:-1])
+            blocks = (counts + block_size_m - 1) // block_size_m
+            block_offsets[0] = 0
+            torch.cumsum(blocks, dim=0, out=block_offsets[1:])
+            total = int(block_offsets[-1].item())
+            schedule.fill_(-1)
+            if total > 0:
+                slots = torch.arange(total, device=device, dtype=torch.int32)
+                expert_idx = torch.searchsorted(
+                    block_offsets[1:], slots, side="right"
+                ).to(torch.int32)
+                schedule[:total] = (
+                    (slots - block_offsets[expert_idx]) << 16
+                ) + expert_idx
+    elif n > ROUTE_CUDA_MIN_IDS:
         _route_module().route_metadata(
             ids,
             weights,

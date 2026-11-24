@@ -100,7 +100,39 @@ def apply_rotary_qk_kernel(
     tl.store(out_k_ptr + pair_offset + 1, out_k_odd, mask=mask)
 
 
+def _apply_rotary_qk_cpu(q, k, positions):
+    num_tokens, _, head_dim = q.shape
+    if num_tokens == 0:
+        return torch.empty_like(q), torch.empty_like(k)
+    assert head_dim in _SUPPORTED_HEAD_DIMS, f"unsupported head dimension {head_dim}"
+    inv_freq = torch.tensor(
+        [_as_float32(10000.0 ** (-dim / head_dim)) for dim in range(0, head_dim, 4)],
+        device=q.device,
+        dtype=torch.float32,
+    )
+    pos = positions.to(torch.float32)
+    angles = torch.cat(
+        (pos[:, 1:2] * inv_freq[None, :], pos[:, 0:1] * inv_freq[None, :]),
+        dim=-1,
+    )
+    cos = torch.cos(angles)[:, None, :]
+    sin = torch.sin(angles)[:, None, :]
+
+    def _rotate(x):
+        pairs = x.float().reshape(*x.shape[:-1], head_dim // 2, 2)
+        even, odd = pairs[..., 0], pairs[..., 1]
+        return (
+            torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1)
+            .reshape_as(x)
+            .to(x.dtype)
+        )
+
+    return _rotate(q), _rotate(k)
+
+
 def apply_rotary_qk(q, k, positions):
+    if not q.is_cuda:
+        return _apply_rotary_qk_cpu(q, k, positions)
     out_q, out_k = torch.empty_like(q), torch.empty_like(k)
     num_tokens, num_heads, head_dim = q.shape
     block_heads = min(4, triton.next_power_of_2(num_heads))

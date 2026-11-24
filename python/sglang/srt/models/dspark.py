@@ -29,6 +29,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
+from sglang.srt.utils.device import use_intel_amx_backend
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 if TYPE_CHECKING:
@@ -127,6 +128,12 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     quant_method = lm_head.quant_method
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
+    if use_intel_amx_backend(lm_head):
+        flat = hidden.reshape(-1, hidden.shape[-1]).to(lm_head.weight.dtype)
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            flat, lm_head.weight, None, True
+        )
+        return out.view(*hidden.shape[:-1], out.shape[-1])
     weight = lm_head.weight
     dtype = get_spec().speculative_dspark_lm_head_dtype
     if dtype is not None and weight.is_floating_point() and hidden.shape[0] > 0:
@@ -1011,7 +1018,8 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
         for layer in self.layers:
             layer.mlp = None
             layer.self_attn.o_proj = None
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class Qwen3DSparkModel(DSparkDraftModel):

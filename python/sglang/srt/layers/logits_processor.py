@@ -1479,17 +1479,22 @@ class LogitsProcessor(nn.Module):
                         out_dtype=torch.float32,
                         out=out,
                     )
-            elif self.use_fp32_lm_head:
-                logits = torch.matmul(
-                    hidden_states.to(torch.float32),
-                    lm_head.weight.to(torch.float32).T,
-                )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
-                    None,  # bias
+                    embedding_bias,
                     True,  # is_vnni
+                )
+                if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
+                    logits = logits.to(torch.float32)
+                if out is not None and out.dtype == logits.dtype:
+                    out.copy_(logits)
+                    logits = out
+            elif self.use_fp32_lm_head:
+                logits = torch.matmul(
+                    hidden_states.to(torch.float32),
+                    lm_head.weight.to(torch.float32).T,
                 )
             elif self.rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype

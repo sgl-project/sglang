@@ -325,6 +325,18 @@ def fused_decode_sconv_metadata(
     safe_idx = dst["safe_idx"]
     cu = dst["cu"]
     si = dst["si"]
+    if not cache_indices.is_cuda:
+        torch.arange(B + 1, dtype=torch.int32, device=device, out=query_start_loc)
+        has_initial_state.fill_(True)
+        cache_mask.copy_((cache_indices != PAD_SLOT_ID)[:, None, None])
+        safe_idx.copy_(cache_indices.clamp(min=0).to(torch.int64))
+        torch.arange(B + 1, dtype=torch.int64, device=device, out=cu)
+        torch.arange(B, dtype=torch.int32, device=device, out=si)
+        return (
+            query_start_loc,
+            has_initial_state,
+            SconvDecodeMetadata(cache_mask=cache_mask, safe_idx=safe_idx, cu=cu, si=si),
+        )
     BLOCK = 1024
     _fused_decode_metadata_kernel[(triton.cdiv(B + 1, BLOCK),)](
         cache_indices,
@@ -588,6 +600,43 @@ def causal_conv1d(
     W = weight.shape[1]
     use_silu = activation in ("silu", "swish")
 
+    if not x.is_cuda:
+        t_idx = torch.arange(T, dtype=torch.long)
+        s_idx = si[:T].long()
+        bos = cu[s_idx].long()
+        slot = safe_idx[s_idx].long()
+        m_val = (
+            torch.ones(T, dtype=x.dtype)
+            if is_decode
+            else cache_mask.reshape(-1)[s_idx].to(x.dtype)
+        )
+        acc = torch.zeros((T, D), dtype=torch.float32)
+        x_cur = x.float()
+        for iw in range(W):
+            shifted = t_idx - (W - 1) + iw
+            if iw == W - 1:
+                tap = x_cur
+            else:
+                in_x = (shifted >= bos) & (shifted < T)
+                x_val = torch.where(
+                    in_x[:, None], x[shifted.clamp(min=0, max=T - 1)], 0
+                )
+                prefix_pos = shifted - bos + (W - 1)
+                in_prefix = (shifted < bos) & (prefix_pos >= 0)
+                p_val = torch.where(
+                    in_prefix[:, None],
+                    sconv_cache[slot, prefix_pos.clamp(min=0, max=max(W - 2, 0))],
+                    0,
+                )
+                if not is_decode:
+                    p_val = p_val * m_val[:, None]
+                tap = (x_val + p_val).float()
+            acc = acc + tap * weight[:, iw].float()[None, :]
+        if use_silu:
+            acc = acc * torch.sigmoid(acc)
+        if use_residual:
+            acc = acc + x_cur
+        return acc.to(x.dtype)
     if (
         is_cuda()
         and not is_decode
@@ -765,6 +814,38 @@ def update_sconv_cache(
     D = x.shape[-1]
     W_minus_1 = sconv_cache.shape[1]
 
+    if not x.is_cuda:
+        if hasattr(torch.ops.sgl_kernel, "inkling2_update_sconv_cache_cpu"):
+            torch.ops.sgl_kernel.inkling2_update_sconv_cache_cpu(
+                x,
+                sconv_cache,
+                cache_indices,
+                has_initial_state,
+                query_start_loc,
+            )
+            return
+        for b in range(B):
+            ci = int(cache_indices[b].item())
+            if ci == PAD_SLOT_ID:
+                continue
+            start = int(query_start_loc[b].item())
+            end = int(query_start_loc[b + 1].item())
+            qlen = end - start
+            if qlen <= 0:
+                continue
+            has_st = bool(has_initial_state[b].item())
+            if qlen >= W_minus_1:
+                sconv_cache[ci] = x[end - W_minus_1 : end].to(sconv_cache.dtype)
+            else:
+                old_tail = (
+                    sconv_cache[ci, qlen:]
+                    if has_st
+                    else sconv_cache.new_zeros((W_minus_1 - qlen, D))
+                )
+                sconv_cache[ci] = torch.cat(
+                    (old_tail, x[start:end].to(sconv_cache.dtype)), dim=0
+                )
+        return
     if (
         is_cuda()
         and x.dtype == torch.bfloat16
@@ -1020,6 +1101,48 @@ def fused_causal_conv1d_update_decode(
     T, D = x.shape
     W = weight.shape[1]
 
+    if not x.is_cuda:
+        if T == 0:
+            return torch.empty(0, D, dtype=x.dtype, device=x.device)
+        cm = cache_mask.reshape(-1).bool()[:T]
+        ci = cache_indices[:T].long()
+        valid = cm & (ci != PAD_SLOT_ID)
+        acc = torch.zeros((T, D), dtype=torch.float32)
+        if W > 1:
+            hist = torch.where(
+                valid[:, None, None],
+                sconv_cache[ci.clamp(min=0)].float(),
+                0.0,
+            )
+            for iw in range(W - 1):
+                acc = acc + hist[:, iw] * weight[:, iw].float()[None, :]
+        x_cur = x.float()
+        acc = acc + x_cur * weight[:, W - 1].float()[None, :]
+        if activation in ("silu", "swish"):
+            acc = acc * torch.sigmoid(acc)
+        if use_residual:
+            acc = acc + x_cur
+        y_out = acc.to(x.dtype)
+        if valid.any() and W > 1:
+            v_slots = ci[valid]
+            if W > 2:
+                new_win = torch.cat(
+                    (
+                        sconv_cache[v_slots, 1:],
+                        x[valid].to(sconv_cache.dtype).unsqueeze(1),
+                    ),
+                    dim=1,
+                )
+            else:
+                new_win = x[valid].to(sconv_cache.dtype).unsqueeze(1)
+            sconv_cache[v_slots] = new_win
+            if track_mask is not None and track_indices is not None:
+                tm = track_mask.reshape(-1)[:T].bool() & valid
+                if tm.any():
+                    sconv_cache[track_indices.reshape(-1)[:T][tm].long()] = new_win[
+                        tm[valid]
+                    ]
+        return y_out
     if (
         is_cuda()
         and x.dtype == torch.bfloat16
@@ -1197,6 +1320,23 @@ def save_intermediate_conv_windows(
     assert hidden_states.stride(-1) == 1, "hidden_states must be D-contiguous"
     assert intermediate_out.stride(-1) == 1, "intermediate_out must be D-contiguous"
 
+    if not sconv_cache.is_cuda:
+        ci = cache_indices[:batch_size].long()
+        valid = ci != PAD_SLOT_ID
+        if valid.any():
+            v_idx = valid.nonzero(as_tuple=True)[0]
+            initial = sconv_cache[ci[v_idx]]
+            padded = torch.cat(
+                (initial, hidden_states[v_idx, :draft_token_num].to(sconv_cache.dtype)),
+                dim=1,
+            )
+            windows = (
+                padded.unfold(1, W_minus_1, 1)[:, 1 : draft_token_num + 1]
+                .transpose(-2, -1)
+                .contiguous()
+            )
+            intermediate_out[v_idx] = windows.to(intermediate_out.dtype)
+        return
     cache_indices = cache_indices[:batch_size].to(torch.int32).contiguous()
 
     BLOCK_D = min(triton.next_power_of_2(D), 1024)

@@ -760,6 +760,11 @@ class DraftBlockProposer:
     def _stage_dp_meta(
         self, gnt: list, gnt_logprob: list, device
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if torch.device(device).type == "cpu":
+            return (
+                torch.tensor(gnt, dtype=torch.int64, device=device),
+                torch.tensor(gnt_logprob, dtype=torch.int64, device=device),
+            )
         dp = len(gnt)
         if self._dp_meta_host is None or self._dp_meta_host.shape[2] != dp:
             self._dp_meta_host = torch.empty(

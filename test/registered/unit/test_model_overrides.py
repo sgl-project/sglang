@@ -1352,6 +1352,86 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         loop = "Inkling2LoopForConditionalGeneration"
         self.assertEqual(backend(arch=loop), ("megamoe", True))
 
+    def test_inkling2_loop_cpu_overrides(self):
+        """On CPU, Inkling2LoopForConditionalGeneration selects intel_amx (when
+        unset), preserves inkling/inkling2 parsers and sconv cache sizing, and
+        does not force CUDA graph or MegaMoE."""
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            apply_inkling_prefill_cuda_graph_default,
+        )
+        from sglang.srt.arg_groups.mamba_hook import (
+            _platform_supports_mamba_cache_extra_buffer,
+        )
+        from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+
+        text = SimpleNamespace(hidden_size=4608, intermediate_size=2304)
+        hf = SimpleNamespace(
+            architectures=["Inkling2LoopForConditionalGeneration"],
+            get_text_config=lambda: text,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                device="cpu",
+                tool_call_parser=None,
+                reasoning_parser=None,
+                tp_size=1,
+                moe_dp_size=1,
+                ep_size=1,
+                attn_dp_size=1,
+                moe_a2a_backend="none",
+                encoder_only=False,
+                enable_two_batch_overlap=False,
+                enable_single_batch_overlap=False,
+                swa_full_tokens_ratio=None,
+                mamba_full_memory_ratio=None,
+                mamba_radix_cache_strategy="auto",
+                disable_radix_cache=False,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                _model_config=SimpleNamespace(quantization="inkling2"),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with (
+            override_platform(
+                is_cuda=False,
+                is_cpu=True,
+                is_sm90=False,
+                is_sm100=False,
+                is_sm120=False,
+            ),
+            patch("sglang.srt.utils.device.is_host_cpu_arm64", return_value=False),
+        ):
+            out = _inkling_overrides(_args(), hf)
+            self.assertEqual(out["attention_backend"], "intel_amx")
+            self.assertEqual(out["tool_call_parser"], "inkling2")
+            self.assertEqual(out["reasoning_parser"], "inkling")
+            self.assertEqual(out["swa_full_tokens_ratio"], 0.1)
+            self.assertEqual(out["mamba_full_memory_ratio"], 0.1)
+            self.assertEqual(out["mamba_radix_cache_strategy"], "extra_buffer")
+            self.assertTrue(out["uses_mamba_radix_cache"])
+            self.assertNotIn("moe_a2a_backend", out)
+            self.assertTrue(_platform_supports_mamba_cache_extra_buffer())
+
+            explicit = _inkling_overrides(_args(attention_backend="torch_native"), hf)
+            self.assertNotIn("attention_backend", explicit)
+
+            sa = SimpleNamespace(
+                device="cpu",
+                disable_cuda_graph=False,
+                cuda_graph_backend_prefill=None,
+                disable_prefill_cuda_graph=False,
+                model_path="dummy",
+                _model_config=SimpleNamespace(hf_config=hf),
+                _declared={},
+                _resolution_records=[],
+            )
+            apply_inkling_prefill_cuda_graph_default(sa)
+            self.assertNotIn("cuda_graph_backend_prefill", sa._declared)
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.

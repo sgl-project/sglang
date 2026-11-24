@@ -304,4 +304,13 @@ def linear(
             else torch.addmm(bias, flat, weight.T, out_dtype=torch.float32)
         )
         return out.view(*x.shape[:-1], weight.shape[0])
+    if not x.is_cuda:
+        if out_dtype == torch.float32 and x.dtype != torch.float32:
+            flat = x.reshape(-1, x.shape[-1]).float()
+            w = weight.float()
+            b = bias.float() if bias is not None else None
+            return F.linear(flat, w, b).view(*x.shape[:-1], weight.shape[0])
+        w = weight.to(x.dtype) if weight.dtype != x.dtype else weight
+        b = bias.to(x.dtype) if bias is not None and bias.dtype != x.dtype else bias
+        return F.linear(x, w, b).to(out_dtype)
     return F.linear(x, weight, bias).to(out_dtype)

@@ -253,7 +253,9 @@ class Inkling2LogitsProcessor(LogitsProcessor):
             if logits.is_cuda:
                 fused_softcap(logits, self.shard_softcap)
             else:
-                logits = self.shard_softcap * torch.tanh(logits / self.shard_softcap)
+                logits.copy_(
+                    self.shard_softcap * torch.tanh(logits / self.shard_softcap)
+                )
         return logits
 
     def _get_logits(

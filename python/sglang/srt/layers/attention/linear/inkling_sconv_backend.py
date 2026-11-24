@@ -116,7 +116,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # Both identity and unified v2p gathers are recordable. The allocator
         # updates the stable device table in place, including after compaction.
-        self._slot_gather_recordable = True
+        self._slot_gather_recordable = is_cuda()
 
         self.sconv_metadata = InklingShortConvMetadata()
 
@@ -254,11 +254,40 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             self._prepare_slot_indices(forward_batch)
         self._refresh_sconv_metadata(forward_batch, on_graph_path=True)
 
-    def init_forward_metadata_capture_cpu_graph(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Inkling's short-conv backend has no CPU-graph path; its conv "
-            "kernels are CUDA/Triton only."
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        super().init_forward_metadata_capture_cpu_graph(
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            out_cache_loc,
+            encoder_lens,
+            forward_mode,
+            spec_info,
         )
+        if self._cache_indices is None:
+            return
+        self.sconv_metadata.cache_indices = self._cache_indices
+        if forward_mode.is_decode_or_idle():
+            (
+                self.sconv_metadata.query_start_loc,
+                self.sconv_metadata.has_initial_state,
+                self.sconv_metadata.precomputed,
+            ) = fused_decode_sconv_metadata(
+                B=bs,
+                cache_indices=self._cache_indices,
+                out=self._graph_metadata_out(B=bs, T=bs),
+            )
 
     def _prepare_slot_indices(self, forward_batch: ForwardBatch):
         self._reset_step_state()
@@ -296,13 +325,17 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             self.sconv_metadata.track_cache_indices = indices
             return
         n = indices.shape[0]
+        translated = self._translate_mamba_indices(indices)
+        if not self._slot_gather_recordable and n > self._graph_track_indices.shape[0]:
+            self.sconv_metadata.track_cache_indices = translated
+            return
         assert n <= self._graph_track_indices.shape[0], (
             "checkpoint-index buffer too small for the forward batch"
         )
         # Keep the batch virtual across repeated eager metadata initialization
         # and across draft backends. Captured consumers read this fixed buffer.
         out = self._graph_track_indices[:n]
-        out.copy_(self._translate_mamba_indices(indices))
+        out.copy_(translated)
         self.sconv_metadata.track_cache_indices = out
 
     def _refresh_sconv_metadata(
@@ -546,7 +579,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         torch.clamp(
             out[:live],
             min=self._track_index_floor,
-            max=query_start_loc[-1:].to(torch.int64) - 1,
+            max=(query_start_loc[-1:].to(torch.int64) - 1).clamp_min(0),
             out=out[:live],
         )
         if live < rows:
@@ -570,8 +603,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
                 # Virtual slot ids are the physical ones: the forward used
                 # these very ids and read no table for them.
                 track = track_ids[:num_requests]
-            else:
+            elif num_requests <= self._graph_track_indices.shape[0]:
                 track = self._graph_track_indices[:num_requests]
+            else:
+                track = self._translate_mamba_indices(track_ids[:num_requests])
         return ForwardStateSlots(working, track)
 
     def commit_conv_state_after_mtp_verify(

@@ -141,6 +141,61 @@ def _num_sms(device_index: int) -> int:
     return get_device_core_count(device_index) or 132
 
 
+def _track_mamba_states_torch(
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    mamba_track_mask: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    batch_size: int,
+    slot_dim: int,
+    check_freed_slots: bool,
+) -> None:
+    """Eager copy of tracked rows for devices without the Triton kernel (CPU)."""
+    rows = mamba_track_mask[:batch_size].nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return
+    src = cache_indices[rows].to(torch.int64)
+    dst = mamba_track_indices[rows].to(torch.int64)
+    if check_freed_slots:
+        keep = (src >= 0) & (dst >= 0)
+        src, dst = src[keep], dst[keep]
+        if src.numel() == 0:
+            return
+    for pool in (conv_states, ssm_states):
+        if pool.numel() > 0:
+            pool.index_copy_(slot_dim, dst, pool.index_select(slot_dim, src))
+
+
+def _scatter_steps_torch(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+    src_indices_raw: torch.Tensor | None,
+) -> None:
+    """Eager ``dst[:, dst[i]] = src[:, src[i], step[i]]`` for valid rows."""
+    dst_idx = dst_indices_raw.to(torch.long)
+    steps = step_indices_raw.to(torch.long)
+    src_idx = (
+        torch.arange(steps.shape[0], dtype=torch.long, device=steps.device)
+        if src_indices_raw is None
+        else src_indices_raw.to(torch.long)
+    )
+    valid = (
+        (steps >= 0)
+        & (steps < src.shape[2])
+        & (dst_idx >= 0)
+        & (dst_idx < dst.shape[1])
+        & (src_idx >= 0)
+        & (src_idx < src.shape[1])
+    )
+    rows = valid.nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return
+    dst[:, dst_idx[rows]] = src[:, src_idx[rows], steps[rows]].to(dst.dtype)
+
+
 def _launch_track_mamba_states(
     conv_states: torch.Tensor,
     ssm_states: torch.Tensor,
@@ -209,6 +264,18 @@ def track_mamba_states_if_needed(
         mamba_track_indices: Indices to track for each batch element [batch_size]
         batch_size: Number of batch elements
     """
+    if not (conv_states.is_cuda or conv_states.is_xpu):
+        _track_mamba_states_torch(
+            conv_states,
+            ssm_states,
+            cache_indices,
+            mamba_track_mask,
+            mamba_track_indices,
+            batch_size,
+            slot_dim=0,
+            check_freed_slots=check_freed_slots,
+        )
+        return
     _launch_track_mamba_states(
         conv_states,
         ssm_states,
@@ -340,10 +407,15 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
-    if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
+    if dst.device != src.device:
         raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA/XPU tensors."
+            f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
+    if not (dst.is_cuda or dst.is_xpu):
+        _scatter_steps_torch(
+            dst, src, dst_indices_raw, step_indices_raw, src_indices_raw
+        )
+        return
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -504,11 +576,16 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0 or dst.numel() == 0:
         return
 
-    if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
+    if dst.device != src.device:
         raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be "
-            f"CUDA/XPU tensors on the same device ({dst.device=}, {src.device=})."
+            "fused_conv_window_scatter_with_mask requires dst and src on the "
+            f"same device ({dst.device=}, {src.device=})."
         )
+    if not (dst.is_cuda or dst.is_xpu):
+        _scatter_steps_torch(
+            dst, src, dst_indices_raw, step_indices_raw, src_indices_raw
+        )
+        return
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
     if dst.shape[0] != src.shape[0]:
@@ -723,6 +800,14 @@ def fused_conv_window_scatter_multi(
     n2 = 0 if step_indices2_raw is None else step_indices2_raw.shape[0]
     if n1 + n2 == 0:
         return
+    if not (pairs[0][0].is_cuda or pairs[0][0].is_xpu):
+        for dst, src in pairs:
+            _scatter_steps_torch(dst, src, dst_indices_raw, step_indices_raw, None)
+            if n2 > 0:
+                _scatter_steps_torch(
+                    dst, src, dst_indices2_raw, step_indices2_raw, None
+                )
+        return
 
     BLOCK_SIZE = 1024
     key = tuple(
@@ -912,6 +997,33 @@ def fused_commit_track_indices(
         bs, dtype=torch.int64, device=accept_lens.device
     )
     has_track = seq_lens is not None
+    if not (accept_lens.is_cuda or accept_lens.is_xpu):
+        al = accept_lens.to(torch.int64)
+        if has_accept_index:
+            rows = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            base = rows * draft_token_num
+            last_correct_step_indices.copy_(
+                accept_index[rows, al - 1].to(torch.int64) - base
+            )
+        else:
+            last_correct_step_indices.copy_(al - 1)
+        if has_track:
+            pre = seq_lens.to(torch.int64)
+            post = pre + al
+            cross = (pre // mamba_track_interval) != (post // mamba_track_interval)
+            tp = (post // mamba_track_interval) * mamba_track_interval
+            ti = (tp - pre - 1).clamp(min=0)
+            if has_accept_index:
+                cand = accept_index[rows, ti].to(torch.int64) - base
+            else:
+                cand = ti
+            mamba_steps_to_track = torch.where(
+                cross,
+                cand,
+                torch.tensor(-1, dtype=torch.int64, device=accept_lens.device),
+            )
+            return last_correct_step_indices, mamba_steps_to_track
+        return last_correct_step_indices, None
     mamba_steps_to_track = (
         torch.empty(bs, dtype=torch.int64, device=accept_lens.device)
         if has_track
@@ -949,6 +1061,18 @@ def track_mamba_states_all_layers(
     destination indices are shared across layers, so a single launch once
     every layer's state is final is equivalent to the per-layer launches.
     """
+    if not (conv_states_pool.is_cuda or conv_states_pool.is_xpu):
+        _track_mamba_states_torch(
+            conv_states_pool,
+            ssm_states_pool,
+            cache_indices,
+            mamba_track_mask,
+            mamba_track_indices,
+            batch_size,
+            slot_dim=1,
+            check_freed_slots=check_freed_slots,
+        )
+        return
     _launch_track_mamba_states(
         conv_states_pool,
         ssm_states_pool,

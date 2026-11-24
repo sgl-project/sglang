@@ -119,3 +119,87 @@ def chunk_gated_delta_rule_cpu(
     last_recurrent_state = initial_state
     h = None  # Todo: add return h support
     return core_attn_out, last_recurrent_state, h
+
+
+def inkling2_short_convolution_cpu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cache: torch.Tensor,
+    safe_idx: torch.Tensor,
+    cache_mask: torch.Tensor,
+    cu: torch.Tensor,
+    si: torch.Tensor,
+    dynamic_weights: torch.Tensor | None = None,
+    decode: bool = False,
+    use_residual: bool = True,
+    track_mask: torch.Tensor | None = None,
+    track_indices: torch.Tensor | None = None,
+    window: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.inkling2_short_convolution_cpu(
+        x,
+        weight,
+        cache,
+        safe_idx,
+        cache_mask,
+        cu,
+        si,
+        dynamic_weights,
+        decode,
+        use_residual,
+        track_mask,
+        track_indices,
+        window,
+    )
+
+
+def inkling2_routed_sconv_epilogue_cpu(
+    down: torch.Tensor,
+    src2dst: torch.Tensor | None,
+    top_k: int,
+    weight: torch.Tensor,
+    cache: torch.Tensor,
+    safe_idx: torch.Tensor,
+    cache_mask: torch.Tensor,
+    cu: torch.Tensor,
+    si: torch.Tensor,
+    attention: torch.Tensor,
+    partial: torch.Tensor | None = None,
+    track_mask: torch.Tensor | None = None,
+    track_indices: torch.Tensor | None = None,
+    window: torch.Tensor | None = None,
+    round_bf16: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.inkling2_routed_sconv_epilogue_cpu(
+        down,
+        src2dst,
+        top_k,
+        weight,
+        cache,
+        safe_idx,
+        cache_mask,
+        cu,
+        si,
+        attention,
+        partial,
+        track_mask,
+        track_indices,
+        window,
+        round_bf16,
+    )
+
+
+def inkling2_update_sconv_cache_cpu(
+    x: torch.Tensor,
+    sconv_cache: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.inkling2_update_sconv_cache_cpu(
+        x,
+        sconv_cache,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+    )

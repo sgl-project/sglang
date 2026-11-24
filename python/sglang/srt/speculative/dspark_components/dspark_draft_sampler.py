@@ -162,7 +162,10 @@ class DsparkDraftSampler:
             capturing = (
                 torch.xpu.is_current_stream_capturing()
                 if _is_xpu
-                else torch.cuda.is_current_stream_capturing()
+                else (
+                    torch.cuda.is_available()
+                    and torch.cuda.is_current_stream_capturing()
+                )
             )
             assert not capturing
             width = _step_logits_width(self.model, self.sharded_accept)

@@ -148,7 +148,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
 
-    static_assert(COLS % 2 == 0);
+    static_assert(COLS >= 1);
 
     // prefetch distance
     constexpr int PREFETCH_SIZE_K = 0;
@@ -296,7 +296,7 @@ struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N> {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
 
-    static_assert(COLS % 2 == 0);
+    static_assert(COLS >= 1);
 
     // prefetch distance
     constexpr int PREFETCH_SIZE_K = 0;
@@ -372,18 +372,30 @@ void tinygemm_kernel(
 
       switch (mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
+        case 0x11:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 16);
+          break;
         case 0x12:
           LAUNCH_TINYGEMM_KERNEL_NN2(1, 32);
           break;
         // mb_size = 2
+        case 0x21:
+          LAUNCH_TINYGEMM_KERNEL_NN2(2, 16);
+          break;
         case 0x22:
           LAUNCH_TINYGEMM_KERNEL_NN2(2, 32);
           break;
         // mb_size = 3
+        case 0x31:
+          LAUNCH_TINYGEMM_KERNEL_NN2(3, 16);
+          break;
         case 0x32:
           LAUNCH_TINYGEMM_KERNEL_NN2(3, 32);
           break;
         // mb_size = 4
+        case 0x41:
+          LAUNCH_TINYGEMM_KERNEL_NN2(4, 16);
+          break;
         case 0x42:
           LAUNCH_TINYGEMM_KERNEL_NN2(4, 32);
           break;
@@ -811,6 +823,172 @@ void shared_expert_kernel_impl(
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
+    }
+  });
+}
+
+template <typename scalar_t>
+inline void inkling2_capped_swiglu_stub(
+    scalar_t* __restrict__ out,
+    const float* __restrict__ gate_up,
+    int64_t n_size,
+    float gamma,
+    float gate_cap,
+    float up_cap) {
+  using fVec = at::vec::Vectorized<float>;
+  const fVec gamma_v(gamma);
+  const bool has_gate_cap = gate_cap > 0.f;
+  const bool has_up_cap = up_cap > 0.f;
+  const fVec gate_cap_v(gate_cap);
+  const fVec inv_gate_cap_v(has_gate_cap ? (1.0f / gate_cap) : 0.0f);
+  const fVec up_cap_v(up_cap);
+  const fVec inv_up_cap_v(has_up_cap ? (1.0f / up_cap) : 0.0f);
+  constexpr int64_t kVec2 = 2 * fVec::size();
+  int64_t d = 0;
+  for (; d <= n_size - kVec2; d += kVec2) {
+    auto [x0_, y0_] = load_float_vec2(gate_up + d);
+    auto [gate, up] = at::vec::deinterleave2<float>(x0_, y0_);
+    fVec sig = fast_sigmoid(gate);
+    if (has_gate_cap) {
+      gate = gate_cap_v * (gate * inv_gate_cap_v).tanh();
+    }
+    if (has_up_cap) {
+      up = up_cap_v * (up * inv_up_cap_v).tanh();
+    }
+    fVec res = gate * sig * up * gamma_v;
+    store_from_float_ext(out + d / 2, res);
+  }
+  for (; d < n_size; d += 2) {
+    float g = gate_up[d];
+    float u = gate_up[d + 1];
+    float sig = 1.0f / (1.0f + std::exp(-g));
+    if (has_gate_cap) {
+      g = gate_cap * std::tanh(g / gate_cap);
+    }
+    if (has_up_cap) {
+      u = up_cap * std::tanh(u / up_cap);
+    }
+    out[d / 2] = static_cast<scalar_t>(g * sig * u * gamma);
+  }
+}
+
+template <typename scalar_t>
+void inkling2_fused_experts_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ packed_w13,
+    const scalar_t* __restrict__ packed_w2,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad,
+    float gate_softcap,
+    float up_softcap) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
+  const int64_t NB_w13 = div_up(2 * N, BLOCK_N);
+  const int64_t stride_e = 2 * N * K;
+  const int64_t stride_n = K;
+
+  int64_t avg_M = std::max(int64_t(1), M * topk / std::max(int64_t(1), E));
+  const bool use_brgemm = can_use_brgemm<scalar_t>(avg_M);
+
+  // Stage 1: gate_up = hidden_states @ w13^T, then capped SwiGLU with per-row gamma
+  parallel_2d(MB, NB_w13, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = get_thread_num();
+    scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+    float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
+      int32_t expert_id = expert_ids[mb];
+      const scalar_t* __restrict__ B = packed_w13 + expert_id * stride_e + nb * BLOCK_N * stride_n;
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+
+      if (nb_offset == 0) {
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, input + index * K, K);
+        }
+      }
+
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(m_size, n_size, K, K, n_size, BLOCK_N, false, A, B, C0);
+      } else {
+        tinygemm_kernel(A, B, C0, m_size, n_size, K, K, n_size, BLOCK_N);
+      }
+
+      const int64_t offset = offsets[mb];
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+      const int64_t out_col_offset = (nb * BLOCK_N) / 2;
+      for (int64_t m = 0; m < m_size; ++m) {
+        float gamma = topk_weights[A_ids[m]];
+        inkling2_capped_swiglu_stub(
+            ic1 + (offset + m) * N + out_col_offset, C0 + m * BLOCK_N, n_size, gamma, gate_softcap, up_softcap);
+      }
+    });
+
+    if (use_brgemm) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+
+  // Stage 2: down = ic1 @ w2^T (unit weight scatter to ic2)
+  const int64_t OC = K;
+  const int64_t IC = N;
+  const int64_t MB2 = MB;
+  const int64_t NB2 = div_up(OC, BLOCK_N);
+  const int64_t stride_e2 = OC * IC;
+  const int64_t stride_oc = IC;
+
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = get_thread_num();
+    float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+
+      const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+
+      int32_t expert_id = expert_ids[mb];
+      const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(m_size, n_size, IC, IC, n_size, BLOCK_N, false, A, B, C);
+      } else {
+        tinygemm_kernel(A, B, C, m_size, n_size, IC, IC, n_size, BLOCK_N);
+      }
+
+      for (int64_t m = 0; m < m_size; ++m) {
+        int32_t index = A_ids[m];
+        copy_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, n_size);
+      }
+    });
+
+    if (use_brgemm) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+
+  // Stage 3: unit-weight sum across topk
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
     }
   });
 }
@@ -1381,6 +1559,123 @@ at::Tensor shared_expert_cpu(
           N,
           K);
     }
+  });
+  return out_hidden_states;
+}
+
+at::Tensor inkling2_fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w13,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double gate_softcap,
+    double up_softcap,
+    bool inplace,
+    bool is_vnni) {
+  CHECK_INPUT(hidden_states);
+  CHECK_INPUT(w13);
+  CHECK_INPUT(w2);
+  CHECK_DIM(2, hidden_states);
+  CHECK_DIM(3, w13);
+  CHECK_DIM(3, w2);
+  CHECK_DIM(2, topk_weights);
+  CHECK_DIM(2, topk_ids);
+  CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
+
+  const auto st = hidden_states.scalar_type();
+  TORCH_CHECK(w13.scalar_type() == st && w2.scalar_type() == st, "inkling2_fused_experts_cpu: dtype mismatch");
+
+  auto topk_ids_ =
+      (topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous()) ? topk_ids : topk_ids.to(at::kInt).contiguous();
+  auto topk_weights_ = (topk_weights.scalar_type() == at::kFloat && topk_weights.is_contiguous())
+                           ? topk_weights
+                           : topk_weights.to(at::kFloat).contiguous();
+
+  int64_t M = hidden_states.size(0);
+  int64_t K = hidden_states.size(1);
+  int64_t E = w13.size(0);
+  int64_t two_N = w13.size(1);
+  TORCH_CHECK(two_N % 2 == 0, "inkling2_fused_experts_cpu: w13.size(1) must be even");
+  int64_t N = two_N / 2;
+  int64_t topk = topk_weights_.size(1);
+
+  CHECK_EQ(w13.size(2), K);
+  CHECK_EQ(w2.size(0), E);
+  CHECK_EQ(w2.size(1), K);
+  CHECK_EQ(w2.size(2), N);
+  CHECK_EQ(topk_weights_.size(0), M);
+
+  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
+  if (M == 0) {
+    return out_hidden_states;
+  }
+
+  auto packed_w13 = is_vnni ? w13 : convert_weight_packed(w13);
+  auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
+
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  int num_threads = at::get_num_threads();
+  int64_t max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
+  int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
+  auto buffer = at::empty(
+      {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
+      topk_ids_.options());
+
+  int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
+  int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
+  int32_t* __restrict__ total_cnts = expert_ids + max_num_blocks;
+  int32_t* __restrict__ cumsums = total_cnts + (num_threads + 1) * E;
+  int32_t* __restrict__ offsets = cumsums + (E + 1);
+
+  int64_t numel = M * topk;
+  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+    int64_t m_start = begin * BLOCK_M;
+    int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
+    fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
+    fill_stub(expert_ids + begin, (int32_t)E, end - begin);
+  });
+  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    fill_stub(total_cnts + begin, 0, end - begin);
+  });
+
+  int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
+      sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+
+  int64_t buffer_size_nbytes = M * topk * N * sizeof(uint16_t) + M * topk * K * sizeof(uint16_t) +
+                               num_threads * BLOCK_M * K * sizeof(uint16_t) +
+                               num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
+  auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "inkling2_fused_experts_kernel_impl", [&] {
+    scalar_t* __restrict__ intermediate_cache1 = reinterpret_cast<scalar_t*>(buffer2.data_ptr<int8_t>());
+    scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
+    scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
+    float* __restrict__ C_tmp = reinterpret_cast<float*>(A_tmp + num_threads * BLOCK_M * K);
+
+    inkling2_fused_experts_kernel_impl<scalar_t>(
+        out_hidden_states.data_ptr<scalar_t>(),
+        intermediate_cache1,
+        intermediate_cache2,
+        A_tmp,
+        C_tmp,
+        hidden_states.data_ptr<scalar_t>(),
+        packed_w13.data_ptr<scalar_t>(),
+        packed_w2.data_ptr<scalar_t>(),
+        topk_weights_.data_ptr<float>(),
+        sorted_ids,
+        expert_ids,
+        offsets,
+        M,
+        N,
+        K,
+        E,
+        topk,
+        num_tokens_post_pad,
+        static_cast<float>(gate_softcap),
+        static_cast<float>(up_softcap));
   });
   return out_hidden_states;
 }

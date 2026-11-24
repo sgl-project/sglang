@@ -40,6 +40,12 @@ def mix_rmsnorm(
     rows, taps, hidden = targets.shape
     assert alpha.shape == (taps,) and alpha.is_contiguous()
     assert weight.shape == (hidden,) and weight.is_contiguous()
+    if not targets.is_cuda:
+        if rows == 0:
+            return targets.new_empty((0, hidden))
+        mixed = (targets.float() * alpha.float().view(1, taps, 1)).sum(dim=1)
+        inv_rms = torch.rsqrt((mixed * mixed).sum(dim=-1, keepdim=True) / hidden + eps)
+        return (mixed * inv_rms * weight.float()).to(targets.dtype)
     out = targets.new_empty((rows, hidden))
     if rows:
         _mix_rmsnorm[(rows,)](
@@ -85,6 +91,19 @@ def rnn_gates(proj: torch.Tensor, state: torch.Tensor):
     """(state', latent) of Inkling2MTPHead._rnn_step from the rnn_proj output."""
     rows, rank = state.shape
     assert proj.shape == (rows, 3 * rank) and proj.stride(-1) == state.stride(-1) == 1
+    if not state.is_cuda:
+        if rows == 0:
+            return state.new_empty((0, rank)), state.new_empty((0, rank))
+        gate_raw, cand_raw, out_raw = proj.chunk(3, dim=-1)
+        # Round each op through BF16 to match the Triton/eager BF16 semantics.
+        gate = torch.sigmoid(gate_raw.float()).to(torch.bfloat16).float()
+        kept = (gate * state.float()).to(torch.bfloat16).float()
+        one_minus_gate = (1.0 - gate).to(torch.bfloat16).float()
+        cand = torch.tanh(cand_raw.float()).to(torch.bfloat16).float()
+        blend = (one_minus_gate * cand).to(torch.bfloat16).float()
+        new_state = (kept + blend).to(state.dtype)
+        latent = torch.tanh(out_raw.float()).to(state.dtype)
+        return new_state, latent
     new_state, latent = state.new_empty((rows, rank)), state.new_empty((rows, rank))
     if rows:
         _rnn_gates[(rows,)](
@@ -141,6 +160,11 @@ def rnn_inputs(state, tokens, embedding, hidden, f_rnn):
     width = hidden.shape[1]
     assert state.is_contiguous() and f_rnn.is_contiguous() and hidden.stride(1) == 1
     assert state.dtype == hidden.dtype == f_rnn.dtype and embedding.is_contiguous()
+    if not state.is_cuda:
+        if rows == 0:
+            return state.new_empty((0, 2 * rank + 2 * width))
+        emb = embedding.index_select(0, tokens.to(torch.int64)).to(state.dtype)
+        return torch.cat([state, emb, hidden, f_rnn], dim=-1)
     out = state.new_empty((rows, 2 * rank + 2 * width))
     if rows:
         _rnn_inputs[(rows,)](

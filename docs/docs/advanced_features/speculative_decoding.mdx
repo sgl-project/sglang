@@ -3,7 +3,7 @@ title: "Speculative Decoding"
 metatags:
     description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, DSPARK, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -34,8 +34,9 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a UNO adapter for the target model**: Use **UNO** with `--speculative-algorithm UNO` and `--uno-lora-path ...`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
+- **Model ships or pairs with a DSpark block-parallel MTP draft**: Use **DSPARK** with `--speculative-algorithm DSPARK` (supported on GPU, TPU, and Intel Xeon CPU with `intel_amx`).
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
-- **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
+- **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA and CPU `intel_amx`).
 
 ### Method comparison (mini table)
 
@@ -104,6 +105,13 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA DP attention requires <code>--enable-dp-lm-head</code> and <code>attn_cp_size == 1</code>; <code>pp_size == 1</code></td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DSPARK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSpark block-parallel MTP draft (bundled or standalone)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Optional (often bundled)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DSPARK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>pp_size == 1</code>; supported on GPU, TPU, and Intel Xeon CPU (<code>intel_amx</code>)</td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Smaller draft LLM (token-level)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
@@ -115,7 +123,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ngram cache from previous tokens</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm NGRAM</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only; no DP attention (<code>--attn-dp-size</code> &gt; 1); disables overlap scheduler &amp; mixed chunked prefill</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA and CPU (<code>intel_amx</code>); no DP attention (<code>--attn-dp-size</code> &gt; 1); disables overlap scheduler &amp; mixed chunked prefill</td>
     </tr>
 </tbody>
 </table>

@@ -25,6 +25,13 @@ def residual_add(*inputs: torch.Tensor) -> torch.Tensor:
     assert inputs and all(
         x.shape == inputs[0].shape and x.device == inputs[0].device for x in inputs
     )
+    if not inputs[0].is_cuda:
+        if len(inputs) == 1:
+            return inputs[0].clone()
+        acc = inputs[0].float()
+        for t in inputs[1:]:
+            acc = acc + t.float()
+        return acc.to(inputs[0].dtype)
     inputs = tuple(x.contiguous() for x in inputs)
     result = torch.empty_like(inputs[0])
     if result.numel():

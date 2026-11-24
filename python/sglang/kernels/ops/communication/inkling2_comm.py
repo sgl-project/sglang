@@ -25,7 +25,9 @@ def _rank_sum(X, Y, N: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
 
 
 def _device():
-    return torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
 
 
 def _symm(group, numel, dtype, device, flags=False):
@@ -66,8 +68,10 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
         return x
     if world not in _RANK_ORDER_MAX_BYTES:
         raise ValueError("Inkling2 tensor parallelism requires 2, 4, 8, or 16 ranks")
-    if not x.is_cuda or x.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("Inkling2 collectives require BF16 or FP32 CUDA tensors")
+    if not x.is_cuda:
+        return group.all_reduce(x)
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("Inkling2 collectives require BF16 or FP32 tensors")
     if x.nbytes % 4:
         raise ValueError("Inkling2 collective payloads must be 4-byte aligned")
     x = x.contiguous()
@@ -202,7 +206,7 @@ def oneshot_all_reduce_input(group, rows, cols, dtype, tag=""):
     """A view of the next one-shot all-reduce input region for a producer to write
     into, or None when the one-shot path does not apply (including when NVLink
     multicast is unavailable). FP32 inputs take only the full one-shot sizes."""
-    if (
+    if not torch.cuda.is_available() or (
         group.world_size not in (4, 8)
         or dtype not in (torch.bfloat16, torch.float32)
         or rows <= 0
@@ -306,6 +310,8 @@ _ROUTED_EXCHANGE: dict = {}
 
 def prepare_routed_exchange(group, max_rows, hidden):
     """Allocate the routed exchange (collective; call outside graph capture)."""
+    if not torch.cuda.is_available():
+        return
     key = (group.device_group.group_name, hidden)
     if key not in _ROUTED_EXCHANGE and group.world_size > 1:
         _ROUTED_EXCHANGE[key] = RoutedExchange(group, max_rows, hidden, _device())
@@ -447,6 +453,8 @@ _PREFILL_EXCHANGE: dict = {}
 
 def prepare_prefill_exchange(group, max_tokens, top_k, hidden):
     """Allocate the prefill exchange (collective; call outside graph capture)."""
+    if not torch.cuda.is_available():
+        return
     key = (group.device_group.group_name, hidden)
     if key not in _PREFILL_EXCHANGE and group.world_size > 1 and max_tokens > 0:
         _PREFILL_EXCHANGE[key] = PrefillExchange(

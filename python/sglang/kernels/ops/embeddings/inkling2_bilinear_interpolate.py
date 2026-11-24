@@ -1,3 +1,4 @@
+import torch
 import triton
 import triton.language as tl
 
@@ -110,7 +111,36 @@ def bilinear_interpolate_rows_fwd_kernel(
     tl.store(output_ptr + row * EMBED_DIM + dim, value, mask=mask)
 
 
+def _bilinear_interpolate_rows_cpu(position_grid, y, x, heights, widths):
+    rows = y.numel()
+    width = position_grid.shape[-1]
+    if rows == 0:
+        return position_grid.new_empty((0, width))
+    src_h, src_w = position_grid.shape[0], position_grid.shape[1]
+
+    def _indices_and_weights(coord_idx, target_len, src_len):
+        coord = (float(src_len) * (coord_idx.float() + 0.5)) / target_len.float() - 0.5
+        coord = coord.clamp(min=0.0, max=float(src_len - 1))
+        s0 = torch.floor(coord).to(torch.int64)
+        s1 = torch.clamp(s0 + 1, max=src_len - 1)
+        w1 = coord - s0.float()
+        w0 = 1.0 - w1
+        return s0, s1, w0[:, None], w1[:, None]
+
+    y0, y1, wy0, wy1 = _indices_and_weights(y, heights, src_h)
+    x0, x1, wx0, wx1 = _indices_and_weights(x, widths, src_w)
+    v00 = position_grid[y0, x0].float()
+    v01 = position_grid[y0, x1].float()
+    v10 = position_grid[y1, x0].float()
+    v11 = position_grid[y1, x1].float()
+    top = v00 * wx0 + v01 * wx1
+    bottom = v10 * wx0 + v11 * wx1
+    return (top * wy0 + bottom * wy1).to(position_grid.dtype)
+
+
 def bilinear_interpolate_rows(position_grid, y, x, heights, widths):
+    if not position_grid.is_cuda:
+        return _bilinear_interpolate_rows_cpu(position_grid, y, x, heights, widths)
     rows, width = y.numel(), position_grid.shape[-1]
     output = position_grid.new_empty((rows, width))
     bilinear_interpolate_rows_fwd_kernel[(rows, 1)](

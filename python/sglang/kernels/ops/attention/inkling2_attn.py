@@ -158,7 +158,32 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
     assert batch * qlen == tokens
     m_strides = m_partial.stride()
     out = torch.empty((tokens, heads * d), device=gate.device, dtype=gate.dtype)
-    if tokens:
+    if tokens and not gate.is_cuda:
+        o_p = o_partial.reshape(splits, tokens, heads, d).float()
+        m_p = m_partial.reshape(splits, tokens, heads).float()
+        max_final = m_p.max(dim=0).values
+        active = m_p > float("-inf")
+        correction = torch.where(active, torch.exp(m_p - max_final.unsqueeze(0)), 0.0)
+        partial_sum = (
+            torch.where(active, l_partial.reshape(splits, tokens, heads).float(), 0.0)
+            if l_partial is not None
+            else active.float()
+        )
+        total = (correction * partial_sum).sum(dim=0)
+        acc = (correction.unsqueeze(-1) * o_p).sum(dim=0)
+        acc = torch.where(
+            max_final.unsqueeze(-1) > float("-inf"),
+            acc / total.clamp(min=1e-30).unsqueeze(-1),
+            acc,
+        )
+        lse = max_final + torch.log(total)
+        res = (
+            acc
+            * torch.sigmoid(gate.reshape(tokens, heads, d).float())
+            * torch.sigmoid(lse - sinks.reshape(tokens, heads).float()).unsqueeze(-1)
+        )
+        out.copy_(res.reshape(tokens, heads * d).to(gate.dtype))
+    elif tokens:
         _combine_gate_sink_kernel[(tokens, heads)](
             o_partial,
             m_partial,
@@ -286,7 +311,31 @@ def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
     group, padded_group = head_groups or (heads, heads)
     assert output.shape[1] == heads // group * padded_group * (gate.shape[1] // heads)
     result = torch.empty(gate.shape, device=output.device, dtype=output_dtype)
-    if result.numel() and not _cuda_gate_sink(
+    if result.numel() and not output.is_cuda:
+        tokens = result.shape[0]
+        head_dim = result.shape[1] // heads
+        out_heads = (
+            output.reshape(tokens, heads // group, padded_group, head_dim)[
+                :, :, :group, :
+            ]
+            .reshape(tokens, heads, head_dim)
+            .float()
+        )
+        lse_heads = (
+            lse[:tokens]
+            .reshape(tokens, heads // group, padded_group)[:, :, :group]
+            .reshape(tokens, heads)
+            .float()
+        )
+        gate_f = gate[:tokens].reshape(tokens, heads, head_dim).float()
+        sink_f = sinks[:tokens].reshape(tokens, heads).float()
+        res = (
+            out_heads
+            * torch.sigmoid(gate_f)
+            * torch.sigmoid(lse_heads - sink_f).unsqueeze(-1)
+        )
+        result.copy_(res.reshape(tokens, heads * head_dim).to(output_dtype))
+    elif result.numel() and not _cuda_gate_sink(
         output, gate, lse, sinks, result, group, padded_group
     ):
         _gate_sink_kernel[(result.shape[0], triton.cdiv(result.shape[1], 256))](
@@ -332,7 +381,12 @@ def _tau_kernel(
 
 def compute_log_scaling_tau(positions, n_floor, alpha):
     output = torch.empty(positions.shape, device=positions.device, dtype=torch.float32)
-    if positions.numel():
+    if positions.numel() and not positions.is_cuda:
+        ratio = torch.clamp(
+            (positions + 1).to(torch.float32) * (1.0 / float(n_floor)), min=1.0
+        )
+        output.copy_(1.0 + float(alpha) * torch.log(ratio))
+    elif positions.numel():
         _tau_kernel[(triton.cdiv(positions.numel(), 256),)](
             positions,
             output,
@@ -377,7 +431,12 @@ def pad_head_groups(x, group, padded_group):
     the padded_group - group extra heads after each group."""
     tokens, heads, width = x.shape
     out = x.new_empty((tokens, heads // group * padded_group, width))
-    if tokens:
+    if tokens and not x.is_cuda:
+        out.zero_()
+        out.view(tokens, heads // group, padded_group, width)[:, :, :group, :] = x.view(
+            tokens, heads // group, group, width
+        )
+    elif tokens:
         _pad_head_groups[(tokens, triton.cdiv(out.shape[1] * width, 1024))](
             x.contiguous(),
             out,

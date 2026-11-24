@@ -121,18 +121,29 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        # Inkling2 attention asserts fa4, which SM120 runs on its FA4 forward host.
-        if (
-            get_platform().is_sm90
-            or get_platform().is_sm100
-            or (inkling2 and get_platform().is_sm120)
-        ):
-            inkling_attn_backend = "fa4"
+        if getattr(cfg, "device", None) == "cpu" or get_platform().is_cpu:
+            from sglang.srt.utils.device import is_host_cpu_arm64
+
+            inkling_attn_backend = (
+                "torch_native" if is_host_cpu_arm64() else "intel_amx"
+            )
+            overrides["attention_backend"] = inkling_attn_backend
+            logger.info(
+                f"Use {inkling_attn_backend} as the attention backend for Inkling on CPU."
+            )
         else:
-            inkling_attn_backend = "triton"
-        overrides["attention_backend"] = inkling_attn_backend
-        logger.info(
-            f"Use {inkling_attn_backend} as the attention backend for Inkling "
-            "(requires fa4 or triton)."
-        )
+            # Inkling2 attention asserts fa4, which SM120 runs on its FA4 forward host.
+            if (
+                get_platform().is_sm90
+                or get_platform().is_sm100
+                or (inkling2 and get_platform().is_sm120)
+            ):
+                inkling_attn_backend = "fa4"
+            else:
+                inkling_attn_backend = "triton"
+            overrides["attention_backend"] = inkling_attn_backend
+            logger.info(
+                f"Use {inkling_attn_backend} as the attention backend for Inkling "
+                "(requires fa4 or triton)."
+            )
     return overrides

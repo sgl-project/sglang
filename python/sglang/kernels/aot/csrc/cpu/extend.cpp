@@ -22,9 +22,60 @@ namespace {
 //      plain causal mask (correct for non-spec extend and topk == 1 chains).
 //
 
+inline int tree_row_depth(const bool* __restrict__ tree_mask_seq, int seq_len_extend, int row_idx) {
+  const bool* __restrict__ row_ptr = tree_mask_seq + static_cast<int64_t>(row_idx) * seq_len_extend;
+  int vis = 0;
+  for (int col = 0; col <= row_idx && col < seq_len_extend; ++col) {
+    vis += row_ptr[col] ? 1 : 0;
+  }
+  return vis > 0 ? (vis - 1) : row_idx;
+}
+
+inline void apply_rel_bias_and_scale(
+    float* __restrict__ s_i_row,
+    const void* __restrict__ rel_bias_ptr,
+    at::ScalarType rb_dtype,
+    int64_t rb_row_offset,
+    int64_t rel_extent,
+    int64_t base_dist,
+    int n_size,
+    float sm_scale) {
+  const int col_start = static_cast<int>(std::max<int64_t>(0, base_dist - rel_extent + 1));
+  const int col_end = static_cast<int>(std::min<int64_t>(n_size, base_dist + 1));
+  const float neg_inf = -std::numeric_limits<float>::infinity();
+  auto run = [&](const auto* rb) {
+    for (int col = 0; col < col_start; ++col) {
+      float v = s_i_row[col];
+      if (v != neg_inf) {
+        s_i_row[col] = v * sm_scale;
+      }
+    }
+    for (int col = col_start; col < col_end; ++col) {
+      float v = s_i_row[col];
+      if (v != neg_inf) {
+        s_i_row[col] = v * sm_scale + static_cast<float>(rb[rb_row_offset + (base_dist - col)]);
+      }
+    }
+    for (int col = col_end; col < n_size; ++col) {
+      float v = s_i_row[col];
+      if (v != neg_inf) {
+        s_i_row[col] = v * sm_scale;
+      }
+    }
+  };
+  if (rb_dtype == at::kFloat) {
+    run(static_cast<const float*>(rel_bias_ptr));
+  } else if (rb_dtype == at::kBFloat16) {
+    run(static_cast<const at::BFloat16*>(rel_bias_ptr));
+  } else {
+    run(static_cast<const at::Half*>(rel_bias_ptr));
+  }
+}
+
 template <typename scalar_t, typename packed_t, typename index_t, int BLOCK_M, int BLOCK_N>
 void extend_attention_kernel_impl(
-    scalar_t* __restrict__ o_extend,
+    void* __restrict__ o_extend_ptr,
+    bool out_fp32,
     const scalar_t* __restrict__ q_extend,
     const scalar_t* __restrict__ k_extend,
     const scalar_t* __restrict__ v_extend,
@@ -41,6 +92,14 @@ void extend_attention_kernel_impl(
     const void* __restrict__ buffer,
     const scalar_t* __restrict__ sinks,
     const bool* __restrict__ tree_mask,
+    const void* __restrict__ rel_bias_ptr,
+    at::ScalarType rel_bias_dtype,
+    int64_t rb_strideM,
+    int64_t rb_strideH,
+    int64_t rel_extent,
+    float* __restrict__ lse_out_ptr,
+    int64_t lse_strideM,
+    int64_t lse_strideH,
     int batches,
     int num_heads,
     int num_heads_kv,
@@ -68,7 +127,8 @@ void extend_attention_kernel_impl(
     bool is_causal,
     bool kv_from_cache,
     bool has_encoder_lens,
-    bool has_sink) {
+    bool has_sink,
+    bool window_anchor_at_start) {
   // strides
   const int o_strideM = num_heads * head_size_v;
   const int o_strideH = head_size_v;
@@ -151,10 +211,13 @@ void extend_attention_kernel_impl(
       // init v', s' and m'
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
-      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), m_size);
+      const bool use_per_row_swa = sliding_window_size > 0 && !window_anchor_at_start;
       // stage 1: compute scores with prefix
       // kv_from_cache has no stage 2, so cover the extend range and stop at the diagonal
-      int kv_start = 0;
+      int kv_start = (window_anchor_at_start && sliding_window_size > 0 && !is_cross_attn)
+                         ? std::max(0, seq_len_prefix - (static_cast<int>(sliding_window_size) - 1))
+                         : 0;
       int kv_end = is_cross_attn ? encoder_lens[bs] : (kv_from_cache ? seq_len_prefix + m + m_size : seq_len_prefix);
       for (int n = kv_start; n < kv_end; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, kv_end - n);
@@ -199,11 +262,16 @@ void extend_attention_kernel_impl(
                   n + n_size - first_future_col);
             }
           }
-          if (!row_is_empty && sliding_window_size > 0) {
-            int last_col = seq_len_prefix + row + m - sliding_window_size + 1;
+          const bool* __restrict__ tree_mask_seq =
+              (tree_mask != nullptr) ? (tree_mask + static_cast<int64_t>(bs) * seq_len_extend * seq_len_extend)
+                                     : nullptr;
+          const int q_depth =
+              (tree_mask_seq != nullptr) ? tree_row_depth(tree_mask_seq, seq_len_extend, m + row) : (m + row);
+          if (!row_is_empty && use_per_row_swa) {
+            int last_col = seq_len_prefix + q_depth - sliding_window_size + 1;
             if (last_col >= n + n_size) {
               row_is_empty = true;
-            } else {
+            } else if (last_col > n) {
               fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
             }
           }
@@ -213,8 +281,24 @@ void extend_attention_kernel_impl(
             fill_stub(s_delta + row * BLOCK_N, 0.f, padded_n_size);
             continue;
           }
+          float softmax_scale = sm_scale;
+          if (rel_bias_ptr != nullptr) {
+            int64_t q_tok_idx = static_cast<int64_t>(seq_extend_start_loc) + m + row;
+            int64_t rb_row_offset = q_tok_idx * rb_strideM + static_cast<int64_t>(head_id) * rb_strideH;
+            int64_t base_dist = static_cast<int64_t>(seq_len_prefix) + q_depth - n;
+            apply_rel_bias_and_scale(
+                s_i + row * BLOCK_N,
+                rel_bias_ptr,
+                rel_bias_dtype,
+                rb_row_offset,
+                rel_extent,
+                base_dist,
+                n_size,
+                sm_scale);
+            softmax_scale = 1.0f;
+          }
           flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, softmax_scale, row);
         }
 
         // get value and pack
@@ -272,61 +356,144 @@ void extend_attention_kernel_impl(
               /* B     */ Btmp,
               /* C     */ s_i);
 
+          alignas(64) bool stage2_empty[BLOCK_M];
+          for (int row = 0; row < m_size; ++row) {
+            stage2_empty[row] = false;
+          }
           // apply tree mask (speculative TARGET_VERIFY) or causal mask
           if (tree_mask != nullptr) {
             // [Note] tree mask for EAGLE topk > 1 (TreeMaskMode::QLEN_ONLY).
-            // mask[bs][m + row][n + col] == false -> query draft token (m + row)
-            // may not attend key draft token (n + col); set the score to -inf
-            // before softmax. The tree mask subsumes the causal constraint:
-            // ancestors always precede descendants in the draft token ordering,
-            // so permitted keys satisfy j <= i and the causal `num_keys` bound
-            // above remains valid.
             const bool* __restrict__ mask_base =
                 tree_mask + (static_cast<int64_t>(bs) * seq_len_extend + m) * seq_len_extend + n;
             for (int row = 0; row < m_size; ++row) {
               float* __restrict__ row_ptr = s_i + row * BLOCK_N;
               const bool* __restrict__ mask_ptr = mask_base + static_cast<int64_t>(row) * seq_len_extend;
+              bool any_visible = false;
               for (int col = 0; col < n_size; ++col) {
                 if (!mask_ptr[col]) {
                   row_ptr[col] = -std::numeric_limits<float>::infinity();
+                } else {
+                  any_visible = true;
                 }
+              }
+              if (!any_visible) {
+                stage2_empty[row] = true;
               }
             }
           } else if (is_causal && n + n_size - 1 > m) {
             // apply causal mask
-            // [Note] condition to apply causal mask.
-            // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
-            // n_size - 1 > m. The original condition was `num_keys - n <= BLOCK_N` (last n-block only). That was
-            // correct when BLOCK_M <= BLOCK_N/2 because earlier n-blocks were guaranteed to contain only past keys.
-            // With BLOCK_M=512, BLOCK_N=768:
-            //   BLOCK_M > BLOCK_N/2, so the first n-block can contain future keys.
-            //   Example: m=512 (mb=1), num_keys=1024, first n-block covers keys [0, 768).
-            //   Query row=0 is at position 512, so keys 513..767 are future and must be
-            //   masked — but `num_keys - 0 = 1024 > BLOCK_N` skips masking entirely,
-            //   producing wrong (non-causal) attention for rows 0..254 of this m-block.
             for (int row = 0; row < m_size; ++row) {
               int last_col = m + row - n;
-              // [Note] mask the entire row if last_col < 0.
-              // Clamp to -1: when n > m + row every key in this block is a future
-              // key, so the entire row should be masked.  Without this clamp,
-              // last_col+1 <= 0 and fill_stub would write before row_ptr.
-              last_col = std::max(last_col, -1);
-              // fill [last_col + 1, n_size) to -inf
-              float* row_ptr = s_i + row * BLOCK_N;
-              fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+              if (last_col < 0) {
+                stage2_empty[row] = true;
+              } else if (last_col + 1 < n_size) {
+                float* row_ptr = s_i + row * BLOCK_N;
+                fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+              }
             }
           }
 
+          const bool* __restrict__ tree_mask_seq =
+              (tree_mask != nullptr) ? (tree_mask + static_cast<int64_t>(bs) * seq_len_extend * seq_len_extend)
+                                     : nullptr;
           for (int row = 0; row < m_size; ++row) {
-            if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size - 1 &&
-                row + m + 1 < n + sliding_window_size + n_size) {
-              fill_stub(
-                  s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), row + m - n - sliding_window_size + 1);
-            } else if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size) {
+            bool row_is_empty = stage2_empty[row];
+            const int q_depth =
+                (tree_mask_seq != nullptr) ? tree_row_depth(tree_mask_seq, seq_len_extend, m + row) : (m + row);
+            if (!row_is_empty && use_per_row_swa) {
+              if (tree_mask_seq != nullptr) {
+                const bool* __restrict__ mask_ptr = tree_mask_seq + static_cast<int64_t>(m + row) * seq_len_extend + n;
+                float* __restrict__ row_ptr = s_i + row * BLOCK_N;
+                bool any_vis = false;
+                for (int col = 0; col < n_size; ++col) {
+                  if (!mask_ptr[col]) {
+                    continue;
+                  }
+                  int k_depth = tree_row_depth(tree_mask_seq, seq_len_extend, n + col);
+                  if (q_depth - k_depth >= sliding_window_size) {
+                    row_ptr[col] = -std::numeric_limits<float>::infinity();
+                  } else {
+                    any_vis = true;
+                  }
+                }
+                if (!any_vis) {
+                  row_is_empty = true;
+                }
+              } else {
+                int left_end = m + row - sliding_window_size + 1 - n;
+                if (left_end >= n_size) {
+                  row_is_empty = true;
+                } else if (left_end > 0) {
+                  fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), left_end);
+                }
+                if (!row_is_empty && !is_causal) {
+                  int right_start = m + row + sliding_window_size - n;
+                  if (right_start <= 0) {
+                    row_is_empty = true;
+                  } else if (right_start < n_size) {
+                    fill_stub(
+                        s_i + row * BLOCK_N + right_start,
+                        -std::numeric_limits<float>::infinity(),
+                        n_size - right_start);
+                  }
+                }
+              }
+            }
+            if (row_is_empty) {
+              fill_stub(s_delta + row * BLOCK_N, 0.f, padded_n_size);
               continue;
             }
+            float softmax_scale = sm_scale;
+            if (rel_bias_ptr != nullptr) {
+              int64_t q_tok_idx = static_cast<int64_t>(seq_extend_start_loc) + m + row;
+              int64_t rb_row_offset = q_tok_idx * rb_strideM + static_cast<int64_t>(head_id) * rb_strideH;
+              if (tree_mask_seq != nullptr) {
+                const bool* __restrict__ mask_ptr = tree_mask_seq + static_cast<int64_t>(m + row) * seq_len_extend + n;
+                float* __restrict__ row_ptr = s_i + row * BLOCK_N;
+                const float neg_inf = -std::numeric_limits<float>::infinity();
+                for (int col = 0; col < n_size; ++col) {
+                  if (!mask_ptr[col]) {
+                    continue;
+                  }
+                  int64_t dist = static_cast<int64_t>(q_depth - tree_row_depth(tree_mask_seq, seq_len_extend, n + col));
+                  float v = row_ptr[col] * sm_scale;
+                  if (dist >= 0 && dist < rel_extent) {
+                    if (rel_bias_dtype == at::kFloat) {
+                      v += static_cast<const float*>(rel_bias_ptr)[rb_row_offset + dist];
+                    } else if (rel_bias_dtype == at::kBFloat16) {
+                      v += static_cast<float>(static_cast<const at::BFloat16*>(rel_bias_ptr)[rb_row_offset + dist]);
+                    } else {
+                      v += static_cast<float>(static_cast<const at::Half*>(rel_bias_ptr)[rb_row_offset + dist]);
+                    }
+                  }
+                  row_ptr[col] = (row_ptr[col] == neg_inf) ? neg_inf : v;
+                }
+              } else {
+                int64_t base_dist = static_cast<int64_t>(m + row) - n;
+                apply_rel_bias_and_scale(
+                    s_i + row * BLOCK_N,
+                    rel_bias_ptr,
+                    rel_bias_dtype,
+                    rb_row_offset,
+                    rel_extent,
+                    base_dist,
+                    n_size,
+                    sm_scale);
+              }
+              softmax_scale = 1.0f;
+            }
             flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-                s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+                s_i,
+                s_delta,
+                v_prime,
+                s_prime,
+                m_prime,
+                m_size,
+                n_size,
+                padded_n_size,
+                head_size_v,
+                softmax_scale,
+                row);
           }
 
           // get value and pack
@@ -352,13 +519,38 @@ void extend_attention_kernel_impl(
               /* C     */ v_prime);
         }  // loop with seq_len_extend
       }
-      scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
+      const int64_t out_base = static_cast<int64_t>(seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
+      scalar_t* __restrict__ out_ptr = out_fp32 ? nullptr : (static_cast<scalar_t*>(o_extend_ptr) + out_base);
+      float* __restrict__ out_f32_ptr = out_fp32 ? (static_cast<float*>(o_extend_ptr) + out_base) : nullptr;
       for (int row = 0; row < m_size; ++row) {
         if (has_sink) {
-          s_prime[row] += std::exp(sinks[head_id] - m_prime[row]);
+          float sink_val = static_cast<float>(sinks[head_id]);
+          if (m_prime[row] == -std::numeric_limits<float>::infinity()) {
+            m_prime[row] = sink_val;
+            s_prime[row] = 1.0f;
+          } else if (sink_val > m_prime[row]) {
+            float m_delta = std::exp(m_prime[row] - sink_val);
+            for (int d = 0; d < head_size_v; ++d) {
+              v_prime[row * head_size_v + d] *= m_delta;
+            }
+            s_prime[row] = s_prime[row] * m_delta + 1.0f;
+            m_prime[row] = sink_val;
+          } else {
+            s_prime[row] += std::exp(sink_val - m_prime[row]);
+          }
         }
-        float s = 1 / s_prime[row];
-        copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+        float s = s_prime[row] > 0.f ? (1.0f / s_prime[row]) : 0.0f;
+        if (out_fp32) {
+          copy_stub<float>(out_f32_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+        } else {
+          copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+        }
+        if (lse_out_ptr != nullptr) {
+          float lse =
+              (s_prime[row] > 0.f) ? (m_prime[row] + std::log(s_prime[row])) : -std::numeric_limits<float>::infinity();
+          lse_out_ptr[(static_cast<int64_t>(seq_extend_start_loc) + m + row) * lse_strideM + head_id * lse_strideH] =
+              lse;
+        }
       }
 
       // move to the next index
@@ -388,7 +580,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
     int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v); \
                                                                                            \
     extend_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_M, BLOCK_N>(           \
-        o_extend.data_ptr<scalar_t>(),                                                     \
+        o_extend.data_ptr(),                                                               \
+        out_fp32,                                                                          \
         q_extend.data_ptr<scalar_t>(),                                                     \
         k_extend.data_ptr<scalar_t>(),                                                     \
         v_extend.data_ptr<scalar_t>(),                                                     \
@@ -405,6 +598,14 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         buffer.data_ptr(),                                                                 \
         sinks_tensor.data_ptr<scalar_t>(),                                                 \
         tree_mask_ptr,                                                                     \
+        rel_bias_ptr,                                                                      \
+        rel_bias_dtype,                                                                    \
+        rb_strideM,                                                                        \
+        rb_strideH,                                                                        \
+        rel_extent,                                                                        \
+        lse_out_ptr,                                                                       \
+        lse_strideM,                                                                       \
+        lse_strideH,                                                                       \
         num_seqs,                                                                          \
         num_heads,                                                                         \
         num_heads_kv,                                                                      \
@@ -432,7 +633,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         is_causal,                                                                         \
         kv_from_cache,                                                                     \
         has_encoder_lens,                                                                  \
-        has_sink);                                                                         \
+        has_sink,                                                                          \
+        window_anchor_at_start);                                                           \
   } while (0)
 
 // q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -475,7 +677,10 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true) {
+    bool is_causal = true,
+    const std::optional<at::Tensor>& rel_bias = std::nullopt,
+    const std::optional<at::Tensor>& lse_out = std::nullopt,
+    bool window_anchor_at_start = false) {
   TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
   // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
   // already wrote them to the cache, so this kernel masks causally itself. Cross
@@ -495,6 +700,12 @@ void extend_attention_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+
+  const bool out_fp32 = o_extend.scalar_type() == at::kFloat;
+  TORCH_CHECK(
+      out_fp32 || o_extend.scalar_type() == q_extend.scalar_type(),
+      "extend: expect o_extend dtype to match q_extend or be float32, got ",
+      o_extend.scalar_type());
 
   int num_seqs = seq_lens.size(0);
   int max_num_reqs = req_to_token.size(0);
@@ -586,11 +797,50 @@ void extend_attention_cpu(
         tree_mask_t.numel());
     TORCH_CHECK(!is_cross_attn, "extend: tree_mask is not supported for cross attention");
     TORCH_CHECK(!kv_from_cache, "extend: tree_mask is not supported for KV-shared layers");
-    // The window mask derives query positions from the row index
-    // (seq_len_prefix + m + row), but tree-mask rows sit at their tree depth,
-    // which is <= the row index; combining the two would over-mask the prefix.
-    TORCH_CHECK(sliding_window_size <= 0, "extend: tree_mask is not supported with sliding window attention");
+
     tree_mask_ptr = tree_mask_t.data_ptr<bool>();
+  }
+
+  const void* rel_bias_ptr = nullptr;
+  at::ScalarType rel_bias_dtype = at::kFloat;
+  int64_t rb_strideM = 0;
+  int64_t rb_strideH = 0;
+  int64_t rel_extent = 0;
+  if (rel_bias.has_value()) {
+    const at::Tensor& rb = rel_bias.value();
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(rb);
+    CHECK_DIM(3, rb);
+    CHECK_EQ(rb.size(0), q_extend.size(0));
+    CHECK_EQ(rb.size(1), num_heads);
+    TORCH_CHECK(rb.size(2) > 0, "extend: rel_bias rel_extent must be positive");
+    rel_bias_dtype = rb.scalar_type();
+    TORCH_CHECK(
+        rel_bias_dtype == at::kFloat || rel_bias_dtype == at::kBFloat16 || rel_bias_dtype == at::kHalf,
+        "extend: unsupported rel_bias dtype ",
+        rel_bias_dtype);
+    rel_bias_ptr = rb.data_ptr();
+    rb_strideM = rb.stride(0);
+    rb_strideH = rb.stride(1);
+    rel_extent = rb.size(2);
+  }
+
+  float* lse_out_ptr = nullptr;
+  int64_t lse_strideM = 0;
+  int64_t lse_strideH = 0;
+  if (lse_out.has_value()) {
+    const at::Tensor& lse_t = lse_out.value();
+    CHECK_DIM(2, lse_t);
+    TORCH_CHECK(lse_t.device().is_cpu(), "extend: lse_out must be a CPU tensor");
+    TORCH_CHECK(lse_t.scalar_type() == at::kFloat, "extend: expect lse_out to be float32, got ", lse_t.scalar_type());
+    CHECK_EQ(lse_t.size(0), q_extend.size(0));
+    CHECK_EQ(lse_t.size(1), num_heads);
+    lse_out_ptr = lse_t.data_ptr<float>();
+    lse_strideM = lse_t.stride(0);
+    lse_strideH = lse_t.stride(1);
+  }
+
+  if (q_extend.size(0) == 0 || num_seqs == 0) {
+    return;
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {

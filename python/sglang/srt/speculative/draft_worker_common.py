@@ -43,10 +43,13 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     back to the platform default, with a warning when ``algo_label`` names the
     caller.
     """
-    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
-    platform_fallback = (
-        "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
-    )
+    # FlashInfer is CUDA-only; fall back to AMX/torch_native on CPU and triton on XPU/ROCm.
+    if get_platform().is_cpu:
+        platform_fallback = "intel_amx" if get_platform().has_amx else "torch_native"
+    elif get_platform().is_xpu or torch.version.hip:
+        platform_fallback = "triton"
+    else:
+        platform_fallback = "flashinfer"
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()

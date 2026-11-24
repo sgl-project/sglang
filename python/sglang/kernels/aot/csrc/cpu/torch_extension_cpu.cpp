@@ -273,9 +273,11 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    int64_t slidling_window_size,
+    int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
-    std::optional<at::Tensor> sinks);
+    std::optional<at::Tensor> sinks,
+    const std::optional<at::Tensor>& rel_bias = std::nullopt,
+    const std::optional<at::Tensor>& lse_out = std::nullopt);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -299,7 +301,10 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true);
+    bool is_causal = true,
+    const std::optional<at::Tensor>& rel_bias = std::nullopt,
+    const std::optional<at::Tensor>& lse_out = std::nullopt,
+    bool window_anchor_at_start = false);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -435,6 +440,57 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation);
+
+at::Tensor inkling2_fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w13,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double gate_softcap,
+    double up_softcap,
+    bool inplace,
+    bool is_vnni);
+
+// inkling2 short convolution
+at::Tensor inkling2_short_convolution_cpu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    at::Tensor& cache,
+    const at::Tensor& safe_idx,
+    const at::Tensor& cache_mask,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const std::optional<at::Tensor>& dynamic_weights = std::nullopt,
+    bool decode = false,
+    bool use_residual = true,
+    const std::optional<at::Tensor>& track_mask = std::nullopt,
+    const std::optional<at::Tensor>& track_indices = std::nullopt,
+    const std::optional<at::Tensor>& window = std::nullopt);
+
+at::Tensor inkling2_routed_sconv_epilogue_cpu(
+    const at::Tensor& down,
+    const std::optional<at::Tensor>& src2dst,
+    int64_t top_k,
+    const at::Tensor& weight,
+    at::Tensor& cache,
+    const at::Tensor& safe_idx,
+    const at::Tensor& cache_mask,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const at::Tensor& attention,
+    const std::optional<at::Tensor>& partial = std::nullopt,
+    const std::optional<at::Tensor>& track_mask = std::nullopt,
+    const std::optional<at::Tensor>& track_indices = std::nullopt,
+    const std::optional<at::Tensor>& window = std::nullopt,
+    bool round_bf16 = false);
+
+void inkling2_update_sconv_cache_cpu(
+    const at::Tensor& x,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& query_start_loc);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -833,7 +889,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, float k_cache_scale, float "
       "v_cache_scale, Tensor(a!) output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks, "
+      "Tensor? rel_bias=None, Tensor(b!)? lse_out=None) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
@@ -843,7 +900,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True, "
+      "Tensor? rel_bias=None, Tensor(b!)? lse_out=None, bool window_anchor_at_start=False) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -944,6 +1002,29 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float? alpha, float? "
       "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+
+  m.def(
+      "inkling2_fused_experts_cpu(Tensor hidden_states, Tensor w13, Tensor w2, Tensor topk_weights, Tensor topk_ids, "
+      "float gate_softcap, float up_softcap, bool inplace, bool is_vnni) -> Tensor");
+  m.impl("inkling2_fused_experts_cpu", torch::kCPU, &inkling2_fused_experts_cpu);
+
+  // inkling2 short convolution
+  m.def(
+      "inkling2_short_convolution_cpu(Tensor x, Tensor weight, Tensor(a!) cache, Tensor safe_idx, Tensor cache_mask, "
+      "Tensor cu, Tensor si, Tensor? dynamic_weights=None, bool decode=False, bool use_residual=True, "
+      "Tensor? track_mask=None, Tensor? track_indices=None, Tensor(b!)? window=None) -> Tensor");
+  m.impl("inkling2_short_convolution_cpu", torch::kCPU, &inkling2_short_convolution_cpu);
+
+  m.def(
+      "inkling2_routed_sconv_epilogue_cpu(Tensor down, Tensor? src2dst, int top_k, Tensor weight, Tensor(a!) cache, "
+      "Tensor safe_idx, Tensor cache_mask, Tensor cu, Tensor si, Tensor attention, Tensor? partial=None, "
+      "Tensor? track_mask=None, Tensor? track_indices=None, Tensor(b!)? window=None, bool round_bf16=False) -> Tensor");
+  m.impl("inkling2_routed_sconv_epilogue_cpu", torch::kCPU, &inkling2_routed_sconv_epilogue_cpu);
+
+  m.def(
+      "inkling2_update_sconv_cache_cpu(Tensor x, Tensor(a!) sconv_cache, Tensor cache_indices, "
+      "Tensor has_initial_state, Tensor query_start_loc) -> ()");
+  m.impl("inkling2_update_sconv_cache_cpu", torch::kCPU, &inkling2_update_sconv_cache_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption

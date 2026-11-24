@@ -197,6 +197,23 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
     out = torch.empty((num, tokens, width), dtype=torch.float32, device=dest.device)
     if not tokens:
         return out
+    if not dest.is_cuda:
+        dest_s = torch.stack(tuple(dests), dim=0).float()
+        msg_s = torch.stack(tuple(messages), dim=0).float()
+        dest_rstd = torch.rsqrt(dest_s.pow(2).mean(dim=-1, keepdim=True) + eps)
+        msg_rstd = torch.rsqrt(msg_s.pow(2).mean(dim=-1, keepdim=True) + eps)
+        normed = torch.cat(
+            (
+                (dest_s * dest_rstd).to(torch.bfloat16),
+                (msg_s * msg_rstd).to(torch.bfloat16),
+            ),
+            dim=-1,
+        )
+        hidden = torch.bmm(normed, down.transpose(1, 2)).to(torch.bfloat16)
+        g = torch.tanh(torch.bmm(hidden, gain.transpose(1, 2)).float())
+        f = torch.tanh(torch.bmm(hidden, forget.transpose(1, 2)).float())
+        out.copy_((1.0 - f) * dest_s + g * msg_s)
+        return out
     pdl = is_arch_support_pdl()
     launch = {"launch_pdl": True} if pdl else {}
     normed = torch.empty((num, tokens, k), dtype=torch.bfloat16, device=dest.device)

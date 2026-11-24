@@ -144,7 +144,8 @@ class Inkling2Attention(nn.Module):
             self.num_tp_heads * self.head_dim,
             self.num_tp_heads,
         ]
-        qkvr_pad_size = -sum(self.split_sizes) % 8
+        pad_align = 16 if getattr(get_platform(), "is_cpu", False) else 8
+        qkvr_pad_size = -sum(self.split_sizes) % pad_align
         if qkvr_pad_size:
             self.split_sizes.append(qkvr_pad_size)
         self.qkvr = MergedColumnParallelLinear(
@@ -154,6 +155,8 @@ class Inkling2Attention(nn.Module):
             parallel_group="attn_tp",
             prefix=add_prefix("qkvr", prefix),
         )
+        if qkvr_pad_size:
+            self.qkvr.weight.data[-qkvr_pad_size:].zero_()
         if self.qkvr.bias is not None:
             self.qkvr.bias.data.zero_()
         self.wo_ud = RowParallelLinear(
@@ -457,10 +460,113 @@ class Inkling2Attention(nn.Module):
                 attn_padded=attn_padded,
             )
 
-    def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
-        assert serving_attention_backend(forward_batch) == "fa4", (
-            "Inkling2 requires FA4 attention"
+    def _torch_native_attention(self, attn, q, k, v, forward_batch, rel_bias):
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+
+        backend = get_attn_backend()
+        attn_backend = getattr(backend, "attn_backend", backend)
+        tokens = q.shape[0]
+        if tokens == 0:
+            return (
+                torch.empty(
+                    (0, self.num_tp_heads, self.head_dim),
+                    dtype=attn.out_dtype or q.dtype,
+                    device=q.device,
+                ),
+                torch.empty(
+                    (0, self.num_tp_heads), dtype=torch.float32, device=q.device
+                ),
+            )
+        attn_backend.kv_layers.layer(attn.layer_id).store(
+            attn,
+            KVWriteLoc(
+                forward_batch.out_cache_loc,
+                window_locs=window_write_locs(
+                    attn_backend.runner_ids, attn_backend.swa_out_cache_loc
+                ),
+            ),
+            k,
+            v,
         )
+        kv = attn_backend.kv_layers.read(attn.layer_id)
+        k_cache, v_cache = kv.key(), kv.value()
+        req_to_token = attn_backend.req_to_token_pool.req_to_token
+        mode = forward_batch.forward_mode
+        is_decode = mode.is_decode_or_idle()
+        is_verify = mode.is_target_verify()
+        bs = forward_batch.batch_size
+        group = self.num_tp_heads // self.num_tp_kv_heads
+        out_dtype = attn.out_dtype or q.dtype
+        out = torch.empty(
+            (tokens, self.num_tp_heads, self.head_dim), dtype=out_dtype, device=q.device
+        )
+        lse = torch.empty(
+            (tokens, self.num_tp_heads), dtype=torch.float32, device=q.device
+        )
+        start_q = 0
+        for seq_idx in range(bs):
+            kv_len = int(forward_batch.seq_lens[seq_idx].item())
+            if is_decode:
+                q_len = 1
+            elif is_verify:
+                q_len = forward_batch.spec_info.draft_token_num
+            else:
+                q_len = int(forward_batch.extend_seq_lens[seq_idx].item())
+            if q_len == 0:
+                continue
+            req_pool_idx = int(forward_batch.req_pool_indices[seq_idx].item())
+            tok_locs = req_to_token[req_pool_idx, :kv_len].long()
+            qi = (
+                q[start_q : start_q + q_len]
+                .view(q_len, self.num_tp_heads, self.head_dim)
+                .transpose(0, 1)
+                .float()
+            )
+            ki = (
+                k_cache[tok_locs, : self.num_tp_kv_heads]
+                .repeat_interleave(group, dim=1)
+                .transpose(0, 1)
+                .float()
+            )
+            vi = (
+                v_cache[tok_locs, : self.num_tp_kv_heads]
+                .repeat_interleave(group, dim=1)
+                .transpose(0, 1)
+                .float()
+            )
+            scores = torch.matmul(qi, ki.transpose(-1, -2)) * attn.scaling
+            q_offset = kv_len - q_len
+            q_pos = torch.arange(q_offset, kv_len, device=q.device)[:, None]
+            k_pos = torch.arange(kv_len, device=q.device)[None, :]
+            dist = q_pos - k_pos
+            valid_rb = (dist >= 0) & (dist < self.rel_extent)
+            rb_slice = rel_bias[start_q : start_q + q_len].transpose(0, 1).float()
+            rb_gathered = torch.gather(
+                rb_slice,
+                2,
+                dist.clamp(0, self.rel_extent - 1)
+                .unsqueeze(0)
+                .expand(self.num_tp_heads, -1, -1),
+            )
+            scores = scores + torch.where(valid_rb.unsqueeze(0), rb_gathered, 0.0)
+            mask = k_pos <= q_pos
+            if attn.sliding_window_size is not None and attn.sliding_window_size >= 0:
+                mask = mask & (k_pos >= q_pos - attn.sliding_window_size)
+            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+            lse_i = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+            probs = torch.softmax(scores, dim=-1)
+            out_i = torch.matmul(probs, vi).transpose(0, 1)
+            out[start_q : start_q + q_len] = out_i.to(out_dtype)
+            lse[start_q : start_q + q_len] = lse_i
+            start_q += q_len
+        return out, lse
+
+    def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
+        backend = serving_attention_backend(forward_batch)
+        assert backend in ("fa4", "intel_amx", "torch_native"), (
+            f"Inkling2 requires fa4, intel_amx, or torch_native attention, got {backend}"
+        )
+        fa4 = backend == "fa4"
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
@@ -472,7 +578,8 @@ class Inkling2Attention(nn.Module):
         mode = forward_batch.forward_mode
         verify = mode.is_target_verify()
         compact = (
-            not mxfp8
+            fa4
+            and not mxfp8
             and self.fused_decode_prologue
             and (
                 mode.is_decode()
@@ -485,7 +592,8 @@ class Inkling2Attention(nn.Module):
             )
         )
         padded = (
-            attn_padded is not None
+            fa4
+            and attn_padded is not None
             and not compact
             and (get_platform().is_sm90 or tokens >= PADDED_DECODE_MIN_TOKENS)
             and (mode.is_decode() or verify)
@@ -583,6 +691,11 @@ class Inkling2Attention(nn.Module):
                 **attention_kwargs,
             )
             head_groups = (self.num_tp_heads // self.num_tp_kv_heads, self.padded_group)
+        elif backend == "torch_native":
+            output, lse = self._torch_native_attention(
+                attn, q, k, v, forward_batch, rel_bias
+            )
+            head_groups = None
         else:
             output, lse = attn(
                 q,
@@ -603,7 +716,9 @@ class Inkling2Attention(nn.Module):
                 head_groups=head_groups,
             )
         parallel = get_parallel()
-        multicast = parallel.moe_ep_size > 1
+        multicast = parallel.moe_ep_size > 1 and not getattr(
+            get_platform(), "is_cpu", False
+        )
         if self.group_all_reduce or (
             multicast
             and (mode.is_decode() or verify)
@@ -615,7 +730,7 @@ class Inkling2Attention(nn.Module):
             oneshot_all_reduce_input(
                 parallel.attn_tp_group, tokens, self.hidden_size, output.dtype
             )
-            if multicast
+            if multicast and output.is_cuda
             else None
         )
         if buffer is not None:

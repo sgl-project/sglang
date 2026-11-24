@@ -294,6 +294,10 @@ class Inkling2Experts(nn.Module):
         self.use_marlin = platform.is_sm90 or (
             platform.is_sm120 and not self.native_sm120
         )
+        self._num_local_experts = num_experts
+        self._cpu_w13_packed = None
+        self._cpu_w2_packed = None
+        self._cpu_is_vnni = False
 
     def _empty_weight(self, shape, dtype):
         if (
@@ -607,9 +611,147 @@ class Inkling2Experts(nn.Module):
                 self.w2_scale, out=self.w2_cute_scale
             )
 
+    @staticmethod
+    def _dequantize_nvfp4(weight, scale, amax, outer_denom):
+        fp4_grid = torch.tensor(
+            (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+            dtype=torch.float32,
+            device=weight.device,
+        )
+        codes = torch.stack((weight & 15, weight >> 4), dim=-1).flatten(-2).long()
+        values = fp4_grid[codes & 7] * torch.where(codes >= 8, -1.0, 1.0)
+        values = values * scale.float().repeat_interleave(16, dim=-1)
+        outer = (amax.float() / outer_denom.float())[:, None, None]
+        return (values * outer).to(torch.bfloat16)
+
+    @staticmethod
+    def _dequantize_mxfp8(weight, scale):
+        exponents = scale.view(torch.uint8).float() - 127.0
+        values = weight.float() * torch.exp2(exponents).repeat_interleave(32, dim=-1)
+        return values.to(torch.bfloat16)
+
+    def _prepare_cpu_weights(self):
+        if self._cpu_w13_packed is not None:
+            return
+        from sglang.srt.layers.amx_utils import dim_is_supported
+        from sglang.srt.utils import cpu_has_amx_support
+
+        dequantized = {}
+        for name in ("w13", "w2"):
+            w = getattr(self, name + "_weight")
+            if w.dtype == torch.uint8:
+                bf16_w = self._dequantize_nvfp4(
+                    w.data,
+                    getattr(self, name + "_scale").data,
+                    getattr(self, name + "_amax").data,
+                    getattr(self, name + "_outer_scale_denominator").data,
+                )
+            elif w.dtype == torch.float8_e4m3fn:
+                bf16_w = self._dequantize_mxfp8(
+                    w.data, getattr(self, name + "_scale").data
+                )
+            else:
+                bf16_w = w.data.to(torch.bfloat16)
+            dequantized[name] = bf16_w.contiguous()
+
+        use_amx = (
+            cpu_has_amx_support()
+            and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+            and hasattr(torch.ops.sgl_kernel, "inkling2_fused_experts_cpu")
+            and dim_is_supported(dequantized["w13"])
+            and dim_is_supported(dequantized["w2"])
+        )
+        if use_amx:
+            self._cpu_w13_packed = torch.ops.sgl_kernel.convert_weight_packed(
+                dequantized["w13"]
+            )
+            self._cpu_w2_packed = torch.ops.sgl_kernel.convert_weight_packed(
+                dequantized["w2"]
+            )
+            self._cpu_is_vnni = True
+        else:
+            self._cpu_w13_packed = dequantized["w13"]
+            self._cpu_w2_packed = dequantized["w2"]
+            self._cpu_is_vnni = False
+
+        # Drop raw weight and scale buffers after lazy conversion/packing.
+        for name in ("w13", "w2"):
+            w_param = getattr(self, name + "_weight")
+            if w_param.dtype in (torch.uint8, torch.float8_e4m3fn) or use_amx:
+                w_param.data = w_param.data.new_empty((w_param.shape[0], 0, 0))
+            for suffix in ("_scale", "_amax", "_outer_scale_denominator"):
+                attr = name + suffix
+                if hasattr(self, attr):
+                    p_buf = getattr(self, attr)
+                    if isinstance(p_buf, nn.Parameter):
+                        p_buf.data = p_buf.data.new_empty(0)
+
+    def _forward_cpu(self, x, weights, ids, combine):
+        self._prepare_cpu_weights()
+        num_local = self._num_local_experts
+        start = self.ep_rank * num_local
+        if self.ep_size > 1:
+            local_ids = ids - start
+            in_range = (local_ids >= 0) & (local_ids < num_local)
+            local_weights = torch.where(in_range, weights.float(), 0.0)
+            local_ids = torch.where(in_range, local_ids, 0)
+        else:
+            local_ids = ids
+            local_weights = weights.float()
+
+        x_bf16 = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+        if self._cpu_is_vnni and hasattr(
+            torch.ops.sgl_kernel, "inkling2_fused_experts_cpu"
+        ):
+            out = torch.ops.sgl_kernel.inkling2_fused_experts_cpu(
+                x_bf16.contiguous(),
+                self._cpu_w13_packed,
+                self._cpu_w2_packed,
+                local_weights.contiguous(),
+                local_ids.to(torch.int32).contiguous(),
+                float(self.gate_cap),
+                float(self.up_cap),
+                False,
+                True,
+            )
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
+        else:
+            tokens, hidden = x.shape
+            acc = torch.zeros((tokens, hidden), dtype=torch.float32, device=x.device)
+            flat_ids = local_ids.reshape(-1)
+            flat_w = local_weights.reshape(-1)
+            valid = (flat_ids >= 0) & (flat_ids < num_local)
+            if self.ep_size > 1:
+                valid = valid & (flat_w != 0)
+            for e in range(num_local):
+                mask = (flat_ids == e) & valid
+                if not mask.any():
+                    continue
+                pos = mask.nonzero(as_tuple=True)[0]
+                tok_idx = pos // self.top_k
+                gammas = flat_w[pos]
+                gate_up = F.linear(x_bf16[tok_idx], self._cpu_w13_packed[e]).float()
+                gate, up = gate_up.unflatten(-1, (-1, 2)).unbind(-1)
+                sig = torch.sigmoid(gate)
+                if self.gate_cap > 0:
+                    gate = self.gate_cap * torch.tanh(gate / self.gate_cap)
+                if self.up_cap > 0:
+                    up = self.up_cap * torch.tanh(up / self.up_cap)
+                act = (gate * sig * up * gammas[:, None]).to(torch.bfloat16)
+                down = F.linear(act, self._cpu_w2_packed[e]).float()
+                acc.index_add_(0, tok_idx, down)
+            out = acc.to(x.dtype)
+
+        if self.ep_size > 1:
+            out = get_parallel().moe_ep_group.all_reduce(out)
+        return out if combine else RoutedOutput(out, None, 0)
+
     def forward(self, x, weights, ids, combine=True):
         if x.shape[0] == 0:
             return x
+        if not x.is_cuda:
+            return self._forward_cpu(x, weights, ids, combine)
         if self.native_sm120:
             return self._forward_sm120(x, weights, ids, combine)
         if self._marlin:

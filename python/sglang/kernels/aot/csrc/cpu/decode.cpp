@@ -176,6 +176,22 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
+template <>
+inline void copy_stub<float>(float* __restrict__ out, const float* __restrict__ acc, float s, int64_t size) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = fVec::size();
+  const fVec s_fvec = fVec(s);
+  int64_t d = 0;
+#pragma GCC unroll 4
+  for (; d <= size - kVecSize; d += kVecSize) {
+    fVec a_fvec = fVec::loadu(acc + d) * s_fvec;
+    a_fvec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = acc[d] * s;
+  }
+}
+
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -1196,11 +1212,42 @@ void decode_set_kv_buffer(
   });
 }
 
+inline void decode_add_rel_bias(
+    float* __restrict__ s_i_row,
+    const void* __restrict__ rel_bias_ptr,
+    at::ScalarType rb_dtype,
+    int64_t rb_row_offset,
+    int64_t rel_extent,
+    int64_t base_dist,
+    int64_t n_size) {
+  const int64_t col_start = std::max<int64_t>(0, base_dist - rel_extent + 1);
+  const int64_t col_end = std::min<int64_t>(n_size, base_dist + 1);
+  if (col_start >= col_end) {
+    return;
+  }
+  auto add_typed = [&](const auto* rb) {
+    for (int64_t col = col_start; col < col_end; ++col) {
+      s_i_row[col] += static_cast<float>(rb[rb_row_offset + (base_dist - col)]);
+    }
+  };
+  if (rb_dtype == at::kFloat) {
+    add_typed(static_cast<const float*>(rel_bias_ptr));
+  } else if (rb_dtype == at::kBFloat16) {
+    add_typed(static_cast<const at::BFloat16*>(rel_bias_ptr));
+  } else {
+    add_typed(static_cast<const at::Half*>(rel_bias_ptr));
+  }
+}
+
 template <typename scalar_t>
 void decode_accumulate_kv_splits(
-    scalar_t* __restrict__ output,
+    void* __restrict__ output_ptr,
+    bool out_fp32,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ sinks_ptr,
+    float* __restrict__ lse_out_ptr,
+    int64_t lse_strideM,
+    int64_t lse_strideH,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size_v,
@@ -1214,24 +1261,21 @@ void decode_accumulate_kv_splits(
   at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
     int64_t bi{0}, ni{0};
     data_index_init(begin, bi, batches, ni, num_heads);
-    // NB: here we use logits[b][h][0] as acc, since
-    // for the first kv split (kv_id == 0):
-    //   m_delta = std::exp(-inf) = 0
-    //   e_logic = std::exp(0) = 1
-    //   acc = acc * m_delta + tv * e_logic = tv
     for (int64_t i = begin; i < end; ++i) {
       float* __restrict__ acc = attn_logits + i * l_stride1;
 
       float s_prime = 0.f;
-      float m_prime = -std::numeric_limits<scalar_t>::infinity();
+      float m_prime = -std::numeric_limits<float>::infinity();
 
       // update acc with from each kv_split
       for (int64_t kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
         float* __restrict__ tv = acc + kv_id * l_stride2;
         const float tlogic = (acc + kv_id * l_stride2)[head_size_v];
-
+        if (tlogic == -std::numeric_limits<float>::infinity()) {
+          continue;
+        }
         float m_i = std::max(tlogic, m_prime);
-        float m_delta = std::exp(m_prime - m_i);
+        float m_delta = (m_prime == -std::numeric_limits<float>::infinity()) ? 0.f : std::exp(m_prime - m_i);
         float e_logic = std::exp(tlogic - m_i);
         if (kv_id != 0) {
           at::vec::map2<float>(
@@ -1246,9 +1290,29 @@ void decode_accumulate_kv_splits(
         m_prime = m_i;
       }
       if (has_sink) {
-        s_prime += std::exp(sinks_ptr[ni] - m_prime);
+        float sink_val = static_cast<float>(sinks_ptr[ni]);
+        if (m_prime == -std::numeric_limits<float>::infinity()) {
+          m_prime = sink_val;
+          s_prime = 1.0f;
+        } else if (sink_val > m_prime) {
+          float m_delta = std::exp(m_prime - sink_val);
+          at::vec::map<float>([m_delta](Vec x) { return x * Vec(m_delta); }, acc, acc, head_size_v);
+          s_prime = s_prime * m_delta + 1.0f;
+          m_prime = sink_val;
+        } else {
+          s_prime += std::exp(sink_val - m_prime);
+        }
       }
-      copy_stub<scalar_t>(output + i * head_size_v, acc, 1 / s_prime, head_size_v);
+      float inv_s = s_prime > 0.f ? (1.0f / s_prime) : 0.0f;
+      if (out_fp32) {
+        copy_stub<float>(static_cast<float*>(output_ptr) + i * head_size_v, acc, inv_s, head_size_v);
+      } else {
+        copy_stub<scalar_t>(static_cast<scalar_t*>(output_ptr) + i * head_size_v, acc, inv_s, head_size_v);
+      }
+      if (lse_out_ptr != nullptr) {
+        float lse = (s_prime > 0.f) ? (m_prime + std::log(s_prime)) : -std::numeric_limits<float>::infinity();
+        lse_out_ptr[bi * lse_strideM + ni * lse_strideH] = lse;
+      }
       // move to the next index
       data_index_step(bi, batches, ni, num_heads);
     }
@@ -1257,7 +1321,8 @@ void decode_accumulate_kv_splits(
 
 template <typename scalar_t, typename packed_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_kernel_impl(
-    scalar_t* __restrict__ output,
+    void* __restrict__ output_ptr,
+    bool out_fp32,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
     const packed_t* __restrict__ k_buffer,
@@ -1269,6 +1334,14 @@ void decode_attention_kernel_impl(
     const int64_t* __restrict__ seq_lens,
     const int64_t* __restrict__ encoder_lens,
     const scalar_t* __restrict__ sinks,
+    const void* __restrict__ rel_bias_ptr,
+    at::ScalarType rel_bias_dtype,
+    int64_t rb_strideM,
+    int64_t rb_strideH,
+    int64_t rel_extent,
+    float* __restrict__ lse_out_ptr,
+    int64_t lse_strideM,
+    int64_t lse_strideH,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -1312,11 +1385,14 @@ void decode_attention_kernel_impl(
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + head_id * q_strideH;
 
       // get key/value
-      int64_t seq_len_kv = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
+      int64_t orig_seq_len = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
+      int64_t seq_len_kv = orig_seq_len;
       int64_t req_pool_id = req_pool_indices[bs];
       int64_t kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
+      int64_t window_start = 0;
       if (sliding_window_size > 0 && seq_len_kv > sliding_window_size) {
-        kv_offset = seq_len_kv - sliding_window_size;
+        window_start = seq_len_kv - sliding_window_size;
+        kv_offset = window_start;
         seq_len_kv = sliding_window_size;
       }
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
@@ -1352,6 +1428,12 @@ void decode_attention_kernel_impl(
             /* ldb */ k_strideN,
             /* ldc */ 1,
             /* mtt */ max_total_num_tokens);
+
+        if (rel_bias_ptr != nullptr) {
+          int64_t rb_row_offset = bs * rb_strideM + head_id * rb_strideH;
+          int64_t base_dist = (orig_seq_len - 1) - (window_start + n);
+          decode_add_rel_bias(s_i, rel_bias_ptr, rel_bias_dtype, rb_row_offset, rel_extent, base_dist, n_size);
+        }
 
         // TODO: `tanh` from torch uses sleef u10, going to be slow
         if (has_logit_cap) {
@@ -1411,12 +1493,26 @@ void decode_attention_kernel_impl(
   });
 
   decode_accumulate_kv_splits(
-      output, attn_logits, sinks, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2, has_sink);
+      output_ptr,
+      out_fp32,
+      attn_logits,
+      sinks,
+      lse_out_ptr,
+      lse_strideM,
+      lse_strideH,
+      batches,
+      num_heads,
+      head_size_v,
+      num_kv_splits,
+      l_stride1,
+      l_stride2,
+      has_sink);
 }  // MHA
 
 template <typename scalar_t, typename packed_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_mla_kernel_impl(
-    scalar_t* __restrict__ output,
+    void* __restrict__ output_ptr,
+    bool out_fp32,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
     const packed_t* __restrict__ k_buffer,
@@ -1428,6 +1524,9 @@ void decode_attention_mla_kernel_impl(
     const int64_t* __restrict__ seq_lens,
     scalar_t* __restrict__ buffer,
     const scalar_t* __restrict__ sinks,
+    float* __restrict__ lse_out_ptr,
+    int64_t lse_strideM,
+    int64_t lse_strideH,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -1612,12 +1711,26 @@ void decode_attention_mla_kernel_impl(
   });
 
   decode_accumulate_kv_splits(
-      output, attn_logits, sinks, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2, has_sink);
+      output_ptr,
+      out_fp32,
+      attn_logits,
+      sinks,
+      lse_out_ptr,
+      lse_strideM,
+      lse_strideH,
+      batches,
+      num_heads,
+      head_size_v,
+      num_kv_splits,
+      l_stride1,
+      l_stride2,
+      has_sink);
 }  // MLA
 
 template <typename scalar_t, typename packed_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_grouped_kernel_impl(
-    scalar_t* __restrict__ output,
+    void* __restrict__ output_ptr,
+    bool out_fp32,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
     const packed_t* __restrict__ k_buffer,
@@ -1629,6 +1742,14 @@ void decode_attention_grouped_kernel_impl(
     const int64_t* __restrict__ seq_lens,
     const int64_t* __restrict__ encoder_lens,
     const scalar_t* __restrict__ sinks,
+    const void* __restrict__ rel_bias_ptr,
+    at::ScalarType rel_bias_dtype,
+    int64_t rb_strideM,
+    int64_t rb_strideH,
+    int64_t rel_extent,
+    float* __restrict__ lse_out_ptr,
+    int64_t lse_strideM,
+    int64_t lse_strideH,
     int64_t batches,
     int64_t num_heads,
     int64_t num_heads_kv,
@@ -1690,13 +1811,16 @@ void decode_attention_grouped_kernel_impl(
       // get query
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
 
-      int64_t seq_len_kv = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
+      int64_t orig_seq_len = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
+      int64_t seq_len_kv = orig_seq_len;
       int64_t req_pool_id = req_pool_indices[bs];
       int64_t kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
+      int64_t window_start = 0;
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
       if (sliding_window_size > 0 && seq_len_kv > sliding_window_size) {
-        kv_offset = seq_len_kv - sliding_window_size;
+        window_start = seq_len_kv - sliding_window_size;
+        kv_offset = window_start;
         seq_len_kv = sliding_window_size;
       }
       const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
@@ -1731,6 +1855,15 @@ void decode_attention_grouped_kernel_impl(
             /* ldb */ k_strideN,
             /* ldc */ BLOCK_N,
             /* mtt */ max_total_num_tokens);
+
+        if (rel_bias_ptr != nullptr) {
+          int64_t base_dist = (orig_seq_len - 1) - (window_start + n);
+          for (int64_t h = 0; h < h_size; ++h) {
+            int64_t rb_row_offset = bs * rb_strideM + (h_start + h) * rb_strideH;
+            decode_add_rel_bias(
+                s_i + h * BLOCK_N, rel_bias_ptr, rel_bias_dtype, rb_row_offset, rel_extent, base_dist, n_size);
+          }
+        }
 
         if (has_logit_cap) {
           at::vec::map<float>(
@@ -1798,7 +1931,20 @@ void decode_attention_grouped_kernel_impl(
   });
 
   decode_accumulate_kv_splits(
-      output, attn_logits, sinks, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2, has_sink);
+      output_ptr,
+      out_fp32,
+      attn_logits,
+      sinks,
+      lse_out_ptr,
+      lse_strideM,
+      lse_strideH,
+      batches,
+      num_heads,
+      head_size_v,
+      num_kv_splits,
+      l_stride1,
+      l_stride2,
+      has_sink);
 }  // GQA/MQA
 
 }  // anonymous namespace
@@ -1832,14 +1978,24 @@ void decode_attention_cpu(
     bool is_cross_attn,
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
-    std::optional<at::Tensor> sinks) {
+    std::optional<at::Tensor> sinks,
+    const std::optional<at::Tensor>& rel_bias = std::nullopt,
+    const std::optional<at::Tensor>& lse_out = std::nullopt) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_INPUT(output);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
   CHECK_DIM(3, query);
+  CHECK_DIM(3, output);
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
   CHECK_DIM(1, loc);
+
+  const bool out_fp32 = output.scalar_type() == at::kFloat;
+  TORCH_CHECK(
+      out_fp32 || output.scalar_type() == query.scalar_type(),
+      "decode: expect output dtype to match query or be float32, got ",
+      output.scalar_type());
 
   int64_t num_seqs = seq_lens.size(0);
   int64_t max_num_reqs = req_to_token.size(0);
@@ -1913,6 +2069,49 @@ void decode_attention_cpu(
   at::Tensor sinks_tensor = has_sink ? sinks.value() : at::empty({num_heads}, query.options());
   CHECK_DIM(1, sinks_tensor);
   CHECK_EQ(sinks_tensor.size(0), num_heads);
+
+  const void* rel_bias_ptr = nullptr;
+  at::ScalarType rel_bias_dtype = at::kFloat;
+  int64_t rb_strideM = 0;
+  int64_t rb_strideH = 0;
+  int64_t rel_extent = 0;
+  if (rel_bias.has_value()) {
+    TORCH_CHECK(!is_mla, "decode MLA: rel_bias is not supported");
+    const at::Tensor& rb = rel_bias.value();
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(rb);
+    CHECK_DIM(3, rb);
+    CHECK_EQ(rb.size(0), num_seqs);
+    CHECK_EQ(rb.size(1), num_heads);
+    TORCH_CHECK(rb.size(2) > 0, "decode: rel_bias rel_extent must be positive");
+    rel_bias_dtype = rb.scalar_type();
+    TORCH_CHECK(
+        rel_bias_dtype == at::kFloat || rel_bias_dtype == at::kBFloat16 || rel_bias_dtype == at::kHalf,
+        "decode: unsupported rel_bias dtype ",
+        rel_bias_dtype);
+    rel_bias_ptr = rb.data_ptr();
+    rb_strideM = rb.stride(0);
+    rb_strideH = rb.stride(1);
+    rel_extent = rb.size(2);
+  }
+
+  float* lse_out_ptr = nullptr;
+  int64_t lse_strideM = 0;
+  int64_t lse_strideH = 0;
+  if (lse_out.has_value()) {
+    const at::Tensor& lse_t = lse_out.value();
+    CHECK_DIM(2, lse_t);
+    TORCH_CHECK(lse_t.device().is_cpu(), "decode: lse_out must be a CPU tensor");
+    TORCH_CHECK(lse_t.scalar_type() == at::kFloat, "decode: expect lse_out to be float32, got ", lse_t.scalar_type());
+    CHECK_EQ(lse_t.size(0), num_seqs);
+    CHECK_EQ(lse_t.size(1), num_heads);
+    lse_out_ptr = lse_t.data_ptr<float>();
+    lse_strideM = lse_t.stride(0);
+    lse_strideH = lse_t.stride(1);
+  }
+
+  if (num_seqs == 0) {
+    return;
+  }
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "decode_attention_packed_types", [&] {
@@ -1958,7 +2157,8 @@ void decode_attention_cpu(
         if (num_heads == num_heads_kv) {
           // MHA
           decode_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
-              output.data_ptr<scalar_t>(),
+              output.data_ptr(),
+              out_fp32,
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
               (const packed_t*)k_buffer_data,
@@ -1970,6 +2170,14 @@ void decode_attention_cpu(
               seq_lens.data_ptr<int64_t>(),
               encoder_lens_t.data_ptr<int64_t>(),
               sinks_tensor.data_ptr<scalar_t>(),
+              rel_bias_ptr,
+              rel_bias_dtype,
+              rb_strideM,
+              rb_strideH,
+              rel_extent,
+              lse_out_ptr,
+              lse_strideM,
+              lse_strideH,
               num_seqs,
               num_heads,
               head_size,
@@ -1995,7 +2203,8 @@ void decode_attention_cpu(
           TORCH_CHECK(key.has_value() && value.has_value(), "MLA requires key and value tensors");
           auto buffer = at::empty({num_threads, size_per_thread}, key.value().options());
           decode_attention_mla_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
-              output.data_ptr<scalar_t>(),
+              output.data_ptr(),
+              out_fp32,
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
               (const packed_t*)k_buffer_data,
@@ -2007,6 +2216,9 @@ void decode_attention_cpu(
               seq_lens.data_ptr<int64_t>(),
               buffer.data_ptr<scalar_t>(),
               sinks_tensor.data_ptr<scalar_t>(),
+              lse_out_ptr,
+              lse_strideM,
+              lse_strideH,
               num_seqs,
               num_heads,
               head_size,
@@ -2028,7 +2240,8 @@ void decode_attention_cpu(
         } else {
           // GQA/MQA
           decode_attention_grouped_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
-              output.data_ptr<scalar_t>(),
+              output.data_ptr(),
+              out_fp32,
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
               (const packed_t*)k_buffer_data,
@@ -2040,6 +2253,14 @@ void decode_attention_cpu(
               seq_lens.data_ptr<int64_t>(),
               encoder_lens_t.data_ptr<int64_t>(),
               sinks_tensor.data_ptr<scalar_t>(),
+              rel_bias_ptr,
+              rel_bias_dtype,
+              rb_strideM,
+              rb_strideH,
+              rel_extent,
+              lse_out_ptr,
+              lse_strideM,
+              lse_strideH,
               num_seqs,
               num_heads,
               num_heads_kv,
