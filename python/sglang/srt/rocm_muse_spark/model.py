@@ -57,6 +57,7 @@ from sglang.kernels.ops.gemm.router_gemm_fp32 import (
     router_gemv_fp32,
     router_gemv_fp32_supported,
 )
+from sglang.kernels.ops.gemm.stream_small_m_gemm import stream_launch
 from sglang.kernels.ops.gemm.unpool_gemm_norm_residual import (
     unpool_gemm_norm_residual,
     unpool_gemm_norm_residual_tlx,
@@ -500,6 +501,16 @@ _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
 _TLX_BOUNDARY_NORM = envs.SGLANG_USE_TLX_BOUNDARY_NORM.get()
 # FP32 router logits on tlx.ops.router_gemm, ahead of the GEMV / tuned / torch paths it beats at every M.
 _TLX_ROUTER_GEMM = envs.SGLANG_USE_TLX_ROUTER_GEMM.get()
+# Rows whose unpooler runs on the weight-streaming GEMM inside the fused FFN-boundary path, which then also covers
+# those of them above 16.
+_STREAM_GEMM_MIN_ROWS = max(envs.SGLANG_ROCM_MUSE_STREAM_GEMM_MIN_ROWS.get(), 1)
+_STREAM_GEMM_MAX_ROWS = min(envs.SGLANG_ROCM_MUSE_STREAM_GEMM_MAX_ROWS.get(), 32)
+
+
+def _stream_unpool_rows(rows: int) -> bool:
+    return _STREAM_GEMM_MIN_ROWS <= rows <= _STREAM_GEMM_MAX_ROWS
+
+
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
@@ -1742,8 +1753,17 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 x_fp8=ffn_input_fp8,
             )
             ffn_boundary._ensure_cached_weights(torch.bfloat16)
-            if _TLX_BOUNDARY_NORM and unpool_gemm_norm_residual_tlx_supported(
-                expert_output, self.mlp.post_expert_proj.weight
+            stream_cfg = (
+                stream_launch(8192, 4096, expert_output.shape[0])
+                if _stream_unpool_rows(expert_output.shape[0])
+                else None
+            )
+            if (
+                stream_cfg is None
+                and _TLX_BOUNDARY_NORM
+                and unpool_gemm_norm_residual_tlx_supported(
+                    expert_output, self.mlp.post_expert_proj.weight
+                )
             ):
                 next_attn_input, stream = unpool_gemm_norm_residual_tlx(
                     expert_output,
@@ -1773,6 +1793,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 split_k=4,
                 pre_bf16=pre_norm_dtype is torch.bfloat16,
                 num_warps=16,
+                stream_cfg=stream_cfg,
             )
             return stream, next_attn_input, None
         ffn_output = (
@@ -1855,14 +1876,15 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def _can_fuse_unpool_boundary(
         self, x: torch.Tensor, boundary: FusedPostNormResidualPreNorm | None
     ) -> bool:
-        """Unpooler + FFN boundary fusion: MoE layers at up to 16 rows (replicated unpooler, any TP)."""
+        """Unpooler + FFN boundary fusion: MoE layers at up to 16 rows, or at the weight-streaming unpooler's rows
+        (replicated unpooler, any TP)."""
         if not self.is_moe_layer or boundary is None:
             return False
         proj = self.mlp.post_expert_proj
         return (
             proj is not None
             and proj.bias is None
-            and 0 < x.shape[0] <= 16
+            and (0 < x.shape[0] <= 16 or _stream_unpool_rows(x.shape[0]))
             and x.dtype == torch.bfloat16
             and x.shape[1] == 8192
             and x.is_contiguous()

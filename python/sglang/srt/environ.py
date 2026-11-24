@@ -2471,6 +2471,12 @@ class Envs:
     # up to this many rows where its small-M GEMM has a tuned launch for the shape (TP4: 512). The default keeps
     # them on the BF16 weight.
     SGLANG_ROCM_MUSE_DENSE_FP8_MAX_ROWS = EnvInt(128)
+    # Decode / verify batches of ..._MIN_ROWS to ..._MAX_ROWS rows (capped at 32; MAX 0 = off): the BF16 QKV + gate
+    # projection of the fused QK-norm / RoPE / cache path and the MoE unpooler (fused into the FFN-boundary
+    # norm-residual kernel, as at <= 16 rows) run on the weight-streaming GEMM (stream_small_m_gemm). Same BF16
+    # weights, MFMA and epilogues; only the K summation order changes.
+    SGLANG_ROCM_MUSE_STREAM_GEMM_MAX_ROWS = EnvInt(0)
+    SGLANG_ROCM_MUSE_STREAM_GEMM_MIN_ROWS = EnvInt(1)
     # Prefill widths (plain extend, > 128 rows): the attention QKV / O projections and the MoE pooler / unpooler on
     # those FP8 weight copies through aiter's CK a8w8 GEMM, activations quantized per row by the boundary kernels or
     # one Triton pass; the Ulysses gathered projections are then kept in FP8 only. Needs SGLANG_ROCM_MUSE_DENSE_FP8;

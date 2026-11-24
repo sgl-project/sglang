@@ -18,10 +18,18 @@ import triton.language as tl
 
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import fp8_gemm_partials
+from sglang.kernels.ops.gemm.stream_small_m_gemm import (
+    stream_gemm_partials,
+    stream_launch,
+)
+from sglang.srt.environ import envs
 
 # (max rows, (BN, BK, SK, warps, stages)) of the QKV + gate projection, tuned at N 2304 (TP8) on gfx1250. BK and SK
 # match the default launch, so the partials are bit-identical to it.
 QKV_BF16_LAUNCH = ((16, (64, 128, 8, 4, 3)), (32, (128, 128, 8, 4, 2)))
+# Rows of the QKV + gate projection that run on the weight-streaming GEMM.
+_STREAM_MIN_ROWS = max(envs.SGLANG_ROCM_MUSE_STREAM_GEMM_MIN_ROWS.get(), 1)
+_STREAM_MAX_ROWS = min(envs.SGLANG_ROCM_MUSE_STREAM_GEMM_MAX_ROWS.get(), 32)
 
 
 @triton.jit
@@ -282,21 +290,27 @@ def qkv_proj_qk_norm_rope_cache(
     assert x.is_contiguous() and weight.is_contiguous()
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
-    # Tuned at N 2304 (TP8); not re-tuned for N 4608.
-    block_n, block_k, split_k, warps, stages = next(
-        cfg for rows, cfg in QKV_BF16_LAUNCH if m <= rows
+    stream_cfg = (
+        stream_launch(n, k, m) if _STREAM_MIN_ROWS <= m <= _STREAM_MAX_ROWS else None
     )
-    partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
-    bf16_splitk_gemm_partials(
-        x,
-        weight,
-        partials,
-        block_n=block_n,
-        block_k=block_k,
-        split_k=split_k,
-        num_warps=warps,
-        num_stages=stages,
-    )
+    if stream_cfg is not None:
+        partials = stream_gemm_partials(x, weight, n, k, stream_cfg)
+    else:
+        # Tuned at N 2304 (TP8); not re-tuned for N 4608.
+        block_n, block_k, split_k, warps, stages = next(
+            cfg for rows, cfg in QKV_BF16_LAUNCH if m <= rows
+        )
+        partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
+        bf16_splitk_gemm_partials(
+            x,
+            weight,
+            partials,
+            block_n=block_n,
+            block_k=block_k,
+            split_k=split_k,
+            num_warps=warps,
+            num_stages=stages,
+        )
     return _launch_qkv_epilogue(
         partials, None, None, positions, cos_sin, cache_k, cache_v, locations, mapping,
         eps, q_scale, k_scale, v_scale, hq, hk,
