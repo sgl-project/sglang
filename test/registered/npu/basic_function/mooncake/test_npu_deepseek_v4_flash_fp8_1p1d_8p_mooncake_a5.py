@@ -226,8 +226,10 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
         # and the memfabric/mooncake library paths of this host.
         mooncake_envs = {
             "MC_USE_TENT": "1",
-            # A5 (950PR/DT) transfers KV over URMA, not device SDMA.
-            "MF_PROTOCOL": "device_urma",
+            # device_urma fails on this board: memfabric's URMA topo table
+            # reports "unknown board id: 108" for the 950PR and refuses to open
+            # the transport, so the KV transfer runs over device SDMA instead.
+            "MF_PROTOCOL": "device_sdma",
             "MF_TRANSFER_TIMEOUT": "10000",
             "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
             "MC_TENT_CONF": write_memfabric_tent_conf(),
