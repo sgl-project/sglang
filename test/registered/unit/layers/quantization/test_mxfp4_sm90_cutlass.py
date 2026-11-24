@@ -843,20 +843,15 @@ def test_dsv4_apply_matches_flashinfer_direct(
     not HAS_CORRECTED_HUMMING_API,
     reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
 )
-@pytest.mark.parametrize("chunk_size", [1, 4, 16])
-def test_dsv4_process_weights_humming_matches_flashinfer_direct(
-    chunk_size, monkeypatch
-):
+@pytest.mark.parametrize("num_experts", [1, 4, 5])
+def test_dsv4_process_weights_humming_matches_flashinfer_direct(num_experts):
     """DSv4's native [up; gate] layout must use the same #3738 transform."""
     from types import SimpleNamespace
 
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
     from sglang.srt.runtime_context import get_context
 
-    monkeypatch.setenv(
-        "SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE", str(chunk_size)
-    )
-    num_experts, hidden, inter = 5, 256, 256
+    hidden, inter = 256, 256
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
     w1, w3 = w13.chunk(2, dim=1)
     w1_s, w3_s = w13_s.chunk(2, dim=1)
@@ -894,7 +889,8 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct(
 
 
 @pytest.mark.skipif(not HAS_CORRECTED_HUMMING_API, reason="Humming API required")
-def test_humming_expert_chunks_reduce_peak_memory():
+@pytest.mark.parametrize("chunk_size", [None, 1, 4, 16])
+def test_humming_expert_chunks_reduce_peak_memory(chunk_size):
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         _preprocess_humming_in_expert_chunks,
     )
@@ -913,14 +909,16 @@ def test_humming_expert_chunks_reduce_peak_memory():
         return outputs, torch.cuda.max_memory_allocated() - initial
 
     reference, whole_peak = measure(lambda: preprocess_humming(weight, scale))
+    kwargs = {} if chunk_size is None else {"chunk_size": chunk_size}
     actual, chunked_peak = measure(
         lambda: _preprocess_humming_in_expert_chunks(
-            weight, scale, preprocess_humming, 4
+            weight, scale, preprocess_humming, **kwargs
         )
     )
     for output, expected in zip(actual, reference):
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    assert chunked_peak < whole_peak * 0.7
+    if chunk_size is None or chunk_size < weight.shape[0]:
+        assert chunked_peak < whole_peak * 0.7
 
 
 class _MockDispatchOutput:
