@@ -98,7 +98,7 @@ struct Fp8IndexerParams {
   int32_t* __restrict__ cand_indices;  // [rows, cap], key - ks[row]
   int32_t* __restrict__ cand_count;    // [rows] number of scores >= T (may exceed cap)
   float* __restrict__ thresholds;      // [rows] T
-  int32_t* __restrict__ overflow;      // [rows] 1 when count > cap
+  int32_t* __restrict__ overflow;      // [rows] bit 0: count > cap, bit 1: nonfinite score when tracked
   uint32_t num_rows;
   uint32_t num_blocks;  // ceil(rows / rows per CTA)
   uint32_t num_keys;
@@ -244,7 +244,7 @@ SGL_DEVICE float reduce_heads_lin(const float* acc, const float* lin, const Weig
 // kNumHeads    index heads (32 or 64).
 // kNumKVStages KV pipeline depth (32 KB per stage).
 // kNumQStages  Q pipeline depth.
-template <uint32_t kNumHeads, uint32_t kNumKVStages, uint32_t kNumQStages, bool kFp32Reduction>
+template <uint32_t kNumHeads, uint32_t kNumKVStages, uint32_t kNumQStages, bool kFp32Reduction, bool kTrackRejections>
 struct Fp8IndexerImpl {
   // 64 heads at most: a uint2 sample code holds 4 rows, a drain warp serves 4 rows (8 lanes each).
   static_assert(kNumHeads == 32 || kNumHeads == 64, "32 or 64 index heads");
@@ -799,8 +799,8 @@ struct Fp8IndexerImpl {
   }
 
   SGL_DEVICE static void store_overflow(const Fp8IndexerParams& params, uint32_t row, bool overflow) {
-    if constexpr (kFp32Reduction) {
-      // The FP32 variant also records nonfinite scores in the rejection status.
+    if constexpr (kTrackRejections) {
+      // Keep the nonfinite flag if the scan has already marked this row.
       if (overflow) atomicOr(params.overflow + row, 1);
     } else {
       params.overflow[row] = overflow;
@@ -931,7 +931,7 @@ struct Fp8IndexerImpl {
             const float score =
                 reduce_heads_lin<kNumHeads, kFp32Reduction>(acc, lin, row_weights_s(i), scale) * row_s[i];
             bool valid = ((need_t >> i) & 1u) && (key - ks[i]) < len[i] && key < slimit;
-            if constexpr (kFp32Reduction) {
+            if constexpr (kTrackRejections) {
               if (valid && !isfinite(score)) {
                 atomicOr(params.overflow + blk * kBlockQ + row0 + i, 2);
                 valid = false;
@@ -1083,7 +1083,7 @@ struct Fp8IndexerImpl {
             score[r] = finish_reduction<kFp32Reduction>(s0, s1, scale) * row_s[r];
             pass[r] = score[r] >= thr[r];
             if constexpr (decltype(edge)::value) pass[r] = pass[r] && (key - ks[r]) < len[r];
-            if constexpr (kFp32Reduction) {
+            if constexpr (kTrackRejections) {
               if (!isfinite(score[r])) {
                 if ((key - ks[r]) < len[r]) atomicOr(params.overflow + blk * kBlockQ + row0 + r, 2);
                 pass[r] = false;
@@ -1375,9 +1375,15 @@ __global__ void __launch_bounds__(Impl::kNumThreads, 1)
 
 }  // namespace device::fp8_indexer
 
-template <uint32_t kNumHeads, uint32_t kNumKVStages, uint32_t kNumQStages, bool kFp32Reduction = false>
+template <
+    uint32_t kNumHeads,
+    uint32_t kNumKVStages,
+    uint32_t kNumQStages,
+    bool kFp32Reduction = false,
+    bool kTrackRejections = kFp32Reduction>
 struct Fp8IndexerKernel {
-  using Impl = device::fp8_indexer::Fp8IndexerImpl<kNumHeads, kNumKVStages, kNumQStages, kFp32Reduction>;
+  using Impl =
+      device::fp8_indexer::Fp8IndexerImpl<kNumHeads, kNumKVStages, kNumQStages, kFp32Reduction, kTrackRejections>;
 
   static void
   run(tvm::ffi::TensorView q,

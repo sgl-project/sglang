@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for the guarded FP32 KPool4 prefill path."""
+"""Regression tests for the guarded KPool4 prefill path."""
 
 from types import SimpleNamespace
 
@@ -78,6 +78,39 @@ def test_fp32_candidates_match_dense_with_signed_gates_on_two_streams():
         torch.testing.assert_close(
             slab.scores[live], expected.gather(1, absolute)[live], atol=0, rtol=0
         )
+
+
+@pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 required")
+def test_native_fp8_candidates_reject_nonfinite_scores_in_visible_keys():
+    generator = torch.Generator(device="cuda").manual_seed(52591)
+    keys_per_request = 16384
+    q = torch.randn(8, 32, 128, generator=generator, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    k = torch.randn(2 * keys_per_request, 128, generator=generator, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(8, 32, generator=generator, device="cuda")
+    scale = torch.ones(2 * keys_per_request, device="cuda")
+    scale[267] = torch.nan
+    starts = torch.tensor(
+        [0, keys_per_request], device="cuda", dtype=torch.int32
+    ).repeat_interleave(4)
+
+    slab = fp8_indexer_candidates(
+        q,
+        weights,
+        k,
+        scale,
+        starts,
+        starts + keys_per_request,
+        512,
+        cap=4096,
+        num_ctas=4,
+        tail_chunks=1,
+        track_rejections=True,
+    )
+    assert (slab.overflow & 2).tolist() == [2] * 4 + [0] * 4
 
 
 @pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 required")

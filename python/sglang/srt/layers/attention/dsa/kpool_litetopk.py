@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.dsa.litetopk_prefill.topk_candidates import (
     _jit_guarded_fp32_topk_candidates_module,
     topk_candidates,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +33,11 @@ _MAX_KEYS = 32 * 256 * 257
 
 
 @cache_once
-def _jit_available() -> bool:
+def _jit_available(native: bool) -> bool:
     try:
-        _jit_fp8_indexer_module(32, DEFAULT_KV_STAGES, DEFAULT_Q_STAGES, True)
+        _jit_fp8_indexer_module(
+            32, DEFAULT_KV_STAGES, DEFAULT_Q_STAGES, not native, native
+        )
         _jit_guarded_fp32_topk_candidates_module(_GROUP_TOPK)
     except (OSError, RuntimeError, CalledProcessError) as exc:
         logger.warning("KPool LiteTopK JIT unavailable; using dense prefill: %s", exc)
@@ -58,6 +61,7 @@ def try_kpool4_lite_topk(
     num_sms: int,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     rows = q.shape[0]
+    native = envs.SGLANG_OPT_USE_KPOOL4_LITE_TOPK_NATIVE.get()
     if (
         not _MIN_ROWS <= rows <= _MAX_ROWS
         or not _MIN_KEYS <= k.shape[0] <= _MAX_KEYS
@@ -73,7 +77,7 @@ def try_kpool4_lite_topk(
         or (page_table is not None and (page_rows is None or page_table.stride(1) != 1))
         or not is_fp8_indexer_supported()
         or torch.cuda.is_current_stream_capturing()
-        or not _jit_available()
+        or not _jit_available(native)
     ):
         return None
 
@@ -87,7 +91,8 @@ def try_kpool4_lite_topk(
         _GROUP_TOPK,
         cap=_CAP,
         num_ctas=num_sms,
-        fp32_reduction=True,
+        fp32_reduction=not native,
+        track_rejections=native,
     )
     groups = torch.empty((rows, _GROUP_TOPK), dtype=torch.int32, device=q.device)
     rejected = slab.overflow

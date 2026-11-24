@@ -41,9 +41,8 @@ class Fp8IndexerCandidates(NamedTuple):
     indices: torch.Tensor  # [rows, cap] int32, key - ks[row]
     counts: torch.Tensor  # [rows] int32, scores >= T (may exceed cap)
     thresholds: torch.Tensor  # [rows] fp32
-    overflow: (
-        torch.Tensor
-    )  # [rows] int32, bit 0 for overflow, bit 1 for nonfinite FP32 scores
+    # Bit 0 marks overflow. Bit 1 marks a tracked nonfinite score.
+    overflow: torch.Tensor  # [rows] int32
 
 
 # Fixed cost of a scan unit (pipeline fill, block-end sync) in 256-key tiles; fitted on B200 (128K-1M keys,
@@ -104,7 +103,11 @@ def is_fp8_indexer_supported() -> bool:
 
 @cache_once
 def _jit_fp8_indexer_module(
-    num_heads: int, kv_stages: int, q_stages: int, fp32_reduction: bool = False
+    num_heads: int,
+    kv_stages: int,
+    q_stages: int,
+    fp32_reduction: bool = False,
+    track_rejections: bool = False,
 ) -> Module:
     if not is_fp8_indexer_supported():
         raise RuntimeError("fp8_indexer_candidates requires CUDA SM100")
@@ -114,6 +117,8 @@ def _jit_fp8_indexer_module(
         )
     if fp32_reduction:
         args = make_cpp_args(num_heads, kv_stages, q_stages, True)
+    elif track_rejections:
+        args = make_cpp_args(num_heads, kv_stages, q_stages, False, True)
     else:
         args = make_cpp_args(num_heads, kv_stages, q_stages)
     return load_jit(
@@ -141,6 +146,7 @@ def fp8_indexer_candidates(
     tail_chunks: Optional[int] = None,
     out: Optional[Fp8IndexerCandidates] = None,
     fp32_reduction: bool = False,
+    track_rejections: bool = False,
 ) -> Fp8IndexerCandidates:
     """``q_fp8`` is ``[rows, heads, 128]`` with 32 or 64 heads, ``weights``
     ``[rows, heads]``. Row ``r`` scores keys ``j`` in ``[ks[r], ke[r])`` as
@@ -149,23 +155,27 @@ def fp8_indexer_candidates(
     ks[r])`` with ``score >= T[r]``, ``T[r]`` the j'-th largest of a sample
     of single keys on an odd stride (65, 129 or 257 by span) of the row's
     scores (``j' = ceil((1 + 4 sqrt(2 / j)) j)``,
-    ``j = topk * samples / keys``), so the candidates contain the row's exact
-    top-``topk``. Rows with at most ``dense_bound`` keys (default ``topk``)
+    ``j = topk * samples / keys``). A slab with at least ``topk`` candidates
+    and no overflow contains the top-``topk`` of the computed scores.
+    Rows with at most ``dense_bound`` keys (default ``topk``)
     keep every key (``T = -inf``). ``counts`` keeps counting past ``cap``; such
     rows set ``overflow``. The ``s w`` half of ``relu(s) w`` comes from the
     tensor core (q' in four e4m3 terms), so the scores differ from DeepGEMM's
-    by the e4m3 split error of q' (measured <= 1e-6 relative); the candidate
-    set still contains the exact top-k. The blocks of the last, partial wave
-    are scanned in ``tail_chunks`` pieces each (default: the count that ends
+    by the e4m3 split error of q' (measured <= 1e-6 relative). This can change
+    selection near the cutoff. The blocks of the last, partial wave are
+    scanned in ``tail_chunks`` pieces each (default: the count that ends
     first, see :func:`pick_tail_chunks`); a cached per-device workspace
     coordinates the pieces, so calls on one device must not overlap. Meant for
     calls whose rows see more than ~12K keys; shorter calls are faster
     on the dense path (DeepGEMM logits + top-k). With ``fp32_reduction``,
-    use the legacy DeepGEMM FP32 reduction order, flag nonfinite scores
-    in ``overflow``, and allocate scratch owned by this call's stream.
+    use the legacy DeepGEMM FP32 reduction order. Both ``fp32_reduction``
+    and ``track_rejections`` flag nonfinite scores in ``overflow`` and
+    allocate scratch owned by this call's stream.
     """
     rows, num_heads = q_fp8.shape[:2]
-    module = _jit_fp8_indexer_module(num_heads, kv_stages, q_stages, fp32_reduction)
+    module = _jit_fp8_indexer_module(
+        num_heads, kv_stages, q_stages, fp32_reduction, track_rejections
+    )
     if dense_bound is None:
         dense_bound = topk
     num_blocks = -(-rows // FP8_INDEXER_BLOCK_ROWS[num_heads])
@@ -183,7 +193,7 @@ def fp8_indexer_candidates(
             overflow=torch.empty((rows,), dtype=torch.int32, device=device),
         )
     device = q_fp8.device
-    if fp32_reduction:
+    if fp32_reduction or track_rejections:
         scratch = torch.zeros(
             max(2 * num_blocks, 4096), dtype=torch.int32, device=device
         )
