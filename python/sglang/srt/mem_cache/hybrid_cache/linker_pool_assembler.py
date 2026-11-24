@@ -35,6 +35,7 @@ class DevicePoolEntry:
         rows_are_pages: bool,
         packed: bool = True,
         tp_replicated: bool = False,
+        cp_replicated: bool = False,
         dcp_sharded: bool = False,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
@@ -48,6 +49,9 @@ class DevicePoolEntry:
         # MLA-family pages have no head dimension to shard, so every attention-TP
         # rank holds identical bytes; KDA state in the same group is sharded.
         self.tp_replicated = tp_replicated
+        # Full logical pages materialized on every prefill context-parallel rank.
+        # Window/state pools must opt in independently of their TP layout.
+        self.cp_replicated = cp_replicated
         self.dcp_sharded = dcp_sharded
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
@@ -333,7 +337,7 @@ def _build_deepseek_v4_device_pool_group(
             )
         )
 
-    def add(name, source, pool, buffers, layer_mapping):
+    def add(name, source, pool, buffers, layer_mapping, *, cp_replicated=False):
         if layer_mapping:
             entries.append(
                 DevicePoolEntry(
@@ -344,6 +348,7 @@ def _build_deepseek_v4_device_pool_group(
                     layer_mapping=layer_mapping,
                     page_size=page_size,
                     rows_are_pages=True,
+                    cp_replicated=cp_replicated,
                 )
             )
 
@@ -369,7 +374,17 @@ def _build_deepseek_v4_device_pool_group(
     for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
         kvcache, infos, page_size
     ):
-        add(name, PoolName.KV, device_pool, buffers, layer_mapping)
+        # DSV4.1's low-ratio compressor gathers the global token order before
+        # writing its source KV and index keys. Unlike the bounded-replay SWA
+        # pages (which can contain unwritten rows), these are full logical pages.
+        add(
+            name,
+            PoolName.KV,
+            device_pool,
+            buffers,
+            layer_mapping,
+            cp_replicated=True,
+        )
 
     # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
     # kv_buffer_rope (bf16 rope); shipping nope alone restores 512 of every 640
