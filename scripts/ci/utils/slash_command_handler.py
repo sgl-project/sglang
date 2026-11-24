@@ -368,7 +368,7 @@ def handle_tag_run_ci(
     must pass run_ci_approval.can_approve, for every tier.
 
     Adding `run-ci` here also approves the PR's head commit for the workflows
-    that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), but
+    that gate on a per-commit approval (run_ci_approval.APPROVAL_WORKFLOWS), but
     only a head the commenter could have seen: one pushed before the comment
     was posted.
 
