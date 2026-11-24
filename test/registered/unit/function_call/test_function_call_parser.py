@@ -3464,6 +3464,40 @@ class TestGlm4MoeDetector(CustomTestCase):
                 self.assertEqual(params, {"body": value})
                 self.assertIsInstance(params["body"], str)
 
+    def test_string_argument_scalar_keeps_raw_text(self):
+        """A string-typed value that also parses as a JSON scalar keeps the text
+        the model wrote, in both paths, instead of a Python repr of the scalar."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {"x": {"type": "string"}},
+                        "required": ["x"],
+                    },
+                ),
+            )
+        ]
+        for raw_value in ("1.10", "1e5", "-0", "true", "false", "null", "NaN"):
+            with self.subTest(raw_value=raw_value):
+                text = (
+                    "<tool_call>f\n"
+                    f"<arg_key>x</arg_key>\n<arg_value>{raw_value}</arg_value>\n"
+                    "</tool_call>"
+                )
+                result = Glm4MoeDetector().detect_and_parse(text, self.tools)
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"x": raw_value}
+                )
+
+                self.detector = Glm4MoeDetector()
+                tool_calls = self._collect_streaming_tool_calls(list(text))
+                self.assertEqual(
+                    json.loads(tool_calls[0]["parameters"]), {"x": raw_value}
+                )
+
     def _parse_raw_null_argument(self, parameters):
         """`x` from a raw `null` value: the non-streaming result, and the distinct
         streamed results over whole-chunk, per-character and every single cut."""
@@ -3490,7 +3524,7 @@ class TestGlm4MoeDetector(CustomTestCase):
         """A `$ref` branch makes an argument nullable only if its target allows null;
         `anyOf: [string, $ref -> integer]` must keep a raw `null` as a string."""
         for count_schema, expected in (
-            ({"type": "integer"}, ("None", {"null"})),
+            ({"type": "integer"}, ("null", {"null"})),
             ({"type": "null"}, (None, {None})),
         ):
             with self.subTest(count=count_schema):
@@ -3549,7 +3583,7 @@ class TestGlm4MoeDetector(CustomTestCase):
         for name, parameters in cases.items():
             with self.subTest(name):
                 self.assertEqual(
-                    self._parse_raw_null_argument(parameters), ("None", {"null"})
+                    self._parse_raw_null_argument(parameters), ("null", {"null"})
                 )
 
 
