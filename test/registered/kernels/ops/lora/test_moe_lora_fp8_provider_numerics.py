@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.moe_lora import rel_l2
+from sglang.test.kernels.moe_lora import cutedsl_ready, rel_l2
 
 register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Also exercise the Blackwell implementation in per-PR CI.
@@ -30,8 +30,8 @@ _BLOCK = 128
 def _skip_unless_supported(vendor="cutedsl"):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if vendor == "cutedsl" and torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("the FP8 CuTeDSL provider needs SM90+")
+    if vendor == "cutedsl" and not cutedsl_ready():
+        pytest.skip("the FP8 CuTeDSL provider needs SM90 or SM100")
 
 
 def _block_quant(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

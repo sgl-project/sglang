@@ -4,7 +4,11 @@ import torch
 
 
 def cutedsl_ready() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
+    # The CuTeDSL grouped GEMMs ship SM90 (WGMMA) and SM100 (tcgen05) kernels
+    # only; SM120 reports a higher major but implements neither.
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
         return False
     try:
         import cuda.bindings.driver  # noqa: F401

@@ -6,12 +6,19 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import cutedsl_ready
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
     reason="the cutedsl masked providers need an SM90+ GPU",
+)
+
+# The CuTeDSL grouped GEMMs ship SM90 and SM100 kernels only.
+cutedsl_only = pytest.mark.skipif(
+    not cutedsl_ready(),
+    reason="the cutedsl masked providers need an SM90 or SM100 GPU",
 )
 
 
@@ -67,6 +74,7 @@ def test_small_prepare_admission_boundaries():
     assert not small_masked_prepare_applies(1, 0)
 
 
+@cutedsl_only
 @pytest.mark.parametrize(
     "hidden,tokens,top_k", [(768, 1, 2), (1536, 3, 3), (1032, 8, 4)]
 )
@@ -139,6 +147,7 @@ def _same_state(ref, got, ids, hidden):
     _same_rows(ref, got, ids, hidden)
 
 
+@cutedsl_only
 def test_single_launch_prepare_replays_under_a_cuda_graph(monkeypatch):
     """Replay changed values/routes, including all-dead pairs followed by a full route."""
     from sglang.kernels.ops.lora.moe import dispatch_masked_small as small
