@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the ``sglang.srt.layers.attention.minimax_sparse`` subpackage."""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+
+from sglang.srt.layers.attention import (
+    minimax_sparse_backend,
+    minimax_sparse_backend_hip,
+    minimax_sparse_nvfp4_backend,
+)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.minimax_sparse import (
+    MiniMaxBF16SparseAttnBackend,
+    MiniMaxHybridAttnBackend,
+    MiniMaxMSAV1AttnBackend,
+    MiniMaxNPUSparseAttnBackend,
+    MiniMaxROCmSparseAttnBackend,
+    MiniMaxSparseAttnBackend,
+    MiniMaxSparseBaseBackend,
+    MiniMaxSparseNvfp4AttnBackend,
+)
+from sglang.srt.layers.attention.minimax_sparse import base as base_module
+from sglang.srt.layers.attention.minimax_sparse import (
+    build_minimax_attn_backend,
+    resolve_minimax_sparse_backend_cls,
+)
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class _DummyDenseBackend(AttentionBackend):
+    def __init__(self):
+        self.runner_ids = object()
+        self.token_to_kv_pool = None
+        self.req_to_token_pool = None
+        self.needs_cpu_seq_lens = False
+        self.max_context_len = 128
+
+
+class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
+    def _runner(self, quantization=None):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(quantization=quantization),
+        )
+
+    def test_subclass_hierarchy_and_compat_reexports(self):
+        for cls in (
+            MiniMaxBF16SparseAttnBackend,
+            MiniMaxROCmSparseAttnBackend,
+            MiniMaxNPUSparseAttnBackend,
+            MiniMaxMSAV1AttnBackend,
+        ):
+            self.assertTrue(issubclass(cls, MiniMaxSparseBaseBackend))
+            self.assertTrue(issubclass(cls, MiniMaxSparseAttnBackend))
+            self.assertTrue(issubclass(cls, AttentionBackend))
+
+        self.assertIs(MiniMaxSparseNvfp4AttnBackend, MiniMaxMSAV1AttnBackend)
+        self.assertIs(
+            minimax_sparse_backend.MiniMaxSparseAttnBackend, MiniMaxSparseAttnBackend
+        )
+        self.assertIs(
+            minimax_sparse_backend.MiniMaxHybridAttnBackend, MiniMaxHybridAttnBackend
+        )
+        self.assertIs(
+            minimax_sparse_nvfp4_backend.MiniMaxSparseNvfp4AttnBackend,
+            MiniMaxMSAV1AttnBackend,
+        )
+        self.assertIs(
+            minimax_sparse_backend_hip.MiniMaxROCmSparseAttnBackend,
+            MiniMaxROCmSparseAttnBackend,
+        )
+
+    def test_resolve_backend_cls_by_platform_and_quantization(self):
+        with (
+            patch.object(base_module, "is_npu", return_value=True),
+            patch.object(base_module, "is_hip", return_value=False),
+        ):
+            self.assertIs(
+                resolve_minimax_sparse_backend_cls(self._runner()),
+                MiniMaxNPUSparseAttnBackend,
+            )
+
+        with (
+            patch.object(base_module, "is_npu", return_value=False),
+            patch.object(base_module, "is_hip", return_value=True),
+        ):
+            self.assertIs(
+                resolve_minimax_sparse_backend_cls(self._runner("minimax_m3_nvfp4")),
+                MiniMaxROCmSparseAttnBackend,
+            )
+
+        with (
+            patch.object(base_module, "is_npu", return_value=False),
+            patch.object(base_module, "is_hip", return_value=False),
+            patch.object(
+                base_module, "uses_minimax_m3_nvfp4_native_stack", return_value=True
+            ),
+        ):
+            self.assertIs(
+                resolve_minimax_sparse_backend_cls(self._runner("minimax_m3_nvfp4")),
+                MiniMaxMSAV1AttnBackend,
+            )
+
+        with (
+            patch.object(base_module, "is_npu", return_value=False),
+            patch.object(base_module, "is_hip", return_value=False),
+            patch.object(
+                base_module, "uses_minimax_m3_nvfp4_native_stack", return_value=False
+            ),
+        ):
+            self.assertIs(
+                resolve_minimax_sparse_backend_cls(self._runner()),
+                MiniMaxBF16SparseAttnBackend,
+            )
+
+    def test_build_minimax_attn_backend_wraps_hybrid_unless_native_nvfp4(self):
+        from sglang.srt.layers.attention import minimax_sparse as pkg
+
+        dense = _DummyDenseBackend()
+        fake_sparse = SimpleNamespace(
+            sparse_layer_ids=[1, 3],
+            dense_layer_ids=[0, 2],
+            skips_unused_dense_metadata=lambda: False,
+        )
+        runner = self._runner()
+        with (
+            patch.object(pkg, "uses_minimax_m3_nvfp4_native_stack", return_value=False),
+            patch.object(
+                pkg, "create_minimax_sparse_backend", return_value=fake_sparse
+            ),
+        ):
+            hybrid = build_minimax_attn_backend(runner, dense)
+        self.assertIsInstance(hybrid, MiniMaxHybridAttnBackend)
+        self.assertIs(hybrid.dense, dense)
+        self.assertIs(hybrid.sparse, fake_sparse)
+        self.assertEqual(hybrid.sparse_layer_ids, [1, 3])
+
+        sentinel = object()
+        with (
+            patch.object(pkg, "uses_minimax_m3_nvfp4_native_stack", return_value=True),
+            patch.object(pkg, "MiniMaxMSAV1AttnBackend", return_value=sentinel),
+        ):
+            self.assertIs(build_minimax_attn_backend(runner, dense), sentinel)
+
+    def test_linear_verify_funnel_preserves_batch_and_expands_queries(self):
+        backend = MiniMaxSparseAttnBackend.__new__(MiniMaxSparseAttnBackend)
+        backend._linear_verify = True
+        backend.speculative_num_draft_tokens = 3
+        backend._linear_verify_meta = None
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+            req_pool_indices=torch.tensor([5, 2], dtype=torch.int64),
+            out_cache_loc=torch.arange(6, dtype=torch.int64),
+        )
+        q = torch.zeros(6, 1, 128, dtype=torch.bfloat16)
+        seen = []
+
+        def fake_decode(q, k, v, layer, verify_batch, save_kv_cache, **kwargs):
+            seen.append(verify_batch)
+            return None, torch.stack(
+                (verify_batch.req_pool_indices, verify_batch.seq_lens.to(torch.int64)),
+                dim=-1,
+            )
+
+        backend.forward_decode = fake_decode
+        backend._init_linear_verify_metadata(batch)
+        idx_o, out = backend.forward_extend(
+            q, q, q, None, batch, idx_q=q, idx_k=q, idx_v=None
+        )
+        self.assertIsNone(idx_o)
+        self.assertEqual(
+            out.tolist(),
+            [[5, 11], [5, 12], [5, 13], [2, 21], [2, 22], [2, 23]],
+        )
+        self.assertIsNot(seen[0], batch)
+        self.assertIs(seen[0].out_cache_loc, batch.out_cache_loc)
+        self.assertEqual(batch.seq_lens.tolist(), [10, 20])
+
+
+if __name__ == "__main__":
+    unittest.main()
