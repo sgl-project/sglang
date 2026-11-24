@@ -275,6 +275,18 @@ class RocmPlatform(Platform):
                 exc_info=True,
             )
 
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+                maybe_optimize_qwen_image21_vae,
+            )
+
+            vae = maybe_optimize_qwen_image21_vae(vae)
+        except Exception:
+            logger.warning(
+                "Failed to apply the Qwen-Image 2.1 VAE fast path; using the unmodified VAE.",
+                exc_info=True,
+            )
+
         if is_gfx1250_supported():
             count = cls._force_math_sdpa_in_attention(vae)
             if count > 0:

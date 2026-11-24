@@ -40,6 +40,7 @@ checkpoint loading and weight transfer are unaffected.
 
 from __future__ import annotations
 
+import os
 from types import MethodType
 
 import torch
@@ -58,6 +59,12 @@ from sglang.kernels.ops.diffusion import (
     dup_up3d_add,
     nearest_upsample_nhwc,
 )
+from sglang.kernels.ops.diffusion.norm.vae_channel_norm_triton import (
+    bias_residual_add_triton,
+    can_use_bias_residual_add_triton,
+    can_use_channel_rmsnorm_silu_nhwc_triton,
+    channel_rmsnorm_silu_nhwc_triton,
+)
 from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
     fold_upsample2x_conv2d_weight,
 )
@@ -69,6 +76,12 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+if current_platform.is_rocm():
+    # The CUDA JIT kernels do not build for HIP; the Triton kernels keep their contracts.
+    bias_residual_add = bias_residual_add_triton
+    can_use_bias_residual_add = can_use_bias_residual_add_triton
+    channel_rmsnorm_silu_nhwc = channel_rmsnorm_silu_nhwc_triton
+    can_use_channel_rmsnorm_silu_nhwc = can_use_channel_rmsnorm_silu_nhwc_triton
 _BIAS_RESIDUAL_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 VAE conv bias + residual add"
 )
@@ -492,11 +505,15 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, AutoencoderKLQwenImage21):
         return vae
-    if not current_platform.is_cuda() or current_platform.is_rocm():
+    if not current_platform.is_cuda_alike():
         return vae
     decoder = vae.decoder if vae.config.load_decoder else None
     if type(decoder) is not QwenImage21Decoder3d or vae.spatial_parallel:
         return vae
+    if current_platform.is_rocm():
+        # MIOpen keeps channels_last convs in NHWC only with this set; PyTorch reads
+        # it once, at the first conv, so it must be set before any conv runs.
+        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
     gate = VaeFastPathGate()
     n_norm = _install_norm_silu(
         decoder, gate, QwenImage21ResidualBlock, QwenImage21RMS_norm
