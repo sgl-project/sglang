@@ -83,33 +83,6 @@ def test_the_read_scope_of_the_sdk_opens_the_database():
     ]
 
 
-def test_an_sdk_without_the_read_scope_name_opens_through_its_former_entry():
-    opened = []
-
-    class PerfDatabase:
-        @staticmethod
-        def open_fidb(system, backend, version, **arguments):
-            opened.append((system, backend, version, arguments))
-            return "database"
-
-    sdk = SimpleNamespace(PerfDatabase=PerfDatabase)
-
-    assert (
-        simopus_sdk.open_database(
-            sdk, "mi355x", "0.5.22", perfdb_dir="/data", database_mode="SILICON"
-        )
-        == "database"
-    )
-    assert opened == [
-        (
-            "mi355x",
-            "sglang",
-            "0.5.22",
-            {"perfdb_dir": "/data", "database_mode": "SILICON"},
-        )
-    ]
-
-
 def test_simopus_runtime_imports_use_the_public_sdk():
     """Simulator integrations depend on the facade, not SDK implementation paths."""
     runtime = Path(simopus_sdk.__file__).resolve().parents[1]

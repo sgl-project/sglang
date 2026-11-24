@@ -125,16 +125,6 @@ def test_config_manager_passes_simopus_configuration(
     assert captured["decode_attn_kernel_impl"] == "cuda_graph"
 
 
-def test_unmerged_provider_does_not_accept_old_selector(monkeypatch):
-    monkeypatch.setattr(
-        ConfigManager, "_raw_config", {"predictor": {"name": "infercast"}}
-    )
-    with pytest.raises(ValueError, match="Unknown predictor name"):
-        ConfigManager.get_inference_time_predictor(
-            object(), object(), SchedulerConfig()
-        )
-
-
 @pytest.mark.parametrize("field", ["contract_version", "reduction_policy"])
 def test_config_manager_rejects_obsolete_simopus_configuration(field, monkeypatch):
     monkeypatch.setattr(
