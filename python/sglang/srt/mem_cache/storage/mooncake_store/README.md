@@ -47,8 +47,11 @@ Set common load options alongside Mooncake connection settings:
 --unified-cache-external-linker-config '{"load_mode":"prefetch","prefetch_policy":"timeout","master_server_address":"HOST:50051"}'
 ```
 
-`load_mode` defaults to `layer_wise`, which currently requires PP=1. For pipeline
-parallelism, set `load_mode` to `prefetch`. When the stages share a Mooncake
+`load_mode` defaults to `layer_wise`. With pipeline parallelism, PP0 issues a
+ticket on request arrival. In `layer_wise` mode each stage queries its own
+storage shard and reserves space for a common prefix at admission.
+
+In `prefetch` mode, when the stages share a Mooncake
 namespace and can describe their shards, PP0 queries them in one batch and
 includes the candidate prefix length in the ticket. If a stage has a
 different local prefix or cannot reserve enough GPU slots, the ranks retry using
