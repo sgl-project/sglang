@@ -3750,14 +3750,14 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle both FunctionCallParser and JsonArrayParser. Each segment is
         # sent text first, then calls; segments are in generation order.
         if isinstance(parser, JsonArrayParser):
-            results = [parser.parse_streaming_chunk(delta, effective_tools)]
+            results = parser.parse_streaming_segments(delta, effective_tools)
             if flush:
-                results += parser.parse_streaming_end(effective_tools)
+                results.append(parser.finish(effective_tools))
             segments = [(result.normal_text, result.calls) for result in results]
         else:
-            segments = [parser.parse_stream_chunk(delta)]
+            segments = parser.parse_stream_segments(delta)
             if flush:
-                segments += parser.parse_stream_tail()
+                segments.append(parser.parse_stream_end())
 
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for normal_text, calls in segments:

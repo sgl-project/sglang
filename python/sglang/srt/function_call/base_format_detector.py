@@ -53,9 +53,6 @@ class BaseFormatDetector(ABC):
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
         self.streamed_args_for_tool: List[str] = []
-        # A step whose text followed calls collected in the same chunk; it
-        # opens the next parse_streaming_chunk result, after those calls.
-        self._held_step: Optional[StreamingParseResult] = None
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
@@ -349,75 +346,45 @@ class BaseFormatDetector(ABC):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
 
-    def parse_streaming_chunk(
+    def parse_streaming_segments(
         self, new_text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
-        """Parse a streamed chunk, stepping until the detector emits nothing.
+    ) -> List[StreamingParseResult]:
+        """Parse a streamed chunk, stepping until a step makes no progress.
 
         A step of parse_streaming_increment can emit as little as one name or
         one argument diff, while a chunk can hold whole calls (batched
         detokenization, stream_interval > 1, speculative decoding).
 
-        A result is sent text first, then calls, so stepping stops at text
-        that follows the calls collected so far; that step opens the next
-        result. parse_streaming_end steps what the last chunk left.
+        A result is sent text first, then calls, so text that follows calls
+        opens a new result; the results are in generation order.
         """
-        normal_text, calls = "", []
-
-        def add_step(step: StreamingParseResult) -> bool:
-            nonlocal normal_text
-            if step.normal_text and calls:
-                self._held_step = step
-                return False
-            normal_text += step.normal_text
-            calls.extend(step.calls)
-            return True
-
-        held, self._held_step = self._held_step, None
-        if held is not None:
-            add_step(held)
+        results = [StreamingParseResult()]
         for i in range(_MAX_STEPS_PER_CHUNK):
             text = new_text if i == 0 else ""
-            buffer = self._buffer
+            held = self._buffer + text
             step = self.parse_streaming_increment(text, tools)
-            if not (step.normal_text or step.calls):
+            if (
+                not step.calls
+                and self._buffer == held
+                and not (text and step.normal_text)
+            ):
+                # The step consumed nothing, so the next step would repeat it:
+                # send nothing, or resend the buffer as several detectors'
+                # error paths do. A detector that keeps its text outside
+                # _buffer must send it in one step.
                 break
-            if not text and not step.calls and self._buffer == buffer:
-                # Text sent without consuming the buffer is a resend: several
-                # detectors' error paths send their whole buffer and keep it.
-                # A detector that keeps its text outside _buffer must send it
-                # in one step.
-                break
-            if not add_step(step):
-                break
+            if step.normal_text and results[-1].calls:
+                results.append(StreamingParseResult())
+            results[-1].normal_text += step.normal_text
+            results[-1].calls.extend(step.calls)
         else:
             logger.error(
-                "%s still emits output after %d steps on one chunk; the rest "
+                "%s still makes progress after %d steps on one chunk; the rest "
                 "of the chunk waits for the next one",
                 type(self).__name__,
                 _MAX_STEPS_PER_CHUNK,
             )
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
-
-    def parse_streaming_end(self, tools: List[Tool]) -> List[StreamingParseResult]:
-        """Results that release what the stream left, in generation order.
-
-        Work still in the buffer and steps held behind earlier calls come
-        first, one parse_streaming_chunk result each, then finish().
-        """
-        results = [self.parse_streaming_chunk("", tools)]
-        for _ in range(_MAX_STEPS_PER_CHUNK):
-            if self._held_step is None:
-                break
-            results.append(self.parse_streaming_chunk("", tools))
-        else:
-            logger.error(
-                "%s still holds output after %d results at the end of the "
-                "stream; the rest is dropped",
-                type(self).__name__,
-                _MAX_STEPS_PER_CHUNK,
-            )
-        return results + [self.finish(tools)]
+        return results
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:
@@ -427,7 +394,7 @@ class BaseFormatDetector(ABC):
         raise NotImplementedError()
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        """Called once by parse_streaming_end; flush any buffered state.
+        """Called once when the stream ends; flush any buffered state.
 
         Detectors that hold text back while waiting for a marker that can no
         longer arrive (the stream is over) override this to release it.

@@ -75,7 +75,7 @@ class FunctionCallParser:
     Parser for function/tool calls in model outputs.
 
     This class handles both streaming and non-streaming parsing of function calls using a detector.
-    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_chunk
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_segments
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
@@ -231,9 +231,27 @@ class FunctionCallParser:
         else:
             return full_text, []
 
+    def parse_stream_segments(
+        self, chunk_text: str
+    ) -> list[Tuple[str, list[ToolCallItem]]]:
+        """Parse a streamed chunk into (normal_text, calls) segments.
+
+        Each segment is sent text first, then calls; the segments are in
+        generation order.
+        """
+        if not self.tools and not self.detector.parses_without_tools():
+            return [(chunk_text, [])]
+        return [
+            (result.normal_text, result.calls)
+            for result in self.detector.parse_streaming_segments(chunk_text, self.tools)
+        ]
+
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
+
+        parse_stream_segments merged into one pair, for callers that do not
+        depend on the order of text and calls.
 
         Args:
             chunk_text: The new chunk of text to parse
@@ -243,36 +261,22 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools and not self.detector.parses_without_tools():
-            return chunk_text, []
-        sp_result = self.detector.parse_streaming_chunk(chunk_text, self.tools)
-        return sp_result.normal_text, sp_result.calls
-
-    def parse_stream_tail(self) -> list[Tuple[str, list[ToolCallItem]]]:
-        """Flush detector state once the stream ends, in generation order.
-
-        Each (normal_text, calls) pair is sent text first, as a
-        parse_stream_chunk result is. Text a detector held back waiting for a
-        marker (which can no longer arrive) is released as normal text; see
-        BaseFormatDetector.finish().
-        """
-        if not self.tools and not self.detector.parses_without_tools():
-            return []
-        return [
-            (result.normal_text, result.calls)
-            for result in self.detector.parse_streaming_end(self.tools)
-        ]
+        normal_text, calls = "", []
+        for text, segment_calls in self.parse_stream_segments(chunk_text):
+            normal_text += text
+            calls.extend(segment_calls)
+        return normal_text, calls
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
-        """parse_stream_tail merged into one (normal_text, calls) pair.
+        """Flush detector state once the stream ends.
 
-        For callers that do not depend on the order of text and calls.
+        Text a detector held back waiting for a marker (which can no longer
+        arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        normal_text, calls = "", []
-        for text, tail_calls in self.parse_stream_tail():
-            normal_text += text
-            calls.extend(tail_calls)
-        return normal_text, calls
+        if not self.tools and not self.detector.parses_without_tools():
+            return "", []
+        sp_result = self.detector.finish(self.tools)
+        return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False

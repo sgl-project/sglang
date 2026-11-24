@@ -1222,10 +1222,10 @@ class TestBaseFormatDetector(unittest.TestCase):
             return StreamingParseResult(normal_text=self.detector._buffer)
 
         with patch.object(self.detector, "parse_streaming_increment", resend):
-            result = self.detector.parse_streaming_chunk("<tool_call>{", self.tools)
-            end = self.detector.parse_streaming_end(self.tools)
-        self.assertEqual(result.normal_text, "<tool_call>{")
-        self.assertEqual("".join(r.normal_text for r in end), "")
+            results = self.detector.parse_streaming_segments("<tool_call>{", self.tools)
+            # The stream's last delta may be empty.
+            results += self.detector.parse_streaming_segments("", self.tools)
+        self.assertEqual([r.normal_text for r in results], ["<tool_call>{", ""])
 
 
 class TestLlama32Detector(unittest.TestCase):
@@ -4336,15 +4336,18 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
 
-    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
-        """Calls that arrive whole in the last chunk still stream their
-        arguments at stream end, exactly once."""
+    def test_chunk_streams_the_arguments_of_whole_calls_once(self):
+        """Calls that arrive whole in one chunk stream their arguments in that
+        chunk, and stream end sends nothing more."""
         text = (
             '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
             '{"name": "search", "parameters": {"query": "restaurants"}}]'
         )
-        calls = self.detector.parse_streaming_increment(text, self.tools).calls
-        calls += self.detector.finish(self.tools).calls
+        calls = [
+            call
+            for result in self.detector.parse_streaming_segments(text, self.tools)
+            for call in result.calls
+        ]
 
         streamed = {}
         for call in calls:
@@ -6528,13 +6531,7 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
 
 
 class TestStreamChunkOrder(unittest.TestCase):
-    """A chunk result is sent text first, so text after a call in the same
-    chunk must come in a later result."""
-
-    CHUNK = (
-        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}'
-        "\n</tool_call>\nDone."
-    )
+    """Text and calls streamed in one chunk keep their generation order."""
 
     def setUp(self):
         tool = Tool(
@@ -6547,24 +6544,36 @@ class TestStreamChunkOrder(unittest.TestCase):
                 },
             ),
         )
-        self.parser = FunctionCallParser(tools=[tool], tool_call_parser="hermes")
+        self.parser = FunctionCallParser(tools=[tool], tool_call_parser="glm47")
 
-    def _assert_whole_call(self, text, calls):
-        self.assertEqual(text, "")
-        self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
-        self.assertEqual(
-            json.loads("".join(c.parameters for c in calls)), {"city": "Paris"}
+    @staticmethod
+    def _call(city):
+        return (
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            f"<arg_value>{city}</arg_value></tool_call>"
         )
 
-    def test_text_after_a_call_comes_with_the_next_chunk(self):
-        self._assert_whole_call(*self.parser.parse_stream_chunk(self.CHUNK))
-        text, calls = self.parser.parse_stream_chunk(" Bye.")
-        self.assertEqual((text.strip(), calls), ("Done. Bye.", []))
+    def _segments(self, chunk):
+        """Each segment as (text, names, arguments)."""
+        return [
+            (
+                text,
+                [c.name for c in calls if c.name],
+                json.loads("".join(c.parameters for c in calls)) if calls else None,
+            )
+            for text, calls in self.parser.parse_stream_segments(chunk)
+        ]
 
-    def test_text_after_a_call_in_the_last_chunk_is_kept(self):
-        self._assert_whole_call(*self.parser.parse_stream_chunk(self.CHUNK))
-        text, calls = self.parser.parse_stream_tail()[0]
-        self.assertEqual((text.strip(), calls), ("Done.", []))
+    def test_calls_split_by_text_all_come_in_their_chunk(self):
+        chunk = "Sure." + self._call("Paris") + " Mid " + self._call("Rome") + " End"
+        self.assertEqual(
+            self._segments(chunk),
+            [
+                ("Sure.", ["get_weather"], {"city": "Paris"}),
+                (" Mid ", ["get_weather"], {"city": "Rome"}),
+                (" End", [], None),
+            ],
+        )
 
 
 class TestToolCallParserNames(unittest.TestCase):

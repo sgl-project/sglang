@@ -2769,18 +2769,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # Each segment is (text, calls); segments are in generation
                 # order.
                 if isinstance(tool_parser, JsonArrayParser):
-                    results = [tool_parser.parse_streaming_chunk(delta, chat_tools)]
+                    results = tool_parser.parse_streaming_segments(delta, chat_tools)
                     if flush:
-                        results += tool_parser.parse_streaming_end(chat_tools)
+                        results.append(tool_parser.finish(chat_tools))
                     segments = [(r.normal_text, r.calls) for r in results]
                 elif token_stream is not None:
                     segments = [(delta, token_calls)]
                 elif tool_parser is not None and not self._answer_started(
                     reasoning_parser_obj
                 ):
-                    segments = [tool_parser.parse_stream_chunk(delta)]
+                    segments = tool_parser.parse_stream_segments(delta)
                     if flush:
-                        segments += tool_parser.parse_stream_tail()
+                        segments.append(tool_parser.parse_stream_end())
                 else:
                     segments = [(delta, [])]
 
