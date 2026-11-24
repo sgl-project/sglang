@@ -956,6 +956,10 @@ class Envs:
     SGLANG_HUGEPAGE_MODE = EnvStr("")
     # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
     SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
+    # Per-pool capacity of the belief table of pages already in L3 storage (~150-250 B
+    # per entry). It must outlive a page's L1+L2 residency, or eviction re-puts the page;
+    # the default covers ~32M tokens at page size 64.
+    SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = EnvInt(512 * 1024)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE = EnvFloat(None)
 

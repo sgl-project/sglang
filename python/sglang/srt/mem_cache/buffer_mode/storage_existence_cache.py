@@ -36,19 +36,17 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
+from typing import Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
-
-# Per pool: ~524K entries; at ~150-250 B/entry this is <= ~125 MiB and covers
-# roughly 32M tokens at page size 64.
-HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 512 * 1024
 
 
 class PoolExistenceBeliefs:
     """One pool's LRU of page hashes believed stored, plus its refcounted
     in-flight content (D2H launch to storage ack)."""
 
-    def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
+    def __init__(self, max_entries: int):
         self.max_entries = max_entries
         self._entries: OrderedDict[str, None] = OrderedDict()
         self._inflight: dict[str, int] = {}
@@ -129,7 +127,9 @@ class PoolExistenceBeliefs:
 class StorageExistenceCache:
     """The beliefs of every storage pool, created on first use."""
 
-    def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
+    def __init__(self, max_entries: Optional[int] = None):
+        if max_entries is None:
+            max_entries = envs.SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES.get()
         self.max_entries = max_entries
         self._pools: dict[str, PoolExistenceBeliefs] = {}
 
