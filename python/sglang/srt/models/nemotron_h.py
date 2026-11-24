@@ -1237,11 +1237,8 @@ class NemotronHForCausalLM(nn.Module):
         self.model.layers_to_capture = {layer_id + 1 for layer_id in layer_ids}
 
     def precompile_kernels_after_loading(self) -> None:
-        # NemotronH does not capture prefill CUDA graphs, so without this the
-        # Mamba2 prefill kernels compile on the first live requests instead.
-        # With chunked prefill, a prefill batch never holds more tokens than
-        # one chunk, so larger layouts would only cost startup time. PP dynamic
-        # chunking can grow past it, so it keeps the full sweep.
+        # No prefill CUDA graphs here, so compile Mamba2 prefill kernels before serving.
+        # Stop at the chunked prefill size, except under PP dynamic chunking.
         schedule = get_schedule()
         max_tokens = None
         if (schedule.chunked_prefill_size or 0) > 0 and not (
