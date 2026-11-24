@@ -1106,6 +1106,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # gfx950 DSA prefill logits: aiter's Triton fp8_mqa_logits (Gluon on Triton >= 3.6), not FlyDSL;
+    # FlyDSL's last block is slow when rows % 4 != 0.
+    # TODO(ROCm/aiter#8425): Revisit the default once SGLang's AITER pin includes the fix.
+    SGLANG_USE_GLUON_DSA_PREFILL_LOGITS = EnvBool(False)
     # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail

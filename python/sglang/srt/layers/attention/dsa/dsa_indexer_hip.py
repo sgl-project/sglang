@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.dsa import (
     aiter_paged_mqa_logits_verify,
 )
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.utils import is_gfx95_supported, print_info_once
@@ -549,9 +550,9 @@ def fp4_prefill(
 # once per process: a missing FlyDSL warns once, not once per layer
 @functools.cache
 def _prefill_mqa_logits_fn():
-    # gfx950: AITER's FlyDSL fp8_mqa_logits instead of Triton; same fp8 inputs and
-    # fp32 accumulation, only the summation order differs
-    if _is_gfx95:
+    # gfx950: FlyDSL fp8_mqa_logits unless SGLANG_USE_GLUON_DSA_PREFILL_LOGITS=1;
+    # aiter's Triton/Gluon kernel has the same fp8 inputs and fp32 accumulation
+    if _is_gfx95 and not envs.SGLANG_USE_GLUON_DSA_PREFILL_LOGITS.get():
         try:
             from aiter.ops.flydsl import flydsl_fp8_mqa_logits
 
@@ -577,7 +578,7 @@ def ragged_mqa_logits(
 ) -> torch.Tensor:
     """gfx950 prefill logits of the rows ``q`` over the gathered index-K ``kv_fp8``:
     the MXFP4 kernel for FP4 keys (with the batch's schedules, fp4_logits_plans, when
-    ``metadata`` is given), else FlyDSL fp8_mqa_logits."""
+    ``metadata`` is given), else fp8_mqa_logits (see ``_prefill_mqa_logits_fn``)."""
     if indexer.fp4_index_k:
         from sglang.kernels.ops.attention.dsa import fp4_index_hip
 
