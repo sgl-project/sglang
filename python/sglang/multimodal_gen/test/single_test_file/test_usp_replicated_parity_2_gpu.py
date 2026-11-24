@@ -111,6 +111,20 @@ def _worker() -> int:
     if dp.max().item() > 1e-2:
         failures.append(f"prefix drift: mae={dp.mean():.3e} max={dp.max():.3e}")
 
+    # K/V-only prefix supplied separately: the packed exchange moves only data,
+    # so it must match the three-collective exchange bit for bit
+    kv_prefix_args = (qf[:, sl], kf[:, S:], vf[:, S:], kf[:, sl], vf[:, sl])
+    out_packed = attn.forward_with_replicated_kv_prefix(*kv_prefix_args)
+    can_use_packed = L._can_use_packed_qkv_a2a_4d
+    L._can_use_packed_qkv_a2a_4d = lambda *args, **kwargs: False
+    try:
+        out_unpacked = attn.forward_with_replicated_kv_prefix(*kv_prefix_args)
+    finally:
+        L._can_use_packed_qkv_a2a_4d = can_use_packed
+    if not torch.equal(out_packed, out_unpacked):
+        d = (out_packed.float() - out_unpacked.float()).abs()
+        failures.append(f"kv prefix packed not bitwise: max={d.max():.3e}")
+
     for f in failures:
         print(f"FAILURE rank{rank}: {f}", flush=True)
     return 1 if failures else 0

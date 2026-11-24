@@ -631,6 +631,49 @@ def _usp_input_all_to_all_qkv(
     return q.contiguous(), k.contiguous(), v.contiguous()
 
 
+def _usp_input_all_to_all_qkv_behind_prefix(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packed Ulysses input exchange that writes K/V right after a local prefix.
+
+    q/k/v: [1, s_local, h, d]; k_prefix/v_prefix: [1, p, h_local, d], already
+    sliced to this rank's heads. Returns q [1, s_global, h_local, d] and K/V
+    [1, p + s_global, h_local, d], equal to concatenating the prefix in front
+    of the gathered K/V. Callers check ``_can_use_packed_qkv_a2a_4d`` first.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    _, s_local, h_global, d = q.shape
+    h_local = h_global // world_size
+    packed = pack_qkv_destination_major(
+        q.view(s_local, h_global, d),
+        k.view(s_local, h_global, d),
+        v.view(s_local, h_global, d),
+        world_size,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size, s_local, h_local, 3 * d),
+            q.dtype,
+            q.device,
+        ),
+    )
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.view(1, world_size * s_local, h_local, 3 * d)
+    q_out = packed[..., :d].contiguous()
+    prefix = k_prefix.shape[1]
+    kv_shape = (1, prefix + world_size * s_local, h_local, d)
+    k_out = q.new_empty(kv_shape)
+    v_out = q.new_empty(kv_shape)
+    k_out[:, :prefix].copy_(k_prefix)
+    v_out[:, :prefix].copy_(v_prefix)
+    k_out[:, prefix:].copy_(packed[..., d : 2 * d])
+    v_out[:, prefix:].copy_(packed[..., 2 * d :])
+    return q_out, k_out, v_out
+
+
 def _usp_input_all_to_all_varlen(
     x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
 ) -> torch.Tensor:
