@@ -267,6 +267,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Monotonic; read by the scheduler thread in _drain_backup to time the
+        # enqueue-to-ack span of L2->L3 writes.
+        self.enqueue_time = time.perf_counter()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -460,6 +463,7 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        self.forward_on_fence_stream = False
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)

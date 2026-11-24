@@ -143,7 +143,9 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
+    get_preserve_last_token_id,
     is_health_check_generate_req,
+    truncate_input_ids,
 )
 from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
@@ -216,7 +218,6 @@ from sglang.srt.speculative.spec_decoding_metrics import (
 from sglang.srt.utils import (
     configure_gc_logging,
     freeze_gc,
-    get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
     print_warning_once,
@@ -293,6 +294,8 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # obj.input_ids was dropped after dispatch, so the request cannot be dumped.
+    prompt_released: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -374,6 +377,10 @@ class ReqState:
     input_top_logprobs_scheduler_flat: Optional[Tuple[np.ndarray, np.ndarray, int]] = (
         None
     )
+    # Weights of an input candidate selector's candidates (float32 [rows, k]),
+    # sent once at prefill completion, and their cached response fields.
+    input_top_logprobs_weights: Optional[np.ndarray] = None
+    input_top_logprobs_weights_fields: Optional[Dict[str, Any]] = None
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -502,8 +509,9 @@ def _add_sampling_mask_to_meta_info(
     chunk: Optional[SamplingMaskChunk],
     finished: bool,
 ):
+    flat = state.obj.return_flat_raw_sampling_mask
     if chunk is not None:
-        if state.obj.return_flat_raw_sampling_mask:
+        if flat:
             state.output_token_sampling_mask_chunks.append(chunk)
         else:
             masks, logprobs = chunk.to_lists(
@@ -511,21 +519,43 @@ def _add_sampling_mask_to_meta_info(
             )
             state.output_token_sampling_mask.extend(masks)
             state.output_token_sampling_logprobs.extend(logprobs)
-            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
-            meta_info["output_token_sampling_logprobs"] = (
-                state.output_token_sampling_logprobs
-            )
-            meta_info["output_token_sampling_mask_length"] = len(
-                state.output_token_sampling_mask
-            )
+    if not flat:
+        meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+        meta_info["output_token_sampling_logprobs"] = (
+            state.output_token_sampling_logprobs
+        )
+        meta_info["output_token_sampling_mask_length"] = len(
+            state.output_token_sampling_mask
+        )
     # Built once on the finished response; streaming is rejected.
-    if state.obj.return_flat_raw_sampling_mask and finished:
+    elif finished:
         meta_info.update(
             _build_flat_sampling_mask_fields(
                 state.output_token_sampling_mask_chunks,
                 return_b64=state.obj.return_flat_raw_sampling_mask_b64,
             )
         )
+
+
+def _build_top_logprobs_weights_fields(
+    weights: np.ndarray, num_positions: int, flat: bool, return_b64: bool
+) -> Dict[str, Any]:
+    """Build the response fields for the [rows, k] weights of prompt top
+    logprob candidates. Nested: one row per position, null where
+    `input_top_logprobs` is. Flat: the layout of `input_top_logprobs_shape`
+    and `input_top_logprobs_null_prefix`."""
+    if not flat:
+        # The first position alone has no row, as in `input_top_logprobs`.
+        assert num_positions == weights.shape[0] + 1, (num_positions, weights.shape)
+        return {"input_top_logprobs_weights": [None] + weights.tolist()}
+    if return_b64:
+        return {
+            "input_top_logprobs_weights_flat_b64": pybase64.b64encode(
+                weights.tobytes()
+            ).decode("utf-8"),
+            "input_top_logprobs_weights_flat_b64_dtype": "float32",
+        }
+    return {"input_top_logprobs_weights_flat": weights.reshape(-1).tolist()}
 
 
 class InputFormat(Enum):
@@ -721,7 +751,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
@@ -783,6 +812,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+        self._embedding_preserve_last_token_id = get_preserve_last_token_id(
+            tokenizer=self.tokenizer, is_generation=self.is_generation
+        )
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
@@ -1089,6 +1122,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if obj.input_ids is not None and not self._reads_input_ids_late():
+                        obj.input_ids = None
+                        state.prompt_released = True
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1486,7 +1522,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                del input_ids[_max_req_len:]
+                input_ids[:] = truncate_input_ids(
+                    input_ids,
+                    max_len=_max_req_len,
+                    preserve_last_token_id=self._embedding_preserve_last_token_id,
+                )
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
@@ -2030,6 +2070,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _reads_input_ids_late(self) -> bool:
+        return (
+            self.request_logger.logs_field_on_finish("input_ids")
+            or self.request_metrics_exporter_manager.exporter_enabled()
+            or bool(self.dump_requests_folder)
+            or bool(self.crash_dump_folder)
+        )
+
     async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
@@ -2454,7 +2502,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
                     )
-                    if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.get()
                     else nullcontext()
                 ):
                     for i in range(batch_size):
@@ -3201,9 +3249,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i, request_stats)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            dumpable = (
+                state.finished and state.obj.log_metrics and not state.prompt_released
+            )
+            if self.dump_requests_folder and dumpable:
                 self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+            if self.crash_dump_folder and dumpable:
                 self.record_request_for_crash_dump(state, out_dict)
 
         # handle_loop awaits next recv immediately
@@ -3353,6 +3404,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
+            if state.input_top_logprobs_weights is not None:
+                if state.input_top_logprobs_weights_fields is None:
+                    state.input_top_logprobs_weights_fields = (
+                        _build_top_logprobs_weights_fields(
+                            state.input_top_logprobs_weights,
+                            len(state.input_top_logprobs_val),
+                            flat=use_flat,
+                            return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                        )
+                    )
+                meta_info.update(state.input_top_logprobs_weights_fields)
             use_flat_output = state.obj.return_flat_raw_output_top_logprobs
             # Built once on the finished response; streaming is rejected and
             # only that response reaches a non-streaming client.
@@ -3476,6 +3538,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
+            # An entry per request of the batch, None without weights.
+            assert recv_obj.input_top_logprobs_weights is None or len(
+                recv_obj.input_top_logprobs_weights
+            ) == len(recv_obj.rids)
+            if (
+                recv_obj.input_top_logprobs_weights is not None
+                and recv_obj.input_top_logprobs_weights[recv_obj_index] is not None
+            ):
+                state.input_top_logprobs_weights = recv_obj.input_top_logprobs_weights[
+                    recv_obj_index
+                ]
             if recv_obj.output_top_logprobs_val is not None:
                 state.output_top_logprobs_val.extend(
                     recv_obj.output_top_logprobs_val[recv_obj_index]
@@ -3783,7 +3856,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Add unfinished requests from rid_to_state
             unfinished_requests = []
             for rid, state in self.rid_to_state.items():
-                if not state.finished:
+                if not state.finished and not state.prompt_released:
                     state.time_stats.set_finished_time()
                     unfinished_requests.append(
                         (
@@ -3967,6 +4040,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and not get_serving().skip_tokenizer_init,
                 finished=True,
             )
+        if is_generate and state.obj.return_sampling_mask:
+            _add_sampling_mask_to_meta_info(meta_info, state, None, finished=True)
 
         output_ids = state.output_ids
         text = state.get_text()
@@ -3988,6 +4063,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         return_b64=state.obj.return_flat_raw_top_logprobs_b64,
                     )
                 )
+            if "output_token_sampling_mask_length" in meta_info:
+                if state.obj.return_flat_raw_sampling_mask:
+                    meta_info.update(
+                        _build_flat_sampling_mask_fields(
+                            [], return_b64=state.obj.return_flat_raw_sampling_mask_b64
+                        )
+                    )
+                else:
+                    meta_info["output_token_sampling_mask_length"] = 0
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
