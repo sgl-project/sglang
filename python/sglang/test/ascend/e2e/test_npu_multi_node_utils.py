@@ -745,33 +745,6 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
     return decorator
 
 
-def prewarm_hf_dynamic_modules(model_config):
-    """Warm the pod-local HF_MODULES_CACHE before the schedulers fork.
-
-    Every pod starts one scheduler process per device and each of them loads
-    the tokenizer itself. The cold /tmp/hf_modules cache is filled by
-    transformers with a non-atomic copy, so concurrent readers can import a
-    truncated tokenization_kimi.py and fail with
-    AttributeError: ... has no attribute 'TikTokenTokenizer'.
-    """
-    tokenizer_path = model_config["model_path"]
-    other_args = model_config.get("other_args") or []
-    for index, arg in enumerate(other_args):
-        if arg == "--tokenizer-path" and index + 1 < len(other_args):
-            tokenizer_path = other_args[index + 1]
-            break
-    try:
-        from transformers import AutoProcessor, AutoTokenizer
-
-        try:
-            AutoProcessor.from_pretrained(tokenizer_path, trust_remote_code=True)
-        except Exception:
-            AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        logger.info(f"HF_MODULES_CACHE prewarmed from {tokenizer_path}")
-    except Exception as e:
-        logger.warning(f"HF_MODULES_CACHE prewarm from {tokenizer_path} failed: {e}")
-
-
 # Launch master/worker node
 def launch_pd_mix_node(model_config):
     logger.info(f"Launch pd mix node start ......")
@@ -830,8 +803,6 @@ def launch_pd_mix_node(model_config):
     for key, value in model_config["node_envs"].items():
         logger.info(f"ENV_VAR_CASE {key}:{value}")
         os.environ[key] = value
-
-    prewarm_hf_dynamic_modules(model_config)
 
     from sglang.test.ascend.test_ascend_utils import (
         HICACHE_STORAGE_BACKEND_ARG,
@@ -1078,8 +1049,6 @@ def launch_pd_separation_node(model_config):
         wait_for_mooncake_master(
             _resolve_mooncake_master_address(service_args, master_address)
         )
-
-    prewarm_hf_dynamic_modules(model_config)
 
     try:
         process = popen_launch_server(
