@@ -75,13 +75,6 @@ def _check_xpu_dcp_mla(
             "LSE, so the cross-rank merge has nothing to weight its partials "
             "with. Dense MLA models are supported."
         )
-    if view.kv_cache_dtype != "auto":
-        raise ValueError(
-            "--dcp-size > 1 with an MLA model on Intel XPU needs "
-            "--kv-cache-dtype auto: the scaled latent write takes the "
-            "combined-row cache door, which has no DCP-aware path, but got "
-            f"--kv-cache-dtype={view.kv_cache_dtype}."
-        )
     if view.disable_chunked_prefix_cache:
         raise ValueError(
             "--dcp-size > 1 with an MLA model on Intel XPU needs the chunked "
@@ -102,26 +95,14 @@ def _check_xpu_dcp_mla(
         )
 
 
-def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
+def _check_xpu_dcp_mha(
+    view: Any, model_config: Any, tp_size: int, dcp_size: int, attn_tp_size: int
+) -> None:
+    """DCP admission for a model whose KV heads TP shards."""
     from sglang.srt.configs.model_config import is_qwen3_5
 
-    view = resolved_view(server_args)
-    tp_size, dcp_size = view.tp_size, view.dcp_size
-    if set(attention_backends_of(view)) != {"intel_xpu"}:
-        raise ValueError(
-            "--dcp-size > 1 on Intel XPU needs --attention-backend intel_xpu."
-        )
-    if tp_size % dcp_size != 0:
-        raise ValueError(f"--dcp-size {dcp_size} must divide --tp-size {tp_size}.")
-
-    attn_tp_size = tp_size // view.attn_cp_size
-    if use_mla_backend(server_args):
-        _check_xpu_dcp_mla(view, model_config, attn_tp_size, dcp_size)
-        return
-
     # Other ranks' rows are written at -1, which only store_cache_xpu skips; unequal
-    # K/V widths fall back to an indexed write that would hit the last slot. MLA is
-    # exempt: its write resolves the owner rule inside set_mla_kv_buffer.
+    # K/V widths fall back to an indexed write that would hit the last slot.
     if model_config.v_head_dim != model_config.head_dim:
         raise ValueError("--dcp-size > 1 on Intel XPU needs equal K and V head dims.")
     # Every rank of a DCP group must hold the same KV heads: qwen3_5 shards qkv that
@@ -148,6 +129,19 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
             "a smaller --dcp-size or a larger --tp-size."
         )
 
+
+def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
+    view = resolved_view(server_args)
+    tp_size, dcp_size = view.tp_size, view.dcp_size
+    if set(attention_backends_of(view)) != {"intel_xpu"}:
+        raise ValueError(
+            "--dcp-size > 1 on Intel XPU needs --attention-backend intel_xpu."
+        )
+    if tp_size % dcp_size != 0:
+        raise ValueError(f"--dcp-size {dcp_size} must divide --tp-size {tp_size}.")
+
+    # Attention-architecture independent: these hold for MHA and MLA alike, so
+    # they must precede the per-architecture split below.
     if view.speculative_algorithm is not None:
         raise ValueError(
             "--dcp-size > 1 with speculative decoding is not supported on Intel XPU."
@@ -161,6 +155,12 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
         raise ValueError(
             "--dcp-size > 1 is not supported on Intel XPU for encoder-decoder models."
         )
+
+    attn_tp_size = tp_size // view.attn_cp_size
+    if use_mla_backend(server_args):
+        _check_xpu_dcp_mla(view, model_config, attn_tp_size, dcp_size)
+    else:
+        _check_xpu_dcp_mha(view, model_config, tp_size, dcp_size, attn_tp_size)
 
 
 def handle_attention_backend_compatibility(server_args: Any):

@@ -344,16 +344,14 @@ class XPUAttentionBackend(AttentionBackend):
         varlen kernel a zero k length for some rows, and it returns NaN there.
         merge_state would then poison the whole request; -inf weighs it 0 instead.
         """
-        cu_k = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
-        empty = (cu_k[1:] - cu_k[:-1]) == 0
-        if not bool(empty.any()):
+        if not forward_batch.prefix_chunk_has_zero_kv[chunk_idx]:
             return output, lse
-        rows = empty.repeat_interleave(
+        rows = (forward_batch.prefix_chunk_seq_lens[chunk_idx] == 0).repeat_interleave(
             forward_batch.extend_seq_lens, output_size=output.shape[0]
         )
         return (
-            output.masked_fill(rows.view(-1, 1, 1), 0.0),
-            lse.masked_fill(rows.unsqueeze(-1), -float("inf")),
+            output.masked_fill_(rows.view(-1, 1, 1), 0.0),
+            lse.masked_fill_(rows.unsqueeze(-1), -float("inf")),
         )
 
     def _ensure_mla_workspaces(self, batch_size: int) -> None:
@@ -440,10 +438,8 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.use_mla:
             self._ensure_mla_workspaces(forward_batch.batch_size)
-            # flash_mla_decode requires block_num % (128 / page_size) == 0; the
-            # per-rank shard is short enough to land under that for page_size
-            # below 128, so widen it with repeats of the last page. Reads past
-            # cache_seqlens are never used.
+            # flash_mla_decode wants block_num % (128 / page_size) == 0, which a
+            # short per-rank shard misses. cache_seqlens bounds the reads.
             align = max(1, 128 // self.page_size)
             table = dcp_metadata.page_table
             if table is not None and table.shape[1] % align:
@@ -861,12 +857,9 @@ class XPUAttentionBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, sinks
             )
         if self.dcp_size > 1:
-            # MLA prefill needs no DCP stage here. The model gathers the prefix
-            # latent across the group itself (all_gather_kv_cache_for_mha_extend)
-            # and merges chunk against prefix by LSE, so each rank already attends
-            # the whole sequence for its own Q heads. The chunked-KV MHA branch
-            # below reads only cu_seqlens_q / max_seq_len_q, which the DCP
-            # metadata carries; it never touches the page table.
+            # The model gathers the prefix latent itself, so each rank already
+            # attends the whole sequence and needs no DCP stage here. The branch
+            # below reads only cu_seqlens_q / max_seq_len_q, never the page table.
             assert not is_hybrid_swa, _DCP_SWA_MSG
             assert forward_batch.attn_attend_prefix_cache is not None, (
                 "DCP on intel_xpu needs the chunked-prefix MLA prefill path; "
@@ -1404,6 +1397,18 @@ class XPUAttentionBackend(AttentionBackend):
         state rather than a finished output.
         """
         dcp = self.dcp_metadata
+        num_tokens = q.shape[0]
+        if dcp.page_table is None:
+            # This rank owns no position of any request in the batch, so there is
+            # no page table to read. Contribute a neutral state to the merge.
+            return (
+                q.new_zeros((num_tokens, layer.tp_q_head_num * layer.v_head_dim)),
+                q.new_full(
+                    (num_tokens, layer.tp_q_head_num),
+                    -float("inf"),
+                    dtype=torch.float32,
+                ),
+            )
         kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
