@@ -238,10 +238,10 @@ impl MambaComponent {
         if tree_core.enable_hicache
             && tree_core.is_write_back
             && !node.has_host_value(MAMBA)
-            && !node.backuped()
             && node.has_device_value(FULL)
         {
-            // Keep the state live until the controller finishes D->H I/O.
+            // Keep the state live until the controller finishes D->H I/O
+            // (backuped covers Full KV only).
             // Native code never calls Python while holding the tree lock.
             let node_id = node.id;
             tree_core

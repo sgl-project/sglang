@@ -58,7 +58,7 @@ _is_npu = is_npu()
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
-def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+def reserve_rope_cache_for_long_sequences(model, model_config):
     """Pre-expand RoPE cache for long sequences and speculative decoding.
 
     Runs inside `ModelRunner`, past publish, so the three config inputs come
@@ -75,7 +75,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     base_ctx = (
         get_model().context_length
         or getattr(model_config, "context_len", None)
-        or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
         or 2048
     )
@@ -299,6 +298,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    weight_cache_transport: str = "auto",
     load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -329,6 +329,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        weight_cache_transport=weight_cache_transport,
         load_group=load_group,
     )
 

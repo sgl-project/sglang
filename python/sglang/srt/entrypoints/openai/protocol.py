@@ -1867,7 +1867,7 @@ class V1RerankReqInput(BaseModel):
 
 class RerankResponse(BaseModel):
     score: float
-    document: Optional[str] = None
+    document: Optional[RerankContent] = None
     index: int
     meta_info: Optional[dict] = None
 
@@ -2284,10 +2284,6 @@ class ResponsesRequest(PDRoutingFields):
                 max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
-
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        if max_tokens is not None:
-            max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:

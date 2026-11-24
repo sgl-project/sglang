@@ -231,9 +231,10 @@ from sglang.srt.runtime_context import (
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
-from sglang.srt.sampling.watermarking.core import WatermarkState
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
+from sglang.srt.sampling.watermarking.interface import WatermarkEngine
+from sglang.srt.sampling.watermarking.runtime import make_watermark_engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
@@ -253,9 +254,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     get_available_gpu_memory,
-    is_host_cpu_arm64,
     is_npu,
     set_cuda_arch,
     slow_rank_detector,
@@ -263,12 +262,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -276,8 +273,6 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
-
-# Detect stragger ranks in model loading
 
 
 logger = logging.getLogger(__name__)
@@ -331,7 +326,7 @@ def resolve_draft_attention_backend(
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
-    watermark_state: Optional[WatermarkState] = None
+    watermark: Optional[WatermarkEngine] = None
     # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
     uocr_greedy_graph: Optional[UocrGreedyGraph] = None
     canary_manager: Optional[CanaryManager] = None
@@ -423,9 +418,6 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
-        self.is_multimodal_chunked_prefill_supported = (
-            model_config.is_multimodal_chunked_prefill_supported
-        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -664,24 +656,21 @@ class ModelRunner:
             device=self.device,
         )
 
-    def maybe_init_watermark_state(self):
-        features = get_exec().features
-        self.watermark_state = (
-            WatermarkState(
+    def maybe_init_watermark(self):
+        self.watermark = (
+            make_watermark_engine(
                 max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-                context_window=features.watermark_context_window,
                 max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
                 vocab_size=self.model_config.vocab_size,
-                key=features.watermark_key,
-                key_b=features.watermark_key_b,
-                mixing_probability=features.watermark_mixing_probability,
-                max_probability=features.watermark_max_probability,
                 device=self.device,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
             )
-            if features.enable_watermark and not self.is_draft_worker
+            if not self.is_draft_worker
             else None
+        )
+
+    def init_sampling_pipeline(self):
+        self.sampling_pipeline = SamplingPipeline(
+            sampler=self.sampler, watermark=self.watermark
         )
 
     def init_kv_cache_configurator(
@@ -1078,7 +1067,8 @@ class ModelRunner:
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
-        self.maybe_init_watermark_state()
+        self.maybe_init_watermark()
+        self.init_sampling_pipeline()
 
         self.maybe_init_hisparse_coordinator()
 
@@ -1253,8 +1243,8 @@ class ModelRunner:
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm sampling, penalty, and logprob kernels after graph initialization."""
         self.sampling_prewarm_result = SamplingPrewarmResult()
-        vocab = getattr(getattr(self, "model_config", None), "vocab_size", 0)
-        dev_str = str(getattr(self, "device", ""))
+        vocab_size = getattr(getattr(self, "model_config", None), "vocab_size", 0)
+        device_str = str(getattr(self, "device", ""))
         warmups = getattr(getattr(self, "server_args", None), "warmups", None) or ""
         if (
             "all" not in {w.strip() for w in warmups.split(",")}
@@ -1262,89 +1252,112 @@ class ModelRunner:
             or getattr(self, "is_draft_worker", False)
             or getattr(self, "sampler", None) is None
             or get_exec().dllm.dllm_algorithm is not None
-            or not dev_str.startswith("cuda")
+            or not device_str.startswith("cuda")
             or not torch.cuda.is_available()
-            or not isinstance(vocab, int)
-            or vocab <= 0
+            or not isinstance(vocab_size, int)
+            or isinstance(vocab_size, bool)
+            or vocab_size <= 0
         ):
             return self.sampling_prewarm_result
 
-        tic, dev = time.perf_counter(), torch.device(self.device)
-        det = get_exec().deterministic.enable_deterministic_inference
+        start_time = time.perf_counter()
+        device = torch.device(self.device)
+        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
         try:
             from sglang.srt.layers.logsumexp import (
                 FUSED_TOPK_MAX_K,
                 row_logsumexp,
                 row_logsumexp_topk,
             )
-            from sglang.srt.sampling.penaltylib.repetition_penalty import (
-                apply_scaling_penalties,
-            )
+            from sglang.srt.sampling.penalties import apply_scaling_penalties
+            from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-            def _sample(
-                bs: int,
-                temp: float,
+            def _run_sampler(
+                batch_size: int,
+                temperature: float,
                 top_p: float = 1.0,
-                top_k: int = vocab,
+                top_k: int = vocab_size,
                 min_p: float = 0.0,
-                lp: bool = False,
+                return_logprob: bool = False,
             ) -> None:
-                g = temp == 0.0
-                info = SamplingBatchInfo(
+                is_greedy = temperature == 0.0
+                sampling_info = SamplingBatchInfo(
                     temperatures=torch.full(
-                        (bs, 1), temp, dtype=torch.float32, device=dev
+                        (batch_size, 1), temperature, dtype=torch.float32, device=device
                     ),
-                    top_ps=torch.full((bs,), top_p, dtype=torch.float32, device=dev),
-                    top_ks=torch.full((bs,), top_k, dtype=torch.int32, device=dev),
-                    min_ps=torch.full((bs,), min_p, dtype=torch.float32, device=dev),
-                    is_all_greedy=g,
-                    is_any_greedy=g,
-                    need_top_p_sampling=not g and top_p < 1.0,
-                    need_top_k_sampling=not g and top_k < vocab,
-                    need_min_p_sampling=not g and min_p > 0.0,
-                    vocab_size=vocab,
-                    sampling_seed=torch.zeros(bs, dtype=torch.int64, device=dev)
-                    if det
-                    else None,
+                    top_ps=torch.full(
+                        (batch_size,), top_p, dtype=torch.float32, device=device
+                    ),
+                    top_ks=torch.full(
+                        (batch_size,), top_k, dtype=torch.int32, device=device
+                    ),
+                    min_ps=torch.full(
+                        (batch_size,), min_p, dtype=torch.float32, device=device
+                    ),
+                    is_all_greedy=is_greedy,
+                    is_any_greedy=is_greedy,
+                    need_top_p_sampling=not is_greedy and top_p < 1.0,
+                    need_top_k_sampling=not is_greedy and top_k < vocab_size,
+                    need_min_p_sampling=not is_greedy and min_p > 0.0,
+                    vocab_size=vocab_size,
+                    sampling_seed=(
+                        torch.zeros(batch_size, dtype=torch.int64, device=device)
+                        if enable_deterministic
+                        else None
+                    ),
                     max_top_k=top_k,
-                    device=dev_str,
+                    device=device_str,
                 )
-                logits = torch.zeros((bs, vocab), dtype=torch.float32, device=dev)
-                pos = torch.zeros(bs, dtype=torch.int64, device=dev)
+                logits = torch.zeros(
+                    (batch_size, vocab_size), dtype=torch.float32, device=device
+                )
+                positions = torch.zeros(batch_size, dtype=torch.int64, device=device)
                 self.sampler(
                     LogitsProcessorOutput(next_token_logits=logits),
-                    info,
-                    lp,
-                    [min(5, vocab) if lp else 0] * bs,
-                    [None] * bs,
-                    pos,
+                    sampling_info,
+                    return_logprob,
+                    [min(5, vocab_size) if return_logprob else 0] * batch_size,
+                    [None] * batch_size,
+                    positions,
                 )
 
             with torch.no_grad(), envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False):
-                for bs in (1, 2):
-                    _sample(bs, 0.0, lp=True)
-                    _sample(bs, 0.6, 0.95, min(20, vocab), lp=True)
-                    _sample(bs, 0.7, 0.95, min(50, vocab), 0.05)
-                    apply_scaling_penalties(
-                        torch.zeros((bs, vocab), dtype=torch.float32, device=dev),
-                        torch.ones((bs, vocab), dtype=torch.float32, device=dev),
+                # Warm greedy, top-k/top-p, min-p, and scaling penalty kernels.
+                for batch_size in (1, 2):
+                    _run_sampler(batch_size, 0.0, return_logprob=True)
+                    _run_sampler(
+                        batch_size, 0.6, 0.95, min(20, vocab_size), return_logprob=True
                     )
-                dtypes = [torch.float32] + (
-                    [self.dtype]
-                    if getattr(self, "dtype", None) in (torch.bfloat16, torch.float16)
-                    else []
-                )
-                ks = [k for k in (1, 2, 5) if k <= min(FUSED_TOPK_MAX_K, vocab)]
-                for dt in dtypes:
-                    x = torch.zeros((2, vocab), dtype=dt, device=dev)
-                    row_logsumexp(x)
-                    for k in ks:
-                        row_logsumexp_topk(x, k)
+                    _run_sampler(batch_size, 0.7, 0.95, min(50, vocab_size), 0.05)
+                    apply_scaling_penalties(
+                        torch.zeros(
+                            (batch_size, vocab_size), dtype=torch.float32, device=device
+                        ),
+                        torch.ones(
+                            (batch_size, vocab_size), dtype=torch.float32, device=device
+                        ),
+                    )
 
-            torch.cuda.synchronize(dev)
+                # Warm fused logsumexp / top-k logprob Triton kernels.
+                dtypes = [torch.float32]
+                if getattr(self, "dtype", None) in (torch.bfloat16, torch.float16):
+                    dtypes.append(self.dtype)
+                top_ks = [
+                    k for k in (1, 2, 5) if k <= min(FUSED_TOPK_MAX_K, vocab_size)
+                ]
+                for dtype in dtypes:
+                    dummy_logits = torch.zeros(
+                        (2, vocab_size), dtype=dtype, device=device
+                    )
+                    row_logsumexp(dummy_logits)
+                    for k in top_ks:
+                        row_logsumexp_topk(dummy_logits, k)
+
+            torch.cuda.synchronize(device)
             if get_parallel().tp_rank == 0:
                 logger.info(
-                    "Prewarmed sampling kernels in %.2f s.", time.perf_counter() - tic
+                    "Prewarmed sampling kernels in %.2f s.",
+                    time.perf_counter() - start_time,
                 )
         except Exception:
             logger.warning(
@@ -1493,6 +1506,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            weight_cache_transport=get_model().weight_cache_transport,
             load_group=self.load_group,
         )
 
@@ -1604,11 +1618,7 @@ class ModelRunner:
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.model_config,
-            logger,
-        )
+        reserve_rope_cache_for_long_sequences(self.model, self.model_config)
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
@@ -2029,7 +2039,7 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(
+        step_span_ctx = forward_nvtx_range(
             build_step_span_name(
                 forward_batch,
                 is_draft_worker=self.is_draft_worker,
@@ -2074,6 +2084,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()
+        if (
+            not self.is_draft_worker
+            and (placement := getattr(self.model, "expert_placement", None)) is not None
+        ):
+            placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
@@ -2298,34 +2313,6 @@ class ModelRunner:
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-    def _preprocess_logits(
-        self,
-        logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
-        observer: Optional[SamplingObserver] = None,
-    ):
-        # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
-        #       was executed after we processed last batch's results.
-
-        # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
-        observer_state = None
-        if observer is not None:
-            observer_state = sampling_info.apply_logits_bias_with_observer(
-                logits_output.next_token_logits,
-                observer=observer,
-            )
-        else:
-            sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
-        # Release the vocab_mask GPU tensor immediately after it has been applied
-        # to the logits. In overlap scheduling, the sampling_info (and its
-        # grammar_mask) can be kept alive by the delay_sample_func closure and
-        # batch_record_buf until the next iteration, causing a steady VRAM leak
-        # when structured output (grammar) is used.
-        sampling_info.grammar_mask = None
-        return observer_state
-
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -2344,75 +2331,16 @@ class ModelRunner:
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
-        observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
-
-        watermark_state = self.watermark_state
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            logprob_logits = (
-                logits_output.next_token_logits.clone()
-                if forward_batch.return_logprob
+        next_token_ids = self.sampling_pipeline.sample(
+            logits_output,
+            forward_batch,
+            observer=self.sampling_observer,
+            graph_token_ids=(
+                self.uocr_greedy_graph.recorded_ids(logits_output, forward_batch)
+                if self.uocr_greedy_graph is not None
                 else None
-            )
-            req_pool_indices = forward_batch.req_pool_indices[
-                : logits_output.next_token_logits.shape[0]
-            ]
-            watermark_state.init_from_prompt(
-                req_pool_indices,
-                forward_batch.watermark_prompt_tail_ids,
-                forward_batch.watermark_context_hash_history,
-            )
-            watermark_state.force(
-                logits_output.next_token_logits,
-                req_pool_indices,
-                forward_batch.sampling_info,
-            )
-        else:
-            logprob_logits = None
-
-        # Sample the next tokens
-        next_token_ids = None
-        if self.uocr_greedy_graph is not None:
-            next_token_ids = self.uocr_greedy_graph.recorded_ids(
-                logits_output, forward_batch, watermark_state=watermark_state
-            )
-        if next_token_ids is None:
-            next_token_ids = self.sampler(
-                logits_output,
-                forward_batch.sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-                **(
-                    {"logprob_logits": logprob_logits}
-                    if logprob_logits is not None
-                    else {}
-                ),
-            )
-        if observer_state is not None:
-            logits_output.auxiliary_device_output = observer.after_sample(
-                observer_state,
-                next_token_ids,
-            )
+            ),
+        )
         if (c := self.canary_manager) is not None:
             c.on_sampled(
                 logits_output=logits_output,
@@ -2423,14 +2351,6 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            watermark_state.append(
-                req_pool_indices,
-                next_token_ids,
-            )
         return next_token_ids
 
     def compute_logprobs_only(
@@ -2450,19 +2370,7 @@ class ModelRunner:
             forward_batch: The forward batch that generates logits_output
         """
         logits_output.auxiliary_device_output = None
-        if not forward_batch.token_ids_logprobs:
-            return
-
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
-        # Delegate to sampler for logprob-only computation
-        # This populates logits_output with requested token probabilities
-        self.sampler.compute_logprobs_only(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-        )
+        self.sampling_pipeline.compute_logprobs_only(logits_output, forward_batch)
 
     def check_weights(
         self,

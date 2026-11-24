@@ -134,6 +134,9 @@ from sglang.srt.entrypoints.server_utils import (
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.entrypoints.uvicorn_worker_spawn import (
+    skip_main_reimport_in_spawned_workers,
+)
 from sglang.srt.entrypoints.warmup import (
     execute_warmups,
     sync_multi_worker_ready_barrier,
@@ -170,6 +173,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    ShutdownReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -190,6 +194,7 @@ from sglang.srt.managers.tokenizer_manager import (
     ServerStatus,
     TokenizerManager,
     get_tokenizer_worker_class,
+    wait_for_schedulers_to_exit,
 )
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
@@ -204,7 +209,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     delete_directory,
@@ -220,6 +225,7 @@ from sglang.srt.utils.json_response import (
     model_json_response,
     orjson_response,
 )
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -257,6 +263,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     Initialization function for multi-process tokenizer mode.
     It read args information from shm and inits tokenizer manager for current process.
     """
+    # Workers do not re-run the launcher module, which applies these filters.
+    suppress_noisy_warnings()
 
     # Read configuration from shared memory
     main_pid = get_main_process_id()
@@ -316,6 +324,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
+        _set_uvicorn_worker_stop_hook(_global_state.tokenizer_manager)
         worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
@@ -976,6 +985,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    # The streaming response holds `request` until the request finishes.
+    request.__dict__.pop("_json", None)
     return await serve_generate_request(obj, request)
 
 
@@ -988,11 +999,26 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            # A client may stop reading at a request's finishing event; a proxy
+            # that has not read [DONE] by then sees a cancelled stream. So a
+            # single request's last event, and an error event, go out in one
+            # write with [DONE]. A batch (several prompts, or n > 1) still
+            # writes [DONE] on its own. The tokenizer manager sets is_single
+            # when it normalizes obj, before the first output; one that
+            # normalizes a copy leaves it unset, which reads as a batch.
+            done_sent = False
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
+                    event = b"data: " + dumps_json(out) + b"\n\n"
+                    if (
+                        getattr(obj, "is_single", False)
+                        and out["meta_info"]["finish_reason"] is not None
+                    ):
+                        event += b"data: [DONE]\n\n"
+                        done_sent = True
+                    yield event
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -1010,8 +1036,10 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                     }
                 }
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + dumps_json(out) + b"\n\n"
-            yield b"data: [DONE]\n\n"
+                yield b"data: " + dumps_json(out) + b"\n\ndata: [DONE]\n\n"
+                done_sent = True
+            if not done_sent:
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
             stream_results(),
@@ -1754,18 +1782,18 @@ async def parse_function_call_request(
             chat_encoding_spec=chat.chat_encoding_spec,
             adapter=chat.encoding_adapter,
         )
+        if text_parser is None:
+            # 1) Initialize the parser based on the request body
+            parser = FunctionCallParser(
+                tools=obj.tools,
+                tool_call_parser=obj.tool_call_parser,
+                tokenizer=get_global_state().tokenizer_manager.tokenizer,
+            )
     except ValueError as error:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
     if text_parser is not None:
         normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
     else:
-        # 1) Initialize the parser based on the request body
-        parser = FunctionCallParser(
-            tools=obj.tools,
-            tool_call_parser=obj.tool_call_parser,
-            tokenizer=get_global_state().tokenizer_manager.tokenizer,
-        )
-
         # 2) Call the non-stream parsing method (non-stream)
         normal_text, calls = parser.parse_non_stream(obj.text)
 
@@ -2396,22 +2424,22 @@ def _execute_server_warmup(server_args: ServerArgs):
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
 
     ssl_verify = ssl_verify_of(server_args)
-    session = _local_requests_session()
 
     # Wait until the server is launched
     success = False
-    for _ in range(120):
-        time.sleep(1)
-        try:
-            res = session.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-            )
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            success = True
-            break
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = traceback.format_exc()
-            pass
+    with _local_requests_session() as session:
+        for _ in range(120):
+            time.sleep(1)
+            try:
+                res = session.get(
+                    url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+                )
+                assert res.status_code == 200, f"{res=}, {res.text=}"
+                success = True
+                break
+            except (AssertionError, requests.exceptions.RequestException):
+                last_traceback = traceback.format_exc()
+                pass
 
     if not success:
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
@@ -2524,13 +2552,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = session.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
+            with _local_requests_session() as session:
+                res = session.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
             assert res.status_code == 200, f"{res.text}"
 
         else:
@@ -2587,17 +2616,17 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    session = _local_requests_session()
-    try:
-        res = session.post(
-            server_args.url() + "/freeze_gc",
-            headers=freeze_headers,
-            timeout=10,
-            verify=ssl_verify_of(server_args),
-        )
-        res.raise_for_status()
-    except requests.exceptions.RequestException:
-        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+    with _local_requests_session() as session:
+        try:
+            res = session.post(
+                server_args.url() + "/freeze_gc",
+                headers=freeze_headers,
+                timeout=10,
+                verify=ssl_verify_of(server_args),
+            )
+            res.raise_for_status()
+        except requests.exceptions.RequestException:
+            logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
 def _wait_and_warmup(
@@ -2709,6 +2738,33 @@ def _run_uvicorn_workers(
     else:
         supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
     supervisor.run()
+
+
+def _set_uvicorn_worker_stop_hook(tokenizer_manager: TokenizerManager) -> None:
+    handler = signal.getsignal(signal.SIGTERM)
+    if inspect.ismethod(handler) and isinstance(handler.__self__, uvicorn.Server):
+        server = handler.__self__
+        tokenizer_manager.set_server_stop_hook(
+            lambda: setattr(server, "should_exit", True)
+        )
+    else:
+        logger.warning(
+            "SIGTERM handler %r is not a uvicorn.Server method; this tokenizer "
+            "worker will exit on SIGTERM without the lifespan shutdown.",
+            handler,
+        )
+
+
+def _shutdown_schedulers_after_http_workers(
+    *,
+    router: MultiTokenizerRouter,
+    subprocess_watchdog: Optional[SubprocessWatchdog],
+) -> None:
+    if subprocess_watchdog is not None:
+        subprocess_watchdog.stop()
+    router.dispatch_to_scheduler(ShutdownReq())
+    wait_for_schedulers_to_exit()
+    kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
 
 class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
@@ -3184,20 +3240,24 @@ def _setup_and_run_http_server(
                     "ssl_ca_certs": get_serving().ssl_ca_certs,
                     "ssl_keyfile_password": get_serving().ssl_keyfile_password,
                 }
-                if get_serving().enable_http_worker_reuseport:
-                    if reserved_socket is not None:
-                        reserved_socket.close()
-                    config = uvicorn.Config(app_path, **uvicorn_options)
-                    supervisor = _ReusePortMultiprocess(config)
-                    logger.info(
-                        f"Uvicorn running on {config.host}:{config.port} "
-                        f"with {config.workers} SO_REUSEPORT workers"
-                    )
-                    supervisor.run()
-                else:
-                    _run_uvicorn_workers(
-                        app_path, reserved_socket=reserved_socket, **uvicorn_options
-                    )
+                with skip_main_reimport_in_spawned_workers():
+                    if get_serving().enable_http_worker_reuseport:
+                        if reserved_socket is not None:
+                            reserved_socket.close()
+                        config = uvicorn.Config(app_path, **uvicorn_options)
+                        supervisor = _ReusePortMultiprocess(config)
+                        logger.info(
+                            f"Uvicorn running on {config.host}:{config.port} "
+                            f"with {config.workers} SO_REUSEPORT workers"
+                        )
+                        supervisor.run()
+                    else:
+                        _run_uvicorn_workers(
+                            app_path, reserved_socket=reserved_socket, **uvicorn_options
+                        )
+            _shutdown_schedulers_after_http_workers(
+                router=tokenizer_manager, subprocess_watchdog=subprocess_watchdog
+            )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

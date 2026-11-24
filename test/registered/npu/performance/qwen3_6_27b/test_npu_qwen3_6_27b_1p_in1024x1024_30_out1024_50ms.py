@@ -22,8 +22,6 @@ QWEN3_6_27B_1024_ENVS = {
     "SGLANG_NPU_PROFILING": "1",
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "300",
     "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
     "ASCEND_USE_FIA": "1",
 }
@@ -81,6 +79,9 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "300",
 ]
 
 
