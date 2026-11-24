@@ -220,6 +220,14 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             smem_thr_copy_Q,
             B_in_regs=self.query_in_regs,
         )
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_k.consumer_release(consumer_state)
 
         acc_S_qk = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
@@ -381,6 +389,14 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             smem_thr_copy_V,
             smem_thr_copy_P,
         )
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_v.consumer_release(consumer_state)
 
         cute.arch.barrier(
