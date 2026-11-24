@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan_Animate_2_14B_Config,
     Wan_Animate_2_14B_Distilled_Config,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.runtime.models import registry as model_registry
 
 
@@ -42,6 +43,21 @@ def _checkpoint_dir(
             json.dumps({**index, "_class_name": modular_class})
         )
     return str(ckpt)
+
+
+def test_metadata_lookups_do_not_discover_native_pipelines(monkeypatch):
+    def unexpected_discovery():
+        pytest.fail("Model-path and config lookups must not import native pipelines")
+
+    monkeypatch.setattr(
+        registry, "_discover_and_register_pipelines", unexpected_discovery
+    )
+    model = "Qwen/Qwen-Image"
+    assert registry.has_registered_diffusion_model_path(model)
+    assert not registry.has_registered_diffusion_model_path("unknown/unknown")
+    info = registry.get_model_info(model, backend="diffusers")
+    assert info.pipeline_cls.__name__ == "DiffusersPipeline"
+    assert info.sampling_param_cls is QwenImageSamplingParams
 
 
 @pytest.mark.parametrize("modular_class", [None, "SomeModularPipeline"])
