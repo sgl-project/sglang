@@ -127,7 +127,7 @@ This is why a stale baseline captured with fusion *not* initialized is incompati
 
 ### Workflow job
 
-The test is registered on the `nightly-8-gpu-h200` stage in `.github/workflows/nightly-test-nvidia.yml`, which runs through `_pr-test-stage.yml` like every other CUDA stage. The baseline env below is exported on every scheduled stage; only this test reads it.
+The test is registered on the `nightly-8-gpu-h200` stage in `.github/workflows/nightly-test-nvidia.yml`, which runs through `_pr-test-stage.yml` like every other CUDA stage. The baseline env below is exported on every scheduled stage; only this test reads it. The write token goes only to the scheduled `8-gpu-h200` stage, which builds its Rust modules and router from source rather than restoring them from a cache a PR run could have written.
 
 Key CI configuration:
 
@@ -135,13 +135,14 @@ Key CI configuration:
 - name: Export precision baseline env
   if: inputs.scheduled
   env:
-    BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+    BASELINE_HF_TOKEN: ${{ env.PRECISION_STORE_STAGE == 'true' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
   run: |
     {
       echo "SGLANG_PRECISION_BASELINE_DIR=/tmp/sglang_precision_baselines"
       echo "SGLANG_PRECISION_HF_REPO=${{ vars.SGLANG_PRECISION_HF_REPO }}"
       echo "SGLANG_PRECISION_HF_REVISION=${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}"
       echo "SGLANG_PRECISION_COMMIT=${{ github.sha }}"
+      echo "SGLANG_PRECISION_FORCE_UPDATE=${{ fromJson(inputs.caller_inputs).force_baseline_update && '1' || '0' }}"
       echo "SGLANG_PRECISION_HF_TOKEN=${BASELINE_HF_TOKEN}"
     } >> "$GITHUB_ENV"
 ```

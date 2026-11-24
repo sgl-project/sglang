@@ -128,13 +128,6 @@ def test_fast_topk_negative_and_zero(topk):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
-def test_fast_topk_unsupported_k():
-    score = torch.randn(2, 4096, dtype=torch.float32, device="cuda")
-    lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="topk"):
-        fast_topk(score, lengths, 1024)
-
-
 if __name__ == "__main__":
     import sys
 

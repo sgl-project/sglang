@@ -112,6 +112,7 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
 - **QAT checkpoints**: Toggle **Checkpoint → QAT** in the selector to target the `qat-q4_0-unquantized` releases. These keep bf16 weights, so memory and TP requirements match the standard checkpoints, and each has a matching `*-qat-q4_0-unquantized-assistant` draft model for MTP.
+- **Text only**: `--language-model-only` skips the vision and audio towers. SGLang does not build or load their weights, which frees memory for the KV cache, and rejects image, video and audio requests. The Rust server (`SGLANG_RUST_SERVER=1`) has no Gemma 4 multimodal pipeline, so it serves Gemma 4 only in this mode.
 - Hardware requirements:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
