@@ -6,7 +6,7 @@ import os
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -120,11 +120,59 @@ class MooncakeStoreConfig:
     tenant_id: str = DEFAULT_TENANT_ID
     # TCP and other staged GPU transports need space for in-flight transfers.
     local_buffer_size: int = DEFAULT_LOCAL_BUFFER_SIZE
+    # Dummy clients only: explicit bool overrides the legacy Mooncake env flag.
+    # None preserves MC_CUDA_IPC_PERSISTENT_REGISTRATION=1 (default: disabled)
+    # and the setup_dummy call signature used by older Mooncake wheels.
+    cuda_ipc_persistent_registration: Optional[bool] = None
 
     def __post_init__(self):
         self.local_buffer_size = int(self.local_buffer_size)
         if self.local_buffer_size < 0:
             raise ValueError("local_buffer_size must be non-negative")
+        if self.cuda_ipc_persistent_registration is not None and not isinstance(
+            self.cuda_ipc_persistent_registration, bool
+        ):
+            raise ValueError(
+                "cuda_ipc_persistent_registration must be a boolean or null"
+            )
+
+    @property
+    def cuda_ipc_persistent_registration_enabled(self) -> bool:
+        if self.cuda_ipc_persistent_registration is not None:
+            return self.cuda_ipc_persistent_registration
+        return os.getenv("MC_CUDA_IPC_PERSISTENT_REGISTRATION") == "1"
+
+    @staticmethod
+    def load(extra_config: Optional[dict] = None) -> "MooncakeStoreConfig":
+        """Resolve one config for setup and any pre-setup compatibility checks."""
+        if extra_config and (
+            extra_config.get("master_server_address") is not None
+            or extra_config.get("client_server_address") is not None
+        ):
+            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+            source = "extra_config"
+        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            config = MooncakeStoreConfig.from_file()
+            source = "file"
+        else:
+            config = MooncakeStoreConfig.load_from_env()
+            source = "env"
+        # Linker extra_config may contain only this option while connection
+        # settings come from a config file or environment. Keep the existing
+        # precedence for all other fields and validate this override normally.
+        if (
+            source != "extra_config"
+            and extra_config
+            and "cuda_ipc_persistent_registration" in extra_config
+        ):
+            config = replace(
+                config,
+                cuda_ipc_persistent_registration=extra_config[
+                    "cuda_ipc_persistent_registration"
+                ],
+            )
+        logger.info("Mooncake Configuration loaded from %s successfully.", source)
+        return config
 
     @staticmethod
     def _resolve_local_hostname(overrides: Optional[dict] = None) -> str:
@@ -206,6 +254,9 @@ class MooncakeStoreConfig:
             ),
             local_buffer_size=config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
+            cuda_ipc_persistent_registration=config.get(
+                "cuda_ipc_persistent_registration"
             ),
         )
 
@@ -292,6 +343,9 @@ class MooncakeStoreConfig:
             local_buffer_size=extra_config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
+            cuda_ipc_persistent_registration=extra_config.get(
+                "cuda_ipc_persistent_registration"
+            ),
         )
 
 
@@ -341,23 +395,7 @@ class MooncakeBaseStore:
         extra_config = (
             getattr(storage_config, "extra_config", None) if storage_config else None
         )
-
-        if extra_config and (
-            extra_config.get("master_server_address") is not None
-            or extra_config.get("client_server_address") is not None
-        ):
-            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-            logger.info("Mooncake Configuration loaded from extra_config successfully.")
-
-        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            config = MooncakeStoreConfig.from_file()
-            logger.info("Mooncake Configuration loaded from file successfully.")
-
-        else:
-            config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
-
-        return config
+        return MooncakeStoreConfig.load(extra_config)
 
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
@@ -515,7 +553,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+        *,
+        mooncake_config: Optional[MooncakeStoreConfig] = None,
     ):
         MooncakeBaseStore.__init__(self)
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
@@ -529,7 +571,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         try:
             self.store = MooncakeDistributedStore()
 
-            self.config = self._load_config(storage_config)
+            self.config = (
+                mooncake_config
+                if mooncake_config is not None
+                else self._load_config(storage_config)
+            )
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
@@ -604,18 +650,38 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     device_name = ""
             if self.config.standalone_storage:
-                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
+                # Direct linkers register their device buffers after setup and
+                # do not allocate a host KV pool in the SGLang process.
+                if mem_pool is not None and not isinstance(
+                    mem_pool.allocator, MooncakeHostTensorAllocator
+                ):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
                         "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
-                ret_code = self.store.setup_dummy(
-                    required_bytes,
-                    self.config.local_buffer_size,
-                    self.config.client_server_address,
-                )
+                setup_dummy_kwargs = {}
+                if self.config.cuda_ipc_persistent_registration is not None:
+                    setup_dummy_kwargs["cuda_ipc_persistent_registration"] = (
+                        self.config.cuda_ipc_persistent_registration
+                    )
+                try:
+                    ret_code = self.store.setup_dummy(
+                        required_bytes,
+                        self.config.local_buffer_size,
+                        self.config.client_server_address,
+                        **setup_dummy_kwargs,
+                    )
+                except TypeError as e:
+                    if not setup_dummy_kwargs:
+                        raise
+                    raise RuntimeError(
+                        "The installed Mooncake version does not support "
+                        "cuda_ipc_persistent_registration in "
+                        "MooncakeDistributedStore.setup_dummy(). Please upgrade "
+                        "Mooncake to configure persistent CUDA IPC registration."
+                    ) from e
             else:
                 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
                     MooncakeTransferEngine,

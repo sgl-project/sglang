@@ -1,6 +1,7 @@
+import os
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,6 +20,173 @@ def _fake_mooncake_modules(fake_store_cls):
 
 
 class TestMooncakeStandaloneDummyMamba(CustomTestCase):
+    @staticmethod
+    def _linker_config(local_buffer_size, **extra_config):
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+
+        return HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test",
+            extra_config={
+                "standalone_storage": True,
+                "client_server_address": "127.0.0.1:50052",
+                "local_buffer_size": local_buffer_size,
+                **extra_config,
+            },
+        )
+
+    def test_setup_dummy_without_host_pool(self):
+        """The GPU direct linker initializes storage before registering its pools."""
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        for local_buffer_size in (16 << 20, 64 << 20, 0):
+            with self.subTest(local_buffer_size=local_buffer_size):
+                backend = Mock()
+                backend.setup_dummy.return_value = 0
+                with (
+                    patch.object(
+                        MooncakeStore,
+                        "_import_mooncake_store",
+                        return_value=lambda: backend,
+                    ),
+                    patch.object(
+                        MooncakeStore,
+                        "_import_mooncake_group_semantics",
+                        return_value=(None, False),
+                    ),
+                    patch.object(MooncakeStore, "warmup"),
+                ):
+                    storage = MooncakeStore(
+                        self._linker_config(local_buffer_size), mem_pool=None
+                    )
+
+                self.assertIs(storage.store, backend)
+                backend.setup_dummy.assert_called_once_with(
+                    0, local_buffer_size, "127.0.0.1:50052"
+                )
+                backend.setup.assert_not_called()
+
+    def test_explicit_persistent_registration_is_forwarded_without_env_changes(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        for enabled, env_value in ((False, "1"), (True, "0")):
+            with self.subTest(enabled=enabled):
+                backend = Mock()
+                backend.setup_dummy.return_value = 0
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"MC_CUDA_IPC_PERSISTENT_REGISTRATION": env_value},
+                    ),
+                    patch.object(
+                        MooncakeStore,
+                        "_import_mooncake_store",
+                        return_value=lambda: backend,
+                    ),
+                    patch.object(
+                        MooncakeStore,
+                        "_import_mooncake_group_semantics",
+                        return_value=(None, False),
+                    ),
+                    patch.object(MooncakeStore, "warmup"),
+                ):
+                    MooncakeStore(
+                        self._linker_config(
+                            16 << 20, cuda_ipc_persistent_registration=enabled
+                        ),
+                        mem_pool=None,
+                    )
+                    self.assertEqual(
+                        os.environ["MC_CUDA_IPC_PERSISTENT_REGISTRATION"], env_value
+                    )
+                backend.setup_dummy.assert_called_once_with(
+                    0,
+                    16 << 20,
+                    "127.0.0.1:50052",
+                    cuda_ipc_persistent_registration=enabled,
+                )
+
+    def test_legacy_backend_requires_upgrade_for_explicit_configuration(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+            MooncakeStoreConfig,
+        )
+
+        class LegacyStore:
+            def setup_dummy(self, required_bytes, local_buffer_bytes, addr):
+                return 0
+
+        for enabled in (None, False, True):
+            with self.subTest(enabled=enabled):
+                storage_config = self._linker_config(
+                    16 << 20, cuda_ipc_persistent_registration=enabled
+                )
+                resolved_config = MooncakeStoreConfig.load(storage_config.extra_config)
+                with (
+                    patch.object(
+                        MooncakeStore,
+                        "_import_mooncake_store",
+                        return_value=LegacyStore,
+                    ),
+                    patch.object(
+                        MooncakeStore,
+                        "_import_mooncake_group_semantics",
+                        return_value=(None, False),
+                    ),
+                    patch.object(MooncakeStore, "warmup"),
+                    patch.object(
+                        MooncakeStore,
+                        "_load_config",
+                        side_effect=AssertionError("config must not be loaded twice"),
+                    ),
+                ):
+                    if enabled is None:
+                        MooncakeStore(storage_config, mooncake_config=resolved_config)
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "Please upgrade Mooncake"
+                        ):
+                            MooncakeStore(
+                                storage_config, mooncake_config=resolved_config
+                            )
+
+    def test_standalone_host_pool_still_requires_mooncake_allocator(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        backend = Mock()
+        with (
+            patch.object(
+                MooncakeStore, "_import_mooncake_store", return_value=lambda: backend
+            ),
+            patch.object(
+                MooncakeStore,
+                "_import_mooncake_group_semantics",
+                return_value=(None, False),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "requires MooncakeHostTensorAllocator"
+            ),
+        ):
+            MooncakeStore(
+                self._linker_config(16 << 20),
+                mem_pool=types.SimpleNamespace(allocator=object()),
+            )
+        backend.setup_dummy.assert_not_called()
+
     def test_setup_dummy_includes_hybrid_buffers(self):
         """Standalone(dummy) must size shared mapping for KV + Mamba buffers."""
         import torch
