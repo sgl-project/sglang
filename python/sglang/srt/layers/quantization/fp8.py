@@ -441,6 +441,18 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUBlockFp8MoEMethod(self)
 
+            if (
+                _is_xpu
+                and not self.is_checkpoint_fp8_serialized
+                and not self.use_mxfp8
+                and not self.is_fp4_experts
+            ):
+                from sglang.srt.hardware_backend.xpu.quantization.fp8_online_moe import (
+                    XPUOnlineFp8MoEMethod,
+                )
+
+                return XPUOnlineFp8MoEMethod(self)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
@@ -2908,6 +2920,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
+    def process_weights_after_loading_online_quant(self, layer: Module) -> None:
+        # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
+        w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+        w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+
+        # Re-initialize w13_scale because we directly quantize
+        # merged w13 weights and generate a single scaling factor.
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                layer.num_local_experts,
+                dtype=torch.float32,
+                device=w13_weight.device,
+            ),
+            requires_grad=False,
+        )
+        for expert in range(layer.num_local_experts):
+            w13_weight[expert, :, :], layer.w13_weight_scale[expert] = scaled_fp8_quant(
+                layer.w13_weight.data[expert, :, :]
+            )
+            w2_weight[expert, :, :], layer.w2_weight_scale[expert] = scaled_fp8_quant(
+                layer.w2_weight.data[expert, :, :]
+            )
+        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+
+        if _is_hip:
+            self.process_weights_hip_scale_padding(layer)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -2918,32 +2958,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
-            # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
-            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
-            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
-
-            # Re-initialize w13_scale because we directly quantize
-            # merged w13 weights and generate a single scaling factor.
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_local_experts,
-                    dtype=torch.float32,
-                    device=w13_weight.device,
-                ),
-                requires_grad=False,
-            )
-            for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-
-            if _is_hip:
-                self.process_weights_hip_scale_padding(layer)
+            self.process_weights_after_loading_online_quant(layer)
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
