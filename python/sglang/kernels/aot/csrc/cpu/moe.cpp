@@ -853,16 +853,16 @@ static inline void check_moe_scales(
   }
 }
 
-#define CHECK_MOE_SCALES_FP8(DIM0, DIM1)    \
-  auto w1s = w1_scale.value();              \
-  auto w2s = w2_scale.value();              \
-  auto block_size_val = block_size.value(); \
-  int64_t block_size_N = block_size_val[0]; \
-  int64_t block_size_K = block_size_val[1];
-// TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
-// TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
-// TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
-// TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
+#define CHECK_MOE_SCALES_FP8(DIM0, DIM1)                      \
+  auto w1s = w1_scale.value();                                \
+  auto w2s = w2_scale.value();                                \
+  auto block_size_val = block_size.value();                   \
+  int64_t block_size_N = block_size_val[0];                   \
+  int64_t block_size_K = block_size_val[1];                   \
+  TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
+  TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
+  TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
+  TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
 
 // hidden_states: [M, K]
 // w1: [E, 2N, K] or [E, 2N, K / 2] for uint8
@@ -902,8 +902,6 @@ at::Tensor fused_experts_cpu(
     TORCH_CHECK(
         !w1_bias.has_value() && !w2_bias.has_value() && !w1_zero.has_value() && !w2_zero.has_value(),
         "FP8_W8A8_FULL does not support biases or zero points.");
-    CHECK_INPUT(hidden_states);
-    CHECK_INPUT(w1);
     CHECK_INPUT(topk_weights);
     CHECK_INPUT(topk_ids);
     CHECK_DIM(5, w1);
@@ -945,8 +943,8 @@ at::Tensor fused_experts_cpu(
   // returns int64 topk_ids; fused_experts_cpu requires int32. Remove the typecast after topk kernel is provided
   auto topk_ids_ = topk_ids.scalar_type() == at::kInt ? topk_ids : topk_ids.to(at::kInt);
 
-  // CHECK_INPUT(hidden_states);
-  // CHECK_INPUT(w1);
+  CHECK_INPUT(hidden_states);
+  CHECK_INPUT(w1);
   CHECK_INPUT(w2);
   CHECK_EQ(topk_weights.sizes(), topk_ids_.sizes());
   CHECK_DIM(2, hidden_states);
@@ -957,7 +955,10 @@ at::Tensor fused_experts_cpu(
     CHECK_DIM(4, w1);
     CHECK_DIM(4, w2);
   } else {
-    // CHECK_DIM(3, w1);  // xeon-dev: may be 4D for FP8_W8A8 prepack
+    // may be 4D for FP8_W8A8 prepack
+    if (moe_comp_method != CPUQuantMethod::FP8_W8A8) {
+      CHECK_DIM(3, w1);
+    }
     CHECK_DIM(3, w2);
   }
   CHECK_DIM(2, topk_weights);
@@ -1156,6 +1157,7 @@ at::Tensor fused_experts_cpu(
           topk,
           num_tokens_post_pad);
     } else if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
+      // here we just ignore C_tmp as it is not used
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
@@ -1250,7 +1252,10 @@ at::Tensor fused_experts_cpu(
       at::Float8_e4m3fn* __restrict__ Aq_tmp =
           full_w8a8 ? (at::Float8_e4m3fn*)(Ukernel_tmp + num_threads * 2 * BLOCK_M * BLOCK_N) : nullptr;
       float* __restrict__ As_tmp = full_w8a8 ? (float*)(Aq_tmp + M * topk * N) : nullptr;
-      CHECK_MOE_SCALES_FP8(1, 2);
+      auto w1s = w1_scale.value();
+      auto w2s = w2_scale.value();
+      const int64_t block_size_N = block_size.value()[0];
+      const int64_t block_size_K = block_size.value()[1];
       fused_experts_fp8_a8_kernel_impl(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
@@ -1477,7 +1482,7 @@ at::Tensor shared_expert_cpu(
 
   // check weight shapes
   CHECK_EQ(w2.size(0), K);
-  // CHECK_EQ(packed_w1.size(1), packed_K);
+  CHECK_EQ(packed_w1.size(1), packed_K);
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
