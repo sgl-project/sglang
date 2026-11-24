@@ -1,11 +1,12 @@
 name: Nightly Test (NPU)
 on:
-  # TEMP(PR 52431 verification): allow PR-triggered runs so the reduced job set
+  # TEMP(nightly rerun): allow PR-triggered runs so the reduced job set
   # below can be validated without waiting for the nightly schedule.
   pull_request:
     branches:
       - main
     paths:
+      - '.github/workflows/nightly-test-npu.yml'
       - 'test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py'
       - 'test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1080p_30_out256_50ms.py'
   schedule:
@@ -196,8 +197,8 @@ jobs:
   # The nightly-test-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring extra-b-test-4-npu-a3 in the PR pipeline.
   nightly-test-4-npu-a3:
     name: nightly-test-4-npu-a3
-    if: false  # TEMP(PR 52431 verification): only jobs covering the two changed cases run
-    needs: [set-image-config, sgl-router-build-aarch64]
+    # TEMP(nightly rerun): rerun only the shard that failed in run 45212673268.
+    needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       ref: ${{ inputs.ref || '' }}
@@ -206,11 +207,15 @@ jobs:
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '5400'
-      partitions: '{"size":2,"arr":[0,1]}'
+      partitions: '{"size":1,"arr":[0]}'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
-      sgl_router: true
-      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
+      # TEMP(nightly rerun): the retained case does not use sgl-router, so the
+      # router build dependency is dropped for this targeted rerun.
+      sgl_router: false
+      # TEMP(nightly rerun): only the file that failed in run 45212673268.
+      only_tests: |
+        test/registered/npu/basic_function/dp_attn/test_npu_dp_attention.py
     secrets: inherit
 
   nightly-test-8-npu-a3:
@@ -261,7 +266,7 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      # TEMP(PR 52431 verification): run only the case whose mem-fraction-static changed.
+      # TEMP(nightly rerun): only the file that failed in run 45212673268 (exit 137 / OOM).
       only_tests: |
         test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1080p_30_out256_50ms.py
 
@@ -335,13 +340,14 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      # TEMP(PR 52431 verification): run only the case whose graph bs / HCCL_BUFFSIZE changed.
+      # TEMP(nightly rerun): only the file that failed in run 45212673268 (host-mem OOM in pin_memory).
       only_tests: |
         test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
 
   nightly-acc-test-4-npu-a5:
      name: nightly-acc-test-4-npu-a5
-     if: false  # TEMP(PR 52431 verification): only jobs covering changed cases run
+     # TEMP(nightly rerun): excluded - fails on the markov_sample softcap shim, which is not part of this branch.
+     if: false
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
