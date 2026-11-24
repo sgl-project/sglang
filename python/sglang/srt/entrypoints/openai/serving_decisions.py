@@ -21,15 +21,16 @@ from sglang.srt.entrypoints.openai.protocol import (
     DecisionResponse,
     DecisionScoreQuestion,
     DecisionText,
-    UsageInfo,
+    PromptTokensDetails,
     is_blank_decision_text,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -399,6 +400,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         adapted_request: Iterator[EncodedQuestion],
         raw_request: Request,
         temperature: float = 1.0,
+        cache_salt: Optional[str] = None,
     ):
         """Encode every question, then score them all in one call."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
@@ -410,6 +412,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
             temperature=temperature,
             return_token_logprobs=True,
             image_data=image_data if any(image_data) else None,
+            cache_salt=cache_salt,
         )
         return prompts, label_token_ids, result
 
@@ -423,6 +426,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
             adapted_request=adapted_request,
             raw_request=raw_request,
             temperature=request.temperature,
+            cache_salt=request.cache_salt,
         )
         answers = {}
         for i, question in enumerate(request.questions):
@@ -440,9 +444,16 @@ class OpenAIServingDecisions(OpenAIServingBase):
             model=request.model,
             prompt_format_version=PROMPT_FORMAT_VERSION,
             answers=answers,
-            usage=UsageInfo(
+            usage=UsageProcessor.calculate_token_usage(
                 prompt_tokens=result.prompt_tokens,
-                total_tokens=result.prompt_tokens,
+                # The route samples nothing: every answer is read from the
+                # logprobs at the answer position.
+                completion_tokens=0,
+                cached_tokens=(
+                    PromptTokensDetails(cached_tokens=result.cached_tokens)
+                    if get_serving().enable_cache_report
+                    else None
+                ),
             ),
         )
         return ORJSONResponse(content=response.model_dump(exclude_none=True))
