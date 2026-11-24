@@ -304,8 +304,8 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
     <tr>
       <td>`--min-free-slots-delay`</td>
       <td>Holds fresh prefill admissions until at least N running-request slots free up, so they are admitted as one
-      batch instead of one at a time. Per-DP-rank local: a rank with free slots does not wait for a congested peer.
-      Useful when a single admission is disproportionately expensive, as with speculative decoding plus a separate
+      batch instead of one at a time. Waiting requests that already fit in the free slots are not held.
+      Per-DP-rank local: a rank with free slots does not wait for a congested peer. Useful when a single admission is disproportionately expensive, as with speculative decoding plus a separate
       draft prefill pass.</td>
       <td><strong>Range.</strong> Up: fewer, larger admissions and fewer prefill/decode interleaves, at later TTFT for
       the held requests. Down to `1`, which disables it. Capped by `--max-running-requests`,
