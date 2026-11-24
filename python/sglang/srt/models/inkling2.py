@@ -14,6 +14,8 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.quantization.inkling2_quark import Inkling2QuarkLayout
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -46,6 +48,7 @@ from sglang.srt.models.inkling_common.inkling2_moe import (
     Inkling2MoE,
     RoutedOutput,
 )
+from sglang.srt.models.inkling_common.inkling2_moe_quark import Inkling2QuarkExperts
 from sglang.srt.models.inkling_common.inkling2_norm import RMSNorm
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
@@ -440,6 +443,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
+        if isinstance(quant_config, QuarkConfig):
+            quant_config = Inkling2QuarkLayout.from_quark_config(
+                quant_config, config.text_config
+            )
         if quant_config is not None and not isinstance(
             quant_config, Inkling2QuantConfig
         ):
@@ -618,7 +625,9 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 continue
             if self.llm is None and not name.startswith("visual."):
                 continue
-            if self.quant_config is not None:
+            if isinstance(self.quant_config, Inkling2QuarkLayout):
+                weight = self.quant_config.checkpoint_tensor(checkpoint_name, weight)
+            elif self.quant_config is not None:
                 expected_dtype = self.quant_config.tensor_dtypes[checkpoint_name]
                 if weight.dtype != expected_dtype:
                     raise ValueError(
@@ -677,6 +686,8 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 module.prepare_mxfp8_cutlass_scales()
                 module.prepare_mega_moe()
                 module.prepare_routed_exchange()
+            elif isinstance(module, Inkling2QuarkExperts):
+                module.finalize_load()
             elif isinstance(module, Inkling2LogitsProcessor):
                 module.warm_logits_gather(
                     self.llm.lm_head.weight.shape[0], self.llm.lm_head.weight.device
@@ -685,6 +696,7 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 module.scale_queries()
             elif isinstance(module, Inkling2CausalLLM):
                 module.prepare_loop()
+        Inkling2QuarkExperts.log_load_summary(self)
 
 
 class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):

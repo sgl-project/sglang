@@ -167,5 +167,14 @@ def test_generic_quark_config_converts_to_the_layout(variant):
     assert (layout.attention_fp8 is not None) is has_fp8_attention(variant)
 
 
+def test_online_requantization_is_refused(monkeypatch):
+    online = QuarkConfig(
+        quant_config={**quantization_config("MXFP4-RTN"), "packed_modules_mapping": {}},
+        is_prequantized=False,
+    )
+    with pytest.raises(ValueError, match="online requantization"):
+        _model_gate(monkeypatch, online)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

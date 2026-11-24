@@ -6,6 +6,7 @@ import torch
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.test.inkling2_quark_kernel_test_utils import synth_mxfp4, synth_uint4
 from sglang.test.inkling2_test_utils import precision_group
 
 VARIANTS = ("UINT4-AWQ", "MXFP4-RTN", "UINT4-AWQ-AttnFP8", "MXFP4-AttnFP8")
@@ -163,6 +164,32 @@ def quantization_config(variant: str) -> dict:
         softmax_quant_spec=None,
         version="0.14+5b5dba3",
     )
+
+
+def expert_checkpoint_tensors(
+    expert_format: str,
+    *,
+    experts: int,
+    hidden: int,
+    intermediate: int,
+    layer: int = 0,
+    seed: int = 0,
+    scale_dtype=torch.bfloat16,
+) -> dict[str, torch.Tensor]:
+    """The routed experts of one layer: synthetic packed tensors with the names, shapes
+    and dtypes of an export."""
+    prefix = f"model.llm.layers.{layer}.mlp.experts."
+    shapes = {"w13": (2 * intermediate, hidden), "w2": (hidden, intermediate)}
+    tensors = {}
+    for i, (name, (n, k)) in enumerate(shapes.items()):
+        if expert_format == "mxfp4":
+            data = synth_mxfp4(experts, n, k, seed=seed + i)
+        else:
+            data = synth_uint4(experts, n, k, seed=seed + i, scale_dtype=scale_dtype)
+        for field, value in data.items():
+            if field != "expected":
+                tensors[f"{prefix}{name}_{field}"] = value
+    return tensors
 
 
 def native_quant_dict(compute="bfloat16", names=("x",)) -> dict:

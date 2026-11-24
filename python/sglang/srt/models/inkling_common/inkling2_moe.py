@@ -64,6 +64,7 @@ from sglang.kernels.ops.quantization.inkling2_mxfp8_scales_sm120 import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.quantization.inkling2_quark import Inkling2QuarkLayout
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
@@ -1267,7 +1268,15 @@ class Inkling2MoE(nn.Module):
             raise ValueError("Inkling2 experts support tensor or expert parallelism")
         self.gate = Inkling2Gate(config)
         checkpoint_prefix = "model." + prefix + ".experts."
-        self.experts = Inkling2Experts(
+        experts_class = Inkling2Experts
+        if isinstance(quant_config, Inkling2QuarkLayout):
+            # imported here: inkling2_moe_quark imports this module
+            from sglang.srt.models.inkling_common.inkling2_moe_quark import (
+                Inkling2QuarkExperts,
+            )
+
+            experts_class = Inkling2QuarkExperts
+        self.experts = experts_class(
             config, config.n_routed_experts, checkpoint_prefix, quant_config
         )
 
