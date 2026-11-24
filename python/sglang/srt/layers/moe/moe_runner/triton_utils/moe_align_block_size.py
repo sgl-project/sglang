@@ -30,6 +30,7 @@ _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
 # The default CUDA kernel scans its buckets with one block of 1024 threads; the JIT
 # kernel handles up to 8192 buckets.
 _CUDA_DEFAULT_MAX_BUCKETS = 1024
+MOE_ALIGN_MAX_BUCKETS = 8192
 
 
 def moe_align_block_size(

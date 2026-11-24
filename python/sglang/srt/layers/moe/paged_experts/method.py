@@ -368,6 +368,9 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def _fuse_host_copy(self, layer, residency) -> None:
         """Put the extra arguments of the layer's MoE kernel launches on its runner config, so that
         the kernels page experts in themselves in this layer's device-planned steps."""
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            MOE_ALIGN_MAX_BUCKETS,
+        )
         from sglang.srt.layers.moe.paged_experts.runners import MARLIN, TRITON
 
         if self.tiered:
@@ -376,6 +379,12 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             )
         if self.contract not in (TRITON, MARLIN):
             raise _FusedHostCopyUnsupported("MoE runners other than triton and Marlin")
+        # The MoE align kernel needs a bucket per slot id, per host id (K + expert) and a sentinel.
+        if self.num_resident + self.num_experts + 1 > MOE_ALIGN_MAX_BUCKETS:
+            raise _FusedHostCopyUnsupported(
+                f"{self.num_experts} experts with {self.num_resident} slots (the MoE align "
+                f"kernel sorts at most {MOE_ALIGN_MAX_BUCKETS} ids)"
+            )
         if get_exec().graph.enable_torch_compile:
             raise _FusedHostCopyUnsupported("--enable-torch-compile")
         if self.contract is TRITON:
