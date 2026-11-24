@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_de
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import setup_allocator_context
+from sglang.test.unified_allocator_fixtures import largest_take, setup_allocator_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -76,13 +76,22 @@ class TestStateUsage(unittest.TestCase):
         self.assertIsNotNone(held)
         # Fill the token sub-pool until it holds bytes a free state id maps to:
         # then that id is free but no take can place it.
-        while allocator.state_slots_available() >= state.available_size():
+        while (
+            largest_take(allocator, allocator.sub_pool_roles()[2])
+            >= state.available_size()
+        ):
             if allocator.alloc(allocator.page_size) is None:
                 break
-        self.assertLess(allocator.state_slots_available(), state.available_size())
+        self.assertLess(
+            largest_take(allocator, allocator.sub_pool_roles()[2]),
+            state.available_size(),
+        )
 
         usage = self._state_usage(storage)
-        self.assertEqual(usage.available, allocator.state_slots_available())
+        # The reported availability is an estimate that bounds every take.
+        self.assertGreaterEqual(
+            usage.available, largest_take(allocator, allocator.sub_pool_roles()[2])
+        )
         # Every slot is held or available: none appears used by nobody.
         self.assertEqual(usage.capacity - usage.available, 2)
 
@@ -95,7 +104,8 @@ class TestStateUsage(unittest.TestCase):
 
         storage = _build()
         allocator = storage.allocator
-        while allocator.state_slots_available():
+        state_name = allocator.sub_pool_roles()[2]
+        while allocator.estimated_units_available(state_name):
             if allocator.alloc(allocator.page_size) is None:
                 break
         usage = self._state_usage(storage)

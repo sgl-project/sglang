@@ -3,10 +3,10 @@
 
 Condition anchor row recipe:
 
-- ``video_vae.encode_images(PIL, use_fp16_latent=True)`` under a
-  scoped seed-42 RNG fork — the DiagonalGaussian is SAMPLED
-  (use_mean=False) with seed 42, so the seed is part of
-  the contract, not a convenience
+- ``video_vae.encode_images(PIL, use_fp16_latent=True)``; the DiagonalGaussian
+  is SAMPLED (use_mean=False). Video recipes sample under a scoped seed-42 RNG
+  fork, so the seed is part of the contract, not a convenience; image releases
+  pass their per-request ``generator`` instead (see ``image_noise.py``)
 - normalize ``(z - latents_mean) / latents_std`` with the loader-injected
   ``MiniMaxH3VideoVAEArchConfig`` values
 - patchify [1, 2, 2] into packed cond rows, fp32
@@ -121,12 +121,28 @@ def minimax_h3_encode_keyframe_cond_rows(
     video_vae: Any,
     image: Any,
     arch_config: MiniMaxH3VideoVAEArchConfig,
+    *,
+    crop_to_even: bool = False,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Encode a target-canvas PIL image into packed imgvid cond rows.
 
-    Returns [n_rows, 24 * patch_h * patch_w] fp32 on CPU. The rows are cached
+    ``crop_to_even`` (image releases, original geometry) drops a trailing odd
+    latent row/column so the grid patchifies [1, 2, 2]. ``generator`` draws the
+    posterior sample; without one the video recipe samples under a scoped RNG
+    fork seeded with ``MINIMAX_H3_KEYFRAME_ENCODE_SEED``.
+    Returns [n_rows, 24 * patch_h * patch_w] fp32 on CPU. Seeded rows are cached
     per image: the fixed encode seed makes them a function of the image alone.
+    Rows drawn from a request ``generator`` are never cached.
     """
+    if generator is not None:
+        return _encode_keyframe_cond_rows(
+            video_vae,
+            image,
+            arch_config,
+            crop_to_even=crop_to_even,
+            generator=generator,
+        )
     world = get_replica_group().world_size if model_parallel_is_initialized() else 1
     return cached_vae_call(
         video_vae,
@@ -137,8 +153,11 @@ def minimax_h3_encode_keyframe_cond_rows(
             arch_config.latent_channels,
             tuple(arch_config.latents_mean),
             tuple(arch_config.latents_std),
+            crop_to_even,
         ),
-        lambda: _encode_keyframe_cond_rows(video_vae, image, arch_config),
+        lambda: _encode_keyframe_cond_rows(
+            video_vae, image, arch_config, crop_to_even=crop_to_even
+        ),
         # Parallel tiling all-gathers inside every replica rank's encode;
         # otherwise only rank 0 encodes and broadcasts the rows.
         group=get_replica_group() if world > 1 and video_vae.parallel_tiling else None,
@@ -149,8 +168,10 @@ def _encode_keyframe_cond_rows(
     video_vae: Any,
     image: Any,
     arch_config: MiniMaxH3VideoVAEArchConfig,
+    *,
+    crop_to_even: bool = False,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    seed = MINIMAX_H3_KEYFRAME_ENCODE_SEED
     # The encode recipe runs on fp32 weights. Normal H3 residency already keeps
     # the shared video VAE in fp32; retain the scoped cast for standalone use.
     parameter = next(video_vae.parameters())
@@ -158,8 +179,14 @@ def _encode_keyframe_cond_rows(
     if prev_dtype != torch.float32:
         video_vae.to(torch.float32)
     try:
-        with minimax_h3_scoped_encode_rng(seed, parameter.device):
-            z = video_vae.encode_images(image, use_fp16_latent=True)[0]
+        if generator is not None:
+            z = video_vae.encode_images(
+                image, use_fp16_latent=True, generator=generator
+            )[0]
+        else:
+            seed = MINIMAX_H3_KEYFRAME_ENCODE_SEED
+            with minimax_h3_scoped_encode_rng(seed, parameter.device):
+                z = video_vae.encode_images(image, use_fp16_latent=True)[0]
     finally:
         if prev_dtype != torch.float32:
             video_vae.to(prev_dtype)
@@ -169,6 +196,8 @@ def _encode_keyframe_cond_rows(
     latent_channels = arch_config.latent_channels
     if z.dim() != 5 or int(z.shape[1]) != latent_channels:
         raise ValueError(f"unexpected imgvid latent shape {list(z.shape)}")
+    if crop_to_even:
+        z = z[..., : z.shape[-2] // 2 * 2, : z.shape[-1] // 2 * 2]
     mean, std = _cached_latent_mean_std(
         tuple(arch_config.latents_mean),
         tuple(arch_config.latents_std),

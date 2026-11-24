@@ -1,15 +1,20 @@
 <div align="center"  style="display:block; margin:auto;">
-<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../../assets/sglang-diffusion/logo-dark.svg">
+  <img src="../../../assets/sglang-diffusion/logo.svg" alt="SGLang Diffusion" width="80%">
+</picture>
 </div>
 
-**SGLang diffusion is an inference framework for accelerated image/video generation.**
+**SGLang Diffusion is an inference framework for accelerated image, video, audio, and action generation.**
 
-SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+SGLang Diffusion features an end-to-end unified pipeline for accelerating diffusion models and action policies. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+
+For robot action generation, see the [VLA cookbook](https://docs.sglang.io/cookbook/vla/intro) and [action API](https://docs.sglang.io/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension). Model-specific recipes define the supported observations, action layouts, and serving interfaces.
 
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan, FastWan, FLUX, Qwen-Image / Qwen-Image 2.1 / Qwen-Image 2.1 Turbo, LongCat-Image, Z-Image, Anima, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, FastH3, VDN-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
+  - Broad model support: Wan, FastWan, FLUX, Qwen-Image / Qwen-Image 2.1 / Qwen-Image 2.1 Turbo, LongCat-Image, Z-Image, Anima, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3 / [H3-Image](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3-Image), FastH3, VDN-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
   - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
   - Ease of use: OpenAI-compatible api, CLI, python sdk, and a [ComfyUI plugin](apps/ComfyUI_SGLDiffusion/README.md)
   - [Conditioning reuse](https://docs.sglang.io/docs/sglang-diffusion/caching-acceleration#conditioning-cache): bounded CPU caching for repeated text/image inputs and VAE posteriors, with `--disable-conditioning-cache` to opt out
@@ -23,7 +28,7 @@ SGLang Diffusion has the following features:
 
 ### AMD/ROCm Support
 
-SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD Instinct GPUs, the default attention backend is AITER (`aiter`), and with `SGLANG_USE_AITER=1` (set in the ROCm images) AITER kernels are also used for layernorm and other operations. `--attention-backend torch_sdpa` is also available; use it on Strix Halo / gfx1151, where AITER is not supported. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ### Moore Threads/MUSA Support
 
@@ -110,6 +115,14 @@ sglang generate \
 ```
 
 For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
+
+## SGLang-Diffusion Adoption & Integrations
+
+<p align="center">
+  <img src="../../../assets/sglang-diffusion/adoption.png" alt="SGLang-Diffusion adopters and integrations: Ant Group, Baseten, Black Forest Labs, Boson AI, fal, Google, Infinigence, Krea, Modal, MOSS, Skywork, Sol-Engine, Tencent Hunyuan, and TikTok" width="800">
+</p>
+
+[fal](https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/) ported SGLang-Diffusion's H3 implementation to its Falcon inference engine.
 
 ## Contributing
 
