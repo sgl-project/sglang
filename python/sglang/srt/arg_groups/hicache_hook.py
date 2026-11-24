@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -148,16 +149,8 @@ def handle_hicache_ratio_default(server_args: Any):
 
 
 def _gpu_shares_host_memory(server_args: Any) -> bool:
-    """True on an integrated GPU (GB10 / DGX Spark) whose device memory is host
-    memory. A Grace-coupled discrete GPU (GH200, GB200) reports False."""
     cfg = resolving_view(server_args)
-    if cfg.device not in (None, "cuda"):
-        return False
-    import torch
-
-    if not torch.cuda.is_available():
-        return False
-    return bool(torch.cuda.get_device_properties(0).is_integrated)
+    return cfg.device in (None, "cuda") and get_platform().is_integrated_gpu
 
 
 def resolve_hicache_host_memory_mode(server_args: Any):

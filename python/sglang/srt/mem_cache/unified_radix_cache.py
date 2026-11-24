@@ -618,6 +618,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 further_window_components=further_windows,
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
+            staging_tokens = self.host_pool_group.anchor_entry.host_pool.logical_size
+            context_len = get_model().context_length or 0
+            if staging_tokens < context_len:
+                logger.warning(
+                    "HiCache buffer_only staging buffer holds %d tokens, fewer "
+                    "than the %d-token context: storage hits longer than the "
+                    "buffer are recomputed. Raise --hicache-size to load them.",
+                    staging_tokens,
+                    context_len,
+                )
             self.buffer_pipeline = self.component_of(TREE_TOKEN).create_buffer_pipeline(
                 max_context_len=get_model().context_length or 0,
                 swa_component=swa,

@@ -2976,10 +2976,7 @@ class TestHiCacheArgs(CustomTestCase):
         ]
         for integrated, overrides, expected, expected_size in cases:
             with self.subTest(integrated=integrated, overrides=overrides):
-                with patch(
-                    "sglang.srt.arg_groups.hicache_hook._gpu_shares_host_memory",
-                    return_value=integrated,
-                ):
+                with override_platform(is_integrated_gpu=integrated):
                     args = self._make_args(enable_hierarchical_cache=True, **overrides)
                 self.assertEqual(
                     resolution_result(args, "hicache_host_memory_mode"), expected
