@@ -238,7 +238,7 @@ class PenaltyStatusPool:
         histories = list(self.pending_init.values())
         self.pending_init.clear()
         indices_device = async_h2d(indices, dtype=torch.int64, device=self.device)
-        tables.counts[indices_device] = 0
+        tables.counts.index_fill_(0, indices_device, 0)
         tables.lens[indices_device] = async_h2d(
             [len(h) for h in histories], dtype=torch.int32, device=self.device
         )
