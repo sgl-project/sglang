@@ -252,7 +252,6 @@ class Magi2MultiHeadMoE(nn.Module):
         self.hidden_size = hidden_size
         self.head_dim = hidden_size // num_heads
         self.local_num_heads = num_heads // self.ep_size
-        self.head_start = self.ep_rank * self.local_num_heads
 
         self.router = Magi2MultiHeadRouter(
             num_heads=self.local_num_heads,

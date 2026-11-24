@@ -46,7 +46,9 @@ def _build_expert_parallel_group(server_args: ServerArgs):
     if ep_size <= 1:
         return None
 
-    rank = dist.get_rank()
+    # Rank within the DIT group, not the global rank: the subgroups below are
+    # built over DIT-group ranks.
+    rank = dist.get_rank(group=get_dit_group())
     my_group = None
     # new_group is collective: all ranks enter every group, keep the one they are in.
     for start in range(0, world_size, ep_size):

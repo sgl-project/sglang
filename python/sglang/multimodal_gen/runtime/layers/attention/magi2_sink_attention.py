@@ -46,6 +46,7 @@ class Magi2SinkAttention(nn.Module):
             else None
         )
         self._impl = None
+        self._impl_dtype: torch.dtype | None = None
 
     def _local_sinks(self) -> torch.Tensor | None:
         """``_usp_input_all_to_all_packed_qkv`` gives rank *r* heads ``[r * h_local, (r + 1) * h_local)``."""
@@ -66,7 +67,10 @@ class Magi2SinkAttention(nn.Module):
         return sinks[start : start + h_local]
 
     def _ensure_impl(self, dtype: torch.dtype) -> None:
-        if self._impl is not None:
+        # The impl holds a dtype-cast copy of the sinks, so a dtype change has to
+        # rebuild it; reusing the old one would feed the kernel logits of the
+        # wrong width.
+        if self._impl is not None and self._impl_dtype == dtype:
             return
         backend = get_attn_backend(
             self.head_dim,
@@ -97,6 +101,7 @@ class Magi2SinkAttention(nn.Module):
             sinks=None if sinks is None else sinks.to(dtype).contiguous(),
             window_size=self.window_size,
         )
+        self._impl_dtype = dtype
 
     def forward(
         self,

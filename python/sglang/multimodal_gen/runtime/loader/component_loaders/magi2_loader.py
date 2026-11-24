@@ -634,12 +634,17 @@ def _isolate_cjk_characters(tokenizer) -> None:
     from tokenizers import Regex, pre_tokenizers
 
     backend = tokenizer.backend_tokenizer
+    if getattr(backend, "_magi2_cjk_isolated", False):
+        return
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
             pre_tokenizers.Split(pattern=Regex(_CJK_PATTERN), behavior="isolated"),
             backend.pre_tokenizer,
         ]
     )
+    # Loaders may run once per process, but a reload would otherwise wrap the
+    # already-wrapped sequence and split each character twice.
+    backend._magi2_cjk_isolated = True
 
 
 def load_magi2_text_encoder(

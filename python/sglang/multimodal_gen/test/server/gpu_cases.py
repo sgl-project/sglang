@@ -978,7 +978,8 @@ MAGI2_FOUR_GPU_H100_CASES = [
                 # ep_size has no CLI flag; the file also skips loading the refiner.
                 "--pipeline-config-path",
                 str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_preview_only.json"),
-                "--warmup-resolutions 896x512",
+                "--warmup-resolutions",
+                "896x512",
                 "--enable-torch-compile",
                 "false",
             ],
