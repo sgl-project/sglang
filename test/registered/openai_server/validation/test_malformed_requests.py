@@ -583,9 +583,6 @@ KNOWN_FAILURES: dict[tuple[str, str, str], str] = {
     (COMPLETIONS, "stop_regex", "unbalanced_paren"): "#40985",
     (CHAT, "stop_regex", "unbalanced_paren"): "#40985",
     (GENERATE, "sampling_params.stop_regex", "unbalanced_paren"): "#40985",
-    (COMPLETIONS, "rid", "list_for_single_prompt"): "#50709",
-    (CHAT, "rid", "list_for_single_prompt"): "#50709",
-    (GENERATE, "rid", "list_for_single_prompt"): "#50709",
     # set_json_schema calls .get on a non-object response_format.
     **{
         (CHAT, "response_format", f"type_{kind}"): "#36011"
