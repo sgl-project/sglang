@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.argparse_actions import NoneChoiceAction
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -797,6 +798,17 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+    cuda_graph_persistence: A[
+        Optional[Literal["save", "load"]],
+        Arg(
+            help="Persist the CUDA graphs across restarts with Foundry (optional dependency sglang[foundry]). 'save' captures as usual and writes the graphs and the memory layout they reference to an archive; 'load' rebuilds the graphs from that archive instead of capturing. SAVE and LOAD must use the same model, flags and GPUs. Decode graphs use the full backend; prefill graphs are 'full' or 'disabled' (default disabled).",
+            choices=["save", "load"],
+        ),
+    ] = None
+    cuda_graph_persistence_config: A[
+        Optional[str],
+        "Foundry TOML for --cuda-graph-persistence (workspace_root, base_addr, region_size, scratch_space_size, ...). Its 'mode' key is ignored: the flag's mode wins. Defaults: archive in ./foundry_archive.",
+    ] = None
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen and paused during capture, which speeds it up and keeps a collection from invalidating the graph.",
@@ -1082,7 +1094,8 @@ class ExecMoe(msgspec.Struct):
         Literal[None, "mooncake", "nixl"],
         Arg(
             help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            action=NoneChoiceAction,
+            action_kwargs={"choices": ["none", "mooncake", "nixl"]},
         ),
     ] = None
     enable_elastic_expert_backup: A[
