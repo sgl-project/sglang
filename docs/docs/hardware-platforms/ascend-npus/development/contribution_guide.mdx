@@ -140,7 +140,7 @@ Then your PR can be merged.
 ## How to Trigger CI Tests
 
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
-Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
+Users with write access to the repository have every CI permission. Other users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json); maintainers prune entries whose user has had no commit on `main` for 90 days.
 
 **PR authors** can always use `/rerun-failed-ci` on their own PRs, even if they are not listed in `CI_PERMISSIONS.json`.
 
