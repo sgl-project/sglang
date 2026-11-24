@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.environ import envs
 from sglang.srt.utils.device import is_hip
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ def maybe_pre_warm_aiter_chip_info() -> None:
     AITER chip info probes can shell out to rocminfo. During graph capture the
     GPU context is locked, so pre-caching CU_NUM/GPU_ARCHS avoids a hang.
     """
-    if not (get_bool_env_var("SGLANG_USE_AITER") and is_hip()):
+    if not (envs.SGLANG_USE_AITER.get() and is_hip()):
         return
 
     global _aiter_chip_info_cached
