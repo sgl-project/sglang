@@ -165,6 +165,21 @@ An operator exposed from here registers into its logical group with
 `KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<hardware>.<model>.<mod>:<fn>")`;
 `test_kernels_namespace.py` enforces the pairing. See `plugin_kernels/README.md`.
 
+## TLX kernel backend
+
+`KernelBackend.TLX` records kernels written in TLX, the Triton extension of
+[facebookexperimental/triton](https://github.com/facebookexperimental/triton)
+(`tlx.ops`). They run on fbtriton, or on stock Triton with the uTLX plugin
+([triton-ext](https://github.com/triton-lang/triton-ext)) plus the runtime
+helpers in `jit/utils/tlx_runtime.py`. Register a TLX kernel, and an SGLang
+wrapper whose work runs in TLX kernels, with `backend=KernelBackend.TLX`, not
+`TRITON`: a TLX implementation of a contract then sits beside the Triton one
+under the same op (as `gemm.unpool_gemm_norm_residual` does) instead of taking
+the op's `TRITON` slot. The TLX backend is not in `DEFAULT_PRIORITY`, because
+whether fbtriton or uTLX is installed is not a capability; callers opt in.
+`test_kernels_namespace.py` checks that every spec whose target is a TLX
+kernel is registered as `TLX`.
+
 ## How it works
 
 Each `ops.<group>` function is a thin wrapper that forwards to a chosen
@@ -206,7 +221,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
-    `forward_helion` / `forward_kda` / `forward_cake` / `forward_plugin` /
+    `forward_helion` / `forward_tlx` / `forward_kda` / `forward_cake` / `forward_plugin` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared

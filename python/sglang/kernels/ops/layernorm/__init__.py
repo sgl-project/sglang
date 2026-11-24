@@ -132,15 +132,24 @@ for _op, _target, _backends in (
         )
 del _op, _target, _backends, _bk
 
-# Vendored tlx.ops.norm_residual_norm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
-register_kernel(
-    KernelSpec(
-        op="layernorm.tlx_norm_residual_norm",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.layernorm.tlx:norm_residual_norm",
-        capabilities=frozenset({CapabilityRequirement.HIP}),
+# gfx950 TLX kernels (vendored tlx.ops.norm_residual_norm and rmsnorm); they need
+# triton.language.extra.tlx from fbtriton or the uTLX plugin.
+for _op, _target in (
+    (
+        "layernorm.tlx_norm_residual_norm",
+        "sglang.kernels.ops.layernorm.tlx:norm_residual_norm",
+    ),
+    ("layernorm.tlx_rmsnorm", "sglang.kernels.tlx_ops.kernels.norm.gfx950:rmsnorm"),
+):
+    register_kernel(
+        KernelSpec(
+            op=_op,
+            backend=KernelBackend.TLX,
+            target=_target,
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
     )
-)
+del _op, _target
 
 register_kernel(
     KernelSpec(

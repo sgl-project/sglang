@@ -345,7 +345,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="moe.tlx_moe",
-        backend=KernelBackend.TRITON,
+        backend=KernelBackend.TLX,
         target="sglang.kernels.tlx_ops.kernels.moe.gfx950:moe",
         capabilities=_HIP,
     )

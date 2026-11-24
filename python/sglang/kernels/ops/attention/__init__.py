@@ -473,6 +473,16 @@ for _bk in ("torch", "triton", "helion"):
         )
     )
 del _bk
+# gfx950 TLX kernel (vendored tlx.ops.qk_norm_rope_kv_cache); it needs
+# triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="attention.tlx_qk_norm_rope_kv_cache",
+        backend=KernelBackend.TLX,
+        target="sglang.kernels.tlx_ops.kernels.fused.qk_norm_rope_kv_cache.gfx950:qk_norm_rope_kv_cache",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 for _mod, _fn in [
     ("mla_qk_prep", "concat_and_cast_q_fp8_pad"),
     ("mla_qk_prep", "absorbed_bmm_concat_cast_q_fp8"),
