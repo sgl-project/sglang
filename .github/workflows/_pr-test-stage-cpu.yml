@@ -87,9 +87,6 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-        with:
-          # v5 cannot restore without saving, so no cache for pull_request_target runs.
-          enable-cache: ${{ github.event_name == 'pull_request_target' && 'false' || 'auto' }}
 
       # This stage compiled the workspace too - 7+ minutes per partition on
       # billable hosted minutes. rust-ext-build's modules need an older glibc than

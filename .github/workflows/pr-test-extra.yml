@@ -93,12 +93,9 @@ jobs:
   # opts in on `run-ci-nv-extra`. Without it the gate passes with
   # opted-in=false and every test job skips, so the run is green and
   # consumes no runner.
-  #
-  # Reads the live labels and head approval from the API: labels added with GITHUB_TOKEN
-  # fire no labeled event, so a rerun after /run-extra-ci must see them.
+  # Live labels and approval from the API: a rerun after /run-extra-ci must see them.
   call-gate:
     if: github.event_name != 'schedule'
-    # statuses: read (top-level permissions) lets it read the head's approval.
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-label: run-ci-nv-extra
