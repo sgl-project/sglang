@@ -1057,11 +1057,6 @@ class Envs:
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
-    # MXFP4 trtllm-gen MoE: deferred-finalize calls above 32 rows pass the finalized
-    # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
-    SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # MXFP4 trtllm-gen MoE on SM100 / SM103: calls with <= 256 tokens run the JIT
     # routing + persistent FC1 / FC2 kernels (kernels/ops/moe/mxfp4_decode_moe.py) on
     # every layer whose shape, activation (SiTU, or SwiGLU with a limit) and MXFP8
@@ -2767,7 +2762,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE": _DeprecatedEnv(
+        note="MXFP4 deferred calls above 32 rows always pass the finalized shape now; "
+        "unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():

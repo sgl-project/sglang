@@ -10,7 +10,6 @@ from torch.nn.parameter import Parameter
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.layers.utils.common import set_weight_attrs
@@ -486,10 +485,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         defer_finalize = is_deferred_finalize_enabled()
         # FlashInfer keys its tactic cache on the output shape. At <= 32 rows the tuned
         # tactic measured slower on real routing, so those keep the (M, 0) key.
-        if envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.get():
-            deferred_output_shape = num_tokens > 32
-        else:
-            deferred_output_shape = 96 < num_tokens <= 384
+        deferred_output_shape = num_tokens > 32
         use_cuda_decode_moe = (
             layer.use_cuda_mxfp4_decode_moe
             and not bypassed
