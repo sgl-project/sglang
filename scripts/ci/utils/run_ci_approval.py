@@ -22,9 +22,6 @@ APPROVAL_CONTEXT = "ci/run-ci-approved"
 APPROVAL_CREATOR = "github-actions[bot]"
 APPROVAL_LABEL = "run-ci"
 APPROVER_REPO_PERMISSIONS = ("write", "maintain", "admin")
-# An approver from CI_PERMISSIONS.json without write access needs a commit on the
-# default branch within this many days (update_ci_permission.py prunes by the same rule).
-APPROVER_ACTIVITY_DAYS = 90
 # The callers of pr-gate.yml with `approval-mode: commit`.
 APPROVAL_WORKFLOWS = (
     ".github/workflows/pr-test.yml",
@@ -114,12 +111,10 @@ def skipped_at_gate(run):
     return any(job_skipped_tests(job) for job in run.jobs())
 
 
-def can_approve(gh_repo, user_login, user_perms):
+def can_approve(gh_repo, user_login):
     """
-    The one rule for who may approve a commit for CI. Returns (ok, reason).
-
-    Write access approves; `can_tag_run_ci_label` in CI_PERMISSIONS.json approves only
-    with a commit on the default branch within APPROVER_ACTIVITY_DAYS.
+    The one rule for who may approve a commit for CI: write, maintain, or admin
+    access to the repository. Returns (ok, reason).
     """
     try:
         permission = gh_repo.get_collaborator_permission(user_login)
@@ -129,26 +124,7 @@ def can_approve(gh_repo, user_login, user_perms):
         permission = None
     if permission in APPROVER_REPO_PERMISSIONS:
         return True, ""
-    if not (user_perms or {}).get("can_tag_run_ci_label", False):
-        return False, (
-            f"{user_login} has neither write access nor can_tag_run_ci_label "
-            f"in {PERMISSIONS_FILE_PATH}"
-        )
-    since = time.strftime(
-        "%Y-%m-%d", time.gmtime(time.time() - APPROVER_ACTIVITY_DAYS * 86400)
-    )
-    _, commits = gh_repo.requester.requestJsonAndCheck(
-        "GET",
-        f"/repos/{gh_repo.full_name}/commits",
-        parameters={"author": user_login, "since": f"{since}T00:00:00Z", "per_page": 1},
-    )
-    if commits:
-        return True, ""
-    return False, (
-        f"{user_login} has can_tag_run_ci_label in {PERMISSIONS_FILE_PATH} but "
-        f"no commit on {gh_repo.full_name}'s default branch since {since} (an "
-        f"approver without write access needs one within {APPROVER_ACTIVITY_DAYS} days)"
-    )
+    return False, f"{user_login} has no write access to {gh_repo.full_name}"
 
 
 def head_seen_by(gh_repo, pr, sha, seen_at):
@@ -300,7 +276,7 @@ def main():
     head_sha = os.environ["HEAD_SHA"]
     sender = os.environ["SENDER_LOGIN"]
 
-    ok, reason = can_approve(gh_repo, sender, load_permissions(sender))
+    ok, reason = can_approve(gh_repo, sender)
     if not ok:
         print(
             f"::warning::{sender} added run-ci but may not approve CI: {reason}. "

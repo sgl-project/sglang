@@ -7,7 +7,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -360,12 +360,12 @@ def handle_tag_run_ci(
     tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
     the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
     their own label, so `run-ci` is always added alongside. The commenter
-    must pass run_ci_approval.can_approve, for every tier.
+    needs `can_tag_run_ci_label` or write access.
 
-    Adding `run-ci` here also approves the PR's head commit for the workflows
-    that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), as
-    adding the label in the UI does, but only a head the commenter could have
-    seen: one pushed before the comment was posted.
+    A commenter with write access (run_ci_approval.can_approve) also approves
+    the PR's head commit for the workflows that gate on a per-commit approval
+    (pr-test.yml, pr-test-extra.yml), as adding the label in the UI does, but
+    only a head they could have seen: one pushed before the comment was posted.
 
     Labels added here start no run (GITHUB_TOKEN label events trigger no
     workflow); the callers re-run the gated runs.
@@ -373,17 +373,18 @@ def handle_tag_run_ci(
     Returns True if action was taken, False otherwise.
     """
     user_login = comment.user.login
-    allowed, reason = can_approve(gh_repo, user_login, user_perms)
-    if not allowed:
-        print(f"Permission denied: {reason}.")
+    approver, _ = can_approve(gh_repo, user_login)
+    if not (approver or user_perms.get("can_tag_run_ci_label", False)):
+        print("Permission denied: no write access and no can_tag_run_ci_label.")
         pr.create_issue_comment(
-            f"`run-ci` was not added and no commit was approved for CI: {reason}."
+            f"`run-ci` was not added: {user_login} has neither write access nor "
+            "`can_tag_run_ci_label` in `.github/CI_PERMISSIONS.json`."
         )
         comment.create_reaction("confused")
         return False
 
     head_sha = pr.head.sha
-    if not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
+    if approver and not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
         print(f"Not approving {head_sha}: pushed after the comment, or no run yet.")
         pr.create_issue_comment(
             f"`run-ci` was not added and no commit was approved for CI: the head "
@@ -397,7 +398,14 @@ def handle_tag_run_ci(
     print(f"Permission granted. Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
-    record_approval(gh_repo, head_sha, user_login)
+    if approver:
+        record_approval(gh_repo, head_sha, user_login)
+    else:
+        pr.create_issue_comment(
+            "`run-ci` was added, but NVIDIA PR Test Base and Extra run only for a "
+            "commit approved by a maintainer with write access (`/tag-and-rerun-ci`, "
+            "or remove and re-add `run-ci`)."
+        )
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -2061,7 +2069,7 @@ def main():
 
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires run_ci_approval.can_approve.
+    # Note: /tag-run-ci-label still requires can_tag_run_ci_label or write access.
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
