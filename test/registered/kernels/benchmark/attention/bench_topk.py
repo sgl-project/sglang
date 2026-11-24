@@ -16,6 +16,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
+register_cuda_ci(
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
+)
 
 # Compressed page size used by the DSA indexer (real value is 256 // 4 = 64).
 PAGE_SIZE = 64
@@ -112,7 +115,7 @@ if not DISABLE_TORCH:
 @marker.parametrize("k", [512, 1024, 2048], [512])
 @marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
 @marker.parametrize("batch_size", [2**x for x in range(13)], [1, 128, 1024])
-@marker.benchmark("provider", PRROVIDERS)
+@marker.benchmark("provider", PRROVIDERS, gate=["jit_v1", "jit_v2"])
 def benchmark_paged(
     seq_len: int, batch_size: int, k: int, page_size: int, provider: str
 ):
@@ -131,7 +134,7 @@ def benchmark_paged(
 @marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
 # NOTE: prefill workload should be heavier than decode; not common for short extend
 @marker.parametrize("batch_size", [2**x for x in range(7, 14)], [128, 1024])
-@marker.benchmark("provider", PRROVIDERS)
+@marker.benchmark("provider", PRROVIDERS, gate=["jit_v1", "jit_v2"])
 def benchmark_ragged(seq_len: int, batch_size: int, k: int, provider: str):
     seed = seq_len ^ (batch_size << 16) ^ (k << 32)
     torch.random.manual_seed(seed)
@@ -215,7 +218,7 @@ def _make_packed_inputs(num_rows: int, mean_window: int, shape: str):
 @marker.parametrize("num_rows", [1024, 4096, 8192], [1024])
 @marker.parametrize("mean_window", [4096, 32768, 131072, 409600], [32768])
 @marker.parametrize("shape", ["mix3", "single"], ["mix3"])
-@marker.benchmark("provider", PACKED_PROVIDERS)
+@marker.benchmark("provider", PACKED_PROVIDERS, gate=["jit_v2"])
 def benchmark_packed(num_rows: int, mean_window: int, shape: str, provider: str):
     import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel
 

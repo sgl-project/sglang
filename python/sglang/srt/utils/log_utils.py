@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import logging.config
 import os
 import re
 import socket
@@ -269,7 +270,6 @@ def configure_logger(server_args, prefix: str = ""):
 
 @functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
-    # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg)
 
 
