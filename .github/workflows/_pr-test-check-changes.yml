@@ -54,7 +54,7 @@ on:
 # workflow_call boundary, so the check-maintenance bypass for runs on main has
 # to be declared here as well.
 env:
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
   detect:
