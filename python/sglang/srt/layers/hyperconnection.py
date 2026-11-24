@@ -13,8 +13,10 @@ from sglang.srt.layers.hc_mix_flydsl import (
     weight_cache_key,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.device import is_musa
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 
 @lru_cache(None)
@@ -63,8 +65,10 @@ class GroupedGemmaRMSNorm(nn.Module):
             return grouped_gemma_rmsnorm(
                 x, self.weight, self.group_size, self.variance_epsilon
             )
+        # torchada reports is_cuda=True for MUSA tensors, but this JIT is CUDA-only.
         if (
-            self._jit_group_size is not None
+            not _is_musa
+            and self._jit_group_size is not None
             and x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
@@ -204,7 +208,8 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
             if (
-                self.hc_count == 4
+                not _is_musa
+                and self.hc_count == 4
                 and self.hidden_size == 2560
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
@@ -255,8 +260,12 @@ class GatedResidual(HyperConnectionBase):
         # Disable torch.compile on NPU; NPU graph capture remains unchanged.
         # TODO: Re-enable after both fresh-cache and cached-restart tests pass
         # on NPU with compatible dependencies.
-        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
-        self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
+        # MUSA uses eager PyTorch: CUDA compatibility flags do not imply that
+        # the CUDA JIT or Inductor compilation backend is available.
+        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu or _is_musa)
+        self._combine_compute = torch.compile(
+            _combine_compute, disable=_is_npu or _is_musa
+        )
 
     def _flydsl_mix_ok(self) -> bool:
         if self._mix_flydsl_ok is None:
@@ -300,7 +309,8 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         elif (
-            self._jit_mix_ok
+            not _is_musa
+            and self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
@@ -333,7 +343,7 @@ class GatedResidual(HyperConnectionBase):
             mixed_input = hc_mix(hyper_input_normed, *self._mix_flydsl_weights).to(
                 self.params_dtype
             )
-        elif fused_hc_mix_supported(
+        elif not _is_musa and fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
@@ -439,7 +449,8 @@ class GatedResidual(HyperConnectionBase):
             ).to(self.params_dtype)
 
         if (
-            self._jit_combine_ok
+            not _is_musa
+            and self._jit_combine_ok
             and block_output.is_cuda
             and block_output.dtype in (torch.bfloat16, torch.float16)
             and hyper_input.dtype == block_output.dtype

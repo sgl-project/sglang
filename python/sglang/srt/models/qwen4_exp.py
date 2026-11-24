@@ -109,9 +109,11 @@ from sglang.srt.runtime_context import (
     linear_attn_parallel_group,
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, logger
+from sglang.srt.utils.device import is_musa
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if _is_npu:
@@ -606,8 +608,10 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # torchada reports is_cuda=True for MUSA tensors, but this JIT is CUDA-only.
         if (
             not _is_npu
+            and not _is_musa
             and x.is_cuda
             and self._jit_group_size is not None
             and x.dtype in (torch.bfloat16, torch.float16)
