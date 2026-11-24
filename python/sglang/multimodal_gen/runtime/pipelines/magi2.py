@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.magi2 import Magi2PipelineConfig
@@ -89,6 +91,20 @@ class Magi2Pipeline(ComposedPipelineBase):
 
         if loaded_modules:
             return dict(loaded_modules)
+
+        # initialize_pipeline runs after load_modules, so the base class has not yet
+        # resolved the HF model ID to a local snapshot path. Resolve it here so the
+        # loader can open the safetensors shards by file path.
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_model,
+        )
+
+        if not os.path.isdir(self.model_path):
+            self.model_path = maybe_download_model(
+                self.model_path,
+                revision=server_args.revision,
+            )
+            logger.info("[magi2] resolved model path: %s", self.model_path)
 
         # Not in initialize_pipeline: that hook runs after load_modules, but the MoE
         # takes its process group at construction time.

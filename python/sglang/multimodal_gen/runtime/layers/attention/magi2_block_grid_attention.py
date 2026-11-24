@@ -167,6 +167,15 @@ def build_mask_mod(*, grid: Magi2BlockGrid, device: torch.device):
 
 
 @functools.lru_cache(maxsize=4)
+def cached_block_scan_order(
+    *, grid: Magi2BlockGrid, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The scan order is a pure function of the grid, but every refiner step
+    rebuilt its two full-sequence index tensors."""
+    return block_scan_order(grid=grid, device=device)
+
+
+@functools.lru_cache(maxsize=4)
 def cached_ffa_ranges(
     *, grid: Magi2BlockGrid, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:

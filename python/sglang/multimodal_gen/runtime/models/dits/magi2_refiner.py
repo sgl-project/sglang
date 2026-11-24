@@ -17,7 +17,7 @@ from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.attention.magi2_block_grid_attention import (
     SEQ_BUCKET,
     Magi2BlockGrid,
-    block_scan_order,
+    cached_block_scan_order,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -101,7 +101,7 @@ class Magi2RefinerDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # Block-scan order is required by the mask, raster again after
         # (refiner_data_proxy.py:889-891, :921).
-        order, restore = block_scan_order(
+        order, restore = cached_block_scan_order(
             grid=Magi2BlockGrid.from_arch_config(
                 arch_config=self.config,
                 latent_thw=layout.video_latent_thw,

@@ -639,6 +639,8 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=used,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                window_size=tuple(self.window_size),
+                sinks=self.sinks,
                 ver=fa_ver,
                 out=output[None, :used],
             )
