@@ -133,6 +133,7 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         self._apply_xpu_compile_config()
         register_xpu_device_properties_for_dynamo()
         patch_sgl_kernel_scratchpad_buffers()
+        register_graph_scratchpad_owner(self)
         super().__init__(model_runner)
 
         assert not self.enable_two_batch_overlap, (
@@ -148,7 +149,6 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         assert not self.require_gathered_buffer, (
             "XPUGraphRunner does not support gathered buffer yet."
         )
-        register_graph_scratchpad_owner(self)
 
     def cleanup(self) -> None:
         unregister_graph_scratchpad_owner(self)

@@ -340,8 +340,6 @@ class TestXPUGraphMetadata(CustomTestCase):
 
     def test_sgl_kernel_scratchpad_dual_compatibility_and_recursion_guard(self):
         """Verify dual compatibility bypass when _XPU_GRAPH_SAFE=True and self-patch recursion guard."""
-        import sgl_kernel
-
         import sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch as xpu_sp_patch
 
         def orig_moe_fn(*a, **kw):
@@ -358,20 +356,18 @@ class TestXPUGraphMetadata(CustomTestCase):
             _XPU_GRAPH_SAFE=False,
             _get_gdn_workspace=orig_gdn_fn,
         )
+        mock_pkg = SimpleNamespace(moe=mock_moe, gdn_attn=mock_gdn)
         saved_orig_moe = xpu_sp_patch._orig_moe_ws
         saved_orig_gdn = xpu_sp_patch._orig_gdn_ws
 
         try:
-            with (
-                patch.dict(
-                    sys.modules,
-                    {
-                        "sgl_kernel.moe": mock_moe,
-                        "sgl_kernel.gdn_attn": mock_gdn,
-                    },
-                ),
-                patch.object(sgl_kernel, "moe", mock_moe),
-                patch.object(sgl_kernel, "gdn_attn", mock_gdn),
+            with patch.dict(
+                sys.modules,
+                {
+                    "sgl_kernel": mock_pkg,
+                    "sgl_kernel.moe": mock_moe,
+                    "sgl_kernel.gdn_attn": mock_gdn,
+                },
             ):
                 patch_sgl_kernel_scratchpad_buffers()
                 # _XPU_GRAPH_SAFE=True on moe leaves it untouched without blocking gdn
@@ -426,17 +422,18 @@ class TestXPUGraphMetadata(CustomTestCase):
             self.skipTest("torch.xpu not available")
 
         device = torch.device("xpu:0")
+        pool = torch.xpu.graph_pool_handle()
 
         # 1. Under graph capture (large to small): all graphs share ONE workspace
         if hasattr(sk_moe, "_get_moe_ws"):
             g4 = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g4):
+            with torch.xpu.graph(g4, pool=pool):
                 buf_g4 = sk_moe._get_moe_ws(
                     "test_shared_ws", (4, 128), torch.bfloat16, device
                 )
 
             g1 = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g1):
+            with torch.xpu.graph(g1, pool=pool):
                 buf_g1 = sk_moe._get_moe_ws(
                     "test_shared_ws", (1, 128), torch.bfloat16, device
                 )
@@ -448,14 +445,14 @@ class TestXPUGraphMetadata(CustomTestCase):
         # 2. Under graph capture (small to large): expansion retains retired buffer
         if hasattr(sk_moe, "_get_moe_ws"):
             g_expand_small = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g_expand_small):
+            with torch.xpu.graph(g_expand_small, pool=pool):
                 buf_small = sk_moe._get_moe_ws(
                     "test_expand_ws", (1, 64), torch.bfloat16, device
                 )
             ptr_small = buf_small.data_ptr()
 
             g_expand_large = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g_expand_large):
+            with torch.xpu.graph(g_expand_large, pool=pool):
                 buf_large = sk_moe._get_moe_ws(
                     "test_expand_ws", (16, 64), torch.bfloat16, device
                 )
@@ -468,12 +465,12 @@ class TestXPUGraphMetadata(CustomTestCase):
         # 3. GDN workspace expansion retains retired GDN buffers
         if hasattr(sk_gdn, "_get_gdn_workspace"):
             g_gdn1 = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g_gdn1):
+            with torch.xpu.graph(g_gdn1, pool=pool):
                 gdn_ws1 = sk_gdn._get_gdn_workspace(1024, device)
             ptr_gdn1 = gdn_ws1.data_ptr()
 
             g_gdn2 = torch.xpu.XPUGraph()
-            with torch.xpu.graph(g_gdn2):
+            with torch.xpu.graph(g_gdn2, pool=pool):
                 gdn_ws2 = sk_gdn._get_gdn_workspace(8192, device)
             ptr_gdn2 = gdn_ws2.data_ptr()
             if not getattr(sk_gdn, "_XPU_GRAPH_SAFE", False):
@@ -499,7 +496,7 @@ class TestXPUGraphMetadata(CustomTestCase):
 
         # Capture M=1 small graph
         replay_graph1 = torch.xpu.XPUGraph()
-        with torch.xpu.graph(replay_graph1):
+        with torch.xpu.graph(replay_graph1, pool=pool):
             graph_out1 = fused_experts(a_in1, w1, w2, topk_w1, topk_i1.int())
 
         # Test M=16 input and ground truth (triggers capture expansion)
@@ -512,7 +509,7 @@ class TestXPUGraphMetadata(CustomTestCase):
 
         # Capture M=16 expanded graph
         replay_graph16 = torch.xpu.XPUGraph()
-        with torch.xpu.graph(replay_graph16):
+        with torch.xpu.graph(replay_graph16, pool=pool):
             graph_out16 = fused_experts(a_in16, w1, w2, topk_w16, topk_i16.int())
 
         # Simulate large eager allocation (512 tokens)
@@ -539,6 +536,7 @@ class TestXPUGraphMetadata(CustomTestCase):
             hasattr(sk_moe, "_get_moe_ws")
             and hasattr(sk_gdn, "_get_gdn_workspace")
             and not getattr(sk_moe, "_XPU_GRAPH_SAFE", False)
+            and not getattr(sk_gdn, "_XPU_GRAPH_SAFE", False)
         ):
 
             def _compiled_ws_fn(x: torch.Tensor) -> int:
@@ -578,7 +576,7 @@ class TestXPUGraphMetadata(CustomTestCase):
         ).clone()
 
         joint_graph = torch.xpu.XPUGraph()
-        with torch.xpu.graph(joint_graph):
+        with torch.xpu.graph(joint_graph, pool=pool):
             joint_out = compiled_two_layer(a_in16, w1, w2, topk_w16, topk_i16.int())
 
         # Trigger large eager compiled run to ensure graph workspace stays isolated
