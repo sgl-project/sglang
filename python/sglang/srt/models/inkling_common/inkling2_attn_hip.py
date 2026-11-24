@@ -4,6 +4,7 @@ from sglang.kernels.ops.attention.inkling2_attn import gate_sink
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.quantization.unquant import _prefer_triton_a16w16
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models.inkling2_hip import all_reduce
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported
 
@@ -74,8 +75,6 @@ def forward(
             output.reshape(tokens, -1), gate, lse, sinks, output_dtype=q.dtype
         )
     output = apply_wo_ud(attention.wo_ud, output)
-    from sglang.srt.models.inkling2_hip import all_reduce
-
     return all_reduce(get_parallel().attn_tp_group, output)
 
 

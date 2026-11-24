@@ -163,8 +163,8 @@ class Inkling2Experts(nn.Module):
             checkpoint_prefix + "w2_weight"
         )
         self._nvfp4_scale_shapes: dict[str, tuple[int, ...]] = {}
-        # The ROCm path (uses_hip_path) loads quantized experts in MFMA order.
         self.hip = get_platform().is_hip
+        # The ROCm path (uses_hip_path) loads quantized experts in MFMA order.
         hip_path = self.uses_hip_path()
         for name, shape, dim, quantized in (
             (

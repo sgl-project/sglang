@@ -15,17 +15,12 @@ from sglang.kernels.ops.moe.inkling2_route_hip import (
     route_topk_metadata,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.models.inkling2_hip import all_reduce as rank_order_all_reduce
 from sglang.srt.models.inkling_common.inkling2_moe import (
     BF16_COMBINE_MIN_TOKENS,
     RoutedOutput,
 )
 from sglang.srt.runtime_context import get_parallel
-
-
-def _deterministic_all_reduce(group, x):
-    from sglang.srt.models.inkling2_hip import all_reduce as hip_all_reduce
-
-    return hip_all_reduce(group, x)
 
 
 def mfma_reorders(shape):
@@ -55,7 +50,7 @@ def moe_forward(moe, x, combine):
     out = forward_experts(moe.experts, x, weights, ids, True, route, quantized)
     if get_parallel().moe_tp_size > 1:
         if is_batch_invariant_mode_enabled():
-            out = _deterministic_all_reduce(get_parallel().moe_tp_group, out)
+            out = rank_order_all_reduce(get_parallel().moe_tp_group, out)
         else:
             out = all_reduce(out, get_parallel().moe_tp_group)
     return out
@@ -157,7 +152,7 @@ def forward_experts(experts, x, weights, ids, combine, route=None, quantized=Non
         # prefill traffic; the reduction itself accumulates in FP32.
         if tokens > BF16_COMBINE_MIN_TOKENS and not is_batch_invariant_mode_enabled():
             sums = sums.to(torch.bfloat16)
-        sums = _deterministic_all_reduce(get_parallel().moe_ep_group, sums)
+        sums = rank_order_all_reduce(get_parallel().moe_ep_group, sums)
     if not combine:
         return RoutedOutput(sums, experts._identity[:tokens], 1)
     return sums.to(x.dtype)

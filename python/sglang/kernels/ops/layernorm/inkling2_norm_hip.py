@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
 ATTN_RES_MAX_SOURCES = 16
 
 
@@ -430,8 +432,6 @@ def attn_res(
         )
         assert normed.shape == (n_queries, tokens, hidden) and normed.is_contiguous()
     if split:
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
         # the split kernel sums a row's dot products in another order
         split = not is_batch_invariant_mode_enabled()
     if split and not split_chunk:

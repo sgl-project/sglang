@@ -4,6 +4,7 @@ residual kernel instead of after it."""
 import torch
 
 from sglang.kernels.ops.layernorm.inkling2_norm_hip import attn_res
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.models.inkling_common.inkling2_attn import AttentionSources
 
 
@@ -11,8 +12,6 @@ def all_reduce(group, x):
     """group.all_reduce, or under deterministic inference a sum in rank order of
     the gathered inputs: the collectives pick their algorithm, and so their order
     of addition, by message size, which ties a token's sum to its batch."""
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
     if group.world_size == 1 or not is_batch_invariant_mode_enabled():
         return group.all_reduce(x)
     parts = group.all_gather(x.unsqueeze(0).contiguous(), dim=0)

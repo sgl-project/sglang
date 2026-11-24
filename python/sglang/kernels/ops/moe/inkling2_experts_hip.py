@@ -21,6 +21,7 @@ from sglang.kernels.ops.moe.inkling_moe import (
     compute_expert_block_metadata,
     compute_grouped_gemm_metadata,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
 
 @triton.jit
@@ -351,8 +352,6 @@ def default_config(rows, num_experts, nvfp4=False, mfma_order=False):
     MFMA-order weights run experts_gluon, whose width is fixed. mfma_order: weights in
     experts_gluon's MFMA order, which take other prefill tiles with the same K split
     (bitwise)."""
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
     if is_batch_invariant_mode_enabled():
         # One tile and K order for every batch, so a row's sums do not depend on
         # what it is batched with (deterministic inference)
