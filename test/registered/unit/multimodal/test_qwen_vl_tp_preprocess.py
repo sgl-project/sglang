@@ -112,6 +112,8 @@ def _test_ranks(rank, rendezvous):
             items[0].model_specific_data = original_marker
 
             class Qwen3VLForConditionalGeneration:
+                tp_image_preprocessing_enabled = True
+
                 def get_image_feature(self, items):
                     raise AssertionError("The rank entered the vision encoder")
 
@@ -312,6 +314,41 @@ class TestQwenVLTPPreprocess(unittest.TestCase):
         self.assertIs(run(vision, torch.tensor([[3.0]]), grid), static_output)
         self.assertEqual(first.item(), 1)
         self.assertEqual(second.item(), 2)
+
+    def test_vit_graph_miss_matches_captured_rotary_precision(self):
+        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+
+        pixels = torch.ones((4, 2), dtype=torch.bfloat16)
+        cos = torch.tensor([[0.123456, 0.654321]]).expand(4, -1)
+        sin = torch.tensor([[0.246813, 0.135792]]).expand(4, -1)
+        cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+        observed = []
+
+        def eager(x, cu, rotary_cos, rotary_sin):
+            observed.append((rotary_cos, rotary_sin))
+            return x
+
+        # Both a cold layout and a capacity-rejected layout take this path.
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            vision = SimpleNamespace(
+                use_bounded_cuda_graph=True,
+                graph_runners=SimpleNamespace(
+                    dtype=dtype, admit_tp_layout=lambda *args: False
+                ),
+                _prepare_graph_inputs=lambda *args: (pixels, cu_seqlens, cos, sin),
+                _forward_vision_blocks=eager,
+            )
+            result = Qwen3VLMoeVisionModel.forward_with_cuda_graph(
+                vision, pixels, torch.tensor([[1, 2, 2]])
+            )
+            self.assertIs(result, pixels)
+            actual_cos, actual_sin = observed[-1]
+            self.assertEqual(actual_cos.dtype, dtype)
+            self.assertEqual(actual_sin.dtype, dtype)
+            torch.testing.assert_close(actual_cos, cos.to(dtype), rtol=0, atol=0)
+            torch.testing.assert_close(actual_sin, sin.to(dtype), rtol=0, atol=0)
+        self.assertEqual(cos.dtype, torch.float32)
+        self.assertEqual(sin.dtype, torch.float32)
 
     def test_rank_consensus_order_and_failure(self):
         with tempfile.TemporaryDirectory() as directory:

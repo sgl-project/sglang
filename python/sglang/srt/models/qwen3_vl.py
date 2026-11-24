@@ -1062,9 +1062,14 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         if self.use_bounded_cuda_graph and not self.graph_runners.admit_tp_layout(
             x.shape[0], attention_layout_key
         ):
-            # Keep positional interpolation identical on captures, replays and misses.
+            # Match both positional interpolation and the graph's rotary workspace
+            # dtype. Keeping FP32 sin/cos only on misses changes the encoder output
+            # when the same layout is later captured with encoder-dtype buffers.
             return self._forward_vision_blocks(
-                x, cu_seqlens.numpy(), rotary_pos_emb_cos, rotary_pos_emb_sin
+                x,
+                cu_seqlens.numpy(),
+                rotary_pos_emb_cos.to(dtype=self.graph_runners.dtype),
+                rotary_pos_emb_sin.to(dtype=self.graph_runners.dtype),
             )
 
         embeddings = self.graph_runners.run(
@@ -1296,6 +1301,9 @@ def check_not_image_generation_head(name: str) -> None:
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Inherited by models that reuse this image entry and vision tower. A model
+    # replacing that contract can opt out independently of its model_type.
+    supports_tp_image_preprocessing = True
 
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
@@ -1322,6 +1330,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         super().__init__()
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
+        self.tp_image_preprocessing_enabled = (
+            envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
+            and self.supports_tp_image_preprocessing
+        )
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -1345,10 +1357,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
-                use_bounded_cuda_graph=(
-                    config.model_type in ("qwen3_vl", "qwen3_vl_moe")
-                    and envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
-                ),
+                use_bounded_cuda_graph=self.tp_image_preprocessing_enabled,
             )
 
         # TODO: make it more elegant
@@ -1455,7 +1464,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self, items: List[MultimodalDataItem]
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         _require_vision(self)
-        if envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get():
+        if envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get() and getattr(
+            self, "tp_image_preprocessing_enabled", False
+        ):
             from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
                 DEFERRED_IMAGE_PATCH_WIDTH_KEY,
             )

@@ -395,10 +395,7 @@ def _uses_qwen_vl_tp_image_preprocessing(
     owner = getattr(data_embedding_func, "__self__", None)
     return getattr(
         data_embedding_func, "__name__", None
-    ) == "get_image_feature" and type(owner).__name__ in {
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-    }
+    ) == "get_image_feature" and getattr(owner, "tp_image_preprocessing_enabled", False)
 
 
 def _sync_tp_image_cache_misses(ordered_candidates, local_misses, cached_embeddings):

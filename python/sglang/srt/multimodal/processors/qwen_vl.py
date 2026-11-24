@@ -57,7 +57,13 @@ from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -228,9 +234,21 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        # Resolve the same architecture registered with this processor. Derived
+        # models inherit the shared image entry's capability without a second
+        # model-type allowlist here or in the scheduler.
+        architectures = getattr(hf_config, "architectures", None) or ()
+        self._supports_tp_image_preprocess = any(
+            model.__name__ in architectures
+            and getattr(model, "supports_tp_image_preprocessing", False)
+            for model in self.models
+        )
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
+        ) or (
+            envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
+            and self._supports_tp_image_preprocess
         )
         if self.model_type in (
             "qwen2_vl",
@@ -287,9 +305,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         ).build(_processor)
 
     def _enable_tp_image_preprocessing(self, server_args, processor) -> bool:
-        if not envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get() or self.model_type not in (
-            "qwen3_vl",
-            "qwen3_vl_moe",
+        if (
+            not envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
+            or not self._supports_tp_image_preprocess
         ):
             return False
 
@@ -320,6 +338,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         prefill_backend = get_exec().graph.cuda_graph_config.prefill.backend
         if not (
             is_cuda()
+            and str(get_model().model_impl).lower() != "transformers"
             and pure_tp
             and colocated
             and fast_gpu_preprocessing
@@ -329,7 +348,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         ):
             raise ValueError(
                 "Qwen-VL TP image preprocessing requires single-node pure CUDA TP, "
-                "fast GPU processing, "
+                "the native SGLang model implementation, fast GPU processing, "
                 "and eager, breakable, or full prefill"
             )
         logger.info("Enabled Qwen-VL rank-local TP image preprocessing")
