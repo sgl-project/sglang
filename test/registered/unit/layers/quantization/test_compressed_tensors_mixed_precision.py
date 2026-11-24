@@ -532,12 +532,12 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
             scheme("model.layers.2.self_attn.qkv_proj")
 
     @staticmethod
-    def _lfm2_qkv_scheme(*groups):
+    def _lfm2_qkv_scheme(*groups, quant_format="mixed-precision"):
         """Scheme of layer 2's qkv_proj with per-shard exact targets."""
         from sglang.srt.models.lfm2_moe import Lfm2MoeForCausalLM
 
         quant_config = CompressedTensorsConfig.from_config(
-            _mixed_precision_config(*groups)
+            {**_mixed_precision_config(*groups), "format": quant_format}
         )
         quant_config.update_packed_modules_mapping(
             Lfm2MoeForCausalLM.packed_modules_mapping
@@ -564,6 +564,27 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
                 "targets": [f"{attn}.{p}" for p in ("q_proj", "k_proj", "v_proj")],
             },
             FP8_GROUP,
+        )
+        self.assertEqual(scheme["weights"].num_bits, 4)
+
+    def test_lfm2_moe_qkv_shards_with_an_inherited_format_share_a_scheme(self):
+        """q/k inheriting pack-quantized match a v that sets it explicitly."""
+        attn = "model.layers.2.self_attn"
+        inherited = {k: v for k, v in WNA16_GROUP.items() if k != "format"}
+        scheme = self._lfm2_qkv_scheme(
+            {**inherited, "targets": [f"{attn}.q_proj", f"{attn}.k_proj"]},
+            {**WNA16_GROUP, "targets": [f"{attn}.v_proj"]},
+            quant_format="pack-quantized",
+        )
+        self.assertEqual(scheme["weights"].num_bits, 4)
+
+    def test_lfm2_moe_qkv_shards_differing_only_in_observer_share_a_scheme(self):
+        """The calibration observer is not loaded, so it does not split a scheme."""
+        attn = "model.layers.2.self_attn"
+        mse = {**WNA16_GROUP["weights"], "observer": "mse"}
+        scheme = self._lfm2_qkv_scheme(
+            {**WNA16_GROUP, "targets": [f"{attn}.q_proj", f"{attn}.k_proj"]},
+            {**WNA16_GROUP, "weights": mse, "targets": [f"{attn}.v_proj"]},
         )
         self.assertEqual(scheme["weights"].num_bits, 4)
 
