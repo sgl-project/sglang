@@ -85,6 +85,8 @@ class TestMambaAutoFitHonorsRequestedRequests(CustomTestCase):
         planner.hybrid_gdn_config = planner.mambaish_config
         planner.hybrid_kda_config = None
         planner.extra_mamba_cache_bytes_per_req = 0
+        planner.extra_mamba_cache_bytes_per_request_row = 0
+        planner.allocate_intermediate_ssm = True
         planner.spec_algorithm = (
             SpeculativeAlgorithm.EAGLE if spec else SpeculativeAlgorithm.NONE
         )

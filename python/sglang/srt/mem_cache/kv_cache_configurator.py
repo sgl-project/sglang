@@ -3714,7 +3714,7 @@ class KVCacheConfigurator:
         total_rest_bytes: float,
         per_req: int,
         extra_per_slot: int,
-        replayssm_fixed_bytes: int,
+        fixed_state_bytes: int,
         reserves_spec_state: bool,
     ) -> float:
         """Grow the auto-fit Mamba budget to serve an explicit request limit.
@@ -3745,7 +3745,7 @@ class KVCacheConfigurator:
                 + extra_per_slot
             )
         else:
-            needed = (slots + 1) * (per_req + extra_per_slot) + replayssm_fixed_bytes
+            needed = (slots + 1) * (per_req + extra_per_slot) + fixed_state_bytes
         # Headroom so the floor division in the solve lands on `slots`.
         needed = math.ceil(needed) + 1
         if needed <= mamba_budget_bytes:
@@ -3916,7 +3916,7 @@ class KVCacheConfigurator:
                     total_rest_bytes=total_rest_memory * (1 << 30),
                     per_req=per_req,
                     extra_per_slot=extra_per_slot,
-                    replayssm_fixed_bytes=replayssm_fixed_bytes,
+                    fixed_state_bytes=fixed_state_bytes,
                     reserves_spec_state=reserves_spec_state,
                 )
 
