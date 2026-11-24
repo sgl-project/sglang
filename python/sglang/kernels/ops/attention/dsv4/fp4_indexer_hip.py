@@ -362,7 +362,7 @@ def rowgroup_prefill_query_start_loc(
     workspace: FP4RowgroupPrefillWorkspace, rows: slice, rows_per_request: List[int]
 ) -> torch.Tensor:
     """query_start_loc of the consecutive requests rows_per_request scored as rows."""
-    key = (rows.start, rows.stop)
+    key = (rows.start, rows.stop, tuple(rows_per_request))
     query_start_loc = workspace.query_start_locs.get(key)
     if query_start_loc is None:
         query_start_loc = _pinned_int32(
@@ -531,6 +531,121 @@ def rowgroup_paged_mqa_logits(
         max_query_len=max_query_len,
         pages_per_block=pages_per_block,
         plan=plan,
+    )
+    return logits
+
+
+@functools.lru_cache(maxsize=1)
+def aiter_has_opus_mqa_logits() -> bool:
+    """Whether the installed AITER ships the OPUS MXFP4 MQA logits kernels."""
+    try:
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import (  # noqa: F401
+            mqa_logits_mxfp4,
+            mqa_logits_mxfp4_config,
+        )
+    except Exception:
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=None)
+def _opus_scale_index(rows_per_group: int, device: torch.device) -> torch.Tensor:
+    """Byte gather from a 256-byte group of our scale layout to OPUS's gfx950 one,
+    [2 (g), 32 (m), 2 * tiles (kt, tile)] with tiles = rows_per_group / 32: row tile * 32 + m,
+    block kt * 2 + g. Ours: q_scale [1, 4 (block), 16, 4 (row / 16)] (row = head) or
+    k_scale [1, 4 (block), 64 ((row % 16) * 4 + row / 16)] (row = key of the 64-row page)."""
+    tiles = rows_per_group // 32
+    g, m, kt, tile = torch.meshgrid(
+        torch.arange(2), torch.arange(32), torch.arange(2), torch.arange(tiles),
+        indexing="ij",
+    )
+    row = tile * 32 + m
+    idx = (kt * 2 + g) * 64 + (row % 16) * 4 + row // 16
+    return idx.flatten().to(device=device, dtype=torch.int64)
+
+
+def opus_q_scale(q_scale: torch.Tensor, heads: int) -> torch.Tensor:
+    """Our [T, 1, 4, 16, 4] index-Q scales as OPUS's gfx950 [T, 2, 32, heads / 16]."""
+    T = q_scale.shape[0]
+    idx = _opus_scale_index(heads, q_scale.device)
+    return q_scale.reshape(T, 256).index_select(1, idx).view(T, 2, 32, heads // 16)
+
+
+_OPUS_K_SCALE_POOL: Dict[Tuple[torch.device, int], torch.Tensor] = {}
+
+
+def opus_k_scale(
+    k_scale: torch.Tensor, block_tables: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """A layer's [pages, 1, 4, 64] index-K scale pool as OPUS's gfx950 [pages, 2, 32, 4], in a
+    per-device scratch shared by every layer (stream-ordered: valid until the next call). With
+    block_tables only the pages they name are converted (the rest of the scratch is stale, so
+    the result serves those tables alone): the pool spans every cached token, a step's tables a
+    small part of it."""
+    pages = k_scale.shape[0]
+    key = (k_scale.device, pages)
+    out = _OPUS_K_SCALE_POOL.get(key)
+    if out is None:
+        out = torch.empty((pages, 256), dtype=torch.uint8, device=k_scale.device)
+        _OPUS_K_SCALE_POOL[key] = out
+    idx = _opus_scale_index(_KV_BLOCK_SIZE, k_scale.device)
+    src = k_scale.view(pages, 256)
+    if block_tables is None:
+        torch.index_select(src, 1, idx, out=out)
+    else:
+        named = block_tables.reshape(-1).to(torch.int64).clamp(0, pages - 1)
+        out.index_copy_(0, named, src.index_select(0, named).index_select(1, idx))
+    return out.view(pages, 2, 32, 4)
+
+
+def opus_prefill_mqa_logits(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale_opus: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale_opus: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """[rows, max_seq_len] fp32 prefill logits from AITER's OPUS MXFP4 kernel: sequence b's
+    rows query_start_loc[b] .. [b + 1] - 1 score the keys of block_tables[b] (64-slot pages)
+    up to their own row_ends; scales in the OPUS layout (opus_q_scale / opus_k_scale). Past a
+    row's bound the logits are left unwritten; the length-aware top-k never reads them."""
+    from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+        mqa_logits_mxfp4,
+        mqa_logits_mxfp4_config,
+    )
+
+    num_rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
+    cfg = mqa_logits_mxfp4_config(
+        q_fp4.device,
+        heads=heads,
+        page_size=_KV_BLOCK_SIZE,
+        pages_per_block=1,
+        max_rows=num_rows,
+        max_seqs=query_start_loc.shape[0] - 1,
+        max_qlen=max_query_len,
+        max_seq_len=max_seq_len,
+    )
+    logits = _alloc_logits(num_rows, max_seq_len, q_fp4.device, False)
+    pages = k_payload.shape[0]
+    mqa_logits_mxfp4(
+        q_fp4.view(torch.uint8).reshape(num_rows, heads, _HEAD_DIM // 2),
+        q_scale_opus,
+        k_payload.view(torch.uint8).view(pages, 4, _KV_BLOCK_SIZE, 16),
+        k_scale_opus,
+        weights,
+        block_tables,
+        query_start_loc,
+        _as_int32_1d(row_ends),
+        cfg=cfg,
+        weight_scale=weight_scale,
+        out=logits,
     )
     return logits
 
