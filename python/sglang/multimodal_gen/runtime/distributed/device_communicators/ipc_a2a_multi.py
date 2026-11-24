@@ -19,6 +19,7 @@ of slots (see ``_PipelinePool``).
 import dataclasses
 import functools
 import logging
+import math
 import socket
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -52,6 +53,65 @@ _MIN_GROUP_WAVES = 3
 # below, 30 us per peer loses to NCCL's one kernel. Pairs have ipc_a2a; larger
 # groups are not measured
 _AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
+# A pool that grows takes this much more than the call needs: every regrowth
+# re-shares the buffers over IPC (0.38 s of cudaIpcOpenMemHandle on 8 x B300),
+# and requests differ by a few percent.
+_POOL_HEADROOM = 1.25
+
+# What an expired in-kernel peer wait leaves in the transport's timeout word:
+# the code of its site, plus the peer it waited for where the wait knows it,
+# the first expiry winning. The plain exchange's spin_wait stores
+# TIMEOUT_EXCHANGE without the peer (kSpinWaitTimeout in ipc_a2a.cuh).
+TIMEOUT_EXCHANGE = 400
+TIMEOUT_PIPELINE_INPUT = 500
+TIMEOUT_PIPELINE_OUTPUT = 600
+_TIMEOUT_SITES = (
+    # (code of peer 0, the path, its switch)
+    (TIMEOUT_EXCHANGE, "copy-engine all-to-all", "SGLANG_DIFFUSION_IPC_A2A_MULTI=0"),
+    (
+        TIMEOUT_PIPELINE_INPUT,
+        "head-group pipeline (input rows)",
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0",
+    ),
+    (
+        TIMEOUT_PIPELINE_OUTPUT,
+        "head-group pipeline (output rows)",
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0",
+    ),
+)
+
+
+class IpcPeerTimeoutError(RuntimeError):
+    """An in-kernel peer wait of the copy-engine transport expired: the request
+    computed on incomplete data, and what the peers hold is unknown, so the
+    server must be restarted (the HTTP server turns unhealthy with this)."""
+
+
+def describe_peer_timeouts(codes: list[int], ranks: list[int], budget_s: float) -> str:
+    """The error for timeout words ``codes`` of the group members with global
+    ranks ``ranks`` (0: that member's waits all completed)."""
+    waits: dict[tuple[str, str], list[int]] = {}
+    switches = []
+    for rank, code in zip(ranks, codes):
+        if code == 0:
+            continue
+        base, path, switch = max(site for site in _TIMEOUT_SITES if site[0] <= code)
+        peer = "a peer" if base == TIMEOUT_EXCHANGE else f"rank {ranks[code - base]}"
+        waits.setdefault((path, peer), []).append(rank)
+        if switch not in switches:
+            switches.append(switch)
+    listed = "; ".join(
+        f"rank{'s' if len(who) > 1 else ''} {', '.join(map(str, who))} waited for "
+        f"{peer} in the {path}"
+        for (path, peer), who in waits.items()
+    )
+    return (
+        f"Ulysses IPC peer wait timed out after {budget_s:g} s: {listed}. The request "
+        "ran on incomplete data and was failed; the transport state is unknown, so "
+        "restart the server's process group. Raise SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS "
+        "if a rank can legitimately stall that long, or turn the path off with "
+        f"{' '.join(switches)}."
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -575,7 +635,8 @@ class IpcA2AMultiState:
         only if every rank sees the same bytes, so a backend that does not
         treat a head group as it treats those heads in the full call never
         changes a result. It runs the sequential exchange first, with the
-        pool released, so that call never holds both at once.
+        pool released so that call never holds both at once, unless the pool
+        already covers this call and every rank has room for both.
         """
         world, r = self.world, self.rank
         filled = fill is not None or fill_all is not None
@@ -624,31 +685,45 @@ class IpcA2AMultiState:
         if pool is not None:
             sizes = tuple(map(max, sizes, pool.sizes))
         reference = None
-        if pool is None or pool.sizes != sizes or check is not None:
+        grow = pool is None or pool.sizes != sizes
+        if grow:
+            sizes = (
+                math.ceil(sizes[0] * _POOL_HEADROOM),
+                math.ceil(sizes[1] * _POOL_HEADROOM),
+                sizes[2],
+            )
+        if grow or check is not None:
             if torch.cuda.is_current_stream_capturing() or key in self.declined:
                 return None
             esz = q.element_size()
-            held = 0 if pool is None else pool.nbytes(esz)
             need = (sizes[0] + sizes[1]) * esz
             if filled:
                 need += plan.world * groups * slots.send_numel * esz
-            if auto and not self._fits_on_every_rank(need, reclaimable=held):
-                logger.info(
-                    "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
-                    "sequential exchange for this shape",
-                    need / 2**30,
-                )
-                self.declined.add(key)
-                return None
-            if pool is not None:
-                # queued copies may still target the old mappings
-                torch.cuda.synchronize()
-                del self.pools[q.dtype]
-                pool = None
-                self._release_shared()
+            # A first sight the pool already covers keeps the pool through the
+            # sequential reference when every rank has room for both: dropping
+            # it re-shares every buffer over IPC, 0.17-0.23 s per new shape on
+            # 4 x B300.
+            keep = not grow and self._fits_on_every_rank(need)
+            if not keep:
+                held = 0 if pool is None else pool.nbytes(esz)
+                if auto and not self._fits_on_every_rank(need, reclaimable=held):
+                    logger.info(
+                        "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
+                        "sequential exchange for this shape",
+                        need / 2**30,
+                    )
+                    self.declined.add(key)
+                    return None
+                if pool is not None:
+                    # queued copies may still target the old mappings
+                    torch.cuda.synchronize()
+                    del self.pools[q.dtype]
+                    pool = None
+                    self._release_shared()
             if check is not None:
                 reference = sequential()
-            pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
+            if pool is None:
+                pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
         if self.pipe_in is None:
             self.pipe_in = torch.cuda.Stream()
         while len(self.pipe_group_streams) < groups:
@@ -848,8 +923,16 @@ class IpcA2AMultiState:
             stream = self.pipe_group_streams[g]
             stream.wait_event(own[g] if filled else placed)
             with torch.cuda.stream(stream):
-                for p in peers:
-                    mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
+                if g == 0:
+                    # bounded: a peer that sends nothing this call expires here
+                    self.wait_peers(pool.fin_ptr[r], base + 1, TIMEOUT_PIPELINE_INPUT)
+                else:
+                    # front-end waits hold no SM while earlier groups attend (a
+                    # wait kernel per group slowed the q/k-filled call 1.2% at
+                    # 11648 rows per rank on B300); a peer that stops after its
+                    # first group expires in the output wait
+                    for p in peers:
+                        mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
                 views = [slots.slot(pool, r, g, part) for part in range(3)]
                 if into:
                     out = full[:, :, start(r, g, 0) : start(r, g, 0) + hq]
@@ -912,8 +995,10 @@ class IpcA2AMultiState:
                             out_row,
                             n,
                         )
+                self.wait_peers(
+                    pool.fout_ptr[r] + 4 * g * world, call, TIMEOUT_PIPELINE_OUTPUT
+                )
                 for p in peers:
-                    mem.wait(stream, pool.fout_ptr[r] + 4 * (g * world + p), call)
                     # the block and the merged output both have one row pitch
                     # across the batch, so a single copy covers every batch row
                     mem.copy2d(
@@ -930,8 +1015,9 @@ class IpcA2AMultiState:
         def gather(first: int, stop: int) -> None:
             # the peers' blocks of this rank's rows for groups [first, stop), one pass each
             for g in range(first, stop):
-                for p in peers:
-                    mem.wait(main, pool.fout_ptr[r] + 4 * (g * world + p), call)
+                self.wait_peers(
+                    pool.fout_ptr[r] + 4 * g * world, call, TIMEOUT_PIPELINE_OUTPUT
+                )
             outb = pool.outb[r]
             for p in peers:
                 blocks = outb.as_strided(
@@ -1067,28 +1153,38 @@ class IpcA2AMultiState:
             )
         return buffers[r][slot]
 
-    def check_timeout(self) -> None:
-        """Retire the transport on every rank if any rank's spin expired.
+    def wait_peers(self, flags: int, target: int, code: int) -> None:
+        """Hold the current stream until every peer's entry of this rank's int32
+        [world] flag array at address ``flags`` reaches ``target``: one launch.
+        A wait that outlasts the budget stores ``code`` + the peer in the timeout
+        word, and every wait gives up at once while that word is set."""
+        self.ops.wait_peers(
+            self.timed_out, flags, self.world, self.rank, target, code, self.budget_ns
+        )
 
-        A spin only flags the peer it waited on, so agree across the whole group
-        at the request boundary: a rank that retired alone would post an NCCL
-        all-to-all that its IPC peers never join. Expiry means a peer went
-        silent for the whole budget and that exchange returned incomplete data,
-        so this raises instead of serving the result.
+    def check_timeout(self) -> None:
+        """Fail the request on every rank if any rank's in-kernel peer wait
+        expired; a group collective, run after each denoising stage (before
+        anything decodes or saves its output).
+
+        A rank that retired alone would post an NCCL all-to-all that its IPC
+        peers never join, so agree across the whole group. Expiry means a peer
+        went silent for the whole budget, so the stage computed on incomplete
+        data. The transport is retired and IpcPeerTimeoutError marks the server
+        unusable.
         """
         if self.failed or not self.inited:
             return
-        expired = self.timed_out.clone()
-        dist.all_reduce(expired, op=dist.ReduceOp.MAX, group=self.group)
-        if expired.item() == 0:
+        codes = torch.empty(self.world, dtype=torch.int32, device="cuda")
+        dist.all_gather_into_tensor(codes, self.timed_out, group=self.group)
+        codes = codes.tolist()
+        if not any(codes):
             return
         self.failed = True
-        raise RuntimeError(
-            "IPC all-to-all gave up waiting for a peer after "
-            f"{envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS:g} ms, so that exchange "
-            "returned incomplete data. The transport is now disabled on every "
-            "rank; retry the request over NCCL, or set "
-            "SGLANG_DIFFUSION_IPC_A2A_MULTI=0."
+        raise IpcPeerTimeoutError(
+            describe_peer_timeouts(
+                codes, dist.get_process_group_ranks(self.group), self.budget_ns / 1e9
+            )
         )
 
 

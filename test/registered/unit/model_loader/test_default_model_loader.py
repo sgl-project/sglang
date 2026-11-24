@@ -230,7 +230,7 @@ class TestShardedStateModelOptFp8(CustomTestCase):
                 LoadConfig(load_format=LoadFormat.SHARDED_STATE)
             )
             with (
-                get_parallel().override(tp_rank=0),
+                get_parallel().override(tp_rank=0, tp_size=1, pp_rank=0),
                 patch.object(loader_mod, "_get_quantization_config", return_value=None),
                 patch.object(loader_mod, "_initialize_model", return_value=model),
             ):

@@ -19,7 +19,10 @@ import json
 import os
 import random
 import re
+import threading
 import time
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
@@ -37,7 +40,7 @@ from sglang.benchmark.stream_metrics import (
     SteadyStateWindow,
     validate_finish_reason,
 )
-from sglang.benchmark.utils import get_processor, get_tokenizer
+from sglang.benchmark.utils import dp_listener_urls, get_processor, get_tokenizer
 from sglang.profiler import run_profile
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
@@ -60,6 +63,12 @@ def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
     Get cached_tokens_total and prompt_tokens_total from Prometheus /metrics endpoint.
     Returns (cached_tokens_total, prompt_tokens_total) or None if metrics are not available.
     """
+    return _read_cache_tokens(url)
+
+
+def _read_cache_tokens(url: str) -> Optional[tuple]:
+    """`get_cache_tokens_from_metrics`, for reads that are not the before/after
+    snapshots of a batch (a caller may wrap that function to see just those)."""
     try:
         response = requests.get(url + "/metrics", timeout=5)
         try:
@@ -109,6 +118,33 @@ def calculate_cache_hit_rate(
     if prompt_delta > 0:
         return cached_delta / prompt_delta
     return None
+
+
+def _get_cache_tokens_once_counted(
+    url: str, prompt_tokens: Optional[float], timeout_s: float = 30.0
+) -> Optional[tuple]:
+    """`get_cache_tokens_from_metrics` once /metrics counts at least
+    `prompt_tokens` prompt tokens (None: read right away).
+
+    A server with one listener per DP rank serves /metrics from one of them,
+    which sees the other listeners' counters only after a delay; waiting for
+    the prompt tokens this client sent keeps a before/after delta exact.
+    """
+    if prompt_tokens is not None:
+        deadline = time.perf_counter() + timeout_s
+    while prompt_tokens is not None:
+        metrics = _read_cache_tokens(url)
+        if metrics is None or metrics[1] >= prompt_tokens:
+            break
+        if time.perf_counter() >= deadline:
+            print(
+                f"WARNING: /metrics counted {metrics[1]:.0f} prompt tokens after "
+                f"{timeout_s:.0f} s, short of the {prompt_tokens:.0f} sent; the "
+                f"cache hit rate may be off."
+            )
+            break
+        time.sleep(0.1)
+    return get_cache_tokens_from_metrics(url)
 
 
 @dataclasses.dataclass
@@ -484,6 +520,15 @@ class BenchOneCaseResult(BaseModel):
             fout.write(json.dumps(res) + "\n")
 
 
+def _http_session(trust_env: bool) -> requests.Session:
+    """A session for one request; `trust_env=False` skips the environment's
+    proxy. Requests to DP rank listeners do: the server publishes them at its
+    own address, which a proxy bypass list covering only loopback misses."""
+    session = requests.Session()
+    session.trust_env = trust_env
+    return session
+
+
 def _warmup_cache(
     url: str,
     input_ids: List[List[int]],
@@ -493,6 +538,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    trust_env: bool = True,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -505,6 +551,7 @@ def _warmup_cache(
         image_data: Optional image data for VLM models
         backend: Backend server type ("sglang" or "vllm")
         model_name: Model name (required for vllm backend)
+        trust_env: False to skip the environment's proxy (see `_http_session`)
     """
     cached_token_len = int(input_len * cache_hit_rate)
     if cached_token_len <= 0:
@@ -541,11 +588,12 @@ def _warmup_cache(
             cache_warmup_payload["image_data"] = image_data
         gen_url = url + "/generate"
 
-    warmup_response = requests.post(
-        gen_url,
-        json=cache_warmup_payload,
-        timeout=DEFAULT_TIMEOUT,
-    )
+    with _http_session(trust_env) as session:
+        warmup_response = session.post(
+            gen_url,
+            json=cache_warmup_payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
     warmup_response.raise_for_status()
     print("Cache warmup completed")
 
@@ -568,6 +616,131 @@ def _flush_cache_with_retry(
             if attempt >= max_retries - 1:
                 raise
         time.sleep(2)
+
+
+# /generate fields holding one entry per prompt of a batch.
+_PER_PROMPT_FIELDS = ("input_ids", "image_data", "lora_path")
+
+
+def _round_robin_parts(batch_size: int, num_parts: int) -> List[List[int]]:
+    """Batch indices per part, prompt i in part i % num_parts (as the DP
+    controller places a batch's prompts on ranks); empty parts are dropped."""
+    parts = [list(range(part, batch_size, num_parts)) for part in range(num_parts)]
+    return [indices for indices in parts if indices]
+
+
+def _sub_batch_payload(payload: dict, indices: List[int]) -> dict:
+    """`payload` restricted to the prompts at `indices`; shared fields as is."""
+    sub_payload = dict(payload)
+    for field in _PER_PROMPT_FIELDS:
+        if isinstance(payload.get(field), list):
+            sub_payload[field] = [payload[field][i] for i in indices]
+    return sub_payload
+
+
+def _stream_sub_batch(
+    gen_url: str,
+    payload: dict,
+    indices: List[int],
+    recorder: BatchStreamRecorder,
+    ignore_eos: bool,
+    trust_env: bool,
+    lock,
+    stop: Optional[threading.Event],
+) -> None:
+    """Stream one batched /generate into `recorder`, its chunk index i
+    recorded as batch index indices[i]. Returns early once `stop` is set."""
+    with (
+        _http_session(trust_env) as session,
+        session.post(
+            gen_url,
+            json=payload,
+            stream=True,
+            timeout=DEFAULT_TIMEOUT,
+        ) as response,
+    ):
+        response.raise_for_status()
+        for chunk in response.iter_lines(decode_unicode=False):
+            if stop is not None and stop.is_set():
+                return
+            chunk = chunk.decode("utf-8")
+            if chunk and chunk.startswith("data:"):
+                if chunk == "data: [DONE]":
+                    break
+                data = json.loads(chunk[5:].strip("\n"))
+                if "error" in data:
+                    raise RuntimeError(f"Request has failed. {data}.")
+
+                finish_reason = data["meta_info"]["finish_reason"]
+                if finish_reason is not None:
+                    validate_finish_reason(finish_reason, ignore_eos=ignore_eos)
+                # Chunk times are taken under the lock, so the recorder sees
+                # them in order across concurrent sub-batches.
+                with lock:
+                    recorder.record_chunk(
+                        index=indices[data["index"]],
+                        completion_tokens=data["meta_info"]["completion_tokens"],
+                        finish_type=(
+                            finish_reason["type"] if finish_reason is not None else None
+                        ),
+                        now=time.perf_counter(),
+                    )
+
+
+def _stream_batch(
+    gen_urls: List[str],
+    payload: dict,
+    recorder: BatchStreamRecorder,
+    ignore_eos: bool,
+    trust_env: bool,
+) -> None:
+    """Stream a batched /generate into `recorder`, split over `gen_urls`.
+
+    With several URLs (one per DP rank listener), prompt i goes to URL
+    i % len(gen_urls); the sub-batches stream concurrently into the one
+    recorder under their batch indices, so its timings and token counts cover
+    the whole batch. A failed sub-batch fails the call and stops the rest.
+    """
+    parts = _round_robin_parts(len(payload["input_ids"]), len(gen_urls))
+    if len(parts) == 1:
+        _stream_sub_batch(
+            gen_urls[0],
+            payload,
+            parts[0],
+            recorder,
+            ignore_eos,
+            trust_env,
+            nullcontext(),
+            None,
+        )
+        return
+
+    lock = threading.Lock()
+    stop = threading.Event()
+    failed = None
+    with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        futures = [
+            pool.submit(
+                _stream_sub_batch,
+                gen_url,
+                _sub_batch_payload(payload, indices),
+                indices,
+                recorder,
+                ignore_eos,
+                trust_env,
+                lock,
+                stop,
+            )
+            for gen_url, indices in zip(gen_urls, parts)
+        ]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        failed = next((f for f in done if f.exception() is not None), None)
+        if failed is not None:
+            # The other streams return at their next chunk, closing their
+            # connections; leaving the pool waits for them.
+            stop.set()
+    if failed is not None:
+        failed.result()
 
 
 @lru_cache(maxsize=None)
@@ -653,7 +826,14 @@ def run_one_case(
     apply_chat_template: bool = False,
     flush_hicache_storage: bool = False,
     input_len_list: str = "",
+    listener_urls: Optional[List[str]] = None,
 ):
+    """Run one batch against `url`. With `listener_urls` (every DP rank's
+    listener, see `dp_listener_urls`), the batch's /generate and its cache
+    warmup are spread over them; control and metrics requests still go to
+    `url`, whose server fans them out to every rank."""
+    # Where the batch's prompts go; item i goes to gen_bases[i % len(gen_bases)].
+    gen_bases = listener_urls or [url]
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
@@ -776,26 +956,11 @@ def run_one_case(
             payload["logprobs"] = 1
         gen_url = url + "/v1/completions"
     else:
-        # Load sampling parameters
-        use_structured_outputs = False
-        if use_structured_outputs:
-            texts = []
-            for _ in range(batch_size):
-                texts.append(
-                    "Human: What is the capital city of france? can you give as many trivial information as possible about that city? answer in json.\n"
-                    * 50
-                    + "Assistant:"
-                )
-            json_schema = "$$ANY$$"
-        else:
-            json_schema = None
-
         payload = {
             "sampling_params": {
                 "temperature": temperature,
                 "max_new_tokens": output_len,
                 "ignore_eos": ignore_eos,
-                "json_schema": json_schema,
                 "stream_interval": stream_interval,
             },
             "return_logprob": return_logprob,
@@ -833,20 +998,38 @@ def run_one_case(
                     f"Unexpected lora_request_distribution: "
                     f"{lora_request_distribution!r}"
                 )
-        gen_url = url + "/generate"
 
-    # Warm up cache if cache_hit_rate > 0.0
+    # Over several listeners, /metrics catches up with the requests sent through
+    # the others only after a delay: count the prompt tokens sent from here on,
+    # and read /metrics once it has counted them (when the server serves it).
+    prompt_tokens_sent = None
+    if len(gen_bases) > 1:
+        baseline = _read_cache_tokens(url)
+        if baseline is not None:
+            prompt_tokens_sent = baseline[1]
+
+    # Warm up cache if cache_hit_rate > 0.0, each prefix on the listener (DP
+    # rank) that serves its prompt below.
     if cache_hit_rate > 0.0:
-        _warmup_cache(
-            url=url,
-            input_ids=input_ids,
-            input_len=input_len,
-            cache_hit_rate=cache_hit_rate,
-            dataset_name=dataset_name,
-            image_data=image_data,
-            backend=backend,
-            model_name=model_name,
-        )
+        if prompt_tokens_sent is not None:
+            cached_token_len = int(input_len * cache_hit_rate)
+            prompt_tokens_sent += sum(len(ids[:cached_token_len]) for ids in input_ids)
+        for gen_base, indices in zip(
+            gen_bases, _round_robin_parts(len(input_ids), len(gen_bases))
+        ):
+            _warmup_cache(
+                url=gen_base,
+                input_ids=[input_ids[i] for i in indices],
+                input_len=input_len,
+                cache_hit_rate=cache_hit_rate,
+                dataset_name=dataset_name,
+                image_data=(
+                    [image_data[i] for i in indices] if image_data is not None else None
+                ),
+                backend=backend,
+                model_name=model_name,
+                trust_env=not listener_urls,
+            )
 
     # Turn on profiler
     profile_link = None
@@ -863,22 +1046,22 @@ def run_one_case(
         )
 
     # Get metrics before the request (for cache hit rate calculation)
-    metrics_before = get_cache_tokens_from_metrics(url)
+    metrics_before = _get_cache_tokens_once_counted(url, prompt_tokens_sent)
 
     # Run the request
     recorder: Optional[BatchStreamRecorder] = None
     tic = time.perf_counter()
-    with requests.post(
-        gen_url,
-        json=payload,
-        stream=True,
-        timeout=DEFAULT_TIMEOUT,
-    ) as response:
-        response.raise_for_status()
+    if backend == "vllm":
+        with requests.post(
+            gen_url,
+            json=payload,
+            stream=True,
+            timeout=DEFAULT_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
 
-        # Get the TTFT of the last request in the batch
-        last_ttft = 0.0
-        if backend == "vllm":
+            # Get the TTFT of the last request in the batch
+            last_ttft = 0.0
             # Parse OpenAI-compatible streaming format from vLLM
             first_token_indices = set()
             for chunk in response.iter_lines(decode_unicode=False):
@@ -896,35 +1079,22 @@ def run_one_case(
                             first_token_indices.add(idx)
                             if len(first_token_indices) == batch_size:
                                 last_ttft = time.perf_counter() - tic
-        else:
-            # mmmu can silently return fewer prompts than requested.
-            recorder = BatchStreamRecorder(batch_size=len(input_ids))
-            for chunk in response.iter_lines(decode_unicode=False):
-                chunk = chunk.decode("utf-8")
-                if chunk and chunk.startswith("data:"):
-                    if chunk == "data: [DONE]":
-                        break
-                    data = json.loads(chunk[5:].strip("\n"))
-                    if "error" in data:
-                        raise RuntimeError(f"Request has failed. {data}.")
-
-                    finish_reason = data["meta_info"]["finish_reason"]
-                    if finish_reason is not None:
-                        validate_finish_reason(finish_reason, ignore_eos=ignore_eos)
-                    recorder.record_chunk(
-                        index=data["index"],
-                        completion_tokens=data["meta_info"]["completion_tokens"],
-                        finish_type=(
-                            finish_reason["type"] if finish_reason is not None else None
-                        ),
-                        now=time.perf_counter(),
-                    )
-            missing = recorder.missing_indices()
-            if missing:
-                raise RuntimeError(
-                    f"No stream chunk received for request indices {missing}."
-                )
-            last_ttft = recorder.all_started_time - tic
+    else:
+        # mmmu can silently return fewer prompts than requested.
+        recorder = BatchStreamRecorder(batch_size=len(input_ids))
+        _stream_batch(
+            [gen_base + "/generate" for gen_base in gen_bases],
+            payload,
+            recorder,
+            ignore_eos,
+            trust_env=not listener_urls,
+        )
+        missing = recorder.missing_indices()
+        if missing:
+            raise RuntimeError(
+                f"No stream chunk received for request indices {missing}."
+            )
+        last_ttft = recorder.all_started_time - tic
 
     # Compute metrics
     latency = time.perf_counter() - tic
@@ -990,7 +1160,9 @@ def run_one_case(
                 last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
-    metrics_after = get_cache_tokens_from_metrics(url)
+    if prompt_tokens_sent is not None:
+        prompt_tokens_sent += sum(len(ids) for ids in input_ids)
+    metrics_after = _get_cache_tokens_once_counted(url, prompt_tokens_sent)
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
 
     # Print results
@@ -1088,7 +1260,8 @@ def should_skip_due_to_token_capacity(
     resident_tokens = input_tokens + batch_size * output_len
     if input_len_list and num_dp_ranks > 1:
         # Requests land on DP rank i % num_dp_ranks (the DP controller's
-        # round-robin), so a ragged batch fills its heaviest rank first; the
+        # round-robin, or the client's split over per-rank listeners), so a
+        # ragged batch fills its heaviest rank first; the
         # requests past that rank's share of the pool would queue.
         lens = _batch_input_lens(input_len_list, batch_size)
         heaviest = max(
@@ -1312,6 +1485,7 @@ def run_benchmark_internal(
         skip_token_capacity_threshold = float("inf")
         skip_max_running_requests_threshold = float("inf")
         num_dp_ranks = 1
+        listener_urls = []
     else:
         model_name = None
         response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
@@ -1335,6 +1509,14 @@ def run_benchmark_internal(
         num_dp_ranks = (internal_state.get("dp_size", None) or 1) * (
             internal_state.get("attn_dp_size", None) or 1
         )
+        # A server whose DP ranks each have their own listener lists them;
+        # spread every batch over them, as the DP controller would behind one
+        # URL. Empty otherwise, and the batch goes to base_url as one request.
+        listener_urls = dp_listener_urls(server_info)
+        if listener_urls:
+            print(f"Spreading each batch over the DP rank listeners {listener_urls}")
+            # Such a server's internal states may not carry the DP sizes.
+            num_dp_ranks = max(num_dp_ranks, len(listener_urls))
 
         # Get effective max running requests
         max_running_requests_per_dp = internal_state.get(
@@ -1465,6 +1647,7 @@ def run_benchmark_internal(
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 fixed_prompt_file=bench_args.fixed_prompt_file,
                 apply_chat_template=bench_args.apply_chat_template,
+                listener_urls=listener_urls,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1519,6 +1702,7 @@ def run_benchmark_internal(
                     fixed_prompt_file=bench_args.fixed_prompt_file,
                     apply_chat_template=bench_args.apply_chat_template,
                     input_len_list=bench_args.input_len_list,
+                    listener_urls=listener_urls,
                     **gsp_kwargs,
                 )
             )
@@ -1584,6 +1768,7 @@ def run_benchmark_internal(
                             fixed_prompt_file=bench_args.fixed_prompt_file,
                             apply_chat_template=bench_args.apply_chat_template,
                             input_len_list=bench_args.input_len_list,
+                            listener_urls=listener_urls,
                             **gsp_kwargs,
                         )
                     )
