@@ -1,11 +1,13 @@
-# type: ignore
-
+import contextlib
 import math
 from functools import cache, partial
 
 import torch
 
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import norm_row_alignment
+
+# type: ignore
+
 
 try:
     import cutlass
@@ -264,6 +266,26 @@ def _qk_l2_clip_cpu(
     N: int,
     rows_per_output_scale: int,
 ) -> torch.Tensor:
+    if not hasattr(torch.ops, "sgl_kernel"):
+        with contextlib.suppress(ImportError):
+            import sgl_kernel  # noqa: F401
+    if (
+        (scale is None or scale.stride(-1) == 1)
+        and (output_scale is None or output_scale.is_contiguous())
+        and hasattr(torch.ops, "sgl_kernel")
+        and hasattr(torch.ops.sgl_kernel, "inkling2_qk_l2_clip_cpu")
+    ):
+        y = torch.empty((M, N), device=x.device, dtype=output_dtype)
+        torch.ops.sgl_kernel.inkling2_qk_l2_clip_cpu(
+            x,
+            scale,
+            output_scale,
+            y,
+            float(threshold),
+            float(eps),
+            int(rows_per_output_scale),
+        )
+        return y
     x_fp32 = x.reshape(M, N).float()
     if scale is not None:
         if scale.ndim == 1:

@@ -450,7 +450,9 @@ at::Tensor inkling2_fused_experts_cpu(
     double gate_softcap,
     double up_softcap,
     bool inplace,
-    bool is_vnni);
+    bool is_vnni,
+    const std::optional<at::Tensor>& w13_scale = std::nullopt,
+    const std::optional<at::Tensor>& w2_scale = std::nullopt);
 
 // inkling2 short convolution
 at::Tensor inkling2_short_convolution_cpu(
@@ -491,6 +493,51 @@ void inkling2_update_sconv_cache_cpu(
     const at::Tensor& cache_indices,
     const at::Tensor& has_initial_state,
     const at::Tensor& query_start_loc);
+
+void inkling2_rms_norm_cpu(
+    const at::Tensor& x,
+    const std::optional<at::Tensor>& weight_opt,
+    const std::optional<at::Tensor>& pre_weight_opt,
+    at::Tensor& out,
+    double eps);
+
+void inkling2_qk_l2_clip_cpu(
+    const at::Tensor& x,
+    const std::optional<at::Tensor>& scale_opt,
+    const std::optional<at::Tensor>& output_scale_opt,
+    at::Tensor& out,
+    double threshold,
+    double eps,
+    int64_t rows_per_output_scale);
+
+void inkling2_gate_sink_cpu(
+    const at::Tensor& output,
+    const at::Tensor& gate,
+    const at::Tensor& lse,
+    const at::Tensor& sinks,
+    at::Tensor& out,
+    int64_t heads,
+    int64_t group,
+    int64_t padded_group);
+
+std::vector<at::Tensor> inkling2_attn_res_cpu(
+    at::TensorList blocks,
+    const std::optional<at::Tensor>& partial_addend_opt,
+    const at::Tensor& queries,
+    bool normalize_values);
+
+void inkling2_route_topk_cpu(
+    const at::Tensor& partials,
+    const std::optional<at::Tensor>& bias_opt,
+    at::Tensor& logits,
+    at::Tensor& ids,
+    const std::optional<at::Tensor>& weights_opt,
+    int64_t topk,
+    double route_scale,
+    const std::optional<at::Tensor>& global_scale_opt);
+
+at::Tensor inkling2_bf16_linear_fp32_cpu(
+    const at::Tensor& x, const at::Tensor& packed_weight, const std::optional<at::Tensor>& bias_opt = std::nullopt);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -1005,7 +1052,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "inkling2_fused_experts_cpu(Tensor hidden_states, Tensor w13, Tensor w2, Tensor topk_weights, Tensor topk_ids, "
-      "float gate_softcap, float up_softcap, bool inplace, bool is_vnni) -> Tensor");
+      "float gate_softcap, float up_softcap, bool inplace, bool is_vnni, "
+      "Tensor? w13_scale=None, Tensor? w2_scale=None) -> Tensor");
   m.impl("inkling2_fused_experts_cpu", torch::kCPU, &inkling2_fused_experts_cpu);
 
   // inkling2 short convolution
@@ -1025,6 +1073,32 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "inkling2_update_sconv_cache_cpu(Tensor x, Tensor(a!) sconv_cache, Tensor cache_indices, "
       "Tensor has_initial_state, Tensor query_start_loc) -> ()");
   m.impl("inkling2_update_sconv_cache_cpu", torch::kCPU, &inkling2_update_sconv_cache_cpu);
+
+  m.def("inkling2_rms_norm_cpu(Tensor x, Tensor? weight, Tensor? pre_weight, Tensor(a!) out, float eps) -> ()");
+  m.impl("inkling2_rms_norm_cpu", torch::kCPU, &inkling2_rms_norm_cpu);
+
+  m.def(
+      "inkling2_qk_l2_clip_cpu(Tensor x, Tensor? scale, Tensor? output_scale, Tensor(a!) out, "
+      "float threshold, float eps, int rows_per_output_scale) -> ()");
+  m.impl("inkling2_qk_l2_clip_cpu", torch::kCPU, &inkling2_qk_l2_clip_cpu);
+
+  m.def(
+      "inkling2_gate_sink_cpu(Tensor output, Tensor gate, Tensor lse, Tensor sinks, Tensor(a!) out, "
+      "int heads, int group, int padded_group) -> ()");
+  m.impl("inkling2_gate_sink_cpu", torch::kCPU, &inkling2_gate_sink_cpu);
+
+  m.def(
+      "inkling2_attn_res_cpu(Tensor[] blocks, Tensor? partial_addend, Tensor queries, "
+      "bool normalize_values) -> Tensor[]");
+  m.impl("inkling2_attn_res_cpu", torch::kCPU, &inkling2_attn_res_cpu);
+
+  m.def(
+      "inkling2_route_topk_cpu(Tensor partials, Tensor? bias, Tensor(a!) logits, Tensor(b!) ids, "
+      "Tensor(c!)? weights, int topk, float route_scale, Tensor? global_scale) -> ()");
+  m.impl("inkling2_route_topk_cpu", torch::kCPU, &inkling2_route_topk_cpu);
+
+  m.def("inkling2_bf16_linear_fp32_cpu(Tensor x, Tensor packed_weight, Tensor? bias=None) -> Tensor");
+  m.impl("inkling2_bf16_linear_fp32_cpu", torch::kCPU, &inkling2_bf16_linear_fp32_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption

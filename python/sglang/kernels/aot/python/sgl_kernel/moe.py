@@ -252,6 +252,8 @@ def inkling2_fused_experts_cpu(
     up_softcap: float,
     inplace: bool = False,
     is_vnni: bool = False,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.sgl_kernel.inkling2_fused_experts_cpu(
         hidden_states,
@@ -263,4 +265,6 @@ def inkling2_fused_experts_cpu(
         up_softcap,
         inplace,
         is_vnni,
+        w13_scale,
+        w2_scale,
     )

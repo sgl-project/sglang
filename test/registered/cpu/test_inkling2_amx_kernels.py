@@ -1289,3 +1289,244 @@ def test_extend_attention_cpu_tree_mask_with_swa_and_rel_bias():
         probs = torch.softmax(scores, dim=-1)
         ref[r] = torch.einsum("hk,khd->hd", probs, v_all)
     torch.testing.assert_close(o_ext, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("quant_kind", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("tokens", [2, 12])
+def test_inkling2_fused_experts_quant_and_ep_skip(quant_kind: str, tokens: int):
+    import torch.nn.functional as F
+
+    from sglang.srt.models.inkling_common.inkling2_moe import Inkling2Experts
+
+    torch.manual_seed(17 if quant_kind == "nvfp4" else 23)
+    experts, hidden, inter, topk = 2, 256, 128, 2
+    gate_cap, up_cap = 10.0, 10.0
+
+    x = (torch.randn(tokens, hidden, dtype=torch.bfloat16) * 0.1).contiguous()
+    if quant_kind == "nvfp4":
+        group_k = 16
+        w13_q = torch.randint(
+            0, 256, (experts, 2 * inter, hidden // 2), dtype=torch.uint8
+        )
+        w2_q = torch.randint(0, 256, (experts, hidden, inter // 2), dtype=torch.uint8)
+        w13_sc_fp8 = (
+            torch.rand(experts, 2 * inter, hidden // group_k) * 0.5 + 0.25
+        ).to(torch.float8_e4m3fn)
+        w2_sc_fp8 = (torch.rand(experts, hidden, inter // group_k) * 0.5 + 0.25).to(
+            torch.float8_e4m3fn
+        )
+        w13_amax = torch.tensor([1.5, 2.0], dtype=torch.float32)
+        w2_amax = torch.tensor([1.2, 1.8], dtype=torch.float32)
+        w13_denom = torch.tensor([6.0], dtype=torch.float32)
+        w2_denom = torch.tensor([6.0], dtype=torch.float32)
+
+        w13_ref = Inkling2Experts._dequantize_nvfp4(
+            w13_q, w13_sc_fp8, w13_amax, w13_denom
+        )
+        w2_ref = Inkling2Experts._dequantize_nvfp4(w2_q, w2_sc_fp8, w2_amax, w2_denom)
+        w13_eff = w13_sc_fp8.float() * (w13_amax / w13_denom)[:, None, None]
+        w2_eff = w2_sc_fp8.float() * (w2_amax / w2_denom)[:, None, None]
+    else:
+        group_k = 32
+        vals13 = torch.randn(experts, 2 * inter, hidden, dtype=torch.float32).clamp(
+            -240, 240
+        )
+        vals2 = torch.randn(experts, hidden, inter, dtype=torch.float32).clamp(
+            -240, 240
+        )
+        w13_q = vals13.to(torch.float8_e4m3fn)
+        w2_q = vals2.to(torch.float8_e4m3fn)
+        w13_sc_u8 = torch.randint(
+            123, 128, (experts, 2 * inter, hidden // group_k), dtype=torch.uint8
+        )
+        w2_sc_u8 = torch.randint(
+            123, 128, (experts, hidden, inter // group_k), dtype=torch.uint8
+        )
+
+        w13_ref = Inkling2Experts._dequantize_mxfp8(w13_q, w13_sc_u8)
+        w2_ref = Inkling2Experts._dequantize_mxfp8(w2_q, w2_sc_u8)
+        w13_eff = torch.exp2(w13_sc_u8.float() - 127.0)
+        w2_eff = torch.exp2(w2_sc_u8.float() - 127.0)
+
+    w13_packed = torch.ops.sgl_kernel.convert_weight_packed(w13_q.contiguous())
+    w2_packed = torch.ops.sgl_kernel.convert_weight_packed(w2_q.contiguous())
+    w13_sc_packed = (
+        w13_eff.view(experts, (2 * inter) // 32, 32, hidden // group_k)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+    w2_sc_packed = (
+        w2_eff.view(experts, hidden // 32, 32, inter // group_k)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+
+    # Route all tokens to experts 0/1, with an explicit remote EP (-1) slot on token 0
+    topk_ids = torch.zeros((tokens, topk), dtype=torch.int32)
+    topk_ids[:, 0] = 0
+    topk_ids[:, 1] = 1 if tokens > 4 else -1
+    topk_ids[0, 1] = -1
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32) * 0.5 + 0.1
+    topk_weights[topk_ids < 0] = 0.0
+
+    out = torch.ops.sgl_kernel.inkling2_fused_experts_cpu(
+        x,
+        w13_packed,
+        w2_packed,
+        topk_weights,
+        topk_ids,
+        gate_cap,
+        up_cap,
+        False,
+        True,
+        w13_sc_packed,
+        w2_sc_packed,
+    )
+
+    ref = torch.zeros((tokens, hidden), dtype=torch.float32)
+    for m in range(tokens):
+        for k in range(topk):
+            eid = int(topk_ids[m, k].item())
+            if eid < 0:
+                continue
+            gamma = float(topk_weights[m, k].item())
+            gu = F.linear(x[m : m + 1], w13_ref[eid]).float()
+            g, u = gu.unflatten(-1, (-1, 2)).unbind(-1)
+            act = (
+                _softcap(g, gate_cap) * torch.sigmoid(g) * _softcap(u, up_cap) * gamma
+            ).to(torch.bfloat16)
+            ref[m : m + 1] += F.linear(act, w2_ref[eid]).float()
+    torch.testing.assert_close(out, ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
+
+    # All-remote-EP batch (no active local experts) must return zeros cleanly
+    all_remote_ids = torch.full((tokens, topk), -1, dtype=torch.int32)
+    zero_out = torch.ops.sgl_kernel.inkling2_fused_experts_cpu(
+        x,
+        w13_packed,
+        w2_packed,
+        torch.zeros_like(topk_weights),
+        all_remote_ids,
+        gate_cap,
+        up_cap,
+        False,
+        True,
+        w13_sc_packed,
+        w2_sc_packed,
+    )
+    torch.testing.assert_close(zero_out, torch.zeros_like(x), atol=0.0, rtol=0.0)
+
+
+def test_inkling2_cpu_fused_auxiliary_ops():
+    import torch.nn.functional as F
+
+    from sglang.kernels.ops.attention.inkling2_attn import gate_sink
+    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+    from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import qk_l2_clip_fwd_cutedsl
+    from sglang.kernels.ops.layernorm.inkling2_rms_norm import rms_norm
+    from sglang.kernels.ops.moe.inkling2_route import route_topk
+
+    torch.manual_seed(99)
+
+    # 1. rms_norm with weight & pre_weight
+    x_rn = torch.randn(3, 128, dtype=torch.bfloat16)
+    w_rn = torch.randn(128, dtype=torch.float32)
+    pw_rn = torch.randn(128, dtype=torch.float32)
+    out_rn = rms_norm(x_rn, w_rn, 1e-6, pre_weight=pw_rn, output_dtype=torch.bfloat16)
+    xf = x_rn.float()
+    ref_rn = (
+        xf * pw_rn * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * w_rn
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(out_rn, ref_rn, atol=2e-2, rtol=2e-2)
+
+    # 2. qk_l2_clip with scale & output_scale
+    x_qk = torch.randn(4, 64, dtype=torch.bfloat16) * 10.0
+    sc_qk = torch.rand(4, 64, dtype=torch.float32) + 0.5
+    osc_qk = torch.tensor([0.75, 1.25], dtype=torch.float32)
+    with torch.no_grad():
+        out_qk = qk_l2_clip_fwd_cutedsl(
+            x_qk,
+            4.0,
+            1e-6,
+            output_dtype=torch.bfloat16,
+            scale=sc_qk,
+            output_scale=osc_qk,
+        )
+    qkf = x_qk.float() * sc_qk
+    qkn = torch.linalg.vector_norm(qkf, dim=-1, keepdim=True)
+    ref_qk = (qkf * torch.clamp(4.0 / (qkn + 1e-6), max=1.0)).to(torch.bfloat16).float()
+    ref_qk = (ref_qk * osc_qk.repeat_interleave(2)[:, None]).to(torch.bfloat16)
+    torch.testing.assert_close(out_qk, ref_qk, atol=2e-2, rtol=2e-2)
+
+    # 3. gate_sink with padded_group > group
+    tokens, heads, group, padded_group, hdim = 2, 4, 2, 4, 64
+    attn_out = torch.randn(
+        tokens, (heads // group) * padded_group, hdim, dtype=torch.float32
+    )
+    gate = torch.randn(tokens, heads * hdim, dtype=torch.bfloat16)
+    lse = torch.randn(tokens, (heads // group) * padded_group, dtype=torch.float32)
+    sinks = torch.randn(tokens, heads, dtype=torch.float32)
+    out_gs = gate_sink(
+        attn_out.reshape(tokens, -1),
+        gate,
+        lse,
+        sinks,
+        output_dtype=torch.bfloat16,
+        head_groups=(group, padded_group),
+    )
+    oh = attn_out.reshape(tokens, heads // group, padded_group, hdim)[
+        :, :, :group, :
+    ].reshape(tokens, heads, hdim)
+    lh = lse.reshape(tokens, heads // group, padded_group)[:, :, :group].reshape(
+        tokens, heads
+    )
+    ref_gs = (
+        (
+            oh
+            * torch.sigmoid(gate.reshape(tokens, heads, hdim).float())
+            * torch.sigmoid(lh - sinks).unsqueeze(-1)
+        )
+        .reshape(tokens, heads * hdim)
+        .to(torch.bfloat16)
+    )
+    torch.testing.assert_close(out_gs, ref_gs, atol=2e-2, rtol=2e-2)
+
+    # 4. attn_res (normalize_values False & True, with partial_addend)
+    blocks = [torch.randn(3, 128, dtype=torch.bfloat16) for _ in range(4)]
+    partial_add = torch.randn(3, 128, dtype=torch.bfloat16) * 0.1
+    queries = torch.randn(2, 128, dtype=torch.float32) * 0.25
+    for norm_v in (False, True):
+        res_ar = attn_res(blocks, partial_add, queries, normalize_values=norm_v)
+        stacked = torch.stack([b.float() for b in blocks], dim=0)
+        stacked[-1] = stacked[-1] + partial_add.float()
+        keys = stacked * torch.rsqrt(stacked.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        w_ar = torch.softmax(torch.einsum("qd,ntd->qnt", queries, keys), dim=1)
+        vals = keys if norm_v else stacked
+        ref_ar = tuple(torch.einsum("qnt,ntd->qtd", w_ar, vals).unbind(0))
+        for got, exp in zip(res_ar, ref_ar, strict=True):
+            torch.testing.assert_close(got, exp, atol=1e-2, rtol=1e-2)
+
+    # 5. route_topk fused renorm
+    partials = torch.randn(2, 5, 32, dtype=torch.float32) * 0.5
+    bias = torch.randn(32, dtype=torch.float32) * 0.1
+    gscale = torch.tensor(1.5, dtype=torch.float32)
+    logits, ids, weights = route_topk(
+        partials, bias, 8, route_scale=2.0, global_scale=gscale
+    )
+    ref_logits = partials.sum(dim=0)
+    ref_ids = (torch.sigmoid(ref_logits) + bias).topk(8, dim=-1).indices.to(torch.int32)
+    ref_lse = F.logsigmoid(ref_logits.gather(-1, ref_ids.long()))
+    ref_w = torch.softmax(ref_lse, dim=-1) * 2.0 * gscale
+    torch.testing.assert_close(logits, ref_logits, atol=1e-5, rtol=1e-5)
+    assert torch.equal(ids, ref_ids)
+    torch.testing.assert_close(weights, ref_w, atol=1e-5, rtol=1e-5)
+
+    # 6. inkling2_bf16_linear_fp32_cpu for M <= 4 (AVX-512) and M > 4 (AMX brgemm)
+    w_lin = torch.randn(64, 128, dtype=torch.bfloat16) * 0.25
+    packed_w = torch.ops.sgl_kernel.convert_weight_packed(w_lin)
+    b_lin = torch.randn(64, dtype=torch.float32)
+    for m in (2, 12):
+        x_lin = torch.randn(m, 128, dtype=torch.bfloat16) * 0.25
+        for b in (None, b_lin):
+            got = torch.ops.sgl_kernel.inkling2_bf16_linear_fp32_cpu(x_lin, packed_w, b)
+            exp = F.linear(x_lin.float(), w_lin.float(), b)
+            torch.testing.assert_close(got, exp, atol=2e-2, rtol=2e-2)

@@ -1,3 +1,4 @@
+import contextlib
 import math
 from functools import cache, partial
 from typing import Type
@@ -295,6 +296,21 @@ def _rms_norm_cpu(
     output_dtype: torch.dtype,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
+    y = (
+        out
+        if out is not None
+        else torch.empty(x.shape, dtype=output_dtype, device=x.device)
+    )
+    if not hasattr(torch.ops, "sgl_kernel"):
+        with contextlib.suppress(ImportError):
+            import sgl_kernel  # noqa: F401
+    if (
+        x.stride(-1) == 1
+        and hasattr(torch.ops, "sgl_kernel")
+        and hasattr(torch.ops.sgl_kernel, "inkling2_rms_norm_cpu")
+    ):
+        torch.ops.sgl_kernel.inkling2_rms_norm_cpu(x, weight, pre_weight, y, float(eps))
+        return y
     x_fp32 = x.float()
     rstd = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + float(eps))
     if pre_weight is not None:
@@ -302,11 +318,8 @@ def _rms_norm_cpu(
     res = x_fp32 * rstd
     if weight is not None:
         res = res * weight.float()
-    res = res.to(output_dtype)
-    if out is not None:
-        out.copy_(res)
-        return out
-    return res
+    y.copy_(res.to(output_dtype))
+    return y
 
 
 def rms_norm(x, weight, eps, *, pre_weight=None, output_dtype=None, out=None):

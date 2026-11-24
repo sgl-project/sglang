@@ -362,8 +362,8 @@ class Inkling2Attention(nn.Module):
         else:
             k_weight, v_weight = self.k_sconv.static_w, self.v_sconv.static_w
             k_source, v_source = sources.k.to(k.dtype), sources.v.to(v.dtype)
-            k_proj = self.k_sconv.weight_proj.to(k.dtype)
-            v_proj = self.v_sconv.weight_proj.to(v.dtype)
+            k_proj = self.k_sconv._weight_proj_for(k.dtype)
+            v_proj = self.v_sconv._weight_proj_for(v.dtype)
             if (
                 uses_k_groups(k_source, k_proj)
                 and k_source.shape[0] <= PAIRED_PARTIALS_MAX_TOKENS

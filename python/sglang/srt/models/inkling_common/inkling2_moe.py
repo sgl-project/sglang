@@ -1,3 +1,4 @@
+import contextlib
 import math
 from functools import partial
 from itertools import groupby
@@ -124,7 +125,28 @@ class Inkling2Gate(nn.Module):
         )
 
     def forward(self, x):
-        if uses_k_groups(x, self.weight):
+        if not x.is_cuda and not hasattr(torch.ops, "sgl_kernel"):
+            with contextlib.suppress(ImportError):
+                import sgl_kernel  # noqa: F401
+        if (
+            not x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.weight.shape[0] % 32 == 0
+            and self.weight.shape[1] % 32 == 0
+            and hasattr(torch.ops, "sgl_kernel")
+            and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+            and hasattr(torch.ops.sgl_kernel, "inkling2_bf16_linear_fp32_cpu")
+        ):
+            packed = getattr(self, "_cpu_weight_packed", None)
+            if packed is None:
+                packed = torch.ops.sgl_kernel.convert_weight_packed(
+                    self.weight.data.to(torch.bfloat16).contiguous()
+                )
+                self._cpu_weight_packed = packed
+            partials = torch.ops.sgl_kernel.inkling2_bf16_linear_fp32_cpu(
+                x.contiguous(), packed, None
+            )[None]
+        elif uses_k_groups(x, self.weight):
             partials = linear_k_group_partials(x.contiguous(), self.weight)
         else:
             partials = linear(x, self.weight, out_dtype=torch.float32)[None]
@@ -636,43 +658,100 @@ class Inkling2Experts(nn.Module):
         from sglang.srt.layers.amx_utils import dim_is_supported
         from sglang.srt.utils import cpu_has_amx_support
 
-        dequantized = {}
-        for name in ("w13", "w2"):
-            w = getattr(self, name + "_weight")
-            if w.dtype == torch.uint8:
-                bf16_w = self._dequantize_nvfp4(
-                    w.data,
-                    getattr(self, name + "_scale").data,
-                    getattr(self, name + "_amax").data,
-                    getattr(self, name + "_outer_scale_denominator").data,
-                )
-            elif w.dtype == torch.float8_e4m3fn:
-                bf16_w = self._dequantize_mxfp8(
-                    w.data, getattr(self, name + "_scale").data
-                )
-            else:
-                bf16_w = w.data.to(torch.bfloat16)
-            dequantized[name] = bf16_w.contiguous()
-
-        use_amx = (
-            cpu_has_amx_support()
+        self._cpu_w13_scale = None
+        self._cpu_w2_scale = None
+        w13_raw = self.w13_weight.data
+        w2_raw = self.w2_weight.data
+        two_n = w13_raw.shape[1]
+        n_inter = two_n // 2
+        k_in = w2_raw.shape[1]
+        same_quant = w13_raw.dtype == w2_raw.dtype and w13_raw.dtype in (
+            torch.uint8,
+            torch.float8_e4m3fn,
+        )
+        can_use_quant_amx = (
+            same_quant
+            and cpu_has_amx_support()
             and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
             and hasattr(torch.ops.sgl_kernel, "inkling2_fused_experts_cpu")
-            and dim_is_supported(dequantized["w13"])
-            and dim_is_supported(dequantized["w2"])
+            and two_n % 32 == 0
+            and n_inter % 32 == 0
+            and k_in % 32 == 0
         )
-        if use_amx:
-            self._cpu_w13_packed = torch.ops.sgl_kernel.convert_weight_packed(
-                dequantized["w13"]
-            )
-            self._cpu_w2_packed = torch.ops.sgl_kernel.convert_weight_packed(
-                dequantized["w2"]
-            )
+
+        if can_use_quant_amx:
+            if w13_raw.dtype == torch.uint8:
+                for name in ("w13", "w2"):
+                    w = getattr(self, name + "_weight").data.contiguous()
+                    packed = torch.ops.sgl_kernel.convert_weight_packed(w)
+                    sc = getattr(self, name + "_scale").data.float()
+                    amax = getattr(self, name + "_amax").data.float()
+                    denom = getattr(
+                        self, name + "_outer_scale_denominator"
+                    ).data.float()
+                    eff = sc * (amax / denom)[:, None, None]
+                    e_dim, oc_dim, ng = eff.shape
+                    packed_sc = (
+                        eff.view(e_dim, oc_dim // 32, 32, ng)
+                        .permute(0, 1, 3, 2)
+                        .contiguous()
+                    )
+                    setattr(self, f"_cpu_{name}_packed", packed)
+                    setattr(self, f"_cpu_{name}_scale", packed_sc)
+            else:
+                for name in ("w13", "w2"):
+                    w = getattr(self, name + "_weight").data.contiguous()
+                    packed = torch.ops.sgl_kernel.convert_weight_packed(w)
+                    sc = getattr(self, name + "_scale").data
+                    eff = torch.exp2(sc.view(torch.uint8).float() - 127.0)
+                    e_dim, oc_dim, ng = eff.shape
+                    packed_sc = (
+                        eff.view(e_dim, oc_dim // 32, 32, ng)
+                        .permute(0, 1, 3, 2)
+                        .contiguous()
+                    )
+                    setattr(self, f"_cpu_{name}_packed", packed)
+                    setattr(self, f"_cpu_{name}_scale", packed_sc)
             self._cpu_is_vnni = True
+            use_amx = True
         else:
-            self._cpu_w13_packed = dequantized["w13"]
-            self._cpu_w2_packed = dequantized["w2"]
-            self._cpu_is_vnni = False
+            dequantized = {}
+            for name in ("w13", "w2"):
+                w = getattr(self, name + "_weight")
+                if w.dtype == torch.uint8:
+                    bf16_w = self._dequantize_nvfp4(
+                        w.data,
+                        getattr(self, name + "_scale").data,
+                        getattr(self, name + "_amax").data,
+                        getattr(self, name + "_outer_scale_denominator").data,
+                    )
+                elif w.dtype == torch.float8_e4m3fn:
+                    bf16_w = self._dequantize_mxfp8(
+                        w.data, getattr(self, name + "_scale").data
+                    )
+                else:
+                    bf16_w = w.data.to(torch.bfloat16)
+                dequantized[name] = bf16_w.contiguous()
+
+            use_amx = (
+                cpu_has_amx_support()
+                and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+                and hasattr(torch.ops.sgl_kernel, "inkling2_fused_experts_cpu")
+                and dim_is_supported(dequantized["w13"])
+                and dim_is_supported(dequantized["w2"])
+            )
+            if use_amx:
+                self._cpu_w13_packed = torch.ops.sgl_kernel.convert_weight_packed(
+                    dequantized["w13"]
+                )
+                self._cpu_w2_packed = torch.ops.sgl_kernel.convert_weight_packed(
+                    dequantized["w2"]
+                )
+                self._cpu_is_vnni = True
+            else:
+                self._cpu_w13_packed = dequantized["w13"]
+                self._cpu_w2_packed = dequantized["w2"]
+                self._cpu_is_vnni = False
 
         # Drop raw weight and scale buffers after lazy conversion/packing.
         for name in ("w13", "w2"):
@@ -694,7 +773,7 @@ class Inkling2Experts(nn.Module):
             local_ids = ids - start
             in_range = (local_ids >= 0) & (local_ids < num_local)
             local_weights = torch.where(in_range, weights.float(), 0.0)
-            local_ids = torch.where(in_range, local_ids, 0)
+            local_ids = torch.where(in_range, local_ids, -1)
         else:
             local_ids = ids
             local_weights = weights.float()
@@ -713,6 +792,8 @@ class Inkling2Experts(nn.Module):
                 float(self.up_cap),
                 False,
                 True,
+                self._cpu_w13_scale,
+                self._cpu_w2_scale,
             )
             if out.dtype != x.dtype:
                 out = out.to(x.dtype)

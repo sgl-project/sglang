@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import triton
 import triton.language as tl
@@ -103,6 +105,25 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
         else None
     )
     if m and not partials.is_cuda:
+        if not hasattr(torch.ops, "sgl_kernel"):
+            with contextlib.suppress(ImportError):
+                import sgl_kernel  # noqa: F401
+        if hasattr(torch.ops, "sgl_kernel") and hasattr(
+            torch.ops.sgl_kernel, "inkling2_route_topk_cpu"
+        ):
+            torch.ops.sgl_kernel.inkling2_route_topk_cpu(
+                partials,
+                bias,
+                logits,
+                ids,
+                weights,
+                int(topk),
+                float(route_scale) if fuse_renorm else 1.0,
+                global_scale,
+            )
+            if fuse_renorm:
+                return logits, ids, weights
+            return logits, ids
         logits.copy_(partials.float().sum(dim=0))
         selection = torch.sigmoid(logits)
         if bias is not None:

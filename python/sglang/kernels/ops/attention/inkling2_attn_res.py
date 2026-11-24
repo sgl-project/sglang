@@ -1,10 +1,12 @@
-# ruff: noqa: SIM102
-
+import contextlib
 import operator
 from functools import cache
 from typing import Optional
 
 import torch
+
+# ruff: noqa: SIM102
+
 
 try:
     import cutlass
@@ -835,6 +837,20 @@ if cutlass is not None:
 
 
 def _attn_res_cpu(blocks, partial_addend, queries, normalize_values: bool):
+    if not hasattr(torch.ops, "sgl_kernel"):
+        with contextlib.suppress(ImportError):
+            import sgl_kernel  # noqa: F401
+    if hasattr(torch.ops, "sgl_kernel") and hasattr(
+        torch.ops.sgl_kernel, "inkling2_attn_res_cpu"
+    ):
+        return tuple(
+            torch.ops.sgl_kernel.inkling2_attn_res_cpu(
+                list(blocks),
+                partial_addend,
+                queries,
+                bool(normalize_values),
+            )
+        )
     stacked = torch.stack([b.float() for b in blocks], dim=0)
     if partial_addend is not None:
         stacked[-1] = stacked[-1] + partial_addend.float()

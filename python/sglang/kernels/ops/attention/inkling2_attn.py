@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import triton
 import triton.language as tl
@@ -312,6 +314,23 @@ def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
     assert output.shape[1] == heads // group * padded_group * (gate.shape[1] // heads)
     result = torch.empty(gate.shape, device=output.device, dtype=output_dtype)
     if result.numel() and not output.is_cuda:
+        if not hasattr(torch.ops, "sgl_kernel"):
+            with contextlib.suppress(ImportError):
+                import sgl_kernel  # noqa: F401
+        if hasattr(torch.ops, "sgl_kernel") and hasattr(
+            torch.ops.sgl_kernel, "inkling2_gate_sink_cpu"
+        ):
+            torch.ops.sgl_kernel.inkling2_gate_sink_cpu(
+                output,
+                gate,
+                lse,
+                sinks,
+                result,
+                int(heads),
+                int(group),
+                int(padded_group),
+            )
+            return result
         tokens = result.shape[0]
         head_dim = result.shape[1] // heads
         out_heads = (
