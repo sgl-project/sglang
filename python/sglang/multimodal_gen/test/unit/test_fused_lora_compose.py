@@ -710,3 +710,65 @@ def test_section_alpha_of_partial_fused_qkv_is_applied(tmp_path):
         [torch.zeros(3, sum(OUTPUT_SIZES[:2])), v_delta], dim=-1
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_flux_lora_on_q_and_v_of_fused_qkv_keeps_k(tmp_path):
+    # Fused-QKV FLUX builds (FP8 / NVFP4) stack to_q/to_k/to_v into to_qkv; a
+    # LoRA trained on to_q and to_v only must apply both and leave K alone.
+    from sglang.multimodal_gen.configs.models.dits.flux import FluxArchConfig
+
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    transformer = torch.nn.Module()
+    transformer.transformer_blocks = torch.nn.ModuleList([torch.nn.Module()])
+    transformer.transformer_blocks[0].attn = torch.nn.Module()
+    transformer.transformer_blocks[0].attn.to_qkv = layer
+    transformer.lora_param_names_mapping = {}
+    layers = {"transformer_blocks.0.attn.to_qkv": layer}
+
+    pipeline = _make_loader_pipeline()
+    pipeline.modules = {"transformer": transformer}
+    pipeline.lora_layers = layers
+    pipeline.server_args.pipeline_config.dit_config.arch_config = FluxArchConfig()
+
+    rank = 2
+    torch.manual_seed(17)
+    q_a, v_a = torch.randn(rank, IN_DIM), torch.randn(rank, IN_DIM)
+    q_b = torch.randn(OUTPUT_SIZES[0], rank)
+    v_b = torch.randn(OUTPUT_SIZES[2], rank)
+    prefix = "transformer.transformer_blocks.0.attn"
+    adapter_file = str(tmp_path / "flux_q_v.safetensors")
+    save_file(
+        {
+            f"{prefix}.to_q.lora_A.weight": q_a,
+            f"{prefix}.to_q.lora_B.weight": q_b,
+            f"{prefix}.to_v.lora_A.weight": v_a,
+            f"{prefix}.to_v.lora_B.weight": v_b,
+        },
+        adapter_file,
+    )
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0)
+        applied = pipeline._apply_lora_to_layers(
+            layers,
+            ["adapter"],
+            [adapter_file],
+            rank=0,
+            strengths=[1.0],
+            merge_weights=False,
+        )
+
+    assert applied == 1
+    x = torch.randn(3, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    delta = torch.cat(
+        [x @ q_a.T @ q_b.T, torch.zeros(3, OUTPUT_SIZES[1]), x @ v_a.T @ v_b.T],
+        dim=-1,
+    )
+    torch.testing.assert_close(out, x @ base_weight.T + delta, rtol=1e-5, atol=1e-5)
