@@ -6,6 +6,8 @@ row's vocabulary over several programs; the second adds the parts, the top-k mas
 clamp. Only the summation order and the exp / divide rounding differ from the compiled path.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -74,9 +76,15 @@ def _top_p_finish_kernel(
     tl.store(out_ptr + row, tl.minimum(top_p * (full_mass / topk_mass), 1.0))
 
 
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def _split_for(rows: int, device: torch.device) -> int:
     # Enough programs for every SM to hold several; the rows alone give one wave at most.
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    sms = _sm_count(index)
     split = 4
     while split < 32 and rows * split < 8 * sms:
         split *= 2
@@ -93,8 +101,8 @@ def top_p_for_top_k_support(
 ) -> torch.Tensor:
     """[rows, 1] fp32 top-p bounds on the sorted top-k support, as
     ``_adjust_top_p_for_top_k`` computes them. ``topk_logits`` [rows, K] sorted descending,
-    ``full_logits`` [rows, vocab]; ``temperatures`` / ``top_ks`` / ``top_ps`` per request
-    (rows = requests x ``width``)."""
+    ``full_logits`` [rows, vocab] with unit column stride; ``temperatures`` / ``top_ks`` /
+    ``top_ps`` per request (rows = requests x ``width``)."""
     rows, vocab = full_logits.shape
     max_top_k = topk_logits.shape[1]
     split = _split_for(rows, full_logits.device)

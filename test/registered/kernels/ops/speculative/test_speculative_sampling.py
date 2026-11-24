@@ -381,25 +381,46 @@ def test_target_only_triton_matches_reference():
 
 
 @pytest.mark.skipif(torch.version.cuda is None, reason="UNO compact path requires CUDA")
-@pytest.mark.parametrize("requests", [1, 16, 68])
-def test_uno_fused_top_p_mass_matches_the_compiled_bound(requests, monkeypatch):
+@pytest.mark.parametrize(
+    "requests, vocab, dtype",
+    [
+        (1, 248320, torch.float32),
+        (16, 248320, torch.float32),
+        (68, 248320, torch.float32),
+        (16, 32000, torch.float32),
+        (16, 151936, torch.bfloat16),
+        (16, 100003, torch.bfloat16),  # not a multiple of the 4096-entry block
+    ],
+)
+@pytest.mark.parametrize("case", ["random", "masked", "top_k_1"])
+def test_uno_fused_top_p_mass_matches_the_compiled_bound(
+    requests, vocab, dtype, case, monkeypatch
+):
     """SGLANG_OPT_SPEC_FUSED_TOP_P_MASS: the compiled bound up to fp32 summation order,
-    and the same kept supports."""
+    and the same kept supports from the same top-k, including -inf (masked) logits,
+    top_k = 1 and bf16 logits."""
     from sglang.kernels.ops.speculative.top_p_mass import top_p_for_top_k_support
     from sglang.srt.speculative import uno_utils
     from sglang.srt.speculative.dflash_utils import _adjust_top_p_for_top_k
 
-    width, vocab, max_top_k = 4, 248320, 20
+    width, max_top_k = 4, 20
     rows = requests * width
-    g = torch.Generator(device="cuda").manual_seed(requests)
+    g = torch.Generator(device="cuda").manual_seed(requests * 7 + vocab)
     logits = torch.randn(rows, vocab, generator=g, device="cuda") * 2.5
     peaks = torch.randint(0, vocab, (rows, 8), generator=g, device="cuda")
     logits.scatter_add_(1, peaks, torch.rand(rows, 8, generator=g, device="cuda") * 12)
+    if case == "masked":
+        # a masked vocabulary tail, and a first request with three allowed tokens
+        logits[:, vocab - vocab // 10 :] = float("-inf")
+        logits[:width, 3:] = float("-inf")
+    logits = logits.to(dtype)
     temperatures = 0.5 + torch.rand(requests, 1, generator=g, device="cuda")
     top_ks = torch.randint(2, max_top_k + 1, (requests,), generator=g, device="cuda")
+    if case == "top_k_1":
+        top_ks.fill_(1)
     top_ps = 0.6 + 0.4 * torch.rand(requests, generator=g, device="cuda")
 
-    topk_logits = torch.topk(logits, max_top_k, dim=-1).values
+    topk_logits, topk_ids = torch.topk(logits, max_top_k, dim=-1)
     expanded_t = temperatures.repeat_interleave(width, dim=0)
     valid = torch.arange(max_top_k, device="cuda")[None, :] < top_ks.repeat_interleave(
         width
@@ -413,10 +434,10 @@ def test_uno_fused_top_p_mass_matches_the_compiled_bound(requests, monkeypatch):
     )
     torch.testing.assert_close(got, want, rtol=1e-5, atol=0)
 
-    supports = {}
-    for fused in (False, True):
-        monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", fused)
-        supports[fused] = _build_sparse_target_support_tensors(
+    (ids, base), (fused_ids, fused) = (
+        uno_utils._sparse_target_support_from_topk(
+            topk_logits=topk_logits,
+            topk_ids=topk_ids,
             next_token_logits=logits,
             temperatures=temperatures,
             top_ks=top_ks,
@@ -424,12 +445,36 @@ def test_uno_fused_top_p_mass_matches_the_compiled_bound(requests, monkeypatch):
             batch_size=requests,
             forward_width=width,
             max_top_k=max_top_k,
+            adjusted_top_ps=adjusted,
         )
-    assert torch.equal(supports[False][0], supports[True][0])
-    assert torch.equal(supports[False][1] > 0, supports[True][1] > 0)
-    torch.testing.assert_close(
-        supports[True][1], supports[False][1], rtol=1e-5, atol=1e-7
+        for adjusted in (None, got)
     )
+    assert torch.equal(ids, fused_ids)
+    assert torch.equal(base > 0, fused > 0)
+    torch.testing.assert_close(fused, base, rtol=1e-5, atol=1e-7)
+
+    # the switch routes the support builder through the fused bound; FlashInfer's
+    # top-k in the builder needs rows of whole 16-byte words
+    if vocab * logits.element_size() % 16:
+        return
+    calls = []
+
+    def fused_bound(*args):
+        calls.append(args)
+        return top_p_for_top_k_support(*args)
+
+    monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", True)
+    monkeypatch.setattr(uno_utils, "top_p_for_top_k_support", fused_bound)
+    _build_sparse_target_support_tensors(
+        next_token_logits=logits,
+        temperatures=temperatures,
+        top_ks=top_ks,
+        top_ps=top_ps,
+        batch_size=requests,
+        forward_width=width,
+        max_top_k=max_top_k,
+    )
+    assert len(calls) == 1
 
 
 if __name__ == "__main__":

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import functools
-import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,8 +17,6 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
 )
 from sglang.srt.speculative.spec_utils import fast_sample
-
-logger = logging.getLogger(__name__)
 
 _SPARSE_TOP_K_LIMIT = 128
 _FUSED_TOP_P_MASS = envs.SGLANG_OPT_SPEC_FUSED_TOP_P_MASS.get()
@@ -139,13 +135,6 @@ def _sparse_rejection_from_support(
     return accepted_counts, bonus
 
 
-@functools.cache
-def _log_fused_top_p_mass_once() -> None:
-    logger.info(
-        "Compact verify support: fused top-p bound engaged (SGLANG_OPT_SPEC_FUSED_TOP_P_MASS)"
-    )
-
-
 def _build_sparse_target_support_tensors(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -158,8 +147,9 @@ def _build_sparse_target_support_tensors(
     """Build compact support using the fastest available top-k primitive."""
     # Runs outside torch.compile: Dynamo cannot trace FlashInfer's stream-keyed
     # scratch-buffer lookup, which calls torch._C._cuda_getCurrentRawStream since 0.7.4.
+    logits = next_token_logits.contiguous()
     topk_logits, topk_ids = _flashinfer_top_k(
-        next_token_logits.contiguous(),
+        logits,
         max_top_k,
         sorted=True,
         deterministic=False,
@@ -167,9 +157,8 @@ def _build_sparse_target_support_tensors(
     adjusted_top_ps = None
     if top_ps is not None and _FUSED_TOP_P_MASS:
         adjusted_top_ps = top_p_for_top_k_support(
-            topk_logits, next_token_logits, temperatures, top_ks, top_ps, forward_width
+            topk_logits, logits, temperatures, top_ks, top_ps, forward_width
         )
-        _log_fused_top_p_mass_once()
     return _sparse_target_support_from_topk(
         topk_logits=topk_logits,
         topk_ids=topk_ids,
