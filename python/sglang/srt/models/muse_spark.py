@@ -70,7 +70,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.muse_spark.fused import glue
-from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
+from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import (
+    MuseSpark1xBf16Experts,
+    expert_stack_in_layout,
+)
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
@@ -1419,7 +1422,7 @@ class MuseSparkTextForCausalLM(nn.Module):
         self, param: torch.Tensor, loaded_weight: torch.Tensor, name: str
     ) -> None:
         if param.shape == loaded_weight.shape:
-            param.data.copy_(loaded_weight)
+            param.data.copy_(expert_stack_in_layout(param, loaded_weight))
             return
         parallel = get_parallel()
         if loaded_weight.shape[0] == self.config.num_local_experts:
@@ -1435,7 +1438,7 @@ class MuseSparkTextForCausalLM(nn.Module):
                 f"Expert weight shape mismatch for {name}: "
                 f"parameter={tuple(param.shape)}, checkpoint={tuple(loaded_weight.shape)}"
             )
-        param.data.copy_(loaded_weight)
+        param.data.copy_(expert_stack_in_layout(param, loaded_weight))
 
     @staticmethod
     def _shard_expert_intermediate(

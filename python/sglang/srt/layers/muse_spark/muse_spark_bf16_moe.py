@@ -185,6 +185,22 @@ def _triton_bf16_moe_supported(device: torch.device) -> bool:
     return True
 
 
+_INTERLEAVED_DIRECT_UPDATE_ERROR = (
+    "load_format='direct' would write the checkpoint's [gate; up] rows into Muse "
+    "Spark's interleaved BF16 experts; update weights with the default load format."
+)
+
+
+def interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
+    """``[..., 2I, H]`` gate rows then up rows -> rows 2i, 2i + 1: gate i, up i."""
+    return w.unflatten(-2, (2, -1)).transpose(-3, -2).flatten(-3, -2)
+
+
+def expert_stack_in_layout(param: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A checkpoint's expert stack in ``param``'s row order."""
+    return interleave_gate_up(w) if getattr(param, "gate_up_interleaved", False) else w
+
+
 class MuseSpark1xBf16Experts(nn.Module):
     """Local BF16 expert weights, run by TRT-LLM or by the PyTorch loop."""
 
@@ -227,6 +243,8 @@ class MuseSpark1xBf16Experts(nn.Module):
         self.use_trtllm = False
         self.use_triton = False
         self._triton_runner_config = None
+        self._triton_interleaved = False
+        self._direct_weight_update_error = None
         self._finalize_op: Optional[FusedPostExpertNormWeightedSumTRTLLM] = None
         self.register_buffer("_post_expert_norm_weight", None, persistent=False)
         self.gate_up_proj = nn.Parameter(
@@ -275,8 +293,13 @@ class MuseSpark1xBf16Experts(nn.Module):
                 self.intermediate_size,
             )
         if shard_id in ("w1", "w3"):
-            offset = 0 if shard_id == "w1" else self.intermediate_size
-            target = target.narrow(0, offset, self.intermediate_size)
+            half = 0 if shard_id == "w1" else 1
+            if self._triton_interleaved:
+                target = target.view(self.intermediate_size, 2, -1).select(1, half)
+            else:
+                target = target.narrow(
+                    0, half * self.intermediate_size, self.intermediate_size
+                )
         elif shard_id != "w2":
             raise ValueError(f"Unsupported expert shard: {shard_id}")
         if target.shape != loaded_weight.shape:
@@ -309,7 +332,10 @@ class MuseSpark1xBf16Experts(nn.Module):
                     return
                 # gate / up rows interleaved: the up-GEMM epilogue applies the SiLU, stores half width
                 for w in self.gate_up_proj.data:
-                    w.copy_(w.view(2, -1, w.shape[1]).transpose(0, 1).reshape(w.shape))
+                    w.copy_(interleave_gate_up(w))
+                # later checkpoint loads write the same layout
+                self.gate_up_proj.gate_up_interleaved = True
+                self._direct_weight_update_error = _INTERLEAVED_DIRECT_UPDATE_ERROR
                 if torch.cuda.get_device_capability(self.gate_up_proj.device) == (9, 0):
                     self._compile_grouped(post_expert_norm)
             return
