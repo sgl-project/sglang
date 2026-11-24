@@ -107,10 +107,11 @@ def handle_moe_kernel_config(server_args: Any):
     if view.moe_runner_backend == "flashinfer_cutedsl":
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
         assert (
-            view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
+            view.quantization
+            in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online", "minimax_m3_nvfp4"]
             or model_config_of(server_args).nvfp4_moe_meta is not None
         ), (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', 'minimax_m3_nvfp4', or hybrid NVFP4 models."
         )
         assert view.ep_size in [
             1,
@@ -133,6 +134,18 @@ def handle_moe_kernel_config(server_args: Any):
                 "flashinfer_cutedsl per-token NVFP4 activation requires "
                 "moe_a2a_backend='none' or 'flashinfer_nvlink_one_sided'."
             )
+        if view.quantization == "minimax_m3_nvfp4":
+            if view.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "MiniMax-M3 NVFP4 on flashinfer_cutedsl requires "
+                    "--moe-a2a-backend deepep."
+                )
+            if cfg.deepep_dispatcher_output_dtype not in ("auto", "nvfp4"):
+                raise ValueError(
+                    "MiniMax-M3 NVFP4 on flashinfer_cutedsl dispatches per-token "
+                    "NVFP4 activations; --deepep-dispatcher-output-dtype must be "
+                    "auto or nvfp4."
+                )
 
     if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
         assert view.quantization in [
@@ -854,9 +867,39 @@ def _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
     return max(tokens, graph_bs * tokens_per_req)
 
 
+def _validate_minimax_m3_deepep_ll_token_budget(server_args: Any) -> None:
+    view = resolved_view(server_args)
+    if (
+        view.quantization != "minimax_m3_nvfp4"
+        or view.moe_runner_backend != "flashinfer_cutedsl"
+        or view.moe_a2a_backend != "deepep"
+    ):
+        return
+    if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
+        raise ValueError(
+            "MiniMax-M3 NVFP4 on flashinfer_cutedsl dispatches prefill through "
+            "DeepEP low-latency mode, which requires chunked prefill "
+            "(--chunked-prefill-size > 0)."
+        )
+    # DeepEP low-latency dispatch serves prefill as well, so every prefill chunk
+    # and captured graph must fit its per-rank buffer.
+    required = _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args)
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if required > capacity:
+        raise ValueError(
+            "MiniMax-M3 NVFP4 on flashinfer_cutedsl dispatches every "
+            "forward through DeepEP low-latency mode, whose per-rank "
+            f"buffer holds {capacity} tokens, but this config needs "
+            f"{required} (prefill chunk, prefill graph, or decode graph). "
+            "Raise SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK (<= 1024) "
+            "or lower --chunked-prefill-size / --cuda-graph-max-bs-prefill."
+        )
+
+
 def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
     """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
     largest forward; at runtime the dispatcher asserts on the first such batch."""
+    _validate_minimax_m3_deepep_ll_token_budget(server_args)
     view = resolved_view(server_args)
     if view.moe_a2a_backend != "flashinfer_nvlink_one_sided":
         return
