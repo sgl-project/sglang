@@ -35,7 +35,7 @@ stages in that mode.
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import msgspec
 import torch
@@ -49,6 +49,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 from sglang.srt.sampling.grammar_mask import apply_grammar_mask
 from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -63,13 +64,15 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_observer import SamplingObserver
-    from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
     from sglang.srt.sampling.watermarking.interface import (
         VerifyWatermark,
         WatermarkEngine,
     )
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
     from sglang.srt.speculative.spec_utils import HostVerifyTree
+
+# A tree verify's accept, or a chain verify's.
+_Accept = TypeVar("_Accept", VerifyAccept, ChainAccept)
 
 
 class SamplingPipeline(msgspec.Struct, frozen=True):
@@ -364,17 +367,23 @@ class VerifyStep(msgspec.Struct):
         self,
         logits_output: LogitsProcessorOutput,
         *,
-        tree: EagleVerifyInput,
         host_tree: Optional[HostVerifyTree],
         barrier: Optional[Callable[[], Dict[Req, List[int]]]],
-        accept_core: Callable[[torch.Tensor, SamplingBatchInfo], VerifyAccept],
-    ) -> VerifyAccept:
-        """A tree verify after its target forward, in one call: probe the
-        model's logits, build the stages' row inputs (`build_row_inputs`, which
-        reads `host_tree` and `barrier`), apply the stages when the route says
-        some stage edits the logits, never on an idle batch (on the full
-        logits, so a vocabulary shard is gathered first), accept, cap each
-        first-row-only request to one token, and commit.
+        accept_core: Callable[[torch.Tensor, SamplingBatchInfo], _Accept],
+        tree: Optional[EagleVerifyInput] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
+    ) -> _Accept:
+        """A verify after its target forward, in one call: probe the model's
+        logits, build the stages' row inputs (`build_row_inputs`, which reads
+        `host_tree` and `barrier`), apply the stages when the route says some
+        stage edits the logits, never on an idle batch (on the full logits, so a
+        vocabulary shard is gathered first), accept, cap each first-row-only
+        request to one token, and commit.
+        A tree verify passes its verify input as `tree`, and its `accept_core`
+        returns a `VerifyAccept`; a chain verify passes its [bs, width]
+        `draft_tokens` and the `prefix_lens` its accept commits after, and its
+        `accept_core` returns a `ChainAccept`.
         `accept_core(logits, sampling_info)` is the worker's accept over the
         logits and sampling info after the stages; when no stage runs, the
         model's logits (possibly a vocabulary shard) and the batch's sampling
@@ -384,15 +393,23 @@ class VerifyStep(msgspec.Struct):
         batch = self.batch
         logits, sampling_info = logits_output.next_token_logits, batch.sampling_info
         if self.route.adjusts_logits and not batch.forward_mode.is_idle():
-            draft_tokens = tree.draft_token.reshape(
-                len(batch.seq_lens), tree.draft_token_num
-            )
+            if tree is not None:
+                draft_tokens = tree.draft_token.reshape(
+                    len(batch.seq_lens), tree.draft_token_num
+                )
             logits, sampling_info = self.adjust(
                 logits_output.gather_vocab_shard(), draft_tokens, tree=tree
             )
         result = accept_core(logits, sampling_info)
-        self.cap_tree_accept(result.accept_lens, result.accept_index)
-        self.commit(result, logits_output=logits_output)
+        if tree is not None:
+            self.cap_tree_accept(result.accept_lens, result.accept_index)
+            committed = result
+        else:
+            self.cap_chain_accept(result, prefix_lens=prefix_lens)
+            committed = VerifyAccept(
+                tokens=result.out_tokens, accept_lens=result.commit_lens
+            )
+        self.commit(committed, logits_output=logits_output)
         return result
 
     def build_row_inputs(
