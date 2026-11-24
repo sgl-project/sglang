@@ -22,6 +22,7 @@ cd "${sglang_source_path}"
 # CI hosts mount /root/.cache/huggingface read-only, but --trust-remote-code
 # needs a writable transformers dynamic-module cache.
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
+echo "HF_MODULES_CACHE=${HF_MODULES_CACHE}"
 
 echo "NPU info:"
 npu-smi info
@@ -189,20 +190,31 @@ rm -rf "${log_path}"
 mkdir -p "${log_path}"
 echo "Log path: ${log_path}"
 
+test_status=0
 if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
     echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
     ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
     sleep 14400
 else
     ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
+    # A pipeline reports tee's status, so keep the test's own exit code and
+    # replay it at the end: otherwise a failed pod exits 0, shows up as
+    # Succeeded, and the k8s/Volcano failure semantics never trigger.
+    test_status=${PIPESTATUS[0]}
 fi
 echo "Finished test case ${test_case}"
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
-    # Archive the test log into the output directory for result collection
-    cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
-    echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+    node_log_dir="${METRICS_DATA_FILE}/node_logs/${HOSTNAME}"
+    mkdir -p "${node_log_dir}"
+    # dump_pod_logs archives this pod under the same ${HOSTNAME}.log name from
+    # the runner and may win the race, so keep whichever copy landed first
+    # instead of also dropping the test-only log under the case name.
+    if [ ! -f "${node_log_dir}/${HOSTNAME}.log" ]; then
+        cp -a "${log_path}/${tc_name}.log" "${node_log_dir}/${HOSTNAME}.log"
+    fi
+    echo "Node log saved to ${node_log_dir}"
 fi
 
 source_plog_path="/root/ascend/log/debug/plog"
@@ -216,3 +228,5 @@ if [ -d "$source_plog_path" ];then
     mkdir -p "${target_plog_path}"
     cp ${source_plog_path}/* "${target_plog_path}"
 fi
+
+exit "${test_status}"

@@ -1,6 +1,6 @@
 import json
 from types import SimpleNamespace
-from typing import Dict, List, TypedDict
+from typing import Dict, List, Tuple, TypedDict
 
 import torch
 
@@ -22,12 +22,21 @@ class BenchmarkConfig(TypedDict):
 
 
 def calculate_shard_intermediate_size(
-    intermediate_size: int, tp_size: int, ep_size: int = 1
+    intermediate_size: int, tp_size: int, ep_size: int = 1, is_gated: bool = True
 ) -> int:
+    """Rows of w1 per shard: gate and up stacked for gated MoE, up only otherwise."""
     assert tp_size % ep_size == 0
     moe_tp_size = tp_size // ep_size
     assert intermediate_size % moe_tp_size == 0
-    return 2 * intermediate_size // moe_tp_size
+    return (2 if is_gated else 1) * intermediate_size // moe_tp_size
+
+
+def get_moe_activation(architecture: str, config) -> Tuple[str, bool]:
+    """(activation, is_gated) of the routed experts, as the model builds its MoE layer."""
+    if architecture == "NemotronHForCausalLM":
+        # NemotronH experts are non-gated: up projection then relu2, no gate.
+        return config.mlp_hidden_act, False
+    return "silu", True
 
 
 def get_model_config(
@@ -193,8 +202,9 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
 
+    activation, is_gated = get_moe_activation(architecture, config)
     shard_intermediate_size = calculate_shard_intermediate_size(
-        intermediate_size, tp_size, ep_size
+        intermediate_size, tp_size, ep_size, is_gated
     )
 
     # gfx942 (MI300X) remaps MXFP8 [1,32]->[128,128] at load; tune must match.
@@ -218,6 +228,8 @@ def get_model_config(
         "topk": topk,
         "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
+        "activation": activation,
+        "is_gated": is_gated,
         "dtype": torch_dtype,
         "block_shape": block_shape,
         "architecture": architecture,
@@ -310,6 +322,7 @@ def get_config_filename(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int],
+    is_gated: bool = True,
 ) -> str:
     dtype_str = get_config_dtype_str(
         dtype,
@@ -321,7 +334,7 @@ def get_config_filename(
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
-    N = shard_intermediate_size // 2
+    N = shard_intermediate_size // 2 if is_gated else shard_intermediate_size
 
     filename = get_config_file_name(
         num_experts,

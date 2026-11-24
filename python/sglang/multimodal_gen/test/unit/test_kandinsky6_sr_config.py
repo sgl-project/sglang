@@ -221,7 +221,7 @@ def test_sr_flags_reach_the_sampling_params_through_the_generate_cli():
     assert "num_inference_steps" in Kandinsky6TI2VASamplingParams.get_cli_args(args)
 
 
-def test_request_needs_exactly_one_video_and_names_its_output_after_it():
+def test_request_needs_exactly_one_video_and_keeps_its_name_private():
     with pytest.raises(ValueError, match="--video-path"):
         Kandinsky6SRSamplingParams()._validate_with_pipeline_config(
             Kandinsky6SRPipelineConfig()
@@ -231,4 +231,4 @@ def test_request_needs_exactly_one_video_and_names_its_output_after_it():
 
     params = Kandinsky6SRSamplingParams(video_path="/data/my clip.mp4", prompt=" ")
     params._set_output_file_name()
-    assert re.fullmatch(r"my_clip_sr2\.25x_\d{8}-\d{6}\.mp4", params.output_file_name)
+    assert re.fullmatch(r"output_[0-9a-f]{32}\.mp4", params.output_file_name)

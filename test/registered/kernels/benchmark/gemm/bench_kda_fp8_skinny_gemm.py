@@ -18,7 +18,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+)
 
 
 def _make_inputs(m: int, n: int, k: int):
@@ -109,7 +111,7 @@ NATIVE_M1_CASES = [
     MODEL_FP8_CASES,
     [("Qwen3.8-27B/attn-qkv", 9, 8192, 5120)],
 )
-@marker.benchmark("provider", ["kda", "torch", "flashinfer"])
+@marker.benchmark("provider", ["kda", "torch", "flashinfer"], gate=["kda"])
 def benchmark(model: str, m: int, n: int, k: int, provider: str):
     del model
     args = _make_inputs(m, n, k)

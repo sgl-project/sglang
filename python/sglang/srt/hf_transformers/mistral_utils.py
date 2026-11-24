@@ -374,7 +374,7 @@ def load_mistral_config(
     Returns a ``PretrainedConfig`` with dict sub-configs (text_config,
     vision_config) converted to proper AutoConfig objects.
     """
-    local_path = download_from_hf(model_path)
+    local_path = download_from_hf(model_path, revision=revision)
     parser = MistralConfigParser()
     config_dict, _ = parser.parse(local_path)
 
@@ -464,11 +464,7 @@ def is_bare_tekken_checkpoint(tokenizer_name, revision=None) -> bool:
 
 
 def retry_without_mistral_common_kwargs(tokenizer_name, *args, **common_kwargs):
-    """Retry ``AutoTokenizer.from_pretrained`` without kwargs that MistralCommon rejects.
-
-    Returns the loaded tokenizer, or *None* if the error is not a
-    MistralCommon kwargs rejection.
-    """
+    """Retry ``AutoTokenizer.from_pretrained`` without kwargs that MistralCommon rejects."""
     from transformers import AutoTokenizer
 
     stripped = {
