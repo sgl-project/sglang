@@ -254,9 +254,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     get_available_gpu_memory,
-    is_host_cpu_arm64,
     is_npu,
     set_cuda_arch,
     slow_rank_detector,
@@ -268,8 +266,6 @@ from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -277,8 +273,6 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
-
-# Detect stragger ranks in model loading
 
 
 logger = logging.getLogger(__name__)
@@ -424,9 +418,6 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
-        self.is_multimodal_chunked_prefill_supported = (
-            model_config.is_multimodal_chunked_prefill_supported
-        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -1507,11 +1498,7 @@ class ModelRunner:
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.model_config,
-            logger,
-        )
+        reserve_rope_cache_for_long_sequences(self.model, self.model_config)
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
