@@ -4145,6 +4145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-processor-python"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "serde_json",
+ "sglang-processor",
+]
+
+[[package]]
 name = "sglang-runtime-v1-types"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sglang-processor"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "In-process SGLang chat preprocessing for Python frontends"
+
+[project.entry-points."dynamo.frontend.chat_processors"]
+sglang-rust = "sglang_processor.dynamo:provider"
+
+[tool.maturin]
+module-name = "sglang_processor._native"
+python-source = "python"
