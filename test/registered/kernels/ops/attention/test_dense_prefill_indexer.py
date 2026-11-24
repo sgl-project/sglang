@@ -482,6 +482,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     req_pool_indices=torch.arange(len(cases), device="cuda"),
                     k_slots=data.k_slots,
                     index_plans=None,
+                    paged_index_k_caches={},
                     kv_page_table=torch.empty(0, device="cuda"),
                     seq_lens_cpu=data.lens_per_request,
                     rows_per_request=data.rows_per_request,
@@ -528,12 +529,14 @@ class TestDensePrefillIndexer(CustomTestCase):
                 ):
                     backend.consume_prefill(inputs, published)
                     if context == 32769:
-                        plan = published.sm90_paged
-                        self.assertIsNotNone(plan)
+                        page_map = published.sm90_page_map
+                        self.assertIsNotNone(page_map)
+                        k_cache = inputs.paged_index_k_caches[(0, 1)]
                         previous = raw.sort(dim=1).values
                         later_layer = msgspec.structs.replace(inputs, layer_id=1)
                         backend.consume_prefill(later_layer, published)
-                        self.assertIs(published.sm90_paged, plan)
+                        self.assertIs(published.sm90_page_map, page_map)
+                        self.assertIs(inputs.paged_index_k_caches[(0, 1)], k_cache)
                         torch.testing.assert_close(raw.sort(dim=1).values, previous)
                 scores = dense_scores(consumer)
                 columns = torch.arange(scores.shape[1], device="cuda")

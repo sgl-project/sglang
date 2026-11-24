@@ -57,10 +57,15 @@ _SM90_PAGED_MIN_CONTEXT = 32 * 1024
 _SM90_PAGED_SMALL_QUERY_ROWS = 128
 
 
-class _Sm90PagedCandidates(msgspec.Struct, frozen=True):
+class _Sm90PagedKCache(msgspec.Struct, frozen=True):
     source_layer: int
+    compress_ratio: int
     k_slots: torch.Tensor
     cache: torch.Tensor
+    request_page_starts: torch.Tensor
+
+
+class _Sm90PagedCandidateMap(msgspec.Struct, frozen=True):
     context_lens: torch.Tensor
     block_table: torch.Tensor
     schedules: List[Tuple[slice, torch.Tensor]]
@@ -79,8 +84,8 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     rows_per_request: Optional[List[int]] = None
     # Hopper decode materializes this once at the source and reuses it in consumers.
     decode_mask: Optional[torch.Tensor] = None
-    # A prefill publish owns the shared K pages and their candidate-to-page map.
-    sm90_paged: Optional[_Sm90PagedCandidates] = None
+    # Candidate-specific page map; the shared K pages live in forward metadata.
+    sm90_page_map: Optional[_Sm90PagedCandidateMap] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -332,49 +337,50 @@ class DenseBlocksBackend:
         import deep_gemm
 
         source_layer = self.token_to_kv_pool.source_layer_of(inputs.layer_id)
-        plan = published.sm90_paged
-        if (
-            plan is None
-            or plan.source_layer != source_layer
-            or plan.k_slots is not data.k_slots
-            or plan.context_lens.shape[0] != data.num_rows
-        ):
-            plan = self._sm90_paged_candidates(inputs, data, blocks, source_layer)
-            published.sm90_paged = plan
+        cache_key = (source_layer, inputs.compress_ratio)
+        caches = inputs.paged_index_k_caches
+        k_cache = caches.get(cache_key)
+        if k_cache is None or k_cache.k_slots is not data.k_slots:
+            k_cache = self._sm90_paged_k_cache(inputs, data, source_layer)
+            caches[cache_key] = k_cache
+
+        page_map = published.sm90_page_map
+        if page_map is None or page_map.context_lens.shape[0] != data.num_rows:
+            page_map = self._sm90_paged_candidate_map(
+                inputs, data, blocks, k_cache.request_page_starts
+            )
+            published.sm90_page_map = page_map
 
         selected = data.empty_selection(inputs.indexer.index_topk)
-        for rows, schedule in plan.schedules:
+        for rows, schedule in page_map.schedules:
             q, scale = widen_fp4_to_fp8(data.q_fp4[rows], data.q_sf[rows])
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q.unsqueeze(1),
-                plan.cache,
+                k_cache.cache,
                 data.weights[rows] * scale,
-                plan.context_lens[rows],
-                plan.block_table[rows],
+                page_map.context_lens[rows],
+                page_map.block_table[rows],
                 schedule,
-                plan.max_context_len,
+                page_map.max_context_len,
                 clean_logits=False,
             )
-            scores = logits.gather(1, plan.score_columns[rows])
+            scores = logits.gather(1, page_map.score_columns[rows])
             _select_candidate_positions(
                 scores,
-                plan.positions[rows],
-                plan.lens[rows],
+                page_map.positions[rows],
+                page_map.lens[rows],
                 data.request_starts[rows],
                 selected[rows],
             )
             del logits, scores
         data.write_selection(selected, inputs)
 
-    def _sm90_paged_candidates(
+    def _sm90_paged_k_cache(
         self,
         inputs: PrefillInputs,
         data: DeepGEMMPrefillData,
-        blocks: torch.Tensor,
         source_layer: int,
-    ) -> _Sm90PagedCandidates:
-        import deep_gemm
-
+    ) -> _Sm90PagedKCache:
         page_size = _SM90_INDEX_K_PAGE_SIZE
         blocks_per_page = page_size // self.block_size
         # Pad each request separately so its local positions map to whole pages.
@@ -395,12 +401,33 @@ class DenseBlocksBackend:
         k_bytes = k.view(torch.uint8).reshape(pages, -1)
         scale_bytes = scale.view(torch.uint8).reshape(pages, -1)
         cache = torch.cat((k_bytes, scale_bytes), dim=1).view(pages, page_size, 1, -1)
+        request_page_starts = async_h2d(
+            page_starts, dtype=torch.int32, device=data.q_fp4.device
+        )
+        return _Sm90PagedKCache(
+            source_layer,
+            inputs.compress_ratio,
+            data.k_slots,
+            cache,
+            request_page_starts,
+        )
+
+    def _sm90_paged_candidate_map(
+        self,
+        inputs: PrefillInputs,
+        data: DeepGEMMPrefillData,
+        blocks: torch.Tensor,
+        request_page_starts: torch.Tensor,
+    ) -> _Sm90PagedCandidateMap:
+        import deep_gemm
+
+        page_size = _SM90_INDEX_K_PAGE_SIZE
+        blocks_per_page = page_size // self.block_size
         row_page_starts = torch.repeat_interleave(
-            async_h2d(page_starts, dtype=torch.int32, device=blocks.device),
+            request_page_starts,
             inputs.rows_per_request_device,
             output_size=data.num_rows,
         )
-
         # The publisher sorts blocks, so equal page IDs are adjacent. Duplicate
         # blocks targeting a page write the same ID. Invalid blocks use a sink column.
         page_ids = blocks // blocks_per_page
@@ -437,10 +464,7 @@ class DenseBlocksBackend:
                     ),
                 )
             )
-        return _Sm90PagedCandidates(
-            source_layer,
-            data.k_slots,
-            cache,
+        return _Sm90PagedCandidateMap(
             context_lens,
             block_table,
             schedules,
