@@ -649,10 +649,8 @@ class TestDcpMToNRelayout(CustomTestCase):
             CommonKVManager,
             PrefillServerInfo,
         )
-        from sglang.srt.disaggregation.mooncake.conn import (
-            MooncakeBufferKey,
-            MooncakeKVManager,
-        )
+        from sglang.srt.disaggregation.mooncake.buffers import MooncakeBufferKey
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
         from sglang.srt.disaggregation.utils import (
             compute_mamba_state_slice_byte_blocks,
         )
