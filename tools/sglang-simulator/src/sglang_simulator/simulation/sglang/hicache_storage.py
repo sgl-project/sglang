@@ -42,6 +42,14 @@ class MockHiCacheStorage:
         """Simulated storage tracks keys only and does not consume request hints."""
         return False
 
+    # Simulated storage has no rank-keyed objects and owns no router source
+    # (see HiCacheStorage).
+    requires_rank_local_backup = False
+    rank_keyed_mha_drafts = False
+
+    def get_kv_hint_source(self) -> Optional[dict]:
+        return None
+
     def register_mem_pool_host(self, mem_pool_host):
         pass
 
