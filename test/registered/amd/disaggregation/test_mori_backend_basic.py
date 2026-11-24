@@ -252,7 +252,9 @@ class TestMoriPpDsaStatePairing(CustomTestCase):
         self, manager, *, state_type, num_src, num_dst=_DECODE_DSA_ENTRIES
     ):
         manager._send_swa_dsa_state(
-            peer_info=SimpleNamespace(decode_tp_size=4, engine_key="peer"),
+            peer_info=SimpleNamespace(
+                decode_tp_size=4, engine_key="peer", dst_page_head_groups=False
+            ),
             src_state_indices=np.array([3, 4, 9], dtype=np.int32),
             dst_state_indices=np.array([7, 8, 12], dtype=np.int32),
             src_keys=[f"P{i}" for i in range(num_src)],

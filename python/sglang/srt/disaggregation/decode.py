@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.page_head_groups import reorder_landed_pages
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -3796,6 +3797,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         if not prealloc_queue.allocate_host_staged(decode_req):
                             num_host_staged_landed += 1
                             continue
+                page_head_groups = getattr(
+                    decode_req.kv_receiver, "page_head_groups", None
+                )
+                if page_head_groups is not None:
+                    # Prefill ranks wrote whole pages side by side; restore the head layout.
+                    reorder_landed_pages(
+                        decode_req.kv_receiver.kv_mgr.kv_args,
+                        *page_head_groups,
+                        device=self.scheduler.device,
+                    )
                 self._commit_transfer_to_req(decode_req)
                 # The peer wrote its last byte.
                 end_network_transfer(

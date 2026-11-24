@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.page_head_groups import page_group_plan
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
@@ -210,6 +211,8 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
     dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    # The decode takes a prefill rank's pages whole and reorders them itself.
+    dst_page_head_groups: bool = False
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
 
@@ -255,6 +258,7 @@ class KVArgsRegisterInfo:
             if len(payload) > 16 and payload[16]
             else []
         )
+        dst_page_head_groups = len(payload) > 17 and payload[17] == b"1"
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -272,6 +276,7 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=dst_dcp_rank,
             dst_state_layer_ids=dst_state_layer_ids,
             dst_kv_layer_ids=dst_kv_layer_ids,
+            dst_page_head_groups=dst_page_head_groups,
         )
 
 
@@ -1096,6 +1101,48 @@ class MoriKVManager(CommonKVManager):
         )
         return PeerBuffers(remote=remote, keys=keys)
 
+    def _page_head_group(
+        self, peer_info: KVArgsRegisterInfo, src_item_len: int, dst_item_len: int
+    ) -> Optional[Tuple[int, int]]:
+        """(groups, this rank's group) when the decode takes this rank's pages whole
+        (it has fewer attention-TP ranks and asked for it); None otherwise."""
+        if (
+            not peer_info.dst_page_head_groups
+            or self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or peer_info.decode_tp_size >= self.attn_tp_size
+        ):
+            return None
+        groups = self.attn_tp_size // peer_info.decode_tp_size
+        if (
+            self.attn_tp_size % peer_info.decode_tp_size
+            or dst_item_len != groups * src_item_len
+        ):
+            raise RuntimeError(
+                f"Decode attention TP {peer_info.decode_tp_size} takes whole pages from "
+                f"attention TP {self.attn_tp_size}: its {dst_item_len}-byte pages must "
+                f"hold {self.attn_tp_size // max(1, peer_info.decode_tp_size)} of this "
+                f"rank's {src_item_len}-byte pages"
+            )
+        return groups, self.attn_tp_rank % groups
+
+    def _submit_page_group_transfer(
+        self,
+        remote: MoriRemoteBuffers,
+        src: MoriBufferKey,
+        dst: MoriBufferKey,
+        src_pages: npt.NDArray[np.int32],
+        dst_pages: npt.NDArray[np.int32],
+        src_item_len: int,
+        page_group: Tuple[int, int],
+    ) -> List[MoriHandle]:
+        return self._submit_batch_transfer_plan(
+            remote=remote,
+            src=src,
+            dst=dst,
+            plan=page_group_plan(src_pages, dst_pages, src_item_len, *page_group),
+        )
+
     def _get_mha_kv_key_slices(
         self,
         dst_keys: Sequence[MoriBufferKey],
@@ -1372,6 +1419,29 @@ class MoriKVManager(CommonKVManager):
             dst_v_keys,
             layers_current_pp_stage,
         ) = self._get_mha_kv_key_slices(peer.keys.kv, peer_info.dst_kv_layer_ids)
+
+        page_group = self._page_head_group(
+            peer_info, kv_item_len, peer_info.dst_kv_item_len
+        )
+        if page_group is not None:
+            for src, dst in zip(
+                src_k_keys[:layers_current_pp_stage]
+                + src_v_keys[:layers_current_pp_stage],
+                dst_k_keys[:layers_current_pp_stage]
+                + dst_v_keys[:layers_current_pp_stage],
+            ):
+                statuses.extend(
+                    self._submit_page_group_transfer(
+                        peer.remote,
+                        src,
+                        dst,
+                        prefill_kv_indices,
+                        dst_kv_indices,
+                        kv_item_len,
+                        page_group,
+                    )
+                )
+            return statuses
 
         if peer_info.decode_tp_size != self.attn_tp_size:
             tp_cfg = self._build_tp_slice_config(peer_info)
@@ -1805,11 +1875,22 @@ class MoriKVManager(CommonKVManager):
         src_layer_ids: List[int],
         dst_layer_ids: List[int],
     ) -> List[MoriHandle]:
+        page_grouped = (
+            state_type == "swa"
+            and bool(src_state_item_lens)
+            and self._page_head_group(
+                peer_info,
+                src_state_item_lens[0],
+                dst_state_item_lens[0] if dst_state_item_lens else 0,
+            )
+            is not None
+        )
         # TP mismatch check for non-MLA SWA
         if (
             state_type == "swa"
             and not self.is_mla_backend
             and peer_info.decode_tp_size != self.attn_tp_size
+            and not page_grouped
         ):
             raise RuntimeError(
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
@@ -1924,6 +2005,21 @@ class MoriKVManager(CommonKVManager):
                 # buffer; either peer eliding it means nothing moves, and the
                 # descriptor describes an empty allocation. Skipping keeps the
                 # index alignment with the state keys that registration relies on.
+                continue
+            if page_grouped:
+                statuses.extend(
+                    self._submit_page_group_transfer(
+                        remote,
+                        src_keys[i],
+                        dst_keys[j],
+                        src_state_indices,
+                        dst_state_indices,
+                        state_item_len,
+                        self._page_head_group(
+                            peer_info, state_item_len, dst_state_item_lens[j]
+                        ),
+                    )
+                )
                 continue
 
             statuses.extend(
@@ -2071,7 +2167,7 @@ class MoriKVManager(CommonKVManager):
         dcp_size = str(self.dcp_size).encode("ascii")
         dcp_rank = str(self.dcp_rank).encode("ascii")
 
-        return [
+        message = [
             MORI_GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -2091,6 +2187,10 @@ class MoriKVManager(CommonKVManager):
             packed_state_layer_ids,
             packed_kv_layer_ids,
         ]
+        # Sent only when set, so the message is unchanged without the flag.
+        if envs.SGLANG_DISAGG_DECODE_PAGE_HEAD_GROUPS.get():
+            message.append(b"1")
+        return message
 
     def build_receiver_metadata_message(
         self,
@@ -2148,7 +2248,35 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-    pass
+    # (groups, KV pages, window-state pages) of a whole-page transfer, reordered on landing.
+    page_head_groups = None
+
+    def send_metadata(
+        self, kv_indices, aux_index=None, state_indices=None, *args, **kwargs
+    ):
+        self.page_head_groups = None
+        info = getattr(self, "prefill_info", None)
+        if (
+            envs.SGLANG_DISAGG_DECODE_PAGE_HEAD_GROUPS.get()
+            and info is not None
+            and not (self.kv_mgr.is_mla_backend or self.kv_mgr.is_hybrid_mla_backend)
+            and info.attn_tp_size > self.kv_mgr.attn_tp_size
+        ):
+            if info.attn_tp_size % self.kv_mgr.attn_tp_size:
+                raise RuntimeError(
+                    f"Prefill attention TP {info.attn_tp_size} is not a multiple of "
+                    f"this decode's {self.kv_mgr.attn_tp_size}"
+                )
+            self.page_head_groups = (
+                info.attn_tp_size // self.kv_mgr.attn_tp_size,
+                np.array(kv_indices, dtype=np.int64),
+                [
+                    None if pages is None else pages.copy()
+                    for pages in _normalize_state_indices_per_component(state_indices)
+                    or []
+                ],
+            )
+        super().send_metadata(kv_indices, aux_index, state_indices, *args, **kwargs)
 
 
 class MoriKVBootstrapServer(CommonKVBootstrapServer):

@@ -971,6 +971,9 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Decode with fewer attention-TP ranks than its prefill: take each prefill rank's
+    # pages whole and reorder them into the decode head layout on landing (MoRI, non-MLA).
+    SGLANG_DISAGG_DECODE_PAGE_HEAD_GROUPS = EnvBool(False)
     SGLANG_ENABLE_NIXL_KV_PACKING = EnvBool(False)
     SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Queue incoming KV scatters between forwards; disabled by default.
