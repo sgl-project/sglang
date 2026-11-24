@@ -300,15 +300,17 @@ class KVStorage:
         ``last_loc``; None when they do not fit. With ``window_tails`` (one
         request whose KV a peer sends; every window, by sub-pool), each
         window binds pages for its own last tokens only. ``tree_cache`` and
-        ``batch`` are for pools that need the step's context (static ones);
-        a unified pool needs neither. ``receive``: a network receive writes
-        the pages first."""
+        ``batch`` are for pools that need the step's context: static ones, and
+        a sharded unified pool, which reads the rotation bases from them.
+        ``receive``: a network receive writes the pages first."""
+        # One rounding page per request; sharded, one per owner class.
+        shard_size = self._allocator.shard_size
         demand = self._allocator.get_extend_allocation_demand(
             prefix_lens_cpu,
             seq_lens_cpu,
             conservative_num_tokens=num_tokens
-            + len(seq_lens_cpu) * self._allocator.page_size,
-            shard_size=1,
+            + len(seq_lens_cpu) * self._allocator.page_size * shard_size,
+            shard_size=shard_size,
         )
 
         make_room(demand)
@@ -323,7 +325,16 @@ class KVStorage:
                 window_tail_lens=window_tails,
                 consumer=_consumer(receive),
             )
-        return self._allocator.alloc_extend(
+        rotation_bases = None
+        if shard_size > 1:
+            from sglang.srt.mem_cache.static_kv_storage import (
+                _kv_shard_rotation_bases,
+            )
+
+            rotation_bases = _kv_shard_rotation_bases(
+                tree_cache=tree_cache, batch=batch, prefix_lens_cpu=prefix_lens_cpu
+            )
+        out = self._allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -331,7 +342,13 @@ class KVStorage:
             last_loc,
             num_tokens,
             consumer=_consumer(receive),
+            rotation_bases=rotation_bases,
         )
+        if out is not None and rotation_bases is not None:
+            # The tree insert stamps each request's base on the nodes it adds.
+            for req, base in zip(batch.reqs, rotation_bases):
+                req.kv_rotation_base = base
+        return out
 
     def take_decode(
         self,

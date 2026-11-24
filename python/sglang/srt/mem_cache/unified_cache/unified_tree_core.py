@@ -679,6 +679,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             parent = parent.parent
         return node.rotation_base + prefix_len // self.page_size
 
+    def full_evictable_pages_by_class(self, shard_size: int) -> Optional[list[int]]:
+        # Position-page P of a chain is class ``(rotation_base + P) %
+        # shard_size``: one walk of the tree, no device read.
+        ct = BASE_COMPONENT_TYPE
+        component = self.components_by_type[ct]
+        page = self.page_size
+        counts = [0] * shard_size
+        stack = [(child, 0) for child in self.root_node.children.values()]
+        while stack:
+            node, prefix_len = stack.pop()
+            end = prefix_len + len(node.key)
+            stack.extend((child, end) for child in node.children.values())
+            cd = node.component_data[ct]
+            if cd.value is None or cd.lock_ref > 0:
+                continue
+            if node.rotation_base is None:
+                return None
+            first_page = prefix_len // page
+            pages = (prefix_len + component.reclaimable_value_len(node)) // page
+            pages -= first_page
+            start = (node.rotation_base + first_page) % shard_size
+            whole, rest = divmod(pages, shard_size)
+            for offset in range(shard_size):
+                counts[(start + offset) % shard_size] += whole + (offset < rest)
+        return counts
+
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
         return self.node_by_id(node_id).get_last_hash_value()

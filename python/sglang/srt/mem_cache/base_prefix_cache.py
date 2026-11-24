@@ -749,6 +749,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
+    def full_evictable_pages_by_class(self, shard_size: int) -> Optional[list[int]]:
+        """`full_evictable_size` in pages per owner class of a KV shard group;
+        None from a cache that does not track the classes."""
+        return None
+
     def window_evictable_size(self, sub_pool: str) -> int:
         """Evictable tokens of one window sub-pool."""
         return 0

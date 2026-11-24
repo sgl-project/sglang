@@ -883,7 +883,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if allocator.fits_after_frees(demands):
             return result
         if not allocator.admits(
-            self._units_demand(demands), evictable=evictable_by_sub_pool(self)
+            self._units_demand(demands),
+            evictable=evictable_by_sub_pool(self),
+            owner_class_evictable=self.full_evictable_pages_by_class,
         ):
             return result
         owner, windows, state = self._sub_pool_roles()
@@ -4948,6 +4950,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
+
+    def full_evictable_pages_by_class(self, shard_size: int) -> Optional[list[int]]:
+        return self.tree_core.full_evictable_pages_by_class(shard_size)
 
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size() + (
