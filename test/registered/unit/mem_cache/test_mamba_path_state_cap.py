@@ -1,7 +1,6 @@
 """CPU-only unit tests for the per-path Mamba checkpoint cap."""
 
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -14,7 +13,6 @@ register_amd_ci(est_time=30, stage="base-b", runner_config="1-gpu-small-amd")
 
 import unittest
 from collections import defaultdict
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -287,22 +285,14 @@ class TestMambaPathStateCap(unittest.TestCase):
                     self.assertEqual(freed_host, [])
                     self.assertIsNotNone(both.host_value)
 
-    def test_host_counting_is_opt_in_and_needs_a_cap_and_a_cache_mode_host_tier(self):
-        for name, host_mode, env, cap, host_pool, enabled in (
-            ("default", "cache", None, 1, object(), False),
-            ("opted_in", "cache", True, 1, object(), True),
-            ("buffer_only", "buffer_only", True, 1, object(), False),
-            ("no_cap", "cache", True, -1, object(), False),
-            ("no_mamba_host_pool", "cache", True, 1, None, False),
+    def test_host_counting_needs_a_cap_and_a_cache_mode_host_tier(self):
+        for name, host_mode, cap, host_pool, enabled in (
+            ("default", "cache", 1, object(), True),
+            ("buffer_only", "buffer_only", 1, object(), False),
+            ("no_cap", "cache", -1, object(), False),
+            ("no_mamba_host_pool", "cache", 1, None, False),
         ):
-            with (
-                self.subTest(name),
-                (
-                    nullcontext()
-                    if env is None
-                    else envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.override(env)
-                ),
-            ):
+            with self.subTest(name):
                 cache = SimpleNamespace(
                     components={
                         ComponentType.MAMBA: SimpleNamespace(

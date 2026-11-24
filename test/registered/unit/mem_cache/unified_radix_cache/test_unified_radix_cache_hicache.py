@@ -3,7 +3,6 @@ from array import array
 from dataclasses import replace
 from unittest import mock
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
@@ -627,15 +626,14 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_mamba
     def test_hicache_write_through_mamba_path_cap_frees_superseded_host_copy(self):
-        """SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, cap 1: the state a longer insert
-        supersedes loses its device value and its write-through host copy, and
-        its host slot returns to the Mamba host pool."""
+        """Cap 1: the state a longer insert supersedes loses its device value and
+        its write-through host copy, and its host slot returns to the Mamba host
+        pool."""
         # Cap 1 at construction (level 2), which both tree cores read; HiCache init
         # then turns host counting on.
         cfg = replace(self.cfg, hybrid_cache_checkpoints_level=2)
         cache, allocator, req_to_token_pool = build_fixture(cfg)
-        with envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.override(True):
-            self._init_hicache(cache, write_policy="write_through")
+        self._init_hicache(cache, write_policy="write_through")
         cache.write_through_threshold = 1
         host_pool = cache.mamba_pool_host
 
