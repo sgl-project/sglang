@@ -326,15 +326,8 @@ class SchedulerMetricsReporter:
         )
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
         self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
-        # FIFO of (wall-clock recorded-at, GPU elapsed seconds) for each
-        # completed "extend" (prefill) forward, populated from the device
-        # timer below and drained by _consume_device_gpu_time -- gives
-        # _prefill_sol_suffix an accurate per-forward duration instead of the
-        # wall-clock gap between log lines. Keyed by category (currently only
-        # "extend" is populated) so a future consumer (e.g. a decode
-        # equivalent) can reuse the same structure without resurrecting the
-        # unbounded-growth bug this avoids: only append for categories
-        # something actually drains.
+        # FIFO of (recorded-at, GPU elapsed seconds) per completed forward, by
+        # category; drained by _consume_device_gpu_time for _prefill_sol_suffix.
         self._device_timer_elapsed_by_category: Dict[
             str, Deque[Tuple[float, float]]
         ] = defaultdict(lambda: deque(maxlen=_DEVICE_TIMER_FIFO_MAXLEN))
@@ -351,18 +344,8 @@ class SchedulerMetricsReporter:
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
                 self._forward_occupancy_log_window.gpu_seconds += kwargs["t"]
-                # Only "extend" (prefill) is ever drained, via
-                # _consume_device_gpu_time below -- tracking every category
-                # here (decode, idle, eagle_draft, ...) would queue entries
-                # that nothing consumes, growing unboundedly for the life of
-                # the process. Also gate on the same conditions that let
-                # report_prefill_stats() reach _consume_device_gpu_time at all
-                # (mirrors its own early-return check): on TP ranks other than
-                # attn_tp_rank 0 (without --enable-metrics-for-all-schedulers),
-                # or with --enable-mfu-metrics off, report_prefill_stats()
-                # returns before ever draining this queue, so appending here
-                # unconditionally leaks the same way the all-categories
-                # version used to.
+                # Only append for "extend", and only when report_prefill_stats()
+                # can actually reach _consume_device_gpu_time to drain it.
                 if (
                     kwargs.get("category") == "extend"
                     and self.enable_mfu_metrics
@@ -600,32 +583,8 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
-        # Per-layer attention/MLP/Mamba split for hybrid architectures. Two
-        # distinct conventions exist across real HF configs:
-        #   - Dedicated-layer (NemotronH): each layer is *exclusively* one of
-        #     "attention"/"mamba"/"mlp"/"moe" -- a "mamba" layer has no MLP of
-        #     its own, since the FFN lives in its own separately-indexed
-        #     layer. Only count the dedicated labels.
-        #   - Bundled-layer (FalconH1's uniform "hybrid" label; Jamba/Bamba's
-        #     "attention"/"mamba" with no separate FFN label at all): every
-        #     layer carries its own attention-or-mamba mixer *and* its own
-        #     MLP together. These vocabularies never contain "mlp"/"moe" at
-        #     all, so detect the convention by that and fall back to
-        #     "every layer pays the FFN cost" instead of silently zeroing it.
-        # `layers_block_type`'s vocabulary is not standardized across hybrid
-        # configs. NemotronH and Jamba/Bamba use sglang's/transformers' own
-        # exclusive {"mamba", "attention", "mlp", "moe"} labels (Jamba/Bamba
-        # never emit "mlp"/"moe" since the FFN is bundled into every mixer
-        # layer -- see has_dedicated_ffn_layers below). But Qwen3-Next/
-        # Qwen3.5, GigaChat3.5, and BailingHybrid's own layers_block_type
-        # returns "full_attention"/"linear_attention" instead -- counting
-        # "attention" against that vocabulary silently finds zero real
-        # attention layers while the generic "not mamba/mlp/moe" fallback
-        # would overcount by treating every linear_attention layer as full
-        # attention too. Only trust literal label-counting when the
-        # vocabulary is actually a subset of the exclusive convention;
-        # otherwise fall back to full_attention_layer_ids, which each of
-        # those config classes computes correctly for its own semantics.
+        # Per-layer attention/MLP/Mamba split for hybrid architectures (dedicated
+        # vs. bundled FFN labeling, see has_dedicated_ffn_layers below).
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
         _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
         if (
@@ -642,12 +601,7 @@ class SchedulerMetricsReporter:
                 else num_layers
             )
         else:
-            # full_attention_layer_ids is usually computed by sglang itself
-            # (ModelConfig.__init__, via get_hybrid_layer_ids()) and stored on
-            # model_config -- NOT on hf_text_config, which only ever has it
-            # when a model's own HF config class defines the field natively
-            # (e.g. KimiLinear/KimiK3). Check both so neither source is
-            # silently ignored.
+            # Check model_config (sglang-computed) before hf_text_config (native field).
             full_attention_layer_ids = getattr(
                 model_config, "full_attention_layer_ids", None
             )
@@ -672,17 +626,8 @@ class SchedulerMetricsReporter:
             )
             num_mlp_layers = num_layers
 
-        # Pure Mamba/SSM stacks (FalconMamba, Mamba, Mamba2 -- see
-        # PURE_SSM_ARCHITECTURES in model_config.py) have no MLP sublayer at
-        # all: every layer is just a Mamba mixer. Neither convention above
-        # expresses "zero MLP layers", so without this they fall through to
-        # `num_mlp_layers = num_layers` and get charged a fake FFN cost built
-        # from `hf_text_config.intermediate_size` -- on these configs that
-        # field is the SSM mixer's own inner/expand dimension (d_inner), not
-        # an FFN size, so the fabricated cost has no basis in the real model.
-        # This was inflating FLOPs/weight-bytes enough to push MFU/MBU over
-        # 100% on falcon-mamba-7b(-instruct). The real Mamba-mixer FLOPs/bytes
-        # aren't estimated here (follow-up); zeroing is the honest fallback.
+        # Pure Mamba/SSM stacks have no MLP sublayer; zero both rather than
+        # fabricating FFN cost from intermediate_size (the SSM expand dim there).
         if getattr(model_config, "attention_arch", None) == AttentionArch.SSM:
             num_mlp_layers = 0.0
             num_attn_layers = 0.0
@@ -707,20 +652,9 @@ class SchedulerMetricsReporter:
         w_bytes = float(dtype_num_bytes)
         cache_bytes = float(dtype_num_bytes)
 
-        # Weight-only quantization (W4A16/W8A16-style: GPTQ/AWQ/compressed-tensors)
-        # stores weights at a narrower width than the activation dtype above, so
-        # charging w_bytes at the activation width overcounts weight-read
-        # bandwidth by roughly (activation_bits / weight_bits) -- e.g. ~4x for a
-        # 4-bit-weight model read as if it were bf16. Derive the ratio from the
-        # quantized weight bit-width itself (GPTQ/AWQ flat configs, or
-        # compressed-tensors' per-group `weights.num_bits`) rather than
-        # compressed-tensors' published `global_compression_ratio`: that field
-        # is a whole-model average blended across every parameter, including
-        # layers the quant config leaves unquantized (e.g. lm_head/embeddings),
-        # so it understates the savings on the matmul weights actually modeled
-        # here -- e.g. RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8's
-        # real published config reports global_compression_ratio=1.24, not the
-        # 2.0x its 8-bit weights actually achieve.
+        # Weight-only quantization (GPTQ/AWQ/compressed-tensors): derive the
+        # compression ratio from the weight bit-width, not global_compression_ratio
+        # (a whole-model average that understates the matmul-weight savings).
         hf_quant_config = getattr(model_config, "hf_quant_config", None) or {}
         weight_bits = (
             hf_quant_config.get("bits")
@@ -820,12 +754,7 @@ class SchedulerMetricsReporter:
                 or 0
             )
             active_expert_units = float(num_experts_per_tok) + shared_expert_count
-            # MoE experts are gated (SwiGLU) in every architecture this estimator
-            # currently special-cases (Mixtral/DeepSeek/Qwen-MoE/OLMoE/GraniteMoE),
-            # so mlp_weight_mult stays at the gated 3x multiplier here -- set
-            # explicitly (rather than left to the dense branch below) so
-            # _ffn_act_bytes_per_token's shared reference to it stays correct
-            # regardless of which branch ran.
+            # MoE experts are gated (SwiGLU) for every architecture special-cased here.
             mlp_weight_mult = 3.0
             mlp_flops = 6.0 * hidden_size * moe_intermediate_size * active_expert_units
             mlp_weight_elems_per_layer = (
@@ -836,13 +765,8 @@ class SchedulerMetricsReporter:
             )
             ffn_act_intermediate_size = moe_intermediate_size * active_expert_units
         else:
-            # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
-            # gated (SwiGLU/GeGLU-style: separate gate_proj + up_proj + down_proj,
-            # 3 weight matrices) or a plain 2-matrix FFN (up/fc_in + down/fc_out).
-            # Gating is a property of the architecture, not the activation
-            # function (GeGLU and a plain GELU FFN can share the same hidden_act),
-            # so key off architectures rather than hidden_act. Default to gated
-            # for every unlisted architecture.
+            # Gated (3-matrix SwiGLU) vs. plain 2-matrix FFN; keyed off architecture
+            # since hidden_act alone can't distinguish them. Default to gated.
             _NON_GATED_MLP_ARCHITECTURES = {
                 "GPT2LMHeadModel",
                 "GPTBigCodeForCausalLM",
@@ -978,15 +902,8 @@ class SchedulerMetricsReporter:
         return flops, read_bytes, write_bytes
 
     def _consume_device_gpu_time(self, category: str) -> Optional[float]:
-        """Pop the next not-yet-consumed per-forward GPU elapsed time (seconds)
-        recorded for `category`, FIFO-ordered so it matches 1:1 with however
-        many forwards of that category actually ran before this call -- even
-        if several completed (and got drained by the device timer's internal
-        `_report()`) before either of their stats got reported. Returns None
-        when the device timer is disabled or nothing is queued yet; callers
-        should fall back to a wall-clock estimate in that case. Discards
-        entries older than _DEVICE_TIMER_FIFO_MAX_AGE_S instead of returning
-        them."""
+        """Pop the next FIFO-ordered per-forward GPU elapsed time (seconds) for
+        `category`, discarding stale entries. Returns None if unavailable."""
         if self.forward_pass_device_timer is None:
             return None
         # Poll completed events before reading, without synchronizing.
@@ -1003,19 +920,9 @@ class SchedulerMetricsReporter:
 
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Device-timer-based replacement for the wall-clock `est. prefill
-        TFLOPS/s` estimate in report_prefill_stats.
-
-        `elapsed_s` (the wall-clock gap between consecutive "Prefill batch"
-        log lines) is not this forward's own execution time -- under overlap
-        scheduling, two distinct admissions' results can get processed and
-        logged back-to-back, making `elapsed_s` for the second one collapse
-        toward zero even though real GPU work happened, which previously
-        produced physically-impossible TFLOPS/s values (multiples of the
-        hardware's peak). This computes the same FLOPs estimate but divides by
-        this specific forward's own GPU time (SGLANG_ENABLE_METRICS_DEVICE_TIMER's
-        CUDA-event-based "extend" interval), which stays accurate regardless of
-        scheduler-loop logging cadence. Falls back to "" (letting the caller
-        use the wall-clock estimate) when the device timer is unavailable."""
+        TFLOPS/s` estimate: divides by this forward's own GPU time instead of
+        the inter-log-line gap. Falls back to "" when the device timer is
+        unavailable, letting the caller use the wall-clock estimate."""
         device_elapsed_s = self._consume_device_gpu_time("extend")
         if device_elapsed_s is None or device_elapsed_s <= 0:
             return ""
