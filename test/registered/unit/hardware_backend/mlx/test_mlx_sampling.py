@@ -22,11 +22,14 @@ if _HAS_MLX:
         GREEDY_PARAMS,
         MAX_BOUNDED_TOP_K,
         MlxLogprobSpec,
+        MlxPenaltyState,
         MlxSamplingParams,
         _candidate_width,
         _gumbel_noise,
         _murmur_hash32,
         all_greedy,
+        apply_penalties,
+        commit_penalties,
         compute_logprobs,
         sample_tokens,
         sanitize_logits,
@@ -60,9 +63,29 @@ def _reference_murmur3(seed: int, pos: int, col: int) -> int:
     return h
 
 
-def _params(temperature=1.0, top_k=1 << 30, top_p=1.0, min_p=0.0, seed=None):
+def _params(
+    temperature=1.0,
+    top_k=1 << 30,
+    top_p=1.0,
+    min_p=0.0,
+    seed=None,
+    frequency_penalty=0.0,
+    presence_penalty=0.0,
+    repetition_penalty=1.0,
+    min_new_tokens=0,
+    stop_token_ids=(),
+):
     return MlxSamplingParams(
-        temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, seed=seed
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
+        min_new_tokens=min_new_tokens,
+        stop_token_ids=stop_token_ids,
     )
 
 
@@ -714,6 +737,263 @@ class TestWorkerSamplingExtras(CustomTestCase):
             [[-3.0], []],
         )
         self.assertEqual(out.next_token_token_ids_logprobs_idx, [[9], []])
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestSamplingPenalties(CustomTestCase):
+    """In-graph MLX sampling penalties, parity, and runner lifecycle."""
+
+    VOCAB = 8
+
+    class _FakeCache:
+        def __init__(self, offset):
+            self.offset = offset
+
+    class _FakeLayout:
+        has_auxiliary_state = False
+        first_attention_layer_index = 0
+
+    def _runner(self):
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+
+        runner = object.__new__(MlxModelRunner)
+        runner._enable_sampling = True
+        runner._cache_layout = self._FakeLayout()
+        runner._req_sampling = {}
+        runner._req_penalty_state = {}
+        runner._req_penalty_init = {}
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._rng_key = mx.random.key(0)
+        return runner
+
+    def test_from_req_extracts_penalties_and_stop_token_ids(self):
+        from types import SimpleNamespace
+
+        req = SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                temperature=0.8,
+                top_k=40,
+                top_p=0.9,
+                min_p=0.0,
+                sampling_seed=None,
+                frequency_penalty=0.5,
+                presence_penalty=0.25,
+                repetition_penalty=1.2,
+                min_new_tokens=3,
+                stop_token_ids={4, 2, -1},
+            ),
+            eos_token_ids={2, 7},
+            tokenizer=SimpleNamespace(
+                eos_token_id=1,
+                additional_stop_token_ids={5, None},
+            ),
+        )
+        p = MlxSamplingParams.from_req(req)
+        self.assertTrue(p.uses_penalty)
+        self.assertEqual(p.frequency_penalty, 0.5)
+        self.assertEqual(p.presence_penalty, 0.25)
+        self.assertEqual(p.repetition_penalty, 1.2)
+        self.assertEqual(p.min_new_tokens, 3)
+        self.assertEqual(p.stop_token_ids, (1, 2, 4, 5, 7))
+
+        req.sampling_params.min_new_tokens = 0
+        req.sampling_params.frequency_penalty = 0.0
+        req.sampling_params.presence_penalty = 0.0
+        req.sampling_params.repetition_penalty = 1.0
+        p_off = MlxSamplingParams.from_req(req)
+        self.assertFalse(p_off.uses_penalty)
+        self.assertEqual(p_off.stop_token_ids, ())
+
+    def test_no_penalty_fast_path_returns_identical_array(self):
+        logits = mx.zeros((2, self.VOCAB), dtype=mx.float32)
+        out = apply_penalties(logits, [GREEDY_PARAMS, _params()], [None, None])
+        self.assertIs(out, logits)
+
+    def test_apply_penalties_matches_pytorch_reference(self):
+        """Exact numerical parity against sglang.srt.sampling.penalties."""
+        import numpy as np
+        import torch
+
+        from sglang.srt.sampling.penalties import (
+            _compute_logit_penalties,
+            apply_scaling_penalties,
+        )
+
+        raw = np.array(
+            [
+                [2.0, -1.5, 0.5, 3.0, -2.0, 0.0, 1.2, -0.4],
+                [-1.0, 2.5, -0.5, 1.0, 0.0, -3.0, 4.0, 0.8],
+                [0.3, -0.7, 1.1, -2.2, 0.9, 1.5, -0.1, 2.0],
+            ],
+            dtype=np.float32,
+        )
+        params = [
+            _params(
+                frequency_penalty=0.4,
+                presence_penalty=0.6,
+                repetition_penalty=1.3,
+                min_new_tokens=4,
+                stop_token_ids=(3, 6),
+            ),
+            _params(repetition_penalty=0.8),
+            _params(),
+        ]
+        state0 = MlxPenaltyState.from_history(self.VOCAB, [0, 0, 1, 4])
+        state0.length = 2  # keep min_new_tokens active for row 0
+        states = [
+            state0,
+            MlxPenaltyState.from_history(self.VOCAB, [0, 1, 5]),
+            None,
+        ]
+        got = apply_penalties(mx.array(raw), params, states)
+        mx.eval(got)
+
+        ref = torch.tensor(raw, dtype=torch.float32)
+        counts = torch.zeros((3, self.VOCAB), dtype=torch.int32)
+        counts[0, 0] = 2
+        counts[0, 1] = 1
+        counts[0, 4] = 1
+        counts[1, 0] = 1
+        counts[1, 1] = 1
+        counts[1, 5] = 1
+        additive, scaling = _compute_logit_penalties(
+            counts=counts,
+            lens=torch.tensor([2, 3, 0], dtype=torch.int32),
+            frequency=torch.tensor([[0.4], [0.0], [0.0]], dtype=torch.float32),
+            presence=torch.tensor([[0.6], [0.0], [0.0]], dtype=torch.float32),
+            repetition=torch.tensor([[1.3], [0.8], [1.0]], dtype=torch.float32),
+            min_new_tokens=torch.tensor([[4], [0], [0]], dtype=torch.int32),
+            stop_token_ids=torch.tensor([[3, 6], [self.VOCAB] * 2, [self.VOCAB] * 2]),
+        )
+        ref = ref + additive
+        apply_scaling_penalties(ref, scaling)
+
+        np.testing.assert_allclose(np.array(got), ref.numpy(), rtol=1e-5, atol=1e-5)
+
+    def test_min_new_tokens_unmasks_stop_token_at_threshold(self):
+        p = _params(top_k=1, min_new_tokens=2, stop_token_ids=(7,))
+        state = MlxPenaltyState.from_history(self.VOCAB)
+        logits = mx.array([[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0]])
+
+        pen0 = apply_penalties(logits, [p], [state])
+        tok0 = mx.argmax(pen0, axis=-1)
+        commit_penalties([state], tok0)
+        mx.eval(tok0, state.counts)
+        self.assertEqual(int(tok0[0].item()), 1)
+        self.assertEqual(state.length, 1)
+
+        pen1 = apply_penalties(logits, [p], [state])
+        tok1 = mx.argmax(pen1, axis=-1)
+        commit_penalties([state], tok1)
+        mx.eval(tok1, state.counts)
+        self.assertEqual(int(tok1[0].item()), 1)
+        self.assertEqual(state.length, 2)
+
+        pen2 = apply_penalties(logits, [p], [state])
+        tok2 = mx.argmax(pen2, axis=-1)
+        mx.eval(tok2)
+        self.assertEqual(int(tok2[0].item()), 7)
+
+    def test_chained_decode_accumulates_penalties_in_graph(self):
+        """Chained decode must see step N's committed penalty at step N+1
+        with zero host sync between steps."""
+        runner = self._runner()
+        runner._req_sampling = {
+            "a": _params(top_k=1, presence_penalty=10.0),
+        }
+        runner._req_caches = {"a": [self._FakeCache(3)]}
+        runner._req_token_ids = {"a": [0]}
+        logits = mx.array([[0.0, 4.0, 5.0, 3.0, 0.0, 0.0, 0.0, 0.0]])
+        runner._decode_with_batched_attention = lambda caches, x, rids: logits
+
+        step0 = runner.decode_batch_start(["a"])
+        step1 = runner.decode_batch_start_chained(step0)
+        step2 = runner.decode_batch_start_chained(step1)
+        mx.eval(
+            step0.lazy_tokens,
+            step1.lazy_tokens,
+            step2.lazy_tokens,
+            *runner.penalty_state_arrays(["a"]),
+        )
+        self.assertEqual(step0.lazy_tokens.tolist(), [2])
+        self.assertEqual(step1.lazy_tokens.tolist(), [1])
+        self.assertEqual(step2.lazy_tokens.tolist(), [3])
+
+    def test_retracted_prefill_replays_output_ids_into_penalty_state(self):
+        """Re-prefilling a retracted request must seed counts & length from
+        req.output_ids so penalties continue seamlessly after retraction."""
+        from types import SimpleNamespace
+
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        runner = self._runner()
+        runner.disable_radix_cache = True
+        runner._acquire_cache = lambda: [self._FakeCache(4)]
+        logits = mx.array([0.0, 0.0, 5.0, 3.0, 0.0, 4.0, 0.0, 9.0])
+        runner.model = lambda input_ids, cache: mx.broadcast_to(
+            logits, (*input_ids.shape, self.VOCAB)
+        )
+        req = SimpleNamespace(
+            kv=SimpleNamespace(),
+            output_ids=[2, 2, 5],
+            sampling_params=SamplingParams(
+                top_k=1,
+                frequency_penalty=2.0,
+                min_new_tokens=4,
+                stop_token_ids={7},
+            ),
+        )
+        full_ids = [0, *req.output_ids]
+        pending = runner.prefill_start("a", full_ids, full_ids, [], [], 0, req=req)
+        state = runner._req_penalty_state["a"]
+        mx.eval(pending.lazy_token, state.counts)
+        self.assertEqual(pending.lazy_token.tolist(), [3])
+        self.assertEqual(state.length, 4)
+        self.assertEqual(state.counts.tolist(), [0, 0, 2, 1, 0, 1, 0, 0])
+
+    def test_discarded_chunk_does_not_mutate_penalty_state(self):
+        """Non-final chunked-prefill chunks (needs_logits=False) must not
+        commit discarded tokens into penalty counts or length."""
+
+        def full_model_only(input_ids, cache=None):
+            return mx.zeros((1, input_ids.shape[1], self.VOCAB))
+
+        runner = self._runner()
+        runner.model = full_model_only
+        runner._req_sampling = {"a": _params(top_k=1, frequency_penalty=1.0)}
+        tok, lazy_lp = runner._forward_lazy_token(
+            mx.array([[1, 2]], dtype=mx.int32),
+            [self._FakeCache(2)],
+            needs_logits=False,
+            req_id="a",
+        )
+        mx.eval(tok)
+        self.assertIsNone(lazy_lp)
+        self.assertNotIn("a", runner._req_penalty_state)
+
+    def test_penalties_run_before_custom_logits_hook(self):
+        """Custom logit processor hook must observe already-penalized logits
+        and penalties must not be applied a second time afterward."""
+        runner = self._runner()
+        runner._req_sampling = {"a": _params(top_k=1, presence_penalty=2.0)}
+        runner._req_penalty_state = {"a": MlxPenaltyState.from_history(self.VOCAB, [3])}
+        runner._req_caches = {"a": [self._FakeCache(4)]}
+        runner._req_token_ids = {"a": [3]}
+        raw_logits = mx.array([[0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0]])
+        runner._decode_with_batched_attention = lambda caches, x, rids: raw_logits
+
+        observed = []
+
+        def hook(arr):
+            observed.append(float(arr[0, 3]))
+            arr[0, 4] = 2.5
+            return arr
+
+        pending = runner.decode_batch_start(["a"], logits_hook=hook)
+        mx.eval(pending.lazy_tokens)
+        self.assertAlmostEqual(observed[0], 3.0, places=5)
+        self.assertEqual(pending.lazy_tokens.tolist(), [3])
 
 
 if __name__ == "__main__":

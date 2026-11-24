@@ -229,6 +229,11 @@ class MlxTpModelWorker(TpModelWorker):
     def _sampling_active(batch: ScheduleBatch) -> bool:
         return get_device().mlx_enable_sampling and batch.sampling_info is not None
 
+    def _penalty_state_arrays(self, req_ids: list[str]) -> list[mx.array]:
+        if not get_device().mlx_enable_sampling:
+            return []
+        return self._mlx_runner.penalty_state_arrays(req_ids)
+
     def _build_logit_edit_rows(
         self, batch: ScheduleBatch
     ) -> dict[str, mx.array] | None:
@@ -441,6 +446,7 @@ class MlxTpModelWorker(TpModelWorker):
             mx.async_eval(
                 pending_decode.lazy_tokens,
                 *lazy_logprob_arrays(pending_decode.lazy_logprobs),
+                *self._penalty_state_arrays(req_ids),
             )
             return MlxLaunch(
                 lazy_tokens=pending_decode.lazy_tokens,
@@ -556,6 +562,7 @@ class MlxTpModelWorker(TpModelWorker):
             async_args.extend(
                 self._mlx_runner.cache_state_arrays(pending_mixed_decode.caches)
             )
+        async_args.extend(self._penalty_state_arrays([req.rid for req in reqs]))
 
         if async_args:
             mx.async_eval(*async_args)
@@ -594,7 +601,10 @@ class MlxTpModelWorker(TpModelWorker):
         and extend lists are always empty for a chained decode.
         """
         pending = self._mlx_runner.decode_batch_start_chained(prev_pending)
-        mx.async_eval(pending.lazy_tokens)
+        mx.async_eval(
+            pending.lazy_tokens,
+            *self._penalty_state_arrays(pending.req_ids),
+        )
         return MlxLaunch(
             lazy_tokens=pending.lazy_tokens,
             prefills=[],

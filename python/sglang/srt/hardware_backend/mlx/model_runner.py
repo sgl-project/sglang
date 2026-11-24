@@ -66,9 +66,12 @@ from sglang.srt.hardware_backend.mlx.sampling import (
     GREEDY_PARAMS,
     MlxLazyLogprobs,
     MlxLogprobSpec,
+    MlxPenaltyState,
     MlxSamplingParams,
     MlxStepLogprobs,
     all_greedy,
+    apply_penalties,
+    commit_penalties,
     compute_logprobs,
     lazy_logprob_arrays,
     sample_tokens,
@@ -161,6 +164,8 @@ class MlxModelRunner:
     _enable_sampling = False
     _sanitize_nan = False
     _deterministic_seeding = False
+    _req_penalty_state: dict[str, MlxPenaltyState] | None = None
+    _req_penalty_init: dict[str, tuple[int, ...]] | None = None
 
     def __init__(
         self,
@@ -260,6 +265,8 @@ class MlxModelRunner:
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
         self._req_sampling: dict[str, MlxSamplingParams] = {}
+        self._req_penalty_state: dict[str, MlxPenaltyState] = {}
+        self._req_penalty_init: dict[str, tuple[int, ...]] = {}
         # Reusable cache lists, for models without auxiliary layer state.
         self._cache_pool: list[list[Any]] = []
 
@@ -912,13 +919,24 @@ class MlxModelRunner:
         if req is not None:
             req.kv.mamba_last_track_seqlen = None
         if self._enable_sampling:
-            self._req_sampling[req_id] = (
+            sp_mlx = (
                 MlxSamplingParams.from_req(
                     req, deterministic_seeding=self._deterministic_seeding
                 )
                 if req is not None
                 else GREEDY_PARAMS
             )
+            self._req_sampling[req_id] = sp_mlx
+            if self._req_penalty_state is None:
+                self._req_penalty_state = {}
+            if self._req_penalty_init is None:
+                self._req_penalty_init = {}
+            self._req_penalty_state.pop(req_id, None)
+            if sp_mlx.uses_penalty:
+                output_ids = getattr(req, "output_ids", ()) or ()
+                self._req_penalty_init[req_id] = tuple(int(t) for t in output_ids)
+            else:
+                self._req_penalty_init.pop(req_id, None)
 
         if self.disable_radix_cache:
             cache = self._acquire_cache()
@@ -1173,6 +1191,41 @@ class MlxModelRunner:
             logits[:, -1, :], [req_id], [cache], edits, logprob_spec
         )
 
+    def _get_penalty_states(
+        self,
+        req_ids: list[str],
+        params: list[MlxSamplingParams],
+        vocab_size: int,
+    ) -> list[MlxPenaltyState | None]:
+        """Return per-row lazy penalty states, initializing penalized rows once."""
+        if self._req_penalty_state is None:
+            self._req_penalty_state = {}
+        if self._req_penalty_init is None:
+            self._req_penalty_init = {}
+        states: list[MlxPenaltyState | None] = []
+        for rid, p in zip(req_ids, params):
+            if not p.uses_penalty:
+                states.append(None)
+                continue
+            state = self._req_penalty_state.get(rid)
+            if state is None:
+                init_ids = self._req_penalty_init.pop(rid, ())
+                state = MlxPenaltyState.from_history(vocab_size, init_ids)
+                self._req_penalty_state[rid] = state
+            states.append(state)
+        return states
+
+    def penalty_state_arrays(self, req_ids: list[str]) -> list[mx.array]:
+        """Lazy penalty-count arrays for ``req_ids``, for eval/async_eval."""
+        if not self._req_penalty_state:
+            return []
+        arrays: list[mx.array] = []
+        for rid in req_ids:
+            state = self._req_penalty_state.get(rid)
+            if state is not None:
+                arrays.append(state.counts)
+        return arrays
+
     def _select_tokens_with_logprobs(
         self,
         last_logits: mx.array,
@@ -1180,20 +1233,28 @@ class MlxModelRunner:
         caches: list[list[Any]],
         edit_rows: mx.array | None = None,
         logprob_spec: MlxLogprobSpec | None = None,
+        penalties_applied: bool = False,
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Pick one token per row of ``last_logits`` — lazily, inside the graph.
 
         Greedy behavior (sampling disabled, or every row greedy with no logit
-        edits) is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
-        worker's pre-combined additive [B, vocab] array (grammar mask +
-        logit_bias), applied before token selection and logprobs, mirroring the
-        CUDA ``SamplingPipeline`` order.  Positions for seeded
-        rows come from the attention cache offsets; they are build-time Python
-        ints, so this is chained-decode safe.
+        edits or penalties) is exactly the pre-sampling ``mx.argmax``.
+        Penalties run first, followed by ``edit_rows`` (grammar mask +
+        logit_bias) and NaN sanitization, mirroring the CUDA
+        ``SamplingPipeline`` order.  Positions for seeded rows come from the
+        attention cache offsets; they are build-time Python ints, so this is
+        chained-decode safe.
         """
         if not self._enable_sampling:
             return mx.argmax(last_logits, axis=-1), None
         params = [self._req_sampling[rid] for rid in req_ids]
+        penalty_states = (
+            self._get_penalty_states(req_ids, params, last_logits.shape[-1])
+            if any(p.uses_penalty for p in params)
+            else None
+        )
+        if penalty_states is not None and not penalties_applied:
+            last_logits = apply_penalties(last_logits, params, penalty_states)
         edited = self._edited_logits(last_logits, edit_rows)
         greedy = all_greedy(params)
         # Shared by sampling and logprobs; None when neither needs it.
@@ -1225,6 +1286,8 @@ class MlxModelRunner:
             if logprob_spec is not None
             else None
         )
+        if penalty_states is not None:
+            commit_penalties(penalty_states, tokens)
         return tokens, lazy_logprobs
 
     def _edited_logits(
@@ -1294,13 +1357,22 @@ class MlxModelRunner:
         write-then-read ordering lands in a single kernel submission.
         """
         if isinstance(pending, MlxPendingDecode):
-            tokens, caches = pending.lazy_tokens, pending.caches
+            tokens, caches, req_ids = (
+                pending.lazy_tokens,
+                pending.caches,
+                pending.req_ids,
+            )
         else:
-            tokens, caches = pending.lazy_token, [pending.cache]
+            tokens, caches, req_ids = (
+                pending.lazy_token,
+                [pending.cache],
+                [pending.req_id],
+            )
         mx.eval(
             tokens,
             *self.cache_state_arrays(caches),
             *lazy_logprob_arrays(pending.lazy_logprobs),
+            *self.penalty_state_arrays(req_ids),
         )
 
     @staticmethod
@@ -1582,15 +1654,30 @@ class MlxModelRunner:
                 caches, batched_input, list(req_ids)
             )
 
+        penalties_applied = False
         if logits_hook is not None:
-            # CUDA edit order: grammar mask + logit_bias first, custom
-            # processors second, sanitization last (inside selection).
+            # CUDA edit order: penalties first, grammar mask + logit_bias
+            # second, custom processors third, sanitization last (inside
+            # selection).
+            if self._enable_sampling:
+                params = [self._req_sampling[rid] for rid in req_ids]
+                if any(p.uses_penalty for p in params):
+                    states = self._get_penalty_states(
+                        req_ids, params, last_logits.shape[-1]
+                    )
+                    last_logits = apply_penalties(last_logits, params, states)
+                    penalties_applied = True
             if edit_rows is not None:
                 last_logits = last_logits.astype(mx.float32) + edit_rows
                 edit_rows = None
             last_logits = self._run_logits_hook(last_logits, logits_hook)
         lazy_tokens, lazy_logprobs = self._select_tokens_with_logprobs(
-            last_logits, list(req_ids), caches, edit_rows, logprob_spec
+            last_logits,
+            list(req_ids),
+            caches,
+            edit_rows,
+            logprob_spec,
+            penalties_applied=penalties_applied,
         )
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
@@ -1688,6 +1775,10 @@ class MlxModelRunner:
         only through release_request_row, while the request owns its row."""
         self._req_token_ids.pop(req_id, None)
         self._req_sampling.pop(req_id, None)
+        if self._req_penalty_state is not None:
+            self._req_penalty_state.pop(req_id, None)
+        if self._req_penalty_init is not None:
+            self._req_penalty_init.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
         if cache is not None:
             self._release_cache(cache)
@@ -1698,6 +1789,10 @@ class MlxModelRunner:
         """Clear all request states."""
         self._req_token_ids.clear()
         self._req_sampling.clear()
+        if self._req_penalty_state is not None:
+            self._req_penalty_state.clear()
+        if self._req_penalty_init is not None:
+            self._req_penalty_init.clear()
         for cache in self._req_caches.values():
             self._release_cache(cache)
         self._req_caches.clear()
