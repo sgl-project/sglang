@@ -320,6 +320,26 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                 self.assertEqual(batch.full_prefill_cuda_graph_capture, expected)
                 self.assertEqual(batch.batch_size, 2 if expected else 1)
 
+    def test_output_buffer_fits_replicated_buckets_under_sp(self):
+        """TP8, buckets 1024 / 4096, SP above 1024 tokens: the first (4096) capture
+        returns its 512-row shard, but the 1024 bucket stays replicated."""
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.capture_num_tokens = [1024, 4096]
+        parallel = SimpleNamespace(
+            layernorm_sp_min_tokens=1024,
+            tp_group=SimpleNamespace(world_size=8, rank_in_group=0),
+        )
+        with (
+            patch("sglang.srt.layers.layernorm_sp.get_parallel", return_value=parallel),
+            patch(
+                "sglang.srt.layers.layernorm_sp.layernorm_sp_enabled", return_value=True
+            ),
+        ):
+            rows = runner.cuda_graph_output_capacity_rows(
+                (torch.empty(512, 4), torch.empty(512, 4))
+            )
+        self.assertEqual(rows, 1024)
+
     def test_trim_logits_output_preserves_customized_info(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = SimpleNamespace(

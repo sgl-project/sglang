@@ -330,6 +330,17 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 
+def _max_leading_rows(output: Any) -> Optional[int]:
+    if torch.is_tensor(output):
+        return output.shape[0]
+    if isinstance(output, (list, tuple)):
+        return max(
+            (r for r in map(_max_leading_rows, output) if r is not None),
+            default=None,
+        )
+    return None
+
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -782,19 +793,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_logits_rows = 0
 
     def cuda_graph_output_capacity_rows(self, output: Any) -> Optional[int]:
-        # Shapes are captured largest first; an SP body returns only its shard's rows
-        if torch.is_tensor(output):
-            return output.shape[0]
-        if isinstance(output, (list, tuple)):
-            return max(
-                (
-                    r
-                    for r in map(self.cuda_graph_output_capacity_rows, output)
-                    if r is not None
-                ),
-                default=None,
-            )
-        return None
+        from sglang.srt.layers.layernorm_sp import stack_rows
+
+        rows = _max_leading_rows(output)
+        if rows is None:
+            return None
+        # An SP bucket returns its shard's rows, one at or under
+        # --layernorm-sp-min-tokens all of its tokens.
+        return max(
+            rows, *(stack_rows(ForwardMode.EXTEND, n) for n in self.capture_num_tokens)
+        )
 
     def _is_mamba_track_enabled(self) -> bool:
         return get_exec().mamba.enable_mamba_extra_buffer and (
