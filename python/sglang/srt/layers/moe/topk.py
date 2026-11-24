@@ -57,7 +57,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_remap import (
     EpRemapPolicy,
     prepare_biased_topk_ep_kwargs,
-    prepare_softmax_topk_ep_kwargs,
+    prepare_softmax_topk_kwargs,
     resolve_ep_remap_policy,
 )
 from sglang.srt.layers.moe.utils import (
@@ -290,6 +290,8 @@ class TopKConfig:
     # Lazy materialization still needs the producer's solver and capture slot.
     layer_id: Optional[int] = None
     ep_remap_policy: Optional[EpRemapPolicy] = None
+    # Keep global expert IDs when the dispatcher uses a custom local_expert_mapping.
+    use_custom_local_expert_mapping: bool = False
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -685,6 +687,16 @@ def resolve_routing_inputs(
     return num_token_non_padded, expert_location_dispatch_info
 
 
+def _resolve_ep_remap_policy(topk_config: TopKConfig) -> EpRemapPolicy:
+    return resolve_ep_remap_policy(
+        topk_config=topk_config,
+        is_cuda=_is_cuda,
+        use_aiter=_use_aiter,
+        is_xpu=_is_xpu,
+        is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+    )
+
+
 class TopK(BaseFusedOp):
     """
     Parameters:
@@ -770,12 +782,8 @@ class TopK(BaseFusedOp):
             self.topk_config.output_format == TopKOutputFormat.STANDARD
             and custom_routing_function is None
         ):
-            self.topk_config.ep_remap_policy = resolve_ep_remap_policy(
-                topk_config=self.topk_config,
-                is_cuda=_is_cuda,
-                use_aiter=_use_aiter,
-                is_xpu=_is_xpu,
-                is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+            self.topk_config.ep_remap_policy = _resolve_ep_remap_policy(
+                self.topk_config
             )
 
     def routing_inputs(self):
@@ -811,44 +819,28 @@ class TopK(BaseFusedOp):
         self.topk_config.fused_gate_packed_ids &= (
             runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
         )
-        if self.topk_config.output_format is not None:
-            if (
-                self.topk_config.output_format == TopKOutputFormat.STANDARD
-                and self.topk_config.custom_routing_function is None
+        if self.topk_config.output_format is None:
+            if runner_backend is not None and (
+                runner_backend.is_flashinfer_trtllm()
+                and _can_bypass_trtllm_routing(self.topk_config)
+                or runner_backend.is_flashinfer_mxfp4()
+                and not self.is_fp4_experts
             ):
-                self.topk_config.ep_remap_policy = resolve_ep_remap_policy(
-                    topk_config=self.topk_config,
-                    is_cuda=_is_cuda,
-                    use_aiter=_use_aiter,
-                    is_xpu=_is_xpu,
-                    is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+                output_format = (
+                    TopKOutputFormat.STANDARD
+                    if runner_backend.is_experimental_sgl_trtllm()
+                    and get_lora().enable_lora
+                    else TopKOutputFormat.BYPASSED
                 )
-            return
-        if runner_backend is not None and (
-            runner_backend.is_flashinfer_trtllm()
-            and _can_bypass_trtllm_routing(self.topk_config)
-            or runner_backend.is_flashinfer_mxfp4()
-            and not self.is_fp4_experts
-        ):
-            output_format = (
-                TopKOutputFormat.STANDARD
-                if runner_backend.is_experimental_sgl_trtllm()
-                and get_lora().enable_lora
-                else TopKOutputFormat.BYPASSED
-            )
-        else:
-            output_format = TopKOutputFormat.STANDARD
-        self.topk_config.output_format = output_format
+            else:
+                output_format = TopKOutputFormat.STANDARD
+            self.topk_config.output_format = output_format
         if (
-            output_format == TopKOutputFormat.STANDARD
+            self.topk_config.output_format == TopKOutputFormat.STANDARD
             and self.topk_config.custom_routing_function is None
         ):
-            self.topk_config.ep_remap_policy = resolve_ep_remap_policy(
-                topk_config=self.topk_config,
-                is_cuda=_is_cuda,
-                use_aiter=_use_aiter,
-                is_xpu=_is_xpu,
-                is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
+            self.topk_config.ep_remap_policy = _resolve_ep_remap_policy(
+                self.topk_config
             )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
@@ -2958,13 +2950,7 @@ def select_experts(
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
     ep_local_remapped = False
-    ep_policy = topk_config.ep_remap_policy or resolve_ep_remap_policy(
-        topk_config=topk_config,
-        is_cuda=_is_cuda,
-        use_aiter=_use_aiter,
-        is_xpu=_is_xpu,
-        is_expert_remapping_enabled_fn=is_expert_remapping_enabled,
-    )
+    ep_policy = topk_config.ep_remap_policy or _resolve_ep_remap_policy(topk_config)
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -3206,28 +3192,23 @@ def select_experts(
                     )
 
             # Qwen3MOE uses fused_topk
-            _fused_topk_kwargs = {}
             # ===== TO BE REFACTORED ====
-            # Only the experimental fused topk+pack passes packed_out/num_token_non_padded;
-            # the default call keeps the upstream signature (fused_topk_cpu lacks these).
-            if packed_topk is not None:
-                _fused_topk_kwargs = dict(
-                    packed_out=packed_topk,
+            # Only CUDA softmax paths pass packed_out / num_token_non_padded / EP remap
+            # kwargs; non-CUDA implementations (e.g. fused_topk_cpu) keep the base args.
+            _fused_topk_kwargs, softmax_padded_masked, ep_local_remapped = (
+                prepare_softmax_topk_kwargs(
+                    policy=ep_policy,
+                    topk_config=topk_config,
+                    num_routed_experts=router_logits.shape[1],
+                    scoring_func=scoring_func,
                     num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    routing_overridden=routing_overridden,
+                    packed_topk=packed_topk,
                 )
-            else:
-                ep_kwargs, padded_rows_masked, ep_local_remapped = (
-                    prepare_softmax_topk_ep_kwargs(
-                        policy=ep_policy,
-                        topk_config=topk_config,
-                        num_routed_experts=router_logits.shape[1],
-                        scoring_func=scoring_func,
-                        num_token_non_padded=num_token_non_padded,
-                        expert_location_dispatch_info=expert_location_dispatch_info,
-                        routing_overridden=routing_overridden,
-                    )
-                )
-                _fused_topk_kwargs.update(ep_kwargs)
+            )
+            if packed_topk is None:
+                padded_rows_masked = softmax_padded_masked
             # ===== END TO BE REFACTORED ====
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,

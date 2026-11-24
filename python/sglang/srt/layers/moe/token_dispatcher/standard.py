@@ -3,9 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
+from sglang.kernels.ops.moe.map_local_experts import map_topk_ids_to_local_experts
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -16,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_max_padding,
     mask_dp_pad_moe_topk_ids,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import get_device, is_hip
 
@@ -95,24 +95,6 @@ class StandardCombineInput(NamedTuple):
 assert isinstance(StandardCombineInput, CombineInput)
 
 
-@triton.jit
-def _map_topk_ids_to_local_experts_kernel(
-    topk_ids_ptr,
-    mapping_ptr,
-    out_ptr,
-    numel,
-    NUM_EXPERTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < numel
-    idx = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
-    valid = mask & (idx >= 0) & (idx < NUM_EXPERTS)
-    mapped = tl.load(mapping_ptr + tl.where(valid, idx, 0), mask=valid, other=-1)
-    tl.store(out_ptr + offs, mapped.to(out_ptr.dtype.element_ty), mask=mask)
-
-
 def _map_topk_ids_to_local_experts(
     topk_ids: torch.Tensor,
     local_expert_mapping: torch.Tensor,
@@ -131,21 +113,10 @@ def _map_topk_ids_to_local_experts(
         and local_expert_mapping.is_contiguous()
         and allow_triton
     ):
-        numel = topk_ids.numel()
-        out = torch.empty_like(topk_ids)
-        if numel > 0:
-            BLOCK_SIZE = 256
-            grid = (triton.cdiv(numel, BLOCK_SIZE),)
-            _map_topk_ids_to_local_experts_kernel[grid](
-                topk_ids_ptr=topk_ids,
-                mapping_ptr=local_expert_mapping,
-                out_ptr=out,
-                numel=numel,
-                NUM_EXPERTS=local_expert_mapping.numel(),
-                BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=1,
-            )
-        return out
+        return map_topk_ids_to_local_experts(
+            topk_ids=topk_ids,
+            local_expert_mapping=local_expert_mapping,
+        )
     return torch.where(
         topk_ids < 0,
         -1,
@@ -202,7 +173,12 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.moe_ep_rank = get_parallel().moe_ep_rank
         self._disable_fused_ep_remap = _envs.SGLANG_DISABLE_FUSED_EP_REMAP.get()
-        self._interleaved_experts = _envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
+        self._interleaved_experts = (
+            _envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
+            and get_moe_a2a_backend().is_none()
+            and not self.skip_local_expert_mapping
+            and get_exec().moe.ep_join_mode != "scale"
+        )
         self.local_expert_mapping = None
         self._default_local_expert_mapping: Optional[torch.Tensor] = None
         self.expert_mask_gpu = None
@@ -326,19 +302,22 @@ class StandardDispatcher(BaseDispatcher):
             self.local_expert_mapping is not None
             and self.local_expert_mapping is not self._default_local_expert_mapping
         )
-        if (
-            isinstance(topk_output, StandardTopKOutputLocalMapped)
-            and not has_custom_mapping
-            and not self.skip_local_expert_mapping
-            and not self.use_aiter_moe_runner
-        ):
-            if _MASK_DP_PAD_MOE and is_dp_max_padding():
-                mask_dp_pad_moe_topk_ids(topk_output.topk_ids)
-            return StandardDispatchOutput(
-                hidden_states=hidden_states,
-                hidden_states_scale=hidden_states_scale,
-                topk_output=topk_output,
-            )
+        if isinstance(topk_output, StandardTopKOutputLocalMapped):
+            if has_custom_mapping:
+                raise ValueError(
+                    "StandardDispatcher received StandardTopKOutputLocalMapped with a "
+                    "custom local_expert_mapping; set "
+                    "TopKConfig.use_custom_local_expert_mapping=True so the router "
+                    "preserves global expert IDs."
+                )
+            if not self.skip_local_expert_mapping and not self.use_aiter_moe_runner:
+                if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                    mask_dp_pad_moe_topk_ids(topk_output.topk_ids)
+                return StandardDispatchOutput(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=hidden_states_scale,
+                    topk_output=topk_output,
+                )
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
             if self.use_aiter_moe_runner and self.expert_mask_gpu is None:

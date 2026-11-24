@@ -67,6 +67,7 @@ def resolve_ep_remap_policy(
         and ep_size > 1
         # DWDP replicates full experts after load and collapses FusedMoE.moe_ep_size=1.
         and parallel.dwdp_size <= 1
+        and not topk_config.use_custom_local_expert_mapping
         and not topk_config.shared_experts.use_waterfill
         and get_exec().moe.ep_join_mode != "scale"
         and get_moe_a2a_backend().is_none()
@@ -95,8 +96,9 @@ def can_fuse_ep_local_expert_remap(
     num_routed_experts: int,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     routing_overridden: bool,
+    use_custom_local_expert_mapping: bool = False,
 ) -> bool:
-    if not policy.can_fuse_static:
+    if not policy.can_fuse_static or use_custom_local_expert_mapping:
         return False
     if num_routed_experts <= 0 or num_routed_experts % policy.ep_size != 0:
         return False
@@ -155,7 +157,9 @@ def prepare_biased_topk_ep_kwargs(
         from sglang.kernels.ops.moe import moe_route_radix
 
         if correction_bias.stride(0) == 1 and moe_route_radix.covered(
-            router_logits, correction_bias, top_k_for_gate
+            scores=router_logits,
+            bias=correction_bias,
+            topk=top_k_for_gate,
         ):
             return {}, False
     kwargs = {}
@@ -167,6 +171,7 @@ def prepare_biased_topk_ep_kwargs(
         num_routed_experts=router_logits.shape[1],
         expert_location_dispatch_info=expert_location_dispatch_info,
         routing_overridden=routing_overridden,
+        use_custom_local_expert_mapping=topk_config.use_custom_local_expert_mapping,
     )
     if ep_local_remapped:
         kwargs.update(
@@ -177,7 +182,7 @@ def prepare_biased_topk_ep_kwargs(
     return kwargs, ep_local_remapped
 
 
-def prepare_softmax_topk_ep_kwargs(
+def prepare_softmax_topk_kwargs(
     *,
     policy: EpRemapPolicy,
     topk_config: TopKConfig,
@@ -186,7 +191,17 @@ def prepare_softmax_topk_ep_kwargs(
     num_token_non_padded: Optional[torch.Tensor],
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     routing_overridden: bool,
+    packed_topk: Optional[torch.Tensor] = None,
 ) -> Tuple[dict, bool, bool]:
+    if packed_topk is not None:
+        return (
+            dict(
+                packed_out=packed_topk,
+                num_token_non_padded=num_token_non_padded,
+            ),
+            False,
+            False,
+        )
     if not policy.allow_padded_row_mask or scoring_func != "softmax":
         return {}, False, False
     kwargs = {}
@@ -200,6 +215,7 @@ def prepare_softmax_topk_ep_kwargs(
         num_routed_experts=num_routed_experts,
         expert_location_dispatch_info=expert_location_dispatch_info,
         routing_overridden=routing_overridden,
+        use_custom_local_expert_mapping=topk_config.use_custom_local_expert_mapping,
     )
     if ep_local_remapped:
         kwargs.update(
@@ -208,4 +224,3 @@ def prepare_softmax_topk_ep_kwargs(
             )
         )
     return kwargs, padded_rows_masked, ep_local_remapped
-

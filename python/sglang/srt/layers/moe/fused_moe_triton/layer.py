@@ -439,7 +439,6 @@ class FusedMoE(torch.nn.Module):
         )
         self.moe_ep_size = get_parallel().moe_ep_size
         self.moe_ep_rank = get_parallel().moe_ep_rank
-        self._interleaved_experts = envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
         self.moe_tp_size = get_parallel().moe_tp_size
         self.moe_tp_rank = get_parallel().moe_tp_rank
 
@@ -659,6 +658,13 @@ class FusedMoE(torch.nn.Module):
 
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
+        )
+        self._interleaved_experts = (
+            envs.SGLANG_ENABLE_EP_INTERLEAVED_EXPERTS.get()
+            and get_moe_a2a_backend().is_none()
+            and isinstance(self.dispatcher, StandardDispatcher)
+            and not self.dispatcher.skip_local_expert_mapping
+            and get_exec().moe.ep_join_mode != "scale"
         )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.

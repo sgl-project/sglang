@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.moe import moe_fused_gate as moe_fused_gate_mod
+from sglang.kernels.ops.moe.map_local_experts import map_topk_ids_to_local_experts
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -851,6 +852,44 @@ def test_moe_fused_gate_ep_remap_offset_strided_and_warp_bypass() -> None:
     )
     assert torch.equal(ids_warp_bypass, ids_warp_ref)
     assert torch.allclose(w_warp_bypass, w_warp_ref, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("m_rows", [0, 1, 64])
+def test_map_topk_ids_to_local_experts_matches_eager_and_oob(
+    dtype: torch.dtype, m_rows: int
+) -> None:
+    torch.manual_seed(17)
+    num_experts = 128
+    mapping = torch.full((num_experts,), -1, dtype=torch.int32, device=DEVICE)
+    mapping[64:128] = torch.arange(64, dtype=torch.int32, device=DEVICE)
+
+    raw = torch.randint(-1, num_experts, (m_rows, 8), dtype=dtype, device=DEVICE)
+    if m_rows > 0:
+        raw[0, :5] = torch.tensor(
+            [-1, 0, 63, 64, num_experts - 1], dtype=dtype, device=DEVICE
+        )
+    expected = torch.where(
+        raw < 0,
+        torch.tensor(-1, dtype=dtype, device=DEVICE),
+        mapping[raw.clamp(0, num_experts - 1)].to(dtype),
+    )
+
+    out_triton = map_topk_ids_to_local_experts(
+        topk_ids=raw, local_expert_mapping=mapping
+    )
+    assert out_triton.dtype == dtype
+    assert torch.equal(out_triton, expected)
+
+    if m_rows > 0:
+        oob = raw.clone()
+        oob[0, 0] = num_experts
+        oob[0, 1] = num_experts + 5
+        out_oob = map_topk_ids_to_local_experts(
+            topk_ids=oob, local_expert_mapping=mapping
+        )
+        assert int(out_oob[0, 0].item()) == -1
+        assert int(out_oob[0, 1].item()) == -1
 
 
 if __name__ == "__main__":
