@@ -790,6 +790,7 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if draft_head_tp is not None:
+            # Only the draft graphs set it; they never ask for logprobs or sampled rows.
             assert not logits_metadata.extend_return_logprob and sample_indices is None
             return LogitsProcessorOutput(
                 next_token_logits=None,

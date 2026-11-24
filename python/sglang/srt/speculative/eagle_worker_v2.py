@@ -1012,11 +1012,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
+                vocab_bound = (
+                    self.draft_runner.model_config.vocab_size
+                    if logits_output.next_token_logits is None
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    self.draft_runner.model_config.vocab_size,
-                    f"draft_forward step {i}: topk_index OOB",
+                    vocab_bound,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={vocab_bound}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]

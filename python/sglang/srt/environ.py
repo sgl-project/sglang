@@ -261,7 +261,6 @@ def _k31_gb_best(best: Any, default: Any) -> Callable[[], Any]:
 
 
 class Envs:
-    SGLANG_MTP_DRAFT_HEAD_TP = EnvBool(False)
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
     #   section; add a new one only when no current section is a clear fit.
@@ -1921,6 +1920,9 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Shard the Qwen3.5 greedy MTP draft head over four node-local ranks (decode
+    # workers with DP attention only; logs the reason when it does not turn on).
+    SGLANG_MTP_DRAFT_HEAD_TP = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

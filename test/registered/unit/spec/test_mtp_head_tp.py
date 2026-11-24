@@ -11,9 +11,10 @@ from sglang.srt.layers.mtp_head_tp import (
     local_argmax_pair,
     merge_argmax_pairs,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestMTPHeadTopology(unittest.TestCase):
@@ -27,22 +28,34 @@ class TestMTPHeadTopology(unittest.TestCase):
         self.assertIsNone(head_tp4_rank_groups([(r, "node", 0) for r in range(4)]))
 
     def test_megakernel_draft_skips_head_tp(self):
-        model = SimpleNamespace()
-        with (
-            mock.patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(pp_size=1, tp_size=4),
-            ),
-            mock.patch("sglang.srt.runtime_context.get_spec"),
-            mock.patch(
-                "sglang.srt.speculative.eagle_megakernel._offers_eagle_entries",
-                return_value=True,
-            ),
-            self.assertLogs("sglang.srt.layers.mtp_head_tp", "INFO") as logs,
-        ):
-            configure_draft_head_tp(model, None)
-        self.assertFalse(hasattr(model, "draft_head_tp"))
-        self.assertIn("megakernel", logs.output[0])
+        for entries, step_fold in ((True, False), (False, True)):
+            model = SimpleNamespace()
+            with (
+                mock.patch(
+                    "sglang.srt.runtime_context.get_parallel",
+                    return_value=SimpleNamespace(
+                        pp_size=1,
+                        tp_size=4,
+                        tp_group=SimpleNamespace(cpu_group=None, rank=0),
+                    ),
+                ),
+                mock.patch("sglang.srt.runtime_context.get_spec"),
+                mock.patch(
+                    "sglang.srt.speculative.eagle_megakernel._offers_eagle_entries",
+                    return_value=entries,
+                ),
+                mock.patch(
+                    "sglang.srt.kernel_plugins.nvidia.binding.megakernel_entry",
+                    side_effect=lambda _, name: (
+                        object() if step_fold and name == "draft_step_fold" else None
+                    ),
+                ),
+                mock.patch("torch.distributed.all_reduce"),
+                self.assertLogs("sglang.srt.layers.mtp_head_tp", "INFO") as logs,
+            ):
+                configure_draft_head_tp(model, None)
+            self.assertFalse(hasattr(model, "draft_head_tp"))
+            self.assertIn("megakernel", logs.output[0])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
