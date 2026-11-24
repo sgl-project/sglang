@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import logging
 import os
@@ -23,6 +24,7 @@ import shutil
 import signal
 import sys
 import time
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from typing import Optional
 
@@ -202,7 +204,7 @@ def _thread_siblings(cpu: int) -> str:
         return str(cpu)
 
 
-def _cores(cpus) -> list[list[int]]:
+def physical_cores(cpus) -> list[list[int]]:
     """``cpus`` grouped by physical core, a core's threads in one list."""
     cores = {}
     for cpu in sorted(cpus):
@@ -219,14 +221,53 @@ def _share(cores: list[list[int]], rank: int, num_ranks: int) -> list[int]:
     return sorted(c for core in cores[start : start + num_cores_bind] for c in core)
 
 
+def allocate_cpus(starts: dict[int, list[list[int]]]) -> dict[int, list[int]]:
+    """Each scheduler's CPUs, by GPU, from the physical cores it may use.
+
+    The schedulers take turns claiming the free core the fewest others may use, which
+    sets how many cores each gets. Then, those with the fewest cores to choose from
+    first, each takes a run of that many free cores the schedulers still to come want
+    least. A scheduler left without a core shares all of its own."""
+    cores = {gpu_id: [tuple(core) for core in own] for gpu_id, own in starts.items()}
+    demand = Counter(core for own in cores.values() for core in own)
+    free = set(demand)
+    quota = dict.fromkeys(cores, 0)
+    claimed = True
+    while claimed:
+        claimed = False
+        for gpu_id, own in cores.items():
+            choices = free.intersection(own)
+            if choices:
+                free.remove(min(choices, key=lambda core: (demand[core], core)))
+                quota[gpu_id] += 1
+                claimed = True
+
+    plan = {}
+    taken = set()
+    order = sorted(cores, key=lambda gpu_id: (len(cores[gpu_id]), gpu_id))
+    for i, gpu_id in enumerate(order):
+        options = sorted(core for core in cores[gpu_id] if core not in taken)
+        count = min(quota[gpu_id], len(options))
+        if count == 0:
+            plan[gpu_id] = sorted(cpu for core in cores[gpu_id] for cpu in core)
+            continue
+        later = Counter(core for other in order[i + 1 :] for core in cores[other])
+        first = min(
+            range(len(options) - count + 1),
+            key=lambda s: (sum(later[core] for core in options[s : s + count]), s),
+        )
+        run = options[first : first + count]
+        taken.update(run)
+        plan[gpu_id] = sorted(cpu for core in run for cpu in core)
+    return plan
+
+
 def plan_gpu_proc_affinity(server_args, gpu_ids) -> dict[int, list[int]]:
     """The CPUs each local scheduler binds to under ``SGLANG_SET_CPU_AFFINITY``, by GPU.
 
     A scheduler starts from the launcher's CPUs, narrowed to its GPU's NUMA node when
-    NUMA binding places it there. The schedulers that start from the same CPUs split
-    them by physical core, leaving out the cores a group with fewer CPUs already holds
-    unless no other core is left. Run in the launcher, before any scheduler narrows the
-    visible devices."""
+    NUMA binding places it there; ``allocate_cpus`` splits those starts. Run in the
+    launcher, before any scheduler narrows the visible devices."""
     from sglang.srt.environ import envs
 
     if not envs.SGLANG_SET_CPU_AFFINITY.get():
@@ -235,21 +276,39 @@ def plan_gpu_proc_affinity(server_args, gpu_ids) -> dict[int, list[int]]:
     from sglang.srt.utils.device import maybe_reindex_device_id
 
     launcher_cpus = set(os.sched_getaffinity(0))
-    groups = {}
+    starts = {}
     for gpu_id in gpu_ids:
         # the device id configure_subprocess looks the NUMA node up with
         with maybe_reindex_device_id(gpu_id) as device_id:
             cpus = numa_utils.numa_bound_cpus(server_args, device_id, launcher_cpus)
-        groups.setdefault(frozenset(cpus), []).append(gpu_id)
-    plan = {}
-    taken = set()
-    for cpus in sorted(groups, key=lambda cpus: (len(cpus), min(groups[cpus]))):
-        members = groups[cpus]
-        cores = _cores(cpus - taken) or _cores(cpus)
-        for rank, gpu_id in enumerate(members):
-            plan[gpu_id] = _share(cores, rank, len(members))
-            taken.update(plan[gpu_id])
-    return plan
+        starts[gpu_id] = physical_cores(cpus)
+    return allocate_cpus(starts)
+
+
+class CpuShareBoard:
+    """Hands each scheduler on a host its ``allocate_cpus`` share once every scheduler of
+    that host has reported the physical cores it may use. For launchers that place
+    schedulers on hosts they cannot inspect (Ray)."""
+
+    def __init__(self):
+        self._starts = defaultdict(dict)
+        self._plans = {}
+        self._ready = defaultdict(asyncio.Event)
+
+    async def register(
+        self, host: str, expected: int, gpu_id: int, cores, timeout: float = 300.0
+    ):
+        """This scheduler's CPUs, or None when the host's other schedulers do not all
+        report within ``timeout`` seconds."""
+        self._starts[host][gpu_id] = cores
+        if len(self._starts[host]) >= expected and host not in self._plans:
+            self._plans[host] = allocate_cpus(self._starts[host])
+            self._ready[host].set()
+        try:
+            await asyncio.wait_for(self._ready[host].wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        return self._plans[host].get(gpu_id)
 
 
 @contextmanager
@@ -287,7 +346,7 @@ def set_gpu_proc_affinity(gpu_id: int, server_args=None):
         parallel = get_parallel()
         nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
         tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
-        bind_cpu_ids = _share(_cores(cpus), gpu_id, tp_size_per_node)
+        bind_cpu_ids = _share(physical_cores(cpus), gpu_id, tp_size_per_node)
 
     # set cpu_affinity to current process
     try:

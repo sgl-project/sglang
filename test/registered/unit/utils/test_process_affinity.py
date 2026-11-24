@@ -1,5 +1,6 @@
 """Unit tests for srt/utils/process.py: the launcher's CPU plan and set_gpu_proc_affinity."""
 
+import asyncio
 import contextlib
 import unittest
 from types import SimpleNamespace
@@ -155,6 +156,49 @@ class TestPlanGpuProcAffinity(CustomTestCase):
         )
         self.assertTrue(set(plan[0]) <= _NODE_CPUS[0])
         self.assertTrue(set(plan[1]) <= _NODE_CPUS[1])
+
+
+class TestAllocateCpus(CustomTestCase):
+    def test_leaves_a_core_for_each_scheduler_of_a_wider_mask(self):
+        """TP4: GPU 0 may use cores 0-7 and the others 0-8. Each of the three gets its
+        own cores instead of all sharing core 8."""
+        starts = {0: [[c] for c in range(8)]}
+        starts.update({g: [[c] for c in range(9)] for g in (1, 2, 3)})
+        plan = process.allocate_cpus(starts)
+        self.assertEqual(plan, {0: [0, 1, 2], 1: [3, 4], 2: [5, 6], 3: [7, 8]})
+
+    def test_shares_its_cores_when_none_is_left(self):
+        plan = process.allocate_cpus({0: [[0]], 1: [[0]]})
+        self.assertEqual(plan[0], [0])
+        self.assertEqual(plan[1], [0])
+
+
+class TestCpuShareBoard(CustomTestCase):
+    def test_splits_each_host_among_its_schedulers(self):
+        """Ray TP2 with one GPU per 32-core socket of each host: each actor gets its
+        socket's cores; a host's split waits for both of its actors."""
+        socket = lambda first: [[c] for c in range(first, first + 32)]
+
+        async def run():
+            board = process.CpuShareBoard()
+            return await asyncio.gather(
+                board.register("a", 2, 0, socket(0)),
+                board.register("a", 2, 1, socket(32)),
+                board.register("b", 1, 0, socket(0)),
+            )
+
+        a0, a1, b0 = asyncio.run(run())
+        self.assertEqual(a0, list(range(32)))
+        self.assertEqual(a1, list(range(32, 64)))
+        self.assertEqual(b0, list(range(32)))
+
+    def test_gives_up_when_the_hosts_schedulers_do_not_all_report(self):
+        async def run():
+            return await process.CpuShareBoard().register(
+                "a", 2, 0, [[0]], timeout=0.01
+            )
+
+        self.assertIsNone(asyncio.run(run()))
 
 
 class TestSetGpuProcAffinity(CustomTestCase):
