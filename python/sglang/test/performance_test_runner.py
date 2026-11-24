@@ -84,7 +84,7 @@ def run_performance_test(
         print(f"  Baseline FTL: {baseline_ftl_s} s")
     if baseline_itl_ms is not None:
         print(f"  Baseline ITL: {baseline_itl_ms} ms")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Build extra args for benchmarks
     extra_bench_args = ["--trust-remote-code"]
@@ -92,6 +92,21 @@ def run_performance_test(
         extra_bench_args.append(f"--dataset-name={dataset_name}")
 
     try:
+        # Scalar gates describe one shape at the largest batch size. Reject
+        # ambiguous configurations before launching an expensive benchmark.
+        if any(
+            baseline is not None
+            for baseline in (
+                baseline_output_throughput,
+                baseline_ftl_s,
+                baseline_itl_ms,
+            )
+        ) and (len(input_lens) != 1 or len(output_lens) != 1):
+            raise ValueError(
+                "Performance baselines require exactly one input length "
+                "and one output length"
+            )
+
         results, success, avg_spec_accept_length = perf_runner.run_benchmark_for_model(
             model_path=model.model_path,
             batch_sizes=batch_sizes,
@@ -127,7 +142,9 @@ def run_performance_test(
             passed = True
             if spec_accept_length_threshold is not None:
                 if avg_spec_accept_length is None:
-                    error_msg = f"Spec accept length threshold set but no accept length reported"
+                    error_msg = (
+                        "Spec accept length threshold set but no accept length reported"
+                    )
                     passed = False
                     print(f"✗ {error_msg}")
                 elif avg_spec_accept_length < spec_accept_length_threshold:

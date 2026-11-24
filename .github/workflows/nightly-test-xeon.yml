@@ -36,8 +36,9 @@ on:
         default: true
 
 concurrency:
-  group: nightly-test-xeon-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
+  # Explicit entry points supply a boolean input; direct push/schedule runs do not.
+  group: nightly-test-xeon-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || (toJSON(inputs.continue_on_error) == 'true' || toJSON(inputs.continue_on_error) == 'false') && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ toJSON(inputs.continue_on_error) != 'true' && toJSON(inputs.continue_on_error) != 'false' }}
 
 jobs:
   nightly-xeon:
@@ -47,8 +48,8 @@ jobs:
     timeout-minutes: 960
     env:
       REPORT_DIR: nightly-results/${{ matrix.name }}
-      # Push events have no workflow_dispatch/workflow_call input defaults.
-      CONTINUE_ON_ERROR_FLAG: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+      # Honor explicit false even when a reusable caller was triggered by push/schedule.
+      CONTINUE_ON_ERROR_FLAG: ${{ toJSON(inputs.continue_on_error) != 'false' && '--continue-on-error' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -231,19 +232,15 @@ jobs:
           docker builder prune -f --filter until=24h || true
 
   check-all-jobs:
-    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    if: always() && github.repository == 'sgl-project/sglang'
     needs:
       - nightly-xeon
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
         run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more nightly test jobs failed"
-            exit 1
-          fi
-          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more nightly test jobs were cancelled"
+          if [[ "${{ needs['nightly-xeon'].result }}" != "success" ]]; then
+            echo "Nightly Xeon test job did not succeed"
             exit 1
           fi
           echo "All nightly test jobs passed"
