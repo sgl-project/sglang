@@ -39,6 +39,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_cache,
     hold_band,
+    largest_take,
     open_float_side,
     release_band,
     setup_allocator_context,
@@ -148,7 +149,7 @@ class TestTriJointReclaim(CustomTestCase):
                     demand = 4 if count == 8 else 9
                     if count == 24:
                         # One token past what owner and window can take together.
-                        demand = a.available_size() + 1
+                        demand = largest_take(a) + 1
                     # Eviction is needed exactly when the records' first prefix
                     # in eviction order must go: without it the demand does not
                     # fit (5 states leave room already).
@@ -237,7 +238,7 @@ class TestTriJointReclaim(CustomTestCase):
             )
         # Require one token pair beyond free space, so the unlocked state
         # checkpoints must make room while every token binding stays locked.
-        demand = a.available_size() + 1
+        demand = largest_take(a) + 1
         self.assertFalse(a.admits(KVDemand(demand, demand_windows(a, demand, demand))))
         try:
             self.assertEqual(c.full_evictable_size(), 0)
@@ -408,7 +409,7 @@ class TestTriJointReclaim(CustomTestCase):
                     hold_band(member)
                 if grouped:
                     a.free_group_begin()
-                self.assertGreaterEqual(a.available_size(), page_size)
+                self.assertGreaterEqual(largest_take(a), page_size)
                 before = snapshot(a)
                 self.assertTrue(evict_to_free_tokens(c, a, page_size))
                 self.assertEqual(snapshot(a), before)
@@ -483,7 +484,7 @@ class TestTriJointReclaim(CustomTestCase):
         for entry in ("direct", "helper", "decode"):
             with self.subTest(entry=entry):
                 b, a, c = self.build(state_cache=False)
-                demand = a.available_size()
+                demand = largest_take(a)
                 self.assertGreater(demand, a.conserve_full_available_size())
                 self.assertTrue(
                     feasible(a.pricing_snapshot(), _pages(a, demand, demand))
@@ -592,8 +593,13 @@ class TestTriJointReclaim(CustomTestCase):
                         plan(allocator.pricing_snapshot(), six, FLUSH_ENDS)
                     )
                     self.assertGreaterEqual(allocator.conserve_full_available_size(), 6)
-                    self.assertGreaterEqual(allocator.swa_available_size(), 6)
-                    self.assertGreaterEqual(allocator.available_size(), 6)
+                    self.assertGreaterEqual(
+                        largest_take(
+                            allocator, allocator.swa_attn_allocator.sub_pool_name
+                        ),
+                        6,
+                    )
+                    self.assertGreaterEqual(largest_take(allocator), 6)
                     self.assertTrue(feasible(allocator.pricing_snapshot(), six))
                     if recovery == "prepare":
                         self.assertTrue(
@@ -1095,7 +1101,7 @@ class TestTriGeometry(CustomTestCase):
             with self.subTest(page_size=ps, ratio=ratio, cut=cut, demand=npage):
                 recognized.add(ps)
                 # The read credits the compaction.
-                self.assertGreaterEqual(a.available_size(), npage * ps)
+                self.assertGreaterEqual(largest_take(a), npage * ps)
                 saved = payload(a, kv, mk)
                 prior = snapshot(a)
                 for _ in range(20):
@@ -1129,7 +1135,7 @@ class TestTriGeometry(CustomTestCase):
                     n: d for n, d in a.page_demands(token_demand(a, 5, 5)).items() if d
                 }
                 self.assertIsNone(plan(a.pricing_snapshot(), five, NO_MOVE))
-                self.assertGreaterEqual(a.available_size(), 5)
+                self.assertGreaterEqual(largest_take(a), 5)
                 self.assertTrue(feasible(a.pricing_snapshot(), five))
                 saved = payload(a, kv, mk)
                 for member in a.members:

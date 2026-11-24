@@ -31,4 +31,4 @@ export LD_LIBRARY_PATH=/usr/local/python3.11.14/lib/python3.11/site-packages/moo
 
 ## Examples
 
-For usage examples please follow the [main disaggregation guide](../../../sglang-diffusion/disaggregation.mdx)
+For usage examples please follow the [main disaggregation guide](/docs/sglang-diffusion/disaggregation)

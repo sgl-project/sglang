@@ -135,7 +135,7 @@ jobs:
           # self-hosted-only snapshot has nothing for them. Keep the extra call:
           # its delegated GPU jobs use the explicit caller name as their prefix.
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
-            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs|wait-for-stage-[ab]-amd)$' | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs|wait-for-base-[ab]-amd)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
