@@ -185,10 +185,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     platform = get_platform()
     overrides = {"decode_state_free_radix_default": True}
     if cfg.dcp_size > 1:
-        supported = ("DSPARK",) if platform.is_npu else ("DSPARK", "DFLASH")
-        if cfg.speculative_algorithm not in (None, *supported):
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
-                f"Kimi-K3.1 DCP supports {', '.join(supported)} on {cfg.device}."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
         pd_backends = ("mooncake", "mori") if platform.is_gfx95 else ("mooncake",)
         if (
@@ -199,7 +198,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             raise ValueError(
                 "Kimi-K3.1 DCP supports PD only over Mooncake (or MoRI on gfx950)."
             )
-        if cfg.speculative_algorithm == "DSPARK":
+        if cfg.speculative_algorithm == "DSPARK" or (
+            platform.is_npu and cfg.speculative_algorithm == "DFLASH"
+        ):
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
@@ -207,14 +208,17 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
 
             if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
+                    f"Kimi-K3.1 DCP + {cfg.speculative_algorithm} requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.speculative_algorithm == "DFLASH":
             from sglang.srt.speculative.dflash_draft_ring import (
                 dflash_dcp_mla_draft_backend,
             )
 
-            draft_backend = dflash_dcp_mla_draft_backend()
+            draft_backend = (
+                "ascend" if platform.is_npu else dflash_dcp_mla_draft_backend()
+            )
             if cfg.speculative_draft_attention_backend not in (None, draft_backend):
                 raise ValueError(
                     "Kimi-K3.1 DCP + DFLASH needs "
