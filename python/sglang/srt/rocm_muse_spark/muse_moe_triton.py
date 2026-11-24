@@ -600,6 +600,9 @@ def _align_scatter_kernel(
 
 
 ALIGN_TRITON_MIN = 16384  # routed slots (2048 tokens x top-8: the SP prefill widths) from which the Triton align runs
+# Both Triton aligners expand over the local experts at compile time; above this count (an EP1 pipeline
+# stage holds every expert) the compile is too slow for the serving loop.
+ALIGN_JIT_MAX_EXPERTS = int(os.environ.get("MUSE_MOE_ALIGN_JIT_MAX_EXPERTS", "64"))
 
 
 def moe_align_block_size_triton(
@@ -629,15 +632,17 @@ def moe_align_block_size_triton(
 
 
 def moe_align_block_size(topk_ids, num_local_experts, local_start, block_m):
+    jit = num_local_experts <= ALIGN_JIT_MAX_EXPERTS
     if (
-        topk_ids.numel() >= ALIGN_TRITON_MIN
+        jit
+        and topk_ids.numel() >= ALIGN_TRITON_MIN
         and num_local_experts & (num_local_experts - 1) == 0
         and block_m & (block_m - 1) == 0
     ):
         return moe_align_block_size_triton(
             topk_ids, num_local_experts, local_start, block_m
         )
-    if topk_ids.numel() <= ALIGN_SMALL_MAX and ALIGN_BACKEND != "torch":
+    if jit and topk_ids.numel() <= ALIGN_SMALL_MAX and ALIGN_BACKEND != "torch":
         return moe_align_block_size_small(
             topk_ids, num_local_experts, local_start, block_m
         )

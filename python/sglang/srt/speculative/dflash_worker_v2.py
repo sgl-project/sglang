@@ -881,6 +881,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if not self._hosts_draft:
+            return None
         dumped = self._info_dumper.dump()
         if dumped is not None:
             dumped["simulate_acc_len"] = (
@@ -889,7 +891,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         return dumped
 
     def clear_info_records(self) -> None:
-        self._info_dumper.clear()
+        if self._hosts_draft:
+            self._info_dumper.clear()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [

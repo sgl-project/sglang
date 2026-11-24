@@ -65,7 +65,7 @@ from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
     should_skip_weight_loading,
 )
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed import get_pp_indices, tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -80,12 +80,12 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
-from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.common import PPMissingLayer, add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.rocm_muse_spark import (
     finalize_allreduce,
@@ -125,7 +125,7 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
     ulysses_enabled,
     ulysses_prepared,
 )
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +419,8 @@ _ROWMAJOR_LINEAR_SHAPES = ((8192, 2048), (8192, 1024))  # O-proj at TP4 / TP8
 # Unquantized linear layers with an FP8 weight copy: the TP4 QKV (+ gate) projection, fed the per-row FP8 copy of
 # the attention input that the previous FFN boundary kernel writes (decode / verify up to 128 rows).
 _FP8W_LINEAR_SHAPES = ((4608, 8192), (2304, 8192))  # QKV at TP4 / TP8
+# A pipeline stage or an attention-DP rank runs attention TP1: its unsharded QKV (+ gate) and O projections.
+_PP_STAGE_FP8_LINEAR_SHAPES = ((18432, 8192), (8192, 8192))
 # The dense FP8 weight copies are gfx950-only; gfx1250 runs the BF16 weights.
 _DENSE_FP8 = envs.SGLANG_ROCM_MUSE_DENSE_FP8.get() and not mxfp4_moe._is_gfx1250()
 _FP8_MAX_ROWS = 128
@@ -1872,17 +1874,37 @@ class MuseSpark1xModel(nn.Module):
         # Layer indices whose output residual stream feeds the DFLASH draft
         # context (set through MuseSparkTextForCausalLM.set_dflash_layers_to_capture).
         self.layers_to_capture: list[int] = []
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=None,
-            prefix=add_prefix("embed_tokens", prefix),
+        parallel = get_parallel()
+        self.pp_group = parallel.pp_group
+        if parallel.pp_size > 1 and parallel.tp_size != 1:
+            raise NotImplementedError(
+                "Muse Spark pipeline stages run TP1 on ROCm (use --tp-size 1)"
+            )
+        # The draft of a speculative last stage embeds the committed tokens.
+        self.has_embedding = self.pp_group.is_first_rank or (
+            self.pp_group.is_last_rank and get_spec().speculative_algorithm is not None
         )
-        self.embed_norm = MuseSpark1xRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, has_weight=False
+        if self.has_embedding:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=None,
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+            self.embed_norm = MuseSpark1xRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, has_weight=False
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+            self.embed_norm = None
+        self.start_layer, self.end_layer = get_pp_indices(
+            config.num_hidden_layers, parallel.pp_rank, parallel.pp_size
         )
         self.layers = nn.ModuleList()
         for layer_idx in range(config.num_hidden_layers):
+            if not self.start_layer <= layer_idx < self.end_layer:
+                self.layers.append(PPMissingLayer())
+                continue
             layer_prefix = add_prefix(f"layers.{layer_idx}", prefix)
             layer = MuseSpark1xDecoderLayer(
                 config,
@@ -1893,13 +1915,21 @@ class MuseSpark1xModel(nn.Module):
             )
             _install_pre_attn_norm(config, layer)
             self.layers.append(layer)
-        self.norm = MuseSpark1xRMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            has_weight=True,
-            zero_centered_gamma=True,
-            output_norm_gain_center_type="zero",
-            residual_id=-1,
+        # This stage's layers, outside the module tree.
+        object.__setattr__(
+            self, "local_layers", list(self.layers[self.start_layer : self.end_layer])
+        )
+        self.norm = (
+            MuseSpark1xRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                has_weight=True,
+                zero_centered_gamma=True,
+                output_norm_gain_center_type="zero",
+                residual_id=-1,
+            )
+            if self.pp_group.is_last_rank
+            else None
         )
         # Cross-layer FFN boundaries: layer i's post_feedforward_layernorm + post_feedforward_residual_gate + layer i+1's
         # pre_attn_norm (the final norm for the last layer) as one fused kernel each.
@@ -1907,18 +1937,22 @@ class MuseSpark1xModel(nn.Module):
         self._ffn_boundaries = None
         if (
             os.environ.get("MUSE_FUSE_FFN_BOUNDARY", "1") == "1"
-            and len(self.layers) > 0
+            and len(self.local_layers) > 0
         ):
-            pre_norms = [layer.self_attn.pre_attn_norm for layer in self.layers[1:]] + [
-                self.norm
-            ]
+            # A stage's last layer has its next pre-norm on the next stage, which
+            # normalizes the relayed stream itself.
+            pre_norms = [
+                layer.self_attn.pre_attn_norm for layer in self.local_layers[1:]
+            ] + [self.norm]
             self._ffn_boundaries = [
                 FusedPostNormResidualPreNorm(
                     layer.post_feedforward_layernorm,
                     layer.post_feedforward_residual_gate,
                     pre_norm,
                 )
-                for layer, pre_norm in zip(self.layers, pre_norms)
+                if pre_norm is not None
+                else None
+                for layer, pre_norm in zip(self.local_layers, pre_norms)
             ]
 
     def forward(
@@ -1927,13 +1961,17 @@ class MuseSpark1xModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        pp_proxy_tensors: PPProxyTensors | None = None,
+    ) -> torch.Tensor | PPProxyTensors:
+        relayed = None if self.pp_group.is_first_rank else pp_proxy_tensors.tensors
         sp = None
-        if self._ffn_boundaries is not None:
+        if self._ffn_boundaries is not None and relayed is None:
             # Long plain prefills and wide verify batches: every rank keeps a 1/TP token shard of the stream.
             num_tokens = (input_ids if input_embeds is None else input_embeds).shape[0]
             sp = sp_shape(forward_batch, num_tokens, self.config.hidden_size * 2)
-        if input_embeds is not None:
+        if relayed is not None:
+            hidden_states = relayed["hidden_states"]
+        elif input_embeds is not None:
             hidden_states = input_embeds
         elif sp is not None and self.embed_tokens.tp_size > 1:
             # Each token's row comes from one vocab shard: reduce-scatter the local lookups straight to this rank's
@@ -1945,19 +1983,25 @@ class MuseSpark1xModel(nn.Module):
             )
         else:
             hidden_states = self.embed_tokens(input_ids)
-        if input_embeds is None and self.embed_norm is not None:
+        if relayed is None and input_embeds is None and self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
         stream = hidden_states.to(self.residual_dtype)
         # DFLASH draft context: the residual stream after each listed layer, read
         # in operator dtype (bf16) like the CUDA model does.
         aux_hidden_states: list[torch.Tensor] = []
+        if relayed is not None:
+            aux_hidden_states = [
+                relayed[key]
+                for key in sorted(k for k in relayed if k.startswith("aux_hidden_"))
+            ]
+        layers = self.local_layers
         if self._ffn_boundaries is not None and stream.shape[0] > 0:
             if sp is not None and input_embeds is not None:
                 stream = sp_shard(stream, sp)
             final_pre_norm_dtype = torch.bfloat16
-            attn_input = self.layers[0].self_attn_input_norm(stream)
+            attn_input = layers[0].self_attn_input_norm(stream)
             attn_input_fp8 = None
-            last = len(self.layers) - 1
+            last = len(layers) - 1
             tuned = (
                 _prefill_tuned_gemms()
                 if _PREFILL_GEMM_TUNABLEOP is not None
@@ -1966,18 +2010,25 @@ class MuseSpark1xModel(nn.Module):
                 else contextlib.nullcontext()
             )
             with tuned:
-                for i, layer in enumerate(self.layers):
-                    stream, attn_input, attn_input_fp8 = layer(
+                for i, layer in enumerate(layers):
+                    boundary = self._ffn_boundaries[i]
+                    output = layer(
                         positions,
                         stream,
                         forward_batch,
                         attn_input=attn_input,
-                        ffn_boundary=self._ffn_boundaries[i],
-                        pre_norm_dtype=final_pre_norm_dtype if i == last else None,
+                        ffn_boundary=boundary,
+                        pre_norm_dtype=final_pre_norm_dtype
+                        if i == last and boundary is not None
+                        else None,
                         sp=sp,
                         attn_input_fp8=attn_input_fp8,
                     )
-                    if i in self.layers_to_capture:
+                    if boundary is None:
+                        stream, attn_input, attn_input_fp8 = output, None, None
+                    else:
+                        stream, attn_input, attn_input_fp8 = output
+                    if layer.layer_idx in self.layers_to_capture:
                         aux_hidden_states.append(stream.to(torch.bfloat16))
             # == self.norm(norm_input).to(bf16) from the last boundary
             hidden_states = attn_input
@@ -1988,12 +2039,18 @@ class MuseSpark1xModel(nn.Module):
                     for a in aux_hidden_states
                 ]
         else:
-            for i, layer in enumerate(self.layers):
+            for layer in layers:
                 stream = layer(positions, stream, forward_batch)
-                if i in self.layers_to_capture:
+                if layer.layer_idx in self.layers_to_capture:
                     aux_hidden_states.append(stream.to(torch.bfloat16))
-            norm_input = stream.to(torch.bfloat16)
-            hidden_states = self.norm(norm_input).to(torch.bfloat16)
+            if self.norm is not None:
+                norm_input = stream.to(torch.bfloat16)
+                hidden_states = self.norm(norm_input).to(torch.bfloat16)
+        if not self.pp_group.is_last_rank:
+            tensors = {"hidden_states": stream}
+            for k, aux in enumerate(aux_hidden_states):
+                tensors[f"aux_hidden_{k:03d}"] = aux
+            return PPProxyTensors(tensors)
         if self.layers_to_capture:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -2114,6 +2171,9 @@ class MuseSparkTextForCausalLM(nn.Module):
         fp8_shapes = _FP8W_LINEAR_SHAPES + (
             _ROWMAJOR_LINEAR_SHAPES if _PREFILL_DENSE_FP8 else ()
         )
+        parallel = get_parallel()
+        if (parallel.pp_size > 1 or parallel.attn_dp_size > 1) and _PREFILL_DENSE_FP8:
+            fp8_shapes += _PP_STAGE_FP8_LINEAR_SHAPES
         register_gfx950_unquantized_gemm_shapes(
             tiled_weights=tuple(TILED_GEMM_LAYOUT),
             rowmajor_weights=_ROWMAJOR_LINEAR_SHAPES,
@@ -2146,15 +2206,19 @@ class MuseSparkTextForCausalLM(nn.Module):
         )
         self._nvfp4_pending: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=None,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=False,
-        )
-        if config.tie_word_embeddings:
-            self.lm_head.tie_weights(self.model.embed_tokens)
+        self.pp_group = get_parallel().pp_group
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=None,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=False,
+            )
+            if config.tie_word_embeddings:
+                self.lm_head.tie_weights(self.model.embed_tokens)
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = MuseSpark1xLogitsProcessor(
             config, logit_scale=config.output_multiplier
         )
@@ -2168,10 +2232,17 @@ class MuseSparkTextForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ):
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -2190,7 +2261,7 @@ class MuseSparkTextForCausalLM(nn.Module):
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        num_layers = len(self.model.language_model.layers)
+        num_layers = self.config.num_hidden_layers
         bad = [i for i in layer_ids if not 0 <= i < num_layers]
         if bad:
             raise ValueError(
@@ -2204,6 +2275,26 @@ class MuseSparkTextForCausalLM(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.language_model.end_layer
+
+    def _pp_skips_weight(self, name: str) -> bool:
+        """Whether a text tensor belongs to another pipeline stage."""
+        decoder = self.model.language_model
+        layer = re.search(r"\.layers\.(\d+)\.", name)
+        if layer is not None:
+            return not decoder.start_layer <= int(layer.group(1)) < decoder.end_layer
+        if ".embed_tokens." in name:
+            return not decoder.has_embedding
+        if name.startswith("lm_head.") or ".language_model.norm." in name:
+            return not self.pp_group.is_last_rank
+        return False
 
     def get_layers(self):
         return self.model.layers
@@ -2424,8 +2515,12 @@ class MuseSparkTextForCausalLM(nn.Module):
         stacked.append((".qkv_proj", ".gate_proj", "g"))
 
         skipped = 0
+        pp_staged = self.pp_group.world_size > 1
         for raw_name, loaded_weight in weights:
             name = raw_name
+            if pp_staged and self._pp_skips_weight(raw_name):
+                skipped += 1
+                continue
             if self.requant_nvfp4_experts and self._stash_nvfp4_expert_tensor(
                 params, name, loaded_weight
             ):
@@ -2505,10 +2600,9 @@ class MuseSparkTextForCausalLM(nn.Module):
 
     @torch.no_grad()
     def post_load_weights(self) -> None:
+        layers = self.model.language_model.local_layers
         moe_layers = [
-            layer.mlp
-            for layer in self.model.layers
-            if isinstance(layer.mlp, MuseSpark1xMoE)
+            layer.mlp for layer in layers if isinstance(layer.mlp, MuseSpark1xMoE)
         ]
         if router_pooler.JOINT_ROUTER_POOLER:
             for moe in moe_layers:
@@ -2553,12 +2647,12 @@ class MuseSparkTextForCausalLM(nn.Module):
                             proj.weight.data
                         )
         if ulysses_enabled():
-            for layer in self.model.layers:
+            for layer in layers:
                 prepare_ulysses(layer.self_attn, fp8=_PREFILL_DENSE_FP8)
         if _PREFILL_DENSE_FP8:
             for moe in moe_layers:
                 _prepare_prefill_fp8_projections(moe)
-        for layer in self.model.layers:
+        for layer in layers:
             for residual in (
                 layer.post_attention_residual_gate,
                 layer.post_feedforward_residual_gate,
@@ -2570,13 +2664,17 @@ class MuseSparkTextForCausalLM(nn.Module):
                 module.cache_effective_weight()
         # Layer 0's attention input norm reads the FP32 stream: with a matching FP32 weight F.rms_norm takes its
         # fused kernel instead of the much slower unfused chain (same result).
-        first_norm = self.model.layers[0].self_attn.pre_attn_norm
+        first_norm = layers[0].self_attn.pre_attn_norm
         if first_norm.weight is not None:
             first_norm._effective_weight_cache = (
                 first_norm._effective_weight_cache.float()
             )
-        boundaries = [layer._fused_attn_boundary for layer in self.model.layers]
-        boundaries += list(getattr(self.model, "_ffn_boundaries", None) or [])
+        boundaries = [layer._fused_attn_boundary for layer in layers]
+        boundaries += [
+            op
+            for op in getattr(self.model, "_ffn_boundaries", None) or []
+            if op is not None
+        ]
         for op in boundaries:
             ensure = getattr(op, "_ensure_cached_weights", None)
             if ensure is not None:
