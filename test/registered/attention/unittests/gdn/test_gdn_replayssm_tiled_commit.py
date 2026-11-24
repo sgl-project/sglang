@@ -1,4 +1,5 @@
-"""Tiled GDN ReplaySSM commit: bit for bit the stock compact commit."""
+"""Tiled GDN ReplaySSM commit: bit for bit the stock compact commit, on SM 10.x where it is
+enabled."""
 
 import sys
 from unittest import mock
@@ -8,19 +9,23 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.version.hip is not None,
-        reason="the tiled commit is a CUDA Triton kernel",
+        not torch.cuda.is_available()
+        or torch.version.hip is not None
+        or torch.cuda.get_device_capability()[0] != 10,
+        reason="the tiled commit is enabled on SM 10.x only",
     ),
 ]
 
 DEVICE = "cuda"
-LAYERS, SLOTS, H, HV, D, RING = 2, 12, 2, 8, 128, 16
+LAYERS, SLOTS, D, RING = 2, 12, 128, 16
 B = 4  # request rows of each case
+# (H, HV): HV / H = 4, and Qwen3.8 at TP1 (16 key / 48 value heads, HV / H = 3)
+HEADS = [(2, 8), (16, 48)]
 
 
 def _cursor(values, *, strided: bool):
@@ -34,13 +39,24 @@ def _cursor(values, *, strided: bool):
     return out
 
 
-def _case(seed: int, *, residual: bool, track: bool, strided: bool = False):
+def _case(
+    seed: int,
+    *,
+    residual: bool,
+    track: bool,
+    strided: bool = False,
+    heads=HEADS[0],
+    dtype=torch.bfloat16,
+    rows_kind: str = "fold",
+):
+    """rows_kind "fold": every row folds below a full ring; "mixed": row 1 folds a full
+    ring (its track snapshot spans the whole ring) and row 3 does not fold, so with track
+    rows it only snapshots one step."""
+    H, HV = heads
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
 
     def rand(*shape, scale):
-        return (torch.randn(*shape, device=DEVICE, generator=gen) * scale).to(
-            torch.bfloat16
-        )
+        return (torch.randn(*shape, device=DEVICE, generator=gen) * scale).to(dtype)
 
     state = rand(LAYERS, SLOTS, HV, D, D, scale=0.05)
     caches = dict(
@@ -72,11 +88,15 @@ def _case(seed: int, *, residual: bool, track: bool, strided: bool = False):
             ),
         )
     write_pos = torch.zeros(SLOTS, dtype=torch.int32, device=DEVICE)
-    write_pos[rows["replay_indices"]] = torch.tensor([3, 12, 2, 1], device=DEVICE).int()
+    history = [3, 12, 2, 1] if rows_kind == "fold" else [3, RING, 2, 1]
+    write_pos[rows["replay_indices"]] = torch.tensor(history, device=DEVICE).int()
+    is_flush = torch.ones(SLOTS, dtype=torch.int8, device=DEVICE)
+    if rows_kind == "mixed":
+        is_flush[2] = 0  # row 3
     cursors = dict(
         write_pos=write_pos,
         cache_base=torch.randint(0, RING, (SLOTS,), device=DEVICE, generator=gen).int(),
-        is_flush=torch.ones(SLOTS, dtype=torch.int8, device=DEVICE),
+        is_flush=is_flush,
     )
     cursors = {k: _cursor(v, strided=strided) for k, v in cursors.items()}
     return state, caches, rows, cursors
@@ -92,15 +112,25 @@ def _commit(gdn, state, caches, rows, cursors):
     return out, cur
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("seed", [0, 1])
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("track", [True, False])
 @pytest.mark.parametrize("strided", [False, True])
-def test_tiled_equals_stock(seed, residual, track, strided):
+@pytest.mark.parametrize("heads", HEADS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rows_kind", ["fold", "mixed"])
+def test_tiled_equals_stock(seed, residual, track, strided, heads, dtype, rows_kind):
     from sglang.kernels.ops.attention.linear import gdn_replayssm_spec_decode as gdn
 
+    H, HV = heads
     state, caches, rows, cursors = _case(
-        seed, residual=residual, track=track, strided=strided
+        seed,
+        residual=residual,
+        track=track,
+        strided=strided,
+        heads=heads,
+        dtype=dtype,
+        rows_kind=rows_kind,
     )
     with mock.patch.object(gdn, "_use_tiled_commit", return_value=False):
         stock, stock_cur = _commit(gdn, state, caches, rows, cursors)
@@ -124,6 +154,7 @@ def test_tiled_equals_stock(seed, residual, track, strided):
 def test_fp32_state_takes_the_stock_commit(seed, track):
     from sglang.kernels.ops.attention.linear import gdn_replayssm_spec_decode as gdn
 
+    H, HV = HEADS[0]
     state, caches, rows, cursors = _case(seed, residual=True, track=track)
     state = state.float()
     with mock.patch.object(gdn, "_use_tiled_commit", return_value=False):

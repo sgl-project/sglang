@@ -447,6 +447,7 @@ class TestGdnTiledCommitDispatch(CustomTestCase):
         )
         with (
             patch.object(torch.version, "hip", None),
+            patch.object(replay, "_bitwise_checked_arch", return_value=True),
             patch.object(replay, "_sm_count", return_value=212),
         ):
             for H, HV, track, batches in cases:
@@ -460,6 +461,30 @@ class TestGdnTiledCommitDispatch(CustomTestCase):
                         ),
                         tiled,
                         (H, HV, track, batch),
+                    )
+
+    def test_tiled_commit_only_on_the_checked_architecture(self):
+        from sglang.kernels.ops.attention.linear import (
+            gdn_replayssm_spec_decode as replay,
+        )
+
+        ring = SimpleNamespace(
+            dtype=torch.bfloat16, is_cuda=True, device=SimpleNamespace(index=0)
+        )
+        state = SimpleNamespace(dtype=torch.bfloat16, shape=(36, 8, 48, 128, 128))
+        with (
+            patch.object(torch.version, "hip", None),
+            patch.object(replay, "_sm_count", return_value=212),
+        ):
+            for checked in (True, False):
+                with patch.object(
+                    replay, "_bitwise_checked_arch", return_value=checked
+                ):
+                    self.assertEqual(
+                        replay._use_tiled_commit(
+                            state, ring, ring, 16, 48, 128, 128, 64, False
+                        ),
+                        checked,
                     )
 
 

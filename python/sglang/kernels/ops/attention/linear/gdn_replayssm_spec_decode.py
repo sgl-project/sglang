@@ -45,6 +45,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.numerics import mul_rn_f32
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 from sglang.srt.utils import is_gfx95_supported
 
@@ -68,6 +69,12 @@ def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+@functools.lru_cache(maxsize=8)
+def _bitwise_checked_arch(device_index: int) -> bool:
+    # Checked bit for bit against the stock commit on SM 10.x only; tl.dot lowers per arch.
+    return torch.cuda.get_device_capability(device_index)[0] == 10
+
+
 def _use_tiled_commit(
     checkpoint_state, d_cache, k_cache, H, HV, V, K, B, has_track
 ) -> bool:
@@ -81,6 +88,7 @@ def _use_tiled_commit(
         checkpoint_state.dtype in (torch.bfloat16, torch.float16)
         and d_cache.is_cuda
         and torch.version.hip is None
+        and _bitwise_checked_arch(d_cache.device.index)
         and d_cache.dtype in (torch.bfloat16, torch.float16)
         and k_cache.dtype == d_cache.dtype
         and K >= 16
@@ -859,18 +867,6 @@ def gdn_replayssm_compact_commit_kernel(
 
 
 @triton.jit
-def _replayssm_mul_rn(a, b):
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        "=r,r,r",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _compact_commit_tile(
     old_state,  # [BV, K] checkpoint tile (h0 dtype)
     dst,  # [BV, K] destination pointers
@@ -930,7 +926,7 @@ def _compact_commit_tile(
     # contracts the fold's product/add.
     if SEPARATE_MUL:
         combined = (
-            _replayssm_mul_rn(
+            mul_rn_f32(
                 old_state.to(tl.float32),
                 tl.zeros_like(active_delta) + tl.exp(active_total),
             )
