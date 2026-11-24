@@ -106,15 +106,16 @@ def _worker_request(request, ids, eos, template_stops):
     if any(not isinstance(s, str) or not s for s in stop):
         raise InvalidArgument("stop must contain non-empty strings")
     limit = request.get("max_completion_tokens")
+    ignore_eos = request.get("ignore_eos", False)
     worker = {
         "model": request["model"],
         "token_ids": ids,
         "sampling_options": sampling,
         "stop_conditions": {
             "max_tokens": request.get("max_tokens") if limit is None else limit,
-            "stop": template_stops + stop,
+            "stop": stop if ignore_eos else template_stops + stop,
             "stop_token_ids": request.get("stop_token_ids") or [],
-            "ignore_eos": request.get("ignore_eos", False),
+            "ignore_eos": ignore_eos,
         },
         "output_options": {
             "skip_special_tokens": request.get("skip_special_tokens", True)
@@ -122,7 +123,7 @@ def _worker_request(request, ids, eos, template_stops):
         "eos_token_ids": eos,
     }
     # Dynamo's SGLang worker forwards hidden stop IDs into SamplingParams.
-    if eos and not worker["stop_conditions"]["ignore_eos"]:
+    if eos and not ignore_eos:
         worker["stop_conditions"]["stop_token_ids_hidden"] = eos
     if salt:
         worker["routing"] = {"cache_salt": salt}

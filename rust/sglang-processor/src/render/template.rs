@@ -63,8 +63,32 @@ impl ChatFormatter {
             .continuing
             .clone()
             .map_err(|message| TemplateError::Renderer { message })?;
+        if let ChatFormatter::Legacy(formatter) = self {
+            // The worker encodes the entire continued conversation in one pass.
+            let prompt = formatter.render_with_continuation(request, continuing)?;
+            return Ok((RenderedPrompt::text(prompt), String::new()));
+        }
+        // _render_and_encode_chat_template supplies these arguments itself.
+        if matches!(
+            self,
+            ChatFormatter::HuggingFace { .. } | ChatFormatter::KimiK25 { .. }
+        ) && let Some(key) = [
+            "conversation",
+            "tools",
+            "add_generation_prompt",
+            "tokenize",
+            "return_dict",
+        ]
+        .into_iter()
+        .find(|key| args.kwargs.contains_key(*key))
+        {
+            return Err(TemplateError::Renderer {
+                message: format!(
+                    "chat_template_kwargs duplicates apply_chat_template argument {key}"
+                ),
+            });
+        }
         let (messages, continuation) = match self {
-            ChatFormatter::Legacy(_) => None,
             // SGLang's K3 encoder splits a trailing assistant turn off only to continue it.
             ChatFormatter::KimiK3 if !continuing => None,
             _ => last_assistant_message(request, continuing)?,
@@ -158,6 +182,7 @@ fn last_assistant_message(
 mod tests {
     use serde_json::json;
 
+    use super::super::legacy::{LegacyFormatter, builtin_template};
     use super::*;
 
     fn jinja(template: &str) -> ChatFormatter {
@@ -216,6 +241,49 @@ mod tests {
         let request = serde_json::from_value(body.clone()).unwrap();
         let args = TemplateArgs::new(&body, &none);
         assert!(formatter.render_template(&request, &args).is_err());
+    }
+
+    #[test]
+    fn legacy_continuation_removes_the_assistant_turn_delimiters() {
+        for (name, expected) in [
+            ("llama-2", "[INST] Hi [/INST] Hel"),
+            ("phi-4-mm", "<|user|>Hi<|end|><|assistant|>Hel"),
+        ] {
+            let formatter = ChatFormatter::Legacy(Box::new(LegacyFormatter {
+                spec: builtin_template(name).unwrap(),
+            }));
+            let body = json!({"messages": trailing("Hel".into()), "continue_final_message": true});
+            let (prompt, continuation) = render(&formatter, body, &HashMap::new());
+            assert_eq!(prompt, expected, "{name}");
+            assert!(continuation.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn generic_jinja_rejects_duplicate_tokenizer_arguments() {
+        let formatter = jinja("{{ messages[0].content }}");
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        for key in [
+            "conversation",
+            "tools",
+            "add_generation_prompt",
+            "tokenize",
+            "return_dict",
+        ] {
+            let mut explicit = body.clone();
+            explicit["chat_template_kwargs"] = json!({key: false});
+            for (body, defaults) in [
+                (explicit, HashMap::new()),
+                (body.clone(), HashMap::from([(key.into(), false.into())])),
+            ] {
+                let request = serde_json::from_value(body.clone()).unwrap();
+                let args = TemplateArgs::new(&body, &defaults);
+                let Err(error) = formatter.render_template(&request, &args) else {
+                    panic!("accepted duplicate {key}");
+                };
+                assert!(error.to_string().contains(key), "{error}");
+            }
+        }
     }
 
     /// A Jinja template sees the tools as Python's `Tool.model_dump()`, not as sent.
