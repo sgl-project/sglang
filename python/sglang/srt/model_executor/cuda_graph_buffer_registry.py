@@ -347,6 +347,13 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        if torch.device(device).type == "cuda":
+            from sglang.kernels.ops.memory.small_field_copy import (
+                small_field_copy_available,
+            )
+
+            # Build the fill's copy kernel at startup, not at the first replay.
+            small_field_copy_available()
 
     # ---- registration ------------------------------------------------------
 

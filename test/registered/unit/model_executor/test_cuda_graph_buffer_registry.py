@@ -389,7 +389,7 @@ class TestFieldCopyPlan(unittest.TestCase):
             return plans[-1]
 
         with (
-            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_KERNEL_OK", True),
             patch.object(small_field_copy, "_PLANS", OrderedDict()),
             patch.object(small_field_copy, "SmallFieldCopyPlan", make_plan),
         ):
@@ -411,7 +411,7 @@ class TestFieldCopyPlan(unittest.TestCase):
             return made[-1]
 
         with (
-            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_KERNEL_OK", True),
             patch.object(small_field_copy, "_PLANS", OrderedDict()),
             patch.object(small_field_copy, "_MAX_PLANS", 3),
             patch.object(small_field_copy, "SmallFieldCopyPlan", make_plan),
@@ -427,6 +427,8 @@ class TestFieldCopyPlan(unittest.TestCase):
 
         with (
             patch.object(small_field_copy, "_CUDA_BUILD", False),
+            patch.object(small_field_copy, "_KERNEL_OK", None),
+            patch.object(small_field_copy, "_jit_small_field_copy_module") as build,
             patch.object(small_field_copy, "SmallFieldCopyPlan") as plan,
         ):
             self.assertFalse(
@@ -434,7 +436,33 @@ class TestFieldCopyPlan(unittest.TestCase):
                     [torch.zeros(4)], [torch.ones(4)]
                 )
             )
+        build.assert_not_called()
         plan.assert_not_called()
+
+    def test_failed_kernel_build_keeps_the_stock_copy(self):
+        """A build failure warns once and is not retried; every call keeps the stock copy."""
+        from sglang.kernels.ops.memory import small_field_copy
+
+        with (
+            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_KERNEL_OK", None),
+            patch.object(
+                small_field_copy,
+                "_jit_small_field_copy_module",
+                side_effect=RuntimeError("nvcc not found"),
+            ) as build,
+            patch.object(small_field_copy, "SmallFieldCopyPlan") as plan,
+            self.assertLogs(small_field_copy.logger, "WARNING") as logs,
+        ):
+            for _ in range(3):
+                self.assertFalse(
+                    small_field_copy.cached_small_field_copy(
+                        [torch.zeros(4)], [torch.ones(4)]
+                    )
+                )
+        build.assert_called_once()
+        plan.assert_not_called()
+        self.assertEqual(len(logs.records), 1)
 
     def test_large_or_many_fields_keep_the_stock_copy(self):
         from sglang.kernels.ops.memory import small_field_copy
@@ -442,7 +470,7 @@ class TestFieldCopyPlan(unittest.TestCase):
         large = [torch.zeros(8193)]
         many = [torch.zeros(1) for _ in range(17)]
         with (
-            patch.object(small_field_copy, "_CUDA_BUILD", True),
+            patch.object(small_field_copy, "_KERNEL_OK", True),
             patch.object(small_field_copy, "_PLANS", OrderedDict()),
             patch.object(small_field_copy, "SmallFieldCopyPlan") as plan,
         ):
