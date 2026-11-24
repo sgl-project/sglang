@@ -230,10 +230,8 @@ def estimate_simopus_budget(
             "SimOpus memory budget leaves no usable KV capacity "
             f"(status={budget.status!r}, max_cache_tokens={max_tokens!r})"
         )
-    provenance = resources.provenance.to_dict()
-    # The current SDK preserves this serialized field in existing resource
-    # artifacts. Translate the external display once; no old SDK is loaded.
-    provenance["simopus_revision"] = provenance.pop("infercast_revision")
+    # The budget names the installed SimOpus revision verified above.
+    provenance = {**resources.provenance.to_dict(), "simopus_revision": revision}
     metrics = {
         "provider": budget_config["provider"],
         "provider_revision": revision,
