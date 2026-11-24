@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     ReqList,
+    move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     create_async_shm_materializer,
@@ -22,6 +23,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     META_FORCED_TOKENS,
     DocReuse,
     forced_len,
+    validate_reuse_request,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.overlap_release import (
     DeferredOverlapRelease,
@@ -105,12 +107,16 @@ class UocrSchedulerRuntime:
 
     # -- Waiting queue and admission --
 
-    def take_released(self) -> List[Req]:
+    @property
+    def released(self) -> IndexedReqList:
         """Parked windows whose predecessor finished, to queue in this order."""
-        return self._prefetch.take_released()
+        return self._prefetch.released
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return self._prefetch.request_lists()
+
+    def validate_request(self, req: Req) -> Optional[str]:
+        return validate_reuse_request(req)
 
     def on_req_dropped(self, req: Req) -> None:
         """Release reuse and prefetch state of a dropped or aborted request."""
@@ -228,18 +234,22 @@ class UocrSchedulerRuntime:
         return len(self._reuse.held_slots())
 
     def enqueue(
-        self, waiting_queue: IndexedReqList, req: Req, *, is_retracted: bool
+        self,
+        waiting_queue: IndexedReqList,
+        req: Req,
+        *,
+        is_retracted: bool,
     ) -> bool:
         """queue a follow-up in reuse order, or keep it parked until its source finishes"""
         if is_retracted:
             self._reuse.on_retracted(req)
         if not is_retracted and self._prefetch.park(req):
             return False
-        pos = self._reuse.queue_position(waiting_queue, req)
-        if pos is None:
-            waiting_queue.join([req])
-        else:
-            waiting_queue.replace([*waiting_queue[:pos], req, *waiting_queue[pos:]])
+        move(
+            [req],
+            waiting_queue,
+            at=self._reuse.queue_position(waiting_queue, req),
+        )
         return True
 
     def close(self) -> None:

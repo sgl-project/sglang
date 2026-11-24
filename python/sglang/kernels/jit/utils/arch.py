@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import subprocess
-from typing import List
+from typing import List, Literal
 
 import msgspec
 import torch
@@ -22,6 +22,7 @@ from sglang.kernels.jit.utils.common import (
     is_musa_runtime,
     is_sail_runtime,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.device import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -102,8 +103,11 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
     return ""
 
 
+MODULE_USES_CUTLASS = ["deep_select_topk"]
+
+
 @cache_once
-def get_compile_arch() -> CompileArch:
+def get_compile_arch(kernel_name: str = "") -> CompileArch:
     """The target JIT builds compile for: the local GPU, with its a/f suffix.
 
     Only the build pipeline reads this; kernels branch on `sglang.kernels.arch`.
@@ -125,13 +129,49 @@ def get_compile_arch() -> CompileArch:
         suffix = _sail_arch_suffix(major, minor)
     else:
         suffix = _cuda_arch_suffix(major, minor)
-        if (major, minor) == (10, 7):
+        if (major, minor) == (10, 7) and kernel_name in MODULE_USES_CUTLASS:
             from flashinfer.compilation_context import cutlass_supports_sm107
 
             if not cutlass_supports_sm107():
                 major, minor, suffix = 10, 0, "f"
 
     return CompileArch(major, minor, suffix)
+
+
+CudaArchPolicy = Literal["specific", "family"]
+
+
+def get_family_compile_arch(kernel_name: str = "") -> CompileArch:
+    """The family-specific target of the local GPU (``sm_100f`` for 10.0 and
+    10.3), which every device of that family runs; the local target where there
+    is none (before Blackwell, nvcc older than 12.9, HIP/MUSA/SAIL).
+
+    A family build gives up what only the arch-specific target has, such as
+    its instructions and its larger static shared memory, so that one artifact
+    serves the whole family.
+    """
+    arch = get_compile_arch(kernel_name)
+    if is_hip_runtime() or is_musa_runtime() or is_sail_runtime():
+        return arch
+    if arch.major < 10 or _jit_cuda_version() < (12, 9):
+        return arch
+    return CompileArch(arch.major, 0, "f")
+
+
+def resolve_compile_arch(
+    policy: CudaArchPolicy | None = None, kernel_name: str = ""
+) -> CompileArch:
+    """The target JIT module ``kernel_name`` compiles for under ``policy``: the
+    local GPU's arch-specific one ("specific") or its family's ("family"). None
+    takes ``SGLANG_JIT_CUDA_ARCH_POLICY``."""
+    policy = policy or envs.SGLANG_JIT_CUDA_ARCH_POLICY.get()
+    if policy == "specific":
+        return get_compile_arch(kernel_name)
+    if policy == "family":
+        return get_family_compile_arch(kernel_name)
+    raise ValueError(
+        f"Unknown CUDA arch policy {policy!r}; expected 'specific' or 'family'"
+    )
 
 
 def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:

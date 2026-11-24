@@ -236,7 +236,10 @@ mod tests {
             image_data: vec![src("/image"), src("BQY=")],
             video_data: vec![MmItem::Ref {
                 url: "https://example.test/video".into(),
-                hints: MediaHints { fps: Some(2.0) },
+                hints: MediaHints {
+                    fps: Some(2.0),
+                    ..Default::default()
+                },
             }],
             audio_data: vec![src("Bwg=")],
             prefetched: vec![image, video],
