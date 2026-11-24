@@ -473,8 +473,7 @@ for _bk in ("torch", "triton", "helion"):
         )
     )
 del _bk
-# gfx950 TLX kernel (vendored tlx.ops.qk_norm_rope_kv_cache); it needs
-# triton.language.extra.tlx from fbtriton or the uTLX plugin.
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
 register_kernel(
     KernelSpec(
         op="attention.tlx_qk_norm_rope_kv_cache",

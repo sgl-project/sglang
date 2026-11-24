@@ -616,8 +616,7 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
-# gfx950 TLX kernels (vendored tlx.ops.mm, router_gemm and norm_residual_norm); they need
-# triton.language.extra.tlx from fbtriton or the uTLX plugin.
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
 for _op, _target in (
     ("tlx_linear", "tlx:linear"),
     ("router_gemm_tlx", "router_gemm_fp32:router_gemm_tlx"),

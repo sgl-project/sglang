@@ -1,4 +1,4 @@
-"""gfx950 BF16/FP16 GEMM from fbtriton ``tlx.ops.mm``, vendored as ``tlx_mm``.
+"""gfx950 BF16/FP16 GEMM from upstream ``tlx.ops.mm``, vendored as ``tlx_mm``.
 
 ``linear`` runs ``x @ weight.T`` for an ``[N, K]`` weight and ``x`` of any leading
 dims and strides, any M/N/K. Rejected (see ``mm_supported``): other or mixed dtypes,

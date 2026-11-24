@@ -1,8 +1,9 @@
 """Runtime support for the vendored TLX kernels (``sglang.kernels.ops.<group>.tlx_*``) on stock ROCm Triton.
 
-The kernels import ``triton.language.extra.tlx``. fbtriton ships it. On stock ROCm
-Triton, the uTLX plugin built for that Triton release registers it at interpreter
-start through its ``.pth`` hook. Verified on MI355X:
+The kernels import ``triton.language.extra.tlx``. facebookexperimental/triton
+("fbtriton" below) ships it. On stock ROCm Triton, the uTLX plugin built for that
+Triton release registers it at interpreter start through its ``.pth`` hook.
+Verified on MI355X:
 
     torch 2.14.1+rocm7.2, triton-rocm 3.8.0:   pip install --no-deps triton-utlx==3.8.0.post16
     torch 2.15.0+rocm7.14, triton-rocm 3.9.0:  pip install --no-deps triton-utlx==3.9.0.post4
@@ -40,11 +41,11 @@ _llvm_flags = contextvars.ContextVar("tlx_llvm_flags", default=())
 
 
 class UnsupportedOp(RuntimeError):
-    """Raised by a vendored TLX kernel for a configuration it does not implement (fbtriton ``tlx.ops``)."""
+    """Upstream ``tlx.ops`` ``UnsupportedOp``: a configuration the vendored TLX kernel does not implement."""
 
 
 class InvalidInput(ValueError):
-    """Raised by a vendored TLX kernel for inputs outside its contract (fbtriton ``tlx.ops``)."""
+    """Upstream ``tlx.ops`` ``InvalidInput``: inputs outside the vendored TLX kernel's contract."""
 
 
 @functools.cache

@@ -126,9 +126,9 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 
 # best -> fallback. ``torch_compile`` is deliberately absent: auto-selection
 # must never trigger a surprise compilation in a serving process; force it
-# explicitly when wanted. ``tlx`` is absent too: it needs fbtriton or the uTLX
-# plugin, which capabilities cannot express. Per-op priority overrides this
-# (see BaseFusedOp).
+# explicitly when wanted. ``tlx`` is absent too: it needs facebookexperimental/triton
+# or the uTLX plugin, which capabilities cannot express. Per-op priority overrides
+# this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.KDA,
     KernelBackend.CAKE,

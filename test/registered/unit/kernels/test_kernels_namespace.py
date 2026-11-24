@@ -437,7 +437,7 @@ def test_backend_directories_register_their_backend():
 
 
 def test_tlx_kernels_register_the_tlx_backend():
-    """TLX kernels need fbtriton or uTLX, so they must not take an op's ``TRITON`` slot."""
+    """TLX kernels need facebookexperimental/triton or uTLX, so they must not take an op's ``TRITON`` slot."""
     for spec in K.registry.all_specs():
         is_tlx = "tlx" in re.split(r"[.:_]", spec.target)
         assert (spec.backend is KernelBackend.TLX) == is_tlx, spec

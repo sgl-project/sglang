@@ -166,24 +166,29 @@ An operator exposed from here registers into its logical group with
 
 ## TLX kernel backend
 
-`KernelBackend.TLX` records kernels written in TLX, the Triton extension of
-[facebookexperimental/triton](https://github.com/facebookexperimental/triton)
-(`tlx.ops`). They run on fbtriton, or on stock Triton with the uTLX plugin
-([triton-ext](https://github.com/triton-lang/triton-ext)) plus the runtime
-helpers in `jit/utils/tlx_runtime.py`. Register a TLX kernel, and an SGLang
-wrapper whose work runs in TLX kernels, with `backend=KernelBackend.TLX`, not
-`TRITON`: a TLX implementation of a contract then sits beside the Triton one
-under the same op (as `gemm.unpool_gemm_norm_residual` does) instead of taking
-the op's `TRITON` slot. The TLX backend is not in `DEFAULT_PRIORITY`, because
-whether fbtriton or uTLX is installed is not a capability; callers opt in.
+`KernelBackend.TLX` records kernels written in TLX (Triton Low-Level
+Extensions), which extends Triton with explicit control over GPU execution
+(warp groups, asynchronous memory movement, barriers) while keeping Triton's
+Python programming model. TLX ships in
+[facebookexperimental/triton](https://github.com/facebookexperimental/triton);
+on stock Triton, the uTLX plugin
+([triton-ext](https://github.com/triton-lang/triton-ext)) provides it, and
+`jit/utils/tlx_runtime.py` fills the remaining gaps. Register a TLX kernel,
+and an SGLang wrapper whose work runs in TLX kernels, with
+`backend=KernelBackend.TLX`, not `TRITON`: a TLX implementation of a contract
+then sits beside the Triton one under the same op (as
+`gemm.unpool_gemm_norm_residual` does) instead of taking the op's `TRITON`
+slot. The TLX backend is not in `DEFAULT_PRIORITY`, because whether TLX is
+installed is not a capability; callers opt in.
 `test_kernels_namespace.py` checks that every spec whose target is a TLX
 kernel is registered as `TLX`.
 
 TLX code lives in the operator groups as `ops/<group>/tlx_<op>.py` (kernels) and
-`ops/<group>/tlx.py` (SGLang wrappers). The kernel files below are copied from
-`third_party/tlx/ops/` in fbtriton (MIT licence); each starts with a line naming
-its upstream path and commit, and the pre-commit config excludes them so their
-formatting stays upstream's. To re-sync one, copy the upstream file, re-apply
+`ops/<group>/tlx.py` (SGLang wrappers). The kernel files below target gfx950
+(MI350X/MI355X) and are copied from the `tlx.ops` kernel library
+(`third_party/tlx/ops/` in facebookexperimental/triton, MIT license); each
+starts with a line naming its upstream path and commit, and the pre-commit
+config excludes them so their formatting stays upstream's. To re-sync one, copy the upstream file, re-apply
 the header and the import edits listed here, and update its commit.
 
 | File | Upstream (`third_party/tlx/ops/`) | Commit | Local edits |
@@ -199,8 +204,8 @@ the header and the import edits listed here, and update its commit.
 `InvalidInput` and `UnsupportedOp` are the two exception classes of upstream's
 `_catalog.py`, whose op table SGLang does not use. Upstream's
 `kernels/moe/routing_gfx950.py` (`tlx.ops.moe_routing`) is not vendored: with
-triton-utlx 3.9.0.post4 its `tl.where` on a `tlx.require_layout` tensor and a
-plain one fails `arith.select` verification on stock Triton.
+triton-utlx 3.9.0.post4 and post5, its `tl.where` on a `tlx.require_layout`
+tensor and a plain one fails `arith.select` verification on stock Triton.
 
 ## How it works
 

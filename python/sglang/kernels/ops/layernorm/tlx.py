@@ -1,4 +1,4 @@
-"""gfx950 residual-stream boundary from fbtriton ``tlx.ops.norm_residual_norm``, vendored as ``tlx_norm_residual_norm``.
+"""gfx950 residual-stream boundary from upstream ``tlx.ops.norm_residual_norm``, vendored as ``tlx_norm_residual_norm``.
 
 ``norm_residual_norm`` RMS-normalizes a BF16 branch (weight after the norm, or the input-scale form that applies it
 first), rounds it to BF16, updates the FP32 stream as ``alpha * stream + beta * y`` (per-channel or scalar gate) or

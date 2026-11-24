@@ -132,8 +132,7 @@ for _op, _target, _backends in (
         )
 del _op, _target, _backends, _bk
 
-# gfx950 TLX kernels (vendored tlx.ops.norm_residual_norm and rmsnorm); they need
-# triton.language.extra.tlx from fbtriton or the uTLX plugin.
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
 for _op, _target in (
     (
         "layernorm.tlx_norm_residual_norm",
