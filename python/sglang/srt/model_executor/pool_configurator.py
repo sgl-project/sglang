@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -652,6 +653,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
+                if get_platform().is_sm120 and num_layers:
+                    # One BF16 row per token for FA4 (MHATokenToKVPoolMXFP8).
+                    cell_size += (
+                        n
+                        * (model_config.head_dim + model_config.v_head_dim)
+                        * torch._utils._element_size(torch.bfloat16)
+                    )
 
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_config,
@@ -880,6 +888,20 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 model_config.get_swa_num_kv_heads(tp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
+        self._full_dequant_per_token = self._swa_dequant_per_token = 0
+        if self.kv_cache_dtype_str == "mxfp8" and get_platform().is_sm120:
+            bf16_size = torch._utils._element_size(torch.bfloat16)
+            if self._full_layers_num:
+                self._full_dequant_per_token = (
+                    model_config.get_num_kv_heads(tp_size)
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * bf16_size
+                )
+            self._swa_dequant_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * bf16_size
+            )
 
         # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
         self._draft_full_layers_num = 0
@@ -941,8 +963,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         there, else the target's rows plus the private draft's full rows."""
         if self._fused_full_entry is not None:
             return self._fused_full_entry
-        return self._full_per_token * (
-            self._full_layers_num + self._draft_full_layers_num
+        return (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._full_dequant_per_token
         )
 
     def _swa_cell_bytes(self) -> int:
@@ -950,6 +973,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             return self._fused_swa_entry
         return (
             self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+            + self._swa_dequant_per_token
             + self._draft_swa_cell_size
         )
 
@@ -959,6 +983,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
+                + self._swa_dequant_per_token
                 + self._full_per_token * self._draft_full_layers_num
                 + self._swa_per_token * self._draft_swa_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
