@@ -30,11 +30,13 @@ from sglang.srt.layers.cp.utils import (
     cp_shard_position_ids,
     get_cp_strategy,
 )
+from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import is_npu
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import cdiv, is_npu
 from sglang.srt.utils.device import is_gfx95_supported
 
 _is_npu = is_npu()
@@ -442,6 +444,8 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
         max_row_keys: Optional[int] = None,
+        *,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -453,8 +457,11 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
+        width = self.token_topk + self.compress_ratio - 1
+        if defer_expansion:
+            width = self.block_topk
         output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
+            (rows, width),
             dtype=torch.int32,
             device=q.device,
         )
@@ -513,16 +520,57 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
-            selected = expand_qsa_block_indices(
-                block_indices,
-                query_positions[chunk_slice],
-                sequence_lengths_for_rows[chunk_slice],
-                compress_ratio=self.compress_ratio,
-                token_topk=self.token_topk,
-            )
+            selected = block_indices
+            if not defer_expansion:
+                selected = expand_qsa_block_indices(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
             output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
         return output
+
+    def select_prefill_tokens_tp(self, q, logical_positions, metadata):
+        """Score one contiguous query shard against the replicated compressed K."""
+        parallel = get_parallel()
+        rows = q.shape[0]
+        shard_rows = cdiv(rows, parallel.attn_tp_size)
+        start = parallel.attn_tp_rank * shard_rows
+        local = slice(start, start + shard_rows)
+        request_ids = metadata.get_token_to_batch_idx()
+        local_request_ids = request_ids[local]
+        local_positions = logical_positions[local]
+        keys, starts, ends, lengths = metadata.get_prefill_mqa_inputs(
+            self.layer_id, local_positions, query_sequence_ids=local_request_ids
+        )
+        local_blocks = self.select_prefill_tokens(
+            q[local],
+            keys,
+            starts,
+            ends,
+            local_positions,
+            lengths.index_select(0, local_request_ids.long()),
+            defer_expansion=True,
+        )
+        if local_blocks.shape[0] != shard_rows:
+            padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
+            padded[: local_blocks.shape[0]].copy_(local_blocks)
+            local_blocks = padded
+        blocks = local_blocks.new_empty(
+            (shard_rows * parallel.attn_tp_size, self.block_topk)
+        )
+        # Gather compact block IDs before expanding to token positions.
+        attn_tp_all_gather_into_tensor(blocks, local_blocks)
+        return expand_qsa_block_indices(
+            blocks[:rows],
+            logical_positions,
+            lengths.index_select(0, request_ids.long()),
+            compress_ratio=self.compress_ratio,
+            token_topk=self.token_topk,
+        )
 
     def select_decode_tokens(
         self,
@@ -777,6 +825,13 @@ class QSAIndexer(MultiPlatformOp):
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
+
+        if _is_npu and forward_mode.is_context_parallel_extend():
+            tp_size = get_parallel().attn_tp_size
+            if 1 < tp_size <= num_valid_tokens:
+                return self.select_prefill_tokens_tp(
+                    q, logical_positions, indexer_metadata
+                )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
