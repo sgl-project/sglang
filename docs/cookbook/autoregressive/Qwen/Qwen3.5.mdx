@@ -1218,3 +1218,47 @@ python3 -m sglang.benchmark.serving \
 ```text Output
 TODO
 ```
+
+### 5.4 Long text on two H200 GPUs with Qwen3.5-122B-A10B-FP8
+
+For a text-only service with 128 concurrent 8K-input, 1K-output requests and speculative decoding disabled, use tensor parallelism across two 141 GB H200 GPUs. The checkpoint requests FP32 temporal states. At the original memory split, changing the state precision lowered the scheduler limit from 148 to 75 active requests. The configuration below reserves 640 state slots (five slots per active request) and 1,572,864 KV tokens. With this model on each rank, the FP32 state pool used 45.07 GiB and the full-attention key and value pools used 9 GiB each.
+
+Set `MODEL_PATH` to the local checkpoint snapshot. The measured revision was `a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9`.
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --served-model-name Qwen/Qwen3.5-122B-A10B-FP8 --tp-size 2 \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder --tokenizer-worker-num 6 \
+  --flashinfer-allreduce-fusion-backend auto --attention-backend flashinfer \
+  --prefill-attention-backend fa3 --decode-attention-backend flashinfer \
+  --mamba-ssm-dtype float32 --linear-attn-prefill-backend triton \
+  --enable-mixed-chunk --chunked-prefill-size 6144 --cuda-graph-max-bs-prefill 8192 \
+  --mem-fraction-static 0.895 --max-total-tokens 1572864 \
+  --max-mamba-cache-size 640 --max-running-requests 128 --host 127.0.0.1 --port 31001
+```
+
+FA3 handles full-attention prefill. FlashInfer handles full-attention decode. SGLang can also select FlashInfer GDN prefill on Hopper with FP32 states. The explicit Triton setting controls this separate linear-attention path.
+
+The serving client used 64 warmup requests and 640 measured requests at concurrency 128. Values below are medians of three independent restarts, except where a single run is labeled. The mixed configuration trades longer inter-token and end-to-end tails against the original SGLang configuration for shorter median time to first token and higher long-generation accuracy.
+
+| Configuration | Output tok/s | TTFT p50 ms | TTFT p90 ms | TTFT p99 ms | ITL p99 ms | E2E p99 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original benchmark SGLang recipe (one run) | 2713.73 | 12862.39 | 22928.46 | 25106.15 | 24.17 | 48541.21 |
+| BF16 state, matched pools | 2786.36 | 934.92 | 12564.34 | 24386.22 | 160.29 | 70003.15 |
+| FP32 state, matched pools | 2655.29 | 950.98 | 12644.98 | 24643.50 | 161.87 | 72460.44 |
+
+The first 128 original GSM8K test questions used greedy decoding, seed 42, concurrency 16 and an 8192-token cap. Every generation that reached the cap remained in the denominator. Short-prefix next-token checks and full-generation scores are available separately in the experiment evidence.
+
+| Configuration | Correct out of 128 by restart | Truncated at 8192 tokens |
+| --- | --- | --- |
+| BF16, matched pools | 108, 101, 108 | 19, 26, 19 |
+| FP32, matched pools | 118, 114, 118 | 9, 13, 9 |
+
+The next 256 original questions were reserved before this second evaluation. Both configurations used identical questions, concurrency and token limits. The FP32 row in this table used chunk size 6144. Each configuration ran once on this holdout.
+
+| Configuration | Correct out of 256 | Truncated at 8192 |
+| --- | ---: | ---: |
+| BF16, matched pools | 205 | 48 |
+| FP32, matched pools | 222 | 31 |
+
+The tests used SGLang `2544c9ac34be`. At matched capacity and with Triton GDN prefill, FP32 improved held-out accuracy from 205 to 222 correct answers and lowered throughput from 2786.36 to 2655.29 output tokens/s. The complete recipe increased E2E p99 by 23.92 s relative to the original SGLang benchmark configuration.
