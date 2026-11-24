@@ -82,8 +82,8 @@ class MetadataGlueGraph:
 
     def reinstall(self, key) -> None:
         """Point each backend at the metadata ``key``'s graph writes."""
-        for backend, metadata in self._states[key]["meta"]:
-            backend.forward_metadata = metadata
+        for backend, snapshot in self._states[key]["meta"]:
+            backend.restore_forward_metadata(snapshot)
 
     def replay(self, key) -> None:
         """Replay ``key``'s captured prep on the current stream (a staging side stream
@@ -109,8 +109,8 @@ class MetadataGlueGraph:
             self._states[key] = st
 
         if st["graph"] is not None:
-            for backend, metadata in st["meta"]:
-                backend.forward_metadata = metadata
+            for backend, snapshot in st["meta"]:
+                backend.restore_forward_metadata(snapshot)
             st["graph"].replay()
             self.replays += 1
             return
@@ -145,7 +145,9 @@ class MetadataGlueGraph:
             attn_backend.init_forward_metadata_out_graph(fb_view)
             return
 
-        st["meta"] = [(b, b.forward_metadata) for b in self._leaves(attn_backend)]
+        st["meta"] = [
+            (b, b.snapshot_forward_metadata()) for b in self._leaves(attn_backend)
+        ]
         st["graph"] = graph
         # Capture records without executing; replay once to do this step's prep.
         graph.replay()

@@ -65,6 +65,14 @@ class HybridAttnBackend(AttentionBackend):
     def forward_metadata(self, value):
         self._active_backend.forward_metadata = value
 
+    def snapshot_forward_metadata(self):
+        return self._active_backend, self._active_backend.forward_metadata
+
+    def restore_forward_metadata(self, snapshot) -> None:
+        backend, metadata = snapshot
+        self._active_backend = backend
+        backend.forward_metadata = metadata
+
     def window_capacity_children(self) -> list:
         return [self.prefill_backend, self.decode_backend]
 

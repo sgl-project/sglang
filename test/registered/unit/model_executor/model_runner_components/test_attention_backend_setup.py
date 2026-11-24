@@ -129,9 +129,9 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
 
 
 def test_split_backend_forward_metadata_follows_serving_child():
-    # Model code reads get_attn_backend().forward_metadata and the idle path
-    # resets it; behind a prefill/decode split both must reach the child that
-    # served the forward, not an attribute on the wrapper.
+    # Model code reads get_attn_backend().forward_metadata, the idle path resets it
+    # and a metadata glue replay restores it without re-running init; behind a
+    # prefill/decode split all three must reach the child that served the forward.
     from sglang.srt.runtime_context import get_context
 
     override = get_context().override_server_args(speculative_attention_mode="prefill")
@@ -153,9 +153,15 @@ def test_split_backend_forward_metadata_follows_serving_child():
         assert split.forward_metadata == ("prefill", ForwardMode.EXTEND)
         split.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.DECODE))
         assert split.forward_metadata == ("decode", ForwardMode.DECODE)
+        snapshot = split.snapshot_forward_metadata()
 
         split.forward_metadata = None
         assert decode.forward_metadata is None
+
+        split.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.EXTEND))
+        split.restore_forward_metadata(snapshot)
+        assert split.forward_metadata == ("decode", ForwardMode.DECODE)
+        assert prefill.forward_metadata == ("prefill", ForwardMode.EXTEND)
     finally:
         override.restore()
 
