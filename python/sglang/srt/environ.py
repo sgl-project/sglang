@@ -2205,6 +2205,13 @@ class Envs:
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    # Exact, deterministic FP8 fused prefill top-k via vendored FlashTopK
+    # (kernels/ops/attention/dsa/flashtopk_prefill) for 32-head DSA and KPool indexers on SM90 and SM100.
+    SGLANG_OPT_USE_PREFILL_FLASHTOPK = EnvBool(False)
+    # Optional override for the minimum longest-row key count (pool keys for KPool) from which
+    # FlashTopK prefill top-k runs; unset uses the backend default (128K on SM100, or 32K/64K
+    # for topk<=1024 / topk>1024 on SM90).
+    SGLANG_OPT_PREFILL_FLASHTOPK_MIN_KEYS = EnvInt(None)
     SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)

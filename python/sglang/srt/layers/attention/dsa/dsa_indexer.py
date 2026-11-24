@@ -8,6 +8,14 @@ import torch
 from einops import rearrange
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
+    FLASHTOPK_HEAD_DIM,
+    FLASHTOPK_HEADS,
+    FLASHTOPK_MAX_TOPK,
+    flashtopk_fp8_indexer_topk,
+    flashtopk_should_use,
+    is_flashtopk_supported,
+)
 from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     aiter_fused_fp8_qk_write,
     aiter_fused_fp8_writer_available,
@@ -507,6 +515,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and is_fp8_indexer_supported()
             and self.n_heads in (32, 64)
             and self.index_topk in (512, 1024, 2048)
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+        )
+        # Exact, deterministic FP8 prefill top-k via FlashTopK (SM90 and SM100):
+        # 32 index heads x 128, top-k up to 4096 (multiple of 4 for PAGED transform),
+        # and no forced init / local tokens.
+        self.use_prefill_flashtopk = (
+            envs.SGLANG_OPT_USE_PREFILL_FLASHTOPK.get()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and is_flashtopk_supported()
+            and self.n_heads == FLASHTOPK_HEADS
+            and self.head_dim == FLASHTOPK_HEAD_DIM
+            and 1 <= self.index_topk <= FLASHTOPK_MAX_TOPK
+            and self.index_topk % 4 == 0
             and self.num_init_tokens == 0
             and self.num_local_tokens == 0
         )
@@ -1892,10 +1914,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = kv_fp8.num_keys if self.fp4_index_k else k_fp8.shape[0]
+        # FlashTopK prefill top-k (SM90 and SM100, exact + deterministic, adaptive pruning >= 128K keys).
+        if (
+            self.use_prefill_flashtopk
+            and not self.fp4_index_k
+            and isinstance(metadata, DSAIndexerMetadata)
+            and not metadata.force_unfused_topk
+            and flashtopk_should_use(
+                max_seq_len=max_seq_len,
+                num_keys=k_offset,
+                topk=self.index_topk,
+                has_lite_topk=self.use_prefill_lite_topk,
+            )
+        ):
+            self._prefill_flashtopk(
+                q_fp8[:q_offset],
+                weights[:q_offset],
+                k_fp8,
+                k_scale,
+                ks,
+                ke,
+                metadata,
+                topk_result[:q_offset],
+            )
+            return topk_result
         # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
         # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
         if (
             self.use_prefill_lite_topk
+            and not self.fp4_index_k
             and max_seq_len >= 8 * self.index_topk
             and isinstance(metadata, DSAIndexerMetadata)
             and not metadata.force_unfused_topk
@@ -2104,6 +2151,40 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dst, sizes=tp_split.rows_per_rank, output=topk_result[:q_offset]
             )
         return topk_result
+
+    def _prefill_flashtopk(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        metadata: DSAIndexerMetadata,
+        out: torch.Tensor,
+    ) -> None:
+        print_info_once(
+            f"Using FlashTopK prefill indexer backend (top-k {self.index_topk})."
+        )
+        offsets = metadata.attn_metadata.topk_indices_offset
+        flashtopk_fp8_indexer_topk(
+            q_fp8,
+            weights,
+            k_fp8,
+            k_scale,
+            ks,
+            ke,
+            self.index_topk,
+            out_offsets=None if offsets is None else offsets[: out.shape[0]],
+            out=out,
+        )
+        if metadata.topk_transform_method == TopkTransformMethod.PAGED:
+            topk_page_table_transform_(
+                out,
+                metadata.get_page_table_64(),
+                metadata.get_token_to_batch_idx()[: out.shape[0]],
+                metadata.attn_metadata.page_size,
+            )
 
     def _prefill_lite_topk(
         self,

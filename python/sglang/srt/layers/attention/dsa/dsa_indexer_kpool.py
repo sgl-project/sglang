@@ -9,6 +9,14 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
+    FLASHTOPK_HEAD_DIM,
+    FLASHTOPK_HEADS,
+    FLASHTOPK_MAX_TOPK,
+    flashtopk_kpool_indexer_topk,
+    flashtopk_kpool_should_use,
+    is_flashtopk_supported,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     rotate_activation,
@@ -32,7 +40,14 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
+from sglang.srt.utils import (
+    ceil_align,
+    is_cuda,
+    is_gfx1250_supported,
+    is_hip,
+    is_npu,
+    print_info_once,
+)
 
 if is_cuda():
     try:
@@ -243,6 +258,14 @@ class IndexerKPool(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        group_topk = self.index_topk // self.index_kpool
+        self.use_prefill_flashtopk = (
+            envs.SGLANG_OPT_USE_PREFILL_FLASHTOPK.get()
+            and is_flashtopk_supported()
+            and self.n_heads == FLASHTOPK_HEADS
+            and self.head_dim == FLASHTOPK_HEAD_DIM
+            and 1 <= group_topk <= FLASHTOPK_MAX_TOPK
+        )
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
@@ -1101,7 +1124,41 @@ class IndexerKPool(MultiPlatformOp):
         topk_row_starts: Optional[torch.Tensor],
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
+        max_pool_len: Optional[int] = None,
     ) -> torch.Tensor:
+        if (
+            self.use_prefill_flashtopk
+            and kv_fp8 is not None
+            and logits_starts is not None
+            and flashtopk_kpool_should_use(
+                max_pool_len=(
+                    kv_fp8[0].shape[0] if max_pool_len is None else max_pool_len
+                ),
+                num_keys=kv_fp8[0].shape[0],
+                group_topk=self.index_topk // self.index_kpool,
+            )
+        ):
+            print_info_once(
+                "Using FlashTopK KPool prefill indexer backend "
+                f"(pool top-k {self.index_topk // self.index_kpool}, kpool {self.index_kpool})."
+            )
+            k_fp8, k_scale = kv_fp8
+            return flashtopk_kpool_indexer_topk(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=k_fp8,
+                kv_scale=k_scale,
+                starts=logits_starts,
+                ends=logits_ends,
+                pool_lens=pool_lens,
+                kpool=self.index_kpool,
+                topk=self.index_topk,
+                seq_lens=seq_lens,
+                page_table=page_table,
+                page_table_row_index=page_table_row_index,
+                topk_offsets=topk_offsets,
+                out_rows=out_rows,
+            )
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
         single_chunk = len(row_chunks) == 1
@@ -1222,6 +1279,12 @@ class IndexerKPool(MultiPlatformOp):
         # The plan's table is req_to_token, indexed by request-pool ID.
         assert page_table_all is None or page_table_row_index_all is not None
 
+        max_pool_len = (
+            int(forward_batch.seq_lens_cpu.max().item()) // self.index_kpool
+            if forward_batch.seq_lens_cpu is not None
+            and forward_batch.seq_lens_cpu.numel() > 0
+            else total_k_rows
+        )
         return self._kpool_topk_by_row_chunks(
             q_fp8=q_fp8,
             weights=weights,
@@ -1238,6 +1301,7 @@ class IndexerKPool(MultiPlatformOp):
                 num_rows=n_real, num_cols=total_k_rows, device=device
             ),
             out_rows=total_q,
+            max_pool_len=max_pool_len,
         )
 
     def _get_topk_ragged_kpool(
@@ -1455,6 +1519,7 @@ class IndexerKPool(MultiPlatformOp):
                     num_rows=q_len, num_cols=pool_seq_len, device=q_fp8.device
                 ),
                 out_rows=None,
+                max_pool_len=pool_seq_len,
             )
 
             topk_result[q_slice] = local_topk

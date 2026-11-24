@@ -753,6 +753,7 @@ class ModelRunner:
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
         self.maybe_warmup_bf16_gemms()
+        self.maybe_warmup_flashtopk()
 
         self.maybe_init_dwdp()
 
@@ -1346,6 +1347,15 @@ class ModelRunner:
         # so keep the PP group it was built with; read every other placement
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
+
+    def maybe_warmup_flashtopk(self):
+        if self.device != "cuda" or not envs.SGLANG_OPT_USE_PREFILL_FLASHTOPK.get():
+            return
+        from sglang.kernels.ops.attention.dsa.flashtopk_prefill import (
+            warmup_flashtopk_prefill,
+        )
+
+        warmup_flashtopk_prefill(self.model, torch.device("cuda", self.gpu_id))
 
     def maybe_warmup_bf16_gemms(self):
         """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
