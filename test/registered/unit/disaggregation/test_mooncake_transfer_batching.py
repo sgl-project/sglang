@@ -13,8 +13,14 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.buffers import copy_ranges
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVSender,
+    PeerBuffers,
+)
 from sglang.srt.disaggregation.transport.base import Copy, Result, Status
+from sglang.srt.disaggregation.transport.null import NullTransport
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
 )
@@ -118,6 +124,40 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         ret = MooncakeKVManager._transfer_copies(manager, "session", [copy])
 
         self.assertEqual(ret, -1)
+
+    def test_one_unfinished_copy_among_finished_copies_is_not_success(self):
+        """With a transport that returns one handle per copy, the transfer
+        succeeds only when every copy is DONE."""
+        for unfinished in (Status.PENDING, Status.FAILED):
+            with self.subTest(unfinished=unfinished):
+                manager = self._make_manager()
+                src_keys = manager._local_keys.kv
+                peer_keys = manager._peers["session"].keys
+                transport = NullTransport()
+                for key in src_keys:
+                    transport.register(key=key, ptr=0, length=64, device=0)
+                if unfinished is Status.PENDING:
+                    peer_lengths = {key: 64 for key in peer_keys.kv}
+                    transport.hold(dst=peer_keys.kv[1])
+                else:
+                    # A destination the peer never registered is a rejected post.
+                    peer_lengths = {peer_keys.kv[0]: 64}
+                manager.transport = transport
+                manager._peers = {
+                    "session": PeerBuffers(
+                        remote=transport.import_registration(lengths=peer_lengths),
+                        keys=peer_keys,
+                    )
+                }
+                copies = [
+                    Copy(src=src, dst=dst, ranges=copy_ranges([(0, 0, 10)]))
+                    for src, dst in zip(src_keys, peer_keys.kv)
+                ]
+
+                ret = MooncakeKVManager._transfer_copies(manager, "session", copies)
+
+                self.assertEqual(ret, -1)
+                self.assertIs(transport.status(transport.writes[0]).status, Status.DONE)
 
     def test_stops_after_first_failed_index_batch(self):
         manager = self._make_manager(side_effect=[0, -1], max_batch_indices=2)
