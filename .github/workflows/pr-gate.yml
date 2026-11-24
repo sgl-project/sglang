@@ -12,8 +12,8 @@ on:
       approval-mode:
         description: >-
           'label' (default): the run-ci label on the PR opts it in.
-          'commit' (pr-test.yml, pr-test-extra.yml): a run passes only if the PR has run-ci
-          now and, unless its author may approve, its head commit carries a ci/run-ci-approved
+          'commit' (run_ci_approval.APPROVAL_WORKFLOWS): a run passes only if the PR has
+          run-ci now and, unless its author may approve, its head commit carries a ci/run-ci-approved
           status, which an approver's slash command records
           (scripts/ci/utils/run_ci_approval.py). Every push needs a new approval.
           The caller's job must grant statuses: read.
