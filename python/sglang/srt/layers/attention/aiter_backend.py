@@ -659,10 +659,13 @@ class AiterAttnBackend(AttentionBackend):
         # Draft-extend only (prefill/target verify keep their kernels). Read the
         # eagle topk from the spec config: the registry builds this backend with the
         # default topk=1, so self.topk is 1 even when the server runs topk > 1.
-        # topk > 1 stays on the CK path.
+        # topk > 1 stays on the CK path; the vectorized 5D KV layout keeps its own
+        # forward_extend_vectorized_5d path (unified_attention reads it as a plain
+        # page table and would mix token positions).
         draft_extend_topk = get_spec().speculative_eagle_topk
         self._use_unified_draft_extend = (
             not self.use_mla
+            and not self.kv_cache_is_vectorized_5d
             and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
             and (draft_extend_topk is None or int(draft_extend_topk) <= 1)
         )
