@@ -1,0 +1,108 @@
+---
+title: "Fast-dVLM"
+description: "Serve text prompts with Fast-dVLM HierarchyBlock decoding and radix caching."
+---
+
+[Fast-dVLM](https://github.com/NVlabs/Fast-dLLM) uses block diffusion with a
+Qwen2.5-VL checkpoint. This integration serves text prompts with the
+`HierarchyBlock` algorithm. Image and video inputs are not supported.
+
+## Prerequisites
+
+Use Linux and an NVIDIA CUDA GPU with a SGLang checkout that includes
+`Fast_dVLMForConditionalGeneration`. Follow the
+[installation guide](/docs/get-started/install) for the CUDA runtime and source
+installation. Earlier validation used one A40 with 48 GB of memory and tensor
+parallel size one.
+
+The model is
+[Efficient-Large-Model/Fast_dVLM_3B](https://huggingface.co/Efficient-Large-Model/Fast_dVLM_3B).
+The launch below downloads this public checkpoint without an API key.
+
+## Launch the server
+
+```bash
+python -m sglang.launch_server \
+  --model-path Efficient-Large-Model/Fast_dVLM_3B \
+  --trust-remote-code \
+  --dllm-algorithm HierarchyBlock \
+  --attention-backend flashinfer \
+  --dtype bfloat16 \
+  --tp 1 \
+  --max-running-requests 4 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+HierarchyBlock selects synchronous block decoding and disables FDFO. It also
+disables multimodal inputs and prefill CUDA graphs. Denoising forwards can use
+decode CUDA graphs. Causal forwards run eagerly. Radix caching stays enabled.
+
+Leave `--enable-multimodal` unset. An explicit request to enable it fails at
+startup. FlashInfer is the default attention backend for this algorithm;
+Triton and FA3 are also accepted by its backend constraints.
+
+## Send a text prompt
+
+```python
+import requests
+from transformers import AutoTokenizer
+
+model = "Efficient-Large-Model/Fast_dVLM_3B"
+tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+prompt = tokenizer.apply_chat_template(
+    [{"role": "user", "content": "Describe the color of the sky."}],
+    tokenize=False,
+    add_generation_prompt=True,
+)
+input_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+response = requests.post(
+    "http://127.0.0.1:30000/generate",
+    json={
+        "input_ids": input_ids,
+        "sampling_params": {"temperature": 0, "max_new_tokens": 128},
+    },
+    timeout=120,
+)
+response.raise_for_status()
+print(response.json()["text"])
+```
+
+Decoding uses argmax predictions and confidence-based token acceptance.
+Temperature does not control sampling in HierarchyBlock.
+
+## Algorithm settings
+
+Default blocks contain 32 tokens, split into sub-blocks of eight. The confidence
+threshold is 0.9 and the token shift is one. To change the sub-block size or
+threshold, pass a YAML file with `--dllm-algorithm-config`:
+
+```yaml
+sub_block_size: 8
+threshold: 0.9
+token_shift: 1
+```
+
+The sub-block size must divide the block size. This checkpoint requires a token
+shift of one.
+
+## Prefix reuse and validation
+
+Denoising uses bidirectional attention within a block. A final causal forward
+writes the KV that remains cached and predicts the first token of the next
+block. Prefix lookup reruns the last committed block when needed to recover
+that prediction, sacrificing at most one block of reuse per admission.
+
+Upstream aligns blocks to absolute token positions, whereas the reference fork
+starts generation blocks after the prompt. Only prompt lengths divisible by 32
+produce matching layouts. Validate output quality on unaligned prompts as well
+as comparing aligned prompts. Batch size and kernel versions can change
+predictions near the confidence threshold.
+
+The repository's
+[validation harness](https://github.com/sgl-project/sglang/tree/main/test/manual/dllm)
+captures cache and graph comparisons with pinned checkpoint revisions. You can
+also compare batch sizes or the reference fork. Prompts span remainders 0 to 31.
+Run it on your target GPU before relying on historical performance results.
+
+This port does not cover speculative decoding, FDFO, or DP attention.
