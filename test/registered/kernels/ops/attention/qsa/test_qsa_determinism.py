@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
+    sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -106,6 +107,62 @@ def test_qsa_prefill_batch_invariance() -> None:
             dim**-0.5,
         )
         torch.testing.assert_close(actual[:seq], reference, rtol=0, atol=0)
+
+
+def test_qsa_fp8_chunk_prefill_batch_invariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
+    torch.manual_seed(42)
+    long_q, short_q = 4096, 1024
+    long_kv, short_kv = 16384, 4096
+    heads, dim, topk = 3, 256, 1024
+    q = torch.randn(long_q + short_q, heads, dim, dtype=torch.bfloat16, device="cuda")
+    k, v = [
+        torch.randn(long_kv + short_kv, 1, dim, dtype=torch.bfloat16, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    ]
+    indices = torch.cat(
+        (
+            torch.randint(0, long_kv, (long_q, topk), dtype=torch.int32, device="cuda"),
+            torch.randint(
+                0, short_kv, (short_q, topk), dtype=torch.int32, device="cuda"
+            ),
+        )
+    )
+    scale = dim**-0.5
+
+    reference = sparse_gqa_fwd_interface_triton_ck(
+        q[:long_q],
+        k[:long_kv],
+        v[:long_kv],
+        indices[:long_q],
+        torch.tensor([0, long_q], dtype=torch.int32, device="cuda"),
+        torch.tensor([0, long_kv], dtype=torch.int32, device="cuda"),
+        torch.tensor([long_kv], dtype=torch.int32, device="cuda"),
+        scale,
+        max_q=long_q,
+    )
+    actual = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        k,
+        v,
+        indices,
+        torch.tensor([0, long_q, long_q + short_q], dtype=torch.int32, device="cuda"),
+        torch.tensor(
+            [0, long_kv, long_kv + short_kv], dtype=torch.int32, device="cuda"
+        ),
+        torch.tensor([long_kv, short_kv], dtype=torch.int32, device="cuda"),
+        scale,
+        max_q=long_q,
+    )
+
+    torch.testing.assert_close(actual[:long_q], reference, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

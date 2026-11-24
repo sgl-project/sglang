@@ -1,5 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import re
 from typing import NamedTuple, Optional
 
 import torch
@@ -66,6 +67,8 @@ def _get_fp8_chunk_pipeline_config(
     group_size: int,
     topk: int,
 ) -> _FP8ChunkPipelineConfig | None:
+    if is_batch_invariant_mode_enabled():
+        return None
     if not _is_fp8_chunk_pipeline_eligible(
         total_q, num_requests, kv_dtype, head_dim, group_size, topk
     ):
@@ -74,7 +77,10 @@ def _get_fp8_chunk_pipeline_config(
         (
             config
             for device, config in _VALIDATED_FP8_CHUNK_PIPELINE_CONFIGS.items()
-            if device in device_name
+            if re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(device)}(?![A-Za-z0-9])",
+                device_name,
+            )
         ),
         None,
     )

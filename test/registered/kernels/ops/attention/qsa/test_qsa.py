@@ -81,6 +81,9 @@ def test_fp8_chunk_pipeline_config_requires_validated_device():
     assert (
         sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H100", *valid) is None
     )
+    assert (
+        sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H200", *valid) is None
+    )
 
     invalid = valid.copy()
     invalid[2] = torch.bfloat16
