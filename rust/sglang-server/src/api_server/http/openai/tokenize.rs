@@ -268,7 +268,9 @@ mod tests {
                 let item = match &request.kind {
                     // What intake answers when the tokenizer pool is full.
                     RequestKind::Tokenize(TokenizeInput::Text { text, .. }) if text == "full" => {
-                        ResponseItem::Error(crate::utils::error::Error::QueueFull)
+                        ResponseItem::Error(crate::utils::error::Error::QueueFull(
+                            crate::utils::error::QueueStage::Tokenizer,
+                        ))
                     }
                     RequestKind::Tokenize(TokenizeInput::Text {
                         text,
