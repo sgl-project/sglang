@@ -554,24 +554,21 @@ def _parse_metric_labels(raw):
 def generate_metrics_json(
     metrics_data_file, test_case, status, streamed_metrics=None, streamed_labels=None
 ):
-    """Collect [METRIC] lines from the log and write metrics.json.
+    """Collect [METRIC] lines and write metrics.json.
 
     This writes ${metrics_data_file}/metrics.json only, which feeds the
     persistence-directory output (e.g. /root/.cache/tests/output/...).
     It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
     'Upload metrics' path was removed).
 
-    ``streamed_metrics`` carries the [METRIC] values already parsed from the
-    live pod log; they are merged in because the archived test_output.log can
-    be missing when the pod is deleted as soon as the test finishes.
+    The [METRIC] lines are parsed from the live pod log stream
+    (``streamed_metrics``); each pod archives its own log under node_logs/ for
+    the artifact, so there is no single shared log file to read back here.
 
-    ``streamed_labels`` (merged with the labels parsed from the archived log)
-    keeps each metric's dump_metric labels -- notably the evaluation
-    ``dataset`` -- so consumers can tell gpqa_diamond from gsm8k instead of
-    reading a bare ``accuracy`` number.
+    ``streamed_labels`` keeps each metric's dump_metric labels -- notably the
+    evaluation ``dataset`` -- so consumers can tell gpqa_diamond from gsm8k
+    instead of reading a bare ``accuracy`` number.
     """
-    log_file = os.path.join(metrics_data_file, "test_output.log")
-
     metrics = {}
     baselines = {}
     metric_labels = {}
@@ -581,23 +578,6 @@ def generate_metrics_json(
             baselines[key[: -len("_baseline")]] = value
         else:
             metrics[key] = value
-
-    if os.path.exists(log_file):
-        with open(log_file, "r") as f:
-            for line in f:
-                m = re.match(r"\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$", line.strip())
-                if m:
-                    value = m.group(2)
-                    try:
-                        value = float(value)
-                    except ValueError:
-                        pass
-                    _record_metric(m.group(1), value)
-                    labels = _parse_metric_labels(m.group(3))
-                    if labels:
-                        metric_labels[m.group(1)] = labels
-    else:
-        logger.warning(f"Metrics log file not found: {log_file}")
 
     for key, value in (streamed_metrics or {}).items():
         _record_metric(key, value)
@@ -638,6 +618,74 @@ def generate_metrics_json(
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
+
+
+def dump_pod_logs(namespace, pod_name_key_str, metrics_data_file):
+    """Archive the container log of every pod that has not archived its own.
+
+    The pod-side script only copies its own log after its test process exits, so
+    when one role fails the remaining pods are deleted before they archive
+    anything (the prefill pod was the only log in the artifact). Running before
+    delete_pod() captures the router, prefill and decode logs no matter how each
+    pod ended; pods that already wrote their own copy under the same
+    ${pod_name}.log are left untouched.
+    """
+    if not metrics_data_file:
+        return
+    try:
+        pods = core_api.list_namespaced_pod(namespace=namespace)
+    except Exception as e:
+        logger.warning(f"Failed to list pods for log collection: {e}")
+        return
+
+    for pod in pods.items:
+        pod_name = pod.metadata.name
+        if pod_name_key_str not in pod_name:
+            continue
+        out_dir = os.path.join(metrics_data_file, "node_logs", pod_name)
+        # The pod script archives its own stdout as <pod_name>.log once its test
+        # process exits; skip it so the same pod is not stored twice.
+        out_path = os.path.join(out_dir, f"{pod_name}.log")
+        if os.path.isfile(out_path):
+            logger.info(f"Pod log already archived by {pod_name}, skipping")
+            continue
+        # Only a complete snapshot may take the final name: the pod-side copy
+        # and the workflow's fallback both skip when <pod_name>.log exists, so a
+        # truncated file from a failed kubectl would hide the pod's own log.
+        tmp_path = f"{out_path}.tmp"
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            # Write straight to disk: a router/prefill log can be tens of MB.
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                result = subprocess.run(
+                    [
+                        "kubectl",
+                        "logs",
+                        "-n",
+                        namespace,
+                        pod_name,
+                        "--all-containers=true",
+                    ],
+                    stdout=f,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=120,
+                )
+            if result.returncode != 0:
+                logger.warning(
+                    f"kubectl logs {pod_name} failed: {result.stderr.strip()}"
+                )
+            else:
+                os.replace(tmp_path, out_path)
+                logger.info(f"Pod log saved to {out_path}")
+        except Exception as e:
+            logger.warning(f"Failed to archive logs for pod {pod_name}: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 def run_npu_e2e_test_case(
@@ -855,6 +903,7 @@ def run_npu_e2e_test_case(
                 except Exception as e:
                     logger.error(f"Failed to generate metrics JSON: {e}", exc_info=True)
     finally:
+        dump_pod_logs(kube_name_space, final_kube_job_name, metrics_data_file)
         if os.path.exists(kube_yaml_file):
             # Don't delete pod when trouble_shotting is enabled
             if not trouble_shotting:

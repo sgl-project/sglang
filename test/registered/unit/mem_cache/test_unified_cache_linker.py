@@ -64,7 +64,11 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -81,6 +85,7 @@ from sglang.test.tree_slots import FAMILY_OF, index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class _RecordedSeries:
@@ -295,7 +300,7 @@ class TestMooncakePrefetch(CustomTestCase):
         transfer = PoolTransfer(
             name=PoolName.KV, keys=["page"], device_indices=torch.tensor(indices)
         )
-        ready = TransferReady([SimpleNamespace(synchronize=synchronize)])
+        ready = TransferReady(SimpleNamespace(synchronize=synchronize))
         with patch.object(linker, "record_transfer_ready", return_value=ready):
             return linker.prefetch([transfer])
 
@@ -373,7 +378,15 @@ class TestMooncakePrefetch(CustomTestCase):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete", metrics=None):
+    def _fixture(
+        self,
+        *,
+        swa=False,
+        mamba=False,
+        policy="wait_complete",
+        session=False,
+        metrics=None,
+    ):
         cfg = CacheConfig(
             page_size=1 if mamba else 2,
             components=(ComponentType.FULL,)
@@ -385,7 +398,9 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             full_attention_layer_ids=(0,),
         )
         with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
-            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+            cache, allocator, _ = build_fixture(
+                cfg, enable_session_radix_cache=session, tree_core_backend="python"
+            )
         cache.metrics_collector = metrics
         backend = _FakeLinker()
         if swa:
@@ -771,6 +786,36 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._match(cache, req).device_prefix_len == 6
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
+
+    def test_published_prefetch_is_covered_by_its_session_while_queued(self):
+        cache, backend, req, allocator = self._fixture(session=True)
+        req.session_id = "s"
+        req.session_generation = cache.ensure_session_generation("s")
+        self._enqueue(cache, req)
+        backend.prefetch_futures[-1].set_result(True)
+        cache.linker.check_prefetch_events()
+        published = self._match(cache, req).last_device_node
+        full = cache.components[ComponentType.FULL]
+        assert full.session_ref(cache.tree_core.node_by_id(published)) == 1
+
+        # Newer and unreferenced, so plain LRU would evict the prefetch first.
+        cache.write_through_threshold = sys.maxsize
+        other = self._request("other", start=11)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(other.origin_input_ids[:6]),
+                value=allocator.alloc(6),
+                inserted_len=6,
+            )
+        )
+        cache.evict(EvictParams(num_tokens=6))
+        assert self._match(cache, req).device_prefix_len == 6
+        assert self._match(cache, other).device_prefix_len == 0
+
+        cache.release_radix_session("s")
+        assert full.session_ref(cache.tree_core.node_by_id(published)) == 0
+        self._assert_balanced(cache, allocator)
+        cache.sanity_check()
 
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
         cache, backend, req, allocator = self._fixture()
@@ -2564,15 +2609,17 @@ class TestTransferReadyEvents(CustomTestCase):
 
     def test_transfer_waits_on_the_forward_using_the_pages(self):
         forward_stream = MagicMock(name="forward_stream")
-        indices_ready, forward_done = self._record(forward_stream).events
+        ready = self._record(forward_stream)
+        indices_ready, forward_done = ready.indices_ready, ready.forward_done
         indices_ready.record.assert_called_once_with()
         forward_done.record.assert_called_once_with(forward_stream)
         # The transfer thread waits; the forward stream's own order is untouched.
         self.assertEqual(forward_stream.mock_calls, [])
 
     def test_transfer_without_a_forward_stream_waits_on_the_current_one(self):
-        (indices_ready,) = self._record(None).events
-        indices_ready.record.assert_called_once_with()
+        ready = self._record(None)
+        ready.indices_ready.record.assert_called_once_with()
+        self.assertIsNone(ready.forward_done)
 
     def test_mooncake_offload_thread_waits_on_every_event(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -2586,7 +2633,7 @@ class TestTransferReadyEvents(CustomTestCase):
             (
                 ["transfer"],
                 1,
-                TransferReady([order.indices_ready, order.forward_done]),
+                TransferReady(order.indices_ready, order.forward_done),
                 "session-a",
             )
         )
@@ -2611,7 +2658,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
                 order = MagicMock()
                 linker.record_transfer_ready = order.record_transfer_ready
-                ready = TransferReady([order.indices_ready, order.forward_done])
+                ready = TransferReady(order.indices_ready, order.forward_done)
                 order.record_transfer_ready.return_value = ready
                 linker.load_layer_wise = order.load_layer_wise
                 linker.load_all_layers = order.load_all_layers
@@ -2661,7 +2708,7 @@ class TestTransferReadyEvents(CustomTestCase):
         order = MagicMock()
         linker.mla_broadcaster = order.broadcaster
         linker.num_layers = 2
-        ready = TransferReady([order.indices_ready, order.forward_done])
+        ready = TransferReady(order.indices_ready, order.forward_done)
         linker.broadcast_loads = {3: (0, "prepared", ready)}
         device = MagicMock(name="device_module")
         device.current_stream.return_value = order.stream
