@@ -6,9 +6,9 @@ const modelOf = (s) => s.variant === "distilled"
   : "black-forest-labs/flux-3-image-klein-base";
 const hardware = [
   { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
-  { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
+  { id: "rtxpro6000", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
 ];
-const hardwareLabels = { rtx5090: "RTX 5090", rtx6000pro: "RTX PRO 6000", h100: "H100", h200: "H200", b200: "B200", b300: "B300", gb200: "GB200", gb300: "GB300" };
+const hardwareLabels = { rtx5090: "RTX 5090", rtxpro6000: "RTX PRO 6000", h100: "H100", h200: "H200", b200: "B200", b300: "B300", gb200: "GB200", gb300: "GB300" };
 // Matched eager/BCG HTTP runs: 1 MP, batch 1, 80-token bucket, resident.
 const graphRuns = [
   { hw: "gb300", variant: "distilled", quant: "bf16", mode: "t2i", execution: "eager" },
