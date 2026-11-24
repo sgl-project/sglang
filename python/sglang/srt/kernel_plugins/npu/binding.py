@@ -4,11 +4,21 @@ import logging
 
 import torch.distributed as dist
 
-from sglang.kernels.plugin_kernels.npu.spec import PreparationView, find_spec
+from sglang.kernels.plugin_kernels.npu.spec import Decline, PreparationView, find_spec
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+
+def _decline_text(reason):
+    return reason.reason if isinstance(reason, Decline) else reason
+
+
+def _unexpected_decline(reason):
+    if isinstance(reason, Decline):
+        return not reason.expected
+    return reason is not None
 
 
 def install_megakernels(runner):
@@ -26,15 +36,19 @@ def install_megakernels(runner):
                 f"draft_worker={runner.is_draft_worker}"
             )
         else:
-            spec.prepare.decline_reason = None
             resources = PreparationView(
                 model=runner.model,
                 token_to_kv_pool=runner.token_to_kv_pool,
                 physical_slots=not runner.runner_ids.is_translating
                 and not runner.token_to_kv_pool_allocator.hands_out_virtual_ids,
             )
-            binding = spec.prepare(resources, cfg)
-            decline = getattr(spec.prepare, "decline_reason", None)
+            outcome = spec.prepare(resources, cfg)
+            if isinstance(outcome, Decline):
+                decline = outcome
+            elif outcome is None:
+                decline = None
+            else:
+                binding = outcome
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     signature = (
@@ -52,13 +66,15 @@ def install_megakernels(runner):
         raise RuntimeError(f"NPU megakernel preflight failed: {ranks}")
     if any(peer[1] is None for peer in ranks):
         reasons = [peer[6] for peer in ranks]
-        # Native draft is an explicit off switch. Any other reason means the
-        # enabled plugin did not install.
-        unexpected = any(
-            reason and "draft mode is native" not in reason for reason in reasons
-        )
+        # Decline.expected is an explicit off switch. Any other reason means
+        # the enabled plugin did not install.
+        unexpected = any(_unexpected_decline(reason) for reason in reasons)
         log = logger.warning if unexpected else logger.info
-        log("NPU megakernel declined %s: %s", architecture, reasons)
+        log(
+            "NPU megakernel declined %s: %s",
+            architecture,
+            [_decline_text(reason) for reason in reasons],
+        )
         return None
     if any(peer != signature for peer in ranks):
         raise RuntimeError(f"NPU megakernel preflight failed: {ranks}")

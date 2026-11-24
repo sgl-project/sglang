@@ -14,9 +14,12 @@ def register():
 
 Each attribute is a `MegakernelSpec` with the role `target` or `nextn`. Its
 `prepare` callback inspects the loaded model, allocated KV pool and resolved
-configuration. It returns a binding or declines by returning `None`. Resource
-preflight must complete without TP collectives. SGLang compares decisions
-across the group before invoking the binding's `build` method.
+configuration. It returns a binding, or a `Decline(reason, expected)` when it
+refuses. `expected=True` is an intentional off switch and is logged at info;
+any other refusal is a warning. Return `None` only when there is no reason to
+report. Do not store the reason on the prepare function. Resource preflight
+must complete without TP collectives. SGLang compares decisions across the
+group before invoking the binding's `build` method.
 
 Enable installation with `--enable-npu-megakernel`. The target binding votes across TP ranks before entering a collective, computes decode or verify logits and returns outputs owned by SGLang.
 
