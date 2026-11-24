@@ -16,8 +16,8 @@ import torch
 
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
+    OffloadedState,
 )
-from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
