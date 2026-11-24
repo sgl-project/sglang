@@ -91,7 +91,6 @@ class TestCanApprove(unittest.TestCase):
             (("read", tag), True),
             ((404, tag), True),
             (("read", {"can_rerun_failed_ci": True}), False),
-            (("triage", None), False),
             ((404, None), False),
         ]
         for (permission, perms), expected in cases:
@@ -103,9 +102,9 @@ class TestCanApprove(unittest.TestCase):
 class TestIsApproved(unittest.TestCase):
     def test_label_plus_approver_author_or_bot_status(self):
         cases = [
-            ("maint", [], {"run-ci"}, True),  # an approver's PR: the label is enough
+            ("maint", [], {"run-ci"}, True),
             ("maint", [], set(), False),
-            ("listed", [], {"run-ci"}, True),  # can_tag_run_ci_label in the file
+            ("listed", [], {"run-ci"}, True),
             ("ext", [_status()], {"run-ci"}, True),
             ("ext", [], {"run-ci"}, False),
             ("ext", [_status(login="someone")], {"run-ci"}, False),

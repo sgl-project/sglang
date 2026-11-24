@@ -65,9 +65,8 @@ jobs:
           echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
-      # 'commit' mode needs the live run-ci label and, unless the author may approve, a
-      # ci/run-ci-approved status on the event payload's head commit only, so a push needs
-      # a new approval.
+      # 'commit' mode: the live run-ci label and, unless the author may approve, a
+      # ci/run-ci-approved status on the payload's head commit.
       # run_ci_approval.is_approved is the Python twin; keep the two in step.
       - name: Check run-ci approval
         id: approval
@@ -87,7 +86,6 @@ jobs:
             const { owner, repo } = context.repo;
             const sha = context.payload.pull_request.head.sha;
             const author = context.payload.pull_request.user.login;
-            // An author who may approve keeps the label semantics: run-ci runs every push.
             async function authorMayApprove() {
               try {
                 const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: author });

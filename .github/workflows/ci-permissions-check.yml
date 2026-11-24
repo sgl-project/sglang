@@ -1,8 +1,7 @@
 name: CI Permissions Check
 
-# Warns about CI_PERMISSIONS.json entries that update_ci_permission.py would
-# drop or change (write-access users, users inactive for 90 days). Report only:
-# continue-on-error keeps a stale entry or an API error from blocking a PR.
+# Warns about CI_PERMISSIONS.json entries that update_ci_permission.py would drop.
+# Report only: continue-on-error keeps it from blocking a PR.
 
 on:
   pull_request:

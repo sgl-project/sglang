@@ -115,10 +115,7 @@ def has_write_access(user):
 
 
 def get_active_authors():
-    """Lowercased logins of commit authors on the default branch in the last WINDOW_DAYS days.
-
-    PRs are squash-merged, so this is also who had a PR merged in the window.
-    """
+    """Lowercased logins of commit authors on the default branch in the last WINDOW_DAYS days."""
     print(f"Fetching commits from the last {WINDOW_DAYS} days...")
     since_date = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).isoformat()
     commits = github_api_get("commits", params={"since": since_date, "per_page": 100})

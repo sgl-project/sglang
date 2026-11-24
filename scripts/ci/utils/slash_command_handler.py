@@ -370,7 +370,7 @@ def handle_tag_run_ci(
     Adding `run-ci` here also approves the PR's head commit for the workflows
     that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), but
     only a head the commenter could have seen: one pushed before the comment
-    was posted. Adding the label in the UI approves nothing.
+    was posted.
 
     Labels added here start no run (GITHUB_TOKEN label events trigger no
     workflow); the callers re-run the gated runs.
@@ -2056,7 +2056,7 @@ def main():
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
     # Write access grants every CI permission; CI_PERMISSIONS.json lists only
-    # users without it (update_ci_permission.py drops write-access users).
+    # users without it.
     if repo.get_collaborator_permission(user_login) in APPROVER_REPO_PERMISSIONS:
         print(f"User {user_login} has write access. Granting all CI permissions.")
         user_perms = dict(WRITE_ACCESS_CI_PERMISSIONS)
