@@ -84,14 +84,20 @@ def _status(state="success", login=rca.APPROVAL_CREATOR):
 
 
 class TestCanApprove(unittest.TestCase):
-    def test_only_write_access_approves(self):
-        for permission, expected in [
-            *((p, True) for p in rca.APPROVER_REPO_PERMISSIONS),
-            *((p, False) for p in ("read", "triage", 403, 404)),
-        ]:
-            with self.subTest(permission=permission):
+    def test_write_access_or_ci_permissions_entry_approves(self):
+        tag = {"can_tag_run_ci_label": True}
+        cases = [
+            *(((p, None), True) for p in rca.APPROVER_REPO_PERMISSIONS),
+            (("read", tag), True),
+            ((404, tag), True),
+            (("read", {"can_rerun_failed_ci": True}), False),
+            (("triage", None), False),
+            ((404, None), False),
+        ]
+        for (permission, perms), expected in cases:
+            with self.subTest(permission=permission, perms=perms):
                 repo = FakeRepo(permissions={"u": permission})
-                self.assertEqual(rca.can_approve(repo, "u")[0], expected)
+                self.assertEqual(rca.can_approve(repo, "u", perms)[0], expected)
 
 
 class TestIsApproved(unittest.TestCase):

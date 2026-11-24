@@ -151,7 +151,7 @@ For CI to run on a pull request, it must have the "run-ci" label and not be a dr
 
 NVIDIA's PR Test Base and Extra (`pr-test.yml`, `pr-test-extra.yml`) need more: an approval of the PR's head commit, with "run-ci" still on the PR. Adding "run-ci" approves the commit the PR has at that moment, and only that commit, then reruns those workflows on it. Every push needs a new approval, a maintainer's own push included: no commit is ever approved automatically. After a push, a maintainer approves the new commit with `/tag-and-rerun-ci`, or by removing and re-adding "run-ci". Removing "run-ci" withdraws the approval; adding it back approves the head commit the PR has then. A slash command approves only a commit pushed before the comment was posted, so if the PR changed after the comment, post the command again; an edited comment approves nothing. A PR that changes nothing these workflows test (a README edit, for example) passes `pr-test-finish` without an approval.
 
-Approvers are users with write access to the repository. Users with `can_tag_run_ci_label` in `CI_PERMISSIONS.json` can add the label, which other workflows read, but it approves nothing for NVIDIA PR Test. If you are not a maintainer, ask a Merge Oncall to approve: adding "run-ci" yourself approves nothing and gives no notice (the approve workflow only logs a warning).
+Approvers are users with write access to the repository, and users with `can_tag_run_ci_label` in `CI_PERMISSIONS.json`. If you are not a maintainer, ask a Merge Oncall to approve: adding "run-ci" yourself approves nothing and gives no notice (the approve workflow only logs a warning).
 
 Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 

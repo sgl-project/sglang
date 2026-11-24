@@ -111,10 +111,11 @@ def skipped_at_gate(run):
     return any(job_skipped_tests(job) for job in run.jobs())
 
 
-def can_approve(gh_repo, user_login):
+def can_approve(gh_repo, user_login, user_perms):
     """
-    The one rule for who may approve a commit for CI: write, maintain, or admin
-    access to the repository. Returns (ok, reason).
+    The one rule for who may approve a commit for CI. Returns (ok, reason).
+
+    Write access, or `can_tag_run_ci_label` in CI_PERMISSIONS.json.
     """
     try:
         permission = gh_repo.get_collaborator_permission(user_login)
@@ -124,7 +125,12 @@ def can_approve(gh_repo, user_login):
         permission = None
     if permission in APPROVER_REPO_PERMISSIONS:
         return True, ""
-    return False, f"{user_login} has no write access to {gh_repo.full_name}"
+    if (user_perms or {}).get("can_tag_run_ci_label", False):
+        return True, ""
+    return False, (
+        f"{user_login} has neither write access nor can_tag_run_ci_label "
+        f"in {PERMISSIONS_FILE_PATH}"
+    )
 
 
 def head_seen_by(gh_repo, pr, sha, seen_at):
@@ -276,7 +282,7 @@ def main():
     head_sha = os.environ["HEAD_SHA"]
     sender = os.environ["SENDER_LOGIN"]
 
-    ok, reason = can_approve(gh_repo, sender)
+    ok, reason = can_approve(gh_repo, sender, load_permissions(sender))
     if not ok:
         print(
             f"::warning::{sender} added run-ci but may not approve CI: {reason}. "
