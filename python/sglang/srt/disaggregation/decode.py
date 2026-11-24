@@ -4414,7 +4414,14 @@ class SchedulerDisaggregationDecodeMixin:
         # pop req from waiting queue
         can_run_list: List[Req] = []
 
-        for req in self.waiting_queue:
+        vpp_manifest = getattr(self, "_vpp_admit_manifest", None)
+        candidates = self.waiting_queue
+        if vpp_manifest is not None:
+            by_rid = {req.rid: req for req in self.waiting_queue}
+            candidates = [
+                by_rid[rid] for rid, _, _ in vpp_manifest["requests"] if rid in by_rid
+            ]
+        for req in candidates:
             # we can only add at least `num_not_used_batch` new batch to the running queue;
             # a request restored from host memory waits until its copy has finished
             if len(can_run_list) < num_not_used_batch and (

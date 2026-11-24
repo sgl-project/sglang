@@ -20,6 +20,7 @@ class PipelineControlKind(str, Enum):
     REQUEST = "request"
     BOOTSTRAP_STATUS = "bootstrap_status"
     TRANSFER_STATUS = "transfer_status"
+    DECODE_STATUS = "decode_status"
     ADMIT = "admit"
     CANCEL = "cancel"
     FIRST_PASS_DONE = "first_pass_done"

@@ -13,6 +13,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.distributed.vpp_policy import (
     PipelineControlEnvelope,
     PipelineControlKind,
@@ -31,6 +32,7 @@ from sglang.srt.distributed.vpp_transport import (
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import max_prefill_buffer_tokens
 
 if TYPE_CHECKING:
@@ -83,16 +85,23 @@ class SchedulingVPPCore:
         batch: ScheduleBatch,
     ) -> Dict[str, object]:
         requests = []
+        decode = getattr(batch, "forward_mode", None)
+        decode = decode is not None and decode.is_decode()
         for req in batch.reqs:
             index = len(requests)
+            end = (
+                int(batch.seq_lens_cpu[index])
+                if decode
+                else int(batch.prefix_lens[index] + batch.extend_lens[index])
+            )
             requests.append(
                 (
                     req.rid,
-                    int(batch.prefix_lens[index]),
-                    int(batch.prefix_lens[index] + batch.extend_lens[index]),
+                    end - 1 if decode else int(batch.prefix_lens[index]),
+                    end,
                 )
             )
-        return {
+        manifest = {
             "protocol_version": _VPP_PROTOCOL_VERSION,
             "batch_seq": batch_seq,
             "generation": batch_seq // len(self.mbs),
@@ -106,6 +115,9 @@ class SchedulingVPPCore:
                 req.rid: getattr(req, "bootstrap_room", None) for req in batch.reqs
             },
         }
+        if getattr(batch, "forward_mode", None) is not None:
+            manifest["forward_mode"] = batch.forward_mode.value
+        return manifest
 
     def _pp_vpp_accept_received_tensors(
         self: Scheduler,
@@ -152,10 +164,14 @@ class SchedulingVPPCore:
         # and send the next generation before that control round trip finishes.
         retiring_previous_generation = (
             slot_batch_seq is not None
-            and batch_seq == slot_batch_seq + len(self._pp_vpp_slot_batch_seqs)
+            and batch_seq > slot_batch_seq
             and self.pp_group.is_last_rank
             and stage_id == self.pp_group.rank_in_group
             and self.mbs[slot_id] is None
+            and not any(
+                seq % len(self._pp_vpp_slot_batch_seqs) == slot_id and seq != batch_seq
+                for seq, _ in self._pp_vpp_early_activations
+            )
         )
         if slot_batch_seq not in (None, batch_seq) and not retiring_previous_generation:
             raise RuntimeError(
@@ -446,6 +462,13 @@ class SchedulingVPPCore:
         rooms = manifest["bootstrap_rooms"]
 
         candidates = {req.rid: req for req in self.waiting_queue}
+        slot_id = envelope.slot_id
+        for batches in (
+            getattr(self, "running_mbs", ()),
+            getattr(self, "last_mbs", ()),
+        ):
+            if batches and batches[slot_id] is not None:
+                candidates.update((req.rid, req) for req in batches[slot_id].reqs)
         if self.chunked_req is not None:
             candidates[self.chunked_req.rid] = self.chunked_req
 
@@ -467,11 +490,12 @@ class SchedulingVPPCore:
                 ready = False
                 continue
 
-            if end > len(req.origin_input_ids):
+            decode = manifest.get("forward_mode") == ForwardMode.DECODE.value
+            if end > len(req.origin_input_ids) + (len(req.output_ids) if decode else 0):
                 raise RuntimeError("VPP admission span exceeds request input")
 
             entry = self._pp_vpp_prefix_registry.get(rid, generation)
-            if entry is not None and entry.planned_end != start:
+            if not decode and entry is not None and entry.planned_end != start:
                 raise RuntimeError("VPP admission prefix order mismatch")
 
             ready = ready and not req.finished()
@@ -655,7 +679,8 @@ class SchedulingVPPCore:
             candidates = [] if batch is None else batch.reqs
         else:
             candidates = list(self.waiting_queue)
-            candidates += list(self.disagg_prefill_bootstrap_queue.queue)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                candidates += list(self.disagg_prefill_bootstrap_queue.queue)
             candidates += [
                 req for batch in self.mbs if batch is not None for req in batch.reqs
             ]
@@ -805,11 +830,10 @@ class SchedulingVPPCore:
             return self.chunked_req
         return None
 
-    def _event_loop_pp_disagg_prefill_vpp(self: Scheduler):
-        return self._event_loop_pp_disagg_prefill_vpp_rank_local()
-
-    def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
+    def _event_loop_vpp_rank_local(self: Scheduler):
         self._init_scheduling_native_loop_state()
+        prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        decode = self.disaggregation_mode == DisaggregationMode.DECODE
         self._pp_vpp_overlap_chunks = False
         self._pp_vpp_launched_prefix = {}
         max_inflight = self._pp_vpp_max_inflight()
@@ -882,6 +906,8 @@ class SchedulingVPPCore:
         pending_bootstrap_applies = deque()
         bootstrap_round_active = False
         transfer_round_active = False
+        decode_round_active = False
+        pending_decode_controls = deque()
         pending_first_pass: Dict[int, set[int]] = defaultdict(set)
         pending_chunk_batches = set()
         tick = 0
@@ -1085,7 +1111,7 @@ class SchedulingVPPCore:
             envelope: PipelineControlEnvelope,
             wire: Dict[str, object],
         ) -> None:
-            nonlocal bootstrap_round_active, transfer_round_active
+            nonlocal bootstrap_round_active, transfer_round_active, decode_round_active
             payload = envelope.payload or {}
             returned_to_source = (
                 envelope.source_rank == self.pp_group.rank_in_group
@@ -1126,6 +1152,71 @@ class SchedulingVPPCore:
                 if requests:
                     self.process_input_requests(list(requests))
                 forward_control(envelope, wire)
+                return
+
+            if envelope.kind == PipelineControlKind.DECODE_STATUS:
+                phase = payload["phase"]
+                operation = payload["operation"]
+                if rank_schedule.inflight_count:
+                    # Queue allocation and retirement run only after every
+                    # retained batch on this rank has processed its output.
+                    pending_decode_controls.append((envelope, wire))
+                    return
+                if phase == "collect":
+                    if not returned_to_source:
+                        local = self._pp_vpp_decode_poll(operation, payload["slot_id"])
+                        previous = payload["outcomes"]
+                        if operation == "retract":
+                            payload["outcomes"] = sorted(set(previous) & set(local))
+                        elif operation == "prealloc":
+                            bad = set(previous[1]) | set(local[1])
+                            payload["outcomes"] = [
+                                sorted((set(previous[0]) & set(local[0])) - bad),
+                                sorted(bad),
+                            ]
+                        else:
+                            payload["outcomes"] = {
+                                rid: failed or local[rid]
+                                for rid, failed in previous.items()
+                                if rid in local
+                            }
+                        forward_control(envelope, wire)
+                        return
+                    outcomes = self._pp_vpp_decode_apply(operation, payload["outcomes"])
+                    self._pp_vpp_queue_control(
+                        self._pp_vpp_new_control(
+                            PipelineControlKind.DECODE_STATUS,
+                            payload={**payload, "phase": "apply", "outcomes": outcomes},
+                        ).forwarded()
+                    )
+                    return
+                if phase != "apply":
+                    raise RuntimeError(f"Invalid VPP decode queue phase {phase}")
+                if not returned_to_source:
+                    payload["outcomes"] = self._pp_vpp_decode_apply(
+                        operation, payload["outcomes"]
+                    )
+                    forward_control(envelope, wire)
+                    return
+                operations = ("retract", "prealloc", "transfer")
+                index = operations.index(operation) + 1
+                if index == len(operations):
+                    decode_round_active = False
+                else:
+                    operation = operations[index]
+                    self._pp_vpp_queue_control(
+                        self._pp_vpp_new_control(
+                            PipelineControlKind.DECODE_STATUS,
+                            payload={
+                                "phase": "collect",
+                                "operation": operation,
+                                "slot_id": payload["slot_id"],
+                                "outcomes": self._pp_vpp_decode_poll(
+                                    operation, payload["slot_id"]
+                                ),
+                            },
+                        ).forwarded()
+                    )
                 return
 
             if envelope.kind == PipelineControlKind.BOOTSTRAP_STATUS:
@@ -1429,7 +1520,7 @@ class SchedulingVPPCore:
                         and bool(self.disagg_prefill_transfer_queue)
                     )
                 )
-                if self.pp_group.is_first_rank
+                if self.pp_group.is_first_rank and prefill
                 else False
             )
             while True:
@@ -1466,6 +1557,8 @@ class SchedulingVPPCore:
                     pending_bootstrap_applies.append(apply_args)
             for _ in range(len(self._pp_vpp_pending_batch_controls)):
                 handle_control(*self._pp_vpp_pending_batch_controls.popleft())
+            if not rank_schedule.inflight_count and pending_decode_controls:
+                handle_control(*pending_decode_controls.popleft())
 
             self._pp_vpp_reap_send_work(activation_send_work)
             self._pp_vpp_flush_control_outbox(
@@ -1504,6 +1597,33 @@ class SchedulingVPPCore:
                         ).forwarded()
                     )
 
+                if (
+                    decode
+                    and not rank_schedule.inflight_count
+                    and not decode_round_active
+                ):
+                    self.disagg_decode_transfer_queue.resolve_deferred_releases()
+                    self.disagg_decode_prealloc_queue.publish_pending_destinations()
+                    self.disagg_decode_transfer_queue.publish_pending_metadata()
+                    if (
+                        self.pause_state.may_launch()
+                        and self._pp_vpp_decode_queues_pending()
+                    ):
+                        decode_round_active = True
+                        self._pp_vpp_queue_control(
+                            self._pp_vpp_new_control(
+                                PipelineControlKind.DECODE_STATUS,
+                                payload={
+                                    "phase": "collect",
+                                    "operation": "retract",
+                                    "slot_id": next_batch_seq % max_inflight,
+                                    "outcomes": self._pp_vpp_decode_poll(
+                                        "retract", next_batch_seq % max_inflight
+                                    ),
+                                },
+                            ).forwarded()
+                        )
+
                 round_states = (
                     self._pp_vpp_all_gather_cpu_state(
                         (
@@ -1520,7 +1640,7 @@ class SchedulingVPPCore:
                             ),
                         )
                     )
-                    if self._pp_vpp_round_check
+                    if self._pp_vpp_round_check and prefill
                     else None
                 )
                 start_bootstrap_round = round_states is not None and bool(
@@ -1634,6 +1754,8 @@ class SchedulingVPPCore:
                         or bool(self.waiting_queue)
                     )
                     and (self._pp_vpp_overlap_chunks or not pending_chunk_batches)
+                    and self.pause_state.may_launch()
+                    and not decode_round_active
                     and self._pp_vpp_can_queue_admit(
                         next_batch_seq,
                         pending_admits,
@@ -1658,6 +1780,10 @@ class SchedulingVPPCore:
                         self.mbs[slot_id] = None
                         self.mb_metadata[slot_id] = None
                         slot_batch_seqs[slot_id] = None
+                        if not prefill:
+                            # Visit the other running microbatch even when this
+                            # slot has no requests. No admission is published.
+                            next_batch_seq += 1
                     else:
                         self._pp_vpp_register_prefix_batch(batch)
                         manifest = self._pp_vpp_batch_manifest(
@@ -1844,7 +1970,10 @@ class SchedulingVPPCore:
                         )
                     transition = rank_schedule.complete(action)
                     batch = self.mbs[action.slot_id]
-                    if batch is not None:
+                    if (
+                        batch is not None
+                        and getattr(batch, "forward_mode", None) != ForwardMode.DECODE
+                    ):
                         for req in batch.reqs:
                             if req.extend_end is None:
                                 continue
@@ -1915,9 +2044,12 @@ class SchedulingVPPCore:
                 or bootstrap_round_active
                 or bool(pending_chunk_batches)
                 or bool(pending_bootstrap_applies)
+                or decode_round_active
+                or bool(pending_decode_controls)
+                or (decode and self._pp_vpp_decode_queues_pending())
                 or bool(self.waiting_queue)
-                or bool(self.disagg_prefill_bootstrap_queue.queue)
-                or bool(self.disagg_prefill_transfer_queue)
+                or (prefill and bool(self.disagg_prefill_bootstrap_queue.queue))
+                or (prefill and bool(self.disagg_prefill_transfer_queue))
                 or bool(self._pp_vpp_control_outbox)
                 or bool(control_send_work)
                 or bool(activation_send_work)
@@ -1959,9 +2091,11 @@ class SchedulingVPPCore:
                     rank_schedule.ready_tasks,
                     rank_schedule.running,
                     len(self.waiting_queue),
-                    len(self.disagg_prefill_bootstrap_queue.queue),
-                    len(self.disagg_prefill_transfer_queue),
-                    self.req_to_metadata_buffer_idx_allocator.available_size(),
+                    len(self.disagg_prefill_bootstrap_queue.queue) if prefill else 0,
+                    len(self.disagg_prefill_transfer_queue) if prefill else 0,
+                    self.req_to_metadata_buffer_idx_allocator.available_size()
+                    if prefill
+                    else 0,
                     len(pending_bootstrap_applies),
                     len(self._pp_vpp_pending_materialized),
                     len(self._pp_vpp_pending_replica_updates),
@@ -1978,6 +2112,20 @@ class SchedulingVPPCore:
                 server_is_idle = False
             if rank_schedule.inflight_count or self._pp_vpp_pending_batch_controls:
                 server_is_idle = False
-            if server_is_idle and len(self.disagg_prefill_transfer_queue) == 0:
+            if decode_round_active or pending_decode_controls:
+                server_is_idle = False
+            if not prefill and any(
+                not req.finished()
+                for batches in (getattr(self, "running_mbs", ()), self.last_mbs)
+                for batch in batches
+                if batch is not None
+                for req in batch.reqs
+            ):
+                # A completed forward can still own live request KV while the
+                # leader rotates slots or the next decode manifest is in flight.
+                server_is_idle = False
+            if server_is_idle and (
+                not prefill or not self.disagg_prefill_transfer_queue
+            ):
                 self.on_idle()
             tick += 1

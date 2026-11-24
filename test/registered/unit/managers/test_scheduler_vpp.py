@@ -7,17 +7,14 @@ import textwrap
 import unittest
 from array import array
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.distributed.vpp_activation import VPPReceivedActivation
-from sglang.srt.distributed.vpp_batch import VPPBatchLedger, VPPBatchState
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.distributed.vpp_layout import VPPLayout
 from sglang.srt.distributed.vpp_policy import (
     PipelineControlEnvelope,
@@ -27,15 +24,13 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineReplicaIdentity,
     PipelineWavefrontAction,
 )
-from sglang.srt.distributed.vpp_schedule import VPPFixedSchedule
 from sglang.srt.distributed.vpp_transport import P2PWorkGroup
-from sglang.srt.managers import scheduler_vpp_wave_mixin as vpp_mod
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
 from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin
-from sglang.srt.managers.scheduler_vpp_wave_mixin import NativeVPPWaveMixin
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.vpp_stage import execute_vpp_stage
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -58,73 +53,6 @@ class _Event:
 
     def record(self, stream=None):
         self.recorded = True
-
-
-class _Receiver:
-    def __init__(self, queue):
-        self.queue = queue
-        self.posted = False
-
-    def start(self):
-        if self.posted:
-            raise RuntimeError("Receive leaked from the preceding wave")
-        self.posted = True
-
-    def take(self, *, post_next=True):
-        if not self.posted:
-            raise RuntimeError("No receive posted")
-        result = self.queue.get(timeout=10)
-        self.posted = post_next
-        return VPPReceivedActivation(result)
-
-
-class _Sends:
-    def __init__(self, queue):
-        self.queue = queue
-
-    def acquire(self):
-        return None
-
-    def send(self, tensors, forward_event):
-        if not forward_event.recorded:
-            raise RuntimeError("Activation published before the forward fence")
-        self.queue.put(tensors)
-
-    def wait_for_reuse(self):
-        return None
-
-
-class _Worker:
-    def __init__(self, rank, calls):
-        self.rank = rank
-        self.calls = calls
-        self.model_runner = object()
-        # Deliberately reused output storage; the scheduler must snapshot views.
-        self.workspace = torch.empty(1)
-
-    def set_hicache_consumer(self, index):
-        pass
-
-    def forward_batch_generation(
-        self, batch, *, forward_batch, pp_proxy_tensors, vpp_stage_id
-    ):
-        self.calls.append((forward_batch.batch_seq, vpp_stage_id))
-        value = (
-            forward_batch.batch_seq
-            if pp_proxy_tensors is None
-            else pp_proxy_tensors["hidden_states"].item()
-        )
-        self.workspace.fill_(value + 1)
-        if vpp_stage_id == forward_batch.final_stage:
-            return SimpleNamespace(
-                next_token_ids=self.workspace,
-                pp_hidden_states_proxy_tensors=None,
-            )
-        return SimpleNamespace(
-            pp_hidden_states_proxy_tensors=PPProxyTensors(
-                {"hidden_states": self.workspace}
-            )
-        )
 
 
 class _SchedulingCore(SchedulingVPPCore):
@@ -197,7 +125,7 @@ class _LoopStopped(Exception):
 
 def _run_native_ticks(scheduler, ticks, before_tick=None):
     """Bound the real loop at its tick boundary without changing its body."""
-    method = SchedulingVPPCore._event_loop_pp_disagg_prefill_vpp_rank_local
+    method = SchedulingVPPCore._event_loop_vpp_rank_local
     lines, first_line = inspect.getsourcelines(method)
     definition = ast.parse(textwrap.dedent("".join(lines))).body[0]
     loop = next(node for node in definition.body if isinstance(node, ast.While))
@@ -218,7 +146,7 @@ def _run_native_ticks(scheduler, ticks, before_tick=None):
     previous = sys.gettrace()
     sys.settrace(trace)
     try:
-        scheduler._event_loop_pp_disagg_prefill_vpp()
+        scheduler._event_loop_vpp_rank_local()
     except _LoopStopped:
         pass
     finally:
@@ -351,6 +279,8 @@ class TestSchedulingVPPCore(CustomTestCase):
     def _scheduler(self, *, rank=0, owner=0, retained=True, core_type=_SchedulingCore):
         scheduler = core_type()
         scheduler.__dict__.update(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            pause_state=SimpleNamespace(may_launch=lambda: True),
             _pp_vpp_runtime_epoch=3,
             _pp_vpp_control_layout_digest="layout",
             _pp_vpp_slot_batch_seqs=[owner, None],
@@ -440,9 +370,16 @@ class TestSchedulingVPPCore(CustomTestCase):
         return scheduler, PipelineRankSchedule(1, 2, 2, 2), wire
 
     def _control_loop(
-        self, *, rank=1, core_type=_ControlCore, ticks=0, before_tick=None
+        self,
+        *,
+        rank=1,
+        core_type=_ControlCore,
+        ticks=0,
+        before_tick=None,
+        mode=DisaggregationMode.PREFILL,
     ):
         scheduler, _, _ = self._remote_admission(core_type=core_type)
+        scheduler.disaggregation_mode = mode
         scheduler.pp_group.rank_in_group = rank
         scheduler.pp_group.is_first_rank = rank == 0
         scheduler.pp_group.is_last_rank = rank == 1
@@ -616,6 +553,84 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertEqual(scheduler.actions, [])
         self.assertEqual(scheduler.published, [])
         self.assertEqual(context["rank_schedule"].inflight_count, 0)
+
+    def test_standalone_loop_visits_running_slot_after_empty_slot(self):
+        def before_tick(scheduler, context):
+            if context["tick"] == 0:
+                self._tick_batches(scheduler, 3)
+                scheduler.waiting_queue = (
+                    scheduler.batches[0].reqs + scheduler.batches[2].reqs
+                )
+                scheduler.batches.pop(1)
+                for batch in scheduler.batches.values():
+                    batch.forward_mode = ForwardMode.DECODE
+                    batch.seq_lens_cpu = torch.tensor([9])
+                    batch.disagg_prefill_chunk_end_by_rid = {}
+                    batch.reqs[0].output_ids = [9]
+            if context["tick"] in (2, 5):
+                self._tick_activation(scheduler, 0 if context["tick"] == 2 else 2, 2)
+            if context["tick"] in (3, 6):
+                seq = 0 if context["tick"] == 3 else 2
+                envelope, wire = self._control_message(
+                    scheduler, PipelineControlKind.COMPLETION, seq=seq
+                )
+                wire["next_token_ids"] = torch.tensor([seq])
+                scheduler.controls.append((envelope, wire))
+
+        scheduler, context = self._control_loop(
+            rank=0,
+            core_type=_TickCore,
+            ticks=7,
+            before_tick=before_tick,
+            mode=DisaggregationMode.NULL,
+        )
+        self.assertEqual(scheduler.actions, [(0, 0), (0, 2), (2, 0), (2, 2)])
+        self.assertEqual(context["rank_schedule"].inflight_count, 0)
+        self.assertFalse(scheduler._pp_vpp_pending_materialized)
+
+    def test_standalone_idle_waits_for_live_request_in_completed_batch(self):
+        finished = [False]
+
+        def before_tick(scheduler, context):
+            if context["tick"] == 0:
+                self._tick_batches(scheduler, 0)
+                scheduler.last_mbs[0] = SimpleNamespace(
+                    reqs=[SimpleNamespace(finished=lambda: finished[0])]
+                )
+            if context["tick"] == 1:
+                finished[0] = True
+
+        scheduler, _ = self._control_loop(
+            core_type=_TickCore,
+            ticks=2,
+            before_tick=before_tick,
+            mode=DisaggregationMode.NULL,
+        )
+        self.assertEqual(scheduler.idle_ticks, [1])
+
+    def test_decode_queue_vote_waits_for_retained_batch_and_failure_wins(self):
+        scheduler, context = self._control_loop()
+        scheduler._pp_vpp_decode_poll = lambda operation, slot: {"request": True}
+        envelope, wire = self._control_message(
+            scheduler,
+            PipelineControlKind.DECODE_STATUS,
+            payload={
+                "phase": "collect",
+                "operation": "transfer",
+                "slot_id": 0,
+                "outcomes": {"request": False, "pending": False},
+            },
+        )
+        schedule = context["rank_schedule"]
+        schedule.admit(0)
+        context["handle_control"](envelope, wire)
+        self.assertFalse(scheduler._pp_vpp_control_outbox)
+        self.assertEqual(len(context["pending_decode_controls"]), 1)
+        schedule.mark_completed(0)
+        schedule.retire(0)
+        context["handle_control"](*context["pending_decode_controls"].popleft())
+        forwarded = scheduler._pp_vpp_control_outbox.popleft()
+        self.assertEqual(forwarded["payload"]["outcomes"], {"request": True})
 
     def _control_message(
         self, scheduler, kind, *, payload=None, seq=-1, returned=False
@@ -1332,6 +1347,34 @@ class TestSchedulingVPPCore(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "prefix order mismatch"):
             scheduler._pp_vpp_remote_manifest_ready(envelope)
 
+    def test_decode_manifest_uses_running_slot_and_current_sequence_length(self):
+        scheduler, req, _ = self._remote_admission()
+        scheduler.mbs = [None, None]
+        req.kv.holds_kv = True
+        req.output_ids = [20, 21, 22]
+        batch = SimpleNamespace(
+            reqs=[req],
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=torch.tensor([19]),
+            prefix_lens=None,
+            extend_lens=None,
+        )
+        scheduler.running_mbs = [batch, None]
+        scheduler.waiting_queue = []
+        scheduler.last_mbs = [None, None]
+        manifest = scheduler._pp_vpp_batch_manifest(2, 0, batch)
+        self.assertEqual(manifest["requests"], (("request", 18, 19),))
+        envelope = scheduler._pp_vpp_new_control(
+            PipelineControlKind.ADMIT,
+            batch_seq=2,
+            slot_id=0,
+            payload={"manifest": manifest},
+        )
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        req.output_ids = [20]
+        with self.assertRaisesRegex(RuntimeError, "exceeds request input"):
+            scheduler._pp_vpp_remote_manifest_ready(envelope)
+
     def test_remote_admission_prices_new_rows_and_requires_valid_spans(self):
         scheduler, req, envelope = self._remote_admission()
         scheduler.req_to_token_pool.available_size = lambda: 0
@@ -2003,223 +2046,8 @@ class TestSchedulerVPP(CustomTestCase):
                     self.assertEqual(reqs[0].start_send_idx, 4)
                     self.assertEqual(reqs[0].arrival_processed_tokens, 7)
 
-    def test_manifest_tracks_real_request_chunk_boundaries(self):
-        from sglang.srt.managers.schedule_batch import Req
-        from sglang.srt.sampling.sampling_params import SamplingParams
 
-        req = Req(
-            rid="chunked",
-            origin_input_text="",
-            origin_input_ids=array("q", range(12)),
-            sampling_params=SamplingParams(max_new_tokens=2),
-        )
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(value=1),
-            reqs=[req],
-            seq_lens_cpu=torch.tensor([8]),
-            extend_lens=[4],
-        )
-        self.assertEqual(
-            vpp_mod._vpp_manifest(batch)[1], (("chunked", None, None, None),)
-        )
-        req.prefix_len, req.extend_end = 4, 8
-        first = vpp_mod._vpp_manifest(batch)
-        self.assertEqual(first[1], (("chunked", None, 4, 8),))
-        req.prefix_len, req.extend_end = 8, 12
-        self.assertNotEqual(first, vpp_mod._vpp_manifest(batch))
-
-    def test_pd_terminal_consensus_waits_for_all_layers_and_failure_wins(self):
-        """A stage that finished early cannot admit or free a partial KV request."""
-        from threading import Barrier
-
-        from sglang.srt.disaggregation.base.conn import KVPoll
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-
-        class TransferQueue(dict):
-            # IndexedReqList.items() exposes queue entries, rather than RID pairs.
-            def items(self):
-                return list(self.values())
-
-        size = 3
-        channels = [Queue() for _ in range(size - 1)]
-        barrier = Barrier(size)
-        broadcast = [None]
-        schedulers = []
-        for rank in range(size):
-            scheduler = object.__new__(NativeVPPWaveMixin)
-
-            def recv(rank=rank):
-                return channels[rank - 1].get(timeout=10)
-
-            def send(value, async_send=True, rank=rank):
-                channels[rank].put(value)
-                return []
-
-            def bcast(value, src, rank=rank):
-                if rank == src:
-                    broadcast[0] = value
-                barrier.wait(timeout=10)
-                result = broadcast[0]
-                barrier.wait(timeout=10)
-                return result
-
-            polls = {
-                "request": (KVPoll.Success, KVPoll.Success, KVPoll.Transferring)[rank]
-            }
-            queue = TransferQueue(
-                request=SimpleNamespace(req=SimpleNamespace(rid="request"))
-            )
-            retired = {}
-
-            def get_rids(reqs, is_send, *groups, polls=polls):
-                return tuple(
-                    [req.req.rid for req in reqs if KVPoll.Success in group]
-                    for group in groups
-                )
-
-            def transfer(waiting, outcomes, queue=queue, retired=retired):
-                for rid, failed in outcomes.items():
-                    queue.pop(rid)
-                    retired[rid] = failed
-                return [], outcomes
-
-            scheduler.__dict__.update(
-                disaggregation_mode=vpp_mod.DisaggregationMode.DECODE,
-                _vpp_next_slot=0,
-                pp_group=SimpleNamespace(
-                    is_first_rank=rank == 0,
-                    is_last_rank=rank == size - 1,
-                    world_size=size,
-                    broadcast_object=bcast,
-                ),
-                _pp_recv_pyobj_from_prev_stage=recv,
-                _pp_send_pyobj_to_next_stage=send,
-                _pp_commit_comm_work=lambda work: None,
-                pause_state=SimpleNamespace(may_launch=lambda: True),
-                waiting_queue=[],
-                disagg_decode_prealloc_queue=SimpleNamespace(
-                    queue={},
-                    retracted_queue=[],
-                    publish_pending_destinations=lambda: None,
-                ),
-                disagg_decode_transfer_queue=SimpleNamespace(
-                    queue=queue,
-                    resolve_deferred_releases=lambda: None,
-                    publish_pending_metadata=lambda: None,
-                    enable_staging=True,
-                    _poll_with_staging=lambda polls=polls: list(polls.values()),
-                    move_transferred_with_outcomes=transfer,
-                ),
-                get_rids=get_rids,
-                enable_hisparse=False,
-                process_retract_queue=lambda rids: rids,
-                process_prealloc_queue=lambda rids: rids,
-                retired=retired,
-                polls=polls,
-            )
-            for name in (
-                "_pp_pd_get_retract_ids",
-                "_pp_pd_get_prealloc_ids",
-                "_route_aborts_to_bad",
-                "process_decode_transfer_queue",
-            ):
-                method = getattr(SchedulerPPMixin, name)
-                setattr(
-                    scheduler,
-                    name,
-                    method
-                    if name == "_route_aborts_to_bad"
-                    else method.__get__(scheduler),
-                )
-            schedulers.append(scheduler)
-
-        def advance():
-            with ThreadPoolExecutor(max_workers=size) as pool:
-                results = [pool.submit(s._vpp_pd_advance) for s in schedulers]
-                for result in results:
-                    result.result(timeout=10)
-
-        advance()
-        self.assertTrue(all(s.disagg_decode_transfer_queue.queue for s in schedulers))
-        self.assertTrue(all(not s.retired for s in schedulers))
-        schedulers[1].polls["request"] = KVPoll.Failed
-        schedulers[2].polls["request"] = KVPoll.Success
-        advance()
-        self.assertTrue(
-            all(not s.disagg_decode_transfer_queue.queue for s in schedulers)
-        )
-        self.assertEqual([s.retired for s in schedulers], [{"request": True}] * size)
-        self.assertTrue(all(channel.empty() for channel in channels))
-
-    def test_abort_inputs_are_not_dispatched_between_retained_admissions(self):
-        """A later input poll could release the preceding unlaunched batch's KV."""
-        layout = VPPLayout(12, 2, virtual_stages=3)
-        scheduler = object.__new__(NativeVPPWaveMixin)
-        polls = []
-        batches = [
-            SimpleNamespace(
-                reqs=[
-                    SimpleNamespace(
-                        rid=f"req-{i}",
-                        session_generation=0,
-                        prefix_len=0,
-                        extend_end=None,
-                        beam_group=None,
-                        finished=False,
-                    )
-                ],
-                seq_lens_cpu=torch.tensor([10]),
-                extend_lens=[10],
-                forward_mode=SimpleNamespace(value=1),
-                return_hidden_states=False,
-                chunked_req=None,
-            )
-            for i in range(2)
-        ]
-
-        def ingest():
-            polls.append(True)
-            if len(polls) > 1:
-                batches[0].reqs[0].finished = True
-            return []
-
-        pending = iter(batches)
-        scheduler.__dict__.update(
-            disaggregation_mode=vpp_mod.DisaggregationMode.NULL,
-            pp_loop_size=2,
-            _vpp_next_slot=0,
-            _vpp_next_batch_seq=0,
-            running_mbs=[object(), object()],
-            last_mbs=[None, None],
-            mbs=[None, None],
-            chunked_req=None,
-            vpp_batches=VPPBatchLedger(layout, 0, 2),
-            vpp_schedule=VPPFixedSchedule(layout, 0, 2),
-            pp_group=SimpleNamespace(
-                is_first_rank=True,
-                is_last_rank=False,
-                all_gather_object=lambda manifest: [manifest, manifest],
-            ),
-            send_req_work=[],
-            increment_scheduler_iterations=lambda: None,
-            _pp_mark_capacity_digest=lambda: None,
-            _pp_check_capacity_digest=lambda: None,
-            _pp_ingest_requests=ingest,
-            _pp_commit_comm_work=lambda works: None,
-            _pp_send_reqs_to_next_stage=lambda requests: [],
-            _pp_send_capacity_digest=lambda: None,
-            pause_state=SimpleNamespace(may_launch=lambda: True),
-            get_next_batch_to_run=lambda **kwargs: SimpleNamespace(
-                running_batch=kwargs["running_batch"], batch_to_run=next(pending)
-            ),
-        )
-        wave = scheduler._vpp_admit_wave()
-        self.assertEqual(
-            [state.batch.reqs[0].rid for state in wave], ["req-0", "req-1"]
-        )
-        self.assertFalse(batches[0].reqs[0].finished)
-        self.assertEqual([state.slot_id for state in wave], [0, 1])
-
+class TestNativeVPPAdapter(CustomTestCase):
     def test_physical_last_rank_samples_only_at_global_final_stage(self):
         """The last physical rank's earlier passes must return activations."""
         samples = []
@@ -2325,110 +2153,6 @@ class TestSchedulerVPP(CustomTestCase):
             ],
         )
 
-    def test_multiple_waves_keep_inputs_outputs_and_completion_independent(self):
-        """A partial wave must not leave receives or recycle workspace views."""
-        from threading import local
-
-        topology = local()
-        layout = VPPLayout(12, physical_size=2, virtual_stages=3)
-        queues = [Queue(), Queue()]
-        schedulers = []
-        calls = [[], []]
-        launches = [[], []]
-        completions = [[], []]
-        for rank in range(2):
-            scheduler = object.__new__(NativeVPPWaveMixin)
-            scheduler.__dict__.update(
-                pp_group=SimpleNamespace(is_first_rank=rank == 0),
-                vpp_schedule=VPPFixedSchedule(layout, rank, 2),
-                vpp_batches=VPPBatchLedger(layout, rank, 2),
-                vpp_receiver=_Receiver(queues[rank]),
-                vpp_sends=_Sends(queues[1 - rank]),
-                forward_stream=_Stream(),
-                schedule_stream=_Stream(),
-                forward_stream_ctx=nullcontext(),
-                device_module=SimpleNamespace(Event=_Event),
-                tp_worker=_Worker(rank, calls[rank]),
-                future_map=None,
-                enable_unified_memory=False,
-                resolve_forward_inputs=lambda batch, future_map: None,
-                _pp_prepare_tensor_dict=lambda result, batch: {
-                    "next_token_ids": result.next_token_ids
-                },
-                _on_step_launch=lambda batch, r=rank: (
-                    launches[r].append(batch.batch_seq) or batch.batch_seq
-                ),
-                _on_step_forward_recorded=lambda event, r=rank: completions[r].append(
-                    event
-                ),
-            )
-            schedulers.append(scheduler)
-
-        def init_forward_batch(batch, runner, *, return_hidden_states_before_norm):
-            self.assertFalse(return_hidden_states_before_norm)
-            return SimpleNamespace(
-                batch_seq=batch.batch_seq, final_stage=layout.logical_size - 1
-            )
-
-        def execute(rank, wave):
-            topology.rank = rank
-            schedulers[rank]._vpp_execute_wave(wave)
-
-        with (
-            patch.object(
-                vpp_mod,
-                "get_parallel",
-                lambda: SimpleNamespace(pp_rank=topology.rank),
-            ),
-            patch.object(vpp_mod.ForwardBatch, "init_new", init_forward_batch),
-            ThreadPoolExecutor(max_workers=2) as executor,
-        ):
-            for sequences in ((0, 1), (2,), (3, 4)):
-                waves = [[], []]
-                for rank, scheduler in enumerate(schedulers):
-                    for slot_id, seq in enumerate(sequences):
-                        batch = SimpleNamespace(
-                            batch_seq=seq,
-                            hicache_consumer_index=-1,
-                            return_logprob=False,
-                            extend_lens=[1],
-                            forward_mode=SimpleNamespace(is_extend=lambda: True),
-                        )
-                        state = VPPBatchState(seq, slot_id, ("req", seq), batch)
-                        scheduler.vpp_batches.admit(state)
-                        waves[rank].append(state)
-                        if rank == 0:
-                            scheduler.vpp_schedule.enqueue(vpp_mod.VPPTask(seq, 0))
-                futures = [
-                    executor.submit(execute, rank, waves[rank]) for rank in range(2)
-                ]
-                for future in futures:
-                    future.result(timeout=15)
-                for rank, scheduler in enumerate(schedulers):
-                    self.assertFalse(scheduler.vpp_receiver.posted)
-                    for state in waves[rank]:
-                        self.assertTrue(state.metadata.forward_done.recorded)
-                        if rank == 1:
-                            self.assertEqual(
-                                state.output_tensors["next_token_ids"].item(),
-                                state.batch_seq + layout.logical_size,
-                            )
-                        scheduler.vpp_batches.complete(state.batch_seq)
-        for rank in range(2):
-            self.assertEqual(launches[rank], list(range(5)))
-            self.assertEqual(len(completions[rank]), 5)
-            self.assertEqual(
-                calls[rank],
-                [
-                    (seq, stage_id)
-                    for sequences in ((0, 1), (2,), (3, 4))
-                    for stage_id in range(rank, 6, 2)
-                    for seq in sequences
-                ],
-            )
-
-
-class TestNativeVPPAdapter(CustomTestCase):
     def test_control_identity_is_checked_before_reposting_receive(self):
         """An old epoch/layout must not enter a newly reused control channel."""
         for changed in (

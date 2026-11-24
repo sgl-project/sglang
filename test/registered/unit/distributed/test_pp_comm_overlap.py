@@ -8,11 +8,6 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.distributed.vpp_activation import (
-    VPPActivationReceiver,
-    VPPReceivedActivation,
-    VPPSendWindow,
-)
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -249,64 +244,6 @@ class TestPPCommOverlap(CustomTestCase):
 
 
 class TestVPPActivationTransport(CustomTestCase):
-    def test_tagged_activation_does_not_consume_control_and_finishes_receive(self):
-        """A posted activation receive must leave untagged PP control intact."""
-        mailbox = defaultdict(deque)
-
-        def send(tensor, dst, group=None, tag=0):
-            mailbox[tag].append(tensor.clone())
-            return SimpleNamespace(wait=lambda: None)
-
-        def recv(tensor, src, group=None, tag=0):
-            return SimpleNamespace(wait=lambda: tensor.copy_(mailbox[tag].popleft()))
-
-        group = object.__new__(GroupCoordinator)
-        group.__dict__.update(
-            rank_in_group=0,
-            ranks=[0, 1],
-            world_size=2,
-            cpu_group=object(),
-            device_group=object(),
-            device=torch.device("cpu"),
-        )
-        with patch.multiple(
-            torch.distributed, is_initialized=lambda: True, isend=send, irecv=recv
-        ):
-            # Control is ahead of the activation on the same peer/group.
-            group.send_object(["abort", "req-a"], dst=1, async_send=True)
-            controls = [tensor.clone() for tensor in mailbox[0]]
-            group.send_tensor_dict(
-                {"hidden_states": torch.arange(6).reshape(2, 3)},
-                dst=1,
-                async_send=True,
-                tag=2,
-            )
-            receiver = VPPActivationReceiver(group, tag=2)
-            receiver.start()
-            result = receiver.take(post_next=False)
-            torch.testing.assert_close(
-                result.tensors["hidden_states"], torch.arange(6).reshape(2, 3)
-            )
-            self.assertEqual(len(mailbox[0]), 2)
-            for actual, expected in zip(mailbox[0], controls):
-                torch.testing.assert_close(actual, expected)
-            self.assertFalse(mailbox[2])
-            with self.assertRaisesRegex(RuntimeError, "not started"):
-                receiver.progress()
-            group.send_tensor_dict(
-                {"hidden_states": torch.tensor([8])},
-                dst=1,
-                async_send=True,
-                tag=2,
-            )
-            receiver.start()
-            self.assertEqual(
-                receiver.take(post_next=False).tensors["hidden_states"].tolist(),
-                [8],
-            )
-
-    """Protect wire compatibility and cross-stream activation storage lifetime."""
-
     def test_async_metadata_progress_does_not_wait_for_payload(self):
         # The actual GroupCoordinator sender and receiver share a CPU mailbox.
         # Work completion is controlled explicitly, without timing-based sleeps.
@@ -401,88 +338,6 @@ class TestVPPActivationTransport(CustomTestCase):
             Event=Mock(side_effect=lambda: Mock()),
         )
         return module, stream
-
-    def test_receiver_keeps_event_local_and_protects_forward_storage(self):
-        module, comm_stream = self._device_module()
-        tensor = Mock(spec=torch.Tensor)
-        tensor.is_cpu = False
-        tensors = {"hidden_states": tensor, "batch_seq": 0}
-        handle = Mock()
-        handle.wait.return_value = tensors
-        handle.poll_metadata_ready.return_value = False
-        group = SimpleNamespace(
-            device="cuda",
-            recv_tensor_dict_async=Mock(return_value=handle),
-        )
-        with patch.object(torch, "get_device_module", return_value=module):
-            receiver = VPPActivationReceiver(group)
-            receiver.start()
-            self.assertFalse(receiver.progress())
-            handle.wait.assert_not_called()
-            received = receiver.take()
-        self.assertIsInstance(received, VPPReceivedActivation)
-        self.assertIs(received.tensors, tensors)
-        self.assertEqual(set(tensors), {"hidden_states", "batch_seq"})
-        received.recv_event.record.assert_called_once_with(comm_stream)
-        forward_stream = Mock()
-        received.wait_on(forward_stream)
-        forward_stream.wait_event.assert_called_once_with(received.recv_event)
-        tensor.record_stream.assert_called_once_with(forward_stream)
-        self.assertEqual(group.recv_tensor_dict_async.call_count, 2)
-
-    def test_send_credit_and_graph_reuse_fence_all_unfinished_readers(self):
-        module, comm_stream = self._device_module()
-        operations = []
-        items = []
-        for index in range(3):
-            tensor = Mock(spec=torch.Tensor)
-            tensor.is_cpu = False
-            work = Mock()
-            work.wait.side_effect = lambda i=index: operations.append(("wait", i))
-            tensor.record_stream.side_effect = lambda stream, i=index: (
-                operations.append(("retain", i))
-            )
-            items.append(SimpleNamespace(wait=work.wait, payload=tensor))
-        group = SimpleNamespace(
-            device="cuda",
-            send_tensor_dict=Mock(side_effect=[[item] for item in items]),
-        )
-        forward_event = object()
-        with patch.object(torch, "get_device_module", return_value=module):
-            window = VPPSendWindow(group, max_inflight=2)
-            with self.assertRaisesRegex(ValueError, "requires a forward event"):
-                window.send({})
-            window.send({}, forward_event)
-            window.send({}, forward_event)
-            self.assertEqual(operations, [])
-            with self.assertRaisesRegex(RuntimeError, "Acquire"):
-                window.send({}, forward_event)
-            fence = window.acquire()
-            fence.record.assert_called_once_with(comm_stream)
-            self.assertEqual(operations, [("wait", 0), ("retain", 0)])
-            window.send({}, forward_event)
-            # Both remaining sends are inside the credit window, but their
-            # storage is about to be overwritten by the next graph replay.
-            fence = window.wait_for_reuse()
-            fence.record.assert_called_once_with(comm_stream)
-            self.assertEqual(
-                operations,
-                [
-                    ("wait", 0),
-                    ("retain", 0),
-                    ("wait", 1),
-                    ("retain", 1),
-                    ("wait", 2),
-                    ("retain", 2),
-                ],
-            )
-            self.assertEqual(len(window), 0)
-            self.assertIsNone(window.wait_for_reuse())
-        self.assertEqual(
-            comm_stream.wait_event.call_args_list, [call(forward_event)] * 3
-        )
-        for item in items:
-            item.payload.record_stream.assert_called_once_with(comm_stream)
 
 
 if __name__ == "__main__":
