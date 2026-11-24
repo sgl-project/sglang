@@ -167,6 +167,19 @@ class TestAllocateCpus(CustomTestCase):
         plan = process.allocate_cpus(starts)
         self.assertEqual(plan, {0: [0, 1, 2], 1: [3, 4], 2: [5, 6], 3: [7, 8]})
 
+    def test_keeps_a_ranks_only_core_for_it(self):
+        """TP4 with masks {0-3}, {0}, {1-3}, {1-3}: GPU 1's only core stays its own."""
+        starts = {
+            0: [[0], [1], [2], [3]],
+            1: [[0]],
+            2: [[1], [2], [3]],
+            3: [[1], [2], [3]],
+        }
+        plan = process.allocate_cpus(starts)
+        self.assertEqual(plan[1], [0])
+        self.assertTrue(_disjoint(plan.values()))
+        self.assertTrue(all(plan.values()))
+
     def test_shares_its_cores_when_none_is_left(self):
         plan = process.allocate_cpus({0: [[0]], 1: [[0]]})
         self.assertEqual(plan[0], [0])
@@ -181,10 +194,14 @@ class TestCpuShareBoard(CustomTestCase):
 
         async def run():
             board = process.CpuShareBoard()
+            first = asyncio.ensure_future(board.register("a", 0, socket(0)))
+            await asyncio.sleep(0)
+            # the launcher reports its counts after some actors have registered
+            await board.expect({"a": 2, "b": 1})
             return await asyncio.gather(
-                board.register("a", 2, 0, socket(0)),
-                board.register("a", 2, 1, socket(32)),
-                board.register("b", 1, 0, socket(0)),
+                first,
+                board.register("a", 1, socket(32)),
+                board.register("b", 0, socket(0)),
             )
 
         a0, a1, b0 = asyncio.run(run())
@@ -192,11 +209,21 @@ class TestCpuShareBoard(CustomTestCase):
         self.assertEqual(a1, list(range(32, 64)))
         self.assertEqual(b0, list(range(32)))
 
+    def test_counts_only_the_schedulers_the_launcher_placed(self):
+        """TP1 using one of a host's two bundles: the actor does not wait for the other."""
+
+        async def run():
+            board = process.CpuShareBoard()
+            await board.expect({"a": 1})
+            return await board.register("a", 0, [[0], [1]], timeout=1)
+
+        self.assertEqual(asyncio.run(run()), [0, 1])
+
     def test_gives_up_when_the_hosts_schedulers_do_not_all_report(self):
         async def run():
-            return await process.CpuShareBoard().register(
-                "a", 2, 0, [[0]], timeout=0.01
-            )
+            board = process.CpuShareBoard()
+            await board.expect({"a": 2})
+            return await board.register("a", 0, [[0]], timeout=0.01)
 
         self.assertIsNone(asyncio.run(run()))
 

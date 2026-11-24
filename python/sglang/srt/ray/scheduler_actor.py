@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from typing import Any, Dict, Optional
 
 import ray
@@ -28,24 +29,11 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 logger = logging.getLogger(__name__)
 
 
-def _cpu_share(server_args: ServerArgs, gpu_id: int) -> Optional[list[int]]:
-    """This actor's CPUs, split with the other scheduler actors on its node, or None
-    when they cannot be gathered."""
-    from sglang.srt.utils import numa_utils
-    from sglang.srt.utils.process import CpuShareBoard, physical_cores
+def cpu_share_board(pg):
+    """The placement group's ``CpuShareBoard`` actor, created on first use."""
+    from sglang.srt.utils.process import CpuShareBoard
 
-    pg = ray.util.get_current_placement_group()
-    if pg is None:
-        return None
-    table = ray.util.placement_group_table(pg)
-    node_id = ray.get_runtime_context().get_node_id()
-    # one scheduler actor per GPU of the group's bundles on this node
-    expected = sum(
-        int(table["bundles"][bundle].get("GPU", 0))
-        for bundle, node in table["bundles_to_node_id"].items()
-        if node == node_id
-    )
-    board = (
+    return (
         ray.remote(CpuShareBoard)
         .options(
             name=f"sglang_cpu_share_board_{pg.id.hex()}",
@@ -54,11 +42,46 @@ def _cpu_share(server_args: ServerArgs, gpu_id: int) -> Optional[list[int]]:
         )
         .remote()
     )
+
+
+class CpuShareLaunch:
+    """Counts the scheduler actors a launch places on each node and tells the CPU share
+    board once they all exist (SGLANG_SET_CPU_AFFINITY)."""
+
+    def __init__(self, pg):
+        from sglang.srt.environ import envs
+
+        self.board = cpu_share_board(pg) if envs.SGLANG_SET_CPU_AFFINITY.get() else None
+        self.node_of = (
+            ray.util.placement_group_table(pg)["bundles_to_node_id"]
+            if self.board is not None
+            else {}
+        )
+        self.counts = Counter()
+
+    def add(self, bundle_idx: int):
+        if self.board is not None:
+            self.counts[self.node_of[bundle_idx]] += 1
+
+    def close(self):
+        if self.board is not None:
+            ray.get(self.board.expect.remote(dict(self.counts)))
+
+
+def _cpu_share(server_args: ServerArgs, gpu_id: int) -> Optional[list[int]]:
+    """This actor's CPUs, split with the other scheduler actors on its node, or None
+    when they cannot be gathered."""
+    from sglang.srt.utils import numa_utils
+    from sglang.srt.utils.process import physical_cores
+
+    pg = ray.util.get_current_placement_group()
+    if pg is None:
+        return None
+    node_id = ray.get_runtime_context().get_node_id()
     # the CPUs this actor keeps once NUMA binding places it, as the launcher plans them
     cpus = numa_utils.numa_bound_cpus(server_args, gpu_id, set(os.sched_getaffinity(0)))
-    return ray.get(
-        board.register.remote(node_id, expected, gpu_id, physical_cores(cpus))
-    )
+    board = cpu_share_board(pg)
+    return ray.get(board.register.remote(node_id, gpu_id, physical_cores(cpus)))
 
 
 @ray.remote

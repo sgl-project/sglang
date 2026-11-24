@@ -32,7 +32,7 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
-from sglang.srt.ray.scheduler_actor import SchedulerActor
+from sglang.srt.ray.scheduler_actor import CpuShareLaunch, SchedulerActor
 from sglang.srt.runtime_context import (
     get_parallel,
 )
@@ -193,6 +193,7 @@ def _create_scheduler_actor(
     dp_rank: int,
     dist_init_addr: str,
     rank0_node_ip: str,
+    cpu_share: Optional[CpuShareLaunch] = None,
 ) -> SchedulerActor:
     """Create a SchedulerActor on the given placement group bundle.
 
@@ -202,7 +203,10 @@ def _create_scheduler_actor(
         gpu_id: GPU ID within the bundle (0 for custom PG, computed for auto PG).
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
+        cpu_share: Counts the actor toward its node's CPU split.
     """
+    if cpu_share is not None:
+        cpu_share.add(bundle_idx)
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
@@ -323,6 +327,7 @@ class RayEngine(Engine):
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
             scheduler_actors = []
+            cpu_share = CpuShareLaunch(pg)
 
             if not is_custom_pg:
                 gpus_per_node = world_size // nnodes
@@ -353,6 +358,7 @@ class RayEngine(Engine):
                                 dp_rank=0,
                                 dist_init_addr=dist_init_addr,
                                 rank0_node_ip=rank0_node_ip,
+                                cpu_share=cpu_share,
                             )
                             scheduler_actors.append(actor)
 
@@ -385,9 +391,11 @@ class RayEngine(Engine):
                         dp_rank=0,
                         dist_init_addr=dist_init_addr,
                         rank0_node_ip=rank0_node_ip,
+                        cpu_share=cpu_share,
                     )
                     scheduler_actors.append(actor)
 
+            cpu_share.close()
             try:
                 scheduler_infos = ray.get(
                     [actor.get_info.remote() for actor in scheduler_actors]

@@ -224,33 +224,60 @@ def _share(cores: list[list[int]], rank: int, num_ranks: int) -> list[int]:
 def allocate_cpus(starts: dict[int, list[list[int]]]) -> dict[int, list[int]]:
     """Each scheduler's CPUs, by GPU, from the physical cores it may use.
 
-    The schedulers take turns claiming the free core the fewest others may use, which
-    sets how many cores each gets. Then, those with the fewest cores to choose from
-    first, each takes a run of that many free cores the schedulers still to come want
-    least. A scheduler left without a core shares all of its own."""
+    Every scheduler first gets one core of its own where the masks allow it (a
+    matching); the rest are claimed in turns, each turn taking the free core the fewest
+    others may use. Those counts are then placed as runs of free cores, the schedulers
+    with the fewest cores to choose from first; when runs cannot hold them, the claims
+    stand as they are. A scheduler left without a core shares all of its own."""
     cores = {gpu_id: [tuple(core) for core in own] for gpu_id, own in starts.items()}
     demand = Counter(core for own in cores.values() for core in own)
-    free = set(demand)
-    quota = dict.fromkeys(cores, 0)
+    order = sorted(cores, key=lambda gpu_id: (len(cores[gpu_id]), gpu_id))
+
+    owner = {}
+
+    def claim(gpu_id, seen):
+        # the cores the fewest others may use first, as the turns below
+        for core in sorted(cores[gpu_id], key=lambda core: (demand[core], core)):
+            if core not in seen:
+                seen.add(core)
+                if core not in owner or claim(owner[core], seen):
+                    owner[core] = gpu_id
+                    return True
+        return False
+
+    for gpu_id in order:
+        claim(gpu_id, set())
+    claims = {gpu_id: set() for gpu_id in cores}
+    for core, gpu_id in owner.items():
+        claims[gpu_id].add(core)
+    free = set(demand) - set(owner)
     claimed = True
     while claimed:
         claimed = False
         for gpu_id, own in cores.items():
             choices = free.intersection(own)
             if choices:
-                free.remove(min(choices, key=lambda core: (demand[core], core)))
-                quota[gpu_id] += 1
+                core = min(choices, key=lambda core: (demand[core], core))
+                free.remove(core)
+                claims[gpu_id].add(core)
                 claimed = True
+
+    def cpus_of(own):
+        return sorted(cpu for core in own for cpu in core)
 
     plan = {}
     taken = set()
-    order = sorted(cores, key=lambda gpu_id: (len(cores[gpu_id]), gpu_id))
     for i, gpu_id in enumerate(order):
-        options = sorted(core for core in cores[gpu_id] if core not in taken)
-        count = min(quota[gpu_id], len(options))
+        count = len(claims[gpu_id])
         if count == 0:
-            plan[gpu_id] = sorted(cpu for core in cores[gpu_id] for cpu in core)
+            plan[gpu_id] = cpus_of(cores[gpu_id])
             continue
+        options = sorted(core for core in cores[gpu_id] if core not in taken)
+        if len(options) < count:
+            return {
+                gpu_id: cpus_of(claims[gpu_id]) if claims[gpu_id] else cpus_of(own)
+                for gpu_id, own in cores.items()
+            }
         later = Counter(core for other in order[i + 1 :] for core in cores[other])
         first = min(
             range(len(options) - count + 1),
@@ -258,7 +285,7 @@ def allocate_cpus(starts: dict[int, list[list[int]]]) -> dict[int, list[int]]:
         )
         run = options[first : first + count]
         taken.update(run)
-        plan[gpu_id] = sorted(cpu for core in run for cpu in core)
+        plan[gpu_id] = cpus_of(run)
     return plan
 
 
@@ -286,24 +313,36 @@ def plan_gpu_proc_affinity(server_args, gpu_ids) -> dict[int, list[int]]:
 
 
 class CpuShareBoard:
-    """Hands each scheduler on a host its ``allocate_cpus`` share once every scheduler of
-    that host has reported the physical cores it may use. For launchers that place
-    schedulers on hosts they cannot inspect (Ray)."""
+    """Hands each scheduler on a host its ``allocate_cpus`` share once every scheduler
+    the launcher placed on that host has reported the physical cores it may use. For
+    launchers that place schedulers on hosts they cannot inspect (Ray)."""
 
     def __init__(self):
+        self._expected = {}
         self._starts = defaultdict(dict)
         self._plans = {}
         self._ready = defaultdict(asyncio.Event)
 
-    async def register(
-        self, host: str, expected: int, gpu_id: int, cores, timeout: float = 300.0
-    ):
-        """This scheduler's CPUs, or None when the host's other schedulers do not all
-        report within ``timeout`` seconds."""
-        self._starts[host][gpu_id] = cores
-        if len(self._starts[host]) >= expected and host not in self._plans:
+    def _plan_when_complete(self, host):
+        if (
+            host not in self._plans
+            and host in self._expected
+            and len(self._starts[host]) >= self._expected[host]
+        ):
             self._plans[host] = allocate_cpus(self._starts[host])
             self._ready[host].set()
+
+    async def expect(self, counts: dict):
+        """How many schedulers the launcher placed on each host."""
+        self._expected.update(counts)
+        for host in counts:
+            self._plan_when_complete(host)
+
+    async def register(self, host: str, gpu_id: int, cores, timeout: float = 300.0):
+        """This scheduler's CPUs, or None when its host's schedulers are not all known
+        within ``timeout`` seconds."""
+        self._starts[host][gpu_id] = cores
+        self._plan_when_complete(host)
         try:
             await asyncio.wait_for(self._ready[host].wait(), timeout)
         except asyncio.TimeoutError:
