@@ -801,8 +801,10 @@ DEVI void stage_block(const Params& p, const Plan& pl, int w, int lane) {
   __syncwarp();
   if (lane == 0) red_release(p.ctr + C_GW + 2 * j + k2, 1);
 }
-// sk >= 0: this warp's static first row (rows [0, 2 grid) belong to the helper warps)
-DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
+// Every gather row (and guest staging block) is claimed from C_GQUEUE, so the rows, and the G1
+// items waiting on them, never depend on a CTA that is not resident: pfm_main completes with any
+// subset of its CTAs resident (SM partitions, MPS limits, other work on the device).
+DEVI void helper_gather(const Params& p, const Plan& pl, int lane) {
   if (lane == 0) wait_geq(p.ctr + (p.cl ? C_CDONE : C_LDONE), p.cl ? pl.u1 - pl.u0 : pl.nlu);
   __syncwarp();
   const int c = lane & 7, lo = 8 * (lane >> 3);
@@ -824,7 +826,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
   auto claim_k = [&] {
     int k = 0;
     if (lane == 0) k = atomicAdd(p.ctr + C_GQUEUE, 1);
-    return shfl(k, 0) + 2 * gridDim.x;
+    return shfl(k, 0);
   };
   // asm volatile keeps the next route's load ahead of this row's data loads
   auto route = [&](int x) {
@@ -833,7 +835,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
       asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(r) : "l"(p.rev + (size_t)(x >> 20) * p.M + (x & 0xFFFFF)));
     return r;
   };
-  int x = locate(sk >= 0 ? sk : claim_k()), tj = route(x);
+  int x = locate(claim_k()), tj = route(x);
   while (x != END) {
     if (x < 0) {
       stage_block(p, pl, -1 - x, lane);
@@ -875,10 +877,9 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
     tj = tjn;
   }
 }
-// Static first rows (never claimed): pfm_main needs all clusters co-resident (66 on H200).
 DEVI void helper(const Params& p, const Plan& pl, u32 bars, int lane, bool first) {
   if (first) mbar_wait(bars + B_PL, 0);
-  helper_gather(p, pl, lane, first ? 2 * blockIdx.x + (threadIdx.x >> 5) - 2 : -1);
+  helper_gather(p, pl, lane);
 }
 extern "C" __global__ void __launch_bounds__(384, 1) pfm_main(const __grid_constant__ Params p) {
   extern __shared__ __align__(1024) u8 sm[];

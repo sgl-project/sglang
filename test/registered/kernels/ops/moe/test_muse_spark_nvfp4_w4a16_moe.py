@@ -1,7 +1,10 @@
 """Fused NVFP4 W4A16 MoE vs fp64 torch and Marlin; dynamic guests; CUDA graph replay."""
 
 import functools
+import os
+import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -195,6 +198,60 @@ def test_cuda_graph_replay(M):
             t.copy_(u)
         graph.replay()
         assert torch.equal(out, run())
+
+
+_PARTITION_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    import torch
+    from flashinfer.green_ctx import split_device_green_ctx
+    sys.path.insert(0, sys.argv[1])
+    import test_muse_spark_nvfp4_w4a16_moe as t
+
+    (w13, w2), (g13, g2) = (t._experts(n)[2] for n in (2 * t.H, t.H)), t._gs()[:, : t.E]
+
+    def run(M):  # the small-M kernel, then the large-M one (two 8192-token launches)
+        x, ids, tw, nw = t._inputs(M, t.E, 0, M)
+        a = (ids, tw, w13, g13, w2, g2, nw.float())
+        if M <= t.m.MAX_TOKENS:
+            return t.m.nvfp4_w4a16_moe_with_post_norm(x, *a)
+        r = x.new_zeros((8 * M, t.H))
+        ptrs = dict(shard_ptrs=[x.data_ptr()], recv_ptrs=[r.data_ptr()])
+        t.m.nvfp4_w4a16_moe_sp(*a, shard=x, **ptrs)
+        return r
+
+    full = [run(M) for M in (256, 8193)]
+    streams, resources = split_device_green_ctx(torch.device("cuda", 0), 1, 16)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(streams[0]):
+        part = [run(M) for M in (256, 8193)]
+    streams[0].synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(full, part))
+    print("partition SMs", resources[0].sm.smCount)
+    """
+)
+
+
+@sm90
+def test_kernels_complete_on_sm_partition():
+    """Both kernels launch one CTA per SM. On a green-context SM partition only part
+    of that grid is resident at a time: no CTA may wait on work owned by a CTA that
+    has not started. A subprocess with a timeout turns a hang into a failure."""
+    pytest.importorskip("flashinfer.green_ctx")
+    if torch.cuda.get_device_properties(0).multi_processor_count < 64:
+        pytest.skip("needs a device much larger than the 16-SM partition")
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", _PARTITION_SCRIPT, os.path.dirname(__file__)],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the W4A16 MoE kernels did not complete on a 16-SM partition")
+    if res.returncode != 0 and "Failed to split device" in res.stderr:
+        pytest.skip("green contexts are not available")
+    assert res.returncode == 0, res.stderr[-4000:]
 
 
 if __name__ == "__main__":
