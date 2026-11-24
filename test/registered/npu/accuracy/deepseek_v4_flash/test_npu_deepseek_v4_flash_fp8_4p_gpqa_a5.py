@@ -72,7 +72,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     32,
     "--chunked-prefill-size",
     131072,
-    # "--enable-mixed-chunk",
+    "--enable-mixed-chunk",
     "--max-prefill-tokens",
     131072,
     "--cuda-graph-bs-decode",
