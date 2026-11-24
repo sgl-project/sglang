@@ -920,7 +920,8 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
-    # CTA quota of the per-layer HiCache KV load; None keeps the stock one.
+    # CTA quota of the MHA host pool's layer_first / page_first per-layer KV load; None
+    # keeps the stock one. Measured useful range 8-16 (32 costs decode time).
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
