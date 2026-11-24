@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import msgspec
 import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -173,16 +173,76 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 # Prompt tokens per round: more than one prefill chunk at common chunk sizes,
 # so every round also splits a prompt across a chunk boundary.
 _CONCURRENT_PREFILL_TOKENS = 40000
+_CONCURRENT_PREFILL_NEW_TOKENS = 8
+# Input-logprob probes over an unaligned and a 16-aligned row count.
+_CONCURRENT_PREFILL_LOGPROB_SIZES = (513, 512)
 
 
-def concurrent_prefill_plan(max_running_requests) -> List[List[int]]:
-    """Prompt lengths of each concurrent round: 1, about 1/8 and all of the
-    running-request slots; lengths step by 37 so no two extends align."""
-    m = max_running_requests or 1
-    return [
-        [_CONCURRENT_PREFILL_TOKENS // n + 37 * i + 1 for i in range(n)]
-        for n in sorted({1, m // 8 or 1, m})
-    ]
+class ConcurrentPrefillLimits(msgspec.Struct, frozen=True, kw_only=True):
+    """The scheduler's effective limits that the warmup plan must stay inside."""
+
+    # Effective running-request slots, summed over DP ranks.
+    max_running_requests: int
+    # Per scheduler; None is unlimited.
+    max_queued_requests: Optional[int]
+    # None or <= 0: chunked prefill is off.
+    chunked_prefill_size: Optional[int]
+    context_len: int
+    max_req_input_len: int
+
+
+class ConcurrentPrefillPlan(msgspec.Struct, frozen=True, kw_only=True):
+    rounds: List[List[int]]
+    logprob_sizes: List[int]
+
+
+def concurrent_prefill_limits(
+    internal_states: List[Dict[str, Any]],
+    *,
+    context_len: int,
+    max_req_input_len: int,
+) -> ConcurrentPrefillLimits:
+    """Collect the limits from the schedulers' `get_internal_state` readback
+    (one dict per DP rank)."""
+    state = internal_states[0]
+    return ConcurrentPrefillLimits(
+        max_running_requests=sum(
+            s["effective_max_running_requests_per_dp"] for s in internal_states
+        ),
+        max_queued_requests=state["max_queued_requests"],
+        chunked_prefill_size=state["chunked_prefill_size"],
+        context_len=context_len,
+        max_req_input_len=max_req_input_len,
+    )
+
+
+def concurrent_prefill_plan(limits: ConcurrentPrefillLimits) -> ConcurrentPrefillPlan:
+    """Prompt lengths of each concurrent round (1, about 1/8 and all of the
+    running slots) and of the input-logprob probes.
+
+    A round sends at least one round budget (two prefill chunks, at least
+    `_CONCURRENT_PREFILL_TOKENS`) and less than two: each prompt gets an equal
+    share plus an offset below that share, stepped by 37 so extends do not align.
+    """
+    # leave room for the new tokens under the server's input limit
+    max_prompt = limits.max_req_input_len - _CONCURRENT_PREFILL_NEW_TOKENS
+    slots = limits.max_running_requests
+    if limits.max_queued_requests is not None:
+        # A round arriving in one scheduler poll must fit in the waiting queue.
+        slots = min(slots, limits.max_queued_requests)
+    if max_prompt < 1 or slots < 1:
+        return ConcurrentPrefillPlan(rounds=[], logprob_sizes=[])
+
+    chunk = limits.chunked_prefill_size
+    budget = _CONCURRENT_PREFILL_TOKENS
+    if chunk is not None and chunk > 0:
+        budget = max(budget, 2 * chunk)
+    rounds = []
+    for n in sorted({1, slots // 8 or 1, slots}):
+        share = max(1, budget // n)
+        rounds.append([min(max_prompt, share + 37 * i % share + 1) for i in range(n)])
+    logprob_sizes = [min(max_prompt, s) for s in _CONCURRENT_PREFILL_LOGPROB_SIZES]
+    return ConcurrentPrefillPlan(rounds=rounds, logprob_sizes=logprob_sizes)
 
 
 @warmup("concurrent_prefill")
@@ -194,18 +254,26 @@ async def concurrent_prefill(
     vocab = min(2**16, tokenizer_manager.model_config.vocab_size)
 
     async def one(size, **kwargs):
-        # leave room for the 8 new tokens under the server's input limit
-        size = min(size, tokenizer_manager.max_req_input_len - 8)
         req = GenerateReqInput(
             input_ids=np.random.randint(vocab, size=size).tolist(),
-            sampling_params={"max_new_tokens": 8, "temperature": 0},
+            sampling_params={
+                "max_new_tokens": _CONCURRENT_PREFILL_NEW_TOKENS,
+                "temperature": 0,
+            },
             **kwargs,
         )
         await tokenizer_manager.generate_request(req, None).__anext__()
 
-    plan = concurrent_prefill_plan(get_schedule().max_running_requests)
-    for sizes in plan:
+    limits = concurrent_prefill_limits(
+        await tokenizer_manager.get_internal_state(),
+        context_len=tokenizer_manager.context_len,
+        max_req_input_len=tokenizer_manager.max_req_input_len,
+    )
+    plan = concurrent_prefill_plan(limits)
+    logger.info(
+        f"concurrent_prefill: {limits=}, round sizes {[len(r) for r in plan.rounds]}"
+    )
+    for sizes in plan.rounds:
         await asyncio.gather(*(one(size) for size in sizes))
-    # input logprobs over an unaligned and a 16-aligned row count
-    for size in (513, 512):
+    for size in plan.logprob_sizes:
         await one(size, return_logprob=True, logprob_start_len=0)
