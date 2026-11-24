@@ -14,8 +14,6 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineControlKind,
     PipelinePrefixRegistry,
     PipelineRankSchedule,
-    PipelineReplicaIdentity,
-    PipelineReplicaRegistry,
 )
 from sglang.srt.distributed.vpp_transport import (
     P2PWorkGroup,
@@ -140,36 +138,6 @@ class TestVPPPolicy(CustomTestCase):
         new_request = registry.plan("request", 2, 0, 0, 4, range(4))
         registry.release("request", 1)
         self.assertIs(registry.get("request", 2), new_request)
-
-    def test_replica_eviction_waits_for_all_owners_and_rejects_stale_restore(self):
-        """One batch releasing its lock must not evict another batch's replica."""
-        registry = PipelineReplicaRegistry()
-        identities = [
-            PipelineReplicaIdentity("content", 0, 1, rank) for rank in range(2)
-        ]
-        first, second = identities
-        registry.install(first, 3, 0, 16)
-        registry.install(second, 3, 0, 8)
-        self.assertEqual(registry.common_boundary(identities, 3), 8)
-        self.assertEqual(registry.missing_range(second, 3, 16), (8, 16))
-        registry.lock(first, 8, owner_id=10)
-        registry.lock(first, 16, owner_id=11)
-        with self.assertRaises(RuntimeError):
-            registry.unlock(first, 8, owner_id=11)
-        registry.unlock(first, 16, owner_id=11)
-        self.assertEqual(registry.get(first).locked_until, 8)
-        with self.assertRaises(RuntimeError):
-            registry.evict(first, 3)
-        registry.unlock(first, 8, owner_id=10)
-        self.assertEqual(registry.evict(first, 3), 4)
-        self.assertEqual(registry.common_boundary(identities, 3), 0)
-        self.assertEqual(registry.missing_range(first, 4, 16), (0, 16))
-        with self.assertRaises(RuntimeError):
-            registry.install(first, 3, 0, 16)
-        with self.assertRaises(RuntimeError):
-            registry.install(first, 4, 8, 16)
-        registry.install(first, 4, 0, 16)
-        self.assertIsNone(registry.missing_range(first, 4, 16))
 
 
 class _CPUWork:

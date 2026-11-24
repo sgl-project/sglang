@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import pickle
 import time
@@ -19,8 +18,6 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineControlKind,
     PipelinePrefixRegistry,
     PipelineRankSchedule,
-    PipelineReplicaIdentity,
-    PipelineReplicaRegistry,
     PipelineWavefrontAction,
 )
 from sglang.srt.distributed.vpp_transport import (
@@ -234,8 +231,7 @@ class SchedulingVPPCore:
         ):
             raise ValueError("VPP scheduling requires PP2/VPP2/max-inflight=2")
         logger.info(
-            "VPP fixed batch scheduling enabled: two-batch waves, "
-            "activation manifests"
+            "VPP fixed batch scheduling enabled: two-batch waves, activation manifests"
         )
         self._pp_vpp_fixed_wave = []
         self._pp_vpp_fixed_second_pass = False
@@ -521,8 +517,8 @@ class SchedulingVPPCore:
             if self.attn_tp_group.rank_in_group == 0
             else None
         )
-        wire, consume, self._pp_vpp_round_check = (
-            self.attn_tp_group.broadcast_object(progress, src=0)
+        wire, consume, self._pp_vpp_round_check = self.attn_tp_group.broadcast_object(
+            progress, src=0
         )
         for _ in range(consume):
             # Follow exactly the leader's FIFO prefix, even when local
@@ -727,10 +723,7 @@ class SchedulingVPPCore:
         while self._pp_vpp_arrivals:
             rank_schedule.mark_ready(*self._pp_vpp_arrivals.popleft())
 
-        if (
-            pending_send_work is not None
-            and stage_id < rank_schedule.logical_size - 1
-        ):
+        if pending_send_work is not None and stage_id < rank_schedule.logical_size - 1:
             self._pp_vpp_fixed_wait_send_credit(
                 pending_send_work, rank_schedule.max_inflight
             )
@@ -776,10 +769,7 @@ class SchedulingVPPCore:
         self._pp_vpp_control_outbox = deque()
         self._pp_vpp_stage_events = {}
         self._pp_vpp_pending_materialized = deque()
-        self._pp_vpp_pending_replica_updates = deque()
-        self._pp_vpp_batch_replicas = defaultdict(dict)
         self._pp_vpp_prefix_registry = PipelinePrefixRegistry()
-        self._pp_vpp_replica_registry = PipelineReplicaRegistry()
         self._pp_vpp_cpu_state_buffers = {}
         self._pp_vpp_control_layout_digest = self._pp_vpp_layout_digest()
         is_epoch_source = self.world_group.rank_in_group == 0
@@ -859,122 +849,6 @@ class SchedulingVPPCore:
             forward_control(envelope, wire)
             return True
 
-        def replica_identity(payload: Dict[str, object]) -> PipelineReplicaIdentity:
-            return PipelineReplicaIdentity(
-                content_id=str(payload["content_id"]),
-                source_id=int(payload["source_id"]),
-                format_version=int(payload["format_version"]),
-                consumer_rank=int(payload["consumer_rank"]),
-            )
-
-        def apply_cache_update(payload: Dict[str, object]) -> None:
-            identity = replica_identity(payload)
-            generation = int(payload["residency_generation"])
-            start = int(payload["start"])
-            end = int(payload["end"])
-            state = self._pp_vpp_replica_registry.get(identity)
-            if (
-                state is not None
-                and state.residency_generation == generation
-                and state.valid_end >= end
-            ):
-                return
-            if (
-                state is not None
-                and state.residency_generation == generation
-                and start <= state.valid_end
-            ):
-                start = state.valid_end
-            self._pp_vpp_replica_registry.install(
-                identity,
-                generation,
-                start,
-                end,
-            )
-
-        def flush_replica_updates() -> None:
-            while self._pp_vpp_pending_replica_updates:
-                (
-                    batch_seq,
-                    stage_id,
-                    identity,
-                    generation,
-                    start,
-                    end,
-                ) = self._pp_vpp_pending_replica_updates[0]
-                event = self._pp_vpp_stage_events[(batch_seq, stage_id)]
-                query = getattr(event, "query", None)
-                if query is not None and not query():
-                    return
-                self._pp_vpp_pending_replica_updates.popleft()
-                payload = {
-                    "content_id": identity.content_id,
-                    "source_id": identity.source_id,
-                    "format_version": identity.format_version,
-                    "consumer_rank": identity.consumer_rank,
-                    "residency_generation": generation,
-                    "start": start,
-                    "end": end,
-                }
-                apply_cache_update(payload)
-                self._pp_vpp_replica_registry.lock(
-                    identity,
-                    end,
-                    owner_id=batch_seq,
-                )
-                self._pp_vpp_batch_replicas[batch_seq][identity] = (
-                    generation,
-                    end,
-                )
-                self._pp_vpp_queue_control(
-                    self._pp_vpp_new_control(
-                        PipelineControlKind.CACHE_UPDATE,
-                        batch_seq=batch_seq,
-                        payload=payload,
-                    ).forwarded()
-                )
-                if not any(
-                    pending[0] == batch_seq and pending[1] == stage_id
-                    for pending in self._pp_vpp_pending_replica_updates
-                ) and not any(
-                    pending[0] == batch_seq and pending[1] == stage_id
-                    for pending in self._pp_vpp_pending_materialized
-                ):
-                    self._pp_vpp_stage_events.pop((batch_seq, stage_id), None)
-
-        def evict_batch_replicas(batch_seq: int, batch: ScheduleBatch) -> None:
-            if not getattr(batch, "contains_last_prefill_chunk", False):
-                return
-            replicas = self._pp_vpp_batch_replicas.pop(batch_seq, {})
-            for identity, (generation, end) in replicas.items():
-                state = self._pp_vpp_replica_registry.get(identity)
-                if state is None or state.residency_generation != generation:
-                    continue
-                if state.locked_until:
-                    self._pp_vpp_replica_registry.unlock(
-                        identity,
-                        end,
-                        owner_id=batch_seq,
-                    )
-                if state.locked_until:
-                    continue
-                self._pp_vpp_replica_registry.evict(identity, generation)
-                for tracked in self._pp_vpp_batch_replicas.values():
-                    tracked.pop(identity, None)
-                self._pp_vpp_queue_control(
-                    self._pp_vpp_new_control(
-                        PipelineControlKind.EVICT_ACK,
-                        batch_seq=batch_seq,
-                        payload={
-                            "content_id": identity.content_id,
-                            "source_id": identity.source_id,
-                            "format_version": identity.format_version,
-                            "consumer_rank": identity.consumer_rank,
-                            "residency_generation": generation,
-                        },
-                    ).forwarded()
-                )
-
         def flush_materialized() -> None:
             while self._pp_vpp_pending_materialized:
                 (
@@ -1004,9 +878,6 @@ class SchedulingVPPCore:
                 if not any(
                     pending[0] == batch_seq and pending[1] == stage_id
                     for pending in self._pp_vpp_pending_materialized
-                ) and not any(
-                    pending[0] == batch_seq and pending[1] == stage_id
-                    for pending in self._pp_vpp_pending_replica_updates
                 ):
                     self._pp_vpp_stage_events.pop((batch_seq, stage_id), None)
 
@@ -1028,8 +899,6 @@ class SchedulingVPPCore:
                     PipelineControlKind.COMPLETION,
                     PipelineControlKind.PREFIX_MATERIALIZED,
                     PipelineControlKind.PREFIX_COMMIT,
-                    PipelineControlKind.CACHE_UPDATE,
-                    PipelineControlKind.EVICT_ACK,
                 )
             ):
                 # These messages may overtake the activation that admits their
@@ -1321,36 +1190,12 @@ class SchedulingVPPCore:
                 forward_control(envelope, wire)
                 return
 
-            if envelope.kind == PipelineControlKind.CACHE_UPDATE:
-                if returned_to_source:
-                    return
-                apply_cache_update(payload)
-                forward_control(envelope, wire)
-                return
-
-            if envelope.kind == PipelineControlKind.EVICT_ACK:
-                if returned_to_source:
-                    return
-                identity = replica_identity(payload)
-                state = self._pp_vpp_replica_registry.get(identity)
-                generation = int(payload["residency_generation"])
-                if (
-                    state is not None
-                    and state.residency_generation == generation
-                    and not state.locked_until
-                ):
-                    self._pp_vpp_replica_registry.evict(identity, generation)
-                forward_control(envelope, wire)
-                return
-
             if envelope.kind == PipelineControlKind.CANCEL:
                 if returned_to_source:
                     return
                 _, req = self._pp_vpp_cancel_target(envelope)
                 if req is not None:
-                    if req in getattr(
-                        self, "chunked_reqs", (self.chunked_req,)
-                    ):
+                    if req in getattr(self, "chunked_reqs", (self.chunked_req,)):
                         self._pending_chunked_abort_req = req
                         self.process_pending_chunked_abort()
                     else:
@@ -1376,9 +1221,6 @@ class SchedulingVPPCore:
                     return
                 output_tensors = control_extras(envelope, wire)
                 rank_schedule.mark_completed(envelope.batch_seq)
-                batch = self.mbs[envelope.batch_seq % max_inflight]
-                if batch is not None:
-                    evict_batch_replicas(envelope.batch_seq, batch)
                 self._pp_vpp_finalize_rank_local_batch(
                     envelope.batch_seq,
                     slot_batch_seqs,
@@ -1699,57 +1541,8 @@ class SchedulingVPPCore:
                 activation_send_work,
             )
             if action is not None:
-                replica_restores = []
                 if action.stage_id > 0:
                     proxy = self._pp_vpp_take_ready_proxy(action)
-                    source_id = proxy.tensors.get("vpp_source_layer_id")
-                    batch = self.mbs[action.slot_id]
-                    if source_id is not None and batch is not None:
-                        for req in batch.reqs:
-                            end = batch.disagg_prefill_chunk_end_by_rid.get(req.rid)
-                            if end is None:
-                                continue
-                            content_id = getattr(
-                                req,
-                                "_vpp_replica_content_id",
-                                None,
-                            )
-                            if content_id is None:
-                                content_id = hashlib.sha256(
-                                    pickle.dumps(
-                                        tuple(req.origin_input_ids),
-                                        protocol=pickle.HIGHEST_PROTOCOL,
-                                    )
-                                ).hexdigest()
-                                req._vpp_replica_content_id = content_id
-                            identity = PipelineReplicaIdentity(
-                                content_id=content_id,
-                                source_id=int(source_id),
-                                format_version=1,
-                                consumer_rank=self.pp_group.rank_in_group,
-                            )
-                            state = self._pp_vpp_replica_registry.get(identity)
-                            generation = (
-                                0 if state is None else state.residency_generation
-                            )
-                            missing = self._pp_vpp_replica_registry.missing_range(
-                                identity,
-                                generation,
-                                end,
-                            )
-                            if missing is None:
-                                self._pp_vpp_replica_registry.lock(
-                                    identity,
-                                    end,
-                                    owner_id=action.batch_seq,
-                                )
-                                self._pp_vpp_batch_replicas[action.batch_seq][
-                                    identity
-                                ] = (generation, end)
-                            else:
-                                replica_restores.append(
-                                    (identity, generation, *missing)
-                                )
                     self._pp_tensor_dict_inbox["vpp_proxy"].appendleft(proxy.tensors)
                 action_executed, send_work = self._pp_vpp_execute_wavefront_action(
                     action,
@@ -1759,17 +1552,6 @@ class SchedulingVPPCore:
                     activation_send_work.append(send_work)
                 if action_executed:
                     mark_progress(f"stage:{action.stage_id}")
-                    for identity, generation, start, end in replica_restores:
-                        self._pp_vpp_pending_replica_updates.append(
-                            (
-                                action.batch_seq,
-                                action.stage_id,
-                                identity,
-                                generation,
-                                start,
-                                end,
-                            )
-                        )
                     transition = rank_schedule.complete(action)
                     batch = self.mbs[action.slot_id]
                     if (
@@ -1807,15 +1589,12 @@ class SchedulingVPPCore:
                             action.batch_seq,
                             self.last_rank_comm_queue,
                         )
-                        flush_replica_updates()
                         flush_materialized()
                         completion = self._pp_vpp_new_control(
                             PipelineControlKind.COMPLETION,
                             batch_seq=action.batch_seq,
                             slot_id=action.slot_id,
                         )
-                        if batch is not None:
-                            evict_batch_replicas(action.batch_seq, batch)
                         self._pp_vpp_finalize_rank_local_batch(
                             action.batch_seq,
                             slot_batch_seqs,
@@ -1828,7 +1607,6 @@ class SchedulingVPPCore:
                         )
                     server_is_idle = False
 
-            flush_replica_updates()
             flush_materialized()
 
             self._pp_vpp_flush_control_outbox(
@@ -1868,7 +1646,7 @@ class SchedulingVPPCore:
                     "slots=%s ready=%s running=%s "
                     "waiting=%s bootstrap=%s inflight=%s "
                     "metadata_slots=%s bootstrap_applies=%s "
-                    "materialized=%s replica_updates=%s "
+                    "materialized=%s "
                     "control_outbox=%s control_sends=%s activation_sends=%s "
                     "ready_proxies=%s arrivals=%s",
                     now - stall_last_progress_at,
@@ -1895,7 +1673,6 @@ class SchedulingVPPCore:
                     else 0,
                     len(pending_bootstrap_applies),
                     len(self._pp_vpp_pending_materialized),
-                    len(self._pp_vpp_pending_replica_updates),
                     len(self._pp_vpp_control_outbox),
                     len(control_send_work),
                     len(activation_send_work),

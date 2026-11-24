@@ -21,7 +21,6 @@ from sglang.srt.distributed.vpp_policy import (
     PipelineControlKind,
     PipelinePrefixRegistry,
     PipelineRankSchedule,
-    PipelineReplicaIdentity,
     PipelineWavefrontAction,
 )
 from sglang.srt.distributed.vpp_transport import P2PWorkGroup
@@ -435,7 +434,7 @@ class TestSchedulingVPPCore(CustomTestCase):
                 seq, seq % 2, scheduler.batches[seq]
             )
         if stage == 3:
-            wire["vpp_source_layer_id"] = 0
+            wire["vpp_source_layer"] = 0
         scheduler._pp_vpp_activation_receiver.queue.append(wire)
 
     def test_native_ticks_run_two_batch_waves_and_reuse_retired_slots(self):
@@ -551,11 +550,6 @@ class TestSchedulingVPPCore(CustomTestCase):
         self.assertEqual(
             [wire["next_token_ids"].item() for wire in completions], [4, 5]
         )
-        kinds = [wire["kind"] for wire in scheduler.published]
-        self.assertEqual(kinds.count(PipelineControlKind.CACHE_UPDATE.value), 2)
-        self.assertEqual(kinds.count(PipelineControlKind.EVICT_ACK.value), 2)
-        self.assertEqual(scheduler._pp_vpp_batch_replicas, {})
-        self.assertEqual(scheduler._pp_vpp_pending_replica_updates, deque())
 
     def test_native_ticks_call_idle_only_without_inflight_batches_or_sends(self):
         def before_tick(scheduler, context):
@@ -677,11 +671,10 @@ class TestSchedulingVPPCore(CustomTestCase):
                 self.assertEqual(context["max_control_sends"], 64)
                 self.assertEqual(scheduler._pp_vpp_pending_batch_controls, deque())
 
-    def test_control_publication_waits_for_fifo_events_and_keeps_shared_fences(self):
+    def test_control_publication_waits_for_fifo_events(self):
         scheduler, context = self._control_loop()
         registry = scheduler._pp_vpp_prefix_registry
         entry = registry.plan("request", 1, 1, 0, 8, range(4))
-        identity = PipelineReplicaIdentity("content", 0, 1, 1)
         ready = [False]
         event = SimpleNamespace(query=lambda: ready[0])
         scheduler._pp_vpp_stage_events = {
@@ -691,24 +684,16 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler._pp_vpp_pending_materialized.extend(
             [(0, 0, "request", 1, 8), (0, 1, "request", 1, 8)]
         )
-        scheduler._pp_vpp_pending_replica_updates.append((0, 0, identity, 1, 0, 8))
         context["flush_materialized"]()
-        context["flush_replica_updates"]()
         self.assertEqual(entry.materialized_by_stage[1], 0)
         self.assertEqual(len(scheduler._pp_vpp_pending_materialized), 2)
-        self.assertEqual(len(scheduler._pp_vpp_pending_replica_updates), 1)
         self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
         ready[0] = True
         context["flush_materialized"]()
-        self.assertIs(scheduler._pp_vpp_stage_events[(0, 0)], event)
+        self.assertNotIn((0, 0), scheduler._pp_vpp_stage_events)
         self.assertNotIn((0, 1), scheduler._pp_vpp_stage_events)
         self.assertEqual(entry.materialized_by_stage, {0: 8, 1: 8, 2: 0, 3: 0})
         self.assertEqual(entry.committed_end, 0)
-        context["flush_replica_updates"]()
-        replica = scheduler._pp_vpp_replica_registry.get(identity)
-        self.assertEqual((replica.valid_end, replica.locked_until), (8, 8))
-        self.assertEqual(replica.lock_owners, {0: 8})
-        self.assertEqual(scheduler._pp_vpp_batch_replicas[0][identity], (1, 8))
         self.assertEqual(scheduler._pp_vpp_stage_events, {})
         messages = [
             PipelineControlEnvelope.from_dict(wire)
@@ -719,70 +704,9 @@ class TestSchedulingVPPCore(CustomTestCase):
             [
                 PipelineControlKind.PREFIX_MATERIALIZED,
                 PipelineControlKind.PREFIX_MATERIALIZED,
-                PipelineControlKind.CACHE_UPDATE,
             ],
         )
-        self.assertEqual([message.hops for message in messages], [1, 1, 1])
-
-    def test_replica_updates_merge_overlap_and_reject_gaps_and_stale_generations(self):
-        scheduler, context = self._control_loop()
-        payload = {
-            "content_id": "content",
-            "source_id": 0,
-            "format_version": 1,
-            "consumer_rank": 1,
-            "residency_generation": 1,
-            "start": 0,
-            "end": 4,
-        }
-        identity = context["replica_identity"](payload)
-        context["apply_cache_update"](payload)
-        context["apply_cache_update"](payload)
-        context["apply_cache_update"]({**payload, "start": 2, "end": 8})
-        registry = scheduler._pp_vpp_replica_registry
-        self.assertEqual(registry.get(identity).valid_end, 8)
-        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
-            context["apply_cache_update"]({**payload, "start": 10, "end": 12})
-        with self.assertRaisesRegex(RuntimeError, "stale replica"):
-            context["apply_cache_update"]({**payload, "residency_generation": 2})
-        registry.lock(identity, 8, owner_id=0)
-        envelope, wire = self._control_message(
-            scheduler, PipelineControlKind.EVICT_ACK, payload=payload
-        )
-        context["handle_control"](envelope, wire)
-        self.assertEqual(registry.get(identity).residency_generation, 1)
-        registry.unlock(identity, 8, owner_id=0)
-        context["handle_control"](envelope, wire)
-        self.assertEqual(registry.get(identity).residency_generation, 2)
-        self.assertEqual(registry.get(identity).valid_end, 0)
-
-    def test_replica_eviction_waits_for_all_batch_owners_and_last_chunks(self):
-        scheduler, context = self._control_loop()
-        identity = PipelineReplicaIdentity("content", 0, 1, 1)
-        registry = scheduler._pp_vpp_replica_registry
-        registry.install(identity, 1, 0, 8)
-        for seq in (0, 1):
-            registry.lock(identity, 8, owner_id=seq)
-            scheduler._pp_vpp_batch_replicas[seq][identity] = (1, 8)
-        scheduler._pp_vpp_batch_replicas[2][identity] = (1, 8)
-        context["evict_batch_replicas"](
-            0, SimpleNamespace(contains_last_prefill_chunk=False)
-        )
-        self.assertEqual(registry.get(identity).lock_owners, {0: 8, 1: 8})
-        final_batch = SimpleNamespace(contains_last_prefill_chunk=True)
-        context["evict_batch_replicas"](0, final_batch)
-        self.assertEqual(registry.get(identity).lock_owners, {1: 8})
-        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
-        context["evict_batch_replicas"](1, final_batch)
-        self.assertEqual(registry.get(identity).residency_generation, 2)
-        self.assertEqual(registry.get(identity).valid_end, 0)
-        self.assertEqual(scheduler._pp_vpp_batch_replicas[2], {})
-        ack = PipelineControlEnvelope.from_dict(
-            scheduler._pp_vpp_control_outbox.popleft()
-        )
-        self.assertEqual(ack.kind, PipelineControlKind.EVICT_ACK)
-        self.assertEqual(ack.payload["residency_generation"], 1)
-        self.assertEqual(ack.hops, 1)
+        self.assertEqual([message.hops for message in messages], [1, 1])
 
     def test_batch_controls_wait_for_activation_admission(self):
         scheduler, context = self._control_loop()
@@ -791,8 +715,6 @@ class TestSchedulingVPPCore(CustomTestCase):
             PipelineControlKind.COMPLETION,
             PipelineControlKind.PREFIX_MATERIALIZED,
             PipelineControlKind.PREFIX_COMMIT,
-            PipelineControlKind.CACHE_UPDATE,
-            PipelineControlKind.EVICT_ACK,
         )
         for kind in kinds:
             envelope, wire = self._control_message(scheduler, kind, seq=0)
@@ -1547,9 +1469,7 @@ class TestSchedulingVPPCore(CustomTestCase):
             (2, 3, 2),
             (2, 2, 1),
         ):
-            with self.subTest(
-                pp=pp_size, vpp=virtual_stages, inflight=inflight
-            ):
+            with self.subTest(pp=pp_size, vpp=virtual_stages, inflight=inflight):
                 scheduler = self._scheduler()
                 scheduler.pp_group.world_size = pp_size
                 scheduler._vpp_layout = SimpleNamespace(virtual_stages=virtual_stages)
