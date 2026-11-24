@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,11 +17,15 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -37,6 +42,10 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     metrics_reporter = Mock()
     metrics_reporter.num_generated_tokens = 0
     metrics_reporter.forward_ct_decode = 0
+    # A tree that leases no state slots ahead of the checkpoints.
+    tree_cache = SimpleNamespace(
+        lease_checkpoint_state_slots=lambda reqs: nullcontext()
+    )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -44,7 +53,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
             think_end_ids=None, self_opened_think_start_ids=None
         ),
         token_to_kv_pool_allocator=Mock(),
-        tree_cache=None,
+        tree_cache=tree_cache,
         hisparse_coordinator=None,
         req_to_token_pool=None,
         kv_weight_version_tracker=None,
@@ -56,9 +65,10 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         logprob_result_processor=None,
         output_streamer=Mock(),
         beam_coordinator=Mock(),
-        request_retirer=release_only_retirer(),
+        request_retirer=release_only_retirer(tree_cache=tree_cache),
         abort_request=lambda *args, **kwargs: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 
@@ -66,7 +76,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
     def test_failed_kv_load_discarded_with_mixed_embedding_formats(self):
         reason = FINISH_ABORT("External KV cache load failed", 503)
         reqs = [
-            SimpleNamespace(
+            FakeReq(
                 encoding_format=encoding_format,
                 discard_output_reason=discard_reason,
                 is_retracted=False,
@@ -225,7 +235,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertIsNone(output.sampling_mask_output)
 
 
-class _PrefillReq:
+class _PrefillReq(FakeReq):
     def __init__(self, *, rid: str, return_hidden_states):
         self.rid = rid
         self.return_hidden_states = return_hidden_states
@@ -249,7 +259,7 @@ class _PrefillReq:
         return None
 
 
-class _DecodeReq:
+class _DecodeReq(FakeReq):
     request_finish = Req.request_finish
 
     def __init__(self):

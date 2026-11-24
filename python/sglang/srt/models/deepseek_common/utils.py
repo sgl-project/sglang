@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-import math
 from typing import Optional
 
 import torch
@@ -50,10 +49,10 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
-# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but its
-# aiter rope kernels (ck_tile) do not build, so it runs sglang's native rope which
-# lacks the separate cos_cache/sin_cache buffers the gfx95 fused-rope decode path
-# expects. This flag lets gfx1250 carve out of that fused-rope path.
+# gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but it
+# runs sglang's rope modules, which lack the separate cos_cache/sin_cache buffers
+# the gfx95 fused-rope decode path expects. This flag lets gfx1250 carve out of
+# that fused-rope path.
 _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -68,7 +67,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "dsa",
-    "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
     "trtllm_mla",
     "cutedsl_mla",
@@ -161,6 +159,53 @@ def is_wint4afp8_or_wint4a16_config(
     ) or quant_config._is_wint4abf16(weight_quant, input_quant)
 
 
+# Formats whose qweight / qzeros / scales put the output dim last
+# (AutoRound packs as auto_gptq or auto_awq).
+_OUTPUTS_LAST_PACKED_FORMATS = (
+    "awq",
+    "awq_marlin",
+    "moe_wna16",
+    "gptq",
+    "gptq_marlin",
+    "auto-round",
+)
+
+
+def fuse_qkv_a_proj_tensors(
+    name: str,
+    *,
+    q_a: torch.Tensor,
+    kv_a: torch.Tensor,
+    quant_config: Optional[QuantizationConfig] = None,
+) -> torch.Tensor:
+    """Merge a q_a_proj tensor with its kv_a_proj_with_mqa twin for
+    fused_qkv_a_proj_with_mqa; ``weight_shape`` adds the output rows."""
+    if q_a.dim() == 0 and kv_a.dim() == 0:
+        return q_a
+    if name.endswith(".weight_shape"):
+        assert q_a.shape == kv_a.shape == (2,) and q_a[1] == kv_a[1], (
+            f"{name}: q_a_proj {q_a.tolist()} and kv_a_proj_with_mqa "
+            f"{kv_a.tolist()} must share the input size"
+        )
+        return torch.stack([q_a[0] + kv_a[0], q_a[1]])
+    if name.endswith((".weight_g_idx", ".g_idx")):
+        if not torch.equal(q_a, kv_a):
+            raise ValueError(
+                f"{name}: q_a_proj and kv_a_proj_with_mqa use different "
+                "activation orders and cannot be fused."
+            )
+        return q_a
+    # AWQ/GPTQ-packed tensors store the output dim last; a projection such a
+    # checkpoint leaves unconverted keeps a plain [out, in] weight. Keyed on
+    # the format too, since GGUF also names its tensors qweight.
+    packed_outputs_last = (
+        quant_config is not None
+        and quant_config.get_name() in (_OUTPUTS_LAST_PACKED_FORMATS)
+        and name.endswith((".qweight", ".qzeros", ".scales"))
+    )
+    return torch.cat([q_a, kv_a], dim=1 if packed_outputs_last else 0)
+
+
 def quant_blocks_shared_experts_fusion(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
@@ -169,12 +214,6 @@ def quant_blocks_shared_experts_fusion(
     """
     can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
     return can_fuse_fn is not None and not can_fuse_fn()
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 def _get_llama_4_scaling(

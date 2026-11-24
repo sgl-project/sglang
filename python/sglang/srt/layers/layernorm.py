@@ -40,7 +40,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_gfx1250_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -115,17 +114,8 @@ _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-
-    if is_gfx1250_supported():
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rms_norm,
-        )
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
-        )
-    else:
-        from aiter import rmsnorm2d_fwd as rms_norm
-        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+    from aiter import rmsnorm2d_fwd as rms_norm
+    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
@@ -185,7 +175,7 @@ if _is_npu:
     import torch_npu
 
     try:
-        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+        from sgl_kernel_npu.operators.norm import gemma_rmsnorm as npu_gemma_rms_norm
     except ImportError:
         # sgl-kernel-npu wheels built before the target-specific Gemma provider
         # landed expose only the torch_npu operator, which is exactly what that
@@ -289,7 +279,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
 ):
     """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
 
-    The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
+    The single-kernel quantized backend dispatch is ROCm + aiter on gfx942 and gfx95.
     Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
     the existing tuple handoff behavior.
 
@@ -1534,7 +1524,12 @@ class Gemma3RMSNorm(BaseFusedOp):
             return x, residual
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
-        return self.forward_native(x)
+        if x.numel() == 0:
+            return x
+        # q_norm and k_norm get [tokens, heads, head_dim]. The norm reduces over
+        # the last dim only, so flatten the leading dims for the fused kernel.
+        flat = x.contiguous().view(-1, x.shape[-1])
+        return gemma_rmsnorm(flat, self.weight.data, self.eps).view(x.shape)
 
     def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None and x.dim() == 2:
@@ -1658,26 +1653,3 @@ class Gemma4RMSNorm(BaseFusedOp):
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
-
-
-class RMSNormWithoutScale(BaseFusedOp):
-    def __init__(self, hidden_size: int, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward_native(self, x):
-        orig_dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return x.to(orig_dtype)
-
-    def forward_cuda(self, x):
-        return self.forward_native(x)
-
-    def extra_repr(self):
-        return f"{self.hidden_size}, eps={self.eps}"

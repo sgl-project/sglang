@@ -155,26 +155,6 @@ class ResnetBlock(nn.Module):
         return x + h
 
 
-class Downsample(nn.Module):
-    def __init__(self, in_channels: int, add_temporal_downsample: bool = True):
-        super().__init__()
-        self.add_temporal_downsample = add_temporal_downsample
-        stride = (2, 2, 2) if add_temporal_downsample else (1, 2, 2)
-        self.conv = Conv3d(
-            in_channels, in_channels, kernel_size=3, stride=stride, padding=0
-        )
-
-    def forward(self, x: Tensor):
-        spatial_pad = (0, 1, 0, 1, 0, 0)
-        x = nn.functional.pad(x, spatial_pad, mode="constant", value=0)
-        temporal_pad = (
-            (0, 0, 0, 0, 0, 1) if self.add_temporal_downsample else (0, 0, 0, 0, 1, 1)
-        )
-        x = nn.functional.pad(x, temporal_pad, mode="replicate")
-        x = self.conv(x)
-        return x
-
-
 class DownsampleDCAE(nn.Module):
     def __init__(
         self, in_channels: int, out_channels: int, add_temporal_downsample: bool = True
@@ -199,19 +179,6 @@ class DownsampleDCAE(nn.Module):
         B, C, T, H, W = shortcut.shape
         shortcut = shortcut.view(B, h.shape[1], self.group_size, T, H, W).mean(dim=2)
         return h + shortcut
-
-
-class Upsample(nn.Module):
-    def __init__(self, in_channels: int, add_temporal_upsample: bool = True):
-        super().__init__()
-        self.add_temporal_upsample = add_temporal_upsample
-        self.scale_factor = (2, 2, 2) if add_temporal_upsample else (1, 2, 2)
-        self.conv = Conv3d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, x: Tensor):
-        x = nn.functional.interpolate(x, scale_factor=self.scale_factor, mode="nearest")
-        x = self.conv(x)
-        return x
 
 
 class UpsampleDCAE(nn.Module):

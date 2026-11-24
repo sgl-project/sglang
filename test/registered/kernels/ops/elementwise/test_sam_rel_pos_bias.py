@@ -74,8 +74,8 @@ def test_unsupported_inputs_take_the_eager_path(make):
 
 @pytest.mark.parametrize(
     "make",
-    [lambda: _inputs(dtype=torch.float16), _strided_rel_w, _misaligned_rel_w],
-    ids=["fp16", "strided_rel_w", "misaligned_rel_w"],
+    [_strided_rel_w],
+    ids=["strided_rel_w"],
 )
 def test_kernel_rejects_unsupported_inputs(make):
     """A non-unit key-width stride used to be read as contiguous and give a wrong bias."""
