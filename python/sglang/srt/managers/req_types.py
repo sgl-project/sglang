@@ -405,28 +405,6 @@ class MultimodalProcessorOutput(
     # have wrap_shm_features also move large model_specific_data tensors to SHM.
     shm_model_specific_data: ClassVar[bool] = False
 
-    @staticmethod
-    def from_dict(d: dict) -> MultimodalProcessorOutput:
-        return MultimodalProcessorOutput(
-            mm_items=d["mm_items"],
-            input_ids=d.get("input_ids"),
-            padded_input_ids=d.get("padded_input_ids"),
-            im_token_id=d.get("im_token_id"),
-            im_start_id=d.get("im_start_id"),
-            im_end_id=d.get("im_end_id"),
-            slice_start_id=d.get("slice_start_id"),
-            slice_end_id=d.get("slice_end_id"),
-            video_token_id=d.get("video_token_id"),
-            audio_token_id=d.get("audio_token_id"),
-            audio_start_id=d.get("audio_start_id"),
-            audio_end_id=d.get("audio_end_id"),
-            mrope_positions=d.get("mrope_positions"),
-            mrope_position_delta=d.get("mrope_position_delta"),
-            vision_position_ids=d.get("vision_position_ids"),
-            media_nums_per_sample=d.get("media_nums_per_sample"),
-            visible_frame_counts=d.get("visible_frame_counts"),
-        )
-
     def map_object_fields(
         self, transform: Callable[[list], list]
     ) -> MultimodalProcessorOutput:
