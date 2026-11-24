@@ -8,8 +8,9 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::request::{GenerateRequest, PromptTokenIdsSlot, RequestKind};
 use crate::message::response::ResponseItem;
+use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission};
 use crate::utils::error::Error;
 
@@ -27,6 +28,8 @@ impl CoreHandle {
         request: GenerateRequest,
         received: ReceivedAs,
     ) -> Result<CoreCall, CoreError> {
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         // Counted from admission, media prefetch included: the drain waits
         // for it.
         let in_flight = self.inner.drain.track();
@@ -127,7 +130,7 @@ impl CoreHandle {
         mut generation: Generation,
         in_flight: InFlight,
     ) -> Result<CoreCall, CoreError> {
-        let created_at = Instant::now();
+        let created_at = received.created_at();
         self.set_default_priority(&mut request);
         let record = self
             .receive(std::slice::from_ref(&request), received, false, true)
@@ -145,9 +148,12 @@ impl CoreHandle {
             result = self.prepare_generations(std::slice::from_mut(&mut request)) => result?,
         }
         let metrics = self.request_metrics(&request, created_at);
+        let prompt_token_ids = request.prompt_token_ids.clone();
         self.submit_generation(request, generation)
             .await
-            .map(|runtime| self.generation_call(runtime, metrics, record, Some(in_flight)))
+            .map(|runtime| {
+                self.generation_call(runtime, metrics, record, Some(in_flight), prompt_token_ids)
+            })
     }
 
     /// Submit core-owned work without exposing it through the public Abort
@@ -174,9 +180,12 @@ impl CoreHandle {
         let metrics = log_metrics
             .then(|| self.request_metrics(&request, created_at))
             .flatten();
+        let prompt_token_ids = request.prompt_token_ids.clone();
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(|runtime| self.generation_call(runtime, metrics, record, in_flight))
+            .map(|runtime| {
+                self.generation_call(runtime, metrics, record, in_flight, prompt_token_ids)
+            })
     }
 
     /// Python logs a request once it is normalized, before tokenization or
@@ -203,22 +212,24 @@ impl CoreHandle {
         mut requests: Vec<GenerateRequest>,
         received: ReceivedAs,
     ) -> Result<Vec<CoreCall>, CoreError> {
-        let created_at = Instant::now();
+        let created_at = received.created_at();
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         for request in &mut requests {
             self.set_default_priority(request);
         }
         // A body is a batch here even with one item (a list); the core's own
         // requests are one only when they are several.
-        let batch = matches!(received, ReceivedAs::Body(_)) || requests.len() > 1;
-        let mut records = self
+        let batch = matches!(received, ReceivedAs::Body { .. }) || requests.len() > 1;
+        // No records without a request log.
+        let records = self
             .receive(&requests, received, batch, true)
             .into_iter()
             .map(Some)
-            .collect::<Vec<_>>();
-        records.resize_with(requests.len(), || None);
+            .chain(std::iter::repeat_with(|| None));
         // One refused item refuses the batch before any item is prepared.
         self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
@@ -254,8 +265,11 @@ impl CoreHandle {
         {
             let rid = request.rid.clone();
             let metrics = self.request_metrics(&request, created_at);
+            let prompt_token_ids = request.prompt_token_ids.clone();
             let call = match self.submit_generation(request, generation).await {
-                Ok(call) => self.generation_call(call, metrics, record, Some(in_flight)),
+                Ok(call) => {
+                    self.generation_call(call, metrics, record, Some(in_flight), prompt_token_ids)
+                }
                 // Cancellation may happen during preparation or while waiting
                 // for intake. Keep this slot without rolling back siblings.
                 Err(CoreError::Cancelled(_)) => {
@@ -271,8 +285,15 @@ impl CoreHandle {
     /// Cancel active generations by public ID, or all active generations,
     /// ending each call as `ending` says. The admission gate and internal IDs
     /// keep cancellation safe across preprocessing, queueing, duplicate public
-    /// IDs, and ID reuse.
+    /// IDs, and ID reuse. Every entry's abort comes here, and one by a
+    /// non-empty `rid` tells the package's [`crate::AbortHook`] before anything
+    /// ends.
     pub(crate) fn abort(&self, rid: Option<&str>, ending: AbortEnding) -> bool {
+        if let (Some(hook), Some(rid)) = (&self.inner.abort_hook, rid)
+            && !rid.is_empty()
+        {
+            hook.named_abort(rid);
+        }
         self.inner
             .generations
             .abort(rid, ending, &self.inner.abort_tx)
@@ -293,14 +314,16 @@ impl CoreHandle {
         metrics: Option<RequestMetrics>,
         record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
+        prompt_token_ids: Option<PromptTokenIdsSlot>,
     ) -> CoreCall {
         CoreCall::new(
             runtime,
             self.inner.metadata.weight_version.clone(),
-            Some(self.inner.dp_rank),
+            self.inner.metadata.deployment_info.reported_dp_rank(),
             metrics,
             record,
             in_flight,
+            prompt_token_ids,
         )
     }
 
@@ -326,26 +349,29 @@ impl CoreHandle {
     /// names ([`Self::check_routed_dp_rank`]), then the launch's
     /// [`crate::GenerateValidator`]; the first refusal is the error.
     fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
-        requests
-            .iter()
-            .try_for_each(|request| self.check_routed_dp_rank(request.routed_dp_rank))?;
+        requests.iter().try_for_each(|request| {
+            self.check_routed_dp_rank(request.routed_dp_rank)
+                .inspect_err(|error| {
+                    tracing::warn!(rid = %request.rid, %error, "rejected request");
+                })
+        })?;
         let Some(validator) = &self.inner.generate_validator else {
             return Ok(());
         };
-        requests
-            .iter()
-            .try_for_each(|request| validator.validate(request))
-            .map_err(CoreError::InvalidArgument)
+        requests.iter().try_for_each(|request| {
+            validator.validate(request).map_err(|message| {
+                tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+                CoreError::InvalidArgument(message)
+            })
+        })
     }
 
     /// Python `TokenizerManager.generate_request`'s `routed_dp_rank` check:
     /// rank 0 of a single-rank deployment is ignored, a rank outside the
     /// deployment's `[0, dp_size)` is refused. Then this listener's own: it
     /// feeds only its own DP rank's scheduler, so it refuses a request naming
-    /// another. The HTTP generation routes hand such a request to that rank's
-    /// listener before it gets here (`http::dp_relay`); one that still
-    /// arrives (over gRPC, or with no listener known for the rank) fails
-    /// rather than run on the wrong rank.
+    /// another rather than run it on the wrong rank. Clients reach each rank
+    /// at its own listener, which DP rank 0 publishes.
     fn check_routed_dp_rank(&self, rank: Option<i64>) -> Result<(), CoreError> {
         let Some(rank) = rank else {
             return Ok(());
@@ -381,7 +407,12 @@ impl CoreHandle {
         };
         prefetch::prefetch_all(requests, &self.inner.mm_limits, processor)
             .await
-            .map_err(CoreError::from)
+            .map_err(|error| {
+                if let (MediaError::Client(message), Some(request)) = (&error, requests.first()) {
+                    tracing::warn!(rid = %request.rid, error = %message, "rejected request");
+                }
+                CoreError::from(error)
+            })
     }
 }
 
@@ -397,6 +428,9 @@ pub(crate) struct CoreCall {
     /// every output (see [`CoreOutput`](crate::api_server::core::CoreOutput)).
     weight_version: Option<Arc<str>>,
     dp_rank: Option<u32>,
+    /// Where intake leaves the prompt ids of a request that asked for them,
+    /// stamped on every output once there.
+    prompt_token_ids: Option<PromptTokenIdsSlot>,
     /// Observes every runtime item as the call receives it.
     metrics: Option<RequestMetrics>,
     /// Logs the request's `Finish` and keeps its crash-dump entry.
@@ -413,6 +447,7 @@ impl CoreCall {
         metrics: Option<RequestMetrics>,
         mut record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
+        prompt_token_ids: Option<PromptTokenIdsSlot>,
     ) -> Self {
         if let Some(record) = &mut record {
             record.admit();
@@ -422,6 +457,7 @@ impl CoreCall {
             events_finished: false,
             weight_version,
             dp_rank,
+            prompt_token_ids,
             metrics,
             record,
             _in_flight: in_flight,
@@ -455,6 +491,7 @@ impl CoreCall {
                 last_output: LastOutput::default(),
                 abort_deadline: None,
             },
+            None,
             None,
             None,
             None,
@@ -535,6 +572,7 @@ impl CoreCall {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -549,6 +587,10 @@ impl CoreCall {
         if let Some(output) = output {
             output.weight_version = self.weight_version.clone();
             output.dp_rank = self.dp_rank;
+            output.prompt_token_ids = self
+                .prompt_token_ids
+                .as_ref()
+                .and_then(|slot| slot.get().cloned());
         }
         event
     }
@@ -652,6 +694,12 @@ struct Entry {
 }
 
 impl Generations {
+    /// Whether any client generation is between registration and its
+    /// terminal response.
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
     fn register(&self, rid: Rid, abort_tx: flume::Sender<AbortSource>) -> Generation {
         let admission = RequestAdmission::pending();
         let (cancelled, cancellation) = oneshot::channel();
@@ -892,7 +940,6 @@ mod tests {
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
     use crate::message::response::{CachedTokensDetails, ChunkEvent, ChunkExtras};
-    use crate::multi_modality::worker::MediaError;
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
     use std::time::Duration;
@@ -973,9 +1020,11 @@ mod tests {
 
     /// A generation that sets no priority is scheduled and counted under the
     /// configured default, as Python's `_set_default_priority` runs before
-    /// `collect_metrics` picks the label.
+    /// `collect_metrics` picks the label; and its TTFT and e2e latency count
+    /// from when an HTTP layer started it, as Python's do from before the
+    /// work such a layer does.
     #[tokio::test]
-    async fn unset_priority_takes_the_default_before_metrics() {
+    async fn metrics_take_the_default_priority_and_the_layer_start() {
         let dir = std::env::temp_dir().join(format!("core-priority-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = crate::message::config::MetricsConfig {
@@ -1003,10 +1052,16 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
+        let layer_work = 5.0;
+        let received = ReceivedAs::Body {
+            snapshot: None,
+            started_at: Some(Instant::now() - Duration::from_secs_f64(layer_work)),
+        };
         let mut call = handle
-            .generate(GenerateRequest::default(), ReceivedAs::without_headers())
+            .generate(GenerateRequest::default(), received)
             .await
             .unwrap();
         let request = accept_intake(intake_rx.recv().unwrap());
@@ -1039,6 +1094,19 @@ mod tests {
             text.contains(r#"sglang:num_requests_total{is_streaming="false",priority="5"} 1.0"#),
             "{text}"
         );
+        for family in [
+            "sglang:time_to_first_token_seconds",
+            "sglang:e2e_request_latency_seconds",
+        ] {
+            let prefix = format!(r#"{family}_sum{{is_streaming="false",priority="5"}} "#);
+            let sum: f64 = text
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("{family}: {text}"))
+                .parse()
+                .unwrap();
+            assert!(sum >= layer_work, "{family}: {sum}");
+        }
     }
 
     #[tokio::test]
@@ -1244,6 +1312,7 @@ mod tests {
                 metrics: None,
                 request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let call = handle
@@ -1389,23 +1458,22 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
+    async fn assert_duplicate_abort_and_reuse(public_id: &str) {
         let harness = Harness::unbounded(8);
         let mut first = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let mut second = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let old_a = accept_intake(harness.intake_rx.recv().unwrap());
         let old_b = accept_intake(harness.intake_rx.recv().unwrap());
-        assert!(harness.handle.abort(Some("same"), CancelledError));
-        assert!(!harness.handle.abort(Some("same"), CancelledError));
+        assert!(harness.handle.abort(Some(public_id), CancelledError));
+        assert!(!harness.handle.abort(Some(public_id), CancelledError));
         // Backend cancellation does not depend on polling either response.
         let aborted: std::collections::HashSet<_> = (0..2)
             .map(|_| harness.abort_rx.try_recv().unwrap().rid().clone())
@@ -1414,7 +1482,7 @@ mod tests {
 
         let new = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let new_request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1427,10 +1495,20 @@ mod tests {
         }
         drop((first, second));
         assert!(harness.abort_rx.try_recv().is_err());
-        assert!(harness.handle.abort(Some("same"), CancelledError));
+        assert!(harness.handle.abort(Some(public_id), CancelledError));
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &new_request.rid);
         drop(new);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
+        assert_duplicate_abort_and_reuse("same").await;
+    }
+
+    #[tokio::test]
+    async fn long_public_id_abort_cancels_duplicates_but_not_later_reuse() {
+        assert_duplicate_abort_and_reuse(&"x".repeat(200)).await;
     }
 
     #[tokio::test]
@@ -1703,6 +1781,7 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let mut submit =
@@ -1888,7 +1967,8 @@ mod tests {
     }
 
     /// A processor's media failures reach adapters as Python's loader classes:
-    /// a client fault is a 400, a server fault a 500. Neither is admitted.
+    /// a client fault is a 400, logged with its reason, a server fault a 500.
+    /// Neither is admitted.
     #[tokio::test]
     async fn processor_media_failures_keep_their_status_class() {
         use crate::message::types::TokenIds;
@@ -1921,6 +2001,7 @@ mod tests {
         let harness = Harness::unbounded(8);
         assert!(harness.handle.set_mm_processor(Arc::new(FailingFetch)));
         assert!(!harness.handle.set_mm_processor(Arc::new(FailingFetch)));
+        let logs = crate::utils::logging::capture_logs();
         for (source, status, message) in [
             ("custom://client", 400, "bad media"),
             ("custom://server", 500, "backend down"),
@@ -1941,6 +2022,11 @@ mod tests {
             assert_eq!(error.http_status().as_u16(), status, "{source}");
             assert_eq!(error.to_string(), message);
         }
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains("bad media")),
+            "{rejections:?}"
+        );
         assert!(harness.intake_rx.try_recv().is_err());
         assert!(harness.abort_rx.try_recv().is_err());
     }
@@ -1974,6 +2060,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             (handle, intake_rx)

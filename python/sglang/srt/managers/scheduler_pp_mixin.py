@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -26,16 +27,22 @@ from sglang.srt.managers.utils import (
     allocate_distinct_stream,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
+    pp_output_rows_to_host,
+    pp_output_rows_to_lists,
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.invariants import STAGE_CAPACITY_AGREEMENT
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    PP_ROUTED_EXPERTS_KEY,
+    returned_routed_experts_output,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.device import is_npu
@@ -44,7 +51,16 @@ from sglang.srt.utils.invariants import expect_host, resolve_level
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
+# Keeps verdicts apart from the untagged objects the stages exchange.
+_VERDICT_TAG = 1
+
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import (
+        ReleaseMemoryOccupationReqInput,
+        ReleaseMemoryOccupationReqOutput,
+        RpcReqInput,
+        RpcReqOutput,
+    )
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
@@ -54,12 +70,21 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        # The output message carries every chunk's routed experts to stage 0.
+        and not get_exec().features.enable_return_routed_experts
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_routed_experts_slots(result: GenerationBatchResult) -> Optional[torch.Tensor]:
+    output = result.routed_experts_output
+    if output is None or output.host_cache is None:
+        return None
+    return output.out_cache_loc
 
 
 def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -97,6 +122,8 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    # First stage only: where the routed experts that come back belong.
+    routed_experts_slots: Optional[torch.Tensor] = None
     # The step's launch record, which its processed result carries.
     forward_launch: Optional[ForwardLaunch] = None
     # Rank-local: the unified pool's record of this forward, retired when its
@@ -117,6 +144,9 @@ class SchedulerPPMixin:
     # the stages compare, and their digest up to this iteration (`init_pp_loop_state`).
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
+    _pp_reqs_awaiting_verdict: Tuple[
+        Union[ReleaseMemoryOccupationReqInput, RpcReqInput], ...
+    ] = ()
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -228,6 +258,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
+                self._pp_answer_verdict_requests()
 
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
@@ -256,33 +287,19 @@ class SchedulerPPMixin:
         Stage P
         recv ith req from previous stage
         pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
-        recv ith transferred req from previous stage
         recv ith proxy from previous stage
         run ith batch
-        recv prev (i+1) % mb_size th release req from previous stage
-        local consensus on release req
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
+        release transferred reqs (PPConsensusStore + pp_sync polls)
         send ith req to next stage
-        send ith transferred req to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
 
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
-
-        Release Requests still use the two-pass PP consensus. Bootstrap uses
-        PPConsensusStore instead of the legacy two-round RID sync.
-
         """
         self.init_pp_loop_state()
-
-        # PD additional state initialization
-        tmbs = [None] * self.pp_loop_size
-        transferred_rids: Dict[str, bool] = {}
-        release_rids: Optional[Dict[str, bool]] = None
-        send_transfer_work = []
-        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -296,7 +313,6 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
-                next_release_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -308,10 +324,6 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 self.process_bootstrapped_queue()
-
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
-                tmbs[mb_id] = transferred_rids
 
                 self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
@@ -358,15 +370,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
 
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -376,19 +380,15 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_transfer_queue(next_release_rids)
+                self.process_disagg_prefill_transfer_queue()
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     self._pp_send_capacity_digest()
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
+                self._pp_answer_verdict_requests()
 
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
                 if cur_batch:
                     self._pp_apply_war_barrier()
 
@@ -588,6 +588,7 @@ class SchedulerPPMixin:
                         send_transfer_work = []
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
+                self._pp_answer_verdict_requests()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -683,6 +684,10 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
         self._pp_capacity_send_work: List[P2PWork] = []
+        self._pp_verdict_send_work: List[P2PWork] = []
+        # Like the bootstrap poll forwards, the transfer-queue release decision
+        # forwards stay un-waited for the PP loop's depth.
+        self.pp_transfer_poll_send_window = PPSyncSendWindow(self.pp_loop_size)
         self._pp_init_stage_capacity()
 
     def _pp_init_stage_capacity(self: Scheduler) -> None:
@@ -743,34 +748,6 @@ class SchedulerPPMixin:
 
     def process_bootstrapped_queue(self: Scheduler):
         self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
-
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
-        """Return {rid: failed} for the transfers every stage so far has concluded.
-
-        Each stage sends the KV of its own layers, so the stages can conclude the
-        same request differently: a client abort that lands after the first stage
-        finished sending fails the later stages only. The outcome travels with the
-        consensus (failed on any stage = failed on every stage) so every stage
-        releases the request through the same path and keeps its prefix cache in
-        step with the others.
-        """
-        succeeded, failed = self.get_rids(
-            self.disagg_prefill_transfer_queue,
-            True,
-            [KVPoll.Success],
-            [KVPoll.Failed],
-        )
-        curr_transferred = dict.fromkeys(succeeded, False)
-        curr_transferred.update(dict.fromkeys(failed, True))
-        if self.pp_group.is_first_rank:
-            return curr_transferred
-        # Intersect with the previous stage's consensus; a failure anywhere wins.
-        prev_transferred = self._pp_recv_pyobj_from_prev_stage()
-        return {
-            rid: prev_transferred[rid] or rid_failed
-            for rid, rid_failed in curr_transferred.items()
-            if rid in prev_transferred
-        }
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
@@ -882,11 +859,17 @@ class SchedulerPPMixin:
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_reqs_to_next_stage(self: Scheduler, recv_reqs: List) -> List[P2PWork]:
-        return self._pp_send_pyobj_to_next_stage(
+        work = self._pp_send_pyobj_to_next_stage(
             strip_mm_features_for_pp_relay(recv_reqs), async_send=True
         )
+        # The next stage receives a verdict only once it has these requests.
+        work += self._pp_verdict_send_work
+        self._pp_verdict_send_work = []
+        return work
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler, data, async_send: bool = False, tag: int = 0
+    ):
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
@@ -903,10 +886,50 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 async_send=async_send,
+                tag=tag,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_pass_verdict(
+        self: Scheduler,
+        output: Union[ReleaseMemoryOccupationReqOutput, RpcReqOutput],
+        recv_req: Union[ReleaseMemoryOccupationReqInput, RpcReqInput],
+    ) -> None:
+        """Fold this stage's verdict into the earlier stages' and send it on."""
+        if self.pp_group.is_first_rank:
+            first_stage_ok = output.success
+            if first_stage_ok:
+                self._pp_reqs_awaiting_verdict += (recv_req,)
+            else:
+                # Answer a failure at once: a release fails on a busy pipeline,
+                # which stalls if this stage waits on a later one.
+                self.send_control_output(output, recv_req)
+        else:
+            first_stage_ok, earlier = self._pp_recv_pyobj_from_prev_stage(
+                tag=_VERDICT_TAG
+            )
+            if not earlier.success:
+                output = earlier
+        if not self.pp_group.is_last_rank:
+            self._pp_verdict_send_work += self._pp_send_pyobj_to_next_stage(
+                [first_stage_ok, output],
+                async_send=True,
+                tag=_VERDICT_TAG,
+            )
+        elif first_stage_ok:
+            # Blocking: a verdict is awaited only on an idle pipeline (a release
+            # succeeds only then, and an Engine RPC cannot overlap generation),
+            # and the first stage receives it at the end of its iteration.
+            self._pp_send_pyobj_to_next_stage([output], tag=_VERDICT_TAG)
+
+    def _pp_answer_verdict_requests(self: Scheduler) -> None:
+        """Blocks on the last stage, so runs after the iteration's sends."""
+        for recv_req in self._pp_reqs_awaiting_verdict:
+            (verdict,) = self._pp_recv_pyobj_from_prev_stage(tag=_VERDICT_TAG)
+            self.send_control_output(verdict, recv_req)
+        self._pp_reqs_awaiting_verdict = ()
+
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler, tag: int = 0):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
                 get_parallel().attn_dp_rank
@@ -921,6 +944,7 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                tag=tag,
             )
         else:
             data = None
@@ -987,6 +1011,8 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+        if result.routed_experts_output is not None:
+            tensor_dict[PP_ROUTED_EXPERTS_KEY] = result.routed_experts_output.topk
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1010,7 +1036,17 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    # Send last-stage outputs in full to stage 0 to avoid an
+                    # AllGather on the model group during graph replay.
+                    # The forward direction stays sharded for proxy messages.
+                    all_gather_group=(
+                        None
+                        if _is_npu
+                        and get_parallel().pp_size == 2
+                        and self.pp_group.is_last_rank
+                        and msg_type == "output"
+                        else self.attn_tp_group
+                    ),
                     async_send=async_send,
                 )
             )
@@ -1081,7 +1117,13 @@ class SchedulerPPMixin:
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=(
+                None
+                if _is_npu
+                and get_parallel().pp_size == 2
+                and self.pp_group.is_first_rank
+                else self.attn_tp_group
+            ),
         )
 
     def _pp_make_skip_output_result(
@@ -1141,6 +1183,7 @@ class SchedulerPPMixin:
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
+        routed_experts_rows = pp_outputs.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
 
         if (
             batch.return_logprob
@@ -1249,6 +1292,16 @@ class SchedulerPPMixin:
                 new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.draft_worker_common import (
+                make_draft_input_v2,
+            )
+
+            next_draft_input = make_draft_input_v2(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
 
         if self._pp_spec_relay:
             # Gated single-instance PP+spec: the sampled first token roots
@@ -1306,6 +1359,9 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             fpm_timing=mb_metadata.fpm_timing,
+            routed_experts_output=returned_routed_experts_output(
+                rows=routed_experts_rows, slots=mb_metadata.routed_experts_slots
+            ),
             forward_launch=mb_metadata.forward_launch,
             unified_forward_done=mb_metadata.unified_forward_done,
         )
@@ -1580,6 +1636,7 @@ class SchedulerPPMixin:
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
+                    pp_output_rows_to_lists(pp_outputs_to_send.tensors, q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
@@ -1753,6 +1810,7 @@ class SchedulerPPMixin:
                     else:
                         self.device_module.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
+                        pp_output_rows_to_lists(send_dict, q_event)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
             if pp_outputs.tensors.get("__skip__"):
@@ -1797,8 +1855,12 @@ class SchedulerPPMixin:
             with torch.profiler.record_function("send_recv_res_dict"):
                 recv_dict = self.pp_group.send_recv_tensor_dict(
                     send_tensor_dict=send_dict,
-                    send_all_gather_group=all_gather_group,
-                    recv_all_gather_group=all_gather_group,
+                    send_all_gather_group=(
+                        None if self.pp_group.is_last_rank else all_gather_group
+                    ),
+                    recv_all_gather_group=(
+                        None if self.pp_group.is_first_rank else all_gather_group
+                    ),
                 )
             _handle_recv_dict(recv_dict)
         elif send_dict is not None:
@@ -1850,19 +1912,21 @@ class SchedulerPPMixin:
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
+                    routed_experts_slots=_pp_routed_experts_slots(result),
                     forward_launch=result.forward_launch,
                     unified_forward_done=result.unified_forward_done,
                     forward_done=event,
                 )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
+                    tensor_dict = self._pp_prepare_tensor_dict(result, cur_batch)
+                    ready_event = event
+                    if pp_output_rows_to_host(tensor_dict):
+                        # The send waits for these copies, which follow the forward.
+                        ready_event = self.device_module.Event()
+                        ready_event.record(self.device_module.current_stream())
                     last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
-                        )
+                        (ready_event, PPProxyTensors(tensor_dict))
                     )
         return result, event
 

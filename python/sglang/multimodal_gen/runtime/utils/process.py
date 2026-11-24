@@ -13,6 +13,34 @@ from collections.abc import Iterator
 import psutil
 
 
+def local_media_subprocess_env() -> dict[str, str]:
+    """Local codecs need system paths and execution settings, not service credentials."""
+    keys = (
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_ORDER",
+        "NVIDIA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "OMP_NUM_THREADS",
+        "OMP_THREAD_LIMIT",
+    )
+    return {key: value for key in keys if (value := os.environ.get(key)) is not None}
+
+
 def kill_itself_when_parent_died() -> None:
     if sys.platform != "linux":
         return
@@ -31,6 +59,17 @@ def kill_itself_when_parent_died() -> None:
     # parent (e.g. running as a container's init process).
     if os.getppid() != parent_pid:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+def use_thread_lock_for_tqdm() -> None:
+    """Keep tqdm off its default multiprocessing RLock, a POSIX semaphore.
+
+    A worker killed by SIGTERM or PDEATHSIG never unlinks it, so shutdown prints
+    resource_tracker's "leaked semaphore objects" warning.
+    """
+    from tqdm import tqdm
+
+    tqdm.set_lock(threading.RLock())
 
 
 _full_gc_lock = threading.Lock()

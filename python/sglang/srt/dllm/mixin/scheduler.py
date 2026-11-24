@@ -59,6 +59,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
+        self._ack_waiting_health_checks()
         self.waiting_queue.reorder(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
@@ -78,7 +79,7 @@ class SchedulerDllmMixin:
 
         # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
-        self._update_state_for_batch(can_run_list, adder)
+        self._update_state_for_batch(adder)
 
         # Create and prepare batch
         new_batch = self._create_dllm_batch(
@@ -188,7 +189,12 @@ class SchedulerDllmMixin:
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
         ):
-            req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
+            req.finish_outside_step(
+                FINISH_LENGTH(
+                    length=len(req.output_ids),
+                    ignored_stop_position=req.ignored_stop_token_len,
+                )
+            )
 
         if req.finished():
             self.request_retirer.release(
@@ -331,9 +337,7 @@ class SchedulerDllmMixin:
                 adder, incoming_reqs, running_batch=running_batch
             )
 
-    def _update_state_for_batch(
-        self: Scheduler, can_run_list: List[Req], adder: PrefillAdder
-    ) -> None:
+    def _update_state_for_batch(self: Scheduler, adder: PrefillAdder) -> None:
         """Update state for the batch."""
 
         if adder.preempt_list:
@@ -359,6 +363,7 @@ class SchedulerDllmMixin:
             dllm_config=self.dllm_config,
         )
         new_batch.prepare_for_extend()
+        self.sampler_params_pool.write(new_batch.reqs)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
@@ -434,9 +439,6 @@ class DllmManager:
         abort: Callable[[Req], None],
     ):
         self.dllm_config = dllm_config
-        self.max_running_reqs = (
-            dllm_config.max_running_requests if dllm_config is not None else 1
-        )
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         self._abort_one = abort
 
