@@ -856,15 +856,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_page_size = (
             page_size // index_kpool if index_page_size is None else index_page_size
         )
+        self.index_size = size if index_size is None else index_size
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.shard_index_k = shard_index_k
-        if index_size is None:
-            index_size = size
-            if index_head_dim is not None and not (is_draft_worker or shard_index_k):
-                index_size *= self.dcp_size
-        self.index_size = index_size
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -1717,6 +1713,9 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             indexer_layer_ids = [
                 i for i, skip in enumerate(skip_topk_layers) if not skip
             ]
+        index_size = size
+        if not (is_draft_worker or shard_index_k):
+            index_size *= get_parallel().attn_dcp_size
         super().__init__(
             size=size,
             page_size=page_size,
@@ -1727,6 +1726,7 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             index_head_dim=index_head_dim,
+            index_size=index_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=kv_cache_dim,
             is_draft_worker=is_draft_worker,

@@ -290,6 +290,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
+        MemoryPoolConfigurator,
     )
 
 
@@ -452,26 +453,14 @@ class KVCacheConfigurator:
 
     @property
     def npu_dsa_shards_index_k(self) -> bool:
-        # The Ascend PD, host-cache, and prefill-CP paths use global Index-K.
-        if (
-            not _is_npu
-            or self.is_draft_worker
-            or get_parallel().attn_dcp_size <= 1
-            or not is_kimi_k31(self.model_config.hf_config)
-            or self.kv_cache_dtype != torch.bfloat16
-            or self.modelslim_cache_layout is not None
-            or get_parallel().attn_cp_size > 1
-            or get_disagg().disaggregation_mode != "null"
-            or get_memory().enable_hierarchical_cache
-            or get_memory().enable_hisparse
-        ):
+        if not _is_npu:
             return False
 
-        from sglang.srt.hardware_backend.npu.attention.dsa_index_k import (
-            get_scored_indexer,
+        from sglang.srt.hardware_backend.npu.pool_configurator import (
+            uses_sharded_index_k,
         )
 
-        return get_scored_indexer() is not None
+        return uses_sharded_index_k(self)
 
     @property
     def use_combined_kv_buffer(self) -> bool:
@@ -2415,6 +2404,12 @@ class KVCacheConfigurator:
                 get_glm_dsa_cp_layer_shard_info(self)
             )
 
+        # Indexer uses the allocator-global slot space on DCP target workers.
+        dcp_size = get_parallel().attn_dcp_size
+        if self.is_draft_worker:
+            index_size = max_total_num_tokens
+        else:
+            index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
         # Shared layers never access the indexer; pool sizing uses the same gate
         # so the saved indexer memory can be used for additional KV tokens.
@@ -2470,6 +2465,7 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            index_size=index_size,
             index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
@@ -3517,14 +3513,24 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
-    def _resolve_memory_pool_config(
-        self, pre_model_load_memory: int
-    ) -> MemoryPoolConfig:
-        """Profile GPU memory and resolve all pool parameters into a config."""
+    def _create_memory_pool_configurator(self) -> MemoryPoolConfigurator:
+        if self.npu_dsa_shards_index_k:
+            from sglang.srt.hardware_backend.npu.pool_configurator import (
+                NPUShardedIndexKPoolConfigurator,
+            )
+
+            return NPUShardedIndexKPoolConfigurator(self)
+
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
 
+        return create_memory_pool_configurator(self)
+
+    def _resolve_memory_pool_config(
+        self, pre_model_load_memory: int
+    ) -> MemoryPoolConfig:
+        """Profile GPU memory and resolve all pool parameters into a config."""
         # Foundry LOAD reuses the pool config SAVE resolved;
         # the free-memory profile the pool sizes come from differs between the two.
         replayed = get_foundry_adapter().replay_saved_memory_pool_config()
@@ -3539,7 +3545,7 @@ class KVCacheConfigurator:
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
-        configurator = create_memory_pool_configurator(self)
+        configurator = self._create_memory_pool_configurator()
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
         # Foundry SAVE records the resolved config for LOAD.
@@ -3554,12 +3560,7 @@ class KVCacheConfigurator:
         optional ``cap_tokens`` clamp."""
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             return self._unified_config_from_budget(budget_bytes, cap_tokens=cap_tokens)
-        # Local import avoids a pool_configurator import cycle.
-        from sglang.srt.model_executor.pool_configurator import (
-            create_memory_pool_configurator,
-        )
-
-        configurator = create_memory_pool_configurator(self)
+        configurator = self._create_memory_pool_configurator()
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
