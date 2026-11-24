@@ -21,6 +21,7 @@ from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.hf_transformers.processor as processor_utils
+import sglang.srt.hf_transformers.tokenizer as tokenizer_utils
 from sglang.srt.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -274,6 +275,83 @@ class TestGetProcessor(CustomTestCase):
 # ---------------------------------------------------------------------------
 # _patch_image_processor_kwargs
 # ---------------------------------------------------------------------------
+
+
+class TestGetTokenizerRevision(CustomTestCase):
+    def _load(self, **revision_kwargs):
+        from tokenizers import Tokenizer, models
+        from transformers import PreTrainedTokenizerFast
+
+        # A named subclass, so the load is not retried as a generic TokenizersBackend.
+        class TinyTokenizer(PreTrainedTokenizerFast):
+            pass
+
+        vocab = {"a": 0, "[UNK]": 1}
+        loaded = TinyTokenizer(
+            tokenizer_object=Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        )
+        cache_lookups = []
+
+        def fake_cache_lookup(model_name_or_path, filename, revision=None):
+            cache_lookups.append((filename, revision))
+            raise FileNotFoundError(filename)
+
+        auto_tokenizer = MagicMock()
+        auto_tokenizer.from_pretrained.return_value = loaded
+        tekken_probe = MagicMock(return_value=False)
+        with patch.multiple(
+            tokenizer_utils,
+            AutoTokenizer=auto_tokenizer,
+            is_bare_tekken_checkpoint=tekken_probe,
+            _resolve_local_or_cached_file=fake_cache_lookup,
+        ):
+            tokenizer_utils.get_tokenizer("org/model", **revision_kwargs)
+        return (
+            auto_tokenizer.from_pretrained.call_args.kwargs,
+            tekken_probe,
+            cache_lookups,
+        )
+
+    def test_revision_selects_the_branch_of_every_tokenizer_file(self):
+        """With `revision=`, the tekken probe and the post-load fix-ups must read
+        the files of that revision, not of the default branch."""
+        load_kwargs, tekken_probe, cache_lookups = self._load(revision="rev-a")
+
+        self.assertEqual(load_kwargs["revision"], "rev-a")
+        self.assertEqual(tekken_probe.call_args.args, ("org/model", "rev-a"))
+        self.assertEqual(
+            cache_lookups,
+            [("tokenizer.json", "rev-a"), ("tokenizer_config.json", "rev-a")],
+        )
+
+    def test_tokenizer_revision_is_loaded_as_the_revision(self):
+        """`tokenizer_revision=`, the spelling the processor reload passes, must
+        load that revision: AutoTokenizer only reads `revision`."""
+        load_kwargs, _, cache_lookups = self._load(tokenizer_revision="rev-a")
+
+        self.assertEqual(load_kwargs["revision"], "rev-a")
+        self.assertEqual({revision for _, revision in cache_lookups}, {"rev-a"})
+
+
+class TestMistralConfigRevision(CustomTestCase):
+    def test_params_json_is_fetched_at_the_requested_revision(self):
+        """A Mistral-format config must be parsed from the requested revision's
+        params.json, not from the default branch's."""
+        from sglang.srt.hf_transformers import common as hf_common
+        from sglang.srt.hf_transformers.mistral_utils import load_mistral_config
+
+        params = {"dim": 8, "n_layers": 1, "n_heads": 1, "hidden_dim": 16}
+        with tempfile.TemporaryDirectory() as snapshot_dir:
+            Path(snapshot_dir, "params.json").write_text(json.dumps(params))
+            with patch.object(
+                hf_common, "snapshot_download", return_value=snapshot_dir
+            ) as snapshot_download:
+                config = load_mistral_config(
+                    "org/mistral-revision-test", revision="rev-a"
+                )
+
+        self.assertEqual(config.hidden_size, 8)
+        self.assertEqual(snapshot_download.call_args.kwargs.get("revision"), "rev-a")
 
 
 class TestImageProcessorKwargsPatch(CustomTestCase):
