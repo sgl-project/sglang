@@ -530,6 +530,7 @@ def indexpool_verify_update(
         return
     width = raw_key_proj.shape[0] // bs
     assert raw_key_proj.stride(1) == 1 and width * bs == raw_key_proj.shape[0]
+    assert pages.shape[0] >= bs * width, "pages must hold one row per verify row"
     mrope = mrope_section is not None
     _verify_update_kernel[(bs, (width + 2) // 4 + 1)](
         raw_key_proj,
