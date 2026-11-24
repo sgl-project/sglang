@@ -15,6 +15,17 @@ pytestmark = pytest.mark.skipif(
     reason="HiCache TMA kernel requires SM90+",
 )
 
+
+@pytest.fixture(autouse=True)
+def _skip_unless_ring_fits():
+    # Production checks fits_device and keeps the register kernel when the smem
+    # ring does not fit one CTA (consumer Blackwell: ~99 KB opt-in per block).
+    if not _jit_hicache_tma_module(block_quota=2).fits_device(
+        torch.cuda.current_device()
+    ):
+        pytest.skip("the TMA staging ring does not fit this device's shared memory")
+
+
 POOL_TOKENS = 8192
 NUM_LAYERS = 3
 ROW_DIM = 256  # 512-byte bf16 rows: below the register kernel's 128 B unit width x 4

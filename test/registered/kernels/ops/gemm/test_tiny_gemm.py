@@ -163,7 +163,9 @@ def test_tiny_gemm_api(n, k):
     _skip_unsupported()
     torch.manual_seed(0)
     weight_dtype = torch.float32 if k == 5120 else torch.bfloat16
-    assert can_use_tiny_gemm(n, k)
+    if not can_use_tiny_gemm(n, k):
+        # e.g. K = 2880 is mma-only, and the mma template is SM90/SM100-only.
+        pytest.skip(f"no tiny GEMM template serves N={n}, K={k} on this device")
     w = (torch.randn(n, k, device="cuda") / k**0.5).to(weight_dtype)
     buf = torch.randn(16, k + 64, device="cuda").to(torch.bfloat16)
     x = buf[:, :k]
