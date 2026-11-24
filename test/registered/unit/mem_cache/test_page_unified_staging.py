@@ -468,6 +468,28 @@ class TestMHAPageFirstStaging(CustomTestCase):
                     [tokens] * 2,
                 )
 
+    def test_fixed_host_size_bounds_prepared_staging(self):
+        """With --hicache-size the host pool can hold fewer pages than one
+        staging round; scratch prepared before KV sizing must not exceed it."""
+        # 4 layers x 4 heads x (16 + 16) x 2 B = 1 KiB per token: 976 tokens.
+        with _mha_page_first_environment(hicache_size=1e-3):
+            pool = _device_pool(is_mla=False)
+            kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
+            prepared = pool.hicache_write_back_staging
+            host_pages = 976 // PAGE_SIZE + 1
+            self.assertEqual(
+                [buf.shape[0] for buf in prepared], [host_pages * PAGE_SIZE] * 2
+            )
+            with mock.patch.object(
+                torch, "empty", side_effect=AssertionError("late staging allocation")
+            ):
+                host = hybrid_pool_assembler.build_kv_host_pool(
+                    kv_pool=pool, page_size=PAGE_SIZE
+                )
+            self.assertEqual(host.page_num, host_pages)
+            self.assertEqual(host.staging_page_capacity, host_pages)
+            self.assertEqual(host.staging_k_buffer.data_ptr(), prepared[0].data_ptr())
+
 
 if __name__ == "__main__":
     unittest.main()

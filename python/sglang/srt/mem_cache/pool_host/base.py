@@ -44,6 +44,11 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
+def fixed_host_token_capacity(host_size: float, size_per_token: int) -> int:
+    """Tokens a --hicache-size host pool holds, before the padding page."""
+    return int(host_size * 1e9 // size_per_token)
+
+
 def prepare_page_unified_write_back_staging(
     geometry: PageUnifiedLayout,
     *,
@@ -478,7 +483,8 @@ class HostKVCache(abc.ABC):
         else:
             if host_size > 0:
                 self.size = sync_fixed_hicache_size(
-                    int(host_size * 1e9 // self.size_per_token), host_size
+                    fixed_host_token_capacity(host_size, self.size_per_token),
+                    host_size,
                 )
             else:
                 self.size = int(device_capacity_tokens * host_to_device_ratio)
