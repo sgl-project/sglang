@@ -522,7 +522,7 @@ class TestExportedCookbookCommands(CustomTestCase):
         self.assertLessEqual(exported, detected)
 
     def test_guide_sees_one_command_per_pick(self):
-        """Two spellings of one GPU (rtx6000, rtx-pro-6000) must not give the Guide
+        """Two spellings of one GPU must not give the Guide
         two commands for one pick, of which it would silently run the first."""
         device = {
             hw: name for name, hardware in interactive._HARDWARE for hw in hardware
@@ -659,7 +659,7 @@ class TestCliGuide(CustomTestCase):
         self.assertIn("CUDA_VISIBLE_DEVICES", stderr)
 
     def test_recipe_env_reaches_the_server_unless_exported(self):
-        recipe = _recipe(QWEN_NVFP4, "rtx6000", "low-latency")
+        recipe = _recipe(QWEN_NVFP4, "rtxpro6000", "low-latency")
         with patch.dict(interactive.os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "mine"}):
             execvpe, stdout, stderr, _ = self._guide(
                 QWEN_NVFP4,
@@ -750,7 +750,7 @@ class TestCliGuide(CustomTestCase):
 
     def test_terminal_edits_the_whole_command_in_an_editor(self):
         """What the user saves in $VISUAL launches, env lines included."""
-        recipe = _recipe(QWEN_NVFP4, "rtx6000", "low-latency")
+        recipe = _recipe(QWEN_NVFP4, "rtxpro6000", "low-latency")
         argv = edit_flags(
             argv=command_argv(recipe["command"]),
             edits="--port 8000 !--reasoning-parser",
@@ -860,7 +860,7 @@ class TestCliGuide(CustomTestCase):
             ("NVIDIA GB10", ("dgx-spark",)),
             (
                 "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-                ("rtx6000", "rtx-pro-6000"),
+                ("rtxpro6000",),
             ),
             ("NVIDIA GeForce RTX 5090", ("rtx5090",)),
             ("NVIDIA H20-3e", ("h20-3e",)),
