@@ -163,9 +163,29 @@ class TestDefaultModelLoader(CustomTestCase):
 
 
 class TestModelOptLoaderSelection(CustomTestCase):
+    def test_explicit_shard_formats_override_modelopt_loader_selection(self):
+        """ModelOpt auto-selection must not intercept processed-shard formats."""
+        for quantization in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
+            "modelopt_mixed",
+        ):
+            for load_format, expected_loader in (
+                (LoadFormat.SHARDED_STATE, loader_mod.ShardedStateLoader),
+                (LoadFormat.PRESHARDED, loader_mod.PreshardedModelLoader),
+            ):
+                with self.subTest(quantization=quantization, load_format=load_format):
+                    model_config = SimpleNamespace(
+                        quantization=quantization, _is_already_quantized=lambda: True
+                    )
+                    loader = loader_mod.get_model_loader(
+                        LoadConfig(load_format=load_format), model_config
+                    )
+                    self.assertIsInstance(loader, expected_loader)
+
     def test_every_modelopt_quantization_selects_the_modelopt_loader(self):
-        """A pre-quantized checkpoint under any ModelOpt quantization value must
-        load through ModelOptModelLoader, not fall through to the default loader."""
+        """Without an explicit shard format, retain the ModelOpt loader."""
         for quantization in (
             "modelopt",
             "modelopt_fp8",
@@ -182,7 +202,7 @@ class TestModelOptLoaderSelection(CustomTestCase):
                 )
 
 
-class TestShardedStateModelOptFp8(CustomTestCase):
+class TestModelOptFp8ProcessedShards(CustomTestCase):
     @staticmethod
     def _model(is_gated, intermediate):
         from sglang.srt.layers.moe import MoeRunnerBackend
@@ -216,6 +236,7 @@ class TestShardedStateModelOptFp8(CustomTestCase):
             )
         layer.quant_method = ModelOptFp8MoEMethod.__new__(ModelOptFp8MoEMethod)
         layer.quant_method._moe_runner_backend = MoeRunnerBackend.TRITON
+        model.load_weights = lambda weights: model.load_state_dict(dict(weights))
         return model
 
     @staticmethod
@@ -226,8 +247,15 @@ class TestShardedStateModelOptFp8(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             save_file(state, os.path.join(directory, "model-rank-0-part-0.safetensors"))
-            loader = loader_mod.ShardedStateLoader(
-                LoadConfig(load_format=LoadFormat.SHARDED_STATE)
+            model_config = SimpleNamespace(
+                model_path=directory,
+                revision=None,
+                dtype=torch.float32,
+                quantization="modelopt_fp8",
+                _is_already_quantized=lambda: True,
+            )
+            loader = loader_mod.get_model_loader(
+                LoadConfig(load_format=LoadFormat.SHARDED_STATE), model_config
             )
             with (
                 get_parallel().override(tp_rank=0, tp_size=1, pp_rank=0),
@@ -235,9 +263,7 @@ class TestShardedStateModelOptFp8(CustomTestCase):
                 patch.object(loader_mod, "_initialize_model", return_value=model),
             ):
                 return loader.load_model(
-                    model_config=SimpleNamespace(
-                        model_path=directory, revision=None, dtype=torch.float32
-                    ),
+                    model_config=model_config,
                     device_config=SimpleNamespace(device="cpu"),
                 )
 
@@ -297,6 +323,62 @@ class TestShardedStateModelOptFp8(CustomTestCase):
         expected = torch.full((2, 480, 16), -1.0)
         expected[:, :464] = source
         torch.testing.assert_close(loaded.experts.w13_weight, expected, rtol=0, atol=0)
+
+    def test_presharded_factory_loads_checkpoint_then_reuses_processed_cache(self):
+        """Both cold and cached startup must use the explicit presharded loader."""
+        from safetensors.torch import save_file
+
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+
+        def initialize_model(*_args):
+            model = self._model(is_gated=True, intermediate=232)
+            for param in model.parameters():
+                param.data.fill_(float("nan"))
+            return model
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            get_context().override_server_args(model_path=directory, device="cpu"),
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON),
+            get_parallel().override(
+                tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, world_group=None
+            ),
+            patch.object(loader_mod, "is_cuda_alike", return_value=False),
+            patch.object(loader_mod, "_get_quantization_config", return_value=None),
+            patch.object(loader_mod, "_initialize_model", side_effect=initialize_model),
+        ):
+            model_config = SimpleNamespace(
+                model_path=directory,
+                revision=None,
+                dtype=torch.float32,
+                quantization="modelopt_fp8",
+                _is_already_quantized=lambda: True,
+                is_draft_model=False,
+                hf_config=SimpleNamespace(),
+            )
+            checkpoint = os.path.join(directory, "model.safetensors")
+            source = self._model(is_gated=True, intermediate=232)
+            save_file(source.state_dict(), checkpoint)
+            source.experts.quant_method.process_weights_after_loading(source.experts)
+            expected = source.state_dict()
+
+            for cached in (False, True):
+                with self.subTest(cached=cached):
+                    loader = loader_mod.get_model_loader(
+                        LoadConfig(load_format=LoadFormat.PRESHARDED), model_config
+                    )
+                    loaded = loader.load_model(
+                        model_config=model_config,
+                        device_config=SimpleNamespace(device="cpu"),
+                    )
+                    for name, value in loaded.state_dict().items():
+                        torch.testing.assert_close(
+                            value.float(), expected[name].float(), rtol=0, atol=0
+                        )
+                    # A second startup must succeed without the original checkpoint.
+                    if not cached:
+                        os.unlink(checkpoint)
 
     def test_copy_helper_clears_preexisting_padding(self):
         # Do not rely on post-load allocation having initialized the tails.

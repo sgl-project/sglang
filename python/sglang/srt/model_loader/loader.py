@@ -4323,7 +4323,7 @@ def get_model_loader(
 
     # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
     # caller explicitly requests ModelOpt calibration/checkpoint/export work.
-    # Non-local loaders still own their weight transport path.
+    # Explicit transport and processed-shard formats keep their own loaders.
     modelopt_fp4_online = (
         model_config
         and model_config.quantization == "modelopt_fp4"
@@ -4334,7 +4334,12 @@ def get_model_loader(
         model_config
         and not modelopt_fp4_online
         and load_config.load_format
-        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
+        not in (
+            LoadFormat.RUNAI_STREAMER,
+            LoadFormat.REMOTE_INSTANCE,
+            LoadFormat.SHARDED_STATE,
+            LoadFormat.PRESHARDED,
+        )
     )
 
     if model_optloader_allowed and (
