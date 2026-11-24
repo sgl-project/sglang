@@ -99,8 +99,10 @@ class TestAlignCpRouterIds(CustomTestCase):
         self.assertIs(self._align(ids, ids, 1, 1), ids)
 
     def test_stale_global_view_is_replaced_not_trusted(self):
-        # A global view that matches neither row count (e.g. a leftover DP
-        # buffer) is stale: rebuild from the local operand instead of using it.
+        # A view that matches neither row count belongs to some other geometry
+        # (different padding or CP split): rebuild from the local operand
+        # instead of using it. V4 CP rejects DP attention outright
+        # (`attn_dp_size == 1`), so this is not a DP-crossover case.
         local_ids = torch.arange(16)
         aligned = self._align(local_ids, torch.arange(40), 16, 16 * CP)
         torch.testing.assert_close(aligned, _rank_major_view(local_ids))

@@ -108,14 +108,29 @@ def _align_cp_router_ids(input_ids, input_ids_global, local_rows, router_rows):
     The a2a-none CP fast path expands hidden rows to `router_rows` with
     `attn_cp_interleave_gather`, and the router indexes the per-token bias by
     those same rows. Two producer shapes reach the transport:
-    `cp_shard_model_inputs` already attached the complete router-row view, or
-    the caller only has rank-local ids (DSpark prefill never enters that context
+    `cp_shard_model_inputs` already attached the complete router-row view
+    (`cp_interleave_input_ids`, rank-major like the hidden gather), or the
+    caller only has rank-local ids (DSpark prefill never enters that context
     manager, so `input_ids_global` collapses onto the local ids). Reuse the
     attached view when it already spans the router rows; otherwise rebuild it
     from the rank-local operand with the collective that moved the hidden rows,
-    which keeps ids and hidden states in one row order by construction. A global
-    view that matches neither row count is stale rather than authoritative, so
-    it is replaced instead of trusted.
+    which keeps ids and hidden states in one row order by construction. Any
+    other row count describes neither view, so it is replaced instead of
+    trusted.
+
+    Two invariants are left unverified because neither is observable here
+    without an extra collective:
+
+    * A reused view must already be rank-major. `cp_interleave_input_ids` and
+      the hidden gather emit the same order, so the producers in tree satisfy
+      this; an equally-sized permutation would pass the row check and route to
+      the wrong image experts, so a future source with a different layout needs
+      explicit provenance rather than a size check.
+    * The reuse/rebuild split must be uniform across the CP group. `router_rows`
+      is `local_rows * cp_size` on every rank (the fixed-shape all-gather
+      already requires equal per-rank slices), so the row check is group
+      consistent as long as the producers attach the view under the same
+      predicate everywhere.
 
     `input_ids` is left rank-local: Engram reads it before the transport.
     """
