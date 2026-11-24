@@ -335,9 +335,11 @@ def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
     # Draft runners subclass the decode runner without its full field set, so they
     # are ruled out before any runner field is read.
     # FlashInfer's strict replay is single-rank only, as is the managed store here.
+    # Foundry captures or restores each shape itself; a restored graph looks nothing up.
     return (
         not mr.is_draft_worker
         and uses_flashinfer_managed_autotune_cache()
+        and not get_foundry_adapter().enabled
         and isinstance(runner.backend, FullCudaGraphBackend)
         and runner.capture_forward_mode == ForwardMode.DECODE
         and not runner.enable_torch_compile

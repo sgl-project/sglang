@@ -284,6 +284,12 @@ class TestCaptureReplayEligibility(_PublishedConfig):
             with self.subTest(context=context), context:
                 self.assert_eligible(_decode_runner(), False)
 
+    def test_foundry_graph_persistence(self):
+        # Foundry captures or restores each shape itself.
+        foundry = SimpleNamespace(enabled=True)
+        with patch.object(autotune, "get_foundry_adapter", return_value=foundry):
+            self.assert_eligible(_decode_runner(), False)
+
     def test_processes_without_the_managed_store(self):
         # Strict replay is single-rank; so is the store here.
         with get_parallel().override(max_world_size=2):
