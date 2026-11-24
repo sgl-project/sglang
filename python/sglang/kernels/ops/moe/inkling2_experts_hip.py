@@ -14,6 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx942_supported
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import _ue8m0
 from sglang.kernels.ops.moe.inkling2_route import ROUTE_MAX_IDS, route_metadata
 from sglang.kernels.ops.moe.inkling_moe import (
@@ -371,6 +372,15 @@ def default_config(rows, num_experts, nvfp4=False, mfma_order=False):
         if mfma_order:
             return GemmConfig(64, 128, 128, 1, 4, 1)
         return GemmConfig(64, 128, 64, 1, 8, 2)
+    # gfx942 (CDNA3) re-tiles this branch. The tile below is BN=128; activations
+    # are re-read N/BN times, and at prefill shapes (~171 rows per expert) their
+    # traffic is comparable to the expert weights', so BN=256 roughly halves it.
+    # Measured +19.0% on the real prefill shape and +6.3% end-to-end on 8x
+    # MI300X, numerically identical. BN=512 would need 131072 bytes of LDS
+    # against gfx942's 65536. Decode takes the rows_per_expert <= 32 branch
+    # above, which was swept separately and is already optimal here.
+    if is_gfx942_supported() and not mfma_order and not nvfp4:
+        return GemmConfig(64, 256, 256, 1, 8, 1)
     # swept on MI350X at 8192 tokens (~170 rows per expert)
     return GemmConfig(128, 128, 128, 1, 4, 1)
 
