@@ -13,7 +13,7 @@ register_cuda_ci(
 
 @marker.parametrize("rows", [32, 340, 2720, 3173], [3173])
 @marker.parametrize("hidden", [3072, 9216], [3072])
-@marker.benchmark("impl", ["eager", "fused"], unit="us")
+@marker.benchmark("impl", ["eager", "fused"], unit="us", gate=["fused"])
 def benchmark(rows: int, hidden: int, impl: str):
     x = torch.randn((rows, hidden), dtype=torch.bfloat16, device="cuda")
 

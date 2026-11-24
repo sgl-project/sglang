@@ -16,7 +16,7 @@ from sglang.kernels.ops.kv_canary.verify import CANARY_SLOT_BYTES
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="weekly", runner_config="1-gpu-large")
-register_amd_ci(est_time=300, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=300, suite="nightly-kernel-test-1-gpu-amd", nightly=True)
 
 _NUM_SLOTS = 4096
 _VOCAB_SIZE = 32768
