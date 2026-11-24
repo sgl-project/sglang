@@ -2,23 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import hashlib
 import logging
-import math
-import multiprocessing
 import os
-import tempfile
-import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
-import psutil
 import tqdm
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -36,7 +25,6 @@ _current_app_state: contextvars.ContextVar[Optional[Any]] = contextvars.ContextV
     "_current_app_state", default=None
 )
 _DEFAULT_MAX_PREFILL_SIZE = 32768
-_DEFAULT_BARRIER_TIMEOUT_S = 600.0
 
 
 def warmup(name: str, *, rust_server: bool = False):
@@ -70,73 +58,6 @@ async def execute_warmups(
             await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
     finally:
         _current_app_state.reset(token)
-
-
-def _positive_int(value: Any) -> Optional[int]:
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return None
-
-
-def _multi_worker_info(tm: Any) -> Optional[tuple[str, int, int]]:
-    """Return `(path_prefix, main_pid, num_workers)` when in multi-tokenizer mode."""
-    parent_pid = getattr(multiprocessing.current_process(), "_parent_pid", None)
-    server_args = getattr(tm, "server_args", None)
-    num_workers = _positive_int(getattr(server_args, "tokenizer_worker_num", 1))
-    if parent_pid is None or num_workers is None or num_workers <= 1:
-        return None
-    port = getattr(server_args, "port", 0)
-    tag = hashlib.sha256(
-        f"{parent_pid}:{port}:{getattr(tm, 'startup_time', None)!r}".encode()
-    ).hexdigest()[:12]
-    prefix = os.path.join(
-        tempfile.gettempdir(), f"sglang_warmup_{parent_pid}_{port}_{tag}"
-    )
-    return prefix, parent_pid, num_workers
-
-
-def sync_multi_worker_ready_barrier(tm: Any, timeout_s: float = 0) -> bool:
-    """Wait until all tokenizer workers finish warmup; return True on the leader."""
-    info = _multi_worker_info(tm)
-    if info is None:
-        return True
-    prefix, main_pid, num_workers = info
-    barrier_dir = f"{prefix}_ready"
-    my_pid = os.getpid()
-    os.makedirs(barrier_dir, exist_ok=True)
-    with open(os.path.join(barrier_dir, str(my_pid)), "w"):
-        pass
-
-    effective_timeout = (
-        timeout_s
-        if isinstance(timeout_s, (int, float))
-        and not isinstance(timeout_s, bool)
-        and math.isfinite(timeout_s)
-        and timeout_s > 0
-        else _DEFAULT_BARRIER_TIMEOUT_S
-    )
-    deadline = time.monotonic() + effective_timeout
-    live_pids = [my_pid]
-    while time.monotonic() < deadline:
-        try:
-            live_pids = [
-                int(entry)
-                for entry in os.listdir(barrier_dir)
-                if entry.isdigit() and psutil.pid_exists(int(entry))
-            ]
-        except OSError:
-            live_pids = []
-        main_alive = psutil.pid_exists(main_pid)
-        if len(live_pids) >= num_workers or not main_alive:
-            return main_alive and bool(live_pids) and my_pid == min(live_pids)
-        time.sleep(0.05)
-
-    logger.warning(
-        "Timed out waiting for %d tokenizer workers (%d ready).",
-        num_workers,
-        len(live_pids),
-    )
-    return bool(live_pids) and my_pid == min(live_pids)
 
 
 @warmup("whisper_autodetect")
@@ -209,6 +130,12 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
 
 
 def _max_warmup_input_len(tm: Any, max_new_tokens: int = 1) -> Optional[int]:
@@ -341,7 +268,7 @@ async def _send_warmup_request(
         pass
 
 
-async def _run_all_gpu_warmups(disaggregation_mode: str, tm: TokenizerManager) -> None:
+async def _warm_gpu_paths(disaggregation_mode: str, tm: TokenizerManager) -> None:
     if not getattr(tm, "is_generation", True):
         logger.info("Skipping GPU generation warmup for non-generation model.")
         return
@@ -488,7 +415,7 @@ async def _run_all_gpu_warmups(disaggregation_mode: str, tm: TokenizerManager) -
 
 
 async def _warm_local_worker(tm: Any, app_state: Optional[Any]) -> None:
-    """Warm per-process tokenizer, byte-level BPE cache, and chat template state."""
+    """Warm tokenizer, byte-level BPE cache, and chat template state."""
     if getattr(tm, "skip_tokenizer_init", False):
         return
 
@@ -537,15 +464,5 @@ async def _warm_local_worker(tm: Any, app_state: Optional[Any]) -> None:
 
 @warmup("all")
 async def warmup_all(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    info = _multi_worker_info(tokenizer_manager) if fcntl is not None else None
-    if info is None:
-        await _run_all_gpu_warmups(disaggregation_mode, tokenizer_manager)
-    else:
-        with open(f"{info[0]}_all.lock", "a+", encoding="utf-8") as lock_file:
-            await asyncio.to_thread(fcntl.flock, lock_file.fileno(), fcntl.LOCK_EX)
-            lock_file.seek(0)
-            if not lock_file.read():
-                await _run_all_gpu_warmups(disaggregation_mode, tokenizer_manager)
-                lock_file.write("1")
-                lock_file.flush()
+    await _warm_gpu_paths(disaggregation_mode, tokenizer_manager)
     await _warm_local_worker(tokenizer_manager, _current_app_state.get())

@@ -1,22 +1,14 @@
-"""Unit tests for `--warmups all`, context bounds, and multi-worker coordination."""
+"""Unit tests for `--warmups all` and context-length bounded prefill warmups."""
 
 from __future__ import annotations
 
 import asyncio
-import glob
-import multiprocessing
-import os
-import shutil
-import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from sglang.srt.entrypoints import http_server as http_server_mod
 from sglang.srt.entrypoints import warmup as warmup_mod
-from sglang.srt.model_executor.model_runner import ModelRunner, SamplingPrewarmResult
-from sglang.srt.sampling.penalties import apply_scaling_penalties
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -45,14 +37,11 @@ class _FakeTokenizerManager:
             vocab_size=vocab_size, context_len=context_len
         )
         self.server_args = SimpleNamespace(
-            tokenizer_worker_num=4,
-            port=18999,
             grammar_backend="xgrammar",
             context_length=context_len,
             chunked_prefill_size=4096,
             max_prefill_tokens=16384,
         )
-        self.startup_time = {"scheduler_init": 123.45}
         self.async_dynamic_batch_tokenizer = SimpleNamespace(
             encode=AsyncMock(return_value=[1, 2])
         )
@@ -145,83 +134,8 @@ def test_warmup_all_handles_tiny_vocab_and_non_generation_models():
     embed_tm.async_dynamic_batch_tokenizer.encode.assert_awaited_once()
 
 
-def test_warmup_all_deduplicates_gpu_work_across_multi_workers():
-    shared = {"run_id": uuid.uuid4().hex}
-    tm_0 = _FakeTokenizerManager(context_len=512, max_req_input_len=500)
-    tm_1 = _FakeTokenizerManager(context_len=512, max_req_input_len=500)
-    tm_0.startup_time = tm_1.startup_time = shared
-    for timeout_s in (-1, 0, float("inf"), float("nan")):
-        assert warmup_mod.sync_multi_worker_ready_barrier(tm_0, timeout_s) is True
-
-    with patch.object(
-        multiprocessing,
-        "current_process",
-        return_value=SimpleNamespace(_parent_pid=os.getpid()),
-    ):
-        prefix, _, _ = warmup_mod._multi_worker_info(tm_0)
-        try:
-            asyncio.run(warmup_mod.execute_warmups("null", ["all"], tm_0))
-            asyncio.run(warmup_mod.execute_warmups("null", ["all"], tm_1))
-        finally:
-            for path in glob.glob(f"{prefix}_*"):
-                shutil.rmtree(path, ignore_errors=True)
-                if os.path.exists(path):
-                    os.remove(path)
-
-    assert len(tm_0.requests) > 0 and tm_0.flush_count == 1
-    assert len(tm_1.requests) == 0 and tm_1.flush_count == 0
-    tm_0.async_dynamic_batch_tokenizer.encode.assert_awaited_once()
-    tm_1.async_dynamic_batch_tokenizer.encode.assert_awaited_once()
-
-
-def test_local_requests_session_and_prewarm_sampling():
-    with http_server_mod._local_requests_session() as session:
-        assert session.trust_env is False
-
-    assert callable(apply_scaling_penalties)
-    runner = SimpleNamespace(
-        model_config=SimpleNamespace(vocab_size=128),
-        device="cuda:0",
-        dtype=None,
-        server_args=SimpleNamespace(warmups="prefill_shapes"),
-        is_generation=True,
-        is_draft_worker=False,
-        sampler=MagicMock(),
-    )
-    result = ModelRunner.prewarm_sampling(runner)
-    assert result == SamplingPrewarmResult()
-    runner.sampler.assert_not_called()
-
-    # Exercise the active prewarm_sampling body on CPU with patched CUDA/kernel hooks
-    # so missing imports or broken SamplingBatchInfo fields fail fast in CI.
-    import torch
-
-    runner.server_args = SimpleNamespace(warmups="all")
-    runner.device = "cpu"
-    mock_exec = SimpleNamespace(
-        dllm=SimpleNamespace(dllm_algorithm=None),
-        deterministic=SimpleNamespace(enable_deterministic_inference=False),
-    )
-    with (
-        patch.object(torch.cuda, "is_available", return_value=True),
-        patch.object(torch.cuda, "synchronize"),
-        patch(
-            "sglang.srt.model_executor.model_runner.get_exec",
-            return_value=mock_exec,
-        ),
-        patch(
-            "sglang.srt.model_executor.model_runner.get_parallel",
-            return_value=SimpleNamespace(tp_rank=0),
-        ),
-        patch("sglang.srt.layers.logsumexp.row_logsumexp") as mock_lse,
-        patch("sglang.srt.layers.logsumexp.row_logsumexp_topk") as mock_lse_topk,
-        patch("sglang.srt.sampling.penalties.apply_scaling_penalties") as mock_pen,
-    ):
-        runner.device = "cuda:0"
-        with patch.object(torch, "device", return_value=torch.device("cpu")):
-            result = ModelRunner.prewarm_sampling(runner)
-    assert result == SamplingPrewarmResult()
-    assert runner.sampler.call_count == 6
-    assert mock_pen.call_count == 2
-    assert mock_lse.call_count == 1
-    assert mock_lse_topk.call_count == 3
+def test_warmup_all_respects_max_prefill_size_env(monkeypatch):
+    monkeypatch.setenv("SGLANG_WARMUP_MAX_PREFILL_SIZE", "256")
+    tm = _FakeTokenizerManager(context_len=65536, max_req_input_len=40960)
+    asyncio.run(warmup_mod.execute_warmups("null", ["all"], tm))
+    assert max(len(r.input_ids) for r in tm.requests) == 256

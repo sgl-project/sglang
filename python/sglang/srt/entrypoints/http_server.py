@@ -137,10 +137,7 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.uvicorn_worker_spawn import (
     skip_main_reimport_in_spawned_workers,
 )
-from sglang.srt.entrypoints.warmup import (
-    execute_warmups,
-    sync_multi_worker_ready_barrier,
-)
+from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
@@ -2410,13 +2407,6 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _local_requests_session() -> requests.Session:
-    """Session for loopback self-requests unaffected by ambient HTTP_PROXY."""
-    session = requests.Session()
-    session.trust_env = False
-    return session
-
-
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2427,19 +2417,18 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Wait until the server is launched
     success = False
-    with _local_requests_session() as session:
-        for _ in range(120):
-            time.sleep(1)
-            try:
-                res = session.get(
-                    url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-                )
-                assert res.status_code == 200, f"{res=}, {res.text=}"
-                success = True
-                break
-            except (AssertionError, requests.exceptions.RequestException):
-                last_traceback = traceback.format_exc()
-                pass
+    for _ in range(120):
+        time.sleep(1)
+        try:
+            res = requests.get(
+                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            success = True
+            break
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = traceback.format_exc()
+            pass
 
     if not success:
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
@@ -2552,15 +2541,15 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            with _local_requests_session() as session:
-                res = session.post(
-                    url + request_name,
-                    json=json_data,
-                    headers=headers,
-                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                    verify=ssl_verify,
-                )
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                verify=ssl_verify,
+            )
             assert res.status_code == 200, f"{res.text}"
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2585,7 +2574,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                     get_disagg().disaggregation_mode,
                     failed_status_codes,
                 )
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            _global_state.tokenizer_manager.server_status = (
+                ServerStatus.Up if not failed_status_codes else ServerStatus.UnHealthy
+            )
 
     except Exception:
         last_traceback = traceback.format_exc()
@@ -2616,17 +2607,16 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    with _local_requests_session() as session:
-        try:
-            res = session.post(
-                server_args.url() + "/freeze_gc",
-                headers=freeze_headers,
-                timeout=10,
-                verify=ssl_verify_of(server_args),
-            )
-            res.raise_for_status()
-        except requests.exceptions.RequestException:
-            logger.warning("post-warmup freeze_gc failed", exc_info=True)
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
 def _wait_and_warmup(
@@ -2649,19 +2639,12 @@ def _wait_and_warmup(
     if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
-
-    is_leader_worker = True
-    if _global_state.tokenizer_manager.server_status != ServerStatus.UnHealthy:
-        if not getattr(app, "is_single_tokenizer_mode", False):
-            is_leader_worker = sync_multi_worker_ready_barrier(
-                _global_state.tokenizer_manager, envs.SGLANG_WARMUP_TIMEOUT.get()
-            )
+    else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     if post_warmup_callback is not None:
         post_warmup_callback()
-    if is_leader_worker:
-        _freeze_gc_after_server_warmup(server_args)
+    _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
