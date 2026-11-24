@@ -1,11 +1,11 @@
 """CPU page-lifetime ledger, independent of trees, CUDA, and transport workers.
 
 The allocator owner calls allocation/free/epoch methods. Background threads may
-publish, pin, and release, but never physically free a page. A grant protects
+publish, pin, and release, but never physically free a page. A Pin protects its
 pages immediately, including prepared/partial exports. The adapter supplies a
-common TP epoch and maps its
-conservative protection union into rank-local PageRefs; this module never runs
-collectives. The allocator must apply returned reclaim batches before reuse.
+common TP epoch and maps its conservative protection union into rank-local
+PageRefs; this module never runs collectives. The allocator must apply returned
+reclaim batches before reuse.
 """
 
 import threading
@@ -56,6 +56,12 @@ def _epoch_id(epoch_id):
         raise EpochError("allocation epoch id must be an integer")
 
 
+def _distinct(refs):
+    # A repeated page would be counted twice by the owned and held counters.
+    if len(set(refs)) != len(refs):
+        raise ValueError("pages must be distinct")
+
+
 @dataclass(frozen=True, order=True)
 class PageRef:
     pool_epoch: int
@@ -68,7 +74,8 @@ class LeaseIdentity:
     source_incarnation: str
     target_incarnation: str
     # The wire protocol's TransferId: a frozen value of target_incarnation, rid
-    # and attempt. Replay history retains it, so its fields are bounded here.
+    # and attempt. Pin requests decode it from the control wire, so its fields
+    # are bounded here.
     transfer_id: object
     nonce: str
 
@@ -83,12 +90,6 @@ class LeaseIdentity:
             raise ValueError("transfer_id.attempt must be a bounded integer")
 
 
-@dataclass(frozen=True)
-class PinGrant:
-    identity: LeaseIdentity
-    pages: tuple[PageRef, ...]
-
-
 class PageState(str, Enum):
     ALLOCATED = "ALLOCATED"
     PUBLISHED = "PUBLISHED"
@@ -98,69 +99,12 @@ class PageState(str, Enum):
 
 
 @dataclass(frozen=True)
-class FreeDecision:
-    immediately_reusable: tuple[PageRef, ...] = ()
-    deferred: tuple[PageRef, ...] = ()
-    pending: tuple[PageRef, ...] = ()
-    backpressured: bool = False
-
-
-@dataclass(frozen=True)
-class Snapshot:
-    """Immutable census; held_pages includes prepared and partial Pin grants."""
-
-    pool_epoch: int
-    local_owned_pages: tuple[PageRef, ...]
-    published_pages: tuple[PageRef, ...]
-    held_pages: tuple[PageRef, ...]
-    held_local_owned_pages: tuple[PageRef, ...]
-    deferred_pages: tuple[PageRef, ...]
-    pending_pages: tuple[PageRef, ...]
-    free_pages: tuple[PageRef, ...]
-    active_leases: tuple[PinGrant, ...]
-    completed_leases: tuple[PinGrant, ...]
-    frozen_epoch: int | None
-    installed_epoch: int | None
-    protected_pages: frozenset[PageRef]
-    backpressured: bool
-
-    @property
-    def unique_held_local_owned_pages(self):
-        return len(self.held_local_owned_pages)
-
-    @property
-    def reclaim_overflow_pages(self):
-        held = set(self.held_pages)
-        return tuple(ref for ref in self.deferred_pages if ref not in held)
-
-
-@dataclass(frozen=True)
 class EpochSnapshot:
-    """Sparse admission/reclaim state; constructing it never scans the pool.
+    """Held and reclaimable pages at epoch begin; constructing it never scans
+    the pool. Candidates still need the common epoch protection check."""
 
-    Full publication, free-page and replay-history lists are debug-only via
-    snapshot(). Candidate pages still need the common epoch protection check.
-    """
-
-    pool_epoch: int
     held_pages: tuple[PageRef, ...]
-    held_local_owned_pages: tuple[PageRef, ...]
     reclaim_candidate_pages: tuple[PageRef, ...]
-    registered_page_count: int
-    local_owned_page_count: int
-    deferred_page_count: int
-    pending_reclaim_page_count: int
-    reclaim_overflow_page_count: int
-    free_page_count: int
-    active_lease_count: int
-    frozen_epoch: int
-    installed_epoch: int | None
-    protected_pages: frozenset[PageRef]
-    backpressured: bool
-
-    @property
-    def unique_held_local_owned_pages(self):
-        return len(self.held_local_owned_pages)
 
 
 @dataclass(frozen=True)
@@ -174,7 +118,7 @@ class OwnerCounts:
     pending_reclaim_pages: int
     reclaim_overflow_pages: int
     frozen_epoch: int | None
-    credit_remaining: int | None
+    credit_remaining: int
     revision: int
 
 
@@ -187,13 +131,14 @@ class _Page:
 
 
 class SlotGuard:
-    """Bounded page metadata and fail-closed replay history.
+    """Bounded page metadata for remote Pins and owner reclaim.
 
     max_pages bounds the physical registration domain (including FREE records);
-    an adapter should pass its pool size. A full pending queue retains overflow
-    in the existing page records as DEFERRED and backpressures all new Pins.
-    Tombstone space is reserved on admission, so release never needs eviction.
-    No callbacks, hashing of payloads, I/O or accelerator work run under _lock.
+    the allocator checks its pool against it. A full pending queue retains
+    overflow in the existing page records as DEFERRED and backpressures all new
+    Pins. Callers own Pin replay: each lease identity is pinned once and
+    released once. No callbacks, hashing of payloads, I/O or accelerator work
+    run under _lock.
     """
 
     def __init__(
@@ -204,10 +149,7 @@ class SlotGuard:
         max_remote_pinned_pages: int,
         max_active_leases: int,
         max_pending_reclaim_pages: int,
-        max_pin_pages: int = 4096,
-        max_tombstones: int = 65536,
         max_pages: int = 1 << 20,
-        shared_headroom_credit: bool = False,
     ):
         self.pool_epoch = pool_epoch
         self._allocation_faulted = False
@@ -215,18 +157,13 @@ class SlotGuard:
         self.max_remote_pinned_pages = max_remote_pinned_pages
         self.max_active_leases = max_active_leases
         self.max_pending_reclaim_pages = max_pending_reclaim_pages
-        self.max_pin_pages = max_pin_pages
-        self.max_tombstones = max_tombstones
         self.max_pages = max_pages
-        self._shared_headroom_credit = shared_headroom_credit
-        self._credit_remaining = 0 if shared_headroom_credit else None
+        # New Pins draw on headroom that a finished common epoch verified.
+        self._credit_remaining = 0
         self._owner_thread = threading.get_ident()
         self._lock = threading.RLock()
         self._pages: dict[int, _Page] = {}
-        self._active: dict[LeaseIdentity, PinGrant] = {}
-        self._completed: dict[LeaseIdentity, PinGrant] = {}
-        self._nonces: dict[str, LeaseIdentity] = {}
-        self._transfers: dict[object, LeaseIdentity] = {}
+        self._active: dict[LeaseIdentity, tuple[PageRef, ...]] = {}
         self._held_count = self._pending_count = self._overflow_count = 0
         self._local_owned_count = 0
         self._owner_revision = 0
@@ -245,15 +182,6 @@ class SlotGuard:
                 "operation belongs to the allocator owner thread"
             )
 
-    def _refs(self, refs, *, allow_empty=False, bounded=True):
-        if type(refs) is not tuple or (not refs and not allow_empty):
-            raise ValueError("pages must be a nonempty immutable tuple")
-        if len(refs) > (self.max_pin_pages if bounded else self.max_pages):
-            raise ValueError("page request exceeds the bounded batch size")
-        if any(type(ref) is not PageRef for ref in refs) or len(set(refs)) != len(refs):
-            raise ValueError("pages must contain distinct PageRefs")
-        return refs
-
     def _current(self, ref):
         if ref.pool_epoch != self.pool_epoch:
             raise PageUnavailable("pool epoch mismatch")
@@ -271,25 +199,9 @@ class SlotGuard:
     def _backpressured(self):
         return self._overflow_count > 0
 
-    def _binding(self, identity):
-        for bound in (
-            self._nonces.get(identity.nonce),
-            self._transfers.get(identity.transfer_id),
-        ):
-            if bound is not None and bound != identity:
-                raise ReplayConflict(
-                    "nonce or transfer is already bound to another lease"
-                )
-
     def _allocation_refs_locked(self, page_ids):
         self._allocation_epoch_preflight_locked()
-        if len(set(page_ids)) != len(page_ids) or any(
-            type(page_id) is not int or page_id < 0 for page_id in page_ids
-        ):
-            raise ValueError("allocation pages must be distinct page ids")
-        new_pages = sum(page_id not in self._pages for page_id in page_ids)
-        if len(self._pages) + new_pages > self.max_pages:
-            raise ValueError("allocation exceeds the page registration limit")
+        _distinct(page_ids)
         refs = []
         for page_id in page_ids:
             old = self._pages.get(page_id)
@@ -300,8 +212,7 @@ class SlotGuard:
         return tuple(refs)
 
     def _allocation_epoch_preflight_locked(self):
-        if self._allocation_faulted:
-            raise EpochError("allocation owner is permanently faulted")
+        # A faulted owner keeps its frozen epoch uninstalled, so this fences it.
         if self._frozen_epoch is not None and self._installed_epoch is None:
             raise EpochError("allocation requires the frozen epoch to be committed")
 
@@ -316,6 +227,7 @@ class SlotGuard:
                 self._allocation_refs_locked(page_ids)
 
     def register_allocation(self, page_ids: tuple[int, ...]) -> tuple[PageRef, ...]:
+        """``page_ids`` come from the owner's own free queue: physical page ids."""
         self._owner()
         with self._lock:
             refs = self._allocation_refs_locked(page_ids)
@@ -327,7 +239,6 @@ class SlotGuard:
 
     def publish(self, refs: tuple[PageRef, ...]):
         """Publish only after the caller has independently verified producer ready."""
-        self._refs(refs)
         with self._lock:
             pages = [self._current(ref) for ref in refs]
             if any(not page.local_owned for page in pages):
@@ -338,7 +249,6 @@ class SlotGuard:
 
     def published_refs_current(self, refs: tuple[PageRef, ...]) -> bool:
         """Bounded metadata preflight, repeated atomically by try_pin later."""
-        self._refs(refs)
         with self._lock:
             try:
                 return all(
@@ -349,22 +259,14 @@ class SlotGuard:
             except PageUnavailable:
                 return False
 
-    @property
-    def shared_headroom_credit_enabled(self):
-        return self._shared_headroom_credit
-
-    def try_pin(self, identity: LeaseIdentity, refs: tuple[PageRef, ...]) -> PinGrant:
+    def try_pin(self, identity: LeaseIdentity, refs: tuple[PageRef, ...]):
+        """Pin ``refs`` for one lease. The caller pins each identity at most once
+        and bounds the batch size."""
         self._identity(identity)
-        self._refs(refs)
+        _distinct(refs)
         with self._lock:
-            self._binding(identity)
-            existing = self._active.get(identity)
-            if existing is not None:
-                if existing.pages != refs:
-                    raise ReplayConflict("active lease page binding changed")
-                return existing
-            if identity in self._completed:
-                raise ReplayConflict("released lease cannot be revived")
+            if identity in self._active:
+                raise ReplayConflict("lease is already active")
             pages = [self._current(ref) for ref in refs]
             if any(
                 not page.local_owned or page.state is not PageState.PUBLISHED
@@ -373,34 +275,25 @@ class SlotGuard:
                 raise PageUnavailable(
                     "Pin requires current published locally owned pages"
                 )
-            if self._allocation_faulted or self._frozen_epoch is not None:
+            if self._frozen_epoch is not None:
                 raise PinsFrozen("new Pins are frozen through allocation commit")
             if self._backpressured():
                 raise QuotaExceeded("retired page overflow requires owner reclaim")
             if len(self._active) >= self.max_active_leases:
                 raise QuotaExceeded("active lease quota exhausted")
-            if len(self._active) + len(self._completed) >= self.max_tombstones:
-                raise QuotaExceeded("replay history capacity exhausted")
             newly_held = sum(not page.readers for page in pages)
             if self._held_count + newly_held > self.max_remote_pinned_pages:
                 raise QuotaExceeded("unique remotely protected page quota exhausted")
-            if self._shared_headroom_credit and (
-                self._credit_remaining is None or newly_held > self._credit_remaining
-            ):
+            if newly_held > self._credit_remaining:
                 raise QuotaExceeded("verified cumulative headroom credit exhausted")
-            grant = PinGrant(identity, refs)
             for page in pages:
                 if not page.readers:
                     self._held_pages.add(page.ref)
                 page.readers.add(identity)
             self._held_count += newly_held
-            if self._shared_headroom_credit:
-                self._credit_remaining -= newly_held
-            self._active[identity] = grant
-            self._nonces[identity.nonce] = identity
-            self._transfers[identity.transfer_id] = identity
+            self._credit_remaining -= newly_held
+            self._active[identity] = refs
             self._owner_revision += 1
-            return grant
 
     def _queue(self, page):
         self._retired_pages.add(page.ref)
@@ -412,42 +305,34 @@ class SlotGuard:
             page.state = PageState.DEFERRED
             self._overflow_count += 1
 
-    def release(self, identity, refs) -> bool:
-        """Release a Pin once its reader has drained and unmapped every export."""
-        self._identity(identity)
-        self._refs(refs)
+    def release(self, identity: LeaseIdentity, refs: tuple[PageRef, ...]):
+        """Release a Pin once its reader has drained and unmapped every export.
+        The caller releases each pinned identity once, with its pinned pages."""
         with self._lock:
-            self._binding(identity)
-            grant = self._active.get(identity) or self._completed.get(identity)
-            if grant is None:
-                raise SlotGuardError("unknown lease retains all page ownership")
-            if grant.pages != refs:
-                raise ReplayConflict("release page binding changed")
-            if identity in self._completed:
-                return False
+            if self._active.get(identity) != refs:
+                raise SlotGuardError("release does not match an active lease")
+            del self._active[identity]
             for ref in refs:
-                page = self._current(ref)
+                page = self._pages[ref.page_id]
                 page.readers.remove(identity)
                 if not page.readers:
                     self._held_count -= 1
                     self._held_pages.remove(page.ref)
                     if not page.local_owned:
                         self._queue(page)
-            del self._active[identity]
-            self._completed[identity] = grant
             self._owner_revision += 1
-            return True
 
-    def on_free(self, refs: tuple[PageRef, ...]) -> FreeDecision:
-        """Retire the owner's pages; this also closes them to new Pins. The
-        allocator's stream ordering already covers local accesses."""
+    def on_free(self, refs: tuple[PageRef, ...]) -> tuple[PageRef, ...]:
+        """Retire the owner's pages, which also closes them to new Pins, and
+        return those reusable now. The allocator's stream ordering already
+        covers local accesses."""
         self._owner()
-        self._refs(refs, bounded=False)
+        _distinct(refs)
         with self._lock:
             pages = [self._current(ref) for ref in refs]
             if any(not page.local_owned for page in pages):
                 raise PageUnavailable("page was already retired")
-            immediate, deferred, pending = [], [], []
+            reusable = []
             for page in pages:
                 # Retirement and closing Pin admission share the same lock.
                 page.local_owned = False
@@ -455,106 +340,48 @@ class SlotGuard:
                 if page.readers:
                     page.state = PageState.DEFERRED
                     self._retired_pages.add(page.ref)
-                    deferred.append(page.ref)
                 elif (
                     self._installed_epoch is not None
                     and page.ref not in self._protected
                 ):
                     page.state = PageState.FREE
-                    immediate.append(page.ref)
+                    reusable.append(page.ref)
                 else:
                     self._queue(page)
-                    (
-                        pending if page.state is PageState.RECLAIM_PENDING else deferred
-                    ).append(page.ref)
             self._owner_revision += 1
-            return FreeDecision(
-                tuple(immediate), tuple(deferred), tuple(pending), self._backpressured()
-            )
-
-    def snapshot(self) -> Snapshot:
-        with self._lock:
-            pages = sorted(self._pages.values(), key=lambda page: page.ref)
-            return Snapshot(
-                pool_epoch=self.pool_epoch,
-                local_owned_pages=tuple(p.ref for p in pages if p.local_owned),
-                published_pages=tuple(
-                    p.ref for p in pages if p.state is PageState.PUBLISHED
-                ),
-                held_pages=tuple(p.ref for p in pages if p.readers),
-                held_local_owned_pages=tuple(
-                    p.ref for p in pages if p.readers and p.local_owned
-                ),
-                deferred_pages=tuple(
-                    p.ref for p in pages if p.state is PageState.DEFERRED
-                ),
-                pending_pages=tuple(
-                    p.ref for p in pages if p.state is PageState.RECLAIM_PENDING
-                ),
-                free_pages=tuple(p.ref for p in pages if p.state is PageState.FREE),
-                active_leases=tuple(self._active.values()),
-                completed_leases=tuple(self._completed.values()),
-                frozen_epoch=self._frozen_epoch,
-                installed_epoch=self._installed_epoch,
-                protected_pages=self._protected,
-                backpressured=self._backpressured(),
-            )
+            return tuple(reusable)
 
     def begin_epoch(self, epoch_id: int) -> EpochSnapshot:
         self._owner()
         _epoch_id(epoch_id)
         with self._lock:
-            self._allocation_epoch_preflight_locked()
             if self._frozen_epoch is not None or epoch_id <= self._last_epoch:
                 raise EpochError("an unfinished or stale allocation epoch cannot begin")
             self._frozen_epoch = epoch_id
             self._owner_revision += 1
             self._epoch_held = frozenset(self._held_pages)
-            held = tuple(sorted(self._epoch_held))
             return EpochSnapshot(
-                pool_epoch=self.pool_epoch,
-                held_pages=held,
-                held_local_owned_pages=tuple(
-                    ref for ref in held if self._pages[ref.page_id].local_owned
-                ),
+                held_pages=tuple(sorted(self._epoch_held)),
                 reclaim_candidate_pages=tuple(sorted(self._reclaim_candidates)),
-                registered_page_count=len(self._pages),
-                local_owned_page_count=self._local_owned_count,
-                deferred_page_count=len(self._retired_pages) - self._pending_count,
-                pending_reclaim_page_count=self._pending_count,
-                reclaim_overflow_page_count=self._overflow_count,
-                free_page_count=(
-                    len(self._pages)
-                    - self._local_owned_count
-                    - len(self._retired_pages)
-                ),
-                active_lease_count=len(self._active),
-                frozen_epoch=epoch_id,
-                installed_epoch=self._installed_epoch,
-                protected_pages=self._protected,
-                backpressured=self._backpressured(),
             )
 
-    def install_epoch(self, epoch_id: int, protected_pages: tuple[PageRef, ...]):
-        """Install an externally committed conservative union, never shrink it."""
-        self._owner()
-        self._refs(protected_pages, allow_empty=True, bounded=False)
-        with self._lock:
-            protected = self._install_preflight_locked(epoch_id, protected_pages)
-            self._commit_install_locked(epoch_id, protected)
-
-    def install_epoch_and_drain(
-        self, epoch_id: int, protected_pages: tuple[PageRef, ...], refs=None
+    def install_epoch(
+        self,
+        epoch_id: int,
+        protected_pages: tuple[PageRef, ...],
+        reclaim: tuple[PageRef, ...] | None = None,
     ) -> tuple[PageRef, ...]:
-        """install_epoch then drain_reclaim; a rejection changes neither."""
+        """Install an externally committed conservative union, never shrink it,
+        and reclaim ``reclaim`` (default: every unprotected candidate). Returns
+        the reclaimed pages; a rejection changes neither."""
         self._owner()
-        self._refs(protected_pages, allow_empty=True, bounded=False)
-        if refs is not None:
-            self._refs(refs, allow_empty=True, bounded=False)
+        if reclaim is not None:
+            _distinct(reclaim)
         with self._lock:
             protected = self._install_preflight_locked(epoch_id, protected_pages)
-            pages = self._reclaim_batch_locked(refs, protected)
-            self._commit_install_locked(epoch_id, protected)
+            pages = self._reclaim_batch_locked(reclaim, protected)
+            self._protected = protected
+            self._installed_epoch = epoch_id
             return self._drain_locked(pages)
 
     def _install_preflight_locked(self, epoch_id, protected_pages):
@@ -576,26 +403,6 @@ class SlotGuard:
                 "committed protection drops a local prepared/active reference"
             )
         return protected
-
-    def _commit_install_locked(self, epoch_id, protected):
-        self._protected = protected
-        self._installed_epoch = epoch_id
-        self._owner_revision += 1
-
-    def _epoch(self, epoch_id):
-        _epoch_id(epoch_id)
-        if self._frozen_epoch != epoch_id:
-            raise EpochError("allocation epoch is absent or mismatched")
-        if self._installed_epoch != epoch_id:
-            raise EpochError("allocation epoch has not been committed")
-
-    def drain_reclaim(self, epoch_id: int, refs=None) -> tuple[PageRef, ...]:
-        self._owner()
-        if refs is not None:
-            self._refs(refs, allow_empty=True, bounded=False)
-        with self._lock:
-            self._epoch(epoch_id)
-            return self._drain_locked(self._reclaim_batch_locked(refs, self._protected))
 
     def _reclaim_batch_locked(self, refs, protected):
         if refs is None:
@@ -641,34 +448,30 @@ class SlotGuard:
                 self._owner_revision,
             )
 
-    def finish_epoch(
-        self, epoch_id: int, *, verified_headroom_pages: int | None = None
-    ):
+    def finish_epoch(self, epoch_id: int, *, verified_headroom_pages: int):
+        """Close the epoch; new Pins may then hold up to the headroom, in pages,
+        that every rank verified for this epoch."""
         self._owner()
         with self._lock:
-            self._finish_preflight_locked(epoch_id, verified_headroom_pages)
-            if self._shared_headroom_credit:
-                self._credit_remaining = verified_headroom_pages
+            self._finish_preflight_locked(epoch_id)
+            self._credit_remaining = verified_headroom_pages
             self._last_epoch = epoch_id
             self._frozen_epoch = self._installed_epoch = None
             self._protected = frozenset()
             self._epoch_held = frozenset()
             self._owner_revision += 1
 
-    def _finish_preflight_locked(self, epoch_id, verified_headroom_pages):
-        if self._allocation_faulted:
-            raise EpochError("allocation owner is permanently faulted")
-        self._epoch(epoch_id)
-        if self._shared_headroom_credit and verified_headroom_pages is None:
-            raise EpochError("shared credit requires verified epoch capacity")
-        if not self._shared_headroom_credit and verified_headroom_pages is not None:
-            raise EpochError("shared credit was not enabled")
+    def _finish_preflight_locked(self, epoch_id):
+        _epoch_id(epoch_id)
+        # A faulted epoch stays uninstalled, so it can never finish.
+        if self._frozen_epoch != epoch_id or self._installed_epoch != epoch_id:
+            raise EpochError("allocation epoch is absent or not committed")
 
-    def prevalidate_finish_epoch(self, epoch_id, *, verified_headroom_pages=None):
+    def prevalidate_finish_epoch(self, epoch_id):
         """Owner-only read-only input validation before the common finish vote."""
         self._owner()
         with self._lock:
-            self._finish_preflight_locked(epoch_id, verified_headroom_pages)
+            self._finish_preflight_locked(epoch_id)
 
     def fault_allocation_epoch(self, epoch_id):
         """Permanent fence, retaining all physical bookkeeping and cleanup paths."""
@@ -698,7 +501,7 @@ class SlotGuard:
             self._assert_reset_safe_locked()
 
     def reset(self, new_pool_epoch: int):
-        """Clear only an already reclaimed pool; replay tombstones survive reset."""
+        """Clear only an already reclaimed pool."""
         self._owner()
         with self._lock:
             self._assert_reset_safe_locked()
@@ -711,5 +514,4 @@ class SlotGuard:
             self._local_owned_count = 0
             self.pool_epoch = new_pool_epoch
             self._owner_revision += 1
-            if self._shared_headroom_credit:
-                self._credit_remaining = 0
+            self._credit_remaining = 0

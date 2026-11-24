@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.allocator.page_identity import (
-    PageFree,
     cpu_page_identity,
+    page_span_kwargs,
+    split_page_free,
     with_page_span,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -511,15 +512,13 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
-            cd = node.component_data[self.component_type]
-            value = cd.value
+            value = node.component_data[self.component_type].value
             if value is None:
                 return None
             return PoolTransfer(
                 name=PoolName.KV,
                 device_indices=value.to(torch.int64),
                 keys=list(node.hash_value),
-                page_span=cd.page_span,
             )
 
         if not keys:
@@ -558,12 +557,11 @@ class FullComponent(TreeComponent):
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             storage, sub_pool = self.storage_and_sub_pool()
-            kwargs = (
-                {"page_span": transfer.page_span}
-                if transfer.page_span is not None
-                else {}
+            storage.release_taken(
+                sub_pool,
+                transfer.device_indices,
+                **page_span_kwargs(transfer.page_span),
             )
-            storage.release_taken(sub_pool, transfer.device_indices, **kwargs)
             return None
         return transfer
 
@@ -580,12 +578,9 @@ class FullComponent(TreeComponent):
         elif isinstance(action, FreeComponentDeviceSlot):
             storage, sub_pool = self.storage_and_sub_pool()
             for indices in action.indices:
-                kwargs = {}
-                if isinstance(indices, PageFree):
-                    kwargs["page_span"] = indices.page_span
-                    indices = indices.indices
+                indices, page_span = split_page_free(indices)
                 # tree values are page-aligned copies of a kv row: page-exact segments
-                storage.free_units(sub_pool, indices, **kwargs)
+                storage.free_units(sub_pool, indices, **page_span_kwargs(page_span))
         else:
             raise AssertionError(
                 f"FullComponent: unhandled ComponentAction {type(action).__name__}"

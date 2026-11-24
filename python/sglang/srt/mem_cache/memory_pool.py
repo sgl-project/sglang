@@ -401,7 +401,6 @@ class ReqToTokenPool:
     # Whether a row names its request's state slot (the hybrid tables).
     holds_state_slots: bool = False
     _cpu_page_rows: Any = None
-    _cpu_page_rows_owner: Any = None
 
     def __init__(
         self,
@@ -434,34 +433,12 @@ class ReqToTokenPool:
         return self._cpu_page_rows
 
     def attach_cpu_page_identity(self, page_rows):
-        if page_rows is None or (
-            self._cpu_page_rows_owner is not None
-            and self._cpu_page_rows_owner is not page_rows
-        ):
+        """Attach the allocator's row table while every request row is free."""
+        if self._cpu_page_rows is not None and self._cpu_page_rows is not page_rows:
             raise ValueError(
                 "request pool already has a different CPU page identity owner"
             )
-        self._cpu_page_rows = self._cpu_page_rows_owner = page_rows
-
-    def assert_cpu_page_identity_quiescent(self, page_rows):
-        # Include the actual allocation domain, excluding only padded row 0.
-        if sorted(self.free_slots) != list(range(1, self._alloc_size)):
-            raise ValueError("all actual request rows must be free")
-        if (
-            self._cpu_page_rows_owner is not None
-            and self._cpu_page_rows_owner is not page_rows
-        ):
-            raise ValueError("request pool has a different CPU page identity owner")
-        if page_rows is not None:
-            page_rows.assert_empty()
-
-    def set_cpu_page_identity_enabled(self, page_rows, enabled):
-        """Quiescent owner switch; neither rows nor generations are reset."""
-        if type(enabled) is not bool or page_rows is None:
-            raise ValueError("explicit page-row owner and boolean required")
-        self.assert_cpu_page_identity_quiescent(page_rows)
-        self._cpu_page_rows_owner = page_rows
-        self._cpu_page_rows = page_rows if enabled else None
+        self._cpu_page_rows = page_rows
 
     def write_cpu_page_spans(self, writes):
         if self._cpu_page_rows is None:

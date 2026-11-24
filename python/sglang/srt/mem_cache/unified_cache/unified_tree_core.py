@@ -29,7 +29,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.page_identity import with_page_span
+from sglang.srt.mem_cache.allocator.page_identity import (
+    slice_page_span,
+    with_page_span,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -1468,13 +1471,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node,
                 state.value[:prefix_len],
                 session_id=state.params.session_id,
-                page_span=(
-                    state.params.page_span.slice(
-                        state.total_prefix_length,
-                        state.total_prefix_length + prefix_len,
-                    )
-                    if state.params.page_span is not None
-                    else None
+                page_span=slice_page_span(
+                    state.params.page_span,
+                    state.total_prefix_length,
+                    state.total_prefix_length + prefix_len,
                 ),
             )
             state.result.record_adopted_range(
@@ -1546,12 +1546,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKVFullOnly([dup[:swa_already_freed]])
                 )
             if swa_already_freed < dup.numel():
-                span = (
-                    state.params.page_span.slice(
-                        abs_start + swa_already_freed, abs_start + dup.numel()
-                    )
-                    if state.params.page_span is not None
-                    else None
+                span = slice_page_span(
+                    state.params.page_span,
+                    abs_start + swa_already_freed,
+                    abs_start + dup.numel(),
                 )
                 state.pending_actions.append(
                     FreeDeviceKV([with_page_span(dup[swa_already_freed:], span)])
@@ -1592,13 +1590,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 priority=state.priority,
                 session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
-                page_span=(
-                    state.params.page_span.slice(
-                        state.total_prefix_length,
-                        state.total_prefix_length + len(state.key),
-                    )
-                    if state.params.page_span is not None
-                    else None
+                page_span=slice_page_span(
+                    state.params.page_span,
+                    state.total_prefix_length,
+                    state.total_prefix_length + len(state.key),
                 ),
             )
             state.is_new_leaf = True

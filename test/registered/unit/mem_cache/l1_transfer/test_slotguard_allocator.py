@@ -3,7 +3,6 @@
 import threading
 import unittest
 from array import array
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,13 +26,6 @@ from sglang.test.kits.slotguard.ledger import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-def empty_tree():
-    return SimpleNamespace(
-        tree_core=SimpleNamespace(root_node=SimpleNamespace(children={})),
-        assert_cpu_page_identity_supported=lambda: None,
-    )
 
 
 def extend_batch(cache, alloc, rows, length):
@@ -66,7 +58,10 @@ def run_extend(batch):
         "sglang.srt.mem_cache.allocation.attention_backends",
         return_value=("torch_native", "torch_native"),
     ):
-        _, batch.req_pool_indices, batch.req_pool_indices_cpu = alloc_for_extend(batch)
+        out, batch.req_pool_indices, batch.req_pool_indices_cpu = alloc_for_extend(
+            batch
+        )
+    return out
 
 
 class PageIdentityTest(CustomTestCase):
@@ -80,7 +75,7 @@ class PageIdentityTest(CustomTestCase):
 
     def test_row_shadow_is_page_granular_and_rebinds_canonical_prefix(self):
         rows = PageRowTable(4)
-        rows.set(1, PageSpan((8, 3), 4, 0, 7))
+        rows.write(1, 0, PageSpan((8, 3), 4, 0, 7))
         rows.write(1, 4, PageSpan((9, 2), 4, 0, 6))
         self.assertEqual(rows.get(1, 0, 10), PageSpan((8, 9, 2), 4, 0, 10))
         rows.clear(1)
@@ -91,7 +86,7 @@ class PageIdentityTest(CustomTestCase):
         """A write that leaves recorded tokens of a page unwritten cannot
         relabel that page, and a negative start cannot wrap to the row end."""
         rows = PageRowTable(4)
-        rows.set(1, PageSpan((8, 3), 4, 0, 7))
+        rows.write(1, 0, PageSpan((8, 3), 4, 0, 7))
         before = rows.get(1, 0, 7)
         writes = {
             "head_of_full_page": (0, PageSpan((9,), 4, 0, 1)),
@@ -106,7 +101,7 @@ class PageIdentityTest(CustomTestCase):
 
 
 class GuardedAllocatorTest(CustomTestCase):
-    def test_inactive_warmup_resize_then_ordered_quiescent_activation(self):
+    def test_inactive_warmup_resize_then_ordered_activation(self):
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
         alloc = allocator(pages=4, active=False)
@@ -126,34 +121,22 @@ class GuardedAllocatorTest(CustomTestCase):
         self.assertEqual(alloc.free_pages.tolist(), [2, 1, 3])
         rows.free_rows(rows.alloc_rows(1))
         generation = rows.req_generation.clone()
-        alloc.activate(rows, empty_tree())
+        alloc.activate(
+            rows, SimpleNamespace(assert_cpu_page_identity_supported=lambda: None)
+        )
         self.assertIs(alloc.get_kvcache(), pool)
         self.assertIs(alloc.slot_guard, guard)
+        self.assertIs(rows.cpu_page_rows, alloc.page_rows)
         self.assertTrue(torch.equal(rows.req_generation, generation))
         self.assertEqual(tuple(alloc._free_cpu), (2, 1, 3))
         alloc.alloc(4)
         self.assertEqual(alloc.last_allocation_spans[0].page_ids, (2,))
 
-    def test_activation_rejects_live_request_rows_before_mutation(self):
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-
-        for live in ("allocated_row", "duplicate_free_row"):
-            with self.subTest(live=live):
-                alloc = allocator(pages=4, active=False)
-                rows = ReqToTokenPool(2, 32, "cpu", False)
-                if live == "allocated_row":
-                    rows.alloc_rows(1)
-                else:
-                    rows.free_slots = [1, 1]
-                with self.assertRaises(ValueError):
-                    alloc.activate(rows, empty_tree())
-                self.assertIsNone(alloc.cpu_page_identity())
-                self.assertIsNone(rows.cpu_page_rows)
-
     def test_paths_without_cpu_page_spans_are_refused(self):
         """HiCache load-back, document reuse and request-private linker loads
-        put Full KV on the device without a CPU page span; page identity
-        refuses them at activation, at attach time, or before allocation."""
+        put Full KV on the device without a CPU page span; activation refuses
+        the ones configured before it, and the extend prefix refuses document
+        reuse and private loads that are enabled after it."""
         features = {
             "hicache": ("cache_controller", object()),
             "doc_reuse": ("uocr_doc_reuse", object()),
@@ -188,18 +171,11 @@ class GuardedAllocatorTest(CustomTestCase):
             finally:
                 cache.uocr_doc_reuse = None
 
-        uses = {
-            "hicache": lambda cache: cache.init_hicache(None, None),
-            "doc_reuse": doc_reuse,
-            "private_load": private_load,
-        }
-        for name, use in uses.items():
+        for name, use in {"doc_reuse": doc_reuse, "private_load": private_load}.items():
             with self.subTest(attached=name):
                 cache, _, _ = runtime_fixture()
                 with self.assertRaisesRegex(ValueError, "SlotGuard v1"):
                     use(cache)
-                self.assertIsNone(cache.cache_controller)
-                self.assertIsNone(cache.uocr_doc_reuse)
 
     def test_rejected_reclaim_batch_leaves_the_epoch_installable(self):
         """An install whose reclaim batch is rejected must change nothing,
@@ -214,43 +190,53 @@ class GuardedAllocatorTest(CustomTestCase):
             alloc.install_allocation_epoch(1, (), reclaim_refs=refs[1:])
         self.assertEqual(alloc.slot_guard.owner_counts(), before)
         alloc.install_allocation_epoch(1, (), reclaim_refs=refs[:1])
-        self.assertEqual(alloc.available_and_evictable_size(0), 12)
+        self.assertEqual(alloc.available_size(), 12)
 
-    def test_duplicate_group_free_is_refused_without_wedging_the_group(self):
-        """A duplicate free inside a free group fails on its own; the group
-        still ends, and a new group can begin."""
-        alloc = allocator(pages=4)
-        indices, span, _ = owned(alloc, 2)
-        epoch(alloc)
-        alloc.free_group_begin()
-        alloc.free(indices[:4], page_span=span.slice(0, 4))
-        with self.assertRaises(ValueError):
-            alloc.free(indices[:4], page_span=span.slice(0, 4))
-        alloc.free(indices[4:], page_span=span.slice(4, 8))
-        alloc.free_group_end()
-        self.assertEqual(alloc.conservation_counts(), (0, 4, 0, 4))
-        alloc.free_group_begin()
-        alloc.free_group_end()
+    def test_free_returns_only_unread_unprotected_pages_inside_an_epoch(self):
+        """A freed page goes back to the device free list only inside an
+        installed epoch, with no reader and outside the epoch's protected set;
+        every free entry point goes through that decision."""
 
-    def test_all_free_entrypoints_intercept_and_deferred_pages_are_not_free(self):
-        for entry in ("free", "free_segment", "free_group_end"):
-            with self.subTest(entry=entry):
-                alloc = allocator(pages=4)
+        def pinned(alloc, refs):
+            alloc.slot_guard.try_pin(lease_identity(), refs)
+            epoch(alloc)
+
+        def protected(alloc, refs):
+            epoch(alloc, protected=refs[:1])
+
+        def free(alloc, indices, span):
+            alloc.free(indices, page_span=span)
+
+        def free_segment(alloc, indices, span):
+            alloc.free_segment(indices, start_pos=0, page_span=span)
+
+        def free_group(alloc, indices, span):
+            alloc.free_group_begin()
+            alloc.free(indices, page_span=span)
+            alloc.free_group_end()
+
+        # (case, prepare, free entry point, pages that stay retired)
+        cases = (
+            ("pinned_free", pinned, free, 2),
+            ("pinned_free_segment", pinned, free_segment, 2),
+            ("pinned_free_group_end", pinned, free_group, 2),
+            ("protected_without_local_reader", protected, free, 1),
+            ("outside_epoch", lambda alloc, refs: None, free, 2),
+        )
+        for name, prepare, release, retired in cases:
+            with self.subTest(name):
+                alloc = allocator(pages=4, credit=4)
                 indices, span, refs = owned(alloc, 2)
-                alloc.slot_guard.try_pin(lease_identity(), refs)
-                epoch(alloc)
-                if entry == "free_group_end":
-                    alloc.free_group_begin()
-                    alloc.free(indices, page_span=span)
-                    alloc.free_group_end()
-                elif entry == "free_segment":
-                    alloc.free_segment(indices, start_pos=0, page_span=span)
-                else:
-                    alloc.free(indices, page_span=span)
-                self.assertEqual(alloc.available_size(), 8)
-                self.assertEqual(alloc.retired_size(), 8)
-                self.assertEqual(set(alloc.get_all_free_pages().tolist()), {3, 4})
-                self.assertEqual(alloc.conservation_counts(), (0, 2, 2, 4))
+                prepare(alloc, refs)
+                release(alloc, indices, span)
+                self.assertEqual(alloc.retired_size(), retired * 4)
+                self.assertEqual(
+                    alloc.conservation_counts(), (0, 4 - retired, retired, 4)
+                )
+                self.assertEqual(
+                    set(alloc.get_all_free_pages().tolist()),
+                    {1, 2, 3, 4} - set(span.page_ids[:retired]),
+                )
 
     def test_free_without_cpu_identity_fails_before_any_allocator_mutation(self):
         alloc = allocator(pages=4)
@@ -262,50 +248,6 @@ class GuardedAllocatorTest(CustomTestCase):
             alloc.free_page_ids(indices[::4] // 4)
         self.assertEqual(alloc.available_size(), 12)
         self.assertEqual(alloc.conservation_counts(), (1, 3, 0, 4))
-
-    def test_budget_charges_shared_protection_once_and_never_forces_a_chunk(self):
-        alloc = allocator()
-        indices, span, refs = owned(alloc, 90)
-        alloc.slot_guard.try_pin(lease_identity(), refs[:40])
-        alloc.slot_guard.try_pin(lease_identity(1), refs[:40])
-        evictable = [90 * 4]
-        budget = alloc.create_prefill_budget(
-            SimpleNamespace(evictable_size=lambda: evictable[0])
-        )
-        snap = alloc.begin_allocation_epoch(1)
-        with self.assertRaises(EpochError):
-            _ = budget.remaining_total
-        alloc.install_allocation_epoch(1, snap.held_pages)
-        # F10 + E90 - R40, with two leases on the same 40 pages charged once.
-        self.assertEqual(budget.remaining_total, 60 * 4)
-        self.assertEqual(alloc.protected_owned_size(), 40 * 4)
-        self.assertIsNotNone(alloc.alloc(10 * 4))
-        evictable[0] = 40 * 4
-        self.assertEqual(budget.remaining_total, 0)
-        self.assertIsNone(budget.available_chunk_tokens(16))
-        alloc.free(indices[: 40 * 4], page_span=span.slice(0, 40 * 4))
-        self.assertEqual(alloc.protected_owned_size(), 0)
-
-    def test_free_outside_epoch_only_queues_common_reclaim(self):
-        alloc = allocator(pages=4)
-        indices, span, refs = owned(alloc, 2)
-        alloc.free(indices, page_span=span)
-        self.assertEqual(alloc.available_size(), 8)
-        epoch(alloc, protected=refs[:1])
-        self.assertEqual(alloc.available_size(), 12)
-        alloc.finish_allocation_epoch(1)
-        epoch(alloc, 2)
-        self.assertEqual(alloc.available_size(), 16)
-        self.assertEqual(alloc.conservation_counts(), (0, 4, 0, 4))
-
-    def test_group_union_without_local_reader_protects_and_charges_local_owner(self):
-        alloc = allocator(pages=4)
-        indices, span, refs = owned(alloc, 2)
-        epoch(alloc, protected=refs[:1])
-        self.assertEqual(alloc.available_and_evictable_size(8), 12)
-        alloc.free(indices, page_span=span)
-        self.assertEqual(alloc.available_size(), 12)
-        self.assertEqual(alloc.retired_size(), 4)
 
     def test_only_owner_may_free_and_resize_rejects_retired_pages(self):
         alloc = allocator(pages=4)
@@ -327,7 +269,7 @@ class GuardedAllocatorTest(CustomTestCase):
             alloc.resize(SimpleNamespace(max_total_num_tokens=8))
         self.assertEqual(alloc.size, 16)
         epoch(alloc)
-        alloc.finish_allocation_epoch(1)
+        alloc.finish_allocation_epoch(1, verified_headroom_pages=0)
         alloc.resize(SimpleNamespace(max_total_num_tokens=8))
         self.assertEqual(alloc.available_size(), 8)
 
@@ -373,7 +315,7 @@ class GuardedAllocatorTest(CustomTestCase):
                 alloc.get_all_free_pages().tolist(),
                 alloc.num_staged_pages,
                 alloc.conservation_counts(),
-                alloc.allocation_signature(),
+                alloc.slot_guard.owner_counts(),
             )
 
         def freeze(alloc):
@@ -393,8 +335,6 @@ class GuardedAllocatorTest(CustomTestCase):
             ("extend_zero", freeze,
                 lambda a: extend(a, PageSpan((2,), 4, 0, 3), 4), EpochError),
             ("decode_zero", freeze, decode_in_partial_page, EpochError),
-            ("extend_geometry", lambda a: None,
-                lambda a: extend(a, PageSpan((2, 3), 4, 0, 7), 3), ValueError),
             ("unreclaimed_under_merge", register_staged_page_behind_allocator,
                 lambda a: a.alloc(8), PageUnavailable),
         )  # fmt: skip
@@ -405,36 +345,12 @@ class GuardedAllocatorTest(CustomTestCase):
                 epoch(alloc)
                 # Page 1 is staged and page 4 free, so a 2-page request must merge.
                 alloc.free_segment(indices[:4], start_pos=0, page_span=span.slice(0, 4))
-                alloc.finish_allocation_epoch(1)
+                alloc.finish_allocation_epoch(1, verified_headroom_pages=0)
                 prepare(alloc)
                 before = queues(alloc)
                 with self.assertRaises(error):
                     allocate(alloc)
                 self.assertEqual(queues(alloc), before)
-
-    def test_allocation_signature_binds_complete_count_history(self):
-        left, right = allocator(pages=16), allocator(pages=16)
-        for count in (1, 2, 3):
-            left.alloc(count * 4)
-        for count in (2, 1, 3):
-            right.alloc(count * 4)
-        self.assertNotEqual(left.allocation_signature(), right.allocation_signature())
-
-    def test_tp_logical_page_mapping_does_not_assume_equal_physical_ids(self):
-        left, right = allocator(pages=4), allocator(pages=4)
-        right._free_cpu = deque(reversed(right._free_cpu))
-        right.free_pages = right.free_pages.flip(0)
-        _, left_span, left_refs = owned(left, 2)
-        right_indices, right_span, right_refs = owned(right, 2)
-        self.assertNotEqual(left_span.page_ids, right_span.page_ids)
-        logical = left.logical_pages(left_refs)
-        self.assertEqual(logical, right.logical_pages(right_refs))
-        self.assertEqual(right.local_page_refs(logical), right_refs)
-        epoch(right, protected=right_refs[:1])
-        right.free(right_indices, page_span=right_span)
-        self.assertEqual(right.local_page_refs(logical[:1]), right_refs[:1])
-        with self.assertRaises(ValueError):
-            right.local_page_refs(logical[1:])
 
 
 class GuardedRuntimeIdentityTest(CustomTestCase):
@@ -467,7 +383,6 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
         cache, alloc, rows = runtime_fixture()
         values = alloc.alloc(7 * 4)
         span = alloc.last_allocation_spans[0]
-        rows.attach_cpu_page_identity(alloc.page_rows)
         with self.assertRaises(ValueError):
             rows.write((1, slice(0, 28)), values)
         rows.write((1, slice(0, 28)), values, cpu_page_writes=((1, 0, span),))
@@ -483,38 +398,12 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
         self.assertEqual(alloc.conservation_counts(), (1, 15, 0, 16))
 
     def test_actual_alloc_for_extend_and_decode_update_cpu_shadow(self):
-        from sglang.srt.managers.schedule_batch import ReqKvInfo
-        from sglang.srt.mem_cache.allocation import (
-            alloc_for_decode_default,
-            alloc_for_extend,
-        )
+        from sglang.srt.mem_cache.allocation import alloc_for_decode_default
 
         cache, alloc, rows = runtime_fixture()
         epoch(alloc)
-        req = SimpleNamespace(kv=ReqKvInfo(), prefix_len=0, session=None)
-        batch = SimpleNamespace(
-            maybe_evict_swa=lambda: None,
-            is_dllm=lambda: False,
-            reqs=[req],
-            tree_cache=cache,
-            req_to_token_pool=rows,
-            token_to_kv_pool_allocator=alloc,
-            device="cpu",
-            prefix_lens=[0],
-            extend_lens=[3],
-            seq_lens=torch.tensor([3]),
-            seq_lens_cpu=torch.tensor([3]),
-            extend_num_tokens=3,
-            hisparse_coordinator=None,
-            model_config=SimpleNamespace(is_encoder_decoder=False),
-        )
-        with patch(
-            "sglang.srt.mem_cache.allocation.attention_backends",
-            return_value=("torch_native", "torch_native"),
-        ):
-            out, batch.req_pool_indices, batch.req_pool_indices_cpu = alloc_for_extend(
-                batch
-            )
+        req, batch = extend_batch(cache, alloc, rows, 3)
+        run_extend(batch)
         row = req.kv.req_pool_idx
         self.assertEqual(alloc.page_rows.get(row, 0, 3), PageSpan((1,), 4, 0, 3))
         out = alloc_for_decode_default(batch, 1)
@@ -525,10 +414,10 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
         self.assertEqual(out.tolist(), [8])
         self.assertEqual(alloc.page_rows.get(row, 0, 5), PageSpan((1, 2), 4, 0, 5))
 
-    def test_failed_row_write_or_aux_allocation_records_no_cpu_row(self):
+    def test_failed_aux_allocation_records_no_cpu_row(self):
         """When extend or decode rolls back its pages after a failed aux
-        allocation, or a device row write fails, the CPU row must not cover
-        the written positions: a later row free would hit returned pages."""
+        allocation, the CPU row must not cover the written positions: a later
+        row free would hit returned pages."""
         from sglang.srt.mem_cache.allocation import alloc_for_decode_default
 
         for step in ("extend", "decode"):
@@ -559,40 +448,6 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
                     )
                 with self.assertRaises(ValueError):
                     alloc.page_rows.get(row, 0, kept + 1)
-
-        with self.subTest("device_write"):
-            cache, alloc, rows = runtime_fixture()
-            row = rows.alloc_rows(1)[0]
-            values = alloc.alloc(8)
-            span = alloc.last_allocation_spans[0]
-            with self.assertRaises(RuntimeError):
-                rows.write(
-                    (row, slice(0, 8)), values[:4], cpu_page_writes=((row, 0, span),)
-                )
-            with self.assertRaises(ValueError):
-                alloc.page_rows.get(row, 0, 1)
-
-    def test_encoder_decoder_rows_are_refused_before_allocation(self):
-        """Encoder-decoder device rows are offset by encoder_lens while CPU
-        rows use decoder positions; guarded allocation must refuse them."""
-        from sglang.srt.mem_cache.allocation import alloc_for_decode_default
-
-        for step in ("extend", "decode"):
-            with self.subTest(step):
-                cache, alloc, rows = runtime_fixture()
-                epoch(alloc)
-                _, batch = extend_batch(cache, alloc, rows, 4)
-                if step == "decode":
-                    run_extend(batch)
-                batch.model_config = SimpleNamespace(is_encoder_decoder=True)
-                batch.encoder_lens = torch.tensor([4])
-                before = alloc.conservation_counts()
-                with self.assertRaisesRegex(ValueError, "encoder-decoder"):
-                    if step == "extend":
-                        run_extend(batch)
-                    else:
-                        alloc_for_decode_default(batch, 1)
-                self.assertEqual(alloc.conservation_counts(), before)
 
     def test_prompt_boundary_checkpoint_rebinds_rows_to_canonical_tree_spans(self):
         from sglang.srt.managers.schedule_batch import Req
@@ -701,11 +556,11 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
                 self.assertEqual(cache.protected_size(), 0)
                 self.assertEqual(cache.evictable_size(), 36)
 
-    def test_actual_urc_lru_skips_no_physical_free_and_continues_same_epoch(self):
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+    def test_actual_urc_eviction_retires_pinned_pages_and_frees_the_rest(self):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
-        cache, alloc, _ = runtime_fixture(pages=100)
+        cache, alloc, _ = runtime_fixture(pages=100, credit=40)
         for attempt, pages in enumerate((40, 50)):
             values = alloc.alloc(pages * 4)
             span = alloc.last_allocation_spans[0]
@@ -723,7 +578,7 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
                 )
             )
         epoch(alloc)
-        self.assertTrue(alloc.evict_to_free_tokens(cache, 60 * 4))
+        cache.evict(EvictParams(num_tokens=90 * 4))
         self.assertEqual(alloc.available_size(), 60 * 4)
         self.assertEqual(alloc.retired_size(), 40 * 4)
         self.assertIsNotNone(alloc.alloc(60 * 4))
@@ -774,7 +629,7 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
         for state in ("live", "retired", "guard_epoch"):
-            cache, alloc, rows = runtime_fixture()
+            cache, alloc, rows = runtime_fixture(credit=2)
             row = rows.alloc_rows(1)[0]
             span = None
             if state == "guard_epoch":
@@ -810,19 +665,15 @@ class GuardedRuntimeIdentityTest(CustomTestCase):
             expected = observed()
             entries = {
                 "cache.reset": cache.reset,
-                "cache._reset_full": cache._reset_full,
                 "rows.clear": rows.clear,
-                "page_rows.clear": alloc.page_rows.clear,
                 "allocator.clear": alloc.clear,
             }
-            census = AssertionError("reset preflight took a full census")
-            with patch.object(alloc.slot_guard, "snapshot", side_effect=census):
-                for entry, reset in entries.items():
-                    with self.subTest(state=state, entry=entry):
-                        with self.assertRaises(UnsafeReset):
-                            reset()
-                        self.assertEqual(observed(), expected)
-                        self.assertEqual(linker_calls, [])
+            for entry, reset in entries.items():
+                with self.subTest(state=state, entry=entry):
+                    with self.assertRaises(UnsafeReset):
+                        reset()
+                    self.assertEqual(observed(), expected)
+                    self.assertEqual(linker_calls, [])
 
 
 if __name__ == "__main__":

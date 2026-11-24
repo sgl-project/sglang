@@ -21,6 +21,22 @@ def with_page_span(indices, page_span):
     return indices if page_span is None else PageFree(indices, page_span)
 
 
+def page_span_kwargs(page_span):
+    # Storages and allocators without CPU page identity take no page_span.
+    return {} if page_span is None else {"page_span": page_span}
+
+
+def split_page_free(indices):
+    """Return ``(indices, page_span)``; the span is None for a bare tensor."""
+    if isinstance(indices, PageFree):
+        return indices.indices, indices.page_span
+    return indices, None
+
+
+def slice_page_span(page_span, start, end):
+    return None if page_span is None else page_span.slice(start, end)
+
+
 def cpu_page_identity(allocator):
     # A tree cache may be built without an allocator (None).
     if not isinstance(allocator, BaseTokenToKVPoolAllocator):
@@ -92,7 +108,8 @@ class PageSpan:
 
 
 class PageRowTable:
-    """Sparse CPU request rows; O(pages written/read), never O(tokens)."""
+    """Sparse CPU request rows in decoder token positions; encoder-decoder rows
+    are unsupported. O(pages written/read), never O(tokens)."""
 
     def __init__(self, page_size, *, reset_preflight=None):
         self.page_size = page_size
@@ -104,20 +121,9 @@ class PageRowTable:
         if self._reset_preflight is not None:
             self._reset_preflight()
 
-    def assert_empty(self):
-        if self._rows or self._lengths:
-            raise ValueError("CPU request page rows must be empty")
-
-    def set(self, row: int, span: PageSpan):
-        if span.page_size != self.page_size or span.token_offset:
-            raise ValueError("row must begin at a page boundary")
-        self._rows[row] = list(span.page_ids)
-        self._lengths[row] = span.token_length
-
     def check_writes(self, writes):
-        """Validate a batch of (row, start, span) writes before any is applied."""
-        if len({row for row, _, _ in writes}) != len(writes):
-            raise ValueError("a row write batch must name each row once")
+        """Validate a batch of (row, start, span) writes, one per row, before
+        any is applied."""
         for row, start, span in writes:
             self._check_write(row, start, span)
 
@@ -164,15 +170,10 @@ class PageRowTable:
         )
 
     def clear(self, row=None):
+        """Without ``row``, the caller has run ``assert_reset_safe`` first."""
         if row is None:
-            self.assert_reset_safe()
             self._rows.clear()
             self._lengths.clear()
         else:
             self._rows.pop(row, None)
             self._lengths.pop(row, None)
-
-    def last_page(self, row, token_length):
-        if not 0 < token_length <= self._lengths.get(row, 0):
-            raise ValueError("request row lacks its last CPU page identity")
-        return self._rows[row][(token_length - 1) // self.page_size]

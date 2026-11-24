@@ -36,9 +36,11 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     get_shm_exchange,
 )
 from sglang.srt.mem_cache.allocator.page_identity import (
-    PageFree,
     PageSpan,
     cpu_page_identity,
+    page_span_kwargs,
+    slice_page_span,
+    split_page_free,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
@@ -519,9 +521,6 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
-        identity = cpu_page_identity(self.token_to_kv_pool_allocator)
-        if identity is not None:
-            identity.assert_reset_safe()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -563,8 +562,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
-        if cpu_page_identity(self.token_to_kv_pool_allocator) is not None:
-            raise ValueError("SlotGuard v1 does not support HiCache L2/L3")
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}
@@ -1819,11 +1816,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     insert_params,
                     key=prompt_key,
                     value=new_indices[: len(prompt_key)],
-                    page_span=(
-                        new_page_span.slice(0, len(prompt_key))
-                        if new_page_span is not None
-                        else None
-                    ),
+                    page_span=slice_page_span(new_page_span, 0, len(prompt_key)),
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
                     priority=min(
@@ -1841,24 +1834,13 @@ class UnifiedRadixCache(BasePrefixCache):
         assert (
             new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
         ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        row, start = req.kv.req_pool_idx, req.kv.cache_protected_len
+        page_kwargs = {}
+        if identity is not None:
+            span = new_page_span.slice(start, len(new_indices))
+            page_kwargs["cpu_page_writes"] = ((row, start, span),)
         self.req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
-            new_indices[req.kv.cache_protected_len :],
-            **(
-                {
-                    "cpu_page_writes": (
-                        (
-                            req.kv.req_pool_idx,
-                            req.kv.cache_protected_len,
-                            new_page_span.slice(
-                                req.kv.cache_protected_len, len(new_indices)
-                            ),
-                        ),
-                    )
-                }
-                if identity is not None
-                else {}
-            ),
+            (row, slice(start, len(new_indices))), new_indices[start:], **page_kwargs
         )
 
         self.unlock(req.lock)
@@ -1988,11 +1970,8 @@ class UnifiedRadixCache(BasePrefixCache):
             # tree values are page-aligned copies of a kv row: page-exact segments
             storage = self.kv_storage()
             for indices in action.indices:
-                kwargs = {}
-                if isinstance(indices, PageFree):
-                    kwargs["page_span"] = indices.page_span
-                    indices = indices.indices
-                storage.free_token_rows(indices, **kwargs)
+                indices, page_span = split_page_free(indices)
+                storage.free_token_rows(indices, **page_span_kwargs(page_span))
         elif isinstance(action, FreeDeviceKVFullOnly):
             storage = self.kv_storage()
             for indices in action.indices:
@@ -5197,7 +5176,6 @@ class UnifiedRadixCache(BasePrefixCache):
         identity = cpu_page_identity(self.token_to_kv_pool_allocator)
         if identity is None:
             raise ValueError("cache has no CPU physical-page identity capability")
-        identity._owner()
         chunks = []
         current = self.tree_core.node_by_id(node)
         while current.parent is not None:

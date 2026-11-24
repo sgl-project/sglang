@@ -377,8 +377,7 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
     return batch.tree_cache.prefix_device_indices(req)
 
 
-def _prefix_kv_page_spans(batch):
-    identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
+def _prefix_kv_page_spans(batch, identity):
     if identity is None:
         return None
     spans = []
@@ -407,10 +406,8 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
-    prefix_page_spans = _prefix_kv_page_spans(batch)
     identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
-    if identity is not None and batch.model_config.is_encoder_decoder:
-        raise ValueError("SlotGuard v1 does not support encoder-decoder KV rows")
+    prefix_page_spans = _prefix_kv_page_spans(batch, identity)
 
     reuse_kv = None
     if batch.is_dllm():
@@ -596,7 +593,7 @@ def alloc_for_extend(
         raise
     if identity is not None:
         for row, span in zip(req_pool_indices, row_spans):
-            identity.page_rows.set(row, span)
+            identity.page_rows.write(row, 0, span)
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -716,7 +713,9 @@ def alloc_paged_token_slots_decode(
         starts = seq_lens_cpu.tolist()
         rows = batch.req_pool_indices_cpu.tolist()
         guarded_kwargs["prefix_last_page_ids"] = tuple(
-            identity.page_rows.last_page(row, end - 1) if end > 1 else None
+            identity.page_rows.get(row, end - 2, end - 1).page_ids[0]
+            if end > 1
+            else None
             for row, end in zip(rows, starts)
         )
     out_cache_loc = _storage(tree_cache).take_decode(
@@ -754,9 +753,6 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     """
 
     identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
-    # CPU rows use decoder positions; encoder-decoder device rows add encoder_lens.
-    if identity is not None and batch.model_config.is_encoder_decoder:
-        raise ValueError("SlotGuard v1 does not support encoder-decoder KV rows")
 
     batch.maybe_evict_swa()
 

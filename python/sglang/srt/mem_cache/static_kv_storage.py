@@ -12,21 +12,12 @@ entries each static pool family registers. All of it goes when those pools do.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.allocator.page_identity import page_span_kwargs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.advance import (
@@ -304,7 +295,7 @@ class StaticKVStorage:
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
         receive: bool = False,
-        prefix_page_spans: Optional[Sequence[Any]] = None,
+        prefix_page_spans: Optional[tuple] = None,
     ) -> Optional[torch.Tensor]:
         # ``receive`` needs nothing here: static pages never move.
         # Over estimate the number of tokens: assume each request needs a new
@@ -396,7 +387,7 @@ class StaticKVStorage:
         req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
-        prefix_last_page_ids: Optional[Sequence[Optional[int]]] = None,
+        prefix_last_page_ids: Optional[tuple] = None,
     ) -> Optional[torch.Tensor]:
         allocator = self._allocator
         # Over estimate the number of tokens: assume each request needs a new page.
@@ -570,21 +561,20 @@ class StaticKVStorage:
         self, sub_pool: str, ids: torch.Tensor, *, page_span: Any = None
     ) -> None:
         # A SlotGuard allocator frees by the CPU page span it recorded for ``ids``.
-        kwargs = {} if page_span is None else {"page_span": page_span}
-        self._band(sub_pool).free(ids, **kwargs)
+        self._band(sub_pool).free(ids, **page_span_kwargs(page_span))
 
     def free_units(
         self, sub_pool: str, ids: torch.Tensor, *, page_span: Any = None
     ) -> None:
-        kwargs = {} if page_span is None else {"page_span": page_span}
         if sub_pool == _WINDOW:
             self._allocator.free_swa_segment(ids, start_pos=0)
         else:
-            self._band(sub_pool).free_segment(ids, start_pos=0, **kwargs)
+            self._band(sub_pool).free_segment(
+                ids, start_pos=0, **page_span_kwargs(page_span)
+            )
 
     def free_token_rows(self, ids: torch.Tensor, *, page_span: Any = None) -> None:
-        kwargs = {} if page_span is None else {"page_span": page_span}
-        self._allocator.free_segment(ids, start_pos=0, **kwargs)
+        self._allocator.free_segment(ids, start_pos=0, **page_span_kwargs(page_span))
 
     def free_owner_rows(self, ids: torch.Tensor) -> None:
         self._allocator.free_full_segment(ids, start_pos=0)
