@@ -186,9 +186,21 @@ def quantize_rows(x):
 
 
 def run_a4w4(
-    x, scores, ids, experts, local_start, norm_weight, eps, gain, *, quantized=None
+    x,
+    scores,
+    ids,
+    experts,
+    local_start,
+    norm_weight,
+    eps,
+    gain,
+    *,
+    quantized=None,
+    num_local_tokens=None,
 ):
-    """a4w4 prefill experts of this rank, finalized; ``quantized`` = (fp4, scales) replaces ``x``."""
+    """a4w4 prefill experts of this rank, finalized; ``quantized`` = (fp4, scales) replaces ``x``.
+    ``num_local_tokens``: a one-element device count of the leading rows to route (aiter's ``moe_sorting``);
+    the caller gives the rows past it expert id -1, which the finalize skips."""
     from aiter.fused_moe import moe_sorting
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from aiter.utility.fp4_utils import moe_mxfp4_sort
@@ -201,7 +213,14 @@ def run_a4w4(
     mask = torch.zeros(256, dtype=torch.int32, device=ids.device)
     mask[local_start : local_start + e_local] = 1
     sorted_ids, _, sorted_eids, num_valid, _ = moe_sorting(
-        ids, scores, 256, h, torch.bfloat16, block_m, expert_mask=mask
+        ids,
+        scores,
+        256,
+        h,
+        torch.bfloat16,
+        block_m,
+        expert_mask=mask,
+        num_local_tokens=num_local_tokens,
     )
     a1, a1s = quantize_rows(x) if quantized is None else quantized
     a1s = moe_mxfp4_sort(

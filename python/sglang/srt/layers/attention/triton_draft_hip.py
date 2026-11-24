@@ -9,7 +9,7 @@ import torch
 
 from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -29,6 +29,8 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
     # --speculative-draft-kv-cache-dtype says otherwise; keep q and the attention
     # math in BF16 over it instead of casting q and the probabilities to FP8.
     backend.draft_bf16_dot = algorithm.is_dflash_family()
+    # Attention DP: the rank holds all the draft's KV heads; its DFlash block keeps the split-KV kernel.
+    backend.draft_block_dp = algorithm.is_dflash() and get_parallel().attn_dp_enabled
     # A DFLASH draft never runs forward_decode, so its graphs skip the split-KV
     # decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
     backend.runs_decode = not algorithm.is_dflash()
