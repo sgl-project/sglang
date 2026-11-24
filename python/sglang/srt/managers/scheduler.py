@@ -337,7 +337,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin
+from sglang.srt.managers.scheduler_vpp_wave_mixin import SchedulerVPPMixin
 from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,

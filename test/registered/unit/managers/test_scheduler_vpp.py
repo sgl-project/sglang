@@ -14,8 +14,8 @@ from sglang.srt.distributed.vpp_activation import VPPReceivedActivation
 from sglang.srt.distributed.vpp_batch import VPPBatchLedger, VPPBatchState
 from sglang.srt.distributed.vpp_layout import VPPLayout
 from sglang.srt.distributed.vpp_schedule import VPPFixedSchedule
-from sglang.srt.managers import scheduler_vpp_mixin as vpp_mod
-from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin
+from sglang.srt.managers import scheduler_vpp_wave_mixin as vpp_mod
+from sglang.srt.managers.scheduler_vpp_wave_mixin import SchedulerVPPMixin
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner.vpp_stage import execute_vpp_stage
