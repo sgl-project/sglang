@@ -31,7 +31,6 @@ jobs:
        contains(github.event.comment.body, '/rerun-group') ||
        contains(github.event.comment.body, '/rerun-test') ||
        startsWith(github.event.comment.body, '/tag-') ||
-       startsWith(github.event.comment.body, '/approve-') ||
        startsWith(github.event.comment.body, '/rerun-') ||
        startsWith(github.event.comment.body, '/run-'))
     runs-on: ubuntu-latest

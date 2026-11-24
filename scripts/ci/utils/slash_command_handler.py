@@ -357,26 +357,17 @@ def _reply_bad_tier_args(pr, comment, command, unknown, tiers):
     comment.create_reaction("confused")
 
 
-def _approve_head(gh_repo, pr, comment, user_perms, not_done, labels=()):
-    """
-    Approve the PR's head commit for CI on behalf of the commenter: the
-    approval part of /approve-ci and the labeling commands.
+def _approve_head(gh_repo, pr, comment, user_perms):
+    """Check that the commenter may approve the PR's head commit, then record it.
 
-    The commenter must pass run_ci_approval.can_approve. Unless the PR's author
-    may approve (then `run-ci` alone runs CI on every push), the head commit is
-    approved for the workflows that gate on a per-commit approval
-    (run_ci_approval.APPROVAL_WORKFLOWS), but only a head the commenter could
-    have seen: one pushed before the comment was posted. `labels` are added
-    once both checks pass, before the approval is recorded.
-
-    A refusal is answered with `not_done` and the reason. Returns (ok, approved):
-    ok is False after a refusal; approved is whether the head was approved.
+    Returns (ok, approved): ok is False after a refusal, answered here; approved
+    is False when the PR's author may approve, so nothing needs recording.
     """
     user_login = comment.user.login
     allowed, reason = can_approve(gh_repo, user_login, user_perms)
     if not allowed:
         print(f"Permission denied: {reason}.")
-        pr.create_issue_comment(f"{not_done}: {reason}.")
+        pr.create_issue_comment(f"No commit was approved for CI: {reason}.")
         comment.create_reaction("confused")
         return False, False
 
@@ -385,17 +376,13 @@ def _approve_head(gh_repo, pr, comment, user_perms, not_done, labels=()):
     if approve_commit and not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
         print(f"Not approving {head_sha}: pushed after the comment, or no run yet.")
         pr.create_issue_comment(
-            f"{not_done}: the head {head_sha[:8]} was pushed after this comment, "
-            "or CI has not started for it yet. Review the current head, then post "
-            "the command again."
+            f"No commit was approved for CI: the head {head_sha[:8]} was pushed "
+            "after this comment, or CI has not started for it yet. Review the "
+            "current head, then post the command again."
         )
         comment.create_reaction("confused")
         return False, False
 
-    if labels:
-        print(f"Permission granted. Adding labels: {list(labels)}.")
-    for label in labels:
-        pr.add_to_labels(label)
     if approve_commit:
         record_approval(gh_repo, head_sha, user_login)
     return True, approve_commit
@@ -405,29 +392,20 @@ def handle_tag_run_ci(
     gh_repo, pr, comment, user_perms, react_on_success=True, tier_labels=()
 ):
     """
-    The labeling part of /tag-and-rerun-ci and the /run-* layer commands:
-    add `run-ci` and approve the head commit.
-
-    tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
-    the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
-    their own label, so `run-ci` is always added alongside. The labels are
-    added only when _approve_head's checks pass.
+    /tag-and-rerun-ci and the /run-* layer commands: approve the head commit,
+    then add `run-ci` and the `run-ci-<tier>` labels of the named tiers.
 
     Labels added here start no run (GITHUB_TOKEN label events trigger no
-    workflow); the callers re-run the gated runs.
-
-    Returns True if action was taken, False otherwise.
+    workflow); the callers re-run the gated runs. Returns True on success.
     """
-    ok, approved = _approve_head(
-        gh_repo,
-        pr,
-        comment,
-        user_perms,
-        "`run-ci` was not added and no commit was approved for CI",
-        labels=["run-ci", *tier_labels],
-    )
+    ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
     if not ok:
         return False
+
+    labels = ["run-ci", *tier_labels]
+    print(f"Adding labels: {labels}.")
+    for label in labels:
+        pr.add_to_labels(label)
 
     user_login = comment.user.login
     if approved:
@@ -451,18 +429,21 @@ def handle_tag_run_ci(
 
 def handle_approve_ci(gh_repo, pr, comment, user_perms):
     """
-    Handles /approve-ci: approve the PR's head commit for CI, adding no labels;
-    for a new push to a PR that already has `run-ci`.
+    /approve-ci: approve a new head commit of a PR that already has `run-ci`.
 
-    Returns True if the head was approved and the PR has `run-ci`, so its
-    gate-skipped runs can now run.
+    Returns True if the head was approved, so its gate-skipped runs can run.
     """
-    ok, approved = _approve_head(
-        gh_repo, pr, comment, user_perms, "No commit was approved for CI"
-    )
-    if not ok:
+    if "run-ci" not in {label.name for label in pr.get_labels()}:
+        pr.create_issue_comment(
+            "No commit was approved for CI: the PR lacks `run-ci`. "
+            "`/tag-and-rerun-ci` adds it and approves the head."
+        )
+        comment.create_reaction("confused")
         return False
 
+    ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
+    if not ok:
+        return False
     if not approved:
         pr.create_issue_comment(
             f"✅ Nothing to approve: {pr.user.login} may approve, so `run-ci` "
@@ -471,17 +452,11 @@ def handle_approve_ci(gh_repo, pr, comment, user_perms):
         comment.create_reaction("+1")
         return False
 
-    head_sha = pr.head.sha
-    labeled = "run-ci" in {label.name for label in pr.get_labels()}
-    outcome = (
-        f"CI runs on {head_sha}."
-        if labeled
-        else f"{head_sha} may run CI, but CI stays skipped until the PR has "
-        "`run-ci` (`/tag-and-rerun-ci` adds it)."
+    pr.create_issue_comment(
+        f"✅ Approved by {comment.user.login}: CI runs on {pr.head.sha}."
     )
-    pr.create_issue_comment(f"✅ Approved by {comment.user.login}: {outcome}")
     comment.create_reaction("+1")
-    return labeled
+    return True
 
 
 def _rerun_gated_runs_after_approval(gh_repo, pr):
@@ -2036,7 +2011,7 @@ def handle_run_cpu_ci(gh_repo, pr, comment, user_perms, token):
 
 # Namespaces this handler owns. Anything else reaching the script is a comment
 # that merely quoted a path, and is left alone.
-OWNED_COMMAND_PREFIXES = ("/tag-", "/approve-", "/rerun-", "/run-")
+OWNED_COMMAND_PREFIXES = ("/tag-", "/rerun-", "/run-")
 
 # Suggestion targets. Documented spellings only, so a typo is pointed at the
 # canonical name rather than at an undocumented alias.
@@ -2062,11 +2037,6 @@ RETIRED_COMMANDS = {
     "/rerun-stage": (
         "`/rerun-stage` was removed. Use `/rerun-test <test-spec>` for specific "
         "tests, or `/rerun-failed-ci` for everything that didn't pass."
-    ),
-    "/tag-run-ci-label": (
-        "`/tag-run-ci-label` was removed. Use `/tag-and-rerun-ci` to add `run-ci` "
-        "and approve the current commit, or `/approve-ci` to approve a new commit "
-        "of a PR that already has `run-ci`."
     ),
 }
 
