@@ -118,20 +118,25 @@ def auto_size_hicache(
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
-    fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
-        from sglang.srt.mem_cache.pool_host.rocm_budget import explicit_size_scope
-
-        # gfx950 pins only its TTM share: book explicit sizes against it; else no-op
-        with explicit_size_scope(enabled):
-            yield
+    if not enabled:
+        yield
         return
-    requested = get_memory().hicache_ratio
-    device_bytes = _estimate_hicache_bytes(params, draft_plan)
+    fraction = get_memory().hicache_host_memory_fraction
     kvcache_device = getattr(
         params.token_to_kv_pool_allocator.get_kvcache(), "device", None
     )
     allocator = get_allocator_class_from_storage(get_allocator_type())
+    if fraction is None:
+        budget = host_memory_budget_plain_hugetlb(allocator, kvcache_device)
+        # Every local rank samples before any rank pins, or a rank sampling late
+        # sees its siblings' pools as used and fails the preflight.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+        with host_memory_budget_scope(budget):
+            yield
+        return
+    requested = get_memory().hicache_ratio
+    device_bytes = _estimate_hicache_bytes(params, draft_plan)
     plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
         allocator, kvcache_device, auto_size=True
     )
