@@ -12,7 +12,7 @@ on:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   # The workflow file comes from the base branch, so a PR cannot edit the gate (pr-gate.yml,
   # approval-mode commit). No `labeled` type: a label event would cancel the run in progress
-  # through the concurrency group; pr-gate-approve.yml reruns the gated run instead.
+  # through the concurrency group; the approving slash command reruns the gated run instead.
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, 'release/**']
@@ -542,7 +542,7 @@ jobs:
       - name: Require that tests ran
         if: needs.call-gate.outputs.opted-in == 'false'
         run: |
-          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer approve this commit: comment /tag-and-rerun-ci, or add the 'run-ci' label (remove and re-add it if it is on). Every push, a maintainer's included, needs a new approval; /rerun-failed-ci and 'Re-run all jobs' do not approve."
+          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer comment /tag-and-rerun-ci to approve this commit; adding 'run-ci' in the UI, /rerun-failed-ci and 'Re-run all jobs' approve nothing."
           exit 1
 
   # =============================================== notify pr-states ====================================================
