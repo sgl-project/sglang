@@ -703,6 +703,8 @@ impl Anthropic<'_> {
             bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
+            // The grammar starts after the open reasoning, as on the chat route.
+            require_reasoning: starts_in_reasoning,
             ..Default::default()
         };
         let call = self

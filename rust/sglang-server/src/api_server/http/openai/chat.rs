@@ -1265,7 +1265,8 @@ mod tests {
     use super::super::ChatFormatter;
     use super::super::test_utils::{
         GEMMA4_MARKED, GEMMA4_STRIPPED, answering_app_state_with, answering_app_state_with_item,
-        body_json, chat_submitted, chunk, gemma4_marker_state, post_json, with_cached_tokens,
+        answering_app_state_with_request, body_json, chat_submitted, chunk, gemma4_marker_state,
+        post_json, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1628,6 +1629,79 @@ mod tests {
                 text_of("message").as_deref(),
                 Some(answer),
                 "{model_type}: {response}"
+            );
+        }
+    }
+
+    /// gRPC Responses submits on its own, so after a `function_call_output`
+    /// that leaves the thought channel open its grammar must wait for the
+    /// channel to close, as on the chat route.
+    #[tokio::test]
+    async fn gemma4_grpc_responses_waits_for_reasoning_after_tool_output() {
+        use std::sync::Mutex;
+
+        use super::super::test_utils::checkpoint_formatter;
+        use crate::api_server::responses::Responses;
+        use crate::message::config::ModelConfig;
+        use crate::message::request::RequestKind;
+        use sglang_api_types::api::v1 as api;
+
+        let args = Arc::new(ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("gemma4".into()),
+            tool_call_parser: Some("gemma4".into()),
+            model_config: ModelConfig {
+                model_type: Some("gemma4".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let formatter = checkpoint_formatter(
+            &serde_json::json!({"model_type": "gemma4"}),
+            "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
+             {% else %}<|turn>model\n{% endif %}",
+        );
+        for thinking in [true, false] {
+            let submitted = Arc::new(Mutex::new(Vec::new()));
+            let seen = submitted.clone();
+            let state = answering_app_state_with_request(args.clone(), formatter.clone(), None, {
+                move |request| {
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("expected generation");
+                    };
+                    seen.lock().unwrap().push(generate.require_reasoning);
+                    chunk(
+                        request.rid.as_str(),
+                        "Check the result.<channel|>Done.",
+                        true,
+                    )
+                }
+            });
+            let adapter = Responses {
+                core: &state.core,
+                chat_formatter: state.chat_formatter.as_ref(),
+                server_args: &state.server_args,
+            };
+            let request = api::OpenAiResponsesRequest {
+                model: Some("model".into()),
+                input: Some(
+                    serde_json::json!([
+                        {"role": "user", "content": "Check my booking."},
+                        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                        {"type": "function_call_output", "call_id": "call_1", "output": "Confirmed."},
+                    ])
+                    .to_string(),
+                ),
+                chat_template_kwargs: Some(
+                    serde_json::json!({"enable_thinking": thinking}).to_string(),
+                ),
+                ..Default::default()
+            };
+            adapter.create(&request).await.unwrap();
+            assert_eq!(
+                *submitted.lock().unwrap(),
+                [thinking],
+                "thinking={thinking}"
             );
         }
     }
