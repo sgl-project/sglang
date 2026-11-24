@@ -103,7 +103,6 @@ jobs:
     if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci: true
       require-label: run-ci-ppu-extra
     secrets: inherit
 
@@ -240,7 +239,7 @@ jobs:
   pr-test-ppu-finish:
     name: pr-test-ppu-finish
     needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
-    if: always() && needs.check-changes.result != 'skipped'
+    if: always() && needs.check-changes.result != 'skipped' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -248,7 +247,6 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
           PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
-          OPTED_IN: ${{ needs.pr-gate.outputs.opted-in }}
           BUILD_RESULT: ${{ needs.ppu-build.result }}
           SANITY_RESULT: ${{ needs.ppu-sanity.result }}
         run: |
@@ -256,12 +254,12 @@ jobs:
             printf '%s\n' '::error::A PPU CI dependency failed or was cancelled.'
             exit 1
           fi
-          if [[ "$PPU_IN_SCOPE" == "true" && "$OPTED_IN" != "false" ]]; then
+          if [[ "$PPU_IN_SCOPE" == "true" ]]; then
             if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
               printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
               exit 1
             fi
             printf '%s\n' 'Native build and both PPU sanity files passed.'
           else
-            printf '%s\n' 'PPU is outside this run scope or not opted in; no PPU tests were requested.'
+            printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
           fi
