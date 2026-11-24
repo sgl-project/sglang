@@ -74,6 +74,7 @@ from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
@@ -407,7 +408,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=bench_args.output_len[0],
     )
 
     reqs = []
@@ -436,7 +437,6 @@ def prepare_extend_inputs_for_correctness_test(
         req: Req = reqs[i]
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
-            # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
             # The cut prefix is already in the request's row from the first extend.
             req.prefix_len = bench_args.cut_len
             req.logprob_start_len = -1
@@ -445,7 +445,7 @@ def prepare_extend_inputs_for_correctness_test(
 
 
 def prepare_synthetic_inputs_for_latency_test(
-    batch_size, input_len, custom_inputs=None
+    batch_size, input_len, custom_inputs=None, output_len=BenchArgs.output_len[0]
 ):
     input_ids = (
         custom_inputs
@@ -454,7 +454,7 @@ def prepare_synthetic_inputs_for_latency_test(
     )
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=output_len,
     )
 
     reqs = []
@@ -521,10 +521,7 @@ def extend(reqs, model_runner):
     batch.sampling_info.set_plugin_state(reqs)
     batch.sampling_info.set_seeds_and_mask_rows(reqs)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    if (
-        batch.input_ids is None
-        and getattr(batch, "prefill_input_ids_cpu", None) is not None
-    ):
+    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
         batch.input_ids = batch.prefill_input_ids_cpu.to(
             batch.device, non_blocking=True
         )
@@ -665,7 +662,7 @@ def _read_prompts_from_file(prompt_file, rank_print):
 
 
 def _get_torch_profiler_output_dir():
-    return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+    return envs.SGLANG_TORCH_PROFILER_DIR.get()
 
 
 def _create_torch_profiler_filename(
@@ -726,7 +723,11 @@ def correctness_test(
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
         # Prepare extend inputs
-        torch_runner = getattr(model_runner, "torch_runner", None)
+        torch_runner = (
+            model_runner.torch_runner
+            if isinstance(model_runner, _TorchBenchRunner)
+            else None
+        )
         reqs = prepare_extend_inputs_for_correctness_test(
             bench_args, input_ids, reqs, torch_runner
         )
@@ -930,8 +931,12 @@ def latency_test(
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
+    # Shorter decoding to speed up the warmup.
+    warmup_output_len = min(32, bench_args.output_len[0])
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        output_len=warmup_output_len,
     )
 
     # Warm up
@@ -943,7 +948,7 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
+        warmup_output_len,
         log_decode_step=0,
         profile=False,
         profile_record_shapes=False,
@@ -986,7 +991,9 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bs, il, bs_aligned_inputs, output_len=ol
+        )
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -1091,8 +1098,6 @@ def main(server_args, bench_args):
 
         for proc in workers:
             proc.join()
-
-        proc.terminate()
 
 
 def cli_main():
