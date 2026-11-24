@@ -1,17 +1,19 @@
-"""Bit-exact unit test for the vectorized ViT position-embedding interpolation.
+"""Unit tests for the ViT position-embedding interpolation.
 
-The vectorized path (``fast_pos_embed_interpolate_vectorized``) removes the
-per-image Python loop / CPU<->GPU sync of the legacy implementations. It is meant
-to be a pure speedup, so it must be numerically *identical* (bit-exact, rtol=0
-atol=0) to the loop version it replaces -- for single images, many images, video
-(t>1), and mixed-size batches, in both bf16 and fp32.
+Qwen3-VL resizes its learned position-embedding grid with ``F.interpolate``
+(``interpolate_pos_embed``). It is checked against an independent fp32
+4-neighbour bilinear reference, in both coordinate modes (corner-aligned and
+half-pixel), for single images, many images, video (t>1) and mixed-size
+batches: tight in fp32, within bf16 rounding in bf16.
 
-The interpolation is a sequence of embedding lookups + arithmetic, so it runs and
-is bit-exact on CPU; the test exercises CUDA too when available. It calls the real
+The MOSS-VL vectorized path must stay bit-exact (rtol=0, atol=0) with its
+per-image loop version.
+
+Both run on CPU; the test exercises CUDA too when available. It calls the real
 model methods on a lightweight stub holding a real ``nn.Embedding`` (no model
 weights / distributed init needed).
 
-    python -m pytest test/registered/models/test_vit_pos_embed_interpolate.py -v
+    python -m pytest test/registered/unit/models/test_vit_pos_embed_interpolate.py -v
 """
 
 import unittest
@@ -49,7 +51,40 @@ def _devices():
     return devs
 
 
+def _source_coords(size, side, align_corners, device):
+    if align_corners:
+        return torch.linspace(0, side - 1, size, device=device)
+    coords = (torch.arange(size, device=device) + 0.5) * (side / size) - 0.5
+    return coords.clamp(0, side - 1)
+
+
+def _reference_pos_embed(weight, side, grid, align_corners):
+    """fp32 bilinear from the 4 neighbours, merge-block order, repeated over t."""
+    table = weight.view(side, side, -1)
+    outputs = []
+    for t, h, w in grid:
+        hs = _source_coords(h, side, align_corners, weight.device)
+        ws = _source_coords(w, side, align_corners, weight.device)
+        h0, w0 = hs.floor().long(), ws.floor().long()
+        h1, w1 = (h0 + 1).clamp(max=side - 1), (w0 + 1).clamp(max=side - 1)
+        dh, dw = (hs - h0)[:, None, None], (ws - w0)[None, :, None]
+        emb = (
+            table[h0][:, w0] * (1 - dh) * (1 - dw)
+            + table[h0][:, w1] * (1 - dh) * dw
+            + table[h1][:, w0] * dh * (1 - dw)
+            + table[h1][:, w1] * dh * dw
+        )
+        emb = emb.reshape(h // MERGE, MERGE, w // MERGE, MERGE, -1).permute(
+            0, 2, 1, 3, 4
+        )
+        outputs.append(emb.reshape(h * w, -1).repeat(t, 1))
+    return torch.cat(outputs)
+
+
 class TestViTPosEmbedInterpolate(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+
     def _check(self, stub, legacy_fn, vectorized_fn, grid, label):
         ref = legacy_fn(stub, grid)
         out = vectorized_fn(stub, grid)
@@ -60,32 +95,43 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
             f"{(ref.float() - out.float()).abs().max().item():.3e}",
         )
 
-    def test_qwen3_vl_vectorized_matches_loop(self):
+    def test_qwen3_vl_interpolate_matches_reference(self):
         try:
             from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel as M
         except Exception as e:  # heavy optional deps (flashinfer, ...) unavailable
             self.skipTest(f"cannot import Qwen3VLMoeVisionModel: {e}")
 
+        side = int(NUM_POS**0.5)
         for device in _devices():
             for dtype in (torch.bfloat16, torch.float32):
                 stub = SimpleNamespace(
-                    num_grid_per_side=int(NUM_POS**0.5),
+                    num_grid_per_side=side,
                     spatial_merge_size=MERGE,
-                    num_position_embeddings=NUM_POS,
                     pos_embed=nn.Embedding(NUM_POS, HIDDEN).to(
                         device=device, dtype=dtype
                     ),
-                    dtype=dtype,
-                    device=device,
                 )
-                for name, grid in GRID_CASES.items():
-                    self._check(
-                        stub,
-                        M.fast_pos_embed_interpolate_from_list,
-                        M.fast_pos_embed_interpolate_vectorized,
-                        grid,
-                        f"qwen3_vl/{name}/{dtype}/{device.type}",
-                    )
+                for align_corners in (True, False):
+                    for name, grid in GRID_CASES.items():
+                        label = (
+                            f"qwen3_vl/{name}/align_corners={align_corners}"
+                            f"/{dtype}/{device.type}"
+                        )
+                        out = M.interpolate_pos_embed(
+                            stub, grid, align_corners=align_corners
+                        )
+                        ref = _reference_pos_embed(
+                            stub.pos_embed.weight.float(), side, grid, align_corners
+                        )
+                        self.assertEqual(out.shape, ref.shape, f"{label}: shape")
+                        self.assertEqual(out.dtype, dtype, f"{label}: dtype")
+                        # fp32: source coordinates up to side-1 carry ~1e-7 relative
+                        # rounding, scaled by neighbour differences; bf16: the output
+                        # rounds once from an fp32-accurate blend.
+                        scale = ref.abs().max().item()
+                        atol = (1e-4 if dtype == torch.float32 else 2**-7) * scale
+                        err = (out.float() - ref).abs().max().item()
+                        self.assertLessEqual(err, atol, f"{label}: max|diff|={err:.3e}")
 
     def test_moss_vl_vectorized_matches_loop(self):
         try:

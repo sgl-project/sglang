@@ -25,6 +25,7 @@ from typing import Callable, Iterable, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 
@@ -104,10 +105,6 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
-# Below this image count the per-image loop beats the vectorized path (which has a
-# fixed setup cost; measured crossover ~6 on H20); both give the same result.
-_VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
 def _resolve_vision_parallel_group(
@@ -509,260 +506,38 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
-    def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
+    def interpolate_pos_embed(
+        self, grid_thw_list: list[list[int]], align_corners: bool
+    ) -> torch.Tensor:
+        """Resize the learned position-embedding grid to each image's patch grid.
+
+        Bilinear per image, reordered into spatial-merge blocks and repeated over
+        the temporal dimension; returns [sum(t * h * w), hidden].
         """
-        Compute continuous interpolation indices for a single dimension.
-
-        Returns continuous indices.
-        """
-        if self.align_corners:
-            indices = np.linspace(
-                0, self.num_grid_per_side - 1, dim_size, dtype=np.float32
-            )
-        else:
-            indices = (np.arange(dim_size, dtype=np.float32) + 0.5) * (
-                self.num_grid_per_side / dim_size
-            ) - 0.5
-            indices = np.clip(indices, 0, self.num_grid_per_side - 1)
-        return indices
-
-    def _calculate_indices_and_weights(self, h_idxs, w_idxs):
-        """
-        Compute bilinear interpolation indices and weights.
-
-        Returns tuple of (indices, weights), each as 4 numpy arrays for the 4 corner points.
-        """
-        h_f = np.floor(h_idxs).astype(np.int64)
-        h_c = np.clip(h_f + 1, 0, self.num_grid_per_side - 1)
-        dh = h_idxs - h_f
-
-        w_f = np.floor(w_idxs).astype(np.int64)
-        w_c = np.clip(w_f + 1, 0, self.num_grid_per_side - 1)
-        dw = w_idxs - w_f
-
         side = self.num_grid_per_side
-
-        indices = [
-            (h_f[:, None] * side + w_f).flatten(),
-            (h_f[:, None] * side + w_c).flatten(),
-            (h_c[:, None] * side + w_f).flatten(),
-            (h_c[:, None] * side + w_c).flatten(),
-        ]
-        weights = [
-            ((1 - dh)[:, None] * (1 - dw)).flatten(),
-            ((1 - dh)[:, None] * dw).flatten(),
-            (dh[:, None] * (1 - dw)).flatten(),
-            (dh[:, None] * dw).flatten(),
-        ]
-        return indices, weights
-
-    def _get_position_embedding(self, patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-        """
-        Tile and reorganize position embeddings to align with the token sequence.
-        """
-        result_parts = []
-        merge_size = self.spatial_merge_size
-
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-
-            h_merge = h // merge_size
-            w_merge = w // merge_size
-
-            pos_embed = (
-                pos_embed.view(t, h_merge, merge_size, w_merge, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-
-            result_parts.append(pos_embed)
-
-        return torch.cat(result_parts, dim=0)
-
-    def fast_pos_embed_interpolate_from_list(self, grid_thw):
-        num_grid_per_side = self.num_grid_per_side
-        m_size = self.spatial_merge_size
-        hidden_dim = self.pos_embed.embedding_dim
+        m = self.spatial_merge_size
+        weight = self.pos_embed.weight
+        hidden_dim = weight.shape[-1]
+        # Batch stride side*side*hidden marks this view channels-last, so
+        # F.interpolate takes its NHWC kernel; a view with batch stride hidden
+        # (e.g. built with [None]) falls back to a ~20x slower NCHW kernel.
+        table = weight.view(1, side, side, hidden_dim).permute(0, 3, 1, 2)
 
         outputs = []
-        for t, h, w in grid_thw:
-            h_idxs = torch.linspace(
-                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
+        for t, h, w in grid_thw_list:
+            embeds = F.interpolate(
+                table, size=(h, w), mode="bilinear", align_corners=align_corners
             )
-            w_idxs = torch.linspace(
-                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
+            embeds = (
+                embeds[0]
+                .permute(1, 2, 0)
+                .reshape(h // m, m, w // m, m, hidden_dim)
+                .permute(0, 2, 1, 3, 4)
             )
-
-            h_floor = h_idxs.to(torch.long)
-            w_floor = w_idxs.to(torch.long)
-            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
-
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-
-            # Create meshgrid view for all h, w vars
-            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
-
-            # original computation of weights
-            # w00 = (1 - dh_grid) * (1 - dw_grid)
-            # w01 = (1 - dh_grid) * dw_grid
-            # w10 = dh_grid * (1 - dw_grid)
-            # w11 = dh_grid * dw_grid
-            # we reuse w11 here to avoid duplicate
-            # dh_grid * dw_grid computation
-            w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - w01
-
-            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
-            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
-            h_grid_idx = h_grid * num_grid_per_side
-
-            indices = (h_grid_idx + w_grid).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
-
-            embeds = self.pos_embed(indices)
-            embeds *= weights
-            combined = embeds.sum(dim=0)
-
-            combined = combined.reshape(
-                h // m_size, m_size, w // m_size, m_size, hidden_dim
+            outputs.append(
+                embeds.unsqueeze(0).expand(t, *embeds.shape).reshape(-1, hidden_dim)
             )
-            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
-            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
-            outputs.append(repeated)
-
         return torch.cat(outputs, dim=0)
-
-    def _use_vectorized_pos_embed(self, num_images: int) -> bool:
-        """Use the vectorized path only past a few images.
-
-        It drops the per-image loop but has a fixed setup cost, so the loop is
-        faster for a handful of images. Both give the same result.
-        """
-        return (
-            envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
-            and num_images >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
-        )
-
-    def fast_pos_embed_interpolate_vectorized(self, grid_thw):
-        """Vectorized fast_pos_embed_interpolate_from_list (no per-image loop).
-
-        Same result as the loop version; the cost no longer scales with the number
-        of images.
-        """
-        num_grid_per_side = self.num_grid_per_side
-        m = self.spatial_merge_size
-        dtype = self.dtype
-        device = self.device
-
-        grid_list = grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
-        ts = [int(g[0]) for g in grid_list]
-        hs = [int(g[1]) for g in grid_list]
-        ws = [int(g[2]) for g in grid_list]
-        num_images = len(grid_list)
-
-        hw_list = [h * w for h, w in zip(hs, ws)]  # base tokens / frame / image
-        thw_list = [t * s for t, s in zip(ts, hw_list)]  # output tokens / image
-        total_hw = sum(hw_list)
-        total_out = sum(thw_list)
-
-        def _exclusive_prefix(sizes):
-            out, acc = [], 0
-            for s in sizes:
-                out.append(acc)
-                acc += s
-            return torch.tensor(out, device=device, dtype=torch.long)
-
-        hw_off = _exclusive_prefix(hw_list)  # image offset in the base layout
-        thw_off = _exclusive_prefix(thw_list)  # image offset in the output layout
-        image_arange = torch.arange(num_images, device=device)
-
-        # --- 1. per base-token image id + local (row, col) (single frame) ---
-        base_image_id = torch.repeat_interleave(
-            image_arange, torch.tensor(hw_list, device=device)
-        )
-        base_local = torch.arange(total_hw, device=device) - hw_off[base_image_id]
-        w_of = torch.tensor(ws, device=device)[base_image_id]
-        row = base_local // w_of
-        col = base_local % w_of
-
-        # per-size linspace LUT (one entry per unique h/w), so images of the same
-        # size share coords without the per-image loop
-        uniq_h, inv_h = torch.unique(
-            torch.tensor(hs, device=device), return_inverse=True
-        )
-        uniq_w, inv_w = torch.unique(
-            torch.tensor(ws, device=device), return_inverse=True
-        )
-        h_luts = [
-            torch.linspace(0, num_grid_per_side - 1, int(h), device=device)
-            for h in uniq_h.tolist()
-        ]
-        w_luts = [
-            torch.linspace(0, num_grid_per_side - 1, int(w), device=device)
-            for w in uniq_w.tolist()
-        ]
-        h_lut_off = _exclusive_prefix([len(x) for x in h_luts])
-        w_lut_off = _exclusive_prefix([len(x) for x in w_luts])
-        h_idxs = torch.cat(h_luts)[h_lut_off[inv_h[base_image_id]] + row]
-        w_idxs = torch.cat(w_luts)[w_lut_off[inv_w[base_image_id]] + col]
-
-        h_floor = h_idxs.to(torch.long)
-        w_floor = w_idxs.to(torch.long)
-        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
-        dh = h_idxs - h_floor
-        dw = w_idxs - w_floor
-        # bilinear weights (same form as ..._from_list)
-        w11 = dh * dw
-        w10 = dh - w11
-        w01 = dw - w11
-        w00 = 1 - dh - w01
-
-        base_h = h_floor * num_grid_per_side
-        base_h_ceil = h_ceil * num_grid_per_side
-        indices = torch.stack(
-            [
-                base_h + w_floor,
-                base_h + w_ceil,
-                base_h_ceil + w_floor,
-                base_h_ceil + w_ceil,
-            ],
-            dim=0,
-        )
-        weights = torch.stack([w00, w01, w10, w11], dim=0).to(dtype=dtype)
-        embeds = self.pos_embed(indices) * weights[:, :, None]
-        base_embeds = embeds.sum(dim=0)  # [total_hw, C]
-
-        # --- 2. temporal repeat (gather) ---
-        out_image_id = torch.repeat_interleave(
-            image_arange, torch.tensor(thw_list, device=device)
-        )
-        pos_in_image = torch.arange(total_out, device=device) - thw_off[out_image_id]
-        hw_of_out = torch.tensor(hw_list, device=device)[out_image_id]
-        frame_idx = pos_in_image // hw_of_out
-        local_idx = pos_in_image % hw_of_out
-        patch = base_embeds[hw_off[out_image_id] + local_idx]  # [total_out, C]
-
-        # --- 3. spatial-merge reorder (scatter) ---
-        all_w = torch.tensor(ws, device=device)[out_image_id]
-        rows = local_idx // all_w
-        cols = local_idx % all_w
-        out_within = (
-            frame_idx * hw_of_out
-            + ((rows // m) * (all_w // m) + (cols // m)) * m * m
-            + (rows % m) * m
-            + (cols % m)
-        )
-        merged = torch.empty_like(patch)
-        merged[out_within + thw_off[out_image_id]] = patch
-        return merged
 
     def bucket_flashinfer_max_seqlen(self, real_max_seqlen: int) -> int:
         if real_max_seqlen <= 0:
@@ -772,61 +547,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             # For large sequences (> max bucket), round up to a multiple of
             # the largest bucket to avoid under-estimation.
             round_up(real_max_seqlen, FLASHINFER_MAX_SEQLEN_BUCKETS[-1]),
-        )
-
-    def fast_pos_embed_interpolate(self, grid_thw):
-        """Interpolate position embeddings for (batch, 3) size input dimensions.
-
-        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
-        along temporal dimension. The result is reorganized according to spatial_merge_size.
-
-        Args:
-            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
-                     in patches for each sample.
-
-        Returns:
-            Interpolated position embeddings tensor.
-        """
-        grid_thw_cpu = grid_thw.cpu().numpy()
-
-        # transfer data to CPU before loop
-        temporal_dims = grid_thw_cpu[:, 0].tolist()
-        height_dims = grid_thw_cpu[:, 1].tolist()
-        width_dims = grid_thw_cpu[:, 2].tolist()
-
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
-
-        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
-        total_patches = sum(patches_size)
-        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
-        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
-
-        current_idx = 0
-
-        # calculate indices and weights on CPU
-        for t, h, w in zip(temporal_dims, height_dims, width_dims):
-            h_idxs = self._get_interpolation_indices(h)
-            w_idxs = self._get_interpolation_indices(w)
-
-            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
-
-            end_idx = current_idx + h * w
-            for i in range(4):
-                all_indices_np[i, current_idx:end_idx] = indices[i]
-                all_weights_np[i, current_idx:end_idx] = weights[i]
-            current_idx = end_idx
-
-        idx_tensor = torch.from_numpy(all_indices_np).to(device)
-        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
-
-        # calculate interpolation
-        pos_embeds = self.pos_embed(idx_tensor.view(-1))
-        pos_embeds = pos_embeds.view(4, total_patches, -1)
-        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
-        patch_pos_embeds = patch_pos_embeds.split(patches_size)
-        return self._get_position_embedding(
-            patch_pos_embeds, temporal_dims, height_dims, width_dims
         )
 
     def compute_flashinfer_batch_offsets_packed(
@@ -914,11 +634,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             grid_thw_list = grid_thw.tolist()
             grid_thw = grid_thw.cpu().numpy()
 
-        if self._use_vectorized_pos_embed(len(grid_thw_list)):
-            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
-        else:
-            pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
-        x += pos_embeds
+        # Eager mode uses corner-aligned coordinates regardless of
+        # enable_precise_embedding_interpolation; only the graph path honors it.
+        x += self.interpolate_pos_embed(grid_thw_list, align_corners=True)
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
@@ -1103,15 +821,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             grid_thw_list = grid_thw.tolist()
 
-        if self.align_corners and self._use_vectorized_pos_embed(len(grid_thw_list)):
-            # The vectorized implementation uses linspace coordinates. In graph mode
-            # the legacy fallback honors enable_precise_embedding_interpolation, so
-            # only use the vectorized path when the active graph interpolation mode
-            # is also linspace; otherwise image count would change the output.
-            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
-        else:
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        x += pos_embeds
+        x += self.interpolate_pos_embed(grid_thw_list, align_corners=self.align_corners)
 
         # rotary embedding -> (cos, sin)
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
