@@ -857,12 +857,23 @@ class CausalDecodeQueue:
     """
 
     def __init__(
-        self, vae: Any, *, device: torch.device, quality: str = "exact"
+        self,
+        vae: Any,
+        *,
+        device: torch.device,
+        quality: str = "exact",
+        idle_streams: dict[torch.device, torch.cuda.Stream] | None = None,
     ) -> None:
         self.vae = vae
         self.fast_path = quality_allows(quality, "lossless")
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
         self.device = device
-        self.stream = torch.cuda.Stream(device=device)
+        if idle_streams is None:
+            idle_streams = {}
+        self._idle_streams: dict[torch.device, torch.cuda.Stream] | None = idle_streams
+        stream = idle_streams.pop(device, None)
+        self.stream = stream if stream is not None else torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
         self.submitted = 0
         self.vae.reset_causal_decode_state()
@@ -879,6 +890,9 @@ class CausalDecodeQueue:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        idle_streams, self._idle_streams = self._idle_streams, None
+        if idle_streams is None:
+            return
         try:
             self.vae.reset_causal_decode_state()
             if exc_type is not None:
@@ -887,11 +901,15 @@ class CausalDecodeQueue:
             # Drain last: freeing pinned outputs records host-allocator events
             # on this stream, so they must land before the final sync.
             self.stream.synchronize()
+            # The CUDA allocator can reuse decoder buffers on this stream.
+            idle_streams[self.device] = self.stream
 
     def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
         return denormalize_vae_latents(latents, self._mean, self._std)
 
     def submit(self, latents: torch.Tensor) -> None:
+        if self._idle_streams is None:
+            raise RuntimeError("Cannot submit to a closed decode queue")
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
         latents = latents.detach()
         latents.record_stream(self.stream)
@@ -1390,6 +1408,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         # decoding stage then only post-processes.
         self.vae = vae
         self.overlap_vae_decode = bool(overlap_vae_decode and vae is not None)
+        self._idle_decode_streams: dict[torch.device, torch.cuda.Stream] = {}
         # Without a resolved profile the stage runs the artifact as exported:
         # its t_list on every chunk and its K/V window.
         self.profile = profile or CosmosDreamsInferenceProfile(
@@ -1442,7 +1461,12 @@ class CosmosDreamsRolloutStage(PipelineStage):
             or self.server_args.should_start_component_on_cpu("vae")
         ):
             return None
-        return CausalDecodeQueue(self.vae, device=device, quality=quality)
+        return CausalDecodeQueue(
+            self.vae,
+            device=device,
+            quality=quality,
+            idle_streams=self._idle_decode_streams,
+        )
 
     def _rollout(self, batch: Req) -> torch.Tensor:
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]

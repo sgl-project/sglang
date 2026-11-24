@@ -54,12 +54,12 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages import base
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     EXTRA_TARGET_LATENT_FRAMES,
-    CausalDecodeQueue,
     CosmosDreamsPrepareStage,
     CosmosDreamsRolloutStage,
     _RolloutContext,
@@ -1963,9 +1963,22 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 stage.vae = vae
                 stage._latents_mean = stage._latents_std = None
                 expected = stage._denormalize_latents(latents)
+                with mock.patch.object(base, "get_global_server_args") as args:
+                    args.return_value.should_start_component_on_cpu.return_value = False
+                    rollout = CosmosDreamsRolloutStage(
+                        transformer=mock.Mock(
+                            spec=cosmos_dreams.CosmosDreamsTransformer
+                        ),
+                        scheduler=FlowMatchEulerDiscreteScheduler(
+                            stochastic_sampling=True
+                        ),
+                        manifest=MANIFEST,
+                        vae=vae,
+                        overlap_vae_decode=True,
+                    )
                 with self.assertRaisesRegex(RuntimeError, "injected rollout failure"):
-                    with CausalDecodeQueue(
-                        vae, device=torch.device("cuda"), quality="lossless"
+                    with rollout._decode_queue(
+                        latents.device, quality="lossless"
                     ) as queue:
                         queue.submit(latents[:, :, :2])
                         raise RuntimeError("injected rollout failure")
@@ -1974,13 +1987,15 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 self.assertIsNone(vae.cached_latents)
                 self.assertTrue(queue.stream.query())
                 self.assertEqual(queue.outputs, [])
+                drained_stream = queue.stream
                 for quality, enabled in (("lossless", True), ("exact", False)):
                     vae.seen_gates.clear()
-                    with CausalDecodeQueue(
-                        vae, device=torch.device("cuda"), quality=quality
+                    with rollout._decode_queue(
+                        latents.device, quality=quality
                     ) as queue:
                         for chunk in latents.split(2, dim=2):
                             queue.submit(chunk)
+                    self.assertEqual(queue.stream, drained_stream)
                     self.assertEqual(vae.seen_gates, [enabled, enabled])
                     self.assertFalse(vae.gate.enabled)
                     self.assertIsNone(vae.cached_latents)
