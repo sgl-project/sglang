@@ -1,3 +1,6 @@
+// TODO: Fuse TP all-reduce, RMSNorm, residual add, RMSNorm, and FP8 quantization.
+// See gemma4_ar_fusion.py for the CUDA dense prefill path.
+
 #include <bit>
 #include <limits>
 
