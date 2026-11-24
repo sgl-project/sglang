@@ -118,7 +118,6 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(
             move_bootstrapped=lambda dst: []
         )
-        s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()
         s.get_new_batch_prefill = self.calls.admit
         # Stop the infinite loop at admission; no PP transport or GPU is needed.
