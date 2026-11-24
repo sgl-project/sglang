@@ -16,6 +16,7 @@ PR_TEST = ".github/workflows/pr-test.yml"
 PR_TEST_EXTRA = ".github/workflows/pr-test-extra.yml"
 HEAD = "a" * 40
 # 2026-11-23T00:00:00Z; 90 days earlier is 2026-08-25.
+NOW = 1795392000
 
 
 def _time(hour):
@@ -23,12 +24,19 @@ def _time(hour):
 
 
 class FakeRepo:
-    def __init__(self, permissions=None, statuses=(), runs=(), head=HEAD):
+    def __init__(self, permissions=None, commits=0, statuses=(), runs=(), head=HEAD):
         self.full_name = "sgl-project/sglang"
         self.permissions = permissions or {}
+        self.commits = commits
         self.statuses = list(statuses)
         self.runs = list(runs)
         self.head = head
+        self.queries = []
+        self.requester = SimpleNamespace(requestJsonAndCheck=self._request)
+
+    def _request(self, verb, url, parameters):
+        self.queries.append((url, parameters))
+        return {}, [{"sha": "c"}] * self.commits
 
     def get_collaborator_permission(self, login):
         permission = self.permissions.get(login, 404)
@@ -110,24 +118,52 @@ GATE = "call-gate / pr-gate"
 
 
 class TestCanApprove(unittest.TestCase):
-    def test_write_access_approves(self):
+    def setUp(self):
+        patcher = mock.patch("time.time", return_value=NOW)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_write_access_approves_without_activity(self):
         for permission in rca.APPROVER_REPO_PERMISSIONS:
             with self.subTest(permission=permission):
                 repo = FakeRepo(permissions={"u": permission})
-                self.assertEqual(rca.can_approve(repo, "u"), (True, ""))
+                self.assertEqual(rca.can_approve(repo, "u", None), (True, ""))
+                self.assertEqual(repo.queries, [])
 
-    def test_no_write_access_is_refused(self):
+    def test_no_write_access_and_no_permission_entry(self):
         for permission in ("read", "triage", 403, 404):
             with self.subTest(permission=permission):
-                repo = FakeRepo(permissions={"u": permission})
-                ok, reason = rca.can_approve(repo, "u")
+                repo = FakeRepo(permissions={"u": permission}, commits=5)
+                ok, reason = rca.can_approve(repo, "u", {"can_rerun_failed_ci": True})
                 self.assertFalse(ok)
-                self.assertIn("no write access", reason)
+                self.assertIn("neither write access nor can_tag_run_ci_label", reason)
+                self.assertEqual(repo.queries, [])
 
     def test_server_error_is_raised(self):
         repo = FakeRepo(permissions={"u": 500})
         with self.assertRaises(GithubException):
-            rca.can_approve(repo, "u")
+            rca.can_approve(repo, "u", {"can_tag_run_ci_label": True})
+
+    def test_ci_permissions_user_needs_a_recent_commit(self):
+        perms = {"can_tag_run_ci_label": True}
+        repo = FakeRepo(permissions={"u": "read"}, commits=1)
+        self.assertEqual(rca.can_approve(repo, "u", perms), (True, ""))
+        self.assertEqual(
+            repo.queries,
+            [
+                (
+                    "/repos/sgl-project/sglang/commits",
+                    {"author": "u", "since": "2026-08-25T00:00:00Z", "per_page": 1},
+                )
+            ],
+        )
+
+        repo = FakeRepo(permissions={"u": 404}, commits=0)
+        ok, reason = rca.can_approve(repo, "u", perms)
+        self.assertFalse(ok)
+        self.assertIn(
+            "no commit on sgl-project/sglang's default branch since 2026-08-25", reason
+        )
 
 
 class TestIsApproved(unittest.TestCase):
