@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx115_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -1646,6 +1647,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
+        # aiter's only gfx1250 MoE kernel takes MXFP4 weights with gate/up interleaved.
+        if is_gfx1250_supported():
+            return "aiter has no bf16 fused-MoE kernel on gfx1250"
+
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
         if layer.intermediate_size_per_partition % 128 != 0:
