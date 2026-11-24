@@ -5,6 +5,20 @@
 # index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
+# Hugging Face tokens on self-hosted runners come from the runner environment,
+# not from GitHub secrets, so GitHub does not mask them. Register them as
+# masks so later steps print *** instead. Tracing is off here: with -x on,
+# the echo line itself would print the token before GitHub masks it.
+{ set +x; } 2>/dev/null
+for _hf_token in "${HF_TOKEN:-}" "${HUGGING_FACE_HUB_TOKEN:-}" \
+    "$(cat "${HF_HOME:-${HOME}/.cache/huggingface}/token" 2>/dev/null || true)"; do
+    if [ -n "${_hf_token}" ]; then
+        echo "::add-mask::${_hf_token}"
+    fi
+done
+unset _hf_token
+set -x
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 

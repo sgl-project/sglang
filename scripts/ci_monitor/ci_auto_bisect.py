@@ -2,8 +2,9 @@
 """
 SGLang CI Auto Bisect
 
-Fetches recent Nvidia scheduled PR Test runs, identifies consistently failing
-tests, and calls Claude to classify each as regression/flaky/hardware/environment.
+Fetches recent scheduled runs of one workflow (default: Nvidia PR Test),
+identifies consistently failing tests, and calls Claude to classify each as
+regression/flaky/hardware/environment.
 
 Self-contained: does its own lightweight GitHub API analysis instead of running
 the full ci_failures_analysis.py, keeping API usage to ~30-40 calls.
@@ -13,7 +14,8 @@ Usage:
         --github-token $GITHUB_TOKEN \
         --anthropic-api-key $ANTHROPIC_API_KEY \
         --output bisect_results.json \
-        --max-failures 10
+        --max-failures 10 \
+        [--workflow-file pr-test-xpu.yml --hardware "Intel XPU"]
 """
 
 import argparse
@@ -51,8 +53,21 @@ EXCLUDED_JOBS = [
 # Number of recent scheduled runs to analyze
 SCHEDULED_RUN_LIMIT = 6
 
+# Default scheduled workflow and the hardware label passed to Claude
+DEFAULT_WORKFLOW_FILE = "pr-test.yml"
+DEFAULT_HARDWARE = "Nvidia"
+
 # Compiled regex for stripping ANSI escape codes from CI logs
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+# GitHub job-log line prefix, e.g. "2026-11-19T17:41:00.2402142Z "
+_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z ", re.MULTILINE)
+# Diffusion pytest_runner retries a pytest session up to 7 times, then prints this tail
+_PYTEST_ATTEMPT_RE = re.compile(r"^Starting pytest attempt \d+/\d+", re.MULTILINE)
+_PYTEST_TAIL_MARKER = "Pytest Tail Summary"
+_PYTEST_SUMMARY_HEADER_RE = re.compile(r"^=+ short test summary info =+$")
+_PYTEST_RESULT_RE = re.compile(r"^(?:FAILED|ERROR) (\S+?\.py(?:::.+?)?)(?: - .*)?$")
+_PYTEST_STATS_RE = re.compile(r"^=+ (.*\bin [\d.]+s\b.*?) =+$")
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +94,12 @@ class FailureTarget:
     recent_run_statuses: List[str] = field(default_factory=list)
     test_streak: int = 0
     test_total_failures: int = 0
+    # pytest node ID ("file.py::Class::test[param]"); empty for file-level failures
+    test_id: str = ""
+
+    @property
+    def test_label(self) -> str:
+        return self.test_id or self.test_file
 
 
 @dataclass
@@ -108,7 +129,7 @@ class BisectionResult:
 
 
 # ---------------------------------------------------------------------------
-# Focused GitHub API analysis (Nvidia scheduled only)
+# Focused GitHub API analysis (scheduled runs of one workflow)
 # ---------------------------------------------------------------------------
 
 
@@ -173,10 +194,12 @@ def _gh_get_all_pages(
     return all_items
 
 
-def fetch_nvidia_scheduled_runs(token: str) -> List[dict]:
-    """Fetch recent scheduled PR Test runs on main. ~1 API call."""
-    print(f"Fetching {SCHEDULED_RUN_LIMIT} recent scheduled PR Test (Nvidia) runs...")
-    url = f"{GITHUB_API}/repos/{REPO}/actions/workflows/pr-test.yml/runs"
+def fetch_scheduled_runs(
+    token: str, workflow_file: str = DEFAULT_WORKFLOW_FILE
+) -> List[dict]:
+    """Fetch recent scheduled runs of workflow_file on main. ~1 API call."""
+    print(f"Fetching {SCHEDULED_RUN_LIMIT} recent scheduled {workflow_file} runs...")
+    url = f"{GITHUB_API}/repos/{REPO}/actions/workflows/{workflow_file}/runs"
     data = _gh_get(url, token, {"event": "schedule", "per_page": SCHEDULED_RUN_LIMIT})
     if not data:
         return []
@@ -220,6 +243,9 @@ def parse_test_summary(logs: str) -> Optional[Dict]:
 
     summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
     if not summary_match:
+        pytest_summary = parse_pytest_summary(logs)
+        if pytest_summary and pytest_summary["failed_tests"]:
+            return pytest_summary
         # Try to find the last running test (timeout scenario)
         last_test = _find_last_running_test(logs)
         if last_test:
@@ -241,6 +267,74 @@ def parse_test_summary(logs: str) -> Optional[Dict]:
             full_path = match.group(1)
             test_file = full_path.split("/")[-1] if "/" in full_path else full_path
             failed_tests.append({"test_file": test_file, "full_path": full_path})
+
+    return {"passed": passed, "total": total, "failed_tests": failed_tests}
+
+
+def _final_pytest_blocks(logs: str) -> List[List[str]]:
+    """Return the lines after each final pytest "short test summary info" header.
+
+    With diffusion retry markers, only the last block of each session's final
+    attempt counts; without them, every block is its own session's result.
+    """
+    starts = [m.start() for m in _PYTEST_ATTEMPT_RE.finditer(logs)]
+    if starts:
+        bounds = starts + [len(logs)]
+        attempts = [logs[a:b] for a, b in zip(bounds, bounds[1:])]
+        attempts = [
+            text
+            for i, text in enumerate(attempts)
+            if _PYTEST_TAIL_MARKER in text or i == len(attempts) - 1
+        ]
+    else:
+        attempts = [logs]
+
+    blocks = []
+    for text in attempts:
+        lines = text.splitlines()
+        headers = [i for i, l in enumerate(lines) if _PYTEST_SUMMARY_HEADER_RE.match(l)]
+        if starts:
+            # A passing final attempt has no header; keep it for the stats line
+            headers = headers[-1:] or [-1]
+        blocks.extend(lines[h + 1 :] for h in headers)
+    return blocks
+
+
+def parse_pytest_summary(logs: str) -> Optional[Dict]:
+    """Parse final pytest failure summaries, keeping node IDs.
+
+    Items that passed on a diffusion retry are not reported.
+    Returns None if the log has no pytest failure summary.
+    """
+    logs = _LOG_TIMESTAMP_RE.sub("", _ANSI_ESCAPE_RE.sub("", logs))
+    blocks = _final_pytest_blocks(logs)
+    if not blocks:
+        return None
+
+    passed = total = 0
+    failed_tests: List[Dict] = []
+    seen = set()
+    for block in blocks:
+        for line in block:
+            stats = _PYTEST_STATS_RE.match(line)
+            if stats:
+                for n, kind in re.findall(
+                    r"(\d+) (passed|failed|errors?)", stats.group(1)
+                ):
+                    total += int(n)
+                    passed += int(n) if kind == "passed" else 0
+                break
+            result = _PYTEST_RESULT_RE.match(line)
+            if not result:
+                continue
+            full_path, _, rest = result.group(1).partition("::")
+            test_file = full_path.rsplit("/", 1)[-1]
+            test_id = f"{test_file}::{rest}" if rest else ""
+            if (full_path, test_id) not in seen:
+                seen.add((full_path, test_id))
+                failed_tests.append(
+                    {"test_file": test_file, "full_path": full_path, "test_id": test_id}
+                )
 
     return {"passed": passed, "total": total, "failed_tests": failed_tests}
 
@@ -274,10 +368,14 @@ def _find_last_running_test(logs: str) -> Optional[Dict]:
 
 
 def analyze_scheduled_failures(
-    token: str, min_streak: int = 1, max_failures: int = 10
+    token: str,
+    min_streak: int = 1,
+    max_failures: int = 10,
+    workflow_file: str = DEFAULT_WORKFLOW_FILE,
+    hardware: str = DEFAULT_HARDWARE,
 ) -> Tuple[List[FailureTarget], Dict[int, str]]:
     """
-    Fetch Nvidia scheduled runs, analyze job/test failure streaks, return targets.
+    Fetch scheduled runs, analyze job/test failure streaks, return targets.
 
     Returns (targets, logs_cache) where logs_cache maps job_id -> log text,
     so callers can reuse fetched logs without re-fetching.
@@ -287,7 +385,7 @@ def analyze_scheduled_failures(
     """
     logs_cache: Dict[int, str] = {}
 
-    runs = fetch_nvidia_scheduled_runs(token)
+    runs = fetch_scheduled_runs(token, workflow_file)
     if not runs:
         print("No scheduled runs found")
         return [], logs_cache
@@ -394,11 +492,12 @@ def analyze_scheduled_failures(
 
         first_fail = data["first_fail"]
 
-        def _make_target(test_file: str) -> FailureTarget:
+        def _make_target(test_file: str, test_id: str = "") -> FailureTarget:
             return FailureTarget(
                 job_name=job_name,
                 test_file=test_file,
-                hardware="Nvidia",
+                test_id=test_id,
+                hardware=hardware,
                 current_streak=data["streak"],
                 first_failure_sha=first_fail.get("head_sha", ""),
                 last_failure_sha=last_fail.get("head_sha", ""),
@@ -415,7 +514,7 @@ def analyze_scheduled_failures(
 
         if test_failures:
             for tf in test_failures:
-                targets.append(_make_target(tf["test_file"]))
+                targets.append(_make_target(tf["test_file"], tf.get("test_id", "")))
         else:
             targets.append(_make_target("<job-level>"))
 
@@ -430,7 +529,7 @@ def analyze_scheduled_failures(
         if t.test_file == "<job-level>":
             key = f"<job-level>:{t.job_name}"
         else:
-            key = t.test_file
+            key = t.test_label
         if key not in seen or t.current_streak > seen[key].current_streak:
             seen[key] = t
     targets = list(seen.values())
@@ -596,7 +695,29 @@ def _infer_related_paths(test_file: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def extract_error_signature(logs: str, test_file: str) -> str:
+def _extract_pytest_failure(logs: str, test_id: str) -> str:
+    """Return the last pytest FAILURES section for test_id, or ""."""
+    # Header is "___ Class.test[param] ___" for node "file.py::Class::test[param]"
+    name = ".".join(test_id.split("::")[1:])
+    header_re = re.compile(r"^_+ " + re.escape(name) + r" _+$")
+    lines = _LOG_TIMESTAMP_RE.sub("", logs).split("\n")
+    starts = [i for i, l in enumerate(lines) if header_re.match(l)]
+    if not starts:
+        return ""
+    header, body = lines[starts[-1]], []
+    for line in lines[starts[-1] + 1 : starts[-1] + 300]:
+        # Stop at the next case, the next pytest section, or captured output
+        if re.match(r"^(?:_+ .+ _+|=+ .* =+|-+ Captured .* -+)$", line):
+            break
+        body.append(line)
+    # Keep the tail: the last chained exception carries the actual assertion
+    text = "\n".join(body)
+    if len(header) + len(text) > 2000:
+        text = "...\n" + text[-(1990 - len(header)) :]
+    return f"{header}\n{text}"
+
+
+def extract_error_signature(logs: str, test_file: str, test_id: str = "") -> str:
     """Extract error-relevant lines from job logs.
 
     When a specific test_file is given, tries to find the error context
@@ -606,6 +727,11 @@ def extract_error_signature(logs: str, test_file: str) -> str:
         return ""
 
     logs = _ANSI_ESCAPE_RE.sub("", logs)
+    if "::" in test_id:
+        excerpt = _extract_pytest_failure(logs, test_id)
+        if excerpt:
+            return excerpt
+
     lines = logs.split("\n")
 
     # If we have a specific test file, try to find the error near its FAILED marker
@@ -698,7 +824,7 @@ def gather_bisection_context(
         logs_cache: Pre-fetched logs from analyze_scheduled_failures to avoid
             re-fetching the same job logs.
     """
-    print(f"  Gathering context for {target.test_file} in {target.job_name}...")
+    print(f"  Gathering context for {target.test_label} in {target.job_name}...")
 
     commits = get_commits_between(target.first_failure_sha, target.last_failure_sha)
     print(f"    Found {len(commits)} commits in range")
@@ -719,7 +845,7 @@ def gather_bisection_context(
             print(f"    Fetching logs for job {target.last_failure_job_id}...")
             logs = fetch_job_logs(target.last_failure_job_id, github_token)
         if logs:
-            error_sig = extract_error_signature(logs, target.test_file)
+            error_sig = extract_error_signature(logs, target.test_file, target.test_id)
             print(f"    Extracted {len(error_sig)} chars of error context")
         else:
             print("    Warning: No logs retrieved")
@@ -858,7 +984,7 @@ Classify as exactly ONE of: code_regression, flaky_test, hardware_issue, environ
 Analyze this CI test failure and classify its root cause. Be precise and evidence-based.
 
 ## Failure Details
-- **Test**: {t.test_file}
+- **Test**: {t.test_label}
 - **Job**: {t.job_name}
 - **Hardware**: {t.hardware}
 - **Job consecutive failures**: {t.current_streak}
@@ -1034,7 +1160,7 @@ def generate_github_summary(results: List[BisectionResult]) -> None:
                     suspected += f" (PR #{r.suspected_pr})"
                 suspected = suspected or "N/A"
 
-                test_display = r.target.test_file
+                test_display = r.target.test_label
                 if len(test_display) > 30:
                     test_display = "..." + test_display[-27:]
 
@@ -1075,6 +1201,8 @@ def run_bisection_analysis(
     min_streak: int = 1,
     output_file: Optional[str] = None,
     dry_run: bool = False,
+    workflow_file: str = DEFAULT_WORKFLOW_FILE,
+    hardware: str = DEFAULT_HARDWARE,
 ) -> dict:
     """Main orchestration: fetch failures, gather context, call Claude, report."""
     print("=" * 80)
@@ -1088,7 +1216,7 @@ def run_bisection_analysis(
 
     # Fetch and analyze failures directly (no external report file needed)
     targets, logs_cache = analyze_scheduled_failures(
-        github_token, min_streak, max_failures
+        github_token, min_streak, max_failures, workflow_file, hardware
     )
     print(f"\n{len(targets)} failure targets to analyze")
 
@@ -1114,7 +1242,7 @@ def run_bisection_analysis(
         return output
 
     for i, t in enumerate(targets, 1):
-        print(f"  [{i}] {t.test_file} in {t.job_name} (streak: {t.current_streak})")
+        print(f"  [{i}] {t.test_label} in {t.job_name} (streak: {t.current_streak})")
 
     # Process each target
     results: List[BisectionResult] = []
@@ -1122,7 +1250,7 @@ def run_bisection_analysis(
 
     for i, target in enumerate(targets, 1):
         print(f"\n{'─' * 60}")
-        print(f"[{i}/{len(targets)}] Analyzing: {target.test_file}")
+        print(f"[{i}/{len(targets)}] Analyzing: {target.test_label}")
         print(f"  Job: {target.job_name}")
         print(f"  Streak: {target.current_streak} (test-level: {target.test_streak})")
         print(f"  SHA range: {target.first_failure_sha}..{target.last_failure_sha}")
@@ -1263,6 +1391,16 @@ def main():
         action="store_true",
         help="Skip Claude API calls, only gather context",
     )
+    parser.add_argument(
+        "--workflow-file",
+        default=DEFAULT_WORKFLOW_FILE,
+        help=f"Workflow file whose scheduled runs are analyzed (default: {DEFAULT_WORKFLOW_FILE})",
+    )
+    parser.add_argument(
+        "--hardware",
+        default=DEFAULT_HARDWARE,
+        help=f"Hardware name given to Claude (default: {DEFAULT_HARDWARE})",
+    )
     args = parser.parse_args()
 
     try:
@@ -1273,6 +1411,8 @@ def main():
             min_streak=args.min_streak,
             output_file=args.output,
             dry_run=args.dry_run,
+            workflow_file=args.workflow_file,
+            hardware=args.hardware,
         )
     except Exception as e:
         print(f"Error during bisection analysis: {e}")
