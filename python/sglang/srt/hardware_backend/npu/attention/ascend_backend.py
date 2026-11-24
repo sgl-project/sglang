@@ -2171,16 +2171,10 @@ class AscendAttnBackend(AttentionBackend):
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         # The BF16 MLA interface needs an explicit zero RoPE tensor.
-        packed_rope0 = (
-            self.qk_rope_head_dim == 0
-            and is_npu_arch35()
-            and self.token_to_kv_pool.dsa_kv_cache_store_fp8
-        )
-        if packed_rope0:
-            q_pe = q_nope[..., :0]
-        elif self.qk_rope_head_dim == 0 and is_npu_arch35():
-            k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
-            q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
+        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+                k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
+                q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
         elif self.qk_rope_head_dim == 0:
             k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
             q_pe = q_nope.new_zeros(
