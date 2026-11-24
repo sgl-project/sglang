@@ -705,6 +705,62 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIs(transport.pool, pool)
 
 
+class TestStreamOrderedReadyWait(CustomTestCase):
+    def _consumer(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedPoolConsumerMixin,
+        )
+
+        consumer = StreamOrderedPoolConsumerMixin()
+        consumer._init_stream_ordered_consumer(
+            ready_byte_offset=16,
+            ack_byte_offset=20,
+            generation=7,
+            total_consumer_count=1,
+            transport_name="CUDA IPC",
+        )
+        return consumer
+
+    def test_unpublished_slice_fails_instead_of_blocking_stream(self):
+        """A never-published slice must fail its request, not enqueue an
+        unbounded GPU wait; its later release must neither re-wait nor ack."""
+        from sglang.srt.environ import envs
+        from sglang.srt.multimodal.transport import memory_pool
+
+        consumer = self._consumer()
+        read = MagicMock(return_value=6)
+        with (
+            patch.object(memory_pool, "read_value32", read),
+            patch.object(memory_pool, "stream_wait_value32") as stream_wait,
+            patch.object(memory_pool, "stream_write_value32") as stream_write,
+            envs.SGLANG_MM_FEATURE_READY_TIMEOUT_SEC.override(0.01),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "not published"):
+                consumer._wait_until_ready(base_address=0x1000, device_id=0)
+            reads_before_release = read.call_count
+            with self.assertRaises(TimeoutError):
+                consumer._wait_until_ready(base_address=0x1000, device_id=0)
+
+        self.assertEqual(read.call_count, reads_before_release)
+        stream_wait.assert_not_called()
+        stream_write.assert_not_called()
+        self.assertFalse(consumer._consumer_acknowledged)
+
+    def test_newer_generation_counts_as_published(self):
+        """The host check must keep cuStreamWaitValue32's GEQ semantics."""
+        from sglang.srt.multimodal.transport import memory_pool
+
+        consumer = self._consumer()
+        with (
+            patch.object(memory_pool, "read_value32", return_value=8) as read,
+            patch.object(memory_pool, "stream_wait_value32") as stream_wait,
+        ):
+            consumer._wait_until_ready(base_address=0x1000, device_id=0)
+
+        read.assert_called_once_with(0, 0x1010, "CUDA IPC")
+        stream_wait.assert_called_once_with(0, 0x1010, 7, "CUDA IPC")
+
+
 class TestSchedulerMmTransportBoundary(CustomTestCase):
     def _publish(self, **fields):
         from sglang.srt.runtime_context import get_context

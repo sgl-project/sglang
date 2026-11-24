@@ -1975,6 +1975,9 @@ class Envs:
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
+    # A consumer fails the request instead of spinning its compute stream
+    # forever when a producer never publishes the slice.
+    SGLANG_MM_FEATURE_READY_TIMEOUT_SEC = EnvFloat(30.0)
 
     # ===================================================================
     # Mamba state and cache
