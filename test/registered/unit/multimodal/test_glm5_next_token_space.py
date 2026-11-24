@@ -2,7 +2,8 @@
 
 One row per test: what it pins, then the test.
 
-    startup  the registry and the serving factory pick the GLM-5.3 strategy and spec
+    startup  the registry and the serving factory pick the GLM-5.3 strategy and spec;
+             image markers == legacy, no video marker, so gRPC advertises images only
              -> test_registry_and_factory_select_the_glm5_next_strategy
     image    BatchFeature == Glm5NextProcessor(text, images), 1 and 3 images,
              torchvision and PIL backends; M-RoPE == legacy get_rope_index_glm4v
@@ -26,6 +27,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.entrypoints.grpc_bridge import _media_input_features
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor
 from sglang.srt.multimodal.mrope_rope_index import get_rope_index_glm4v
@@ -157,7 +159,13 @@ class TestGlm5NextTokenSpace(CustomTestCase):
         self.assertIs(type(native), Glm5NextTokenSpaceProcessor)
         legacy, _ = self._routes(processor)
         # /v1/decisions validates image markers through mm_tokens.
-        self.assertEqual(vars(native.mm_tokens), vars(legacy.mm_tokens))
+        for name in ("image_token", "image_token_id"):
+            self.assertEqual(
+                getattr(native.mm_tokens, name), getattr(legacy.mm_tokens, name), name
+            )
+        # Video requests fail, so the gRPC bridge must not advertise video inputs.
+        self.assertIsNone(native.mm_tokens.video_token)
+        self.assertEqual(_media_input_features(native), ["image_inputs"])
 
     def test_batch_feature_matches_hf_processor(self):
         images = [Image.open(path) for path in self.image_paths]
@@ -281,6 +289,9 @@ class TestGlm5NextTokenSpace(CustomTestCase):
         actual_items, expected_items = actual.pop("mm_items"), expected.pop("mm_items")
         # Padded IDs are the final IDs with the cache identity's pad values.
         actual.pop("padded_input_ids"), expected.pop("padded_input_ids")
+        # Legacy reports the image token as the video token; token space supports no video.
+        self.assertIsNone(actual.pop("video_token_id"))
+        expected.pop("video_token_id")
         self.assert_same_fields(actual, expected, "output")
         self.assertEqual(len(actual_items), len(expected_items))
         for index, (item, reference) in enumerate(zip(actual_items, expected_items)):

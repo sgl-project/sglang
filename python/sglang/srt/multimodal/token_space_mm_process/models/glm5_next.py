@@ -28,9 +28,6 @@ class Glm5NextTokenSpaceServingSpec(TokenSpaceServingSpec):
         return MultimodalSpecialTokens(
             image_token="<|image|>",
             image_token_id=self.hf_config.image_token_id,
-            video_token="<|video|>",
-            # As legacy: GLM video frames hold the image token once expanded.
-            video_token_id=self.hf_config.image_token_id,
         ).build(processor)
 
 
@@ -38,7 +35,7 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     """GLM-5.3 images: one <|image|> per image between <|begin_of_image|> and
     <|end_of_image|>, expanded to one <|image|> per merged patch.
 
-    Videos stay on the legacy processor, which samples and resizes frames itself.
+    Images only: a video request fails, so video needs the legacy processor.
     """
 
     models = _GLM5_NEXT_MODELS
@@ -48,7 +45,6 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     mm_feature_fields = frozenset({"pixel_values"})
     # As legacy Glm4vImageProcessor.
     rgb_conversion = "smart"
-    video_preprocessing_device = "cpu"
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         super().__init__(hf_config, processor, mm_process_config=mm_process_config)
@@ -60,8 +56,6 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             )
         self.mm_token_expansion_params = {
             "image_token_id": hf_config.image_token_id,
-            # Legacy reports the image token as the video token too.
-            "video_token_id": hf_config.image_token_id,
             # HF Glm5NextProcessor.replace_image_token reads the image processor's.
             "merge_size": image_processor.merge_size,
         }

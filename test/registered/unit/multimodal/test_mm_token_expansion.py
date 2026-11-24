@@ -583,8 +583,13 @@ _LOADER_ATTRIBUTES = (
     "video_preprocessing_device",
     "supports_mm_processor_concurrency",
 )
-# A strategy that composites alpha as the model's reference pipeline does, where the legacy processor only drops it.
-_STRATEGY_RGB_CONVERSION = {"QwenTokenSpaceProcessStrategy": "white"}
+# Loader defaults a strategy sets apart from its legacy processor.
+_STRATEGY_LOADER_OVERRIDES = {
+    # Composites alpha as the model's reference pipeline does; legacy only drops it.
+    "QwenTokenSpaceProcessStrategy": {"rgb_conversion": "white"},
+    # Images only: a video request fails before any video is preprocessed.
+    "Glm5NextTokenSpaceProcessStrategy": {"video_preprocessing_device": None},
+}
 
 
 class _StopInit(Exception):
@@ -650,7 +655,7 @@ _MODEL_TYPES_BY_ARCH = {
 class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
         """A token-space model loads and schedules media like the legacy processor it replaces,
-        except the alpha compositing `_STRATEGY_RGB_CONVERSION` records for it."""
+        except the defaults `_STRATEGY_LOADER_OVERRIDES` records for it."""
         import_processors("sglang.srt.multimodal.processors")
         register_token_space_models()
         legacy = {
@@ -663,8 +668,8 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 hf_config = SimpleNamespace(model_type=model_type, architectures=[arch])
                 hf_config.thinker_config = hf_config
                 expected = _legacy_defaults(legacy[arch], hf_config)
-                expected["rgb_conversion"] = _STRATEGY_RGB_CONVERSION.get(
-                    strategy_class.__name__, expected["rgb_conversion"]
+                expected.update(
+                    _STRATEGY_LOADER_OVERRIDES.get(strategy_class.__name__, {})
                 )
                 with self.subTest(arch=arch, model_type=model_type):
                     self.assertEqual(
