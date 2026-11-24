@@ -841,7 +841,6 @@ def run_eagle_verify(
     topk: int,
     num_draft_tokens: int,
     device: str,
-    metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
@@ -852,12 +851,9 @@ def run_eagle_verify(
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
-    The single-layer eagle verify body is the source of truth (superset). Two
-    switches encode the multi-layer worker's preserved-verbatim differences:
+    The single-layer eagle verify body is the source of truth (superset). One
+    switch encodes the multi-layer worker's preserved-verbatim difference:
 
-    - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
-      pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
-      marking it only when the cuda-graph path ran.
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
@@ -923,17 +919,6 @@ def run_eagle_verify(
         if batch.has_grammar
         else None
     )
-
-    if metadata_ready_pre_pad:
-        # Multi-layer eagle preserved-verbatim behavior: metadata init is
-        # skipped here unconditionally, although eagle_prepare_for_verify
-        # only plans when cuda-graph load_batch ran. Single-layer eagle
-        # re-inits the non-graph path instead (post-pad); multi-layer has
-        # not adopted that fix. On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, non-graph
-        # verify needs metadata init in forward_extend (post-pad); only
-        # mark ready for the cuda-graph path.
-        if not _is_npu or can_run_cuda_graph:
-            verify_forward_batch.mark_forward_metadata_ready()
 
     # Run target verify batch in the main compute stream (GPU compute).
     # Metadata init is skipped iff cuda-graph already ran load_batch —
