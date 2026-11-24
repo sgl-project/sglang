@@ -17,6 +17,7 @@ from sglang.srt.distributed.vpp_layout import VPPLayout
 from sglang.srt.distributed.vpp_policy import (
     PipelineControlEnvelope,
     PipelineControlKind,
+    PipelinePrefixRegistry,
     PipelineRankSchedule,
     PipelineWavefrontAction,
 )
@@ -165,6 +166,168 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler._pp_vpp_overlap_chunks = False
         scheduler._pp_vpp_init_fixed_batch(2)
         return scheduler
+
+    def _remote_admission(self):
+        scheduler = self._scheduler()
+        scheduler.attn_tp_group = SimpleNamespace(
+            world_size=1, rank_in_group=0, cpu_group=None
+        )
+        req = SimpleNamespace(
+            rid="request",
+            session_generation=1,
+            bootstrap_room=3,
+            origin_input_ids=list(range(16)),
+            kv=SimpleNamespace(holds_kv=False),
+            finished=lambda: False,
+        )
+        scheduler.waiting_queue = [req]
+        scheduler.chunked_req = None
+        scheduler._pp_vpp_prefix_registry = PipelinePrefixRegistry()
+        scheduler.page_size = 4
+        scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
+        scheduler._pp_vpp_available_prefill_tokens = lambda: 9
+        manifest = scheduler._pp_vpp_batch_manifest(
+            0, 0, SimpleNamespace(reqs=[req], prefix_lens=[4], extend_lens=[5])
+        )
+        envelope = scheduler._pp_vpp_new_control(
+            PipelineControlKind.ADMIT,
+            batch_seq=0,
+            slot_id=0,
+            payload={"manifest": manifest},
+        )
+        return scheduler, req, envelope
+
+    def test_control_queue_has_one_tp_sender_and_rejects_device_payloads(self):
+        scheduler = self._scheduler(rank=1)
+        scheduler.attn_tp_group = SimpleNamespace(rank_in_group=0)
+        scheduler._pp_vpp_control_outbox = deque()
+        envelope = scheduler._pp_vpp_new_control(
+            PipelineControlKind.ADMIT, batch_seq=5, slot_id=1, payload={}
+        )
+        self.assertEqual(
+            (
+                envelope.protocol_version,
+                envelope.runtime_epoch,
+                envelope.layout_digest,
+                envelope.source_rank,
+                envelope.generation,
+            ),
+            (1, 3, "layout", 1, 2),
+        )
+        payload = torch.ones(1)
+        scheduler._pp_vpp_queue_control(envelope, {"metadata": payload})
+        queued = scheduler._pp_vpp_control_outbox.popleft()
+        self.assertEqual(PipelineControlEnvelope.from_dict(queued), envelope)
+        self.assertIs(queued["metadata"], payload)
+        with self.assertRaisesRegex(RuntimeError, "CPU-only"):
+            scheduler._pp_vpp_queue_control(
+                envelope, {"device_payload": torch.empty(1, device="meta")}
+            )
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+        scheduler.attn_tp_group.rank_in_group = 1
+        scheduler._pp_vpp_queue_control(envelope, {"metadata": payload})
+        self.assertEqual(list(scheduler._pp_vpp_control_outbox), [])
+
+    def test_remote_manifest_identity_includes_all_request_incarnations(self):
+        scheduler, _, envelope = self._remote_admission()
+        manifest = envelope.payload["manifest"]
+        self.assertIs(scheduler._pp_vpp_validate_admit_manifest(envelope), manifest)
+        for changes in (
+            {"protocol_version": 2},
+            {"batch_seq": 2},
+            {"slot_id": 1},
+            {"generation": 1},
+            {"requests": ()},
+            {"requests": (("request", 4, 9), ("request", 9, 12))},
+            {"request_generations": {}},
+            {"bootstrap_rooms": {"other": 3}},
+        ):
+            with self.subTest(changes=changes):
+                bad = scheduler._pp_vpp_new_control(
+                    PipelineControlKind.ADMIT,
+                    batch_seq=0,
+                    slot_id=0,
+                    payload={"manifest": {**manifest, **changes}},
+                )
+                with self.assertRaisesRegex(RuntimeError, "invalid VPP admission"):
+                    scheduler._pp_vpp_validate_admit_manifest(bad)
+
+    def test_remote_admission_requires_matching_request_and_prefix_order(self):
+        scheduler, req, envelope = self._remote_admission()
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        req.session_generation = 2
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        req.session_generation = 1
+        req.bootstrap_room = 4
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        req.bootstrap_room = 3
+        req.finished = lambda: True
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        req.finished = lambda: False
+        scheduler.waiting_queue = []
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        scheduler.waiting_queue = [req]
+        scheduler.chunked_req = SimpleNamespace(rid="other")
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        scheduler.chunked_req = req
+        scheduler.waiting_queue = []
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        registry = scheduler._pp_vpp_prefix_registry
+        registry.plan("request", 1, 1, 0, 4, range(4))
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        registry.plan("request", 1, 1, 4, 8, range(4))
+        with self.assertRaisesRegex(RuntimeError, "prefix order mismatch"):
+            scheduler._pp_vpp_remote_manifest_ready(envelope)
+
+    def test_remote_admission_prices_new_rows_and_requires_valid_spans(self):
+        scheduler, req, envelope = self._remote_admission()
+        scheduler.req_to_token_pool.available_size = lambda: 0
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        req.kv.holds_kv = True
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        # Five extension tokens plus a four-token page reservation.
+        scheduler._pp_vpp_available_prefill_tokens = lambda: 8
+        self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        scheduler._pp_vpp_available_prefill_tokens = lambda: 9
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        manifest = envelope.payload["manifest"]
+        for start, end in ((4, 4), (-1, 9), (4, 17)):
+            with self.subTest(start=start, end=end):
+                bad = scheduler._pp_vpp_new_control(
+                    PipelineControlKind.ADMIT,
+                    batch_seq=0,
+                    slot_id=0,
+                    payload={
+                        "manifest": {
+                            **manifest,
+                            "requests": (("request", start, end),),
+                        }
+                    },
+                )
+                with self.assertRaises(RuntimeError):
+                    scheduler._pp_vpp_remote_manifest_ready(bad)
+
+    def test_remote_admission_waits_for_every_tp_lane(self):
+        """Local capacity cannot admit a batch when another TP lane is blocked."""
+        scheduler, _, envelope = self._remote_admission()
+        cpu_group = object()
+        scheduler.attn_tp_group = SimpleNamespace(
+            world_size=2, rank_in_group=0, cpu_group=cpu_group
+        )
+        for other_ready in (0, 1):
+            with self.subTest(other_ready=other_ready):
+
+                def gather(output, local, *, group):
+                    self.assertIs(group, cpu_group)
+                    output.copy_(torch.cat((local, torch.tensor([other_ready]))))
+
+                with patch(
+                    "torch.distributed.all_gather_into_tensor", side_effect=gather
+                ):
+                    self.assertEqual(
+                        scheduler._pp_vpp_remote_manifest_ready(envelope),
+                        bool(other_ready),
+                    )
 
     def test_fixed_wave_requires_the_supported_layout_and_capacity(self):
         for pp_size, virtual_stages, inflight, overlap in (

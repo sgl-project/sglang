@@ -7,9 +7,11 @@ from collections import deque
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed
 
 from sglang.srt.distributed.vpp_policy import (
     PipelineControlEnvelope,
+    PipelineControlKind,
     PipelineRankSchedule,
     PipelineWavefrontAction,
 )
@@ -322,3 +324,153 @@ class SchedulingVPPCore:
             if not work_group.poll():
                 return
             pending_work.popleft()
+
+    def _pp_vpp_all_gather_cpu_state(
+        self: Scheduler,
+        values: Tuple[int, ...],
+    ) -> torch.Tensor:
+        width = len(values)
+        buffers = getattr(self, "_pp_vpp_cpu_state_buffers", None)
+        if buffers is None:
+            buffers = self._pp_vpp_cpu_state_buffers = {}
+        if width not in buffers:
+            local = torch.empty(width, dtype=torch.int64, device="cpu")
+            gathered = torch.empty(
+                (self.attn_tp_group.world_size, width),
+                dtype=torch.int64,
+                device="cpu",
+            )
+            buffers[width] = (local, gathered)
+        local, gathered = buffers[width]
+        for index, value in enumerate(values):
+            local[index] = int(value)
+        if self.attn_tp_group.world_size == 1:
+            gathered[0].copy_(local)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                gathered.flatten(),
+                local,
+                group=self.attn_tp_group.cpu_group,
+            )
+        return gathered
+
+    def _pp_vpp_new_control(
+        self: Scheduler,
+        kind: PipelineControlKind,
+        *,
+        batch_seq: int = -1,
+        slot_id: int = -1,
+        payload: Optional[Dict[str, object]] = None,
+    ) -> PipelineControlEnvelope:
+        generation = (
+            -1 if batch_seq < 0 else batch_seq // len(self._pp_vpp_slot_batch_seqs)
+        )
+        return PipelineControlEnvelope(
+            protocol_version=_VPP_PROTOCOL_VERSION,
+            runtime_epoch=self._pp_vpp_runtime_epoch,
+            layout_digest=self._pp_vpp_control_layout_digest,
+            kind=kind,
+            source_rank=self.pp_group.rank_in_group,
+            batch_seq=batch_seq,
+            generation=generation,
+            slot_id=slot_id,
+            payload=payload,
+        )
+
+    def _pp_vpp_queue_control(
+        self: Scheduler,
+        envelope: PipelineControlEnvelope,
+        tensors: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if self.attn_tp_group.rank_in_group != 0:
+            return
+        wire = envelope.to_dict()
+        if tensors:
+            cuda_keys = [
+                key
+                for key, value in tensors.items()
+                if isinstance(value, torch.Tensor) and not value.is_cpu
+            ]
+            if cuda_keys:
+                raise RuntimeError(f"VPP control payload must be CPU-only: {cuda_keys}")
+            wire.update(tensors)
+        self._pp_vpp_control_outbox.append(wire)
+
+    def _pp_vpp_validate_admit_manifest(
+        self: Scheduler,
+        envelope: PipelineControlEnvelope,
+    ) -> Dict[str, object]:
+        manifest = (envelope.payload or {}).get("manifest")
+        if not isinstance(manifest, dict) or (
+            manifest.get("protocol_version") != _VPP_PROTOCOL_VERSION
+            or manifest.get("batch_seq") != envelope.batch_seq
+            or manifest.get("slot_id") != envelope.slot_id
+            or manifest.get("generation") != envelope.generation
+        ):
+            raise RuntimeError("invalid VPP admission manifest identity")
+        requests = manifest.get("requests", ())
+        generations = manifest.get("request_generations", {})
+        rooms = manifest.get("bootstrap_rooms", {})
+        rids = [rid for rid, _, _ in requests]
+        if (
+            not rids
+            or len(set(rids)) != len(rids)
+            or set(generations) != set(rids)
+            or set(rooms) != set(rids)
+        ):
+            raise RuntimeError("invalid VPP admission request identities")
+        return manifest
+
+    def _pp_vpp_remote_manifest_ready(
+        self: Scheduler,
+        envelope: PipelineControlEnvelope,
+    ) -> bool:
+        manifest = self._pp_vpp_validate_admit_manifest(envelope)
+        requests = manifest["requests"]
+        generations = manifest["request_generations"]
+        rooms = manifest["bootstrap_rooms"]
+
+        candidates = {req.rid: req for req in self.waiting_queue}
+        if self.chunked_req is not None:
+            candidates[self.chunked_req.rid] = self.chunked_req
+
+        ready = self.chunked_req is None or self.chunked_req.rid in generations
+        new_requests = 0
+        tokens = 0
+        for rid, start, end in requests:
+            if not 0 <= start < end:
+                raise RuntimeError("invalid VPP admission request span")
+
+            req = candidates.get(rid)
+            if req is None:
+                ready = False
+                continue
+            generation = int(getattr(req, "session_generation", None) or 0)
+            if generation != int(generations[rid]) or (
+                getattr(req, "bootstrap_room", None) != rooms[rid]
+            ):
+                ready = False
+                continue
+
+            if end > len(req.origin_input_ids):
+                raise RuntimeError("VPP admission span exceeds request input")
+
+            entry = self._pp_vpp_prefix_registry.get(rid, generation)
+            if entry is not None and entry.planned_end != start:
+                raise RuntimeError("VPP admission prefix order mismatch")
+
+            ready = ready and not req.finished()
+            new_requests += int(not req.kv.holds_kv)
+            tokens += end - start + self.page_size
+
+        available_tokens = self._pp_vpp_available_prefill_tokens()
+
+        ready = (
+            ready
+            and self.req_to_token_pool.available_size() >= new_requests
+            and available_tokens >= tokens
+        )
+
+        # All TP lanes must agree before entering batch-building collectives.
+        states = self._pp_vpp_all_gather_cpu_state((int(ready),))
+        return bool(states[:, 0].min())
