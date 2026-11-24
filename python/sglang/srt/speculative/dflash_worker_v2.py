@@ -3678,6 +3678,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
         verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
+        if accept.new_seq_lens is None:
+            accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
             logits_output=logits_output,
@@ -3711,10 +3713,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
-            if accept.new_seq_lens is None:
-                accept.new_seq_lens = prefix_lens + accept.commit_lens.to(
-                    prefix_lens.dtype
-                )
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
@@ -3722,8 +3720,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=accept.commit_lens,
             )
 
-        if accept.new_seq_lens is None:
-            accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

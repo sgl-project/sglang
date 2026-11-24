@@ -77,7 +77,7 @@ class TestDFlashRaggedVerify(CustomTestCase):
             target_tokens,
             torch.tensor([3, 5, 1], dtype=torch.int32, device=DEVICE),
         )
-        # Each request accepts at most verify_len - 1 drafts and takes its accept.bonus
+        # Each request accepts at most verify_len - 1 drafts and takes its bonus
         # from its last verified row; the cutoff trims the rest.
         self.assertEqual(accept.correct_len.tolist(), [2, 1, 0])
         self.assertEqual(accept.bonus.tolist(), [3, 21, 10])

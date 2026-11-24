@@ -50,7 +50,7 @@ def test_greedy_accept_stops_at_planned_verify_len():
         candidates, target_predict, torch.tensor([3, 5], dtype=torch.int32)
     )
     # Row 0 verified 2 drafts: it keeps them and takes the target token after
-    # the last verified row as its accept.bonus. Row 1 rejected inside its window.
+    # the last verified row as its bonus. Row 1 rejected inside its window.
     assert accept.correct_len.tolist() == [2, 2]
     assert accept.cap_trim_lens.tolist() == [2, 0]
     assert accept.bonus.tolist() == [3, 12]

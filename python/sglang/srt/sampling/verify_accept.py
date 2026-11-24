@@ -37,8 +37,9 @@ class ChainAccept(msgspec.Struct):
     """A chain verify's (DFlash, DSpark) accept, per request: the first
     ``correct_len`` drafts match the target, ``bonus`` follows them, and the
     first ``commit_lens`` tokens of ``out_tokens`` [bs, width] commit. A
-    request whose accept is cut commits fewer than ``correct_len + 1``;
-    ``correct_len`` stays the accept kernel's, for the acceptance estimators."""
+    request capped by ``VerifyStep.cap_chain_accept`` commits fewer than
+    ``correct_len + 1``; ``correct_len`` stays the accept kernel's, for the
+    acceptance estimators."""
 
     correct_len: torch.Tensor
     bonus: torch.Tensor

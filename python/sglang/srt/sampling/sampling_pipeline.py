@@ -478,9 +478,9 @@ class VerifyStep(msgspec.Struct):
         self, accept: ChainAccept, *, prefix_lens: torch.Tensor
     ) -> None:
         """Cut each `first_row_only_reqs` request's chain accept to its first
-        token, `out_tokens[:, 0]`, as `cap_tree_accept` does, in place, and
-        recompute its `new_seq_lens`. The accept kernel's `correct_len` stays
-        uncapped: the acceptance estimators read it."""
+        token, `out_tokens[:, 0]`, as `cap_tree_accept` does: it replaces
+        `accept`'s `commit_lens`, `bonus`, and `new_seq_lens` with new tensors,
+        since DSpark's are views of its graph buffers."""
         if self.first_row_only_reqs is None:
             return
         capped = torch.zeros_like(accept.commit_lens, dtype=torch.bool)

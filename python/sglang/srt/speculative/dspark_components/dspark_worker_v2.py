@@ -1254,9 +1254,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
             # The graph accepts never run with a custom logit processor: it
-            # adjusts the logits. correct_len stays the accept core's for the
-            # acceptance estimators, so on a capped row it no longer matches
-            # bonus and commit_lens.
+            # adjusts the logits.
             verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
