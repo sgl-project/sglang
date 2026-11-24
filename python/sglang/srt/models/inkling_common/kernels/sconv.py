@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.arch.triton_portability import pdl_launch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_cuda
 
@@ -1220,5 +1219,5 @@ def save_intermediate_conv_windows(
         BLOCK_D=BLOCK_D,
         PAD_SLOT_ID=PAD_SLOT_ID,
         USE_PDL=_PDL,
-        **pdl_launch(_PDL),
+        **({"launch_pdl": True} if _PDL else {}),
     )
