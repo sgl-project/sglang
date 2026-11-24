@@ -832,23 +832,6 @@ def abort_all_requests(base_url: str, *, timeout: float = 120) -> None:
 # ---------------------------------------------------------------------------
 
 
-def poll_until(
-    predicate,
-    *,
-    timeout: float = 60,
-    interval: float = 0.05,
-    message: str = "condition",
-):
-    """Poll ``predicate`` until it returns a truthy value."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        value = predicate()
-        if value:
-            return value
-        time.sleep(interval)
-    raise AssertionError(f"timed out after {timeout}s waiting for {message}")
-
-
 def output_stays_frozen(
     counter, *, window: float = 3.0, interval: float = 0.05
 ) -> bool:
