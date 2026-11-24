@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below in that environment.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest                                  # NVIDIA (CUDA)
-docker pull lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916     # AMD MI350X / MI355X (ROCm)
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113     # AMD MI350X / MI355X (ROCm)
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 ```bash Command
 docker pull quay.io/ascend/sglang:main-cann9.1.0-a3   # Ascend A3 Series
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B070   # Ascend 950PR/DT Series
+docker pull lmsysorg/sglang:main-cann9.1.0-950        # Ascend 950PR/DT Series
 ```
 
 For host and platform setup, see the
@@ -98,17 +98,12 @@ import { KimiK3MambaRatioCalculator } from "/src/snippets/_kimi_k3_mamba_ratio_c
 
 The MI350X/MI355X unified Balanced recipe uses TP8/DCP8 with AITER prefill and
 decode attention. DCP shards the target MLA KV cache; RadixArk DSPARK's draft KV
-remains replicated. The pinned `v0.5.19-rocm720-mi35x-20260916` image records
-SGLang revision `e7f7447333`, which includes
+remains replicated. DCP relies on
 [AITER DCP support (#34432)](https://github.com/sgl-project/sglang/pull/34432) and
 the [DCP KV-free fix (#38941)](https://github.com/sgl-project/sglang/pull/38941).
-No source overlay is required for DCP.
-
-Keep `SGLANG_ROCM_K3_KDA_FUSED_BACKEND` unset with this image. The separate fused-KDA
-opt-in requires the [deferred-gate fix (#39066)](https://github.com/sgl-project/sglang/pull/39066),
-which is not included in this image. This updated recipe remains **Final
-Verification In Progress**; the recorded speed numbers use their original
-configurations and do not validate the new image or DCP8 recipe.
+No source overlay is required for DCP. This recipe remains **Final Verification
+In Progress**; the recorded speed numbers use their original configurations and
+do not validate the DCP8 recipe.
 
 ### Mamba ratio calculator
 
@@ -290,7 +285,7 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
 
 <a id="amd-env" />
 
-**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
+**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. The two SiTU rows need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -317,12 +312,12 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting <strong>both</strong> gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to the fused ROCm KDA decode boundary: the <code>f_b</code> projection is deferred into the gfx950 FlyDSL kernel so decode fuses <code>f_b</code> + convolution + recurrent state update + gated RMSNorm. The kernel takes a BF16 <code>f_b</code>: a block-FP8 one uses the dequantized copy the model already keeps, and a Quark per-channel FP8 one is dequantized once at load. On the pinned image, any other value (or unset) keeps the unfused KDA path; newer builds default to the SGLang <code>gfx950</code> kernel, which takes an FP32 state only.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>gfx950</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to the fused ROCm KDA decode boundary: the <code>f_b</code> projection is deferred into the gfx950 FlyDSL kernel so decode fuses <code>f_b</code> + convolution + recurrent state update + gated RMSNorm. The kernel takes a BF16 <code>f_b</code>: a block-FP8 one uses the dequantized copy the model already keeps, and a Quark per-channel FP8 one is dequantized once at load. The default <code>gfx950</code> selects the SGLang <code>gfx950</code> kernel, which takes an FP32 state only; any other value keeps the unfused KDA path.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_FLYDSL_SOURCE</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_FLYDSL_SOURCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Which FlyDSL implementation backs the fused decode: <code>sglang</code> / <code>aiter</code> pin one, and <code>auto</code> prefers SGLang's vendored kernel but binds AITER's when the vendored one is missing or does not take the recurrent state dtype. The vendored kernel takes an FP32 state only; AITER's (<code>aiter.ops.flydsl.linear_attention_kernels</code>, from <a href="https://github.com/ROCm/aiter/pull/6026">ROCm/aiter#6026</a>) also takes the BF16 state of <code>--mamba-ssm-dtype bfloat16</code>, so <code>auto</code> serves that state on AITER's kernel.</td>
     </tr>

@@ -14,6 +14,7 @@ v41_indexer / index_logits module namespaces.
 
 import unittest
 from contextlib import ExitStack
+from itertools import product
 from types import SimpleNamespace
 from unittest import mock
 
@@ -141,16 +142,19 @@ class TestV41IndexerArchGates(CustomTestCase):
             self.assertTrue(full.use_deep_gemm_prefill)
             self.assertTrue(full.use_deep_gemm_decode)
 
-    def test_hopper_batches_prefill_but_not_decode_or_consumers(self):
-        # Hopper prefill scores through DeepGEMM's fp8 logits; decode, LiteTopK and
-        # the candidate consumers stay off, and the path still needs DeepGEMM.
-        for deep_gemm_present in (True, False):
-            with self.subTest(deep_gemm_present=deep_gemm_present):
+    def test_hopper_prefill_consumer_opt_in(self):
+        for deep_gemm_present, enable_consumer in product((False, True), repeat=2):
+            with self.subTest(
+                deep_gemm_present=deep_gemm_present, enable_consumer=enable_consumer
+            ):
                 with (
                     self._route(
                         _FakeCudaArch((9, 0)), deep_gemm_present=deep_gemm_present
                     ),
                     envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.override(True),
+                    envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.override(
+                        enable_consumer
+                    ),
                 ):
                     full = indexer.make_full_topk_indexer(
                         token_to_kv_pool=SimpleNamespace(),
@@ -170,6 +174,10 @@ class TestV41IndexerArchGates(CustomTestCase):
                 self.assertFalse(full.use_deep_gemm_decode)
                 self.assertFalse(full.use_prefill_lite_topk)
                 self.assertFalse(prefill.use_deep_gemm_consume)
+                self.assertEqual(
+                    prefill.use_sm90_deep_gemm_consume,
+                    deep_gemm_present and enable_consumer,
+                )
 
     def test_deep_gemm_prefill_still_needs_deep_gemm(self):
         with self._route(_FakeCudaArch((12, 1)), deep_gemm_present=False):

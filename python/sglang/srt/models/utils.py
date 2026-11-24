@@ -646,6 +646,8 @@ def apply_qk_norm(
     """
 
     batch_size = q.size(0)
+    if batch_size == 0:
+        return q, k
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
 
@@ -656,7 +658,11 @@ def apply_qk_norm(
         return q, k
 
     if (
-        _is_cuda  # TODO(dark): have not tested on ROCm or other backends
+        (
+            _is_cuda
+            # The kernel takes norm weights only in the activation dtype.
+            or (_is_hip and q_norm.weight.dtype == k_norm.weight.dtype == q.dtype)
+        )  # TODO(dark): have not tested on other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
