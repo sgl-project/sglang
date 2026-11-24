@@ -2,6 +2,7 @@
 
 import unittest
 from array import array
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from queue import Queue
@@ -13,8 +14,15 @@ import torch
 from sglang.srt.distributed.vpp_activation import VPPReceivedActivation
 from sglang.srt.distributed.vpp_batch import VPPBatchLedger, VPPBatchState
 from sglang.srt.distributed.vpp_layout import VPPLayout
+from sglang.srt.distributed.vpp_policy import (
+    PipelineControlEnvelope,
+    PipelineControlKind,
+    PipelineRankSchedule,
+    PipelineWavefrontAction,
+)
 from sglang.srt.distributed.vpp_schedule import VPPFixedSchedule
 from sglang.srt.managers import scheduler_vpp_wave_mixin as vpp_mod
+from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
 from sglang.srt.managers.scheduler_vpp_wave_mixin import SchedulerVPPMixin
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -106,6 +114,202 @@ class _Worker:
                 {"hidden_states": self.workspace}
             )
         )
+
+
+class _SchedulingCore(SchedulingVPPCore):
+    def _pp_vpp_start_receiver(self):
+        # The native fixed-TP adapter keeps its continuous receiver posted.
+        pass
+
+
+class TestSchedulingVPPCore(CustomTestCase):
+    def _scheduler(self, *, rank=0, owner=0, retained=True):
+        scheduler = _SchedulingCore()
+        scheduler.__dict__.update(
+            _pp_vpp_runtime_epoch=3,
+            _pp_vpp_control_layout_digest="layout",
+            _pp_vpp_slot_batch_seqs=[owner, None],
+            _pp_vpp_ready_proxies={},
+            _pp_vpp_early_activations={},
+            _pp_vpp_fixed_received=deque(),
+            _pp_vpp_arrivals=deque(),
+            _pp_vpp_fixed_batch=True,
+            _pp_vpp_pending_recv=object(),
+            pp_group=SimpleNamespace(
+                world_size=2, rank_in_group=rank, is_last_rank=rank == 1
+            ),
+            mbs=[object() if retained else None, None],
+        )
+        return scheduler
+
+    def _wire(self, *, batch_seq=0, stage=2):
+        return {
+            "__msg_type__": "vpp_proxy",
+            "vpp_protocol_version": 1,
+            "vpp_runtime_epoch": 3,
+            "vpp_layout_digest": "layout",
+            "vpp_batch_seq": batch_seq,
+            "vpp_generation": batch_seq // 2,
+            "vpp_src_stage_id": stage - 1,
+            "vpp_stage_id": stage,
+            "hidden_states": torch.tensor([batch_seq]),
+        }
+
+    def test_manifest_uses_retained_batch_spans_and_request_incarnations(self):
+        """A later request update must not change the retained batch's manifest."""
+        scheduler = self._scheduler()
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(
+                    rid="first", prefix_len=99, session_generation=7, bootstrap_room=8
+                ),
+                SimpleNamespace(rid="second", prefix_len=99, session_generation=None),
+            ],
+            prefix_lens=[4, 8],
+            extend_lens=[5, 3],
+        )
+        self.assertEqual(
+            scheduler._pp_vpp_batch_manifest(5, 1, batch),
+            {
+                "protocol_version": 1,
+                "batch_seq": 5,
+                "generation": 2,
+                "slot_id": 1,
+                "requests": (("first", 4, 9), ("second", 8, 11)),
+                "request_generations": {"first": 7, "second": 0},
+                "bootstrap_rooms": {"first": 8, "second": None},
+            },
+        )
+
+    def test_admission_waits_for_slot_and_rank_schedule_retirement(self):
+        scheduler = self._scheduler()
+        envelope = PipelineControlEnvelope(
+            protocol_version=1,
+            runtime_epoch=3,
+            layout_digest="layout",
+            kind=PipelineControlKind.ADMIT,
+            source_rank=0,
+            batch_seq=2,
+            slot_id=0,
+        )
+        self.assertTrue(
+            scheduler._pp_vpp_remote_admit_slot_available(envelope, [None, None])
+        )
+        self.assertFalse(
+            scheduler._pp_vpp_remote_admit_slot_available(envelope, [0, None])
+        )
+        for owner in (2, 4):
+            with self.subTest(owner=owner):
+                with self.assertRaisesRegex(RuntimeError, "still owned"):
+                    scheduler._pp_vpp_remote_admit_slot_available(
+                        envelope, [owner, None]
+                    )
+        invalid = PipelineControlEnvelope(
+            protocol_version=1,
+            runtime_epoch=3,
+            layout_digest="layout",
+            kind=PipelineControlKind.ADMIT,
+            source_rank=0,
+            batch_seq=2,
+            slot_id=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "slot identity"):
+            scheduler._pp_vpp_remote_admit_slot_available(invalid, [None, None])
+        schedule = PipelineRankSchedule(0, 2, 2, 2)
+        self.assertTrue(
+            scheduler._pp_vpp_can_queue_admit(2, set(), [None, None], schedule)
+        )
+        self.assertFalse(
+            scheduler._pp_vpp_can_queue_admit(2, {0, 1}, [None, None], schedule)
+        )
+        self.assertFalse(
+            scheduler._pp_vpp_can_queue_admit(2, set(), [0, None], schedule)
+        )
+        schedule.admit(0)
+        self.assertFalse(
+            scheduler._pp_vpp_can_queue_admit(2, set(), [None, None], schedule)
+        )
+
+    def test_activation_rejects_wrong_identity_stale_owner_and_duplicates(self):
+        """Bad activations must not enter either the ready or temporary store."""
+        for changes in (
+            {"__msg_type__": "vpp_control"},
+            {"vpp_protocol_version": 2},
+            {"vpp_runtime_epoch": 2},
+            {"vpp_layout_digest": "other"},
+            {"vpp_generation": 1},
+            {"vpp_src_stage_id": 0},
+            {"vpp_batch_seq": -1, "vpp_generation": -1},
+            {"vpp_stage_id": 1, "vpp_src_stage_id": 0},
+            {"vpp_batch_seq": 2, "vpp_generation": 1},
+        ):
+            with self.subTest(changes=changes):
+                scheduler = self._scheduler()
+                with self.assertRaises(RuntimeError):
+                    scheduler._pp_vpp_accept_received_tensors(
+                        {**self._wire(), **changes}
+                    )
+                self.assertEqual(scheduler._pp_vpp_ready_proxies, {})
+                self.assertEqual(scheduler._pp_vpp_early_activations, {})
+                self.assertEqual(list(scheduler._pp_vpp_fixed_received), [])
+        scheduler = self._scheduler()
+        scheduler._pp_vpp_accept_received_tensors(self._wire())
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [(0, 2)])
+        with self.assertRaisesRegex(RuntimeError, "Duplicate"):
+            scheduler._pp_vpp_accept_received_tensors(self._wire())
+
+    def test_early_activation_waits_for_admission_and_is_consumed_once(self):
+        scheduler = self._scheduler(owner=None, retained=False)
+        wire = self._wire()
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        self.assertEqual(list(scheduler._pp_vpp_fixed_received), [(0, 2)])
+        self.assertEqual(scheduler._pp_vpp_ready_proxies, {})
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [])
+        self.assertIsNone(scheduler._pp_vpp_pending_recv)
+        with self.assertRaisesRegex(RuntimeError, "before admitting"):
+            scheduler._pp_vpp_promote_early_activations(0)
+        scheduler._pp_vpp_slot_batch_seqs[0] = 0
+        scheduler._pp_vpp_promote_early_activations(0)
+        self.assertEqual(scheduler._pp_vpp_early_activations, {})
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [(0, 2)])
+        action = PipelineWavefrontAction(0, 0, 0, 2, 0)
+        proxy = scheduler._pp_vpp_take_ready_proxy(action)
+        self.assertIs(proxy.tensors, wire)
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            scheduler._pp_vpp_take_ready_proxy(action)
+
+    def test_last_rank_quarantines_next_generation_only_after_local_completion(self):
+        """The returning completion control may lag behind the next activation."""
+        wire = self._wire(batch_seq=2, stage=1)
+        scheduler = self._scheduler(rank=1, retained=True)
+        with self.assertRaisesRegex(RuntimeError, "Stale"):
+            scheduler._pp_vpp_accept_received_tensors(wire)
+        scheduler.mbs[0] = None
+        scheduler._pp_vpp_accept_received_tensors(wire)
+        self.assertEqual(scheduler._pp_vpp_slot_batch_seqs, [0, None])
+        self.assertEqual(scheduler._pp_vpp_ready_proxies, {})
+        self.assertEqual(list(scheduler._pp_vpp_early_activations), [(2, 1)])
+        with self.assertRaisesRegex(RuntimeError, "Duplicate"):
+            scheduler._pp_vpp_accept_received_tensors(wire)
+        with self.assertRaisesRegex(RuntimeError, "Stale"):
+            scheduler._pp_vpp_accept_received_tensors(self._wire(batch_seq=4, stage=1))
+        scheduler._pp_vpp_slot_batch_seqs[0] = 2
+        scheduler._pp_vpp_promote_early_activations(2)
+        self.assertEqual(list(scheduler._pp_vpp_arrivals), [(2, 1)])
+        self.assertEqual(scheduler._pp_vpp_early_activations, {})
+
+    def test_early_activation_capacity_and_generation_conflicts_are_bounded(self):
+        scheduler = self._scheduler(rank=1, owner=None, retained=False)
+        for batch_seq in (0, 1):
+            scheduler._pp_vpp_accept_received_tensors(
+                self._wire(batch_seq=batch_seq, stage=1)
+            )
+        with self.assertRaisesRegex(RuntimeError, "quarantine is full"):
+            scheduler._pp_vpp_accept_received_tensors(self._wire(batch_seq=2, stage=1))
+        self.assertEqual(len(scheduler._pp_vpp_early_activations), 2)
+        scheduler._pp_vpp_slot_batch_seqs[0] = 2
+        with self.assertRaisesRegex(RuntimeError, "Stale VPP early activation"):
+            scheduler._pp_vpp_promote_early_activations(2)
 
 
 class TestSchedulerVPP(CustomTestCase):
