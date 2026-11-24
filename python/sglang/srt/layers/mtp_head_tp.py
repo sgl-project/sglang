@@ -180,9 +180,16 @@ def head_tp4_rank_groups(rank_hosts):
 def configure_draft_head_tp(model, hot_token_id):
     from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
     from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel, get_spec
+    from sglang.srt.speculative.eagle_megakernel import _offers_eagle_entries
 
     parallel, spec = get_parallel(), get_spec()
     if parallel.pp_size != 1 or parallel.tp_size not in (4, 8, 16):
+        return
+    if _offers_eagle_entries(draft_model=model):
+        # The megakernel draft folds top-1 itself and never reaches draft_topk_index.
+        logging.getLogger(__name__).info(
+            "MTP draft head TP4 disabled: the draft runs a megakernel entry"
+        )
         return
     weight = getattr(getattr(model, "lm_head", None), "weight", None)
     lp = getattr(model, "logits_processor", None)

@@ -1,9 +1,12 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.layers.mtp_head_tp import (
+    configure_draft_head_tp,
     head_tp4_rank_groups,
     local_argmax_pair,
     merge_argmax_pairs,
@@ -22,6 +25,24 @@ class TestMTPHeadTopology(unittest.TestCase):
             hosts[-1] = (size - 1, "wrong-host", 3)
             self.assertIsNone(head_tp4_rank_groups(hosts))
         self.assertIsNone(head_tp4_rank_groups([(r, "node", 0) for r in range(4)]))
+
+    def test_megakernel_draft_skips_head_tp(self):
+        model = SimpleNamespace()
+        with (
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(pp_size=1, tp_size=4),
+            ),
+            mock.patch("sglang.srt.runtime_context.get_spec"),
+            mock.patch(
+                "sglang.srt.speculative.eagle_megakernel._offers_eagle_entries",
+                return_value=True,
+            ),
+            self.assertLogs("sglang.srt.layers.mtp_head_tp", "INFO") as logs,
+        ):
+            configure_draft_head_tp(model, None)
+        self.assertFalse(hasattr(model, "draft_head_tp"))
+        self.assertIn("megakernel", logs.output[0])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
