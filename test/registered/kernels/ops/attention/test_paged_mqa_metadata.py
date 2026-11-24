@@ -37,6 +37,7 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+from sglang.srt.utils import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -245,6 +246,14 @@ def _load_deep_gemm():
         pytest.skip(f"deep_gemm unavailable: {type(e).__name__}: {e}")
 
 
+# DeepGEMM's SM12x paged MQA kernels split KV into 128-token chunks
+# (BLOCK_KV=64 x 2 warp groups), so its metadata differs from this 256-token
+# schedule by design. The production SM12x paths that consume DeepGEMM's
+# schedule request it from DeepGEMM (force_deep_gemm_metadata).
+@pytest.mark.skipif(
+    is_sm120_supported(),
+    reason="DeepGEMM schedules 128-token KV splits on SM12x, not 256",
+)
 @pytest.mark.parametrize("bs", [64, 128, 1025, 2048, 4096, 8192, 32768, 65536])
 @pytest.mark.parametrize("max_ctx", [256, 32768])
 def test_matches_deep_gemm(bs: int, max_ctx: int):
