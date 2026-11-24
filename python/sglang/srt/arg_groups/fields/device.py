@@ -83,7 +83,9 @@ class Device(msgspec.Struct):
     ] = None
     gc_threshold: A[
         Optional[List[int]],
-        "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
+        "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers. "
+        "With attention DP, the schedulers otherwise run full (generation-2) collections in lockstep "
+        "across ranks; a third value turns that off and leaves full collections to each rank's collector.",
     ] = None
     gc_freeze_on_idle_secs: A[
         float,

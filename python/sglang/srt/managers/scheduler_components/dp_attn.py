@@ -587,17 +587,19 @@ class DPGCPauseColumn:
     """Carries each rank's lockstep GC pause through the MLP-sync gather.
 
     ``local`` is how long (in microseconds, at least 1) the full collection this
-    rank ran right before the gather took, or 0 if it ran none. ``max`` receives
-    the longest pause across every rank whenever the gather produced metadata,
-    so every rank sizes its next lockstep interval from the same value (see
-    GCFreezer).
+    rank ran right before the gather took, or 0 if it ran none. Whenever the
+    gather produced metadata, ``max`` receives the longest pause across every
+    rank and ``any_tokens`` whether any rank has tokens in this gather, so every
+    rank counts the same loaded gathers and sizes its next lockstep interval
+    from the same values (see GCFreezer).
     """
 
-    __slots__ = ("local", "max")
+    __slots__ = ("local", "max", "any_tokens")
 
     def __init__(self, local: int) -> None:
         self.local = local
         self.max: Optional[int] = None
+        self.any_tokens: Optional[bool] = None
 
 
 class DPShutdownVoteSent:
@@ -759,6 +761,7 @@ def prepare_mlp_sync_batch_raw(
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
     if gc_pause_column is not None and metadata_ready:
         gc_pause_column.max = mlp_sync_info.max_gc_pause_us
+        gc_pause_column.any_tokens = max(mlp_sync_info.global_num_tokens) > 0
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -845,12 +848,12 @@ class SchedulerDPAttnAdapter:
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
     # Lockstep GC (see GCFreezer and DPGCPauseColumn): runs before every
-    # gather, and every rank runs the same number of gathers, so a count of
-    # these calls names the same step on every rank; then this rank's pause,
-    # and what to do with the longest one across ranks.
+    # gather; then this rank's pause; then, after each gather with metadata,
+    # the longest pause across ranks and whether any rank has tokens (the same
+    # on every rank).
     before_gather: Optional[Callable[[], None]] = None
     get_gc_pause_us: Callable[[], int] = lambda: 0
-    on_gc_pause: Optional[Callable[[int], None]] = None
+    after_gather: Optional[Callable[[int, bool], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
@@ -907,8 +910,8 @@ class SchedulerDPAttnAdapter:
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
-        if gc_pause_column.max is not None and self.on_gc_pause is not None:
-            self.on_gc_pause(gc_pause_column.max)
+        if gc_pause_column.max is not None and self.after_gather is not None:
+            self.after_gather(gc_pause_column.max, gc_pause_column.any_tokens)
         if shutdown_vote.local:
             self.shutdown_vote_sent.value = True
         if (

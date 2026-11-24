@@ -98,7 +98,9 @@ class TestGCFreezer(CustomTestCase):
 
 
 class _FakeGC:
-    """The thresholds and collections lockstep uses; a pass takes pause_us(interval)."""
+    """The thresholds and collections lockstep uses. A pass takes
+    pause_us(interval), or, with pause_us None, fixed_us plus the garbage
+    added to garbage_us since the last pass."""
 
     def __init__(self, clock, pause_us, keeps_third=True):
         self.threshold = (700, 10, 10)
@@ -106,6 +108,8 @@ class _FakeGC:
         self.clock = clock
         self.pause_us = pause_us
         self.interval = None
+        self.fixed_us = 0.0
+        self.garbage_us = 0.0
         self.collections = 0
 
     def get_threshold(self):
@@ -117,7 +121,11 @@ class _FakeGC:
 
     def collect(self):
         self.collections += 1
-        self.clock[0] += self.pause_us(self.interval) / 1e6
+        if self.pause_us is None:
+            pause_us, self.garbage_us = self.fixed_us + self.garbage_us, 0.0
+        else:
+            pause_us = self.pause_us(self.interval)
+        self.clock[0] += pause_us / 1e6
 
 
 class TestGCLockstep(CustomTestCase):
@@ -145,7 +153,8 @@ class TestGCLockstep(CustomTestCase):
 
     @staticmethod
     def _run(ranks, gathers, fake=None):
-        """One gather at a time on every rank; returns each rank's pass gathers."""
+        """One loaded gather at a time on every rank; returns each rank's pass
+        gathers."""
         cbs = [r.dp_gather_callbacks() for r in ranks]
         passes = [[] for _ in ranks]
         for gather in range(1, gathers + 1):
@@ -157,8 +166,24 @@ class TestGCLockstep(CustomTestCase):
                     passes[rank].append(gather)
             longest = max(cb["get_gc_pause_us"]() for cb in cbs)
             for cb in cbs:
-                cb["on_gc_pause"](longest)
+                cb["after_gather"](longest, True)
         return passes
+
+    @staticmethod
+    def _run_phases(freezer, fake, phases):
+        """phases: (gathers, any_tokens, garbage_us per gather). Returns
+        (phase index, pause_us) per pass."""
+        cb = freezer.dp_gather_callbacks()
+        pauses = []
+        for index, (gathers, any_tokens, garbage_us) in enumerate(phases):
+            for _ in range(gathers):
+                cb["before_gather"]()
+                pause_us = cb["get_gc_pause_us"]()
+                if pause_us:
+                    pauses.append((index, pause_us))
+                cb["after_gather"](pause_us, any_tokens)
+                fake.garbage_us += garbage_us
+        return pauses
 
     def test_on_only_with_dp_gathers_and_without_a_third_gc_threshold(self):
         self._patch()
@@ -168,7 +193,7 @@ class TestGCLockstep(CustomTestCase):
         )
         self.assertEqual(
             set(on.dp_gather_callbacks()),
-            {"before_gather", "get_gc_pause_us", "on_gc_pause"},
+            {"before_gather", "get_gc_pause_us", "after_gather"},
         )
         self.logger.info.assert_not_called()
         off = GCFreezer(
@@ -189,10 +214,11 @@ class TestGCLockstep(CustomTestCase):
     ):
         fake = self._patch()
         freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
-        (passes,) = self._run([freezer], gc_freezer.LOCKSTEP_INITIAL_GATHERS)
+        (passes,) = self._run([freezer], gc_freezer.LOCKSTEP_INITIAL_GATHERS + 1)
         self.freeze_gc.assert_called_once_with("Scheduler")
         self.assertEqual(fake.threshold, (700, 10, gc_freezer.NO_AUTOMATIC_FULL_GC))
-        self.assertEqual(passes, [gc_freezer.LOCKSTEP_INITIAL_GATHERS])
+        # Right before the gather that follows the first 1000 loaded ones.
+        self.assertEqual(passes, [gc_freezer.LOCKSTEP_INITIAL_GATHERS + 1])
 
     def _intervals(self, pause_us, gathers):
         fake = self._patch(pause_us=pause_us)
@@ -220,6 +246,48 @@ class TestGCLockstep(CustomTestCase):
         self.assertTrue(all(b >= a * 0.999 for a, b in zip(intervals, intervals[1:])))
         self.assertAlmostEqual(intervals[-1], 80_000, delta=1_000)
 
+    def test_idle_gathers_get_idle_passes_and_do_not_size_the_interval(self):
+        # 400 us of live objects; idle event-loop gathers leave 0.2 us of
+        # garbage each and loaded ones 16 us. Before this, idle gathers counted
+        # toward the interval: it grew to the maximum, and the first passes
+        # under load took 0.4-1.6 s.
+        fake = self._patch(pause_us=None)
+        fake.fixed_us = 400
+        freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
+        pauses = self._run_phases(
+            freezer, fake, [(300_000, False, 0.2), (20_000, True, 16)]
+        )
+        idle = [p for phase, p in pauses if phase == 0]
+        loaded = [p for phase, p in pauses if phase == 1]
+        idle_every = gc_freezer.LOCKSTEP_IDLE_GATHERS
+        self.assertEqual(len(idle), (300_000 - 1) // idle_every)
+        self.assertEqual(set(idle), {round(400 + 0.2 * idle_every)})
+        # The longest loaded pass is the first one at 1000 loaded gathers
+        # (16.4 ms), which sizes the interval; every later one stays within
+        # twice the budget.
+        budget = gc_freezer.LOCKSTEP_PAUSE_BUDGET_US
+        longest = loaded.index(max(loaded))
+        self.assertLessEqual(longest, 1)
+        self.assertLess(loaded[longest], 20_000)
+        self.assertGreater(len(loaded), 10)
+        self.assertTrue(all(p <= 2 * budget for p in loaded[longest + 1 :]))
+
+    def test_a_jump_in_the_garbage_rate_shrinks_the_interval_at_once(self):
+        # Long light load grows the interval; then the rate jumps 80x. The pass
+        # that meets the jump is long, but the next interval shrinks to its
+        # target instead of reading the long pause as live objects.
+        fake = self._patch(pause_us=None)
+        fake.fixed_us = 400
+        freezer = GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True)
+        pauses = self._run_phases(
+            freezer, fake, [(400_000, True, 0.2), (40_000, True, 16)]
+        )
+        heavy = [p for phase, p in pauses if phase == 1]
+        budget = gc_freezer.LOCKSTEP_PAUSE_BUDGET_US
+        self.assertGreater(heavy[0], 50 * budget)
+        self.assertGreater(len(heavy), 10)
+        self.assertTrue(all(p <= 2 * budget for p in heavy[1:]))
+
     def test_ranks_with_different_pauses_collect_at_the_same_gathers(self):
         fake = self._patch()
         ranks = [GCFreezer(freeze_on_idle_secs=0.0, dp_lockstep=True) for _ in range(3)]
@@ -236,7 +304,7 @@ class TestGCLockstep(CustomTestCase):
                 if pauses[-1]:
                     passes[rank].append(gather)
             for cb in cbs:
-                cb["on_gc_pause"](max(pauses))
+                cb["after_gather"](max(pauses), True)
         self.assertGreater(len(passes[0]), 3)
         self.assertEqual(passes[0], passes[1])
         self.assertEqual(passes[0], passes[2])
@@ -249,12 +317,8 @@ class TestGCLockstep(CustomTestCase):
         self.assertEqual(freezer._next_interval(1), gc_freezer.LOCKSTEP_MAX_GATHERS)
 
 
-def _third_threshold_is_settable() -> bool:
-    return gc_freezer.third_threshold_works()
-
-
 @unittest.skipUnless(
-    _third_threshold_is_settable(), "the collector has no third threshold"
+    gc_freezer.third_threshold_works(), "the collector has no third threshold"
 )
 class TestGCLockstepCollector(CustomTestCase):
     """Against the real collector: with a frozen heap, allocation churn starts
@@ -304,12 +368,12 @@ class TestGCLockstepCollector(CustomTestCase):
             cb["before_gather"]()
             if cb["get_gc_pause_us"]():
                 passes.append(self.gather)
-            cb["on_gc_pause"](cb["get_gc_pause_us"]())
+            cb["after_gather"](cb["get_gc_pause_us"](), True)
             self._churn(keep)
         self.gather = 0
         # Gather 1 is the startup collect-and-freeze.
         self.assertGreaterEqual(len(passes), 2)
-        self.assertEqual(passes[0], 50)
+        self.assertEqual(passes[0], 51)
         self.assertEqual(self.full_collections, [1] + passes)
         self.assertGreater(gc.get_freeze_count(), 0)
 

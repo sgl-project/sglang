@@ -855,7 +855,8 @@ class TestDPDrainColumn(CustomTestCase):
 
 class TestGCLockstepGather(CustomTestCase):
     """The adapter runs the GC lockstep hook once before every MLP-sync gather,
-    gathers each rank's pause, and hands the longest one to every rank."""
+    gathers each rank's pause, and hands the longest one, and whether any rank
+    has tokens, to every rank."""
 
     def _gather(
         self,
@@ -866,6 +867,8 @@ class TestGCLockstepGather(CustomTestCase):
         skip_gather=False,
         calls=1,
         need_sync_false_calls=0,
+        local_idle=False,
+        peer_tokens=None,
     ):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -878,15 +881,17 @@ class TestGCLockstepGather(CustomTestCase):
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
         tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
-        before_gather, on_gc_pause = Mock(), Mock()
+        before_gather, after_gather = Mock(), Mock()
         calls_at_exchange = []
 
         def fake_exchange(output, local, group, **_):
             calls_at_exchange.append(before_gather.call_count)
             rows = [local]
-            for pause in peer_pauses:
+            for k, pause in enumerate(peer_pauses):
                 peer = local.clone()
                 peer[13] = pause
+                if peer_tokens is not None:
+                    peer[0] = peer_tokens[k]
                 rows.append(peer)
             output.copy_(torch.stack(rows).flatten())
 
@@ -907,7 +912,7 @@ class TestGCLockstepGather(CustomTestCase):
             get_require_mlp_sync=lambda: True,
             before_gather=before_gather,
             get_gc_pause_us=lambda: local_pause,
-            on_gc_pause=on_gc_pause,
+            after_gather=after_gather,
         )
         with (
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
@@ -938,12 +943,16 @@ class TestGCLockstepGather(CustomTestCase):
                 return_value=SimpleNamespace(disable_overlap_schedule=True),
             ),
             patch.object(dp_attn, "exchange_sync_rows", side_effect=fake_exchange),
+            # An idle rank whose peers have tokens runs an idle batch.
+            patch.object(
+                dp_attn.SchedulerDPAttnAdapter, "get_idle_batch", return_value=None
+            ),
         ):
             for _ in range(calls):
-                adapter.maybe_prepare_mlp_sync_batch(batch)
+                adapter.maybe_prepare_mlp_sync_batch(None if local_idle else batch)
             for _ in range(need_sync_false_calls):
                 adapter.maybe_prepare_mlp_sync_batch(batch, need_sync=False)
-        return before_gather, on_gc_pause, calls_at_exchange
+        return before_gather, after_gather, calls_at_exchange
 
     def test_hook_runs_once_before_each_gather(self):
         before_gather, _, calls_at_exchange = self._gather(
@@ -955,18 +964,26 @@ class TestGCLockstepGather(CustomTestCase):
     def test_longest_pause_of_every_rank_reaches_the_callback(self):
         # Two DP groups of two attention-TP ranks: the longest pause is on a
         # rank that does not lead its group.
-        _, on_gc_pause, _ = self._gather(
+        _, after_gather, _ = self._gather(
             local_pause=3000, peer_pauses=[7000, 1000, 2000], attn_tp_size=2
         )
-        on_gc_pause.assert_called_once_with(7000)
-        _, on_gc_pause, _ = self._gather(peer_pauses=[0])
-        on_gc_pause.assert_called_once_with(0)
+        after_gather.assert_called_once_with(7000, True)
+        _, after_gather, _ = self._gather(peer_pauses=[0])
+        after_gather.assert_called_once_with(0, True)
+
+    def test_whether_any_rank_has_tokens_reaches_the_callback(self):
+        _, after_gather, _ = self._gather(peer_pauses=[0], local_idle=True)
+        after_gather.assert_called_once_with(0, False)
+        _, after_gather, _ = self._gather(
+            peer_pauses=[0, 0], local_idle=True, peer_tokens=[0, 3]
+        )
+        after_gather.assert_called_once_with(0, True)
 
     def test_no_callback_without_gathered_metadata(self):
-        _, on_gc_pause, _ = self._gather(
+        _, after_gather, _ = self._gather(
             local_pause=3000, peer_pauses=[1000], skip_gather=True
         )
-        on_gc_pause.assert_not_called()
+        after_gather.assert_not_called()
 
     def test_column_defaults(self):
         info = dp_attn.MLPSyncBatchInfo(
@@ -1013,7 +1030,7 @@ class TestGCLockstepGather(CustomTestCase):
                 callbacks = scheduler.gc_freezer.dp_gather_callbacks()
                 self.assertEqual(bool(callbacks), dp_lockstep)
                 self.assertEqual(adapter.before_gather, callbacks.get("before_gather"))
-                self.assertEqual(adapter.on_gc_pause, callbacks.get("on_gc_pause"))
+                self.assertEqual(adapter.after_gather, callbacks.get("after_gather"))
 
 
 _EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)

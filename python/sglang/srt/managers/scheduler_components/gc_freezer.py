@@ -16,18 +16,25 @@ HEAP_GROWTH_WARN_RATIO = 1.5
 NO_AUTOMATIC_FULL_GC = 10**9
 
 # Lockstep full GC across attention-DP ranks. Every rank pauses for each pass
-# at once, so the interval between passes (in batch gathers, one or two per
-# scheduler step) is sized to keep a pass near this pause: well inside a decode
-# step, and about what passes took (2-6.6 ms) on a DEP32 decode deployment
-# that collected every 30000 gathers.
+# at once, so the interval between passes is sized to keep a pass near this
+# pause: well inside a decode step, and about what passes took (2-6.6 ms) on a
+# DEP32 decode deployment that collected every 30000 gathers. Intervals count
+# loaded gathers: batch gathers (one or two per scheduler step) in which some
+# rank has tokens. Idle event-loop iterations also gather, without sleeping,
+# but make little garbage: they get a pass every LOCKSTEP_IDLE_GATHERS idle
+# gathers instead, which clears what they leave and does not feed the fit.
 LOCKSTEP_PAUSE_BUDGET_US = 5_000
+LOCKSTEP_IDLE_GATHERS = 10_000
 # The first pass comes early, so the interval adapts from a measured pause.
 LOCKSTEP_INITIAL_GATHERS = 1_000
 LOCKSTEP_MIN_GATHERS = 16
 # Bounds how long cyclic garbage waits for a pass (~17 min of 10 ms steps).
 LOCKSTEP_MAX_GATHERS = 100_000
-# An interval grows at most this much per pass, so a pause overshoots the
-# budget by at most this factor; it shrinks to its target at once.
+# An interval grows at most this much per pass, so at a steady garbage rate a
+# pause overshoots the budget by at most this factor; it shrinks to its target
+# at once. A pass more than this factor over both the budget and the fit's
+# prediction means the garbage rate jumped (e.g. heavy load after light load):
+# the fit restarts from that pass, so the next interval shrinks at once too.
 LOCKSTEP_MAX_GROWTH = 2
 # The pause per gather is a least-squares fit over this many recent passes,
 # refit only when their intervals differ by at least this ratio, so noise
@@ -38,7 +45,9 @@ LOCKSTEP_MIN_FIT_RATIO = 1.25
 
 def third_threshold_works() -> bool:
     """Whether the collector keeps a third threshold, which lockstep raises so
-    it never starts a full collection on its own."""
+    it never starts a full collection on its own. The incremental collector of
+    CPython 3.14.0-3.14.4 ignores it (on 3.14.2 it reads back as 0); 3.14.5
+    brought back the generational collector, which keeps it."""
     saved = gc.get_threshold()
     try:
         gc.set_threshold(saved[0], saved[1], NO_AUTOMATIC_FULL_GC)
@@ -57,13 +66,17 @@ class GCFreezer:
     ):
         self._freeze_on_idle_secs = freeze_on_idle_secs
         self._dp_lockstep = dp_lockstep and _lockstep_allowed(gc_threshold)
-        self._dp_gathers = 0
+        self._lockstep_started = False
+        self._loaded_gathers = 0
+        self._idle_gathers = 0  # since the last pass
+        self._fit_pass = False
         self._next_collect = LOCKSTEP_INITIAL_GATHERS
         self._interval = LOCKSTEP_INITIAL_GATHERS
         self._collected_at: Optional[int] = None
         self._pause_us = 0
         self._passes: collections.deque = collections.deque(maxlen=LOCKSTEP_FIT_PASSES)
         self._per_gather_us: Optional[float] = None
+        self._fixed_us: Optional[float] = None
         self._seen_forward_ct = -1
         self._next_freeze = math.inf
         now = time.monotonic()
@@ -96,33 +109,48 @@ class GCFreezer:
         return dict(
             before_gather=self._before_dp_gather,
             get_gc_pause_us=lambda: self._pause_us,
-            on_gc_pause=self._on_dp_gc_pause,
+            after_gather=self._after_dp_gather,
         )
 
     def _before_dp_gather(self) -> None:
-        # Each gather is a collective, so every attention-DP rank has run the
-        # same number of them: the count names the same step on every rank,
-        # and the ranks pause for a full collection together instead of each
-        # one stalling all the others at the next gather.
-        if self._dp_gathers == 0:
+        # The count of loaded gathers comes from gathered values, so it is the
+        # same on every attention-DP rank before each gather: the ranks pause
+        # for a full collection together instead of each one stalling all the
+        # others at the next gather.
+        if not self._lockstep_started:
+            self._lockstep_started = True
             self._start_lockstep()
-        self._dp_gathers += 1
-        if self._dp_gathers < self._next_collect:
+        self._fit_pass = self._loaded_gathers >= self._next_collect
+        if not self._fit_pass and self._idle_gathers < LOCKSTEP_IDLE_GATHERS:
             return
         start = time.perf_counter()
         gc.collect()
         self._pause_us = max(1, round((time.perf_counter() - start) * 1e6))
-        self._collected_at = self._dp_gathers
+        self._collected_at = self._loaded_gathers
+        self._idle_gathers = 0
         # Kept if no gather reports the pause back.
-        self._next_collect = self._dp_gathers + self._interval
+        self._next_collect = self._loaded_gathers + self._interval
 
-    def _on_dp_gc_pause(self, max_pause_us: int) -> None:
-        # The longest pause across ranks is the same on every rank, and so is
-        # every interval derived from it: the ranks stay in lockstep.
+    def _after_dp_gather(self, max_pause_us: int, any_tokens: bool) -> None:
+        # Both values are gathered, so they are the same on every rank, and so
+        # is every count and interval derived from them: the ranks stay in
+        # lockstep.
+        if any_tokens:
+            self._loaded_gathers += 1
+        else:
+            self._idle_gathers += 1
         if max_pause_us <= 0 or self._collected_at is None:
             return
-        self._interval = self._next_interval(max_pause_us)
+        # An idle pass collects what the interval has made so far, so the
+        # interval restarts after it, but its pause does not size the interval.
+        if self._fit_pass:
+            self._interval = self._next_interval(max_pause_us)
         self._next_collect = self._collected_at + self._interval
+        logger.debug(
+            f"Lockstep full GC ({'loaded' if self._fit_pass else 'idle'}) at "
+            f"loaded gather {self._collected_at}: longest pause {max_pause_us} "
+            f"us across ranks; next pass in {self._interval} loaded gathers."
+        )
         self._collected_at = None
         self._pause_us = 0
 
@@ -134,6 +162,13 @@ class GCFreezer:
         # latest pass so it follows the live heap. Every rank has the same
         # inputs in the same order, so it computes the same interval.
         n = self._interval
+        if self._per_gather_us is not None:
+            predicted = self._fixed_us + self._per_gather_us * n
+            if pause_us > LOCKSTEP_MAX_GROWTH * max(
+                predicted, LOCKSTEP_PAUSE_BUDGET_US
+            ):
+                self._passes.clear()
+                self._per_gather_us = None
         self._passes.append((n, pause_us))
         ns = [x for x, _ in self._passes]
         if max(ns) >= LOCKSTEP_MIN_FIT_RATIO * min(ns):
@@ -148,6 +183,7 @@ class GCFreezer:
         else:
             per_gather = self._per_gather_us
             fixed = max(pause_us - per_gather * n, 0.0)
+        self._fixed_us = fixed
         # No interval makes a pass shorter than its fixed part: past the budget,
         # allow twice that part and spread it over a longer interval.
         budget = max(LOCKSTEP_PAUSE_BUDGET_US, 2 * fixed)
