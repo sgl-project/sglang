@@ -92,6 +92,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           sparse-checkout: sgl-router/tests/fixtures/tokenizer_parity
 
       - name: Fetch the parity matrix tokenizers
@@ -126,6 +129,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       # Best effort: the sccache release CDN fails intermittently.
       - name: Configure sccache
@@ -214,6 +220,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
@@ -261,6 +270,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       # Push and dispatch runs hold HF_TOKEN, so they build from source rather than trust
       # a cache. PR runs hold no token and can restore it.
       - uses: ./.github/actions/download-rust-ext
