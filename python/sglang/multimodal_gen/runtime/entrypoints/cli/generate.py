@@ -161,14 +161,15 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     if config_file:
         config_args = ServerArgs.load_config_file(config_file) or {}
     # A request for the diffusion decoder loads it, whether it comes from the
-    # CLI or the config file. ServerArgs plans memory placement when it is
-    # built, so it has to know by then.
-    default_args = None
+    # CLI or the config file and whatever load_diffusion_decoder is set to.
+    # ServerArgs plans memory placement when it is built, so it has to know by
+    # then.
+    forced_args = None
     if getattr(args, "use_diffusion_decoder", False) or config_args.get(
         "use_diffusion_decoder"
     ):
-        default_args = {"load_diffusion_decoder": True}
-    server_args = ServerArgs.from_cli_args(args, unknown_args, default_args)
+        forced_args = {"load_diffusion_decoder": True}
+    server_args = ServerArgs.from_cli_args(args, unknown_args, forced_args=forced_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}

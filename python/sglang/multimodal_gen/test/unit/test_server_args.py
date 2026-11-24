@@ -612,6 +612,35 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
 
         self.assertEqual(server_args.component_precisions, {"text_encoder_2": "fp32"})
 
+    def test_forced_args_win_over_the_cli_and_the_config_file(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+        )
+
+        parser = FlexibleArgumentParser()
+        add_multimodal_gen_serve_args(parser)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
+            config.write("load_diffusion_decoder: false\n")
+            config.flush()
+            argv = ["--model-path", "/fake", "--config", config.name]
+            with (
+                patch.object(sys, "argv", ["sglang"] + argv),
+                patch.object(
+                    PipelineConfig,
+                    "from_kwargs",
+                    return_value=QwenImagePipelineConfig(),
+                ),
+                mock_cuda_platform(),
+            ):
+                args, unknown_args = parser.parse_known_args(argv)
+                loaded = ServerArgs.from_cli_args(args, unknown_args)
+                forced = ServerArgs.from_cli_args(
+                    args, unknown_args, forced_args={"load_diffusion_decoder": True}
+                )
+
+        self.assertFalse(loaded.load_diffusion_decoder)
+        self.assertTrue(forced.load_diffusion_decoder)
+
     def test_dynamic_role_qualified_cli_args(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -2525,8 +2554,8 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
     def test_offline_generate_plans_memory_with_the_requested_diffusion_decoder(self):
         # `sglang generate` loads the decoder as well when the CLI flag or the
         # config file asks for it
-        def from_cli_args(args, unknown_args=None, default_args=None):
-            return self._ltx25(**(default_args or {}))
+        def from_cli_args(args, unknown_args=None, default_args=None, **kwargs):
+            return self._ltx25(**(kwargs.get("forced_args") or {}))
 
         def planned_text_encoder_mode(config=None, **flags):
             cli_args = SimpleNamespace(
@@ -2561,12 +2590,13 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertEqual(
             planned_text_encoder_mode(use_diffusion_decoder=True), LAYERWISE_OFFLOAD
         )
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
-            config.write("use_diffusion_decoder: true\n")
-            config.flush()
-            self.assertEqual(
-                planned_text_encoder_mode(config=config.name), LAYERWISE_OFFLOAD
-            )
+        for extra in ("", "load_diffusion_decoder: false\n"):
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
+                config.write("use_diffusion_decoder: true\n" + extra)
+                config.flush()
+                self.assertEqual(
+                    planned_text_encoder_mode(config=config.name), LAYERWISE_OFFLOAD
+                )
 
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(
