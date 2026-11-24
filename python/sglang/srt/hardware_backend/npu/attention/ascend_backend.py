@@ -1202,11 +1202,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.uniform_query_len = 1
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if self.dsa_dcp_target or (
-            self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn
-        ):
-            # DSA reads verify lengths including the candidates. Keep them
-            # separate from the runner's prefix lengths used by KDA and commit.
+        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens
