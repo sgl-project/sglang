@@ -1,6 +1,9 @@
 export const config = {
   modelName: "Beam 1.0",
-  supportedHardware: ["b300", "gb300", "h200"],
+  supportedHardware: ["b300", "gb300", "h200", "rtx-pro-6000"],
+  hardware: [
+    { id: "rtx-pro-6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+  ],
   groupHardware: false,
   showPlaygroundLink: false,
   accuracyLabels: [["gsm8k_pct", "GSM8K", "%"]],
@@ -22,8 +25,16 @@ export const config = {
           disabled: (sel) => sel.hw === "h200",
           disableReason: "The NVFP4 recipe requires Blackwell; use FP8 or BF16 on H200.",
         },
-        { id: "fp8", label: "FP8" },
-        { id: "bf16", label: "BF16" },
+        {
+          id: "fp8", label: "FP8",
+          disabled: (sel) => sel.hw === "rtx-pro-6000",
+          disableReason: "FP8 weights do not fit in four 96 GB GPUs; use NVFP4 on RTX PRO 6000.",
+        },
+        {
+          id: "bf16", label: "BF16",
+          disabled: (sel) => sel.hw === "rtx-pro-6000",
+          disableReason: "BF16 weights do not fit in four 96 GB GPUs; use NVFP4 on RTX PRO 6000.",
+        },
       ],
     },
   ],
@@ -45,6 +56,7 @@ export const config = {
     b300: "lmsysorg/sglang:beam",
     gb300: "lmsysorg/sglang:beam",
     h200: "lmsysorg/sglang:beam",
+    "rtx-pro-6000": "lmsysorg/sglang:beam",
   },
   github: {
     cookbookModel: "reflection/Beam-1.0-501B-A23B",
@@ -497,6 +509,66 @@ export const config = {
         "--page-size 64",
         "--context-length 1048576",
         "--enable-unified-memory",
+        "--tool-call-parser beam",
+        "--reasoning-parser beam",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+    {
+      "match": {
+        "hw": "rtx-pro-6000",
+        "strategy": "low-latency",
+        "quant": "nvfp4"
+      },
+      "nnodes": 1,
+      "verified": true,
+      "env": [
+        "SGLANG_ENABLE_PCIE_IPC_ALLREDUCE=1"
+      ],
+      "flags": [
+        "--model-path {{MODEL_NAME}}",
+        "--served-model-name beam",
+        "--tp 4",
+        "--attention-backend trtllm_mha",
+        "--page-size 64",
+        "--context-length 131072",
+        "--mem-fraction-static 0.83",
+        "--enable-unified-memory",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path reflection/Beam-1.0-501B-A23B-DFlash2",
+        "--speculative-dflash-block-size 8",
+        "--tool-call-parser beam",
+        "--reasoning-parser beam",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+    {
+      "match": {
+        "hw": "rtx-pro-6000",
+        "strategy": "high-throughput",
+        "quant": "nvfp4"
+      },
+      "nnodes": 1,
+      "verified": true,
+      "env": [
+        "SGLANG_ENABLE_PCIE_IPC_ALLREDUCE=1"
+      ],
+      "flags": [
+        "--model-path {{MODEL_NAME}}",
+        "--served-model-name beam",
+        "--tp 4",
+        "--attention-backend trtllm_mha",
+        "--page-size 64",
+        "--context-length 131072",
+        "--mem-fraction-static 0.83",
+        "--enable-unified-memory",
+        "--max-running-requests 64",
+        "--cuda-graph-max-bs-decode 64",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path reflection/Beam-1.0-501B-A23B-DFlash2",
+        "--speculative-dflash-block-size 8",
         "--tool-call-parser beam",
         "--reasoning-parser beam",
         "--host {{HOST_IP}}",

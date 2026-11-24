@@ -190,5 +190,29 @@ export const benchmarks = [
       "gsm8k_pct": 95.38
     },
     "notes": "Original Beam verifier e698bb5: 1,319 GSM8K problems, 0 request errors."
+  },
+  {
+    "match": {
+      "hw": "rtx-pro-6000",
+      "strategy": "low-latency",
+      "quant": "nvfp4"
+    },
+    "sglang_version": "daf3854023",
+    "accuracy": {
+      "gsm8k_pct": 96.29
+    },
+    "notes": "sgl-eval 0.1.3 (temperature 0.7, top_p 0.99, max_tokens 32768): 1,319 GSM8K problems, 0 request errors, DFlash2 accept length 4.55."
+  },
+  {
+    "match": {
+      "hw": "rtx-pro-6000",
+      "strategy": "high-throughput",
+      "quant": "nvfp4"
+    },
+    "sglang_version": "daf3854023",
+    "accuracy": {
+      "gsm8k_pct": 96.21
+    },
+    "notes": "sgl-eval 0.1.3 (temperature 0.7, top_p 0.99, max_tokens 32768): 1,319 GSM8K problems, 0 request errors, DFlash2 accept length 4.54."
   }
 ];

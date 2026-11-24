@@ -1,6 +1,6 @@
 ---
 title: Beam 1.0
-description: "Deploy Reflection Beam 1.0 with SGLang on B300, GB300, and H200: NVFP4, FP8, and BF16 recipes for low latency and high throughput."
+description: "Deploy Reflection Beam 1.0 with SGLang on B300, GB300, H200, and RTX PRO 6000: NVFP4, FP8, and BF16 recipes for low latency and high throughput."
 tag: NEW
 ---
 
@@ -21,7 +21,8 @@ For host setup, see [Install SGLang with Docker](/docs/get-started/install#metho
 Select your hardware, strategy, and quantization to generate the launch command.
 
 - **Low-Latency** uses TP with the [DFlash2 drafter](https://huggingface.co/reflection/Beam-1.0-501B-A23B-DFlash2) at block size 8.
-- **High-Throughput** disables DFlash2. H200 BF16 uses TP8 with an automatic static memory fraction; the other recipes use TP + DPA. Blackwell NVFP4 also enables EP and FlashInfer MegaMoE.
+- **High-Throughput** disables DFlash2. H200 BF16 uses TP8 with an automatic static memory fraction; the other recipes use TP + DPA. B300 and GB300 NVFP4 also enable EP and FlashInfer MegaMoE.
+- **RTX PRO 6000** serves NVFP4 only, with TP4 and DFlash2 in both strategies; High-Throughput raises the running-request limit to 64. The recipe enables FlashInfer's PCIe-IPC all-reduce, since these GPUs have no NVLink.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/reflection/beam-1.0.jsx";
@@ -31,7 +32,7 @@ import { benchmarks } from "/src/snippets/configs/reflection/beam-1.0-benchmarks
 
 Each GSM8K score covers all 1,319 test problems; the benchmark notes identify the evaluation harness.
 
-NVFP4 requires B300 or GB300. **GB300 BF16 uses two four-GPU nodes**: set the head-node address and node rank in **Env**, then run the command on both nodes with rank 0 on the head and rank 1 on the peer.
+NVFP4 requires Blackwell: B300, GB300, or RTX PRO 6000. On four RTX PRO 6000 GPUs the KV cache holds about 150K tokens, so the recipe caps the context at 128K tokens. **GB300 BF16 uses two four-GPU nodes**: set the head-node address and node rank in **Env**, then run the command on both nodes with rank 0 on the head and rank 1 on the peer.
 
 ## TPU Support
 
