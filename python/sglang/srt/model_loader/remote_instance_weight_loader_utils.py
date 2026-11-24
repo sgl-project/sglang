@@ -159,8 +159,6 @@ def register_memory_region(model, transfer_engine):
         if current_weight_block is not None:
             weight_blocks_for_reg_mr.append(current_weight_block)
 
-    # Without this, registration is a silent no-op and only the loading instance
-    # fails, on an unreadable remote address.
     if weight_addr_set and not weight_blocks_for_reg_mr:
         raise RuntimeError(
             f"{get_device_module().__name__}.memory_snapshot() reported no "
