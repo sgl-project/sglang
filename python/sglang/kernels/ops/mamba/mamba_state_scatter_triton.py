@@ -913,6 +913,7 @@ def _state_multi_build_meta(pairs):
             ]
         )
         block = end
+    assert block <= 65535, f"{block} blocks past grid axis 1"
     return make_ptr_table(rows, device=pairs[0][0].device), word, block
 
 
@@ -939,6 +940,8 @@ def fused_state_scatter_multi(
         + tuple(src.stride())
         for dst, src in pairs
     )
+    # One entry, the verify commit's pairs; a miss copies the table from pageable host
+    # memory, so the first call must be eager (the post-verify graphs warm up first).
     cached = _state_multi_meta_cache.get(key)
     if cached is None:
         cached = _state_multi_build_meta(pairs)
