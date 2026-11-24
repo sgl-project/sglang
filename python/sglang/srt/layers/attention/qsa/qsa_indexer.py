@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -23,6 +24,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import qsa_all_to_all
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -446,6 +448,8 @@ class QSAIndexer(MultiPlatformOp):
         max_row_keys: Optional[int] = None,
         *,
         defer_expansion: bool = False,
+        row_offset: int = 0,
+        total_rows: Optional[int] = None,
     ) -> torch.Tensor:
         """Top-k token selection for packed prefill rows.
 
@@ -475,13 +479,17 @@ class QSAIndexer(MultiPlatformOp):
             and q.is_cuda
             and HAS_TILELANG
         )
+        reference_rows = rows if total_rows is None else total_rows
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows,
+            reference_rows,
             max_row_keys if relative else compressed_keys.shape[0],
             q.shape[1],
         )
-        for row_start in range(0, rows, row_chunk_size):
-            row_end = min(row_start + row_chunk_size, rows)
+        first_chunk = (row_offset // row_chunk_size) * row_chunk_size
+        for chunk_start in range(first_chunk, row_offset + rows, row_chunk_size):
+            chunk_end = min(chunk_start + row_chunk_size, reference_rows)
+            row_start = max(chunk_start - row_offset, 0)
+            row_end = min(chunk_end - row_offset, rows)
             chunk_slice = slice(row_start, row_end)
             if compressed_keys.shape[0] == 0:
                 block_indices = torch.full(
@@ -519,6 +527,9 @@ class QSAIndexer(MultiPlatformOp):
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
                     topk=self.block_topk,
+                    dispatch_rows=(
+                        chunk_end - chunk_start if total_rows is not None else None
+                    ),
                 )
             selected = block_indices
             if not defer_expansion:
@@ -539,7 +550,8 @@ class QSAIndexer(MultiPlatformOp):
         rows = q.shape[0]
         shard_rows = cdiv(rows, parallel.attn_tp_size)
         start = parallel.attn_tp_rank * shard_rows
-        local = slice(start, start + shard_rows)
+        layout = metadata.prefill_tp_layout
+        local = layout.indexer_slice if layout else slice(start, start + shard_rows)
         request_ids = metadata.get_token_to_batch_idx()
         local_request_ids = request_ids[local]
         local_positions = logical_positions[local]
@@ -554,18 +566,33 @@ class QSAIndexer(MultiPlatformOp):
             local_positions,
             lengths.index_select(0, local_request_ids.long()),
             defer_expansion=True,
+            row_offset=local.start,
+            total_rows=rows,
         )
         if local_blocks.shape[0] != shard_rows:
             padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
             padded[: local_blocks.shape[0]].copy_(local_blocks)
             local_blocks = padded
-        blocks = local_blocks.new_empty(
-            (shard_rows * parallel.attn_tp_size, self.block_topk)
-        )
-        # Gather compact block IDs before expanding to token positions.
-        attn_tp_all_gather_into_tensor(blocks, local_blocks)
+        if layout is not None:
+            peer = qsa_all_to_all(local_blocks, layout.peer_splits)
+            ordered = (peer, local_blocks) if layout.kv_group else (local_blocks, peer)
+            attn_rows = layout.attention_slice
+            request_ids = request_ids[attn_rows]
+            logical_positions = logical_positions[attn_rows]
+            if not request_ids.numel():
+                return local_blocks.new_empty(
+                    (0, self.token_topk + self.compress_ratio - 1)
+                )
+            blocks = torch.cat(ordered)[: request_ids.numel()]
+        else:
+            blocks = local_blocks.new_empty(
+                (shard_rows * parallel.attn_tp_size, self.block_topk)
+            )
+            # Gather compact block IDs before expanding to token positions.
+            attn_tp_all_gather_into_tensor(blocks, local_blocks)
+            blocks = blocks[:rows]
         return expand_qsa_block_indices(
-            blocks[:rows],
+            blocks,
             logical_positions,
             lengths.index_select(0, request_ids.long()),
             compress_ratio=self.compress_ratio,
@@ -826,7 +853,11 @@ class QSAIndexer(MultiPlatformOp):
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
-        if _is_npu and forward_mode.is_context_parallel_extend():
+        if (
+            _is_npu
+            and forward_mode.is_context_parallel_extend()
+            and envs.SGLANG_NPU_QSA_PREFILL_TP_SHARD.get() in ("indexer", "attention")
+        ):
             tp_size = get_parallel().attn_tp_size
             if 1 < tp_size <= num_valid_tokens:
                 return self.select_prefill_tokens_tp(

@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
     sparse_gqa_paged_prefill_triton,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout, qsa_all_to_all
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
@@ -56,7 +57,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_spec, get_stream
+from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
@@ -354,6 +355,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
+        # The Ascend fast kernel consumes three Q heads sharing one KV head.
+        # Keep each replicated KV-head group on its existing cache.
+        self._use_npu_prefill_tp_attention = (
+            _is_npu
+            and envs.SGLANG_NPU_QSA_PREFILL_TP_SHARD.get() == "attention"
+            and getattr(config, "num_attention_heads", None) == 24
+            and getattr(config, "num_key_value_heads", None) == 2
+            and not runner.is_draft_worker
+            and get_parallel().attn_tp_size == 8
+        )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
@@ -871,6 +882,17 @@ class QwenSparseAttnBackend(AttentionBackend):
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
                     )
+        prefill_tp_layout = None
+        if (
+            self._use_npu_prefill_tp_attention
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is None
+            and token_to_batch_idx.numel() >= 8
+        ):
+            parallel = get_parallel()
+            prefill_tp_layout = QSAPrefillTPLayout.build(
+                token_to_batch_idx.numel(), parallel.attn_tp_size, parallel.attn_tp_rank
+            )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -895,6 +917,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 and decode_logical_positions is not None
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
+            prefill_tp_layout=prefill_tp_layout,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -1495,9 +1518,14 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        logical_indices: torch.Tensor,
+        metadata: QwenSparseAttnMetadata,
+        row_slice: Optional[slice] = None,
     ) -> torch.Tensor:
-        sequence_ids = metadata.token_to_batch_idx.long()
+        sequence_ids = metadata.token_to_batch_idx
+        if row_slice is not None:
+            sequence_ids = sequence_ids[row_slice]
+        sequence_ids = sequence_ids.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
             raise ValueError("QSA top-k rows do not match query rows")
         row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
@@ -1664,6 +1692,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
+        if self._use_npu_prefill_tp_attention:
+            metadata = self._resolve_metadata(forward_batch)
+            layout = metadata.indexer_metadata.prefill_tp_layout
+            if layout is not None:
+                output = self._forward_extend_tp(
+                    q, layer, topk_indices, metadata, layout
+                )
+                return self._pad_extend_output(output, num_output_rows)
         num_valid_rows = topk_indices.shape[0]
         if num_valid_rows > num_output_rows:
             raise ValueError(
@@ -1752,6 +1788,30 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _forward_extend_tp(self, q, layer, topk_indices, metadata, layout):
+        """Transpose query rows and heads inside one replicated KV-head group."""
+        num_rows = metadata.token_to_batch_idx.numel()
+        q = q[:num_rows].contiguous()
+        padded_rows = sum(layout.attention_splits)
+        if num_rows != padded_rows:
+            q = F.pad(q, (0, 0, 0, 0, 0, padded_rows - num_rows))
+        received = qsa_all_to_all(q, layout.attention_splits)
+        local_rows = 2 * layout.rows_per_rank
+        slots = self._logical_to_physical(topk_indices, metadata, layout.attention_slice)
+        if slots.shape[0] != local_rows:
+            padded = slots.new_full((local_rows, slots.shape[1]), -1)
+            padded[: slots.shape[0]].copy_(slots)
+            slots = padded
+        kv = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+        k, v = kv.key(), kv.value()
+        # Each fragment preserves the native 3:1 kernel contract and shares
+        # the same physical slot mapping for this query shard.
+        fragments = received.view(-1, local_rows, *q.shape[1:]).unbind(0)
+        output = torch.cat(
+            [_npu_sparse_attention(x, k, v, slots, layer.scaling) for x in fragments]
+        )
+        return qsa_all_to_all(output, layout.attention_splits)[:num_rows]
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's

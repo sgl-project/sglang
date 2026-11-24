@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     gather_qsa_compressed_keys,
     qsa_fast_topk,
 )
+from sglang.srt.layers.attention.qsa.tp_shard import QSAPrefillTPLayout
 
 
 def build_qsa_row_ranges(
@@ -96,6 +97,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     defer_block_expansion: bool = False
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
+    prefill_tp_layout: Optional[QSAPrefillTPLayout] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)

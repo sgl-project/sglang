@@ -30,6 +30,8 @@ def qsa_fast_topk(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     topk: int,
+    *,
+    dispatch_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """Select compressed blocks with platform kernels or a Torch reference.
 
@@ -42,6 +44,16 @@ def qsa_fast_topk(
     if _is_npu:
         from sgl_kernel_npu.operators.indexer import qsa_topk as fast_topk
 
+        if dispatch_rows is not None:
+            from sgl_kernel_npu.implementation.triton.indexer.qsa_topk import (
+                hybrid_topk,
+                select_implementation,
+            )
+
+            # The tiled and hybrid kernels can emit blocks in different orders.
+            # Preserve the unsharded dispatch so sparse attention and KV match.
+            if select_implementation(dispatch_rows, logits.shape[1], topk) == "hybrid":
+                return hybrid_topk(logits, lengths, topk, starts)
         # Upstream supplies contiguous bounds and finite scores within each
         # valid interval. Unsupported metadata/errors must not silently fall back.
         return fast_topk(logits, lengths, topk, starts)
