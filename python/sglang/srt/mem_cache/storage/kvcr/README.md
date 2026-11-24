@@ -1,8 +1,19 @@
 # KVCR HiCacheStorage backend
 
 This optional backend uses KVCR's indexed-region public API and NIXL/UCX
-transport. Install KVCR 0.2.0 or later separately; an older KVCR (0.1.x) is
-rejected at startup. Selecting another HiCache backend does not import KVCR.
+transport. KVCR is not an SGLang dependency: install KVCR 0.2.0 or later from
+PyPI. An older KVCR (0.1.x) is rejected at startup. Selecting another HiCache
+backend does not import KVCR.
+
+KVCR 0.2.0 needs NIXL 1.5.x. The SGLang image already has NIXL with its CUDA 13
+binary, so install KVCR there without dependencies; otherwise pip also adds the
+CUDA 12 NIXL binary:
+
+```bash
+pip install --no-deps "kvcr>=0.2.0"
+```
+
+Elsewhere, `pip install "kvcr>=0.2.0"` also installs NIXL, msgspec and pyzmq.
 
 ## Ownership and data path
 
