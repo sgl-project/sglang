@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import math
 from contextlib import contextmanager
@@ -40,6 +41,7 @@ from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
+    hip_argmax_verify,
     key_splits,
     reduce_sharded_token_keys,
     sampling_allows_vocab_shards,
@@ -646,13 +648,12 @@ def _verify_coins(
             draft_token_num=draft_token_num,
             device=device,
         )
-    # coins for rejection sampling
-    coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-    # coins for final sampling
-    coins_for_final_sampling = torch.rand(
-        (candidates.shape[0],), dtype=torch.float32, device=device
-    )
-    return coins, coins_for_final_sampling
+    # One draw: rejection coins shaped like candidates, then one final-sampling
+    # coin per request.
+    bs = candidates.shape[0]
+    n = candidates.numel()
+    uniforms = torch.rand((n + bs,), dtype=torch.float32, device=device)
+    return uniforms[:n].view(candidates.shape), uniforms[n:]
 
 
 def _verify_uses_greedy(
@@ -835,7 +836,7 @@ def _sharded_sampling_applies(
     """
     info = batch.sampling_info
     return (
-        _is_cuda
+        (_is_cuda or hip_argmax_verify())
         and verify_input.tree_topk == 1
         and sampling_allows_vocab_shards(
             info,
@@ -1082,9 +1083,12 @@ def _tree_accept(
                 else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+                if verify_out is not None:
+                    tp_group.broadcast(verify_out, src=0)
+                else:
+                    tp_group.broadcast(predict, src=0)
+                    tp_group.broadcast(accept_index, src=0)
+                    tp_group.broadcast(num_correct_drafts, src=0)
     elif vocab_shard is not None:
         # temperature-only rows: a Gumbel-max target sample per row, then the greedy
         # check against it (exact for a topk-1 chain, whose drafts are deterministic)
@@ -1421,9 +1425,17 @@ def _verify_outputs(
     predict = out[:rows]
     accept_index = out[rows : rows + bs * depth].view(bs, depth)
     if init:
-        predict.zero_()
-        accept_index.fill_(-1)
+        out[: rows + bs * depth].copy_(_verify_outputs_init(rows, bs * depth, device))
     return predict, accept_index, out[rows + bs * depth :], out
+
+
+@functools.lru_cache(maxsize=256)
+def _verify_outputs_init(rows: int, num_accept: int, device) -> torch.Tensor:
+    """rows zeros then num_accept -1s: the packed predict / accept_index init,
+    applied with one copy instead of a zero_ and a fill_."""
+    init = torch.full((rows + num_accept,), -1, dtype=torch.int32, device=device)
+    init[:rows] = 0
+    return init
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

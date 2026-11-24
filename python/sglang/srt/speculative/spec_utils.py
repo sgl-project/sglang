@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sglang.kernels.ops.sampling.argmax_jit import can_argmax
     from sglang.kernels.ops.speculative.row_argmax import div_argmax
+if _is_cuda or _is_hip:
     from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
@@ -135,8 +136,8 @@ def fast_sample(
     graph replay. The midpoint uint32 mapping stays strictly inside ``(0, 1)``,
     avoiding infinite exponential/Gumbel values at either hash endpoint.
 
-    The unseeded path keeps using PyTorch's fast RNG-backed implementation.
-    Set ``SGLANG_OPT_USE_GUMBEL_SAMPLE=0`` to make that path fall back to
+    The unseeded path keeps using PyTorch's fast RNG-backed implementation
+    (fused into ``race_sample`` on HIP, seeded from the same generator). Set ``SGLANG_OPT_USE_GUMBEL_SAMPLE=0`` to make that path fall back to
     ``torch.multinomial``.
     """
     if sampling_seed is not None:
@@ -190,6 +191,15 @@ def fast_sample(
         if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
             sample_index = torch.multinomial(probs, num_samples=num_samples)
             return probs.gather(1, sample_index), sample_index
+        if (
+            num_samples == 1
+            and _is_hip
+            and probs.dtype == torch.float32
+            and probs.stride(-1) == 1
+        ):
+            from sglang.kernels.ops.sampling.gumbel_fused import race_sample
+
+            return race_sample(probs)
         q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
         if (
             num_samples == 1
@@ -256,12 +266,20 @@ def sample_draft_proposal(
     positions: Optional[torch.Tensor] = None,
     draft_step: int = 0,
     fused: bool = False,
+    advance_positions: Optional[torch.Tensor] = None,
+    draft_tokens: Optional[torch.Tensor] = None,
+    draft_token_column: int = 0,
+    probs_out: Optional[torch.Tensor] = None,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
     only if q is exactly the distribution X was drawn from, so callers must hand
     the returned q (not a recomputed one) to the verify.
+
+    ``advance_positions`` (if given) is incremented in place and X is also
+    written to ``draft_tokens[:, draft_token_column]`` (if given). q is written
+    into ``probs_out`` (if given) and that tensor is returned as q.
 
     A greedy row (``top_k == 1``) proposes its argmax instead. SamplingParams
     rewrites temperature 0 to ``temperature=1.0, top_k=1``, so T alone cannot
@@ -279,8 +297,69 @@ def sample_draft_proposal(
     """
     if fused:
         # One fused kernel; callers pass the `use_fused_draft_sample` decision.
-        return sampling_softmax_sample(next_token_logits, temperatures, top_ks=top_ks)
-    probs = sampling_softmax(next_token_logits, temperatures=temperatures)
+        probs, topk_p, topk_index = sampling_softmax_sample(
+            next_token_logits, temperatures, top_ks=top_ks, out=probs_out
+        )
+        return _finish_draft_proposal(
+            probs,
+            topk_p,
+            topk_index,
+            advance_positions,
+            draft_tokens,
+            draft_token_column,
+        )
+    race = _is_hip and sampling_seed is None and envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get()
+    if race:
+        from sglang.kernels.ops.sampling.gumbel_fused import softmax_race_sample
+
+        assert top_ks is None or top_ks.device == next_token_logits.device
+        raced = softmax_race_sample(
+            next_token_logits,
+            temperatures,
+            top_ks,
+            out=probs_out,
+            positions=advance_positions,
+            draft_tokens=draft_tokens,
+            draft_token_column=draft_token_column,
+        )
+        if raced is not None:
+            return raced
+    probs = sampling_softmax(
+        next_token_logits, temperatures=temperatures, out=probs_out
+    )
+    if race and probs.dtype == torch.float32 and probs.stride(-1) == 1:
+        from sglang.kernels.ops.sampling.gumbel_fused import race_sample
+
+        assert top_ks is None or top_ks.device == probs.device
+        topk_p, topk_index = race_sample(
+            probs,
+            top_ks,
+            positions=advance_positions,
+            draft_tokens=draft_tokens,
+            draft_token_column=draft_token_column,
+        )
+        return probs, topk_p, topk_index
+    probs, topk_p, topk_index = _sample_draft_proposal_unfused(
+        probs, top_ks, sampling_seed, positions, draft_step
+    )
+    return _finish_draft_proposal(
+        probs, topk_p, topk_index, advance_positions, draft_tokens, draft_token_column
+    )
+
+
+def _finish_draft_proposal(
+    probs, topk_p, topk_index, advance_positions, draft_tokens, draft_token_column
+):
+    """Write the sampled token into the draft chain and bump positions, as the
+    HIP race sampler's finalize kernel does in place."""
+    if draft_tokens is not None:
+        draft_tokens[:, draft_token_column : draft_token_column + 1].copy_(topk_index)
+    if advance_positions is not None:
+        advance_positions.add_(1)
+    return probs, topk_p, topk_index
+
+
+def _sample_draft_proposal_unfused(probs, top_ks, sampling_seed, positions, draft_step):
     topk_p, topk_index = fast_sample(
         probs,
         num_samples=1,
@@ -663,7 +742,7 @@ def generate_simulated_accept_index(
         simulate_acc_len, simulate_acc_method, spec_steps + 1, generator=generator
     )
 
-    if _is_cuda and accept_index.is_cuda:
+    if (_is_cuda or _is_hip) and accept_index.is_cuda:
         return simulated_accept(
             accept_indices=accept_index,
             predict_tokens=predict,

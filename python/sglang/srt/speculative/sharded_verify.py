@@ -42,6 +42,17 @@ else:
     VocabShard = _provider_vocab_shard
 
 
+def hip_argmax_verify() -> bool:
+    """ROCm without rejection sampling: verify commits the argmax of every row,
+    temperature rows included, so per-rank argmax keys pick the same tokens."""
+    from sglang.srt.runtime_context import get_spec
+
+    return (
+        torch.version.hip is not None
+        and not get_spec().speculative_use_rejection_sampling
+    )
+
+
 def spec_allows_vocab_shards(spec) -> bool:
     """Whether the server's verify rule can accept or reject on shard keys."""
     return (
@@ -69,7 +80,9 @@ def sampling_allows_vocab_shards(
         and not return_logprob
         and not adjusts_logits
         and (
-            info.is_all_greedy or (has_local_keys and not need_truncated_sampling(info))
+            info.is_all_greedy
+            or hip_argmax_verify()
+            or (has_local_keys and not need_truncated_sampling(info))
         )
     )
 
@@ -667,7 +680,10 @@ def reduce_sharded_token_keys(
             f"keys shape {tuple(keys.shape)} is incompatible with splits={splits}"
         )
     world = tp_group.world_size
-    power_of_two_world = world > 0 and (world & (world - 1)) == 0
+    # the LL and multimem exchanges need NVLink multicast
+    power_of_two_world = (
+        torch.version.hip is None and world > 0 and (world & (world - 1)) == 0
+    )
     if 0 < keys.shape[0] <= _LL_MAX_ROWS and world <= 16 and power_of_two_world:
         tokens = _ll_keys(keys, tp_group)
         if tokens is not None:

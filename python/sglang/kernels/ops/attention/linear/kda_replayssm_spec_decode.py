@@ -36,8 +36,9 @@ import torch
 import triton
 import triton.language as tl
 
-# Measured on GB300 (K=V=128); any BV keeps the fold bit-identical, re-tune freely.
-KDA_FOLD_BLOCK_V = 8
+# Measured on GB300 and MI355X (K=V=128); any BV keeps the fold bit-identical,
+# re-tune freely.
+KDA_FOLD_BLOCK_V = 32 if torch.version.hip else 8
 
 
 @triton.jit
