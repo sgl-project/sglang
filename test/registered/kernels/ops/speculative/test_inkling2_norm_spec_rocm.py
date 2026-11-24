@@ -1,6 +1,8 @@
 """Inkling2's ROCm kernels against float64 / torch references, and their run-to-run
 determinism (two ROCm Triton miscompilations showed up only as nondeterminism)."""
 
+import sys
+
 import pytest
 import torch
 
@@ -321,3 +323,7 @@ def test_markov_step_fold_matches_addmm_bias(rows):
     assert (logits != expected_logits).float().mean() < 0.01
     diff = (logits.float() - expected_logits.float())[finite].abs().max()
     assert diff <= 0.25  # one BF16 step at |logit| < 30
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
