@@ -142,8 +142,8 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
     def test_npu_deepseek_v4_flash_fp8_4p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash FP8 4p DSPARK GPQA."""
         self.run_accuracy()
-#
-#
+
+
 # class TestNPUDeepSeekV4FlashDSPARK(TestNpuPerformanceTestCaseBase):
 #     """Test DSPARK for Deepseek-V4 in the 950 environment, acceptance rate greater than 0.5"""
 #
