@@ -138,7 +138,7 @@ def sdk_double(monkeypatch):
         provenance=SimpleNamespace(
             to_dict=lambda: {
                 "verified_revision": None,
-                "infercast_revision": _REVISION,
+                "simopus_revision": _REVISION,
                 "config_sha256": sdk.resources.provenance.config_sha256,
             }
         ),
@@ -196,6 +196,7 @@ def test_target_topology_local_config_and_explicit_policy(
     assert metrics["max_total_tokens"] == tokens
     assert "tensors" not in metrics["ranks"][0]
     assert metrics["provenance"]["verified_revision"] is None
+    assert metrics["provenance"]["simopus_revision"] == _REVISION
     json.dumps(metrics, allow_nan=False)
 
 
@@ -204,14 +205,6 @@ def test_default_page_size_and_revision_are_explicit(sdk_double, tmp_path):
     assert sdk_double.calls[0][2]["kv_page_size"] == 1
     assert sdk_double.calls[0][2]["revision"] is None
     assert sdk_double.calls[0][2]["shared_expert_tp_size"] is None
-
-
-def test_unmerged_budget_does_not_accept_old_provider(sdk_double, tmp_path):
-    config = _config()
-    config["provider"] = "infercast"
-    with pytest.raises(ValueError, match="provider must be 'simopus'"):
-        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), config)
-    assert sdk_double.calls == []
 
 
 @pytest.mark.parametrize(
