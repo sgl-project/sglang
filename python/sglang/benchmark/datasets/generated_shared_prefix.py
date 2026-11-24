@@ -138,13 +138,10 @@ def get_gen_prefix_cache_path(
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
     input_ids: bool = False,
+    ordered: bool = False,
+    fast_prepare: bool = False,
 ):
-    """Create cache directory under ~/.cache/sglang/benchmark.
-
-    The uniform-mode filename is preserved exactly as before so existing
-    on-disk caches remain valid. Non-default sampling modes get an extra
-    suffix encoding the parameters that affect the cached payload.
-    """
+    """Use a versioned key because legacy caches mixed ordered and fast modes."""
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
     suffix = ""
@@ -154,9 +151,14 @@ def get_gen_prefix_cache_path(
     # under a distinct key so a text-mode cache is never loaded as ids.
     if input_ids:
         suffix += "_ids"
+    # Ordered rows are cached unshuffled; fast_prepare rows carry prompt_len=1.
+    if ordered:
+        suffix += "_ordered"
+    if fast_prepare:
+        suffix += "_fast"
 
     cache_key = (
-        f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
+        f"gen_shared_prefix_v2_{seed}_{num_groups}_{prompts_per_group}_"
         f"{system_prompt_len}_{question_len}_{output_len}{suffix}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
@@ -207,6 +209,8 @@ def sample_generated_shared_prefix_requests(
         group_distribution=group_distribution,
         zipf_alpha=zipf_alpha,
         input_ids=input_ids,
+        ordered=ordered,
+        fast_prepare=fast_prepare,
     )
     # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
     # cache key; send_routing_key embeds a per-run uuid + timestamp that is

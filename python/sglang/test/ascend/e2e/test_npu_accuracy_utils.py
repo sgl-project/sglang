@@ -7,21 +7,17 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from datetime import datetime
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    SERVICE_PORT,
+    PdMixNodeMixin,
+    PdSepNodeMixin,
     check_role,
     kill_process_group,
-    launch_pd_mix_node,
-    launch_pd_separation_node,
-    start_router_thread,
-    wait_server_ready,
 )
+from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -583,6 +579,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     def setUpClass(cls):
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = list(cls.other_args)
+        cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
+
         env = os.environ.copy()
         for key, value in env.items():
             logger.info(f"ENV_VAR_SYS {key}:{value}")
@@ -590,8 +589,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             for key, value in cls.envs.items():
                 logger.info(f"ENV_VAR_CASE {key}:{value}")
                 env[key] = value
-
-        other_args = list(cls.other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -608,6 +605,12 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
@@ -620,8 +623,10 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             )
 
 
-class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
+class TestNpuAccuracyMultiNodePdMixTestCaseBase(PdMixNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
+    keep_alive_time = MAX_SERVER_KEEP_ALIVE_TIME
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     datasets = ["gsm8k"]
@@ -644,48 +649,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         apply_accuracy_dataset_override(cls)
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_mix_master_node()
-        cls.start_pd_mix_worker_node()
-
-    @classmethod
-    def tearDownClass(cls):
-        pass
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def start_pd_mix_master_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        wait_server_ready(f"{cls.base_url}/health")
-
-        logger.info(
-            f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def start_pd_mix_worker_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
-        )
-        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
+        super().setUpClass()
 
     @check_role(allowed_roles=["master", "worker"])
     def run_accuracy(self):
@@ -694,8 +658,9 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
             run_evalscope_with_retry(self, self.host, self.port, model_name)
 
 
-class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
+class TestNpuAccuracyMultiNodePdSepTestCaseBase(PdSepNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     datasets = ["gsm8k"]
@@ -717,57 +682,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         apply_accuracy_dataset_override(cls)
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_server()
-        cls.start_router_server()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        start_router_thread(cls.model_config, cls.base_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        logger.info(f"Starting pd separation node...")
-        cls.process = launch_pd_separation_node(cls.model_config)
-        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
-
-        while True:
-            if cls.process.poll() is None:
-                time.sleep(30)
-            else:
-                exit_code = cls.process.poll()
-                raise Exception(
-                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
-                )
+        super().setUpClass()
 
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):

@@ -820,7 +820,6 @@ class TestRealtimeTranscriptionSessionUpdates(CustomTestCase):
                     websocket=Mock(send_text=AsyncMock()),
                     tokenizer_manager=Mock(served_model_name="local-asr"),
                     adapter=Qwen3ASRAdapter(),
-                    server_args=self.server_args,
                 )
                 self._update(connection, {"language": "fr", "model": "local-asr"})
                 response = self._update(connection, update)
