@@ -97,7 +97,7 @@ def _copy_output_to_buffer_unchecked(output: Any, output_buffer: Any) -> Any:
         shared_output = output_buffer[: output.shape[0]]
         shared_output.copy_(output)
         return shared_output
-    if isinstance(output, (list, tuple)):
+    if _is_supported_container(output):
         shared = [
             _copy_output_to_buffer_unchecked(item, buffer)
             for item, buffer in zip(output, output_buffer)

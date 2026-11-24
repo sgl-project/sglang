@@ -147,6 +147,36 @@ def _check_page_size_1_graph_compat(*, use_mla: bool, graphs_disabled: bool) -> 
         )
 
 
+def _decode_context_tier_limits(
+    max_context_len: int, page_size: int
+) -> tuple[tuple[str, int], ...]:
+    """Return ascending (label, max_seq_len_k) tiers before the 'long' fallback.
+
+    According to the XPU FlashAttention kernel:
+    - effective_blocks <= 32: non-split single-workgroup execution (num_splits = 1).
+    - effective_blocks > 32: split-KV multi-workgroup execution (num_splits > 1).
+
+    TODO(XPU): Encapsulate kernel split heuristics and thresholds inside
+    sgl-kernel-xpu and query via an API instead of hardcoding fallback thresholds here.
+
+    If max_context <= 32 * page_size:
+      A single default variant covers the entire model context without split overhead.
+    If max_context <= 16384:
+      2 tiers: short (<= 32 * page_size) and long (fallback up to max_context).
+    If max_context > 16384:
+      3 tiers: short (<= 32 * page_size), medium (<= 16384), and long (fallback up to max_context).
+    """
+    split_threshold = 32 * page_size
+    if max_context_len <= split_threshold:
+        return ()
+
+    limits = [("short", split_threshold)]
+    medium_limit = 16384
+    if split_threshold < medium_limit and max_context_len > medium_limit:
+        limits.append(("medium", medium_limit))
+    return tuple(limits)
+
+
 class XPUAttentionBackend(AttentionBackend):
     """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
 
@@ -198,6 +228,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
+        self._full_cg_prefill_context_len: Optional[int] = None
         self.use_sliding_window_kv_pool = (
             model_runner.token_to_kv_pool.layer_router.routes_to(
                 IdSpaceKind.SLIDING_WINDOW
@@ -1716,27 +1747,23 @@ class XPUAttentionBackend(AttentionBackend):
         If max_context > 16384:
           3 tiers: short (<= 32 * page_size), medium (<= 16384), and long (fallback up to max_context).
         """
-        # TODO(XPU): MLA decode currently pins num_kv_splits=1 (matching eager),
-        # so multi-tier context graphs are skipped until MLA split-KV is enabled.
+        # MLA decode currently pins num_kv_splits=1 (matching eager),
+        # encoder-decoder graphs are disabled, and non-zero num_splits bypasses
+        # kernel split heuristics; in all these cases multi-tier graphs are skipped.
         if (
             capture_forward_mode != ForwardMode.DECODE
             or captured_req_width != 1
             or getattr(self, "is_encoder_decoder", False)
             or getattr(self, "use_mla", False)
-            or getattr(self, "num_splits", 0) == 1
+            or getattr(self, "num_splits", 0) != 0
         ):
             return None
 
-        max_context = self.max_context_len
-        split_threshold = 32 * self.page_size
-        if max_context <= split_threshold:
+        limits = _decode_context_tier_limits(self.max_context_len, self.page_size)
+        if not limits:
             return None
-
-        graph_limits = [("short", split_threshold)]
-        if split_threshold < 16384 and max_context > 16384:
-            graph_limits.append(("medium", 16384))
         return SeqLenBucketGraphVariants(
-            graph_limits=tuple(graph_limits),
+            graph_limits=limits,
             fallback_label="long",
         )
 
@@ -1857,7 +1884,13 @@ class XPUAttentionBackend(AttentionBackend):
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
             # captured graph always reads from the same storage addresses.
+            existing = self.decode_cuda_graph_metadata.get(bs)
             metadata = FlashAttentionMetadata()
+            if (
+                existing is not None
+                and getattr(existing, "local_attn_metadata", None) is not None
+            ):
+                metadata.local_attn_metadata = existing.local_attn_metadata
             metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                 "cache_seqlens"
             ][:bs]
@@ -1976,15 +2009,10 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
             variant = get_capture_attention_variant()
-            split_threshold = 32 * self.page_size
-            if variant == "short":
-                metadata.max_seq_len_k = min(self.max_context_len, split_threshold)
-            elif variant == "medium":
-                metadata.max_seq_len_k = min(
-                    self.max_context_len, max(split_threshold, 16384)
-                )
-            else:
-                metadata.max_seq_len_k = self.max_context_len
+            tier_dict = dict(
+                _decode_context_tier_limits(self.max_context_len, self.page_size)
+            )
+            metadata.max_seq_len_k = tier_dict.get(variant, self.max_context_len)
             if (
                 metadata.local_attn_metadata is not None
                 and self.attention_chunk_size is not None
@@ -2064,7 +2092,7 @@ class XPUAttentionBackend(AttentionBackend):
         max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         effective_context_len = (
             min(max_seq_len_override, self.max_context_len)
-            if max_seq_len_override
+            if max_seq_len_override is not None and max_seq_len_override > 0
             else self.max_context_len
         )
         max_num_pages = (effective_context_len + self.page_size - 1) // self.page_size
@@ -2126,11 +2154,12 @@ class XPUAttentionBackend(AttentionBackend):
         else:
             max_seq_len_k = int(seq_lens[:bs].max().item())
 
+        captured_limit = getattr(self, "_full_cg_prefill_context_len", None)
         if max_seq_len_k > 0:
-            if max_seq_len_k > self._full_cg_prefill_context_len:
+            if captured_limit is not None and max_seq_len_k > captured_limit:
                 raise ValueError(
                     f"Replay max_seq_len_k ({max_seq_len_k}) exceeds captured "
-                    f"full-CG prefill context limit ({self._full_cg_prefill_context_len})."
+                    f"full-CG prefill context limit ({captured_limit})."
                 )
             num_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
             valid_mask = (

@@ -376,6 +376,23 @@ class TestXPUGraphMetadata(CustomTestCase):
                     )
                     self.assertEqual(backend.forward_metadata.max_seq_len_k, expected)
 
+            # Test local attention chunk size clamping
+            backend.attention_chunk_size = 1024
+            backend.decode_cuda_graph_metadata[2].local_attn_metadata = SimpleNamespace(
+                local_max_seq_len=0
+            )
+            with patch(
+                "sglang.srt.model_executor.runner_utils.capture_mode.get_capture_attention_variant",
+                return_value="medium",
+            ):
+                backend._init_full_cg_decode_metadata(
+                    make_batch([1, 1]), in_capture=True
+                )
+                self.assertEqual(
+                    backend.forward_metadata.local_attn_metadata.local_max_seq_len, 1024
+                )
+            backend.attention_chunk_size = None
+
             backend._init_full_cg_decode_metadata(
                 make_batch([128, 64]), in_capture=False
             )
@@ -430,7 +447,7 @@ class TestXPUGraphMetadata(CustomTestCase):
             variants_small_page.graph_limits, (("short", 2048), ("medium", 16384))
         )
 
-        # 6. MLA, encoder-decoder, and deterministic (num_splits=1) opt out of tiers.
+        # 6. MLA, encoder-decoder, and fixed num_splits (1 or >1) opt out of tiers.
         backend.use_mla = True
         backend.page_size = 128
         backend.max_context_len = 32768
@@ -443,6 +460,9 @@ class TestXPUGraphMetadata(CustomTestCase):
         backend.is_encoder_decoder = False
         backend.num_splits = 1
         self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
+        backend.num_splits = 4
+        self.assertIsNone(backend.get_decode_graph_variants(ForwardMode.DECODE, 1))
+        backend.num_splits = 0
 
     def test_forward_decode_passes_int_max_seqlen_k_when_zero(self):
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
@@ -568,6 +588,10 @@ class TestXPUGraphMetadata(CustomTestCase):
         self.assertIsNone(
             _copy_output_to_buffer((output.hidden, output.aux), output_buffer)
         )
+
+        # Empty container or tuple containing None leaf disables buffer reuse
+        self.assertIsNone(_allocate_output_buffer(()))
+        self.assertIsNone(_allocate_output_buffer((torch.ones(1, 2), None)))
 
     def test_xpu_mem_get_info(self):
         """Verify that get_available_gpu_memory queries torch.xpu.mem_get_info."""
