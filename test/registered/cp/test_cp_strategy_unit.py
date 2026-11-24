@@ -209,8 +209,15 @@ class TestCPBCGConfiguration(CustomTestCase):
                 self.assertTrue(supports_prefill_cp_bcg(cfg))
 
     def test_trtllm_zigzag_support_is_preserved(self):
-        with _bcg_config(strategy="zigzag", backend="trtllm_mha") as cfg:
-            self.assertTrue(supports_prefill_cp_bcg(cfg))
+        for pp in (1, 2):
+            with (
+                self.subTest(pp=pp),
+                _bcg_config(strategy="zigzag", backend="trtllm_mha", pp=pp) as cfg,
+            ):
+                self.assertTrue(supports_prefill_cp_bcg(cfg))
+        # PP stages still require the CP group to span the attention TP group.
+        with _bcg_config(strategy="zigzag", backend="trtllm_mha", cp=4, pp=2) as cfg:
+            self.assertFalse(supports_prefill_cp_bcg(cfg))
 
 
 class TestCPStrategyUnit(CustomTestCase):
@@ -395,6 +402,77 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             runner.prefill_cp_bcg_input = DSV4CPBCGInput.create(runner)
             with self.assertRaises(MetadataChecked):
                 runner.capture_one_shape(16)
+
+    def test_zigzag_later_pp_stage_replays_eager_local_rows(self):
+        """A later PP stage replays on the CP-local rows an eager stage exchanges."""
+
+        def batch(extend_lens):
+            positions = torch.cat([torch.arange(n) for n in extend_lens])
+            num_tokens = int(positions.shape[0])
+            return ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=len(extend_lens),
+                input_ids=torch.arange(num_tokens),
+                req_pool_indices=torch.arange(len(extend_lens)),
+                seq_lens=torch.tensor(extend_lens),
+                out_cache_loc=torch.arange(num_tokens),
+                seq_lens_sum=num_tokens,
+                positions=positions,
+                seq_lens_cpu=torch.tensor(extend_lens),
+                extend_seq_lens_cpu=list(extend_lens),
+                extend_num_tokens=num_tokens,
+            )
+
+        def embed(ids):
+            raise AssertionError("A later PP stage must not embed input ids")
+
+        cp_size, capture_lens, live_lens = 2, [24], [5, 6]
+        init_cp_strategy(enable_prefill_cp=True, cp_size=cp_size, cp_strategy="zigzag")
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                pp_group=SimpleNamespace(is_first_rank=False),
+                model=SimpleNamespace(get_input_embeddings=lambda: embed),
+            )
+        )
+        for rank in range(cp_size):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(
+                    attn_cp_rank=rank,
+                    attn_cp_size=cp_size,
+                    enable_cp_tp_group_sharing=False,
+                ),
+            ):
+                eager = batch(live_lens)
+                prepare_cp_forward(eager)
+                eager_embeds, eager_positions = cp_split_before_forward(
+                    eager.positions[:, None].float(), eager.positions, eager
+                )
+
+                cp_input = ZigzagCPBCGInput(
+                    input_embeds=torch.zeros(32, 1), positions=torch.zeros(32).long()
+                )
+                cp_input.prepare(
+                    runner, batch(capture_lens), static_num_tokens=24, capture=True
+                )
+                self.assertEqual(cp_input.bucket_local_tokens, {24: 12})
+
+                live = batch(live_lens)
+                cp_input.prepare(runner, live, static_num_tokens=24, capture=False)
+                self.assertIsNone(live.input_embeds)
+                self.assertEqual(cp_input.live_local_tokens, 12)
+                # The stage sends and receives the eager physical shard, which
+                # is smaller than the captured local bucket.
+                self.assertEqual(cp_input.eager_local_tokens, eager_embeds.shape[0])
+                self.assertEqual(cp_input.eager_local_tokens, 8)
+                rows = cp_input.eager_local_tokens
+                torch.testing.assert_close(live.positions[:rows], eager_positions)
+                self.assertEqual(torch.count_nonzero(live.positions[rows:]).item(), 0)
+                # The last stage gathers only each rank's logical rows.
+                self.assertEqual(
+                    live.attn_cp_metadata.per_rank_logical_token,
+                    eager.attn_cp_metadata.per_rank_logical_token,
+                )
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
