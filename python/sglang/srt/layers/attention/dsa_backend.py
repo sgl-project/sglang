@@ -756,6 +756,7 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    draft_decode_len: int = 0
 
     def _call_flash_mla_sparse_fwd_small_heads(self, *args):
         from sglang.kernels.ops.attention.flash_mla_interface import (
@@ -802,7 +803,6 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
-        self.draft_decode_len = 0
         if speculative_num_steps and getattr(
             hf_config, "dsa_draft_attends_to_own_chain", False
         ):
