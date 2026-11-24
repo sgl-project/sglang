@@ -9,9 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_gfx95_supported, is_npu
-from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from sglang.srt.utils.common import calc_diff
 from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
 _is_npu = is_npu()
@@ -22,15 +23,14 @@ if _is_npu:
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
-_ENABLE_MM_DEEPGEMM = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
-)
+_ENABLE_MM_DEEPGEMM = envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM.get()
 # If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
-_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
+_ENABLE_MM_FALLBACK_VARIANT = (
+    envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT.get()
 )
-_ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
+# Cross-checks DeepGEMM against the Triton kernel on every call.
+_ENABLE_MM_COMPARISON_TEST = (
+    envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST.get()
 )
 
 if not _ENABLE_MM_DEEPGEMM:
@@ -647,7 +647,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
-    >> Stashed changes
+
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
