@@ -15,6 +15,7 @@ acceptance, accept lengths) must leave every output bitwise as the unfused tail 
 greedy, compact top-k and dense sampled, at batch sizes up to 64, and the graphs must
 still match eager sampling."""
 
+import os
 import unittest
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -298,20 +299,26 @@ class TestPostVerifyGraphs(CustomTestCase):
 
     def test_allocator_settings_that_do_not_split_the_presize_skip_it(self):
         """Expandable segments already keep the pool small, and under max_split_size_mb
-        the presized block would never be split: both keep main's pool."""
+        the presized block would never be split: both keep main's pool. Unset presizes."""
         graphs = _worker(switch=True)._post_verify_graphs
-        for settings in ("expandable_segments:True", "max_split_size_mb:512"):
+        unset = {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""}
+        for conf in (
+            {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+            {"PYTORCH_ALLOC_CONF": "Expandable_Segments: true"},
+            {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512"},
+        ):
             with (
-                patch.object(
-                    torch._C,
-                    "_accelerator_getAllocatorSettings",
-                    return_value=settings,
-                    create=True,
-                ),
+                patch.dict(os.environ, {**unset, **conf}),
                 patch.object(torch.cuda, "mem_get_info") as mem_get_info,
             ):
                 self.assertEqual(graphs._pool_presize_bytes(SimpleNamespace()), 0)
             mem_get_info.assert_not_called()
+        with (
+            patch.dict(os.environ, unset),
+            patch.object(torch.cuda, "empty_cache", side_effect=StopIteration),
+        ):
+            with self.assertRaises(StopIteration):  # went on to size the presize
+                graphs._pool_presize_bytes(SimpleNamespace())
 
     def test_pool_presize_runs_once_inside_the_first_sampled_capture(self):
         events = []
@@ -783,6 +790,10 @@ def _pool_bytes(pool):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+@unittest.skipIf(
+    eagle_post_verify_graphs.allocator_keeps_presize_unsplit(),
+    "the allocator config keeps main's pool",
+)
 class TestPresizedPoolHoldsLaterKeys(CustomTestCase):
     """Presized at the first sampled capture, the graph pool takes later sampled keys of
     larger batches in that one segment; without the presize it grows with each."""

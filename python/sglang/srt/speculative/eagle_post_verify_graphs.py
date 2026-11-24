@@ -10,6 +10,7 @@ row, so it writes the verify forward's slots, staged with the round's inputs."""
 from __future__ import annotations
 
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -67,6 +68,17 @@ def pool_presize_bytes(
         vocab,
     )
     return nbytes
+
+
+def allocator_keeps_presize_unsplit() -> bool:
+    """Whether PYTORCH_CUDA_ALLOC_CONF / PYTORCH_ALLOC_CONF set expandable segments (the
+    pool already stays small) or max_split_size_mb (the presized block is never split)."""
+    conf = ",".join(
+        os.environ.get(var, "")
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+    )
+    conf = conf.replace(" ", "").lower()
+    return "expandable_segments:true" in conf or "max_split_size_mb" in conf
 
 
 class EaglePostVerifyGraphs:
@@ -151,11 +163,8 @@ class EaglePostVerifyGraphs:
         self._graphs.join()
 
     def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
-        settings = torch._C._accelerator_getAllocatorSettings()
-        if "expandable_segments:True" in settings or "max_split_size_mb" in settings:
-            # expandable segments already keep the pool from growing per key; under
-            # max_split_size_mb the presized block is oversize and never split
-            logger.info("The post-verify graph pool is not presized under %s", settings)
+        if allocator_keeps_presize_unsplit():
+            logger.info("The post-verify graph pool is not presized: allocator config")
             return 0
         torch.cuda.empty_cache()  # so the free reading counts cached blocks
         graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
