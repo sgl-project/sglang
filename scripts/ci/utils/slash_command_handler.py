@@ -34,6 +34,7 @@ from run_ci_approval import (  # noqa: E402
     APPROVAL_WORKFLOWS,
     APPROVER_REPO_PERMISSIONS,
     approval_workflows_for,
+    author_may_approve,
     can_approve,
     head_seen_by,
     is_approved,
@@ -367,8 +368,9 @@ def handle_tag_run_ci(
     their own label, so `run-ci` is always added alongside. The commenter
     must pass run_ci_approval.can_approve, for every tier.
 
-    Adding `run-ci` here also approves the PR's head commit for the workflows
-    that gate on a per-commit approval (pr-test.yml, pr-test-extra.yml), but
+    Unless the PR's author may approve (then `run-ci` alone runs CI on every push),
+    adding `run-ci` here also approves the PR's head commit for the workflows
+    that gate on a per-commit approval (run_ci_approval.APPROVAL_WORKFLOWS), but
     only a head the commenter could have seen: one pushed before the comment
     was posted.
 
@@ -387,8 +389,10 @@ def handle_tag_run_ci(
         comment.create_reaction("confused")
         return False
 
+    author = pr.user.login
+    approve_commit = not author_may_approve(gh_repo, author)
     head_sha = pr.head.sha
-    if not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
+    if approve_commit and not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
         print(f"Not approving {head_sha}: pushed after the comment, or no run yet.")
         pr.create_issue_comment(
             f"`run-ci` was not added and no commit was approved for CI: the head "
@@ -402,8 +406,14 @@ def handle_tag_run_ci(
     print(f"Permission granted. Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
-    record_approval(gh_repo, head_sha, user_login)
-    pr.create_issue_comment(f"✅ Approved by {user_login}: CI runs on {head_sha}.")
+    if approve_commit:
+        record_approval(gh_repo, head_sha, user_login)
+        pr.create_issue_comment(f"✅ Approved by {user_login}: CI runs on {head_sha}.")
+    else:
+        pr.create_issue_comment(
+            f"✅ `run-ci` added by {user_login}: {author} may approve, so CI runs "
+            "on every push."
+        )
 
     if react_on_success:
         comment.create_reaction("+1")
