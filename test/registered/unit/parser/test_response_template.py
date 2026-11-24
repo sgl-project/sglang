@@ -151,16 +151,6 @@ TRANSFORM_EACH_RESPONSE_TEMPLATE = {
     },
 }
 
-# A checkpoint template that names its reasoning field `reasoning_content`,
-# as modern chat templates do, instead of `thinking`.
-REASONING_CONTENT_TEMPLATE = {
-    "start_anchor": "<assistant>",
-    "fields": {
-        "reasoning_content": {"open": "<think>", "close": "</think>"},
-        "content": {"content": "text"},
-    },
-}
-
 REASONING_CONTENT_JOIN_TEMPLATE = {
     "start_anchor": "<assistant>",
     "fields": {
@@ -175,24 +165,6 @@ REASONING_CONTENT_JOIN_TEMPLATE = {
             "close": "</answer>",
             "repeats": True,
             "join": "",
-        },
-    },
-}
-
-REASONING_CONTENT_TOOL_TEMPLATE = {
-    "start_anchor": "<assistant>",
-    "fields": {
-        "reasoning_content": {"open": "<think>", "close": "</think>"},
-        "content": {"content": "text"},
-        "tool_calls": {
-            "open_pattern": r"<call:(?P<name>\w+)>",
-            "close": "</call>",
-            "content": "json",
-            "repeats": True,
-            "transform": {
-                "type": "function",
-                "function": {"name": "{name}", "arguments": "{content}"},
-            },
         },
     },
 }
@@ -309,31 +281,18 @@ class TestResponseTemplateLoading(CustomTestCase):
             tool_close_token_ids("response_template", tokenizer), frozenset()
         )
 
-    def test_reasoning_content_alias_is_accepted(self):
-        validated = validate_response_template_for_serving(REASONING_CONTENT_TEMPLATE)
+    def test_ambiguous_reasoning_fields_are_rejected(self):
+        template = copy.deepcopy(REASONING_CONTENT_JOIN_TEMPLATE)
+        template["fields"]["thinking"] = template["fields"]["reasoning_content"]
 
-        self.assertIn("thinking", validated.fields)
-        self.assertNotIn("reasoning_content", validated.fields)
-        self.assertEqual(validated.fields["thinking"].open_literals, ["<think>"])
-        self.assertEqual(validated.fields["thinking"].close_literals, ["</think>"])
-
-        both = copy.deepcopy(REASONING_CONTENT_TEMPLATE)
-        both["fields"]["thinking"] = {"open": "<think>", "close": "</think>"}
         with self.assertRaisesRegex(ValueError, "cannot declare both"):
-            validate_response_template_for_serving(both)
+            validate_response_template_for_serving(template)
 
-    def test_empty_join_is_accepted_on_reasoning_and_content(self):
-        validated = validate_response_template_for_serving(
-            REASONING_CONTENT_JOIN_TEMPLATE
-        )
-
-        self.assertEqual(validated.fields["thinking"].join, "")
-        self.assertEqual(validated.fields["content"].join, "")
-
-        for field_name, join in (("reasoning_content", "\n"), ("content", " ")):
-            with self.subTest(field=field_name, join=join):
+    def test_nonempty_join_is_rejected_for_streamed_text(self):
+        for field_name in ("reasoning_content", "content"):
+            with self.subTest(field_name=field_name):
                 template = copy.deepcopy(REASONING_CONTENT_JOIN_TEMPLATE)
-                template["fields"][field_name]["join"] = join
+                template["fields"][field_name]["join"] = "\n"
                 with self.assertRaisesRegex(ValueError, "cannot be streamed"):
                     validate_response_template_for_serving(template)
 
@@ -511,60 +470,34 @@ class TestGemma4ResponseTemplateParity(CustomTestCase):
 
 
 class TestReasoningContentAlias(CustomTestCase):
-    def test_non_streaming_reasoning_parity(self):
-        parsed = ResponseTemplateReasoningDetector(
-            response_template=REASONING_CONTENT_TEMPLATE,
-            prefix="<assistant>",
-        ).detect_and_parse("<think>let me think</think>sunny")
-
-        self.assertEqual(parsed.reasoning_text, "let me think")
-        self.assertEqual(parsed.normal_text, "sunny")
-
-    def test_think_tokens_come_from_reasoning_content_field(self):
-        detector = ResponseTemplateReasoningDetector(
-            response_template=REASONING_CONTENT_TEMPLATE,
-            prefix="<assistant>",
-        )
-
-        self.assertEqual(detector.think_start_token, "<think>")
-        self.assertEqual(detector.think_end_token, "</think>")
-
-    def test_streaming_reasoning_parity(self):
-        text = "<think>let me think</think>sunny"
-        for chunk_size in (1, 3, len(text)):
-            with self.subTest(chunk_size=chunk_size):
-                detector = ResponseTemplateReasoningDetector(
-                    response_template=REASONING_CONTENT_TEMPLATE,
-                    prefix="<assistant>",
-                )
-                reasoning = []
-                normal = []
-                for chunk in _chunks(text, chunk_size):
-                    result = detector.parse_streaming_increment(chunk)
-                    reasoning.append(result.reasoning_text)
-                    normal.append(result.normal_text)
-                end = detector.finish()
-                reasoning.append(end.reasoning_text)
-                normal.append(end.normal_text)
-
-                self.assertEqual("".join(reasoning), "let me think")
-                self.assertEqual("".join(normal), "sunny")
-
-    def test_repeated_regions_join_with_empty_separator(self):
-        parsed = ResponseTemplateReasoningDetector(
-            response_template=REASONING_CONTENT_JOIN_TEMPLATE,
-            prefix="<assistant>",
-        ).detect_and_parse(
+    def test_repeated_regions_join_in_streaming_and_nonstreaming(self):
+        text = (
             "<think>first</think><think>second</think>"
             "<answer>one</answer><answer>two</answer>"
         )
-
+        detector = ResponseTemplateReasoningDetector(
+            response_template=REASONING_CONTENT_JOIN_TEMPLATE,
+            prefix="<assistant>",
+        )
+        parsed = detector.detect_and_parse(text)
         self.assertEqual(parsed.reasoning_text, "firstsecond")
         self.assertEqual(parsed.normal_text, "onetwo")
 
+        streamed = [detector.parse_streaming_increment(char) for char in text]
+        streamed.append(detector.finish())
+
+        self.assertEqual(
+            "".join(result.reasoning_text for result in streamed), "firstsecond"
+        )
+        self.assertEqual("".join(result.normal_text for result in streamed), "onetwo")
+
     def test_tool_detector_accepts_reasoning_content_template(self):
+        template = copy.deepcopy(DELIMITED_TEMPLATE)
+        fields = template["fields"]
+        fields["reasoning_content"] = fields.pop("thinking")
+
         parsed = ResponseTemplateToolDetector(
-            response_template=REASONING_CONTENT_TOOL_TEMPLATE,
+            response_template=template,
             prefix="<assistant>",
         ).detect_and_parse('<call:get_weather>{"location": "Paris"}</call>', [_tool()])
 
