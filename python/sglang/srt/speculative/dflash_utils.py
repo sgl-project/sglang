@@ -361,10 +361,18 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
 _SWA_SUB_POOL_DRAFT_BACKENDS = frozenset(
     {"fa3", "fa4", "flashinfer", "triton", "trtllm_mha"}
 )
+# Draft KV dtypes the plain MHA SWA sub-pool stores. mxfp8 needs the block-scaled
+# pool class and FP4 a quant method, which the draft's SWA sub-pool builds neither of.
+_SWA_SUB_POOL_DRAFT_KV_DTYPES = frozenset(
+    {"auto", "bf16", "bfloat16", "fp8_e4m3", "fp8_e5m2"}
+)
 
 
 def dflash_draft_kv_fits_swa(
-    *, draft_hf_config: Any, target_window: Optional[int]
+    *,
+    draft_hf_config: Any,
+    target_window: Optional[int],
+    draft_kv_cache_dtype: str,
 ) -> bool:
     """Every draft layer slides within the target's SWA window."""
     from sglang.srt.platforms import current_platform
@@ -378,6 +386,7 @@ def dflash_draft_kv_fits_swa(
         or get_disagg().disaggregation_mode != "null"
         or not current_platform.is_cuda()
         or spec.speculative_draft_attention_backend not in _SWA_SUB_POOL_DRAFT_BACKENDS
+        or draft_kv_cache_dtype not in _SWA_SUB_POOL_DRAFT_KV_DTYPES
     ):
         return False
     layer_types = get_dflash_layer_types(draft_hf_config)

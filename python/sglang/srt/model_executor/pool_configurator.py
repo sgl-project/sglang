@@ -221,10 +221,25 @@ def _dflash_draft_kv_in_target_swa(
         or kvc.dflash_draft_loc_space_scale != 1
     ):
         return False
+    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
     from sglang.srt.speculative.dflash_utils import dflash_draft_kv_fits_swa
 
+    # The label the draft runner will resolve for its own pool.
+    draft_kv_cache_dtype, _ = configure_kv_cache_dtype(
+        server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+        speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+        quant_config=None,
+        model_dtype=draft_model_config.dtype,
+        is_draft_worker=True,
+        is_dflash=True,
+        speculative_draft_attention_backend=(
+            get_spec().speculative_draft_attention_backend
+        ),
+    )
     return dflash_draft_kv_fits_swa(
-        draft_hf_config=draft_model_config.hf_config, target_window=target_window
+        draft_hf_config=draft_model_config.hf_config,
+        target_window=target_window,
+        draft_kv_cache_dtype=draft_kv_cache_dtype,
     )
 
 

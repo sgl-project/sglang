@@ -32,6 +32,7 @@ class TestDflashDraftKvFitsSwa(CustomTestCase):
         disagg="null",
         cuda=True,
         backend="fa4",
+        kv_dtype="auto",
     ):
         with (
             patch(
@@ -51,7 +52,9 @@ class TestDflashDraftKvFitsSwa(CustomTestCase):
             ),
         ):
             return dflash_draft_kv_fits_swa(
-                draft_hf_config=draft, target_window=target_window
+                draft_hf_config=draft,
+                target_window=target_window,
+                draft_kv_cache_dtype=kv_dtype,
             )
 
     def test_all_sliding_draft_within_the_target_window(self):
@@ -85,6 +88,14 @@ class TestDflashDraftKvFitsSwa(CustomTestCase):
         self.assertFalse(self.fits(sliding, 2047, cuda=False, backend="triton"))
         self.assertFalse(self.fits(sliding, 2047, backend="torch_native"))
         self.assertFalse(self.fits(sliding, 2047, backend=None))
+
+    def test_only_kv_dtypes_the_plain_swa_sub_pool_stores_qualify(self):
+        """The draft's SWA sub-pool is a plain MHA pool: an mxfp8 or FP4 draft KV
+        would lose its scale buffers / quant method there."""
+        sliding = _draft(["sliding_attention"] * 2, 1024)
+        self.assertTrue(self.fits(sliding, 2047, kv_dtype="fp8_e4m3"))
+        for kv_dtype in ("mxfp8", "nvfp4", "fp4_mx_block16"):
+            self.assertFalse(self.fits(sliding, 2047, kv_dtype=kv_dtype), kv_dtype)
 
 
 if __name__ == "__main__":
