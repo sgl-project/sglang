@@ -296,6 +296,23 @@ class TestPostVerifyGraphs(CustomTestCase):
                 want,
             )
 
+    def test_allocator_settings_that_do_not_split_the_presize_skip_it(self):
+        """Expandable segments already keep the pool small, and under max_split_size_mb
+        the presized block would never be split: both keep main's pool."""
+        graphs = _worker(switch=True)._post_verify_graphs
+        for settings in ("expandable_segments:True", "max_split_size_mb:512"):
+            with (
+                patch.object(
+                    torch._C,
+                    "_accelerator_getAllocatorSettings",
+                    return_value=settings,
+                    create=True,
+                ),
+                patch.object(torch.cuda, "mem_get_info") as mem_get_info,
+            ):
+                self.assertEqual(graphs._pool_presize_bytes(SimpleNamespace()), 0)
+            mem_get_info.assert_not_called()
+
     def test_pool_presize_runs_once_inside_the_first_sampled_capture(self):
         events = []
         graphs = eagle_post_verify_graphs._PostVerifyGraphs(

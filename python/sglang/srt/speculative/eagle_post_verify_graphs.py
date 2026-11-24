@@ -151,6 +151,12 @@ class EaglePostVerifyGraphs:
         self._graphs.join()
 
     def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
+        settings = torch._C._accelerator_getAllocatorSettings()
+        if "expandable_segments:True" in settings or "max_split_size_mb" in settings:
+            # expandable segments already keep the pool from growing per key; under
+            # max_split_size_mb the presized block is oversize and never split
+            logger.info("The post-verify graph pool is not presized under %s", settings)
+            return 0
         torch.cuda.empty_cache()  # so the free reading counts cached blocks
         graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
         return pool_presize_bytes(
