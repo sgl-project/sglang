@@ -102,7 +102,6 @@ def _receiver() -> SchedulerRequestReceiver:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
         request_retirer=None,
