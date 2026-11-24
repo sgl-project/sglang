@@ -22,10 +22,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=196, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: the llama3 and pythonic parsers run on real decoded text,
 # so ROCm decode divergence surfaces as tool calls that no longer parse.
-register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=73, suite="base-b-test-1-gpu-small-amd")
 # Backend-specific: Ascend uses a local model mirror and its native
 # attention backend, while sharing the protocol assertions below.
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 
 def _model_path():
@@ -41,7 +41,12 @@ def _model_path():
 def _server_args(parser):
     args = ["--tool-call-parser", parser]
     if is_npu():
-        args[:0] = ["--attention-backend", "ascend", "--disable-cuda-graph"]
+        args[:0] = [
+            "--attention-backend",
+            "ascend",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
+        ]
     return args
 
 
@@ -1009,7 +1014,7 @@ class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCallin
 #             other_args=[
 #                 # If your server needs extra parameters to test function calling, please add them here.
 #                 "--tool-call-parser",
-#                 "glm45",
+#                 "glm",
 #                 "--reasoning-parser",
 #                 "glm45",
 #                 "--tp-size",

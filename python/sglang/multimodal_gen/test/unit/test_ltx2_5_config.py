@@ -182,6 +182,18 @@ class TestLTX25VocoderConfig(unittest.TestCase):
         cls, _ = ModelRegistry.resolve_model_cls("LTX2VocoderWithBWE")
         self.assertEqual(cls.__name__, "LTX2Vocoder")
 
+    def test_mismatched_resnet_lists_are_rejected_with_both_lengths(self):
+        """A non-BWE config whose resnet kernel sizes and dilations differ in
+        length is rejected with the ValueError that names both lengths."""
+        from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import (
+            LTX2Vocoder,
+        )
+
+        config = LTXVocoderConfig()
+        config.arch_config.resnet_dilations = [[1, 3, 5], [1, 3, 5]]
+        with self.assertRaisesRegex(ValueError, "length 3 and 2, respectively"):
+            LTX2Vocoder(config)
+
 
 class TestLTX25PipelineConfig(unittest.TestCase):
     def test_pins_the_distilled_sigma_schedule(self):

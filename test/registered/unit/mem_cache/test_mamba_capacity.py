@@ -69,6 +69,7 @@ def make_cache(pool, held, release):
 
     return SimpleNamespace(
         supports_mamba=lambda: True,
+        request_mamba_only=False,
         evict_for_alloc=MagicMock(side_effect=evict),
     )
 

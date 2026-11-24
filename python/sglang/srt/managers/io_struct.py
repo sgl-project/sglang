@@ -286,6 +286,8 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Like token_ids_logprob, but one list of token ids per scored input position.
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
@@ -303,6 +305,12 @@ class GenerateReqInput:
     return_flat_raw_output_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
+    # Return output sampling masks as flat arrays plus row lengths instead of the
+    # nested per-token lists, on the finished response only. Requires
+    # return_sampling_mask.
+    return_flat_raw_sampling_mask: bool = False
+    # Base64-encode those arrays. Requires return_flat_raw_sampling_mask.
+    return_flat_raw_sampling_mask_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -417,8 +425,9 @@ class GenerateReqInput:
 
     # Versioned KV-hint envelope, set by a trusted orchestrator after worker
     # selection and never by an application client. Passed through untouched to
-    # the HiCache storage backends, each of which reads only the action types it
-    # implements. Accepts a plain dict from HTTP/gRPC; normalization converts it
+    # HiCache storage backends that opt in via HiCacheStorage.consumes_kv_hints(),
+    # each of which reads only the action types it implements. Other backends
+    # never see it. Accepts a plain dict from HTTP/gRPC; normalization converts it
     # to KvHintsEnvelope. A hint describes one request's prefix, so a batch
     # carries one envelope per request.
     kv_hints: Optional[
@@ -524,6 +533,18 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
                 "or return_flat_raw_output_top_logprobs."
+            )
+        if self.return_flat_raw_sampling_mask and self.stream:
+            raise ValueError(
+                "return_flat_raw_sampling_mask is only set on the finished response "
+                "and does not support stream=True."
+            )
+        if (
+            self.return_flat_raw_sampling_mask_b64
+            and not self.return_flat_raw_sampling_mask
+        ):
+            raise ValueError(
+                "return_flat_raw_sampling_mask_b64 requires return_flat_raw_sampling_mask."
             )
 
     def _determine_batch_size(self):
@@ -655,6 +676,10 @@ class GenerateReqInput:
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
+        if self.token_ids_logprob_rows is not None:
+            raise ValueError(
+                "token_ids_logprob_rows scores one input_ids sequence per request."
+            )
         # Calculate expanded batch size
         if self.parallel_sample_num == 1:
             num = self.batch_size
@@ -1104,6 +1129,8 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+            return_flat_raw_sampling_mask=self.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=self.return_flat_raw_sampling_mask_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -1295,6 +1322,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
+    # See GenerateReqInput.token_ids_logprob_rows.
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
+    # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
+    filler_seed: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -1730,8 +1761,9 @@ OutputHiddenStates = Optional[
     List[Optional[List[Optional[Union[float, HiddenStateChunk]]]]]
 ]
 CachedTokensDetails = Dict[str, Union[int, str]]
-# Serialized form of BaseFinishReason.to_json() — all values are primitives.
-FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
+# Serialized form of BaseFinishReason.to_json() — all values are primitives,
+# except a length finish's ignored_stop object.
+FinishReasonDict = Dict[str, Optional[Union[str, int, List[int], Dict[str, int]]]]
 
 
 class RequestOutputStats(
@@ -1896,6 +1928,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    # float32 [rows, k] weights of the prompt top logprob candidates of
+    # requests with an input candidate selector: one row per non-null entry.
+    # None when no request in the batch has a selector.
+    input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
 
 class DetokenizeReleaseReq(BaseReq, kw_only=True):
@@ -1981,6 +2017,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:
@@ -2468,8 +2505,8 @@ class ChecksumInfo(msgspec.Struct, kw_only=True):
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    # One ChecksumInfo per TP rank. The producer wraps the tp==1 result in a
-    # one-element list so the shape is always a list.
+    # One ChecksumInfo per rank that ran the request in the same step: the TP
+    # group, or the DP shard under local control broadcast. Always a list.
     payload: Optional[List[ChecksumInfo]] = None
 
 
@@ -2633,6 +2670,15 @@ class FreezeGCReq(BaseReq, kw_only=True):
     gc_threshold: Optional[List[int]] = None
 
 
+class ControlAckOutput(BaseReq, kw_only=True):
+    """The reply for a control request whose handler returns nothing
+    (pause/continue generation, freeze_gc, configure_logging, close_session).
+    Sent only to the Rust frontend, which waits for one reply per control
+    request; the Python TokenizerManager fire-and-forgets these."""
+
+    success: bool = True
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
@@ -2715,7 +2761,7 @@ class ParseFunctionCallReq(BaseReq, kw_only=True):
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # Specify the parser type, e.g. 'llama3', 'qwen', or 'mistral'. If not specified, tries all.
     )
 
 

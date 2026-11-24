@@ -65,9 +65,6 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
     batch.enable_overlap = True
     batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-    batch.sampling_info = SimpleNamespace(
-        penalizer_orchestrator=SimpleNamespace(is_required=False)
-    )
     batch.hisparse_coordinator = None
     batch.seq_lens = torch.tensor([2], dtype=torch.int64)
     batch.seq_lens_cpu = torch.tensor([2], dtype=torch.int64)
