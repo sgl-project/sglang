@@ -16,7 +16,7 @@ from sglang.srt.models.kimi_k3 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 _H = 7168
 _QKVG = 6144  # q,k,v,g slices per rank at TP8
@@ -42,6 +42,7 @@ def _make_owner(with_stream: bool):
 
     owner = SimpleNamespace(
         use_full_rank_gate=True,
+        _qkvg_gate_float_shard=False,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
         _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,
@@ -50,6 +51,7 @@ def _make_owner(with_stream: bool):
         split_sizes=[3 * 1536, 1536],
         _bfa_alt_stream=torch.cuda.Stream() if with_stream else None,
         _bfa_bs_limit=128 if with_stream else 0,
+        _bfa_side_tgv_m_ranges=None,
     )
     return owner
 
@@ -94,6 +96,54 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                                 captured, serial, ("qkv", "beta", "forget_gate", "g")
                             ):
                                 self.assertTrue(torch.equal(got, ref), name)
+
+    def test_side_bfa_tgv_capture_matches_eager_tgv(self):
+        """Graph replay of the side-stream TGV [f_a | b] matches the eager kernel."""
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("TGV needs SM10x")
+        from sglang.kernels.ops.gemm import cutedsl_bf16_gemm as cg
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+        from sglang.srt.models import kimi_k3
+
+        forward = KimiK3DeltaAttention.forward_qkvbfg_fused
+        ranges = cg.TGVMRanges()
+        for m_lo, m_hi, tactic in kimi_k3._K3_GB300_BFA_SIDE_TGV_M_RANGES[
+            (_BFA_W_ROWS, _H)
+        ]:
+            ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+        for T, tactic in ((72, 21), (144, 23), (264, 24)):
+            with (
+                self.subTest(T=T),
+                patch(
+                    "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                    return_value=True,
+                ),
+            ):
+                x = torch.empty(T, _H, device="cuda", dtype=torch.bfloat16)
+                x.normal_(std=0.05)
+                owner = _make_owner(with_stream=True)
+                owner._bfa_bs_limit = 288
+                owner._bfa_side_tgv_m_ranges = ranges
+                forward(owner, x)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = forward(owner, x)
+                for _ in range(2):
+                    x.normal_(std=0.05)
+                    bfa = cg.cutedsl_bf16_gemm(x, owner._bfa_w, tactic=tactic)
+                    beta = bfa[:, _N_FA : _N_FA + _N_B]
+                    forget = kimi_k3_tiny_gemm(bfa[:, :_N_FA], owner._bfa_f_b_w)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(captured[1], beta))
+                    self.assertTrue(torch.equal(captured[2], forget))
+                    ref = torch.nn.functional.linear(x, owner._bfa_w)
+                    torch.testing.assert_close(
+                        captured[1],
+                        ref[:, _N_FA : _N_FA + _N_B],
+                        rtol=2e-2,
+                        atol=2e-3,
+                    )
 
     def test_eager_stream_branch_not_taken(self):
         x = torch.randn(3, _H, device="cuda", dtype=torch.bfloat16)
@@ -213,8 +263,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
     def test_bfa_weight_reload_preserves_buffers(self):
         """Rebuilding dense or dequantized BFA weights must not strand a graph."""
-        for block_fp8 in (False, True):
-            with self.subTest(block_fp8=block_fp8):
+        for block_fp8, mxfp8 in ((False, False), (True, False), (False, True)):
+            with self.subTest(block_fp8=block_fp8, mxfp8=mxfp8):
 
                 def module(rows):
                     return SimpleNamespace(
@@ -224,6 +274,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                 owner = SimpleNamespace(
                     use_full_rank_gate=True,
                     _bfa_uses_block_fp8=block_fp8,
+                    _bfa_uses_mxfp8=mxfp8,
                     f_a_proj=module(4),
                     b_proj=module(2),
                     f_b_proj=module(8),
@@ -260,6 +311,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         owner = SimpleNamespace(
             _may_fuse_kda_inproj=lambda: True,
+            _kda_dwdp=None,
             _qkvgbfa_layer=None,
             fused_qkvg_proj=module(8),
             f_a_proj=module(4),
@@ -340,7 +392,10 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         owner = SimpleNamespace(
             config=SimpleNamespace(full_attention_layer_ids=[]),
             model=SimpleNamespace(
-                layers=[], output_attn_res_proj=proj, output_attn_res_norm=norm
+                layers=[],
+                output_attn_res_proj=proj,
+                output_attn_res_norm=norm,
+                kda_dwdp=None,
             ),
         )
 
@@ -378,7 +433,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             model=SimpleNamespace(
                 layers=[
                     SimpleNamespace(self_attn=attn, use_attn_residuals=False, mlp=None)
-                ]
+                ],
+                kda_dwdp=None,
             ),
         )
         post_load = KimiK3LinearForCausalLM.post_load_weights
@@ -438,6 +494,34 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         torch.testing.assert_close(
             weight[[0, 0, 128, 128], [0, 128, 0, 128]].float(),
             torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda"),
+        )
+
+    def test_mxfp8_weight_is_dequantized_for_tiny_gemm(self):
+        """MXFP8 scale bytes are UE8M0 exponents, not multipliers; the dense
+        tiny-GEMM weight must apply 2**(byte - 127) per row and 32-wide group."""
+        # Two rows x two 32-wide groups; UE8M0 exponents 127 / 128 / 129 / 126
+        # are scales 1 / 2 / 4 / 0.5.
+        module = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.ones((2, 64), device="cuda", dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.tensor(
+                    [[127, 128], [129, 126]], device="cuda", dtype=torch.uint8
+                ),
+                requires_grad=False,
+            ),
+            quant_method=SimpleNamespace(weight_block_size=[1, 32]),
+            params_dtype=torch.bfloat16,
+        )
+
+        weight = _get_k3_dense_weight(module)
+
+        self.assertEqual(weight.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            weight[[0, 0, 1, 1], [0, 32, 31, 63]].float(),
+            torch.tensor([1.0, 2.0, 4.0, 0.5], device="cuda"),
         )
 
     def test_per_tensor_fp8_weight_is_not_block_dequantized(self):

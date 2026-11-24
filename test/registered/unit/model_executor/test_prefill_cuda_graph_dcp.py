@@ -2,8 +2,8 @@
 
 Replay re-runs the break functions with their capture-time arguments, so the
 DCP extend gather must take the live batch from the forward context, and the
-runner must hand every replayed batch the bucket-sized gather buffer it
-captured. Prefix hits need the cross-rank all-gather and stay eager.
+runner must hand every replayed batch a gather buffer planned for that batch,
+so prefix hits replay too.
 
     python -m pytest test/registered/unit/model_executor/test_prefill_cuda_graph_dcp.py -v
 """
@@ -77,30 +77,24 @@ def _runner(dcp_active):
     runner._capture_chunked_prefix = False
     runner.use_captured_attn_metadata = False
     runner._dcp_extend_active = dcp_active
-    runner._dcp_kv_buffers = {}
     return runner
 
 
 class TestDcpAdmission(unittest.TestCase):
-    def test_prefix_hits_stay_eager_under_dcp(self):
-        fresh = _batch(8, [0])
-        prefix_hit = _batch(8, [4])
-        self.assertTrue(_runner(dcp_active=False).can_run_graph(prefix_hit))
+    def test_prefix_hits_replay_under_dcp(self):
         runner = _runner(dcp_active=True)
-        self.assertTrue(runner.can_run_graph(fresh))
-        self.assertFalse(runner.can_run_graph(prefix_hit))
+        self.assertTrue(runner.can_run_graph(_batch(8, [0])))
+        self.assertTrue(runner.can_run_graph(_batch(8, [4])))
 
 
 class TestDcpReplayMetadata(unittest.TestCase):
-    def test_replay_reuses_the_captured_gather_buffer(self):
+    def test_replay_uses_the_live_plan(self):
         runner = _runner(dcp_active=True)
-        captured = torch.full((8, 1, KV_LORA_RANK + ROPE_DIM), 7.0)
-        runner._dcp_kv_buffers[ShapeKey(size=8)] = captured
         planned = []
 
         def plan(*args):
-            planned.append(args)
-            return _metadata(num_tokens=5)
+            planned.append(_metadata(num_tokens=5))
+            return planned[-1]
 
         attn_backend = SimpleNamespace(
             skips_prefill_metadata_on_idle_dp_rank=False,
@@ -123,9 +117,7 @@ class TestDcpReplayMetadata(unittest.TestCase):
 
         self.assertEqual(len(planned), 1)
         self.assertIs(static.attn_dcp_metadata, live.attn_dcp_metadata)
-        # Live indices, captured (bucket-sized) buffer.
-        self.assertIs(static.attn_dcp_metadata.dcp_kv_buffer, captured)
-        self.assertEqual(static.attn_dcp_metadata.dcp_kv_indices.numel(), 5)
+        self.assertIs(static.attn_dcp_metadata, planned[0])
 
 
 class TestDcpExtendGatherBreak(unittest.TestCase):
@@ -136,8 +128,8 @@ class TestDcpExtendGatherBreak(unittest.TestCase):
 
         capture_batch = _batch(8, [0])
         capture_batch.attn_dcp_metadata = _metadata(8)
-        live_batch = _batch(8, [0])
-        live_batch.attn_dcp_metadata = _metadata(8)
+        live_batch = _batch(5, [0])
+        live_batch.attn_dcp_metadata = _metadata(5)
         k_nope = torch.ones((8, 1, KV_LORA_RANK))
         k_pe = torch.full((8, 1, ROPE_DIM), 2.0)
         with set_forward_batch(live_batch), prefill_graph_scope(full_graph=False):

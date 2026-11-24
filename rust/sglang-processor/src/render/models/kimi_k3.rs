@@ -95,20 +95,6 @@ pub(crate) fn render(
     if thinking && !supported(&thinking_effort) {
         return Err(format!("unsupported thinking_effort {thinking_effort}").into());
     }
-    // Dynamo drops whitespace-only reasoning, which SGLang renders.
-    if thinking
-        && messages.iter().any(|m| {
-            m["role"] == "assistant"
-                && m["reasoning_content"]
-                    .as_str()
-                    .is_some_and(|r| !r.is_empty() && r.trim().is_empty())
-        })
-    {
-        return Err(RenderError::Declined(
-            "whitespace-only Kimi K3 reasoning".into(),
-        ));
-    }
-
     let tools = match request["tools"].as_array() {
         Some(tools) if !tools.is_empty() => {
             Some(tools.iter().map(tool_dump).collect::<Result<Value, _>>()?)

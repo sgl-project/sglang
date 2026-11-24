@@ -32,6 +32,8 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
+    StartProfileReq,
+    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
@@ -63,6 +65,10 @@ from sglang.multimodal_gen.runtime.managers.request_cancel import (
     poll_cancellations,
 )
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    init_execution_reporter,
+    install_stack_dump_handler,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -177,8 +183,18 @@ class Scheduler(
                 init_progress_reporter(
                     context=self.context, endpoint=server_args.progress_endpoint
                 )
+            reporter = init_execution_reporter(
+                self.context, server_args, self.dp_replica
+            )
+            if reporter is not None:
+                self._dispatch_items = reporter.watch_dispatch(self._dispatch_items)
+                # grouped requests may execute lazily while the results are returned
+                self._return_results_sequentially = reporter.watch_dispatch(
+                    self._return_results_sequentially
+                )
         else:
             self.receiver = None
+        install_stack_dump_handler(server_args)
         if server_args.cancel_endpoint is not None:
             # every rank takes part in each stop decision; only the driver
             # receives the cancelled request ids
@@ -205,6 +221,8 @@ class Scheduler(
             SetLoraReq: self._handle_set_lora,
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
+            StartProfileReq: self._handle_start_profile,
+            StopProfileReq: self._handle_stop_profile,
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
@@ -306,6 +324,20 @@ class Scheduler(
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_start_profile(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.start_profile(
+            output_dir=req.output_dir,
+            profile_id=req.profile_id,
+            activities=req.activities,
+            with_stack=req.with_stack,
+            record_shapes=req.record_shapes,
+        )
+
+    def _handle_stop_profile(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.stop_profile(export_trace=req.export_trace)
 
     def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
@@ -1448,7 +1480,7 @@ class Scheduler(
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using
-        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        broadcast_pyobj. ``comfyui_mode`` multi-rank instead keeps CUDA
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
