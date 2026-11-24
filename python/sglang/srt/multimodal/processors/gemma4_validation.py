@@ -1,6 +1,6 @@
 """Validate Gemma 4 vision input metadata before entering model collectives."""
 
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
@@ -21,6 +21,16 @@ def _feature_shape(feature) -> tuple[int, ...]:
     raise ValueError("Gemma 4 vision inputs must be tensor features")
 
 
+def _as_batched(shape: tuple[int, ...]) -> tuple[int, ...]:
+    # Same reshape as the encoders: 2-D gains a batch of 1, and 4-D
+    # (videos, frames, patches, ...) folds into (frames, patches, ...).
+    if len(shape) == 2:
+        return (1, *shape)
+    if len(shape) == 4:
+        return (shape[0] * shape[1], *shape[2:])
+    return shape
+
+
 def validate_gemma4_vision_inputs(
     mm_inputs: Union[MultimodalInputs, MultimodalProcessorOutput],
     *,
@@ -28,11 +38,14 @@ def validate_gemma4_vision_inputs(
     hidden_size: int,
     image_dims: tuple[int, ...],
     video_dims: tuple[int, ...],
+    pooling_kernel_size: Optional[int] = None,
 ) -> None:
     """Reject malformed pixels/positions using shapes only, never tensor values.
 
     `image_dims`/`video_dims` are the pixel and position ranks the model's
-    encoder accepts. Full embeddings and featureless PP/cache metadata pass.
+    encoder accepts. `pooling_kernel_size` is set when the encoder pools
+    k x k patches into one token. Full embeddings and featureless PP/cache
+    metadata pass.
     """
     for item in mm_inputs.mm_items:
         if not (item.is_image() or item.is_video()) or item.feature is None:
@@ -56,17 +69,13 @@ def validate_gemma4_vision_inputs(
                 raise ValueError(
                     f"Gemma 4 {position_key} shape {pos_shape} has the wrong rank"
                 )
-            # The encoders collapse (videos, frames, patches, pixels).
-            if len(shape) == 4:
-                shape = (shape[0] * shape[1], *shape[2:])
-            if len(pos_shape) == 4:
-                pos_shape = (pos_shape[0] * pos_shape[1], *pos_shape[2:])
-            batch_size = shape[0] if len(shape) == 3 else 1
-            if (
-                pos_shape[-1] != 2
-                or pos_shape[-2] != shape[-2]
-                or (len(pos_shape) == 3 and pos_shape[0] not in (1, batch_size))
-            ):
+            shape, pos_shape = _as_batched(shape), _as_batched(pos_shape)
+            if pos_shape != (*shape[:2], 2):
                 raise ValueError(
                     f"Gemma 4 {position_key} shape {pos_shape} does not match pixels {shape}"
+                )
+            if pooling_kernel_size is not None and shape[1] % pooling_kernel_size**2:
+                raise ValueError(
+                    f"Gemma 4 pixels have {shape[1]} patches, not a multiple of "
+                    f"the {pooling_kernel_size}x{pooling_kernel_size} pooling kernel"
                 )

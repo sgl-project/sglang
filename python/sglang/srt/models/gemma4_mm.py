@@ -179,6 +179,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             hidden_size=hf_config.text_config.hidden_size,
             image_dims=(2, 3),
             video_dims=(3, 4),
+            pooling_kernel_size=hf_config.vision_config.pooling_kernel_size,
         )
 
     def __init__(

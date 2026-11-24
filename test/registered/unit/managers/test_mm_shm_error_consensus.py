@@ -215,7 +215,9 @@ def _gemma4_receiver(*, unified=False):
         else Gemma4ForConditionalGeneration
     )
     hf_config = SimpleNamespace(
-        vision_config=SimpleNamespace(patch_size=16, model_patch_size=48),
+        vision_config=SimpleNamespace(
+            patch_size=16, model_patch_size=48, pooling_kernel_size=2
+        ),
         text_config=SimpleNamespace(hidden_size=4096),
     )
     return _receiver(model_cls.build_mm_input_validator(hf_config))
@@ -276,6 +278,43 @@ class TestGemma4InputFailureConsensus(CustomTestCase):
                     bad = _vision_request(video=video)
                     key = "video_position_ids" if video else "image_position_ids"
                     bad.mm_inputs.mm_items[0].set(key, positions)
+                    self._finalize([bad])
+                    self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+
+    def test_positions_must_cover_every_image_in_the_batch(self):
+        """Both encoders index positions per image; batch-1 positions crash them."""
+        for positions in (torch.zeros(1, 4, 2), torch.zeros(4, 2)):
+            for unified in (False, True):
+                with self.subTest(positions=tuple(positions.shape), unified=unified):
+                    width = 6912 if unified else 768
+                    bad = _vision_request(width)
+                    bad.mm_inputs.mm_items[0].feature = torch.zeros(2, 4, width)
+                    bad.mm_inputs.mm_items[0].set("image_position_ids", positions)
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                        return_value=SimpleNamespace(attn_dp_enabled=False, tp_size=1),
+                    ):
+                        _gemma4_receiver(unified=unified)._finalize_shm_features([bad])
+                    self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+
+    def test_patch_count_must_fill_the_pooling_kernel(self):
+        """The Gemma 4 pooler raises unless patches are a multiple of k**2."""
+        from sglang.srt.models.gemma4_vision import Gemma4VisionPooler
+
+        pooler = Gemma4VisionPooler(SimpleNamespace(hidden_size=8))
+        for patches in (2, 6):
+            with self.assertRaises((ValueError, ZeroDivisionError)):
+                pooler._avg_pool_by_positions(
+                    torch.zeros(1, patches, 8),
+                    torch.zeros(1, patches, 2),
+                    length=patches // 4,
+                )
+            for video in (False, True):
+                with self.subTest(patches=patches, video=video):
+                    bad = _vision_request(video=video)
+                    key = "video_position_ids" if video else "image_position_ids"
+                    bad.mm_inputs.mm_items[0].feature = torch.zeros(1, patches, 768)
+                    bad.mm_inputs.mm_items[0].set(key, torch.zeros(1, patches, 2))
                     self._finalize([bad])
                     self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
 
