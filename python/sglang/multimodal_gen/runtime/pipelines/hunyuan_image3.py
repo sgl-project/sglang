@@ -25,9 +25,6 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    get_global_component_residency_manager,
-)
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
     HunyuanImage3ForCausalMM,
     LightProjector,
@@ -111,8 +108,10 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         pipeline_config.vae_config.update_model_arch(vae_config_dict)
         pipeline_config.vae_config.post_init()
 
-        flow_shift = self._read_flow_shift(model_path)
-        pipeline_config.flow_shift = flow_shift
+        # an explicit --flow-shift outranks the checkpoint's generation default
+        if pipeline_config.flow_shift is None:
+            pipeline_config.flow_shift = self._read_flow_shift(model_path)
+        flow_shift = pipeline_config.flow_shift
 
         ar_model = self._load_ar_model(
             server_args, pipeline_config, model_path, config_dict
@@ -395,14 +394,6 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "decoding_stage",
         )
-
-    def forward_batch(self, batches, server_args: ServerArgs):
-        if len(batches) > 1 and self.executor.component_residency_manager is None:
-            self.component_residency_manager = get_global_component_residency_manager(
-                self, server_args
-            )
-            self.executor.component_residency_manager = self.component_residency_manager
-        return super().forward_batch(batches, server_args)
 
 
 EntryClass = [HunyuanImage3Pipeline]

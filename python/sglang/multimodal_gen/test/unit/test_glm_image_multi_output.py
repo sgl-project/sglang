@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
@@ -183,6 +184,65 @@ def test_npu_transformer_fallback_runs_each_batch_item_independently():
 
     assert output.shape == (2, 1, 2, 2)
     assert output[:, 0, 0, 0].tolist() == [3.0, 9.0]
+
+
+class _GlmAttentionProjection(torch.nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states.clone(), None
+
+
+class _GlmAttentionCapture(torch.nn.Module):
+    def forward(self, query, key, value, **kwargs):
+        self.query, self.key = query.clone(), key.clone()
+        return value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA RoPE")
+@torch.inference_mode()
+def test_glm_attention_accepts_inplace_rope_views():
+    """CUDA RoPE views must preserve the text prefix without overlapping writes."""
+    attention = glm_model.GlmImageAttention.__new__(glm_model.GlmImageAttention)
+    torch.nn.Module.__init__(attention)
+    attention.num_local_heads = attention.num_local_kv_heads = 2
+    attention.to_q = _GlmAttentionProjection()
+    attention.to_k = _GlmAttentionProjection()
+    attention.to_v = _GlmAttentionProjection()
+    attention.to_out = torch.nn.ModuleList([_GlmAttentionProjection()])
+    attention.norm_q = attention.norm_k = None
+    attention.rotary_emb = glm_model.RotaryEmbedding(
+        head_size=64, rotary_dim=64, use_precomputed_cache=False, is_neox_style=True
+    )
+    attention.attn = _GlmAttentionCapture()
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    image = torch.randn(
+        1, 5, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    text = torch.randn(
+        1, 3, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    angles = torch.linspace(0, 1, 160, device="cuda").reshape(5, 32)
+    expected = torch.cat([text, image], dim=1).unflatten(2, (2, 64))
+    q_image, k_image = attention.rotary_emb.forward_native(
+        query=expected[:, 3:].clone(),
+        key=expected[:, 3:].clone(),
+        cos=angles.cos(),
+        sin=angles.sin(),
+    )
+
+    attention(image, text, image_rotary_emb=(angles.cos(), angles.sin()))
+
+    torch.testing.assert_close(
+        attention.attn.query[:, :3], expected[:, :3], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        attention.attn.key[:, :3], expected[:, :3], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        attention.attn.query[:, 3:], q_image, rtol=0.016, atol=0.002
+    )
+    torch.testing.assert_close(
+        attention.attn.key[:, 3:], k_image, rtol=0.016, atol=0.002
+    )
 
 
 def _tiny_glm_dit():

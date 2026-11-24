@@ -169,12 +169,12 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
 
     def test_support_triton_is_the_regression_being_guarded(self):
         from sglang.srt.platforms.interface import PlatformCapabilities
-        from sglang.srt.utils.common import support_triton
+        from sglang.srt.utils.triton_utils import support_triton
 
         # This is why a base-only read is not merely imprecise: the unset field
         # reads as "supported".
         with mock.patch(
-            "sglang.srt.utils.common.current_platform",
+            "sglang.srt.utils.triton_utils.current_platform",
             SimpleNamespace(capabilities=PlatformCapabilities(supports_triton=True)),
         ):
             self.assertTrue(support_triton(None))
@@ -265,18 +265,17 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(product.decode_attention_backend_str, "trtllm_mla")
 
     def test_a_host_dependent_alias_stamps_the_concrete_kernel(self):
-        # `hybrid_linear_attn` picks fa3/intel_amx/triton by host inside its
-        # constructor, so no static rename can say what it builds -- the
-        # constructor's own answer is the stamp. A stamp that repeats the
-        # alias crashes Inkling's per-forward kwargs assembly, which asserts
-        # the name is a concrete kernel.
+        # A backend constructor that picks its kernel by host cannot be renamed
+        # statically -- the constructor's own answer is the stamp. A stamp that
+        # repeats the alias crashes Inkling's per-forward kwargs assembly, which
+        # asserts the name is a concrete kernel.
         from types import SimpleNamespace
 
-        self._publish(attention_backend="hybrid_linear_attn")
+        self._publish(attention_backend="host_dependent_alias")
         concrete = SimpleNamespace(attn_backends=[SimpleNamespace()])
         product = self._factory()._create_backend(
             "decode_attention_backend",
-            {"hybrid_linear_attn": lambda: ("triton", concrete)},
+            {"host_dependent_alias": lambda: ("triton", concrete)},
             "unsupported {backend_type}",
             stamps_children=True,
         )

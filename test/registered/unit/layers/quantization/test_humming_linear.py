@@ -160,7 +160,6 @@ class TestHummingLinear(CustomTestCase):
                 layer._expert_storage_rank = 0
                 layer._num_local_routed = 2
                 layer.use_flashinfer_trtllm_moe = False
-                layer.use_triton_kernels = False
                 layer.use_presharded_weights = False
                 layer.moe_tp_size = 1
                 layer.moe_tp_rank = 0

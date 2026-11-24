@@ -33,7 +33,7 @@ def _config(*, num_nextn_predict_layers, num_hidden_layers=1):
         num_hidden_layers=num_hidden_layers,
         num_attention_layers=num_hidden_layers,
         is_hybrid_swa=False,
-        is_deepseek_v4_arch=False,
+        is_compressed_kv_arch=False,
     )
 
 
