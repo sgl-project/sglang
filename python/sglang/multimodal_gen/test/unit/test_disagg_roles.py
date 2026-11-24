@@ -351,6 +351,7 @@ class TestPipelineStageRoleFilter(unittest.TestCase):
             "org/repo",
             force_diffusers_model=True,
             revision="a" * 40,
+            extra_ignore_patterns=(),
         )
 
     def test_stage_factory_skips_without_constructing_for_other_role(self):

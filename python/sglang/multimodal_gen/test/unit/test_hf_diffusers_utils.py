@@ -1,3 +1,4 @@
+import fnmatch
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -434,6 +435,51 @@ def test_pipeline_load_repairs_only_its_requested_cached_subfolder(
     # modular indexes use local components; standard indexes can reference a repo
     assert (selected / "text_encoder").exists() == (not external_text_encoder)
     assert not (tmp_path / "transformer").exists()
+
+
+def test_pipeline_skips_hub_files_it_never_loads(monkeypatch, tmp_path):
+    """H3-Image's repository also holds Diffusers-layout copies of its weights."""
+    from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+        MiniMaxH3ImagePipeline,
+        MiniMaxH3Pipeline,
+    )
+
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            _write_model_index(tmp_path)
+            _populate_components(tmp_path, ("text_encoder", "transformer", "vae"))
+            _populate_components(tmp_path, ("scheduler", "tokenizer"), weights=False)
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", snapshot_download)
+    pipeline = SimpleNamespace(
+        model_path="org/repo",
+        default_model_subfolder=MiniMaxH3ImagePipeline.default_model_subfolder,
+        hub_ignore_patterns=MiniMaxH3ImagePipeline.hub_ignore_patterns,
+        server_args=SimpleNamespace(model_subfolder=None, revision=None),
+    )
+    ComposedPipelineBase._load_config(pipeline)
+
+    # both the cache probe and the download leave the copies out
+    assert [call.get("local_files_only", False) for call in calls] == [True, False]
+    for call in calls:
+        assert call["ignore_patterns"] == [
+            "*.onnx",
+            "*.msgpack",
+            "transformer_diffusers/*",
+            "vae_diffusers/*",
+        ]
+    # the native component folders are not matched
+    kept = ["transformer/model-00001-of-00012.safetensors", "vae/config.json"]
+    assert not any(
+        fnmatch.fnmatch(path, pattern)
+        for path in kept
+        for pattern in MiniMaxH3ImagePipeline.hub_ignore_patterns
+    )
+    assert MiniMaxH3Pipeline.hub_ignore_patterns == ()
 
 
 def test_incomplete_cached_subfolder_does_not_download_when_disabled(

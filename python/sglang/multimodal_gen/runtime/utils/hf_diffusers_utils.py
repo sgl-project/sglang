@@ -978,6 +978,7 @@ def maybe_download_model(
     revision: str | None = None,
     skip_overlay_resolution: bool = False,
     model_subfolder: str | None = None,
+    extra_ignore_patterns: tuple[str, ...] = (),
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -991,6 +992,8 @@ def maybe_download_model(
         revision: Specific Hugging Face Hub revision to resolve
         model_subfolder: Pipeline subfolder whose metadata and local component weights
             must be cached. The returned path remains the repository snapshot root.
+        extra_ignore_patterns: Repository files to skip on top of the defaults, such
+            as weights the pipeline does not load.
     Returns:
         Local path to the model
     """
@@ -1008,6 +1011,8 @@ def maybe_download_model(
         )
         if overlay_model_path is not None:
             return overlay_model_path
+
+    ignore_patterns = ["*.onnx", "*.msgpack", *extra_ignore_patterns]
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
@@ -1055,7 +1060,7 @@ def maybe_download_model(
         )
         local_path = snapshot_download(
             repo_id=model_name_or_path,
-            ignore_patterns=["*.onnx", "*.msgpack"],
+            ignore_patterns=ignore_patterns,
             allow_patterns=allow_patterns,
             local_dir=local_dir,
             local_files_only=True,
@@ -1183,7 +1188,7 @@ def maybe_download_model(
             with get_lock(model_name_or_path).acquire(poll_interval=2):
                 local_path = snapshot_download(
                     repo_id=model_name_or_path,
-                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    ignore_patterns=ignore_patterns,
                     allow_patterns=allow_patterns,
                     local_dir=local_dir,
                     max_workers=8,
@@ -1201,7 +1206,7 @@ def maybe_download_model(
                 with get_lock(model_name_or_path).acquire(poll_interval=2):
                     local_path = snapshot_download(
                         repo_id=model_name_or_path,
-                        ignore_patterns=["*.onnx", "*.msgpack"],
+                        ignore_patterns=ignore_patterns,
                         allow_patterns=allow_patterns,
                         local_dir=local_dir,
                         max_workers=8,

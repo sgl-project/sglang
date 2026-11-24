@@ -456,6 +456,9 @@ class MiniMaxH3ImagePipeline(MiniMaxH3Pipeline):
     # directory), as diffusers does; the shared H3 stages call the module
     # `video_vae`, so the pipeline loads that module from `vae/`.
     _extra_config_module_map = {"video_vae": "vae"}
+    # The repository also holds Diffusers-layout copies of the transformer and VAE
+    # (64 GiB) for modular_model_index.json; the native layout is what loads here.
+    hub_ignore_patterns = ("transformer_diffusers/*", "vae_diffusers/*")
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         # Image releases are PDD checkpoints; there is no image sampler for a
