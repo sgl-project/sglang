@@ -569,6 +569,42 @@ class AttnResidual:
             self.write(prefix, rows)
         return normed, prefix
 
+    def forward_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Complete o_proj's sum over the TP group with the pending prefix add
+        and aggregate the result beside that all-reduce, every row on every
+        rank. ``hidden_states`` holds the prefix afterwards."""
+        nvb = self.num_valid_blocks
+        if (
+            nvb == 0
+            or self.written_on_slice
+            or hidden_states.shape[0] != self.block_residual.shape[0]
+            or not _use_fast(hidden_states.shape[1])
+        ):
+            return None
+        cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
+        assert score_norm.variance_epsilon == out_norm.variance_epsilon
+        from sglang.srt.layers.communication import k3_ar_fusion
+
+        normed = k3_ar_fusion.all_reduce_attn_res(
+            hidden_states,
+            prefix_sum,
+            self.block_residual,
+            cw,
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+        )
+        if normed is None:
+            return None
+        return normed, hidden_states
+
     def forward_sp_all_gather(
         self,
         hidden_states: torch.Tensor,

@@ -212,6 +212,36 @@ struct LamportTrait {
 };
 
 /**
+ * \brief The marker of a 16-byte vector that has not been delivered: 0x80000000
+ * in its first 32-bit word.
+ *
+ * A vector is written by one 16-byte store, so its first word speaks for all of
+ * it. The consumer looks for the pattern in the row it copied; it is also the one
+ * a checked bulk copy can report on SM107. As a value it is -0.0 (fp32) or
+ * (+0.0, -0.0) (two 16-bit floats), which the producer stores as +0.0.
+ */
+struct StreamMarker {
+  static constexpr uint32_t kEmpty = 0x80000000u;
+
+  /// Producer side: make sure a delivered vector does not read as the marker.
+  SGL_DEVICE static void clear(void* vec) {
+    const auto word = static_cast<uint32_t*>(vec);
+    if (*word == kEmpty) *word = 0;
+  }
+
+  SGL_DEVICE static bool is_empty(const void* vec) {
+    return *static_cast<const uint32_t*>(vec) == kEmpty;
+  }
+
+  /// The marker, for the consumer to put back once it has the vector.
+  SGL_DEVICE static void fill(void* vec) {
+    const auto word = static_cast<uint32_t*>(vec);
+    word[0] = kEmpty;
+    word[1] = word[2] = word[3] = 0;
+  }
+};
+
+/**
  * \brief Per-block barrier across all ranks, through semaphore `idx` of every rank.
  *
  * Stateless: thread `tx < kWorldSize` signals rank tx's slot and thread `rank` takes

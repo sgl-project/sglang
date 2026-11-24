@@ -55,6 +55,23 @@ def _jit_fused_tma_module(
     )
 
 
+@cache_once
+def _jit_fused_stream_module(
+    chunk_rows: int, occupancy: int, consumer_regs: int
+) -> Module:
+    """The kernel of _jit_fused_tma_module beside the streamed pull all-reduce
+    that produces its prefix rows (``nvlink_comm.all_reduce_pull_stream``); the
+    same knobs."""
+    args = make_cpp_args(_DIM, _MAX_BANK_ROWS, chunk_rows, occupancy, consumer_regs)
+    return load_jit(
+        _make_name("fused_stream"),
+        *args,
+        cuda_files=["kimi_k3/attn_res/fused_stream.cuh"],
+        cuda_wrappers=[("run", f"AttnResFusedStreamKernel<{args}>::run")],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+    )
+
+
 # Benchmarked-best (chunk_rows, occupancy, consumer_regs) per nvb
 # (GB200/GB300-class, H=7168). nvb=1 is latency-bound per token, so 2 CTAs/SM
 # (occupancy=2, which excludes setmaxnreg: 4*Nc + 2*Np > 512) wins large T by

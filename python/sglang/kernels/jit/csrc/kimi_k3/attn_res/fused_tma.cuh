@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 #include <sgl_kernel/distributed/ptx.cuh>
+#include <sgl_kernel/distributed/stream.cuh>
 #include <sgl_kernel/ptx/barrier.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -171,6 +172,10 @@ struct AttnResTMAParams {
   int64_t stride_bm;  // bank stride along T (in elements)
   float eps;
   uint32_t num_tokens;
+  // kStream only: this rank's replica of the buffer a streamed pull all-reduce
+  // over world_size ranks delivers the prefix rows into. Each row is taken once
+  // it is whole and kept in prefix_out; prefix_sum is not read.
+  bf16_t* prefix_stream = nullptr;
 };
 
 template <int64_t kDim_, uint32_t kNumBankRows_, uint32_t kChunkRows_, uint32_t kConsumerRegs_ = 0>
@@ -221,6 +226,7 @@ struct KimiK3AttnResTrait {
   struct Smem {
     uint64_t bar_full[kNumStages];
     uint64_t bar_free[kNumStages];
+    uint64_t bar_row[kNumStages];  // kStream: the copies of a slot's prefix row
     float warp_rms[kNumConsumerWarps][kChunkRows];
     float warp_dot[kNumConsumerWarps][kChunkRows];
     // The out-norm reduction gets its own buffer: it can overlap the next
@@ -230,6 +236,9 @@ struct KimiK3AttnResTrait {
     alignas(128) bf16_t buf[kNumStages][kChunkRows][kDim];
   };
 
+  /// kStream: the prefix rows are taken from params.prefix_stream as a pull
+  /// all-reduce delivers them, instead of read from params.prefix_sum.
+  template <bool kStream = false>
   static SGL_DEVICE void forward(const AttnResTMAParams& params, Smem* smem);
 };
 
@@ -251,6 +260,7 @@ SGL_DEVICE float2 mul_f32x2(float2 a, float2 b) {
 }
 
 template <int64_t kDim_, uint32_t kNumBankRows_, uint32_t kChunkRows_, uint32_t kConsumerRegs_>
+template <bool kStream>
 SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_>::forward(
     const AttnResTMAParams& params, Smem* smem) {
   using namespace device;
@@ -258,10 +268,14 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
   const auto lane_id = tx % kWarpThreads;
+  // The tokens in the order their prefix rows arrive (the plain order unless streamed).
+  const auto order = distributed::StreamRowOrder(params.num_tokens, kStream ? params.world_size : 1);
+  const auto num_pos = order.size();
 
   if (warp_id == 0 && lane_id < kNumStages) {
     ptx::mbar_init(&smem->bar_full[lane_id], 1);
     ptx::mbar_init(&smem->bar_free[lane_id], kNumConsumerWarps * kWarpThreads);
+    if constexpr (kStream) ptx::mbar_init(&smem->bar_row[lane_id], 1);
     ptx::fence_mbarrier_init();
   } else if (warp_id == 1) {
     ptx::tcgen05_alloc(ptx::to_shared(&smem->tmem_base), kTmemCols);
@@ -272,34 +286,65 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
   if (warp_id >= kNumConsumerWarps) {  // producer warp (group); first warp works
     if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_dec<kProducerRegs>();
     // TODO: reduce the register usage
-    if (warp_id == kNumConsumerWarps && warp::elect_one_lane()) {
+    // One lane issues every copy; the rest of its warp only helps take a
+    // streamed prefix row.
+    const bool lead = warp_id == kNumConsumerWarps && (kStream ? lane_id == 0 : warp::elect_one_lane());
+    if (lead || (kStream && warp_id == kNumConsumerWarps)) {
       uint32_t global_chunks = 0;
+      [[maybe_unused]] uint32_t row_parity[kNumStages] = {};
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
-      for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
+      for (auto pos = blockIdx.x; pos < num_pos; pos += gridDim.x) {
+        const auto token = order.row_at(pos);
+        if (token == order.kNoRow) continue;
 #pragma unroll
         for (uint32_t ci = 0; ci < kNumChunks; ++ci, ++global_chunks) {
           const uint32_t base_row = ci * kChunkRows;
           const uint32_t an = (kNumRows + 1 - base_row) < kChunkRows ? (kNumRows + 1 - base_row) : kChunkRows;
           const auto slot = global_chunks % kNumStages;
           const auto phase = (global_chunks / kNumStages) & 1;
-          if (global_chunks >= kNumStages) {
-            ptx::mbar_wait_parity(&smem->bar_free[slot], phase ^ 1);
-          }
-          // One pull per chunk; each row still gets its own bulk copy.
-          ptx::mbar_arrive_expect_tx(&smem->bar_full[slot], an * kRowBytes);
+          // A streamed prefix row comes in on its own below, and the slot's one
+          // arrival with it; the other rows complete the slot by bytes.
+          const bool streamed = kStream && base_row + an == kNumRows + 1;
+          const uint32_t copies = streamed ? an - 1 : an;
+          if (lead) {
+            if (global_chunks >= kNumStages) {
+              ptx::mbar_wait_parity(&smem->bar_free[slot], phase ^ 1);
+            }
+            // One pull per chunk; each row still gets its own bulk copy.
+            if (!streamed) {
+              ptx::mbar_arrive_expect_tx(&smem->bar_full[slot], copies * kRowBytes);
+            } else if (copies > 0) {
+              ptx::mbar_expect_tx(&smem->bar_full[slot], copies * kRowBytes);
+            }
 #pragma unroll
-          for (uint32_t r = 0; r < an; ++r) {
-            const auto row = base_row + r;
-            const auto src = row == kNumRows ? params.prefix_sum + token * kDim  //
-                                             : params.bank + token * params.stride_bm + row * kDim;
-            // Only prefix_sum is written by the immediately-preceding kernel;
-            // one wait before the first token's prefix load covers the rest.
-            if (token == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
-            ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
+            for (uint32_t r = 0; r < copies; ++r) {
+              const auto row = base_row + r;
+              const auto src = row == kNumRows ? params.prefix_sum + token * kDim  //
+                                               : params.bank + token * params.stride_bm + row * kDim;
+              // Only prefix_sum is written by the immediately-preceding kernel;
+              // one wait before the first token's prefix load covers the rest.
+              if (pos == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
+              ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
+            }
+          }
+          if constexpr (kStream) {
+            if (streamed) {
+              distributed::take_stream_row<kDim / kVecElems>(
+                  params.prefix_stream + static_cast<int64_t>(token) * kDim,
+                  &smem->buf[slot][copies][0],
+                  &smem->bar_row[slot],
+                  row_parity[slot]);
+              if (lead) ptx::mbar_arrive(&smem->bar_full[slot]);
+            }
           }
         }
       }
-      PDLTriggerSecondary<true>();
+      if (lead) {
+        PDLTriggerSecondary<true>();
+        // Outlive the all-reduce, whose ranks still meet at its exit: what waits
+        // for this grid then starts after the all-reduce has left the semaphores.
+        if constexpr (kStream) PDLWaitPrimary<true>();
+      }
     }
   } else {  // 2 consumer warp groups; one chunk per rendezvous
     if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_inc<kConsumerRegs>();
@@ -343,7 +388,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
     }
 
     uint32_t global_chunks = 0;  // mirrors the producer's chunk counter
-    for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
+    for (auto pos = blockIdx.x; pos < num_pos; pos += gridDim.x) {
+      const auto token = order.row_at(pos);
+      if (token == order.kNoRow) continue;
       float run_max = -FLT_MAX;  // online-softmax state
       float run_sum = 0.f;
       float2 acc[kAccPerThread / 2] = {};  // packed fp32x2 accumulator
@@ -388,18 +435,26 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         }
         ptx::mbar_arrive(&smem->bar_free[slot]);
 
-        // Fused bank write: the prefix row (last row of the last chunk) is
-        // already in registers; snapshot it to bank row nvb with plain
-        // stores — the .write() copy kernel disappears. Placed after the
-        // arrive so the slot handoff is not delayed.
-        if (params.prefix_dst != nullptr && base_row + an == kNumRows + 1) {
-          const uint32_t pr = kNumRows - base_row;
-          auto* dst = params.prefix_dst + static_cast<int64_t>(token) * params.stride_bm;
+        // The prefix row (last row of the last chunk) is already in registers;
+        // plain stores of it are placed after the arrive so the slot handoff is
+        // not delayed.
+        if (base_row + an == kNumRows + 1) {
+          const auto store_prefix = [&](bf16_t* dst) {
 #pragma unroll
-          for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-            const auto tile = si * kNumGroups + group;
-            if (tile >= kNumTiles) continue;
-            rows[si][pr].store(dst, tile * (kTile / kVecElems) + tid_in_group);
+            for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
+              const auto tile = si * kNumGroups + group;
+              if (tile >= kNumTiles) continue;
+              rows[si][kNumRows - base_row].store(dst, tile * (kTile / kVecElems) + tid_in_group);
+            }
+          };
+          // Fused bank write: snapshot it to bank row nvb — the .write() copy
+          // kernel disappears.
+          if (params.prefix_dst != nullptr) {
+            store_prefix(params.prefix_dst + static_cast<int64_t>(token) * params.stride_bm);
+          }
+          // A streamed row is nowhere else once its slot is reused.
+          if constexpr (kStream) {
+            store_prefix(params.prefix_out + static_cast<int64_t>(token) * kDim);
           }
         }
 
@@ -644,8 +699,14 @@ struct AttnResFusedTmaKernel {
   }
   static constexpr auto kAgTable = make_ag_table(std::make_index_sequence<kMaxBankRows>{});
 
-  static void
-  run(const tvm::ffi::TensorView prefix_sum,
+  /// A launch on rows this rank holds: its checked operands as kernel parameters.
+  struct LocalLaunch {
+    AttnResTMAParams params;
+    DLDevice device;
+  };
+
+  static LocalLaunch local_launch(
+      const tvm::ffi::TensorView prefix_sum,
       const tvm::ffi::TensorView bank,
       const tvm::ffi::TensorView cw,
       const tvm::ffi::TensorView ow,
@@ -685,17 +746,6 @@ struct AttnResFusedTmaKernel {
         " NB=",
         NB);
 
-    if (num_tokens == 0) return;
-
-    [[maybe_unused]] static const bool attrs_set = [] {
-      for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
-        RuntimeDeviceCheck(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-      }
-      return true;
-    }();
-
-    const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);
-    const auto grid = std::min<int64_t>((int64_t)num_sm * kOccupancy, num_tokens);
     const auto params = AttnResTMAParams{
         .prefix_sum = static_cast<const bf16_t*>(prefix_sum.data_ptr()),
         .bank = static_cast<const bf16_t*>(bank.data_ptr()),
@@ -715,7 +765,35 @@ struct AttnResFusedTmaKernel {
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),
     };
-    LaunchKernel(grid, kNumThreads, device.unwrap(), kSmemBytes).enable_pdl(true)(kTable[nvb], params);
+    return {params, device.unwrap()};
+  }
+
+  /// One persistent block per SM (times the occupancy) of `num_sm` SMs, at most one a token.
+  static void launch(KernelFn kernel, int64_t num_sm, const LocalLaunch& local) {
+    const auto num_tokens = static_cast<int64_t>(local.params.num_tokens);
+    if (num_tokens == 0) return;
+    const auto grid = std::min<int64_t>(num_sm * kOccupancy, num_tokens);
+    host::LaunchKernel(grid, kNumThreads, local.device, kSmemBytes).enable_pdl(true)(kernel, local.params);
+  }
+
+  static void
+  run(const tvm::ffi::TensorView prefix_sum,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw,
+      const tvm::ffi::TensorView ow,
+      const tvm::ffi::TensorView out,
+      int64_t nvb,
+      double eps,
+      bool write_prefix) {
+    using namespace host;
+    const auto local = local_launch(prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix);
+    [[maybe_unused]] static const bool attrs_set = [] {
+      for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
+        RuntimeDeviceCheck(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+      }
+      return true;
+    }();
+    launch(kTable[nvb], runtime::get_sm_count(local.device.device_id), local);
   }
 
   static void run_pull_rs(

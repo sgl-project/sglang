@@ -270,9 +270,14 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
   epoch.commit();
 }
 
-template <typename T, bool kHasResidual, Primitive kPrim, bool kUsePDL, uint32_t kPullUnroll>
+/// `kStream` (all-reduce into a second buffer): for a dependent kernel that takes
+/// rows from its replica of the output while the reduce runs. The output starts
+/// as `StreamMarker`s, no stored vector is one, and the dependent is released
+/// before the first load instead of after the last store.
+template <typename T, bool kHasResidual, Primitive kPrim, bool kUsePDL, uint32_t kPullUnroll, bool kStream = false>
 PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams params) {
   using namespace device;
+  static_assert(!kStream || kPrim == Primitive::AR, "only the all-reduce streams its output");
   constexpr uint32_t kVecSize = 16 / sizeof(T);  // 16 bytes per vector
   using vec_t = device::AlignedVector<packed_t<T>, kVecSize / 2>;
   constexpr uint32_t kNumWarpVecs = kPullUnroll * kWarpThreads;
@@ -288,6 +293,7 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   const auto barrier = distributed::McBarrier{params.sem_local, params.sem_mc, params.world_size};
   barrier.arrive_relaxed();
   __syncthreads();
+  if constexpr (kStream) PDLTriggerSecondary<kUsePDL>();
 
   const auto num_whole_chunks = params.num_vecs / kNumWarpVecs;
   // warp uniform unrolled path, 0 predicate
@@ -319,6 +325,7 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
 
 #pragma unroll
     for (uint32_t i = 0; i < kPullUnroll; ++i) {
+      if constexpr (kStream) distributed::StreamMarker::clear(vecs[i].data());
       if constexpr (kPrim & Primitive::AG) {
         ptx::st_multimem_16B(vecs[i], params.output_mc, base + i * kWarpThreads);
       } else {
@@ -342,6 +349,7 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
       res.load(params.residual, vid);
       vec = reduce_vec(vec, res);
     }
+    if constexpr (kStream) distributed::StreamMarker::clear(vec.data());
     if constexpr (kPrim & Primitive::AG) {
       ptx::st_multimem_16B(vec, params.output_mc, vid);
     } else {
@@ -349,7 +357,7 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
     }
   }
 
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kStream) PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   if constexpr (kPrim & Primitive::AG) {
     barrier.arrive_rel_acq();
@@ -514,8 +522,9 @@ struct NVLinkComm {
     host::LaunchKernel(push.default_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
-  template <Primitive kPrim, uint32_t kPullUnroll>
-  static void run_pull(
+  /// Returns the number of blocks launched.
+  template <Primitive kPrim, uint32_t kPullUnroll, bool kStream = false>
+  static uint32_t run_pull(
       const PullPlaneObj& pull,
       const TensorView in,
       const TensorView out,
@@ -538,6 +547,7 @@ struct NVLinkComm {
     // 0 = no hint, autotune; > 0 always use hint but clip to upper bound
     if constexpr (kPrim == Primitive::AR) {
       CHECK_HOST(num_tokens == out_tokens && in_mc_ptr != 0 && out_mc_ptr != 0);
+      CHECK_HOST(!kStream || in_mc_ptr != out_mc_ptr) << "a streamed all-reduce needs an output of its own";
       in_mc_ptr += prefix_bytes;
       out_mc_ptr += prefix_bytes;
       if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(256u, kPullUnroll * world_size);
@@ -574,9 +584,10 @@ struct NVLinkComm {
     const auto max_vecs_in_world = host::div_ceil(total_tokens, world_size) * num_vecs_per_token;
     const auto max_num_blocks = host::div_ceil(max_vecs_in_world, kPullUnroll * kPullCTASize);
     const auto num_blocks = std::max(1u, std::min(max_num_blocks, num_blocks_hint));
-    const auto kernel = residual.has_value() ? nvlink_pull_kernel<T, true, kPrim, kUsePDL, kPullUnroll>
-                                             : nvlink_pull_kernel<T, false, kPrim, kUsePDL, kPullUnroll>;
+    const auto kernel = residual.has_value() ? nvlink_pull_kernel<T, true, kPrim, kUsePDL, kPullUnroll, kStream>
+                                             : nvlink_pull_kernel<T, false, kPrim, kUsePDL, kPullUnroll, kStream>;
     host::LaunchKernel(num_blocks, kPullCTASize, device).enable_pdl(kUsePDL)(kernel, params);
+    return num_blocks;
   }
 
  public:
@@ -596,8 +607,7 @@ struct NVLinkComm {
       tvm::ffi::Optional<TensorView> residual,
       int64_t out_mc_ptr,
       uint32_t num_blocks_hint) {
-    return run_pull<Primitive::AG, kPullUnroll>(
-        comm->get_pull_obj(), in, out, residual, 0, out_mc_ptr, num_blocks_hint);
+    run_pull<Primitive::AG, kPullUnroll>(comm->get_pull_obj(), in, out, residual, 0, out_mc_ptr, num_blocks_hint);
   }
 
   template <uint32_t kWorldSize>
@@ -615,7 +625,25 @@ struct NVLinkComm {
       int64_t in_mc_ptr,
       int64_t out_mc_ptr,
       uint32_t num_blocks_hint) {
-    return run_pull<Primitive::AR, kPullUnroll>(
+    run_pull<Primitive::AR, kPullUnroll>(
+        comm->get_pull_obj(), in, out, residual, in_mc_ptr, out_mc_ptr, num_blocks_hint);
+  }
+
+  /// The pull all-reduce for a dependent that consumes `out` beside it. `out` is a
+  /// second symmetric buffer of `StreamMarker`s: the next kernel on the stream may
+  /// start before the reduce is done and has to take each row through the marker,
+  /// putting it back (`take_stream_row`). Rank r delivers the rows `get_routing`
+  /// gives it, in ascending order. Returns the blocks launched.
+  template <uint32_t kPullUnroll>
+  static int64_t all_reduce_stream_pull(
+      CommunicatorRef comm,
+      TensorView in,
+      TensorView out,
+      tvm::ffi::Optional<TensorView> residual,
+      int64_t in_mc_ptr,
+      int64_t out_mc_ptr,
+      uint32_t num_blocks_hint) {
+    return run_pull<Primitive::AR, kPullUnroll, /*kStream=*/true>(
         comm->get_pull_obj(), in, out, residual, in_mc_ptr, out_mc_ptr, num_blocks_hint);
   }
 };
