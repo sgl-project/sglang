@@ -21,6 +21,13 @@ Mooncake serves as a high-performance L3 storage backend for SGLang HiCache, ena
 
 When a cache miss occurs in L1 and L2, HiCache automatically fetches the required KV cache from Mooncake's distributed memory pool. The system uses intelligent prefetching strategies to minimize latency, and utilize RDMA technology and zero-copy technique to ensure high-bandwidth, low-latency data transfer between SGLang instances and Mooncake storage nodes.
 
+With pipeline parallelism and `buffer_only` host memory, the first prefetch ticket
+collects the readers' Mooncake object layouts. For compatible layouts, PP0 checks
+all required shards in one batch before broadcasting subsequent tickets. Each stage
+allocates its own host slots and reads its shard. The completion acknowledgements
+determine the common prefix that can be restored, including the checkpoint for a
+sliding window. Other storage backends continue to query and allocate on each rank.
+
 **Key Advantages:**
 
 - **Scalable Capacity**: Aggregate memory across entire clusters into large distributed pools.

@@ -240,6 +240,7 @@ class PrefetchAck:
     # Number of hits in extra pools.
     pool_hits: Optional[dict[str, int]] = None
     completed_req: Optional[bool] = None
+    kv_ready: Optional[threading.Event] = None
 
 
 class StorageOperation:
@@ -1378,7 +1379,9 @@ class HiCacheController:
             count += 1
         return count
 
-    def _page_transfer(self, operation: PrefetchOperation) -> int:
+    def _page_transfer(
+        self, operation: PrefetchOperation, *, ack_pages: int = 0, kv_ready=None
+    ) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         kv_derived_transfers = [
@@ -1388,7 +1391,8 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+        read_pages = len(operation.hash_value)
+        for i in range(0, max(read_pages, ack_pages), STORAGE_BATCH_SIZE):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
@@ -1398,7 +1402,7 @@ class HiCacheController:
                 operation.is_terminated() or self.storage_stop_event.is_set()
             ):
                 all_success = False
-            if all_success:
+            if all_success and i < read_pages:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
                     i * self.page_size : (i + len(batch_hashes)) * self.page_size
@@ -1431,6 +1435,7 @@ class HiCacheController:
                 rid=operation.request_id,
                 completed_tokens=completed_pages * self.page_size,
                 operation=operation,
+                kv_ready=kv_ready if i + STORAGE_BATCH_SIZE >= ack_pages else None,
             )
             self.prefetch_sync_queue.put(ack)
         return completed_pages

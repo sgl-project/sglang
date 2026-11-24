@@ -121,6 +121,7 @@ class TestPrefetchAckSchema(unittest.TestCase):
 class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
+        c._register_thread_trace_info = Mock()  # Workers run on the test thread.
         c.page_size = c.prefetch_threshold = 4
         c.storage_config = HiCacheStorageConfig(
             tp_rank=0,
@@ -355,11 +356,21 @@ class TestPPPrefetchTicket(CustomTestCase):
                 self.assertIsNone(c.get_prefetch_submission(rid))
         self.assertTrue(c.pp_prefetch_command_queue.empty())
 
-    def test_all_backends_query_and_allocate_before_one_worker_consensus(self):
+    def test_local_query_and_allocation_share_one_worker_consensus(self):
         c = self.c
         for backend in ("file", "mooncake", "dynamic"):
             with self.subTest(backend=backend):
                 c.storage_backend_type = backend
+                # An out-of-tree backend exposing the same hook still queries locally.
+                c.storage_backend = (
+                    Mock()
+                    if backend == "mooncake"
+                    else type(
+                        "OtherStorage",
+                        (),
+                        {"pp_query_namespace": Mock(), "pp_query_layout": Mock()},
+                    )()
+                )
                 c._storage_hit_query.reset_mock()
                 c._all_reduce.reset_mock()
                 c.mem_pool_host.alloc.reset_mock()
@@ -403,6 +414,8 @@ class TestPPPrefetchTicket(CustomTestCase):
                     [call(first.operation), call(second.operation)],
                 )
                 self.assertEqual(votes, [8, 8])
+                if backend != "mooncake":
+                    c.storage_backend.pp_query_layout.assert_not_called()
                 self.assertEqual(c._all_reduce.call_count, 2)
                 self.assertIs(c.prefetch_buffer.get_nowait(), first.operation)
                 self.assertIs(c.prefetch_buffer.get_nowait(), second.operation)
@@ -431,6 +444,98 @@ class TestPPPrefetchTicket(CustomTestCase):
                     else:
                         with self.assertNoLogs(logger, "WARNING"):
                             c.attach_storage_backend("dynamic")
+
+    def test_global_query_keeps_ack_count_and_uses_agreed_checkpoint(self):
+        c = self.c
+
+        class Mooncake(Mock):
+            def pp_query_namespace(self):
+                return "shared"
+
+            def pp_query_layout(self):
+                return {PoolName.KV: ("_kv",), PoolName.SWA: ("_swa",)}
+
+        store = c.storage_backend = Mooncake()
+        store.consumes_kv_hints.return_value = True
+        c._storage_hit_query = HybridCacheController._storage_hit_query.__get__(c)
+        store.batch_exists.return_value = 0
+        self.submit("warmup")
+        key = RadixKey(array("q", range(16)))
+        handle = CacheRequestHandle("sparse", 0)
+        sidecar = PoolTransfer(
+            PoolName.SWA,
+            keys=["last"],
+            host_indices=torch.arange(4),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        hints = KvHintsEnvelope(protocol_version="0.1", message_id="query")
+        metadata = {"kv_hints": hints}
+        op = c.submit_prefetch(
+            handle, key, None, None, [], [sidecar], storage_read_metadata=metadata
+        ).operation
+        store.batch_exists_v2.return_value = PoolTransferResult(
+            4, {"kv": 4, "swa": 4}, [1, 4]
+        )
+        c.mem_pool_host.available_size.return_value = 12
+        self.run_commands()
+        (query,) = store.batch_exists_v2.call_args_list
+        self.assertEqual(query.args[2].extra_info["kv_hints"], hints)
+        self.assertEqual(
+            set(query.kwargs["pool_suffixes"]), {PoolName.KV, PoolName.SWA}
+        )
+        self.assertEqual(
+            c._all_reduce.call_count, 1
+        )  # First ticket discovers the layout.
+        self.assertEqual(op.storage_hit_count, 12)
+
+        # This stage has room for three pages, a peer for two, and only the
+        # first and fourth pages have the required checkpoint. Every stage
+        # must issue four progress ACKs, then read the checkpoint at page one.
+        c.page_get_func = Mock(return_value=1)
+        store.batch_get_v2.return_value = {"swa": [True]}
+        progress = []
+
+        def reduce(tensor, *_):
+            if tensor.numel() == 1:
+                progress.append(tensor.item())
+                tensor.clamp_(max=8)
+
+        c._all_reduce.side_effect = reduce
+        c.prefetch_sync_thread = threading.Thread(
+            target=c.prefetch_sync_thread_func, daemon=True
+        )
+        c.prefetch_sync_thread.start()
+        try:
+            with patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1):
+                c._page_transfer(op)
+            c.prefetch_sync_queue.put(PrefetchAck(handle.rid, op, completed_req=True))
+            self.assertTrue(c.pp_prefetch_states[handle.rid].ready_event.wait(3))
+        finally:
+            c.storage_stop_event.set()
+            c.prefetch_sync_queue.put(None)
+            c.prefetch_sync_thread.join(3)
+        self.assertFalse(c.prefetch_sync_thread.is_alive())
+        self.assertEqual(progress[:4], [4, 8, 12, 12])
+        self.assertEqual(c.page_get_func.call_count, 3)
+        restored = store.batch_get_v2.call_args.args[0][0]
+        self.assertEqual(restored.keys, op.all_hash_values[:1])
+        self.assertEqual(op.completed_tokens, 4)
+
+    def test_global_ticket_allocation_miss_keeps_downstream_ack_sequence(self):
+        c = self.c
+        self.submit()
+        ticket = c.pp_prefetch_states.pop("hit").ticket
+        ticket.global_hit = PoolTransferResult(2, {"kv": 2})
+        c.storage_config.pp_rank = 1
+        c.mem_pool_host.available_size.return_value = 0
+        c._storage_hit_query = HybridCacheController._storage_hit_query.__get__(c)
+        self.run_commands(ticket)
+        acks = self.run_io(1)
+        self.assertEqual([ack.completed_tokens for ack in acks], [0, 0, None])
+        c._all_reduce.assert_not_called()
+        c.storage_backend.batch_exists.assert_not_called()
+        c.storage_backend.batch_exists_v2.assert_not_called()
+        c.mem_pool_host.alloc.assert_not_called()
 
     def test_file_attachment_enables_pp_tickets(self):
         c = self.c
