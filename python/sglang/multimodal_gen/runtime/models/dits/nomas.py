@@ -323,6 +323,8 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = c.num_attention_heads
         self.local_attention_heads = c.num_attention_heads // self.parallel.head_shards
         self.num_channels_latents = c.in_channels
+        self._offline_graph = None
+        self.quant_config = quant_config
         self.attention_backend = attention_backend
         # Framework layerwise offload hooks this ModuleList; action_modules stay resident.
         self.layer_names = ["double_blocks"]
@@ -369,6 +371,20 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             p = module.img_attn_q.weight
             module.freqs_cos = cos.to(device=p.device, dtype=p.dtype)
             module.freqs_sin = sin.to(device=p.device, dtype=p.dtype)
+
+    def offline_graph(self, warmup):
+        if warmup and self._offline_graph is None:
+            from sglang.multimodal_gen.runtime.models.dits.nomas_graph import (
+                NomasGraphRunner,
+            )
+
+            self._offline_graph = NomasGraphRunner(self)
+        return self._offline_graph
+
+    def release_cuda_graphs(self):
+        if self._offline_graph is not None:
+            self._offline_graph.reset()
+            self._offline_graph = None
 
     def allocate_cache(self, capacity):
         p = next(self.parameters())
