@@ -412,8 +412,8 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
-    # Model overrides may have filled the ratio; only the raw user input
-    # selects explicit ratio sizing instead of request-cap sizing.
+    # V4's model-default ratio must not disable cap mode or --swa-prefix-tails.
+    # Only the operator's raw ratio selects explicit ratio sizing.
     if cfg._swa_full_tokens_ratio_explicitly_set is None:
         declare_resolution(
             server_args,

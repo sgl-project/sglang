@@ -1,27 +1,37 @@
-"""Model defaults must not count as an operator-supplied SWA ratio."""
+"""NPU SWA prefix-tail sizing preserves model defaults and explicit ratios.
+
+V4.1 already supports cap sizing when the ratio is omitted. V4's injected
+default must not disable the same sizing path. These configuration checks
+run in the CPU-hosted NPU suite without loading weights or NPU operators.
+"""
 
 import pickle
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.kv_cache_hook import handle_cache_compatibility
 from sglang.srt.arg_groups.model_overrides.deepseek_v4 import _deepseek_v4_overrides
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
+from sglang.srt.model_executor.pool_configurator import (
+    create_memory_pool_configurator,
+)
 from sglang.srt.runtime_context import get_schedule, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_npu_ci(est_time=5, suite="base-a-test-npu")
 
 
-class TestSwaRatioExplicitInput(CustomTestCase):
+class TestNpuSwaPrefixTails(CustomTestCase):
     def setUp(self):
         super().setUp()
         reset_context()
         self.addCleanup(reset_context)
 
-    def _record(self, ratio=None, device="cuda", **kwargs):
+    def _record(self, ratio=None, device="npu", **kwargs):
         args = ServerArgs(
             model_path="dummy",
             device=device,
@@ -32,9 +42,9 @@ class TestSwaRatioExplicitInput(CustomTestCase):
         args.resolve_once()
         return args
 
-    def _dsv4_defaults(self, args):
+    def _dsv4_defaults(self, args, model_type="deepseek_v4"):
         hf_config = SimpleNamespace(
-            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v4"
+            architectures=["DeepseekV4ForCausalLM"], model_type=model_type
         )
         declare_resolution(
             args,
@@ -51,6 +61,48 @@ class TestSwaRatioExplicitInput(CustomTestCase):
         self.assertIs(get_schedule()._swa_full_tokens_ratio_explicitly_set, explicit)
         self.assertEqual(get_schedule().swa_full_tokens_ratio, ratio)
 
+    def _pool_sizes(self, model_type, prefix_tails, ratio=None):
+        args = self._record(
+            ratio=ratio,
+            page_size=128,
+            max_running_requests=4,
+            chunked_prefill_size=512,
+            swa_prefix_tails=prefix_tails,
+        )
+        self._dsv4_defaults(args, model_type=model_type)
+        handle_cache_compatibility(args)
+        publish(args, role="test")
+        ratios = [0, 2, 1] if model_type == "deepseek_v41" else [4, 128]
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                model_type=model_type,
+                kv_source_layer_ids=[],
+            ),
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=4096,
+            window_size=128,
+            compress_ratios=ratios,
+            mla_layer_ids=[],
+        )
+        kvc = SimpleNamespace(
+            model_config=config,
+            kv_cache_dtype_str="bfloat16",
+            is_hybrid_swa=True,
+            sliding_window_size=128,
+            page_size=128,
+            attn_dp_size=1,
+            pp_size=1,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=len(ratios)),
+        )
+        with patch("sglang.srt.model_executor.pool_configurator._is_npu", True):
+            planner = create_memory_pool_configurator(kvc)
+            sizes = planner.calculate_pool_sizes_from_max_tokens(65536, 128)
+        return planner, sizes
+
     def test_dsv4_automatic_ratio_is_not_explicit(self):
         for device in ("cuda", "npu"):
             with self.subTest(device=device):
@@ -59,6 +111,40 @@ class TestSwaRatioExplicitInput(CustomTestCase):
                 handle_cache_compatibility(args)
                 self.assertIsNone(args._raw_input["swa_full_tokens_ratio"])
                 self._check_published(args, explicit=False, ratio=0.1)
+
+    def test_dsv41_default_ratio_remains_unset(self):
+        args = self._record()
+        self._dsv4_defaults(args, model_type="deepseek_v41")
+        handle_cache_compatibility(args)
+        self.assertIsNone(args._raw_input["swa_full_tokens_ratio"])
+        self._check_published(args, explicit=False, ratio=0.8)
+
+    def test_prefix_tails_increase_swa_capacity_for_v4_and_v41(self):
+        for model_type in ("deepseek_v4", "deepseek_v41"):
+            with self.subTest(model_type=model_type):
+                base, base_sizes = self._pool_sizes(model_type, prefix_tails=0)
+                self.assertIsNone(base.operator_swa_ratio)
+                self.assertIsNotNone(base.swa_cap_tokens)
+                for tails in (8, 128):
+                    with self.subTest(prefix_tails=tails):
+                        planner, sizes = self._pool_sizes(model_type, tails)
+                        self.assertIsNone(planner.operator_swa_ratio)
+                        self.assertEqual(planner.swa_prefix_tails, tails)
+                        self.assertEqual(
+                            sizes.swa_max_total_num_tokens
+                            - base_sizes.swa_max_total_num_tokens,
+                            tails * (128 + 128),
+                        )
+                        self.assertEqual(sizes.full_max_total_num_tokens, 65536)
+
+    def test_explicit_ratio_selects_ratio_sizing_for_v4_and_v41(self):
+        for model_type in ("deepseek_v4", "deepseek_v41"):
+            for tails in (0, 8):
+                with self.subTest(model_type=model_type, prefix_tails=tails):
+                    planner, sizes = self._pool_sizes(model_type, tails, ratio=0.1)
+                    self.assertEqual(planner.operator_swa_ratio, 0.1)
+                    self.assertIsNone(planner.swa_cap_tokens)
+                    self.assertEqual(sizes.swa_max_total_num_tokens, 6528)
 
     def test_dsv4_explicit_ratio_is_preserved_including_default_value(self):
         for device in ("cuda", "npu"):
