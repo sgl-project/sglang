@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (  # noqa: E402
     get_parallel,
     get_server_args,
 )
+from sglang.srt.sampling.penalties import PenaltyStatusPool  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
@@ -115,11 +116,13 @@ def make_cpu_scheduler(send_output, *, cache_enabled=False, legacy_cache=False):
     scheduler.ipc_channels = SimpleNamespace(
         send_to_tokenizer=SimpleNamespace(send_output=send_output)
     )
+    scheduler.penalty_status_pool = PenaltyStatusPool(vocab_size=32, device="cpu")
     scheduler.request_retirer = RequestRetirer(
         tree_cache=scheduler.tree_cache,
         beam_coordinator=scheduler.beam_coordinator,
         hisparse_coordinator=None,
         uocr_runtime=None,
+        penalty_status_pool=scheduler.penalty_status_pool,
         send_abort_output=scheduler.send_abort_output,
         stream_output=Mock(),
     )
@@ -181,12 +184,19 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertFalse(get_memory().enable_unified_memory)
         target = self._req(scheduler)
         neighbor = self._req(scheduler, "target-neighbor", "instance-b")
+        target.sampling_params.presence_penalty = 1.0
+        neighbor.sampling_params.presence_penalty = 1.0
+        scheduler.penalty_status_pool.alloc([target, neighbor])
+        self.assertIsNotNone(target.penalty_index)
+        neighbor_penalty_index = neighbor.penalty_index
+        self.assertIsNotNone(neighbor_penalty_index)
         move([target, neighbor], scheduler.waiting_queue)
 
         def on_terminal(req):
             self.assertIs(req, target)
             self.assertTrue(req.finished())
             self.assertTrue(req.kv.holds_kv)
+            self.assertIsNotNone(req.penalty_index)
             self.assertEqual(scheduler.req_to_token_pool.available_size(), 6)
             self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 26)
             scheduler._check_cancellation_retirements()
@@ -200,11 +210,40 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         )
         self.assertFalse(target.kv.holds_kv)
         self.assertTrue(target.kv.is_kv_released)
+        self.assertIsNone(target.penalty_index)
         self.assertEqual(scheduler.req_to_token_pool.available_size(), 7)
         self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 29)
         self.assertFalse(neighbor.finished())
         self.assertTrue(neighbor.kv.holds_kv)
+        self.assertEqual(neighbor.penalty_index, neighbor_penalty_index)
         self.assertEqual(list(scheduler.waiting_queue), [neighbor])
+
+    def test_receipt_waits_for_sampling_penalty_index(self):
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        req.sampling_params.presence_penalty = 1.0
+        pool = scheduler.penalty_status_pool
+        pool.alloc([req])
+        batch = ScheduleBatch(reqs=[req])
+        batch.add_inflight_step()
+        scheduler.running_batch = batch
+        move([req], scheduler.running_reqs)
+        self._cancel(scheduler, req)
+
+        req.finish_outside_step(FINISH_ABORT())
+        # Simulate an incomplete release of the independently owned sampling row.
+        # The real retirer still removes the live holder and releases KV.
+        with patch.object(pool, "free"):
+            scheduler.request_retirer.release(req, checkpoint=False)
+        scheduler._on_step_processed(batch, None)
+        self.assertFalse(req.kv.holds_kv)
+        self.assertIsNotNone(req.penalty_index)
+        self.assertEqual(self.outputs, [])
+
+        pool.free(req)
+        scheduler._check_cancellation_retirements()
+        self.assertIsNone(req.penalty_index)
+        self.assertEqual(self.outputs[-1][0].status, "retired")
 
     def test_running_receipt_waits_for_each_launched_step_and_all_live_holders(self):
         scheduler = self._scheduler(cache_enabled=True)
