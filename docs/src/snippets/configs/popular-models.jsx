@@ -18,7 +18,7 @@ export const popularModels = [
     href: "/cookbook/autoregressive/Baidu/ERNIE-5.5-Flash",
     logo: "/cards/logos/ernie.svg",
     badge: "New",
-    tags: ["5 platforms", "HCA + MLA-DSA hybrid", "FP8 / BF16"],
+    tags: ["5 platforms", "HCA + MLA-DSA hybrid", "FP4 / FP8 / BF16"],
     hero: {
       eyebrow: "Featured model \u00b7 New",
       headline: "Meet ERNIE-5.5-Flash on SGLang",
