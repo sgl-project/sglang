@@ -921,8 +921,9 @@ async fn register_one(
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(|mut settings| {
             // `--chat-stop-after-reasoning` is the router's, not the engine's.
-            settings.stop_after_reasoning =
-                cfg.as_ref().is_some_and(|c| c.model.chat_stop_after_reasoning);
+            settings.stop_after_reasoning = cfg
+                .as_ref()
+                .is_some_and(|c| c.model.chat_stop_after_reasoning);
             Arc::new(settings)
         }),
         grpc_port: info.grpc_port,

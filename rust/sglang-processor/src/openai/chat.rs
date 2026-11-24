@@ -1344,8 +1344,13 @@ impl ChatResponder {
             if called {
                 self.has_tool_calls.insert(index);
             }
-            let (text, stopped) =
-                content_after_stops(&self.content_stops, &mut self.held_content, index, text, finished);
+            let (text, stopped) = content_after_stops(
+                &self.content_stops,
+                &mut self.held_content,
+                index,
+                text,
+                finished,
+            );
             events.extend(self.token_output_chunks(index, (reasoning, text, pieces), logprobs));
             if let Some(stop) = stopped {
                 self.stop_on_content(index, stop);
@@ -1389,8 +1394,13 @@ impl ChatResponder {
                 ));
             }
         }
-        let (sendable, content_stop) =
-            content_after_stops(&self.content_stops, &mut self.held_content, index, delta, finished);
+        let (sendable, content_stop) = content_after_stops(
+            &self.content_stops,
+            &mut self.held_content,
+            index,
+            delta,
+            finished,
+        );
         delta = sendable;
         if let Some(tools) = tools {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
@@ -1758,7 +1768,10 @@ mod tests {
         assert_eq!(stop_prefix_suffix("1,2,3,", "END"), 0);
         assert_eq!(stop_prefix_suffix("abc", "abc"), 0);
         let stops = vec!["END".to_owned(), "ZQ7".to_owned()];
-        assert_eq!(earliest_stop("x ZQ7 END", &stops), Some((2, "ZQ7".to_owned())));
+        assert_eq!(
+            earliest_stop("x ZQ7 END", &stops),
+            Some((2, "ZQ7".to_owned()))
+        );
         assert_eq!(earliest_stop("x", &stops), None);
     }
 
@@ -1789,8 +1802,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let Some(sampling_params_or_list::Value::One(sampling)) =
-            lowered.sampling_params.as_ref().and_then(|p| p.value.as_ref())
+        let Some(sampling_params_or_list::Value::One(sampling)) = lowered
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.value.as_ref())
         else {
             panic!("one sampling configuration")
         };
@@ -1853,8 +1868,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let Some(sampling_params_or_list::Value::One(sampling)) =
-            lowered.sampling_params.as_ref().and_then(|p| p.value.as_ref())
+        let Some(sampling_params_or_list::Value::One(sampling)) = lowered
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.value.as_ref())
         else {
             panic!("one sampling configuration")
         };
