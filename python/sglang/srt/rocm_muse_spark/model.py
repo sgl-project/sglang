@@ -103,6 +103,10 @@ from sglang.srt.rocm_muse_spark.fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.rocm_muse_spark.fused_muse_spark_routing import FusedMuseSparkRouting
 from sglang.srt.rocm_muse_spark.fused_norm_gate import FusedRMSNormGate
 from sglang.srt.rocm_muse_spark.fused_norm_residual import FusedPostNormResidualPreNorm
+from sglang.srt.rocm_muse_spark.kv_head_groups import (
+    kv_group_layer_id,
+    kv_head_groups,
+)
 from sglang.srt.rocm_muse_spark.layers import (
     MuseSpark1xNormPreservingResidualConnection,
     MuseSpark1xRMSNorm,
@@ -712,15 +716,31 @@ class MuseSpark1xAttention(nn.Module):
             if self.use_rope
             else None
         )
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_idx,
-            prefix=add_prefix("attn", prefix),
-            use_irope=self.use_rope,
-            sliding_window_size=sliding_window or -1,
+        groups = kv_head_groups()
+        if self.num_kv_heads % groups:
+            raise ValueError(
+                f"SGLANG_ROCM_MUSE_PP_KV_GROUPS={groups} does not divide {self.num_kv_heads} KV heads"
+            )
+
+        def group_attention(group: int) -> RadixAttention:
+            return RadixAttention(
+                self.num_heads // groups,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads // groups,
+                layer_id=kv_group_layer_id(layer_idx, group),
+                prefix=add_prefix("attn", prefix),
+                use_irope=self.use_rope,
+                sliding_window_size=sliding_window or -1,
+            )
+
+        self.attn = group_attention(0)
+        # One attention per KV head group, each on its own pool layer; only group 0 is a submodule, under
+        # the model layer id.
+        object.__setattr__(
+            self,
+            "_kv_groups",
+            [self.attn] + [group_attention(group) for group in range(1, groups)],
         )
         self.norm_eps = config.rms_norm_eps
         # The output norm and the sigmoid gate are one fused kernel. The norm is
@@ -793,6 +813,25 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         return q, k
 
+    def _grouped_attention(self, q, k, v, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Attention and KV store per head group: the head slices are row-strided views."""
+        groups = self._kv_groups
+        rows = q.shape[0]
+        q, k, v = q.reshape(rows, -1), k.reshape(rows, -1), v.reshape(rows, -1)
+        q_width, kv_width = q.shape[1] // len(groups), k.shape[1] // len(groups)
+        return torch.cat(
+            [
+                attn(
+                    q[:, g * q_width : (g + 1) * q_width],
+                    k[:, g * kv_width : (g + 1) * kv_width],
+                    v[:, g * kv_width : (g + 1) * kv_width],
+                    forward_batch,
+                ).view(rows, q_width)
+                for g, attn in enumerate(groups)
+            ],
+            dim=-1,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -848,8 +887,10 @@ class MuseSpark1xAttention(nn.Module):
             )
             kv_written = fused_qk is not None
             q, k = fused_qk if kv_written else self.qk_norm_rope(positions, q, k)
+        grouped = len(self._kv_groups) > 1
         defer = (
             _VERIFY_REDUCE_NORM_GATE
+            and not grouped
             and (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_decode()
@@ -858,7 +899,11 @@ class MuseSpark1xAttention(nn.Module):
         )
         VERIFY_REDUCE_DEFERRAL.requested = defer
         try:
-            output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
+            if grouped:
+                assert not kv_written
+                output = self._grouped_attention(q, k, v, forward_batch)
+            else:
+                output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
         finally:
             VERIFY_REDUCE_DEFERRAL.requested = False
         state = VERIFY_REDUCE_DEFERRAL.take() if defer else None
@@ -1879,6 +1924,10 @@ class MuseSpark1xModel(nn.Module):
         if parallel.pp_size > 1 and parallel.tp_size != 1:
             raise NotImplementedError(
                 "Muse Spark pipeline stages run TP1 on ROCm (use --tp-size 1)"
+            )
+        if kv_head_groups() > 1 and parallel.pp_size == 1:
+            raise ValueError(
+                "SGLANG_ROCM_MUSE_PP_KV_GROUPS groups the KV heads of pipeline stages (--pp-size > 1)"
             )
         # The draft of a speculative last stage embeds the committed tokens.
         self.has_embedding = self.pp_group.is_first_rank or (

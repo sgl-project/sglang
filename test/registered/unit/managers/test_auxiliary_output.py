@@ -426,6 +426,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         to_finish=None,
         finished_reason=None,
         discard_output_reason=None,
+        disagg_kv_sent=False,
         pending_bootstrap=False,
         return_logprob=False,
         return_sampling_mask=False,
