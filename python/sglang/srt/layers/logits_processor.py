@@ -534,6 +534,8 @@ class LogitsProcessor(nn.Module):
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        # Set on a draft model's processor by configure_draft_head_tp.
+        self.draft_head_tp = None
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
@@ -692,12 +694,14 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
-        draft_head_tp=None,
     ) -> LogitsProcessorOutput:
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         token_indices_to_pool = None
+        draft_head_tp = None
         if isinstance(logits_metadata, ForwardBatch):
+            if logits_metadata.mtp_draft_head_tp:
+                draft_head_tp = self.draft_head_tp
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             token_indices_to_pool = logits_metadata.token_indices_to_pool
             verify_vocab_shards = self._batch_vocab_shards(logits_metadata)

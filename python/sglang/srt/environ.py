@@ -1920,9 +1920,6 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
-    # Shard the Qwen3.5 greedy MTP draft head over four node-local ranks (decode
-    # workers with DP attention only; logs the reason when it does not turn on).
-    SGLANG_MTP_DRAFT_HEAD_TP = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

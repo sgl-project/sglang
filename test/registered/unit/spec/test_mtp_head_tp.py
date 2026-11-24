@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.layers.mtp_head_tp import (
+    _ineligible_reason,
     configure_draft_head_tp,
     head_tp4_rank_groups,
     local_argmax_pair,
@@ -56,6 +57,66 @@ class TestMTPHeadTopology(unittest.TestCase):
                 configure_draft_head_tp(model, None)
             self.assertFalse(hasattr(model, "draft_head_tp"))
             self.assertIn("megakernel", logs.output[0])
+
+
+class TestMTPHeadLayouts(unittest.TestCase):
+    def reason(self, enable_dp_lm_head, head_tp_size, attn_tp_size=1):
+        parallel = SimpleNamespace(
+            pp_size=1,
+            tp_size=4,
+            attn_dp_size=4 // attn_tp_size,
+            attn_tp_size=attn_tp_size,
+            enable_dp_lm_head=enable_dp_lm_head,
+        )
+        spec = SimpleNamespace(
+            speculative_eagle_topk=1,
+            speculative_use_rejection_sampling=False,
+            speculative_adaptive=False,
+        )
+        lm_head = SimpleNamespace(
+            weight=SimpleNamespace(
+                is_cuda=True, dtype=torch.bfloat16, ndim=2, shape=(248320, 8)
+            ),
+            tp_size=head_tp_size,
+            num_added_embeddings=0,
+        )
+        lp = SimpleNamespace(
+            use_fp32_lm_head=False,
+            logit_scale=None,
+            final_logit_softcapping=None,
+            return_full_logits=False,
+        )
+        model = SimpleNamespace(
+            lm_head=lm_head, logits_processor=lp, config=SimpleNamespace(vocab_size=248320)
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_megakernel._offers_eagle_entries",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.kernel_plugins.nvidia.binding.megakernel_entry",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="decode"),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_lora",
+                return_value=SimpleNamespace(enable_lora=False),
+            ),
+        ):
+            return _ineligible_reason(model, None, parallel, spec)
+
+    def test_replicated_and_stock_sharded_heads_are_eligible(self):
+        self.assertIsNone(self.reason(enable_dp_lm_head=True, head_tp_size=1))
+        self.assertIsNone(self.reason(enable_dp_lm_head=False, head_tp_size=4))
+
+    def test_other_layouts_decline(self):
+        self.assertIn("not replicated", self.reason(True, 4))
+        self.assertIn("not sharded", self.reason(False, 1))
+        self.assertIn("pure attention DP", self.reason(False, 4, attn_tp_size=2))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

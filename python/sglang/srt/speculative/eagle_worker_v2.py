@@ -452,7 +452,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
-        if envs.SGLANG_MTP_DRAFT_HEAD_TP.get():
+        if get_spec().draft_head_tp != "off":
             from sglang.srt.layers.mtp_head_tp import configure_draft_head_tp
 
             configure_draft_head_tp(self.draft_runner.model, self.hot_token_id)

@@ -132,25 +132,38 @@ def merge_argmax_pairs(pairs):
 
 
 class DraftHeadTP(nn.Module):
-    def __init__(self, group, vocab_size):
+    def __init__(self, group, vocab_size, presharded=False):
         super().__init__()
         self.group = group
         self.vocab_size = vocab_size
+        # presharded: the weight is this rank's padded vocab shard (stock TP lm_head).
+        self.presharded = presharded
 
     def forward(self, hidden, weight, draft_nan_sentinel=False):
         size, rank = self.group.world_size, self.group.rank_in_group
         rows = hidden.shape[0]
         gathered = self.group.all_gather(hidden.contiguous(), dim=0)
-        shard = triton.cdiv(self.vocab_size, size)
-        start, end = (
-            min(rank * shard, self.vocab_size),
-            min((rank + 1) * shard, self.vocab_size),
-        )
-        logits = torch.matmul(gathered.to(weight.dtype), weight[start:end].T)
-        pairs = local_argmax_pair(logits, start, draft_nan_sentinel=draft_nan_sentinel)
+        if self.presharded:
+            start = rank * weight.shape[0]
+            shard_weight = weight
+            width = max(min(weight.shape[0], self.vocab_size - start), 0)
+        else:
+            shard = triton.cdiv(self.vocab_size, size)
+            start, end = (
+                min(rank * shard, self.vocab_size),
+                min((rank + 1) * shard, self.vocab_size),
+            )
+            shard_weight = weight[start:end]
+            width = end - start
+        logits = torch.matmul(gathered.to(weight.dtype), shard_weight.T)
+        pairs = local_argmax_pair(logits, start, width, draft_nan_sentinel)
         gathered_pairs = self.group.all_gather(pairs, dim=0).view(size, size * rows, 2)
         selected = merge_argmax_pairs(gathered_pairs)
         return selected[rank * rows : (rank + 1) * rows]
+
+
+def draft_head_tp_of(model):
+    return getattr(getattr(model, "logits_processor", None), "draft_head_tp", None)
 
 
 def head_tp4_rank_groups(rank_hosts):
@@ -169,7 +182,6 @@ def head_tp4_rank_groups(rank_hosts):
 
 def _ineligible_reason(model, hot_token_id, parallel, spec):
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_entry
-    from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
     from sglang.srt.runtime_context import get_disagg, get_lora
     from sglang.srt.speculative.eagle_megakernel import _offers_eagle_entries
 
@@ -180,13 +192,11 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
     ):
         # The megakernel draft folds top-1 itself and never reaches draft_topk_index.
         return "the draft runs a megakernel entry"
-    if not isinstance(model, Qwen3_5ForCausalLMMTP):
-        return "the draft is not Qwen3.5 MTP"
     # Graph-only path: the DP draft graph buckets keep every rank's row count in step.
     if get_disagg().disaggregation_mode != "decode":
         return "not a decode worker of a disaggregated deployment"
-    if not (parallel.enable_dp_lm_head and parallel.attn_dp_size == parallel.tp_size):
-        return "needs --enable-dp-lm-head with attention DP size equal to tp_size"
+    if not (parallel.attn_dp_size == parallel.tp_size and parallel.attn_tp_size == 1):
+        return "needs pure attention DP (attn_dp_size == tp_size)"
     if (
         spec.speculative_eagle_topk != 1
         or spec.speculative_use_rejection_sampling
@@ -196,17 +206,24 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
         return "needs greedy top-1 drafting without adaptive spec or a token map"
     if get_lora().enable_lora:
         return "LoRA is enabled"
-    weight = getattr(getattr(model, "lm_head", None), "weight", None)
+    lm_head = getattr(model, "lm_head", None)
     lp = getattr(model, "logits_processor", None)
-    if not (
+    weight = getattr(lm_head, "weight", None)
+    if lp is None or not (
         weight is not None
         and weight.is_cuda
         and weight.dtype == torch.bfloat16
         and weight.ndim == 2
-        and weight.shape[0] >= model.config.vocab_size
         and model.config.vocab_size < 2**24 - 1
+        and getattr(lm_head, "num_added_embeddings", 0) == 0
     ):
-        return "the lm_head is not a full bf16 CUDA matrix"
+        return "the lm_head is not a plain bf16 CUDA matrix"
+    if parallel.enable_dp_lm_head:
+        # --enable-dp-lm-head: every rank holds the whole vocabulary.
+        if lm_head.tp_size != 1 or weight.shape[0] < model.config.vocab_size:
+            return "the lm_head is not replicated"
+    elif lm_head.tp_size != parallel.tp_size:
+        return "the lm_head is not sharded over the TP group"
     if (
         lp.use_fp32_lm_head
         or lp.logit_scale is not None
@@ -222,7 +239,10 @@ def configure_draft_head_tp(model, hot_token_id):
 
     log = logging.getLogger(__name__)
     parallel = get_parallel()
-    reason = _ineligible_reason(model, hot_token_id, parallel, get_spec())
+    spec = get_spec()
+    # "auto" explains itself at info level, an explicit "on" that cannot apply warns.
+    declined = log.warning if spec.draft_head_tp == "on" else log.info
+    reason = _ineligible_reason(model, hot_token_id, parallel, spec)
     # Agree once before capture; eager/prefill never opt into the graph-only path.
     agreement = torch.tensor([int(reason is None)], dtype=torch.int32, device="cpu")
     torch.distributed.all_reduce(
@@ -231,16 +251,16 @@ def configure_draft_head_tp(model, hot_token_id):
     group = parallel.tp_group
     if not agreement.item():
         if group.rank == 0:
-            log.info(
-                "MTP draft head TP4 not enabled: %s",
-                reason or "another TP rank is ineligible",
+            declined(
+                "Draft head TP not enabled: %s", reason or "another TP rank is ineligible"
             )
         return
-    if parallel.tp_size > 4 and group.ranks != list(
+    presharded = not parallel.enable_dp_lm_head
+    if not presharded and parallel.tp_size > 4 and group.ranks != list(
         range(torch.distributed.get_world_size())
     ):
         if group.rank == 0:
-            log.info("MTP draft head TP4 not enabled: the TP group is not the world")
+            declined("Draft head TP not enabled: the TP group is not the world")
         return
     # Startup-only topology agreement; replay never inspects device values.
     hosts = [None] * parallel.tp_size
@@ -249,22 +269,27 @@ def configure_draft_head_tp(model, hot_token_id):
         (group.rank, socket.gethostname(), group.local_rank),
         group=group.cpu_group,
     )
-    groups = head_tp4_rank_groups(hosts)
+    if presharded:
+        # The stock TP shard already splits the vocabulary over the whole TP group.
+        groups = [[rank for rank, _, _ in hosts]] if len({h for _, h, _ in hosts}) == 1 else None
+    else:
+        groups = head_tp4_rank_groups(hosts)
     if groups is None:
         if group.rank == 0:
-            log.info("MTP draft head TP4 not enabled: a group of 4 spans several nodes")
+            declined("Draft head TP not enabled: a head group spans several nodes")
         return
-    if parallel.tp_size > 4:
+    if not presharded and parallel.tp_size > 4:
         from sglang.srt.distributed.parallel_state import init_mtp_head_tp_group
 
         group = init_mtp_head_tp_group(groups, group)
     weight = model.lm_head.weight
-    model.draft_head_tp = DraftHeadTP(group, model.config.vocab_size)
+    model.logits_processor.draft_head_tp = DraftHeadTP(
+        group, model.config.vocab_size, presharded
+    )
     log.info(
-        "MTP draft head TP4 enabled: rank=%d group=%s full_weight_shape=%s "
-        "shared_weight_storage_bytes=%d",
+        "Draft head TP enabled: rank=%d group=%s presharded=%s weight_shape=%s",
         group.rank,
         group.ranks,
+        presharded,
         tuple(weight.shape),
-        weight.untyped_storage().nbytes(),
     )
