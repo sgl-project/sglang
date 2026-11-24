@@ -1,8 +1,6 @@
 import logging
 from typing import Optional
 
-import torch
-
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -48,7 +46,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self.target_worker = target_worker
 
         # Args for easy access
@@ -167,12 +164,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             target_vocab_size=target_worker.model_runner.model_config.vocab_size,
             target_tokenizer=target_worker.tokenizer,
         )
-
-        # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
