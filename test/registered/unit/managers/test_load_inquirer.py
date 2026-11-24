@@ -63,7 +63,6 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         )
         return SchedulerLoadInquirer(
             disaggregation_mode=disaggregation_mode,
-            server_args=None,
             max_total_num_tokens=1000,
             max_running_requests=10,
             pool_stats_observer=None,
@@ -304,7 +303,6 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         get_storage_span = Mock(return_value=(20, 80))
         scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
-            server_args=None,
             max_total_num_tokens=1000,
             kv_shard_widening=1,
             max_running_requests=10,
