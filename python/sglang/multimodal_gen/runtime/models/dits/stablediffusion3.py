@@ -28,7 +28,6 @@ logger = init_logger(__name__)
 
 
 class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["JointTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     layer_names = ["transformer_blocks"]
@@ -92,8 +91,6 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.proj_out = nn.Linear(
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
-
-        self.gradient_checkpointing = False
 
     def forward(
         self,
