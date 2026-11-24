@@ -49,6 +49,16 @@ class TestLongcatFlashRouterHpcGemm(CustomTestCase):
                 ):
                     LongcatFlashMoE(config=config, layer_id=0)
 
+            # EvenMoE routing leaves ep_dispatch_algorithm unset; its dynamic
+            # dispatch maps zero-expert ids to -1 and drops the identity output.
+            with (
+                get_exec().moe.override(
+                    ep_dispatch_algorithm=None, moe_load_balancer_algorithm="dynamic"
+                ),
+                self.assertRaisesRegex(ValueError, "LongCat zero experts"),
+            ):
+                LongcatFlashMoE(config=config, layer_id=0)
+
             with (
                 get_exec().moe.override(ep_dispatch_algorithm=None),
                 get_parallel().override(tp_size=1),

@@ -52,33 +52,63 @@ def handle_moe_load_balancer(server_args: Any):
     )
 
     pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
-    if pipeline is not None:
-        if cfg.ep_dispatch_algorithm is not None:
-            raise ValueError(
-                "--moe-load-balancer-algorithm cannot be combined with --ep-dispatch-algorithm"
-            )
-        resolutions = {"moe_load_balancer_algorithm": pipeline.name}
-        capabilities = pipeline.capabilities
-        if not capabilities.supports_concurrent_microbatches and (
-            cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap
-        ):
-            raise ValueError(
-                "The selected EvenMoE pipeline does not support overlapping microbatches."
-            )
-        if (
-            capabilities.graph_stability == "realloc_on_placement_change"
-            and cfg.enable_eplb
-            and not cfg.disable_cuda_graph
-        ):
-            raise ValueError(
-                "The selected EvenMoE pipeline changes routing buffers after placement updates; "
-                "--enable-eplb requires --disable-cuda-graph."
-            )
-        if refreshes_placement_per_layer(pipeline):
-            _check_layer_refresh(cfg)
-        if uses_coupled_placement(pipeline):
-            _check_coupled_placement(cfg)
-        declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
+    if pipeline is None:
+        return
+    capabilities = pipeline.capabilities
+    if cfg.ep_dispatch_algorithm is not None:
+        raise ValueError(
+            "--moe-load-balancer-algorithm cannot be combined with --ep-dispatch-algorithm"
+        )
+    if not capabilities.supports_concurrent_microbatches and (
+        cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap
+    ):
+        raise ValueError(
+            "The selected EvenMoE pipeline does not support overlapping microbatches."
+        )
+    if cfg.elastic_ep_backend is not None and capabilities.requires_placement_state:
+        # Placement-state routers (LPLB, Metro) keep the EP size they were built
+        # with across placement commits; nothing rebuilds them on an EP resize.
+        raise ValueError(
+            "The selected EvenMoE pipeline keeps routing state sized for the "
+            "initial EP group and does not support --elastic-ep-backend."
+        )
+    if refreshes_placement_per_layer(pipeline):
+        _check_layer_refresh(cfg)
+    if uses_coupled_placement(pipeline):
+        _check_coupled_placement(cfg)
+    declare_resolution(
+        server_args,
+        "_handle_moe_load_balancer",
+        moe_load_balancer_algorithm=pipeline.name,
+    )
+
+
+def _check_placement_graph_stability(server_args: Any, pipeline: Any) -> None:
+    """Reject captured graphs that an EPLB update would leave pointing at
+    replaced routing buffers."""
+    if (
+        pipeline is None
+        or pipeline.capabilities.graph_stability != "realloc_on_placement_change"
+    ):
+        return
+    view = resolved_view(server_args)
+    if not view.enable_eplb:
+        return
+    # Resolved per-phase backends, not --disable-cuda-graph: per-phase flags
+    # override that legacy input, and A2A resolution may disable a phase.
+    cg_config = view.cuda_graph_config
+    captured = [
+        phase
+        for phase in (Phase.DECODE, Phase.PREFILL)
+        if cg_config is None or cg_config[phase].backend != Backend.DISABLED
+    ]
+    if captured:
+        raise ValueError(
+            "The selected EvenMoE pipeline changes routing buffers after placement "
+            "updates; --enable-eplb requires CUDA graphs disabled, but "
+            f"{'/'.join(captured)} still captures. Pass "
+            "--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled."
+        )
 
 
 def _check_layer_refresh(cfg: Any) -> None:
@@ -789,6 +819,9 @@ def handle_a2a_moe(server_args: Any):
                 "must be >= the per-rank pplx dispatch tokens "
                 "(chunked_prefill_size, or the decode cuda-graph batch size)"
             )
+
+    # After the A2A writes above, which may disable a graph phase.
+    _check_placement_graph_stability(server_args, pipeline)
 
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:

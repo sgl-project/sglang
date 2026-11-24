@@ -262,14 +262,18 @@ class LongcatFlashMoE(nn.Module):
         self.top_k = config.moe_topk
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
-        if (
-            self.zero_expert_num > 0
-            and get_exec().moe.ep_dispatch_algorithm is not None
+        moe_config = get_exec().moe
+        # EvenMoE routing leaves ep_dispatch_algorithm unset and turns zero-expert
+        # ids, which lie past the placement tables, into -1.
+        if self.zero_expert_num > 0 and (
+            moe_config.ep_dispatch_algorithm is not None
+            or moe_config.moe_load_balancer_algorithm is not None
         ):
             raise ValueError(
                 "LongCat zero experts do not support expert placement remapping. "
-                "Disable EPLB, redundant experts, custom expert placement, and "
-                "--ep-dispatch-algorithm for this model."
+                "Disable EPLB, redundant experts, custom expert placement, "
+                "--ep-dispatch-algorithm, and --moe-load-balancer-algorithm "
+                "for this model."
             )
 
         if config.rounter_params_dtype == "float32":

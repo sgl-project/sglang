@@ -466,7 +466,6 @@ def test_initial_layout_comes_from_the_placement_policy(algorithm):
     [
         ({"pp_size": 2}, "PP=1"),
         ({"enable_eplb": False}, "recorded placement"),
-        ({"disable_cuda_graph": False}, "disable-cuda-graph"),
         ({"enable_two_batch_overlap": True}, "microbatches"),
         ({"expert_distribution_recorder_mode": "per_token"}, "stat expert"),
     ],

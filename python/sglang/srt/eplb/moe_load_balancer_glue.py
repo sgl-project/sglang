@@ -135,7 +135,14 @@ def get_moe_load_balancer_pipeline(algorithm):
             "(https://github.com/ai-dynamo/evenmoe)."
         ) from error
 
-    return RoutingPipeline.from_value(algorithm)
+    pipeline = RoutingPipeline.from_value(algorithm)
+    if not pipeline.steps:
+        # A set flag must name a policy; leaving it unset is the off state.
+        raise ValueError(
+            f"--moe-load-balancer-algorithm {algorithm!r} names no routing "
+            "policy; omit the flag to disable EvenMoE routing."
+        )
+    return pipeline
 
 
 def uses_coupled_placement(pipeline_or_balancer) -> bool:

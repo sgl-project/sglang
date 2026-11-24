@@ -2594,23 +2594,30 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
 
 
 class TestMoELoadBalancerAlgorithm(unittest.TestCase):
-    def test_pipeline_capabilities_gate_overlap_and_online_graphs(self):
-        from types import SimpleNamespace
-
-        pipeline = SimpleNamespace(
+    @staticmethod
+    def _pipeline(**capabilities):
+        defaults = dict(
+            supports_concurrent_microbatches=True,
+            graph_stability="stable",
+            requires_post_topk_routing=True,
+            requires_placement_state=False,
+            routes_shared_expert=False,
+        )
+        return SimpleNamespace(
             name="custom",
             placement_policy=None,
-            capabilities=SimpleNamespace(
-                supports_concurrent_microbatches=False,
-                graph_stability="realloc_on_placement_change",
-                requires_post_topk_routing=True,
-                routes_shared_expert=False,
-            ),
+            capabilities=SimpleNamespace(**{**defaults, **capabilities}),
+        )
+
+    def test_pipeline_capabilities_gate_overlap_and_elastic_ep(self):
+        pipeline = self._pipeline(
+            supports_concurrent_microbatches=False, requires_placement_state=True
         )
         for fields, message in (
             ({"enable_two_batch_overlap": True}, "microbatches"),
             ({"enable_single_batch_overlap": True}, "microbatches"),
-            ({"enable_eplb": True}, "disable-cuda-graph"),
+            # LPLB/Metro state keeps the initial EP size after an elastic resize.
+            ({"elastic_ep_backend": "nixl"}, "elastic-ep-backend"),
         ):
             with (
                 self.subTest(**fields),
@@ -2627,6 +2634,44 @@ class TestMoELoadBalancerAlgorithm(unittest.TestCase):
                         **fields,
                     )
                 )
+
+    def test_graph_guard_reads_resolved_phase_backends(self):
+        """Per-phase graph flags override --disable-cuda-graph, so the guard must
+        read the resolved phases: both disabled passes, decode=full is rejected."""
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.arg_groups.moe_hook import _check_placement_graph_stability
+
+        pipeline = self._pipeline(graph_stability="realloc_on_placement_change")
+        both_disabled = dict(
+            cuda_graph_backend_decode="disabled",
+            cuda_graph_backend_prefill="disabled",
+        )
+        decode_reenabled = dict(
+            disable_cuda_graph=True, cuda_graph_backend_decode="full"
+        )
+        for fields, rejected in ((both_disabled, False), (decode_reenabled, True)):
+            with self.subTest(**fields):
+                args = ServerArgs(model_path="dummy", enable_eplb=True, **fields)
+                parse_cuda_graph_config(args)
+                if rejected:
+                    with self.assertRaisesRegex(ValueError, "decode still captures"):
+                        _check_placement_graph_stability(args, pipeline)
+                else:
+                    _check_placement_graph_stability(args, pipeline)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    def test_rejects_values_that_name_no_policy(self):
+        """A set flag must name a policy: an empty pipeline would suppress native
+        logical-to-physical dispatch while routing nothing itself."""
+        for algorithm in ("disabled", "none", ""):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(ValueError, "names no routing policy"),
+            ):
+                get_moe_load_balancer_pipeline(algorithm)
+        self.assertEqual(get_moe_load_balancer_pipeline("static").name, "static")
 
     def test_replica_routing_preserves_shared_fusion_configuration(self):
         from types import SimpleNamespace
@@ -3665,7 +3710,6 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
             ("lplb", "megamoe", "megamoe"),
             ("static", "mori", "mori"),
             ("ultraep", "megamoe", "deepep"),
-            ("disabled", "megamoe", "megamoe"),
         ]
         for algorithm, backend, expected in cases:
             with self.subTest(algorithm=algorithm, backend=backend):
