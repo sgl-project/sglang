@@ -199,14 +199,6 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
 
     if parallel.pp_size != 1 or parallel.tp_size not in (4, 8, 16):
         return "needs pp_size 1 and tp_size 4, 8 or 16"
-    if spec.draft_head_tp == "auto":
-        if is_hip():
-            return "not validated on ROCm; use --draft-head-tp on to force it"
-        if type(model).__name__ not in VALIDATED_DRAFT_MODELS:
-            return (
-                f"not validated for {type(model).__name__}; "
-                "use --draft-head-tp on to force it"
-            )
     if _offers_eagle_entries(draft_model=model) or (
         megakernel_entry(model, "draft_step_fold") is not None
     ):
@@ -257,6 +249,15 @@ def _ineligible_reason(model, hot_token_id, parallel, spec):
         or lp.return_full_logits
     ):
         return "the logits processor alters the logits"
+    # Last, so that "not validated" is only reported for deployments that otherwise qualify.
+    if spec.draft_head_tp == "auto":
+        if is_hip():
+            return "not validated on ROCm; use --draft-head-tp on to force it"
+        if type(model).__name__ not in VALIDATED_DRAFT_MODELS:
+            return (
+                f"not validated for {type(model).__name__}; "
+                "use --draft-head-tp on to force it"
+            )
     return None
 
 

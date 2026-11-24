@@ -97,6 +97,7 @@ class TestMTPHeadLayouts(unittest.TestCase):
         org_vocab_size=248320,
         rows=62080,
         hip=False,
+        tied=False,
     ):
         parallel = SimpleNamespace(
             pp_size=1,
@@ -124,6 +125,9 @@ class TestMTPHeadLayouts(unittest.TestCase):
             org_vocab_size=org_vocab_size,
             bias=bias,
         )
+        if tied:
+            # A tied head is the embedding module, which has no bias attribute.
+            del lm_head.bias
         lp = SimpleNamespace(
             use_fp32_lm_head=False,
             logit_scale=None,
@@ -164,6 +168,9 @@ class TestMTPHeadLayouts(unittest.TestCase):
         self.assertIsNone(self.reason(enable_dp_lm_head=True))
         self.assertIsNone(self.reason())
 
+    def test_tied_head_without_bias_attribute_is_eligible(self):
+        self.assertIsNone(self.reason(tied=True))
+
     def test_declined_conditions(self):
         cases = (
             ("not replicated", dict(enable_dp_lm_head=True, head_tp_size=8)),
@@ -188,6 +195,12 @@ class TestMTPHeadLayouts(unittest.TestCase):
             self.reason(mode="auto", name="Qwen4ExpForCausalLMMTP"),
         )
         self.assertIn("ROCm", self.reason(mode="auto", hip=True))
+        # "not validated" is only reported when everything else qualifies.
+        self.assertIn(
+            "not a decode worker",
+            self.reason(mode="auto", name="Qwen4ExpForCausalLMMTP", disagg="null"),
+        )
+        self.assertIn("not sharded", self.reason(mode="auto", head_tp_size=1, hip=True))
         # An explicit "on" forces any architecture that meets the conditions.
         self.assertIsNone(self.reason(mode="on", name="Qwen4ExpForCausalLMMTP"))
 
