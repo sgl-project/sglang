@@ -47,10 +47,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import prepare_page_unified_write_back_staging
-from sglang.srt.mem_cache.pool_host.mha import (
-    prepare_mha_write_back_staging,
-    write_back_staging_page_chunk,
-)
+from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -105,9 +102,10 @@ def prepare_hicache_staging(
             ):
                 return
             # Ratio-based host pools can only shrink with post-capture KV sizing.
-            # Sidecars instead inherit their target host pool's capacity.
-            page_capacity = write_back_staging_page_chunk(page_size)
-            if memory.hicache_size <= 0 and not sidecar:
+            # Fixed-size pools and sidecars, which inherit their target host
+            # pool's capacity, leave only the per-round chunk.
+            page_capacity = None
+            if not sidecar and memory.hicache_size <= 0:
                 capacity_tokens = (
                     pool.size
                     if pool.host_capacity_tokens is None

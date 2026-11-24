@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
+    mha_bytes_per_token,
     write_back_staging_page_chunk,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -46,8 +47,14 @@ MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
 LAYOUTS = ["layer_first", "page_first"]
 STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
-# MHA stages write_back_staging_page_chunk(PAGE_SIZE) pages per round
-_MHA_CHUNK = write_back_staging_page_chunk(PAGE_SIZE)
+
+
+def _mha_chunk(page_size: int, element_dim: int = MHA_ELEMENT_DIMS[0]) -> int:
+    """Pages per staging round of a bf16 test pool (K and V of element_dim)."""
+    return write_back_staging_page_chunk(page_size, 2 * element_dim * NUM_LAYERS * 2)
+
+
+_MHA_CHUNK = _mha_chunk(PAGE_SIZE)
 MHA_STAGED_WRITE_BACK_PAGE_COUNTS = sorted(
     {
         1,
@@ -387,7 +394,6 @@ def _run_page_first_staged_write_back_mha(
     host_order: str = "descending",
     page_size: int = PAGE_SIZE,
 ) -> None:
-    chunk = write_back_staging_page_chunk(page_size)
     pool_size = page_size * (page_count + 8)
     head_num = (
         element_dim // 128 if element_dim >= 128 and element_dim % 128 == 0 else 1
@@ -422,6 +428,12 @@ def _run_page_first_staged_write_back_mha(
     # gfx950's direct copy tiles every 16-byte multiple (hicache._default_unroll)
     if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
+    chunk = write_back_staging_page_chunk(
+        page_size,
+        mha_bytes_per_token(
+            device_pool.get_device_pool_infos()[0].buffer_info, NUM_LAYERS
+        ),
+    )
     assert host_pool.staging_page_capacity > 0
     if page_count > chunk:
         assert host_pool.staging_page_capacity < page_count
@@ -644,7 +656,7 @@ def test_hicache_page_first_staged_write_back_mha_coalesced_runs(
     )
 
 
-_PAGE1_CHUNK = write_back_staging_page_chunk(1)
+_PAGE1_CHUNK = _mha_chunk(1)
 
 
 @pytest.mark.parametrize("host_order", ["descending", "ascending", "gapped"])
@@ -653,7 +665,7 @@ def test_hicache_page_first_staged_write_back_mha_page_size_1(
     host_order: str, page_count: int
 ) -> None:
     """Page size 1 (the default): one token per page, so runs of contiguous host
-    slots are what coalescing merges; a round stages at least 4096 tokens."""
+    slots are what coalescing merges; a round stages up to 4096 tokens."""
     _run_page_first_staged_write_back_mha(
         "page_first", MHA_ELEMENT_DIMS[0], page_count, host_order, page_size=1
     )

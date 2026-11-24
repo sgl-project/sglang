@@ -1,4 +1,4 @@
-"""Page-unified transfer scratch must survive final KV sizing and host assembly."""
+"""HiCache write-back scratch must survive final KV sizing and host assembly."""
 
 import unittest
 from contextlib import ExitStack, contextmanager
@@ -402,6 +402,71 @@ class TestPageUnifiedStaging(CustomTestCase):
                             page_capacity=4,
                             staging=staging,
                         )
+
+
+@contextmanager
+def _mha_page_first_environment(**memory_overrides):
+    """The staged MHA write-back path, with its JIT kernels stubbed out."""
+    with ExitStack() as stack:
+        memory = stack.enter_context(
+            _cpu_staging_environment(
+                hicache_mem_layout="page_first", **memory_overrides
+            )
+        )
+        stack.enter_context(mock.patch.object(mha, "_is_cuda", True))
+        stack.enter_context(
+            mock.patch.object(mha, "can_use_write_back_jit_kernel", return_value=True)
+        )
+        stack.enter_context(
+            mock.patch.object(mha, "can_use_hicache_jit_kernel", return_value=False)
+        )
+        yield memory
+
+
+class TestMHAPageFirstStaging(CustomTestCase):
+    def test_staging_bytes_are_capped_for_small_pages(self):
+        """Page size 1 stages up to 4096 tokens per round, but a wide model
+        (32 layers x 32 KV heads x 128, BF16: 512 KiB per token) must not
+        reserve 2 GiB of GPU scratch for it; 64 pages stay the floor."""
+        real_empty = torch.empty
+
+        def meta_empty(shape, *, dtype, device):
+            return real_empty(shape, dtype=dtype, device="meta")
+
+        # 32 layers x head_num x (128 + 128) x 2 B = head_num x 16 KiB per token.
+        for head_num, page_size, tokens in (
+            (32, 1, 128),
+            (1, 1, 4096),
+            (32, 64, 64 * 64),
+        ):
+            with (
+                self.subTest(head_num=head_num, page_size=page_size),
+                _mha_page_first_environment(),
+                mock.patch.object(
+                    kv_cache_builder,
+                    "get_schedule",
+                    return_value=SimpleNamespace(page_size=page_size),
+                ),
+            ):
+                pool = MHATokenToKVPool(
+                    size=page_size * 2,
+                    page_size=page_size,
+                    head_num=head_num,
+                    head_dim=128,
+                    dtype=torch.bfloat16,
+                    layer_num=32,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    enable_alt_stream=False,
+                )
+                # A large host pool, so only the per-round chunk bounds it.
+                pool.host_capacity_tokens = 1 << 16
+                with mock.patch.object(torch, "empty", side_effect=meta_empty):
+                    kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
+                self.assertEqual(
+                    [buf.shape[0] for buf in pool.hicache_write_back_staging],
+                    [tokens] * 2,
+                )
 
 
 if __name__ == "__main__":
