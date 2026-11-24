@@ -37,7 +37,7 @@ class ChainAccept(msgspec.Struct):
     """A chain verify's (DFlash, DSpark) accept, per request: the first
     ``correct_len`` drafts match the target, ``bonus`` follows them, and the
     first ``commit_lens`` tokens of ``out_tokens`` [bs, width] commit. A
-    request capped by ``VerifyStep.cap_chain_accept`` commits fewer than
+    request capped by ``VerifyStep.cap_chain_accept`` commits one token, not
     ``correct_len + 1``; ``correct_len`` stays the accept kernel's, for the
     acceptance estimators."""
 

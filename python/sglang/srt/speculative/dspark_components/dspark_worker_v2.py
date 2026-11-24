@@ -1253,8 +1253,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-            # The graph accepts never run with a custom logit processor: it
-            # adjusts the logits.
+            # The graph accepts never run with a custom logit processor: the
+            # processor adjusts the logits.
             verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
