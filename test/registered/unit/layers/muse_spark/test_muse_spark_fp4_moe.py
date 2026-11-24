@@ -10,21 +10,25 @@ register_cpu_ci(est_time=1, stage="base-a", runner_config="cpu")
 
 # Muse Spark routes each token to 8 of 256 experts; EP8 leaves 32 on each rank.
 TOPK = 8
+NUM_EXPERTS = 256
 NUM_LOCAL_EXPERTS = 32
 
 
-def _stock_block_size_m(num_tokens):
+def _stock_block_size_m(num_tokens, num_local_experts=NUM_LOCAL_EXPERTS):
     """The uncapped rule: the first candidate the mean routes per expert underfill."""
     for block_size_m in (8, 16, 32, 48, 64):
-        if num_tokens * TOPK / NUM_LOCAL_EXPERTS / block_size_m < 0.9:
+        if num_tokens * TOPK / num_local_experts / block_size_m < 0.9:
             return block_size_m
     return 64
 
 
 class TestMuseSparkMarlinBlockSize(CustomTestCase):
-    def block_size_m(self, num_tokens):
+    def block_size_m(self, num_tokens, num_local_experts=NUM_LOCAL_EXPERTS):
         return _marlin_block_size_m(
-            num_tokens=num_tokens, topk=TOPK, num_local_experts=NUM_LOCAL_EXPERTS
+            num_tokens=num_tokens,
+            topk=TOPK,
+            num_local_experts=num_local_experts,
+            num_experts=NUM_EXPERTS,
         )
 
     def test_pinned_sizes(self):
@@ -37,7 +41,7 @@ class TestMuseSparkMarlinBlockSize(CustomTestCase):
         self.assertEqual(_stock_block_size_m(256), 64)
 
     def test_small_batches_cap_the_stock_rule_at_16_rows(self):
-        # Up to 64 routes per local expert: 256 tokens here.
+        # Up to 8 routes per expert: 256 tokens.
         for num_tokens in range(257):
             with self.subTest(num_tokens=num_tokens):
                 self.assertEqual(
@@ -50,6 +54,22 @@ class TestMuseSparkMarlinBlockSize(CustomTestCase):
             with self.subTest(num_tokens=num_tokens):
                 self.assertEqual(
                     self.block_size_m(num_tokens), _stock_block_size_m(num_tokens)
+                )
+
+    def test_expert_tp_keeps_the_stock_rule(self):
+        # --ep-size 1 puts all 256 experts on every rank.
+        expected = {128: 8, 753: 32, 2048: 64}
+        for num_tokens, block_size_m in expected.items():
+            with self.subTest(num_tokens=num_tokens):
+                self.assertEqual(
+                    self.block_size_m(num_tokens, num_local_experts=NUM_EXPERTS),
+                    block_size_m,
+                )
+        for num_tokens in range(4097):
+            with self.subTest(num_tokens=num_tokens):
+                self.assertEqual(
+                    self.block_size_m(num_tokens, num_local_experts=NUM_EXPERTS),
+                    _stock_block_size_m(num_tokens, num_local_experts=NUM_EXPERTS),
                 )
 
 
