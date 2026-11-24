@@ -49,6 +49,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    start_request_watchdog,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
 from sglang.multimodal_gen.runtime.scheduler_client import (
     async_scheduler_client,
@@ -112,10 +115,18 @@ async def _wait_until_http_live(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become live at {liveness_url}")
 
 
-async def _run_server_warmup_after_http_live(
-    server_args: ServerArgs, warmup_done: asyncio.Event
-) -> None:
+async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
+    server_args = app.state.server_args
+    warmup_done = app.state.server_warmup_done
+
+    def check_backend() -> None:
+        error = async_scheduler_client.failure_reason or _backend_failure(app)
+        if error is not None:
+            async_scheduler_client.mark_failed(error)
+            raise RuntimeError(error)
+
     try:
+        check_backend()
         if not should_run_synthetic_server_warmup(server_args):
             warmup_done.set()
             return
@@ -126,13 +137,19 @@ async def _run_server_warmup_after_http_live(
             server_args,
             async_scheduler_client.forward,
             fail_open=server_args.warmup_resolutions is None,
+            check_backend=check_backend,
         )
+        # A worker can exit after replying, before the periodic monitor runs.
+        check_backend()
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        if not async_scheduler_client.failure_reason:
+            async_scheduler_client.mark_failed(str(e))
+        warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -158,6 +175,9 @@ async def lifespan(app: FastAPI):
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     app.state.broker_task = broker_task
     backend_monitor = asyncio.create_task(_monitor_backend(app))
+    request_watchdog = start_request_watchdog(
+        server_args, app.state.worker_processes, async_scheduler_client.mark_failed
+    )
     # 3. Receive per-step progress of video jobs from the replica drivers
     progress_task = None
     if server_args.progress_endpoint is not None:
@@ -169,9 +189,7 @@ async def lifespan(app: FastAPI):
         start_cancel_publisher(server_args.cancel_endpoint, server_args.dp_size)
     warmup_task = None
     if server_args.warmup_mode == "server":
-        warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_live(server_args, warmup_done)
-        )
+        warmup_task = asyncio.create_task(_run_server_warmup_after_http_live(app))
     else:
         warmup_done.set()
 
@@ -186,6 +204,10 @@ async def lifespan(app: FastAPI):
         backend_monitor.cancel()
         with suppress(asyncio.CancelledError):
             await backend_monitor
+        if request_watchdog is not None:
+            request_watchdog.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_watchdog
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -233,7 +255,11 @@ def _backend_failure(app: FastAPI) -> str | None:
                 continue
         except psutil.NoSuchProcess:
             pass
-        return "Scheduler worker exited; restart the server."
+        return (
+            f"Scheduler worker exited (pid={worker.pid}); restart the server. "
+            "Possible SIGKILL from a host/cgroup OOM: check memory.events "
+            "(oom_kill) and kernel logs."
+        )
     return None
 
 
@@ -692,7 +718,9 @@ def create_app(
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
         # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
+        if (
+            request.method == "POST" or request.url.path in ("/v1/models", "/models")
+        ) and async_scheduler_client.failure_reason:
             return orjson_response(
                 {"error": async_scheduler_client.failure_reason}, status_code=503
             )
@@ -703,6 +731,10 @@ def create_app(
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
         ):
             await warmup_done.wait()
+            if async_scheduler_client.failure_reason:
+                return orjson_response(
+                    {"error": async_scheduler_client.failure_reason}, status_code=503
+                )
         return await call_next(request)
 
     app.include_router(health_router)
