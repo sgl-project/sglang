@@ -647,8 +647,9 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(PdMixNodeMixin, CustomTestCase):
     max_retries = None
 
     @classmethod
-    def prepare_cls(cls):
+    def setUpClass(cls):
         apply_accuracy_dataset_override(cls)
+        super().setUpClass()
 
     @check_role(allowed_roles=["master", "worker"])
     def run_accuracy(self):
@@ -679,8 +680,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(PdSepNodeMixin, CustomTestCase):
     max_retries = None
 
     @classmethod
-    def prepare_cls(cls):
+    def setUpClass(cls):
         apply_accuracy_dataset_override(cls)
+        super().setUpClass()
 
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):

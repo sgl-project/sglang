@@ -913,19 +913,14 @@ class PdMixNodeMixin:
 
     Subclasses must define ``model_config``, ``initialization_delay`` (seconds
     to wait after the master turns healthy) and ``keep_alive_time`` (seconds a
-    worker holds its pod), and may override ``prepare_cls`` to set class-level
-    config first.
+    worker holds its pod). Subclasses that need to adjust class-level config
+    first should override ``setUpClass`` and call ``super().setUpClass()``.
     """
 
     model_config = None
 
     @classmethod
-    def prepare_cls(cls):
-        """Hook for subclasses to adjust class-level config before startup."""
-
-    @classmethod
     def setUpClass(cls):
-        cls.prepare_cls()
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -1190,8 +1185,9 @@ def launch_pd_separation_node(model_config):
 class PdSepNodeMixin:
     """Role-aware startup shared by multi-node PD-separation test classes.
 
-    Subclasses must define ``model_config`` and ``initialization_delay``, and
-    may override ``prepare_cls`` to set class-level config first. The router
+    Subclasses must define ``model_config`` and ``initialization_delay``.
+    Subclasses that need to adjust class-level config first should override
+    ``setUpClass`` and call ``super().setUpClass()``. The router
     records the running class in the ConfigMap so the previous class's
     prefill/decode pods exit their wait and free the NPUs.
     """
@@ -1199,12 +1195,7 @@ class PdSepNodeMixin:
     model_config = None
 
     @classmethod
-    def prepare_cls(cls):
-        """Hook for subclasses to adjust class-level config before startup."""
-
-    @classmethod
     def setUpClass(cls):
-        cls.prepare_cls()
         cls.process = None
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
