@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.spec import CapabilityRequirement, PlatformInfo
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -19,10 +20,14 @@ MAX_ROWS = 1024
 _MIN_VOCAB = 128000
 _TREE_THREADS = 1024
 _MAX_CHUNKS = 512  # multi_cta_verify_sampling.cuh kMaxChunks
+# Checked bitwise against the stock tree sampler on SM 10.x only.
+_CAPABILITY = CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))
 
 # Per-device scratch, allocated once and never freed: the post-verify CUDA graphs share one
 # memory pool across batch sizes and slots, and a slot's outputs must outlive the other slot's
-# replay, so the captured body allocates exactly what the stock tree sampling does.
+# replay, so the captured body allocates exactly what the stock tree sampling does. Every call
+# is a verify on the worker's forward stream (eager, or a post-verify graph replay on the
+# current stream), so calls never overlap on it.
 _scratch: dict = {}
 
 
@@ -41,6 +46,15 @@ def _scratch_for(device: torch.device) -> dict:
     return bufs
 
 
+def _num_chunks(vocab: int) -> int:
+    return -(-vocab // (_TREE_THREADS * math.gcd(4, vocab)))
+
+
+@cache_once
+def _arch_checked() -> bool:
+    return _CAPABILITY.is_satisfied_by(PlatformInfo.detect())
+
+
 @cache_once
 def _jit_module(vec_size: int, deterministic: bool) -> Module:
     deterministic_cpp = "true" if deterministic else "false"
@@ -52,20 +66,27 @@ def _jit_module(vec_size: int, deterministic: bool) -> Module:
         cuda_wrappers=[
             ("tree", f"MultiCtaVerifyTree<{vec_size}, {deterministic_cpp}>::run"),
         ],
+        # The stock sampler's FlashInfer headers; the parity test catches a move.
         extra_dependencies=["flashinfer"],
     )
 
 
 def applies(target_probs: torch.Tensor) -> bool:
     """Whether the verify's target-only tree sampling of these [bs, draft, vocab] fp32 probabilities
-    is on a shape the multi-CTA kernels were checked bitwise on (CUDA, not HIP)."""
+    is on a shape and an architecture the multi-CTA kernels were checked bitwise on."""
     return (
         target_probs.is_cuda
-        and torch.version.hip is None
         and target_probs.dtype == torch.float32
         and target_probs.dim() == 3
         and 0 < target_probs.shape[0] * target_probs.shape[1] <= MAX_ROWS
         and target_probs.shape[2] >= _MIN_VOCAB
+        and _num_chunks(target_probs.shape[2]) <= _MAX_CHUNKS
+        and _arch_checked()
+        # the first call builds the kernels and the scratch, which must not happen in a capture
+        and (
+            target_probs.device.index in _scratch
+            or not torch.cuda.is_current_stream_capturing()
+        )
     )
 
 
@@ -89,7 +110,7 @@ def tree_speculative_sampling_target_only(
     the same arguments, outputs and draft_probs writes."""
     bs, _, vocab = target_probs.shape
     vec_size = math.gcd(4, vocab)
-    nchunks = -(-vocab // (_TREE_THREADS * vec_size))
+    nchunks = _num_chunks(vocab)
     if bs > MAX_ROWS or nchunks > _MAX_CHUNKS:
         raise ValueError(
             f"multi-CTA tree sampling: batch {bs} or {nchunks} chunks past the scratch"
