@@ -3157,6 +3157,15 @@ class DeepseekV4AscendAttnBackend(
             return
         fm = self.forward_metadata
         bs = fm.block_tables.shape[0]
+        ctx = SimpleNamespace(fm=fm, bs=bs, forward_batch=forward_batch)
+        # Capture buffer refreshes; kernel metadata generation stays outside replay.
+        self._refresh_cycle_state_block_table(ctx)
+        if self._dsv4_has_c4:
+            # Warmup replaces this field with indexer output; capture the fixed buffer.
+            fm.c4_topk_indices = self.graph_metadata["c4_topk_indices"][
+                : fm.c4_topk_indices.shape[0]
+            ]
+            fm.c4_topk_indices.fill_(-1)
         req_pool_indices = forward_batch.req_pool_indices[:bs]
         # Fixed-width snapshots avoid host length reads and keep replay addresses fixed.
         pages = min(
@@ -3189,9 +3198,7 @@ class DeepseekV4AscendAttnBackend(
             fm.c128_page_table[:, :pages].copy_(sidecar[req_pool_indices, :pages])
             fm.c128_page_table[:, pages:].fill_(-1)
 
-        self._refresh_graph_explicit_state_block_tables(
-            SimpleNamespace(fm=fm, bs=bs, forward_batch=forward_batch)
-        )
+        self._refresh_graph_explicit_state_block_tables(ctx)
         # Draft steps pass their view of the runner-owned cache-location buffer.
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
@@ -3985,7 +3992,7 @@ class DeepseekV4AscendAttnBackend(
         ):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
-        if self._dsv4_has_c4:
+        if self._dsv4_has_c4 and not self.prepare_in_graph:
             fm.c4_topk_indices.fill_(-1)
 
     def _apply_dsv4_graph_metadata(
@@ -4058,7 +4065,8 @@ class DeepseekV4AscendAttnBackend(
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
         # Shared: request bank + sequence lengths/masks (both generations).
-        self._refresh_cycle_state_block_table(ctx)
+        if not self.prepare_in_graph:
+            self._refresh_cycle_state_block_table(ctx)
         self._refresh_graph_seq_metadata(ctx)
 
         # Generation page tables.
