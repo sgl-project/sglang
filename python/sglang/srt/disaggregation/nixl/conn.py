@@ -2090,7 +2090,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(room) == KVPoll.Failed
                     )
                 ):
-                    self._staging_outstanding.pop(room, None)
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
@@ -2099,6 +2098,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         for k in list(self._staging_ctx.prefetch_requested):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
+                    # Deferred allocation holds Success until worker cleanup is
+                    # done, so a reused room cannot lose its new metadata.
+                    self._staging_outstanding.pop(room, None)
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
@@ -3655,10 +3657,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._maybe_ack_drained_abort(room_to_be_aborted)
 
     def _start_bootstrap_thread(self):
+        recv = self._make_worker_recv(self.server_socket)
+
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
+                waiting_req_bytes = recv()
+                if waiting_req_bytes is None:
+                    continue
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )

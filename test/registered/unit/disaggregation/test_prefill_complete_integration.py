@@ -4,6 +4,7 @@ import threading
 import unittest
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from itertools import product
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
@@ -21,6 +22,11 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+    NixlKVReceiver,
+    NixlKVSender,
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import Req
@@ -58,10 +64,22 @@ class _ChunkedSlot(SimpleNamespace):
 
 
 class TestAllocationConfiguration(CustomTestCase):
+    def test_supported_backends(self):
+        for backend, role in product(("mooncake", "nixl"), ("prefill", "decode")):
+            with self.subTest(backend=backend, role=role):
+                handle_pd_disaggregation(
+                    ServerArgs(
+                        model_path="dummy",
+                        disaggregation_mode=role,
+                        disaggregation_transfer_backend=backend,
+                        disaggregation_decode_allocation_policy="prefill_complete",
+                    )
+                )
+
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [
             {"disaggregation_mode": "null"},
-            {"disaggregation_transfer_backend": "nixl"},
+            {"disaggregation_transfer_backend": "mori"},
             {"tp_size": 2},
             {"pp_size": 2},
             {"attn_cp_size": 2},
@@ -82,6 +100,11 @@ class TestAllocationConfiguration(CustomTestCase):
                 "disaggregation_decode_enable_radix_cache": True,
             },
         ]
+        combinations = [
+            {"disaggregation_transfer_backend": backend, **changed}
+            for backend in ("mooncake", "nixl")
+            for changed in combinations
+        ]
         for changed in combinations:
             with self.subTest(changed=changed):
                 values = dict(
@@ -95,6 +118,10 @@ class TestAllocationConfiguration(CustomTestCase):
 
 
 class TestAllocationIntegration(CustomTestCase):
+    manager_cls = MooncakeKVManager
+    sender_cls = MooncakeKVSender
+    receiver_cls = MooncakeKVReceiver
+
     def setUp(self):
         super().setUp()
         reset_context()
@@ -111,7 +138,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.endpoints = {("prefill", 1): self.prefill, ("decode", 2): self.decode}
 
     def manager(self, ip, port):
-        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr = self.manager_cls.__new__(self.manager_cls)
         mgr.customized_info_enabled = False
         mgr.exchange_aux_item_lens = False
         mgr.local_ip, mgr.rank_port = ip, port
@@ -157,10 +184,10 @@ class TestAllocationIntegration(CustomTestCase):
                 )
 
     def sender(self, room=1):
-        return MooncakeKVSender(self.prefill, "prefill:8998", room)
+        return self.sender_cls(self.prefill, "prefill:8998", room)
 
     def receiver(self, room=1, policy="prefill_complete"):
-        receiver = MooncakeKVReceiver(self.decode, "prefill:8998", room)
+        receiver = self.receiver_cls(self.decode, "prefill:8998", room)
         receiver.bootstrap_infos = [{"rank_ip": "prefill", "rank_port": 1}]
         self.decode.prefill_info_table = {
             receiver.bootstrap_addr: PrefillServerInfo(
@@ -809,7 +836,7 @@ class TestAllocationIntegration(CustomTestCase):
             state_indices=None,
             prefill_aux_index=0,
         )
-        mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
+        self.run_transfer_worker(mgr, chunk)
         self.assertEqual(cleanup_observed, [1])
         self.assertNotIn(1, mgr._staging_outstanding)
         self.assertEqual(sender.poll(), KVPoll.Success)
@@ -818,6 +845,9 @@ class TestAllocationIntegration(CustomTestCase):
         sender.clear()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def run_transfer_worker(self, mgr, chunk):
+        mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
 
     def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
         sender, receiver = self.sender(), self.receiver()
@@ -986,6 +1016,32 @@ class TestAllocationIntegration(CustomTestCase):
         queue.add(req, is_rebootstrap=True)
         self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
+
+
+class TestNixlAllocationIntegration(TestAllocationIntegration):
+    manager_cls = NixlKVManager
+    sender_cls = NixlKVSender
+    receiver_cls = NixlKVReceiver
+
+    def manager(self, ip, port):
+        mgr = super().manager(ip, port)
+        mgr.enable_unified_memory = False
+        mgr.agent = SimpleNamespace(name="decode-session")
+        return mgr
+
+    def run_transfer_worker(self, mgr, chunk):
+        mgr.enable_kv_packing = False
+        mgr.kv_shard_state_peer_only = False
+        mgr._await_handles = Mock(return_value=(True, False))
+        info = mgr.decode_kv_args_table["session"]
+        info.unified_layout_error = None
+        info.decode_tp_size = 1
+        mgr.transfer_infos[1]["session"].agent_name = "session"
+        mgr.transfer_infos[1]["session"].dst_aux_index = 0
+        # NIXL workers run indefinitely; stop at the next queue read, outside
+        # the worker's per-chunk exception handler.
+        with self.assertRaises(StopIteration):
+            mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, StopIteration])))
 
 
 if __name__ == "__main__":
