@@ -182,5 +182,162 @@ class TestModelOptLoaderSelection(CustomTestCase):
                 )
 
 
+class TestShardedStateModelOptFp8(CustomTestCase):
+    @staticmethod
+    def _model(is_gated, intermediate):
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8MoEMethod
+
+        model = torch.nn.Module()
+        layer = model.experts = torch.nn.Module()
+        layer.moe_runner_config = MoeRunnerConfig(is_gated=is_gated)
+        layer.intermediate_size_per_partition = intermediate
+        num_parts = 2 if is_gated else 1
+        shapes = {
+            "w13_weight": (2, num_parts * intermediate, 16),
+            "w2_weight": (2, 16, intermediate),
+        }
+        for name, shape in shapes.items():
+            values = (torch.arange(torch.Size(shape).numel()) % 31 + 1).reshape(shape)
+            layer.register_parameter(
+                name,
+                torch.nn.Parameter(values.to(torch.float8_e4m3fn), requires_grad=False),
+            )
+        # Processed shards already have per-expert weight scales. These also
+        # let the real post-load method run without GPU requantization kernels.
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            layer.register_parameter(
+                name, torch.nn.Parameter(torch.tensor([0.25, 0.5]), requires_grad=False)
+            )
+        for name in ("w13_input_scale", "w2_input_scale"):
+            layer.register_parameter(
+                name, torch.nn.Parameter(torch.tensor(0.125), requires_grad=False)
+            )
+        layer.quant_method = ModelOptFp8MoEMethod.__new__(ModelOptFp8MoEMethod)
+        layer.quant_method._moe_runner_backend = MoeRunnerBackend.TRITON
+        return model
+
+    @staticmethod
+    def _load(model, state):
+        from safetensors.torch import save_file
+
+        from sglang.srt.runtime_context import get_parallel
+
+        with tempfile.TemporaryDirectory() as directory:
+            save_file(state, os.path.join(directory, "model-rank-0-part-0.safetensors"))
+            loader = loader_mod.ShardedStateLoader(
+                LoadConfig(load_format=LoadFormat.SHARDED_STATE)
+            )
+            with (
+                get_parallel().override(tp_rank=0),
+                patch.object(loader_mod, "_get_quantization_config", return_value=None),
+                patch.object(loader_mod, "_initialize_model", return_value=model),
+            ):
+                return loader.load_model(
+                    model_config=SimpleNamespace(
+                        model_path=directory, revision=None, dtype=torch.float32
+                    ),
+                    device_config=SimpleNamespace(device="cpu"),
+                )
+
+    def test_legacy_shards_restore_each_projection_and_zero_tails(self):
+        """A contiguous old W13 copy shifts the gate and contaminates the up tail."""
+        for is_gated in (False, True):
+            with self.subTest(is_gated=is_gated):
+                model = self._model(is_gated, intermediate=232)
+                state = {
+                    name: value.clone() for name, value in model.state_dict().items()
+                }
+                for param in model.parameters():
+                    param.data.fill_(float("nan"))
+                expected = dict(state)
+                w13 = torch.zeros(2, (2 if is_gated else 1) * 240, 16)
+                w13[:, :232] = state["experts.w13_weight"][:, :232].float()
+                if is_gated:
+                    w13[:, 240:472] = state["experts.w13_weight"][:, 232:].float()
+                w2 = torch.zeros(2, 16, 240)
+                w2[:, :, :232] = state["experts.w2_weight"].float()
+                expected.update({"experts.w13_weight": w13, "experts.w2_weight": w2})
+                loaded = self._load(model, state)
+                for name, value in loaded.state_dict().items():
+                    torch.testing.assert_close(
+                        value.float(), expected[name].float(), rtol=0, atol=0
+                    )
+                self.assertEqual(loaded.experts.intermediate_size_per_partition, 232)
+
+    def test_padded_and_aligned_shards_round_trip(self):
+        for is_gated in (False, True):
+            for intermediate in (232, 240):
+                with self.subTest(is_gated=is_gated, intermediate=intermediate):
+                    source = self._model(is_gated, intermediate)
+                    source.experts.quant_method.process_weights_after_loading(
+                        source.experts
+                    )
+                    state = source.state_dict()
+                    destination = self._model(is_gated, intermediate)
+                    for param in destination.parameters():
+                        param.data.fill_(float("nan"))
+                    loaded = self._load(destination, state)
+                    for name, value in loaded.state_dict().items():
+                        torch.testing.assert_close(
+                            value.float(), state[name].float(), rtol=0, atol=0
+                        )
+
+    def test_unrelated_w13_keeps_existing_copy_behavior(self):
+        # The same names and shapes on a non-ModelOpt layer must not trigger
+        # projection-aware copying or change the existing padding contents.
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        model.experts.w13_weight = torch.nn.Parameter(
+            torch.full((2, 480, 16), -1.0), requires_grad=False
+        )
+        source = torch.arange(2 * 464 * 16).reshape(2, 464, 16).float()
+        loaded = self._load(model, {"experts.w13_weight": source})
+        expected = torch.full((2, 480, 16), -1.0)
+        expected[:, :464] = source
+        torch.testing.assert_close(loaded.experts.w13_weight, expected, rtol=0, atol=0)
+
+    def test_copy_helper_clears_preexisting_padding(self):
+        # Do not rely on post-load allocation having initialized the tails.
+        for split_dim, num_parts in ((1, 1), (1, 2), (2, 1)):
+            with self.subTest(split_dim=split_dim, num_parts=num_parts):
+                shape = (2, num_parts * 232, 16) if split_dim == 1 else (2, 16, 232)
+                padded_shape = (
+                    (2, num_parts * 240, 16) if split_dim == 1 else (2, 16, 240)
+                )
+                source = torch.ones(shape, dtype=torch.float8_e4m3fn)
+                destination = torch.full(padded_shape, float("nan"), dtype=source.dtype)
+                loader_mod.ShardedStateLoader._copy_padded_shard(
+                    destination=destination,
+                    source=source,
+                    original_shape=source.shape,
+                    split_dim=split_dim,
+                    num_parts=num_parts,
+                )
+                expected = torch.zeros(padded_shape)
+                if split_dim == 1:
+                    expected[:, :232] = 1
+                    if num_parts == 2:
+                        expected[:, 240:472] = 1
+                else:
+                    expected[:, :, :232] = 1
+                torch.testing.assert_close(
+                    destination.float(), expected, rtol=0, atol=0
+                )
+
+    def test_unexpected_legacy_shape_is_rejected(self):
+        for name in ("w13_weight", "w2_weight"):
+            with self.subTest(name=name):
+                model = self._model(is_gated=True, intermediate=232)
+                state = {
+                    name: value.clone() for name, value in model.state_dict().items()
+                }
+                key = f"experts.{name}"
+                state[key] = state[key][:, :, :-1].contiguous()
+                with self.assertRaisesRegex(ValueError, "processed shard shape"):
+                    self._load(model, state)
+
+
 if __name__ == "__main__":
     unittest.main()

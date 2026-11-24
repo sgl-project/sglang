@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -777,6 +778,69 @@ class TestStructuralSignature(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertNotIn(fake_key, _ROPE_DICT)
+
+
+class TestModelOptFp8ShardConfig(CustomTestCase):
+    def test_padding_layout_invalidates_only_modelopt_fp8_caches(self):
+        """Pre-post-load shapes cannot distinguish old and padded FP8 caches."""
+        loader = object.__new__(PreshardedModelLoader)
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="same_shapes"
+            ),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+            ),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            cases = [
+                (quantization, MoeRunnerBackend.TRITON)
+                for quantization in (
+                    "modelopt",
+                    "modelopt_fp8",
+                    "modelopt_mixed",
+                    "modelopt_fp4",
+                    "fp8",
+                    None,
+                )
+            ] + [
+                ("modelopt_fp8", MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED),
+                ("modelopt_fp8", MoeRunnerBackend.FLASHINFER_CUTLASS),
+            ]
+            for quantization, backend in cases:
+                with (
+                    self.subTest(quantization=quantization, backend=backend),
+                    get_flags().moe.override(runner_backend=backend),
+                ):
+                    model_config = SimpleNamespace(
+                        quantization=quantization, dtype=torch.bfloat16
+                    )
+                    current = loader._collect_shard_config(model_config)
+                    legacy = dict(current)
+                    legacy.pop("modelopt_fp8_moe_layout_version", None)
+                    affected = quantization in (
+                        "modelopt",
+                        "modelopt_fp8",
+                        "modelopt_mixed",
+                    )
+                    self.assertEqual(
+                        loader._build_subfolder_name(legacy)
+                        != loader._build_subfolder_name(current),
+                        affected,
+                    )
+                    checksum = os.path.join(directory, loader.CHECKSUM_FILENAME)
+                    with open(checksum, "w") as f:
+                        json.dump({"shard_config": legacy}, f)
+                    self.assertEqual(
+                        loader._shard_config_matches(directory, current), not affected
+                    )
+                    with open(checksum, "w") as f:
+                        json.dump({"shard_config": current}, f)
+                    self.assertTrue(loader._shard_config_matches(directory, current))
+                    self.assertEqual(
+                        current, loader._collect_shard_config(model_config)
+                    )
 
 
 class TestShardConfig(unittest.TestCase):
