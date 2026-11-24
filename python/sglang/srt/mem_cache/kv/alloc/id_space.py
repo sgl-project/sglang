@@ -109,6 +109,9 @@ class UnitIds:
         # carry the widened owner rule (`translate_write`).
         self.unit_tokens = unit_tokens
         self.shards_under_dcp = shards_under_dcp
+        # Set under logical-page KV sharding (`kv_shard.OwnerPageRule`): token
+        # ids arrive logical, and another rank's page resolves to the sink.
+        self.owner_rule = None
         self.num_virtual_ids = num_virtual_ids
         self.virtual_to_physical = torch.full(
             (num_virtual_ids + 1,), -1, dtype=torch.int64, device=device
@@ -197,12 +200,16 @@ class UnitIds:
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Share ``translate_token_ids``'s output dtype and shape contract."""
+        rule = self.owner_rule
         return translate_token_ids(
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.unit_tokens,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
+            shard_size=1 if rule is None else rule.shard_size,
+            shard_rank=0 if rule is None else rule.shard_rank,
+            shard_first_page=0 if rule is None else rule.first_band_page,
             out=out,
             out_width=out_width,
         )
@@ -213,7 +220,10 @@ class UnitIds:
         """How a token sub-pool names an iteration's slots: virtual token ids
         map through this record. ``widened_writes``: the write window arrives
         DCP-widened (the owner's); ``defer_reads`` keeps reads virtual (DCP
-        selects a rank's share where it builds them)."""
+        selects a rank's share where it builds them). Sharded, writes take
+        the owner rule and reads stay logical."""
+        if self.owner_rule is not None:
+            return IdSpace(key=key, write=self.translate_write)
         return IdSpace(
             key=key,
             write=self.translate_write if widened_writes else self.translate,

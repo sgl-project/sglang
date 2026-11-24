@@ -217,10 +217,16 @@ def translate_token_ids_kernel(
     PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
+    SHARD_SIZE: tl.constexpr,
+    SHARD_RANK: tl.constexpr,
+    SHARD_FIRST_PAGE: tl.constexpr,
     STRIDED: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """``physical(t) = v2p[t // ps] * ps + t % ps``, clamped at 0.
+
+    With ``SHARD_SIZE > 1`` the id is LOGICAL: page ``l`` is rank ``l % SHARD_SIZE``'s,
+    at row ``l // SHARD_SIZE - 1 + SHARD_FIRST_PAGE``; another rank's page gives 0.
 
     Under DCP the incoming id is WIDENED: ``loc % dcp_size`` names its owner
     and ``loc // dcp_size`` is the row. Ids this rank does not own resolve to
@@ -260,6 +266,9 @@ def translate_token_ids_kernel(
 
     page = loc // PAGE_SIZE if PAGE_SIZE > 1 else loc
     offset = loc % PAGE_SIZE if PAGE_SIZE > 1 else 0
+    if SHARD_SIZE > 1:
+        keep = keep & (page >= SHARD_SIZE) & ((page % SHARD_SIZE) == SHARD_RANK)
+        page = page // SHARD_SIZE - 1 + SHARD_FIRST_PAGE
     # Torch's gather bounds-checks and `tl.load` does not, so an id past the
     # table is excluded here rather than read out of bounds.
     keep = keep & (page < num_v_pages)
@@ -282,6 +291,9 @@ def translate_token_ids(
     page_size: int,
     dcp_size: int = 1,
     dcp_rank: int = 0,
+    shard_size: int = 1,
+    shard_rank: int = 0,
+    shard_first_page: int = 0,
     out: Optional[torch.Tensor] = None,
     out_width: Optional[int] = None,
 ) -> torch.Tensor:
@@ -298,6 +310,7 @@ def translate_token_ids(
     contiguous ``loc``; everywhere else a 1-D or 2-D strided view is legal.
     """
     N = int(loc.numel())
+    assert shard_size == 1 or dcp_size == 1, "logical-page sharded or DCP-widened"
     if out is None:
         out = torch.empty(loc.shape, dtype=torch.int64, device=loc.device)
     width = N if out_width is None else int(out_width)
@@ -334,6 +347,13 @@ def translate_token_ids(
             keep = keep & (big % dcp_size == dcp_rank)
             big = torch.div(big, dcp_size, rounding_mode="floor")
         page = torch.div(big, page_size, rounding_mode="floor")
+        if shard_size > 1:
+            keep = keep & (page >= shard_size) & (page % shard_size == shard_rank)
+            page = (
+                torch.div(page, shard_size, rounding_mode="floor")
+                - 1
+                + shard_first_page
+            )
         keep = keep & (page < v2p.numel())
         page = torch.where(keep, page, 0)
         offset = big % page_size if page_size > 1 else 0
@@ -374,6 +394,9 @@ def translate_token_ids(
         PAGE_SIZE=page_size,
         DCP_SIZE=dcp_size,
         DCP_RANK=dcp_rank,
+        SHARD_SIZE=shard_size,
+        SHARD_RANK=shard_rank,
+        SHARD_FIRST_PAGE=shard_first_page,
         STRIDED=not flat,
         BLOCK=TRANSLATE_TOKEN_IDS_BLOCK,
     )
