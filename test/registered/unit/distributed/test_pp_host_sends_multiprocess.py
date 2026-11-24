@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation.utils import pp_sync_polls
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.observability.profile_utils import _ProfilerTorch
@@ -24,6 +25,7 @@ from sglang.test.test_utils import CustomTestCase, published_topology
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REQ_TAG, OUT_TAG = 11, 12
+POLL_TAG = P2PTag.DISAGG_BOOTSTRAP_PP_SYNC
 
 
 def _init(rank, world, tmp):
@@ -76,7 +78,9 @@ def _poll_relay_worker(rank, tmp):
             profiler.start()
         for i in range(160):
             polls = [i % 5] * 16 if rank == 0 else None
-            assert pp_sync_polls(polls, group, rank, 2, window) == [i % 5] * 16
+            assert (
+                pp_sync_polls(polls, group, rank, 2, window, POLL_TAG) == [i % 5] * 16
+            )
             sends.extend(window._outstanding[-1])
             if rank == 0 and i == 80:
                 _stop(profiler, sends)
@@ -123,7 +127,7 @@ def _ring_scenario(group, profiler, rank, pp, stop_at, at_ingest, lag):
         for w in req_work:
             w.wait()
         polls = [t] * 8 if rank == 0 else None
-        assert pp_sync_polls(polls, group, rank, pp, window) == [t] * 8
+        assert pp_sync_polls(polls, group, rank, pp, window, POLL_TAG) == [t] * 8
         sends.extend(window._outstanding[-1])
         if rank == pp - 1:
             for w in out_work:
