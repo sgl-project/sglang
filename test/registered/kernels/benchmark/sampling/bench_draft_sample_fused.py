@@ -6,10 +6,7 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15,
-    stage="base-b-kernel-benchmark",
-    runner_config="1-gpu-small",
-    disabled="requires SM100; no benchmark lane runs SM100",
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
 )
 
 
@@ -38,7 +35,7 @@ FN_MAP = {"fused": fused, "stock": stock, "softmax": softmax_only}
 # and top_k per row; "softmax" is the softmax alone, the floor of the fused kernel.
 @marker.parametrize("vocab_size", [129280, 151936, 163840, 248320], [248320])
 @marker.parametrize("batch_size", marker.range(9, pattern="pow2"), [1, 64])
-@marker.benchmark("impl", ["fused", "stock", "softmax"])
+@marker.benchmark("impl", ["fused", "stock", "softmax"], gate=["fused"])
 def benchmark(vocab_size: int, batch_size: int, impl: str):
     logits = create_random(batch_size, vocab_size, dtype=torch.float32)
     temperatures = torch.linspace(0.5, 1.5, batch_size, device=logits.device).view(
