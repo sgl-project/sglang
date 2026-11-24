@@ -83,7 +83,8 @@ class TestDflashDraftKvFitsSwa(CustomTestCase):
         """Ascend builds a plain NPU pool with no register_mapping, which would
         fail the draft's startup; other platforms and backends never take it."""
         sliding = _draft(["sliding_attention"] * 2, 1024)
-        self.assertTrue(self.fits(sliding, 2047, backend="trtllm_mha"))
+        self.assertTrue(self.fits(sliding, 2047, backend="fa3"))
+        self.assertFalse(self.fits(sliding, 2047, backend="flashinfer"))
         self.assertFalse(self.fits(sliding, 2047, cuda=False, backend="ascend"))
         self.assertFalse(self.fits(sliding, 2047, cuda=False, backend="triton"))
         self.assertFalse(self.fits(sliding, 2047, backend="torch_native"))

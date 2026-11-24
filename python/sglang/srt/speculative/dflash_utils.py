@@ -355,12 +355,10 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
-# Draft backends on the CUDA platform that read a sliding layer of an SWAKVPool
-# through its registered full -> SWA mapping. Other platforms build their own
+# Draft backends on the CUDA platform validated with the draft's sliding layers
+# read through the SWAKVPool full -> SWA mapping. Other platforms build their own
 # pools (Ascend: an NPU pool without register_mapping) or read rows differently.
-_SWA_SUB_POOL_DRAFT_BACKENDS = frozenset(
-    {"fa3", "fa4", "flashinfer", "triton", "trtllm_mha"}
-)
+_SWA_SUB_POOL_DRAFT_BACKENDS = frozenset({"fa3", "fa4"})
 # Draft KV dtypes the plain MHA SWA sub-pool stores. mxfp8 needs the block-scaled
 # pool class and FP4 a quant method, which the draft's SWA sub-pool builds neither of.
 _SWA_SUB_POOL_DRAFT_KV_DTYPES = frozenset(
