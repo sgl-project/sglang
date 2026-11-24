@@ -1,4 +1,4 @@
-"""SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: verify inputs and their metadata glue
+"""Verify inputs and their metadata glue
 graph staged on a side stream beside the draft graph (waiting only for the head), and
 the runner gating that keeps every other configuration and variant on the main path."""
 

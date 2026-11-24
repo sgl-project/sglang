@@ -408,12 +408,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
-        # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the static verify's inputs are final
-        # after the head; the target runner stages their metadata beside the draft.
+        # The static verify's inputs are final after the head; the target runner
+        # stages their metadata beside the draft.
         self._verify_inputs_ready: Optional[torch.cuda.Event] = (
             torch.cuda.Event()
-            if envs.SGLANG_OPT_DSV41_TARGET_METADATA_EARLY.get()
-            and self._verify_planner.mode_value == "static"
+            if self._verify_planner.mode_value == "static"
             and not get_parallel().attn_dp_enabled
             and torch.device(self.device).type == "cuda"
             else None

@@ -608,11 +608,6 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
-    # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
-    # and joins at the first draft KV store, overlapping the embedding.
-    SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
     # draft launch instead of between the draft and the target verify.
     SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
@@ -2212,21 +2207,6 @@ class Envs:
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
-    # DSpark static verify: run the target verify runner's metadata prep through the
-    # metadata glue graph where its backend declares the prep host-free.
-    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # DSpark static verify: build the target verify metadata on a side stream beside the
-    # draft graph (needs the glue switch above).
-    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Decode / verify graph replays whose metadata glue graph is captured skip the
-    # replay ForwardBatch view (the graph reads slots and buffers by address).
-    SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # Spec decode prep (DFlash family only so far): when a step must allocate KV pages,
     # give every request this many pages of headroom in the same allocation (capped
     # at 8; 0 = off). Skipped when free pages are low and under HiSparse.
@@ -2738,6 +2718,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         "SGLANG_DSPARK_DEFER_CONTEXT_KV",
         "SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE",
         "SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH",
+        "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK",
+        "SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE",
+        "SGLANG_OPT_DSV41_TARGET_METADATA_EARLY",
+        "SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW",
     )
 }
 

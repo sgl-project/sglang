@@ -306,8 +306,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _skips_prefilled_inputs = False
     _prefilled_inputs: Optional[tuple] = None
     num_prefilled_input_skips = 0
-    # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
-    _skip_glued_replay_view = False
 
     def __init__(
         self,
@@ -331,7 +329,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # this runner's buffers (DSpark target verify).
         self._prefilled_inputs: Optional[tuple] = None
         self.num_prefilled_input_skips = 0
-        # SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: (stream, event) the draft graph's
+        # (stream, event) the draft graph's
         # in-graph metadata prep is forked onto; resolved at the first capture.
         self._metadata_prep_fork: Optional[tuple] = None
         self._metadata_prep_fork_resolved = False
@@ -661,12 +659,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._metadata_glue = MetadataGlueGraph(
                 self.device, strict=envs.SGLANG_IS_IN_CI.get()
             )
-        self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         self._padded_glue = (
             self._draft_metadata_glue or self._target_metadata_glue
         ) and not self.ragged_verify_mode
-        # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
-        # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
+        # The verify's inputs and metadata glue graph run on a side stream beside the draft graph (stage_verify_metadata_early).
         self._early_verify_metadata: Optional[EarlyVerifyMetadata] = (
             EarlyVerifyMetadata(device=self.device, log_every=10000)
             if self._wants_early_verify_metadata()
@@ -704,9 +700,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         return (
-            envs.SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK.get()
             # The unified-KV store location is not a join point.
-            and not is_unified_kv_triton()
+            not is_unified_kv_triton()
             and self.model_runner.spec_algorithm.is_dspark()
             and self.model_runner.is_draft_worker
             and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
@@ -729,10 +724,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._metadata_prep_fork_resolved = True
             if self._forks_draft_metadata_prep():
                 self._metadata_prep_fork = (torch.cuda.Stream(), torch.cuda.Event())
-                logger.info(
-                    "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: draft in-graph "
-                    "metadata prep forked onto a side stream."
-                )
+                logger.info("Draft in-graph metadata prep forked onto a side stream.")
         if self._metadata_prep_fork is None:
             prep()
             return
@@ -1559,8 +1551,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     )
                     if join_in_graph_metadata_prep():
                         raise RuntimeError(
-                            "The draft forward never joined its forked metadata prep; "
-                            "unset SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK."
+                            "The draft forward never joined its forked metadata prep."
                         )
                     for capture_hook in self.model_runner.capture_tail_hooks:
                         capture_hook(self, out, forward_batch, num_tokens)
@@ -1881,7 +1872,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._metadata_glue.reinstall(glue_key)
         elif (
             glue_route
-            and self._skip_glued_replay_view
             and isinstance(self._metadata_glue, MetadataGlueGraph)
             and self._metadata_glue.is_captured(glue_key)
         ):
@@ -1962,11 +1952,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._verify_checkpoint_ids[n:bs].zero_()
 
     def _wants_early_verify_metadata(self) -> bool:
-        """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY, from facts fixed before the buffers
-        are shared."""
+        """Early target verify metadata, from facts fixed before the buffers are
+        shared."""
         return (
-            envs.SGLANG_OPT_DSV41_TARGET_METADATA_EARLY.get()
-            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            self.capture_forward_mode == ForwardMode.TARGET_VERIFY
             and not self.model_runner.is_draft_worker
             and self.model_runner.spec_algorithm.is_dspark()
             and not self.ragged_verify_mode
@@ -2106,10 +2095,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _glues_target_verify_metadata(self) -> bool:
         """Whether this DSpark target verify runner's metadata prep runs through the
-        glue graph: switched on, and its backend declares the prep host-free."""
+        glue graph: its backend declares the prep host-free."""
         if (
-            not envs.SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE.get()
-            or self.model_runner.is_draft_worker
+            self.model_runner.is_draft_worker
             or self.capture_forward_mode != ForwardMode.TARGET_VERIFY
             or not self.model_runner.spec_algorithm.is_dspark()
         ):

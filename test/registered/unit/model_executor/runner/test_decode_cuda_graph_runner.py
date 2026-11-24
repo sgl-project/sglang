@@ -638,17 +638,14 @@ class _RecordingGlue(mod.MetadataGlueGraph):
 
 class TestReplayAttnMetadataWiring(CustomTestCase):
     """Each replay's metadata prep: a staged one only reinstalls; a captured glue key
-    replays without the replay view (SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW); before its
+    replays without the replay view; before its
     capture the glue runs on a view; unrouted replays run the eager prep on a view."""
 
     KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
 
-    def _replay(
-        self, glue, *, raw_bs=2, bs=2, skip=True, staged=False, padded_glue=False
-    ):
+    def _replay(self, glue, *, raw_bs=2, bs=2, staged=False, padded_glue=False):
         runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
         runner._metadata_glue = glue
-        runner._skip_glued_replay_view = skip
         runner._padded_glue = padded_glue
         runner.enable_two_batch_overlap = False
         runner.model_runner = SimpleNamespace(lora_manager=None)
@@ -688,10 +685,6 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue)
         self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
-
-        glue = _RecordingGlue(captured_keys=[key])
-        views, eager = self._replay(glue, skip=False)
-        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
 
         glue = _RecordingGlue()
         views, eager = self._replay(glue)

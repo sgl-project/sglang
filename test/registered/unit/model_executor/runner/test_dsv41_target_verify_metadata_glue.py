@@ -82,18 +82,16 @@ def _runner(*, draft=False, dspark=True, mode=ForwardMode.TARGET_VERIFY, backend
 
 
 class TestRunnerGluesTheTargetVerify(CustomTestCase):
-    def test_on_only_behind_the_switch_for_a_host_free_dspark_verify(self):
+    def test_on_only_for_a_host_free_dspark_verify(self):
         with _parallel():
-            self.assertFalse(_runner()._glues_target_verify_metadata())
-            with envs.SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE.override(True):
-                self.assertTrue(_runner()._glues_target_verify_metadata())
-                for runner in (
-                    _runner(draft=True),
-                    _runner(dspark=False),
-                    _runner(mode=ForwardMode.DECODE),
-                    _runner(backend=_backend(trtllm_attn=True)),
-                ):
-                    self.assertFalse(runner._glues_target_verify_metadata())
+            self.assertTrue(_runner()._glues_target_verify_metadata())
+            for runner in (
+                _runner(draft=True),
+                _runner(dspark=False),
+                _runner(mode=ForwardMode.DECODE),
+                _runner(backend=_backend(trtllm_attn=True)),
+            ):
+                self.assertFalse(runner._glues_target_verify_metadata())
 
     def test_the_target_glue_reads_the_registry_slot(self):
         runner = _runner()
