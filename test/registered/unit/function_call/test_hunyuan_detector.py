@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
@@ -663,6 +664,24 @@ class TestHunyuanDetectorStructureInfo(CustomTestCase):
 
     def test_supports_structural_tag(self):
         self.assertFalse(self.detector.supports_structural_tag())
+
+    def test_structure_info_uses_separator_only_when_present_in_vocab(self):
+        start = "<tool_calls:opensource>"
+        call = "<tool_call:opensource>get_weather"
+        for separator, expected in (
+            (None, start + call),
+            ("<tool_sep>", start + "\n" + call + "<tool_sep>"),
+            ("<tool_sep:opensource>", start + "\n" + call + "<tool_sep:opensource>"),
+            ("<tool_sep>\n", start + call),
+        ):
+            with self.subTest(separator=separator):
+                vocab = _Hy4Tokenizer().get_vocab()
+                if separator is not None:
+                    vocab[separator] = len(vocab) + 1
+                tokenizer = Mock()
+                tokenizer.get_vocab.return_value = vocab
+                info = HunyuanDetector(tokenizer).structure_info()("get_weather")
+                self.assertEqual(info.begin, expected)
 
 
 class TestHunyuanDetectorFunctionCallParser(CustomTestCase):

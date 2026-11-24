@@ -34,6 +34,25 @@ _HUNYUAN_TOKEN_RE = re.compile(
 )
 
 
+def _tokens_from_vocab(vocab: dict) -> tuple[Dict[str, str], bool]:
+    tokens = {}
+    has_tool_sep = False
+    for tok in vocab:
+        if not isinstance(tok, str):
+            continue
+        match = _HUNYUAN_TOKEN_RE.match(tok)
+        if match:
+            name = match.group("name")
+            tokens[name] = tok
+            # The dialect probe requires a whole token. The resolver's '$'
+            # can also match just before a trailing newline.
+            if name == "tool_sep" and match.end() == len(tok):
+                has_tool_sep = True
+    for name in _HUNYUAN_TOKEN_NAMES:
+        tokens.setdefault(name, f"<{name}>")
+    return tokens, has_tool_sep
+
+
 def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
     """Map bare token names to their real (possibly suffixed) strings in vocab.
 
@@ -41,24 +60,37 @@ def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
     when the tokenizer carries no suffixed form, so the same detector serves
     both the preview (suffix-less) and shipping (suffixed) Hy3 tokenizers.
     """
-    tokens: Dict[str, str] = {}
     vocab = None
     if tokenizer is not None:
         try:
             vocab = tokenizer.get_vocab()
         except Exception as e:
             logger.warning("Failed to read Hunyuan tokenizer vocab: %s", e)
-            vocab = None
-    if isinstance(vocab, dict):
-        for tok in vocab:
-            if not isinstance(tok, str):
-                continue
-            m = _HUNYUAN_TOKEN_RE.match(tok)
-            if m:
-                tokens[m.group("name")] = tok
-    for name in _HUNYUAN_TOKEN_NAMES:
-        tokens.setdefault(name, f"<{name}>")
+    tokens, _ = _tokens_from_vocab(vocab if isinstance(vocab, dict) else {})
     return tokens
+
+
+def _resolve_tool_tokens(tokenizer) -> tuple[Dict[str, str], bool]:
+    try:
+        vocab = tokenizer.get_vocab() if tokenizer is not None else None
+    except Exception:
+        vocab = None
+    if isinstance(vocab, dict):
+        return _tokens_from_vocab(vocab)
+
+    # Keep the dialect probe and independent token lookup for tokenizers
+    # that fail to return a vocabulary dictionary.
+    has_tool_sep = True
+    if vocab is not None:
+        try:
+            has_tool_sep = any(
+                re.fullmatch(r"<tool_sep(?::[^>]+)?>", tok)
+                for tok in vocab
+                if isinstance(tok, str)
+            )
+        except Exception:
+            pass
+    return resolve_hunyuan_tokens(tokenizer), has_tool_sep
 
 
 class HunyuanDetector(BaseFormatDetector):
@@ -106,18 +138,7 @@ class HunyuanDetector(BaseFormatDetector):
         # Hy4 dropped <tool_sep> from its vocab entirely; Hy3 carries it (bare
         # or suffixed). Detect the dialect from the vocab, not from the
         # resolved literal (which falls back to "<tool_sep>" for both).
-        self._has_tool_sep = True
-        if tokenizer is not None:
-            try:
-                self._has_tool_sep = any(
-                    re.fullmatch(r"<tool_sep(?::[^>]+)?>", tok)
-                    for tok in tokenizer.get_vocab()
-                    if isinstance(tok, str)
-                )
-            except Exception:
-                pass
-
-        t = resolve_hunyuan_tokens(tokenizer)
+        t, self._has_tool_sep = _resolve_tool_tokens(tokenizer)
         tool_calls = t["tool_calls"]
         tool_call = t["tool_call"]
         tool_sep = t["tool_sep"]
