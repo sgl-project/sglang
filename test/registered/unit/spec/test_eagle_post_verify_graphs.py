@@ -297,7 +297,7 @@ class TestPostVerifyGraphs(CustomTestCase):
 
         class _EagerHooks:
             @property
-            def post_verify(self):
+            def local_keys(self):
                 raise _EagerSample
 
         for clears_c128 in (False, True):

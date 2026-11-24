@@ -15,11 +15,6 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_verify_commit_outputs,
 )
 from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
-from sglang.kernels.plugin_kernels.nvidia.spec import (
-    PostVerifyIO,
-    VerifySamplingView,
-    VerifyTreeView,
-)
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.speculative_runtime import (
     default_speculative_runtime_hooks,
@@ -30,7 +25,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.sampling.verify_accept import VerifyAccept
-from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -100,73 +94,10 @@ def bind_eagle_runtime_hooks(
         processors[0].enable_sharded_verify(
             # A provider's local keys; the stock policy declines every
             # temperature row.
-            temperature_keys=hooks.post_verify.local_keys
-            is not STOCK_SPECULATIVE_RUNTIME_HOOKS.post_verify.local_keys
+            temperature_keys=hooks.local_keys
+            is not STOCK_SPECULATIVE_RUNTIME_HOOKS.local_keys
         )
     return hooks
-
-
-def make_post_verify_io(
-    *,
-    verify_input: Any,
-    sampling_info: Any,
-    sequence_lengths: torch.Tensor,
-    request_pool_indices: torch.Tensor,
-    device: str | torch.device,
-    logits_output: Any,
-    grammar_mask: Any,
-    watermark: Any,
-    watermark_full_mask: bool,
-    return_logprob: bool,
-    is_idle: bool,
-    simulated_accept_length: Optional[torch.Tensor] = None,
-    simulated_accept_length_rng: Optional[torch.Generator] = None,
-    sparse_target_max_top_k: Optional[int] = None,
-    sparse_bonus_argmax: bool = False,
-) -> PostVerifyIO:
-    """Build the immutable, borrowed view shared by eager and captured verify."""
-    return PostVerifyIO(
-        logits=logits_output,
-        verify_tree=VerifyTreeView(
-            draft_tokens=verify_input.draft_token,
-            draft_probabilities=getattr(verify_input, "draft_probs", None),
-            retrieve_index=verify_input.retrieve_index,
-            next_child=verify_input.retrieve_next_token,
-            next_sibling=verify_input.retrieve_next_sibling,
-            custom_mask=verify_input.custom_mask,
-            positions=verify_input.positions,
-            tokens_per_request=verify_input.draft_token_num,
-            max_depth=verify_input.max_tree_depth,
-            topk=verify_input.tree_topk,
-        ),
-        sampling=VerifySamplingView(
-            sequence_lengths=sequence_lengths,
-            temperatures=sampling_info.temperatures,
-            top_ks=sampling_info.top_ks,
-            top_ps=sampling_info.top_ps,
-            min_ps=sampling_info.min_ps,
-            step_penalties=sampling_info.step_penalties,
-            logit_bias=sampling_info.logit_bias,
-            sampling_seed=sampling_info.sampling_seed,
-            is_all_greedy=bool(sampling_info.is_all_greedy),
-            need_top_k_sampling=bool(sampling_info.need_top_k_sampling),
-            need_top_p_sampling=bool(sampling_info.need_top_p_sampling),
-            need_min_p_sampling=bool(sampling_info.need_min_p_sampling),
-            **watermark_view_fields(sampling_info.watermark),
-            max_top_k=sampling_info.max_top_k,
-            device=torch.device(device),
-        ),
-        grammar_mask=grammar_mask,
-        watermark=watermark,
-        watermark_full_mask=watermark_full_mask,
-        request_pool_indices=request_pool_indices,
-        return_logprob=return_logprob,
-        is_idle=is_idle,
-        simulated_accept_length=simulated_accept_length,
-        simulated_accept_length_rng=simulated_accept_length_rng,
-        sparse_target_max_top_k=sparse_target_max_top_k,
-        sparse_bonus_argmax=sparse_bonus_argmax,
-    )
 
 
 def accept_draft_tree(
@@ -180,53 +111,33 @@ def accept_draft_tree(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
 ) -> VerifyAccept:
-    """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify
-    under the NV mega runtime, eagle_sample otherwise."""
+    """The tree accept core of EAGLE and NGRAM: eagle_sample, with the runtime
+    hooks' local keys under the NV mega runtime."""
     batch = verify.batch
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    # The provider's sampling view carries no custom logit processors.
+    local_keys = None
+    simulated_acc_len = None
+    # The runtime hooks serve no custom logit processor.
     if (
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         and not batch.sampling_info.has_custom_logit_processor
     ):
+        local_keys = speculative_runtime_hooks.local_keys
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
-        simulated_accept_length = None
         if post_verify_graphs is not None and not batch.forward_mode.is_idle():
-            simulated_accept_length = post_verify_graphs.eager_simulated_accept_length(
+            simulated_acc_len = post_verify_graphs.eager_simulated_accept_length(
                 max_tree_depth=verify_input.max_tree_depth, device=batch.device
             )
-        post_verify_output = speculative_runtime_hooks.post_verify(
-            make_post_verify_io(
-                verify_input=verify_input,
-                sampling_info=batch.sampling_info,
-                sequence_lengths=batch.seq_lens,
-                request_pool_indices=batch.req_pool_indices,
-                device=batch.device,
-                logits_output=logits_output,
-                grammar_mask=verify.grammar_mask,
-                watermark=verify.watermark,
-                watermark_full_mask=verify.watermark_full_mask,
-                return_logprob=batch.return_logprob,
-                is_idle=batch.forward_mode.is_idle(),
-                simulated_accept_length=simulated_accept_length,
-                simulated_accept_length_rng=simulated_acc_len_rng,
-                sparse_target_max_top_k=uno_target_max_top_k,
-                sparse_bonus_argmax=sparse_bonus_argmax,
-            )
-        )
-        return VerifyAccept(
-            tokens=post_verify_output.token_ids,
-            accept_lens=post_verify_output.accepted_lengths,
-            accept_index=post_verify_output.accepted_indices,
-        )
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
         verify,
         logits_output,
         uno_target_max_top_k=uno_target_max_top_k,
+        simulated_acc_len=simulated_acc_len,
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
+        local_keys=local_keys,
     )
     verify.cap_tree_accept(accept_lens, accept_index)
     return VerifyAccept(

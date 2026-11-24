@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
@@ -14,7 +14,7 @@ from sglang.srt.utils.device import async_h2d, is_cuda
 
 from ..batch_layout import num_prefill_rows
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
-from ..interface import NO_WATERMARK_VIEW_FIELDS, SampleWatermarkOutput
+from ..interface import SampleWatermarkOutput
 from .algorithm import SynthIDConfig
 from .watermark import FilterProbs, SynthIDWatermark
 
@@ -351,11 +351,6 @@ class SynthIDVerify:
             rows.take(accept.accept_tokens()),
             rows.take(accept.accept_lens),
         )
-
-
-def watermark_view_fields(rows: SynthIDRows) -> dict[str, Any]:
-    # check_server_args refuses the NV mega runtime, the fields' only reader.
-    return NO_WATERMARK_VIEW_FIELDS
 
 
 def check_server_args(cfg: ResolvingConfig) -> None:

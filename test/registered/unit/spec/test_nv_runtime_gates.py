@@ -12,7 +12,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestNativeEagerVerify(CustomTestCase):
-    def test_master_selects_native_sampling_or_runtime_hooks(self):
+    def test_master_passes_the_runtime_hooks_local_keys(self):
         # EAGLE passes its sparse and simulated-acceptance options; NGRAM the defaults.
         eagle_options = dict(
             uno_target_max_top_k=17,
@@ -45,24 +45,10 @@ class TestNativeEagerVerify(CustomTestCase):
                     verify_input = object()
                     logits_output = SimpleNamespace(next_token_logits=None)
                     outputs = (object(), object(), object())
-                    hooks = SimpleNamespace(
-                        post_verify=Mock(
-                            return_value=SimpleNamespace(
-                                token_ids=outputs[0],
-                                accepted_lengths=outputs[1],
-                                accepted_indices=outputs[2],
-                            )
-                        )
-                    )
-                    sample, make_io = (
-                        Mock(return_value=outputs),
-                        Mock(return_value=object()),
-                    )
+                    hooks = SimpleNamespace(local_keys=object())
+                    sample = Mock(return_value=outputs)
                     with (
                         patch.object(eagle_worker_common, "eagle_sample", sample),
-                        patch.object(
-                            eagle_worker_common, "make_post_verify_io", make_io
-                        ),
                         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
                             enabled
                         ),
@@ -78,23 +64,18 @@ class TestNativeEagerVerify(CustomTestCase):
                         (accept.tokens, accept.accept_lens, accept.accept_index),
                         outputs,
                     )
-                    if enabled and not custom:
-                        sample.assert_not_called()
-                        make_io.assert_called_once()
-                        hooks.post_verify.assert_called_once_with(make_io.return_value)
-                    else:
-                        make_io.assert_not_called()
-                        hooks.post_verify.assert_not_called()
-                        sample.assert_called_once_with(
-                            verify_input,
-                            verify,
-                            logits_output,
-                            uno_target_max_top_k=options.get("uno_target_max_top_k"),
-                            simulated_acc_len_rng=options.get("simulated_acc_len_rng"),
-                            sparse_bonus_argmax=options.get(
-                                "sparse_bonus_argmax", False
-                            ),
-                        )
+                    sample.assert_called_once_with(
+                        verify_input,
+                        verify,
+                        logits_output,
+                        uno_target_max_top_k=options.get("uno_target_max_top_k"),
+                        simulated_acc_len=None,
+                        simulated_acc_len_rng=options.get("simulated_acc_len_rng"),
+                        sparse_bonus_argmax=options.get("sparse_bonus_argmax", False),
+                        local_keys=(
+                            hooks.local_keys if enabled and not custom else None
+                        ),
+                    )
 
 
 if __name__ == "__main__":

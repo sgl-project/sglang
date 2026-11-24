@@ -321,8 +321,8 @@ class VerifyRoute(msgspec.Struct, frozen=True):
         has_watermark: bool,
     ) -> VerifyRoute:
         """`has_grammar` and `has_watermark` come from the caller: verify builds
-        its grammar mask over the draft tree, and the provider's sampling view
-        carries neither stage's state."""
+        its grammar mask over the draft tree, and the post-verify graphs' sampling
+        info carries neither stage's state."""
         # Without sampling info, only a grammar edits the logits.
         if info is None:
             return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)

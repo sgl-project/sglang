@@ -294,7 +294,7 @@ class GumbelSample:
 
 
 class GumbelVerify:
-    """One verify's forcing; also the provider ABI v2 ``WatermarkStateView``."""
+    """One verify's forcing."""
 
     def __init__(
         self, state: WatermarkState, rows: GumbelRows, full_mask: bool
@@ -375,7 +375,7 @@ class GumbelVerify:
             req_pool_indices, accept.accept_tokens(), accept.accept_lens
         )
 
-    # Provider ABI v2 WatermarkStateView: the state's operations on these rows.
+    # The state's operations on these rows.
     def context_windows(self, sampling: Any) -> torch.Tensor:
         return self.rows.context_windows
 
@@ -455,15 +455,6 @@ class GumbelVerify:
         self.state.record_speculative(
             req_pool_indices, context_hashes, selected, accept_index, accept_lens
         )
-
-
-def watermark_view_fields(rows: GumbelRows) -> dict[str, Any]:
-    return {
-        "watermark_keys": rows.keys,
-        "watermark_context_windows": rows.context_windows,
-        "watermark_enabled": rows.enabled,
-        "has_watermark_candidates": True,
-    }
 
 
 def check_server_args(cfg: ResolvingConfig) -> None:

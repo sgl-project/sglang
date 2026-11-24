@@ -72,12 +72,6 @@ class VerifyWatermark(Protocol):
         """The logits to verify against and the sampling info to verify with.
 
         Callers accept with the returned sampling info, not the one passed in.
-        The NV mega runtime path (SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION)
-        builds the provider's ``VerifySamplingView`` from the sampling info
-        before any apply (``make_post_verify_io``), and a provider forces
-        through the bound object's ABI v2 methods instead of apply, so an
-        algorithm that changes the sampling info must refuse that path in its
-        ``check_server_args``.
 
         ``custom_mask`` None means a chain draft: ``draft_tokens`` and
         ``positions`` are [batch, draft_token_num].
@@ -105,16 +99,6 @@ class WatermarkEngine(Protocol):
     ) -> Optional[VerifyWatermark]:
         """The verify's watermark, or None when the batch has no watermark rows."""
         ...
-
-
-# Provider ABI v2 (``VerifySamplingView.watermark_*``) fields of a batch without
-# watermark rows.
-NO_WATERMARK_VIEW_FIELDS: dict[str, Any] = {
-    "watermark_keys": None,
-    "watermark_context_windows": None,
-    "watermark_enabled": None,
-    "has_watermark_candidates": False,
-}
 
 
 class WatermarkAdapter(Protocol):
@@ -149,8 +133,4 @@ class WatermarkAdapter(Protocol):
 
     def check_server_args(self, cfg: ResolvingConfig) -> None:
         """Server-argument checks; runs only with --enable-watermark."""
-        ...
-
-    def watermark_view_fields(self, rows: WatermarkRows) -> dict[str, Any]:
-        """The provider ABI v2 ``VerifySamplingView.watermark_*`` fields."""
         ...
