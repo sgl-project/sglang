@@ -18,6 +18,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.gptq.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
@@ -25,6 +26,7 @@ from sglang.srt.layers.quantization.gptq.gptq import (
     GPTQLinearMethod,
     GPTQMarlinConfig,
     GPTQMarlinLinearMethod,
+    GPTQMarlinMoEMethod,
 )
 from sglang.srt.layers.quantization.gptq.schemes import (
     GPTQAscendLinearScheme,
@@ -35,7 +37,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supports_layer,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config, MoeWNA16Method
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import (
     _DYNAMIC_FUSED_SHARDS,
     _FALLBACK_FUSED_SHARDS,
@@ -56,6 +61,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet, Qwen3NextForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
@@ -63,7 +69,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _make_gptq_marlin_config(dynamic=None, packed_modules_mapping=None):
@@ -1195,6 +1201,133 @@ class TestQwen35GdnGptqUnquantFallback(CustomTestCase):
                 }
             )
         self.assertFalse(awq_cfg.uses_checkpoint_tensor_manifest)
+
+
+class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
+    """A fused MoE block the checkpoint keeps unquantized must be built dense.
+
+    Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 stores its whole MTP block in bf16 and excludes it with
+    ``dynamic={"-:.*mtp.*": {}}``. The NEXTN draft builds that block, so a quantized MoE there
+    allocates ``w13_qweight`` and the draft loader drops all 768 expert weights without an error.
+    """
+
+    def setUp(self):
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", device="cpu"),
+            role="test",
+            ranks=SpawnRanks(world_rank=0),
+        )
+        get_parallel().override_permanently(tp_group=None, attn_tp_group=None)
+        self.addCleanup(reset_context)
+
+    @staticmethod
+    def _moe(quant_config, prefix):
+        return FusedMoE(
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size=256,
+            layer_id=0,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def test_excluded_moe_is_built_unquantized(self):
+        cfg = _make_gptq_marlin_config(dynamic={"-:.*mtp.*": {}})
+        moe = self._moe(cfg, "mtp.layers.0.mlp.experts")
+        self.assertIsInstance(moe.quant_method, UnquantizedFusedMoEMethod)
+        names = {name for name, _ in moe.named_parameters()}
+        self.assertIn("w13_weight", names)
+        self.assertNotIn("w13_qweight", names)
+
+    def test_non_excluded_moe_stays_quantized(self):
+        cfg = _make_gptq_marlin_config(dynamic={"-:.*mtp.*": {}})
+        moe = self._moe(cfg, "model.layers.3.mlp.experts")
+        self.assertIsInstance(moe.quant_method, GPTQMarlinMoEMethod)
+        self.assertIn("w13_qweight", {name for name, _ in moe.named_parameters()})
+
+    def test_exclusion_is_not_mtp_specific(self):
+        cfg = _make_gptq_marlin_config(dynamic={r"-:.*\.layers\.0\..*": {}})
+        self.assertIsInstance(
+            self._moe(cfg, "model.layers.0.mlp.experts").quant_method,
+            UnquantizedFusedMoEMethod,
+        )
+        self.assertIsInstance(
+            self._moe(cfg, "model.layers.1.mlp.experts").quant_method,
+            GPTQMarlinMoEMethod,
+        )
+
+    def test_mtp_draft_loads_excluded_moe_experts(self):
+        # The draft decides with the "mtp." prefix but names its parameters under "model.".
+        cfg = _make_gptq_marlin_config(dynamic={"-:.*mtp.*": {}})
+        moe = self._moe(cfg, "mtp.layers.0.mlp.experts")
+        self.assertIn("w13_weight", {name for name, _ in moe.named_parameters()})
+        module = _make_dummy_loader_module(moe, prefix="model.layers.0.mlp.experts")
+        module.config.num_experts = 2
+        weights = [
+            (
+                f"mtp.layers.0.mlp.experts.{expert}.{name}.weight",
+                torch.full((256, 256), value),
+            )
+            for expert in range(2)
+            for name, value in (
+                ("gate_proj", 1.0),
+                ("up_proj", 2.0),
+                ("down_proj", 3.0),
+            )
+        ]
+        Qwen3_5ForCausalLMMTP.load_weights(module, weights)
+        torch.testing.assert_close(moe.w13_weight[0, 0], torch.full((256,), 1.0))
+        torch.testing.assert_close(moe.w13_weight[0, 256], torch.full((256,), 2.0))
+        torch.testing.assert_close(moe.w2_weight[0], torch.full((256, 256), 3.0))
+
+    def test_moe_wna16_honours_the_same_exclusion(self):
+        cfg = MoeWNA16Config.from_config(
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "desc_act": False,
+                "dynamic": {"-:.*mtp.*": {}},
+            }
+        )
+        moe = self._moe(cfg, "mtp.layers.0.mlp.experts")
+        self.assertIsInstance(moe.quant_method, UnquantizedFusedMoEMethod)
+        self.assertIn("w13_weight", {name for name, _ in moe.named_parameters()})
+        self.assertIsInstance(
+            self._moe(cfg, "model.layers.3.mlp.experts").quant_method, MoeWNA16Method
+        )
+
+    def test_moe_wna16_awq_moe_stays_quantized(self):
+        cfg = MoeWNA16Config.from_config(
+            {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": True,
+                "modules_to_not_convert": ["visual"],
+            }
+        )
+        self.assertIsInstance(
+            self._moe(cfg, "model.layers.3.mlp.experts").quant_method, MoeWNA16Method
+        )
+
+    def test_moe_wna16_awq_moe_does_not_run_the_gptq_probe(self):
+        cfg = MoeWNA16Config.from_config(
+            {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": True,
+                "modules_to_not_convert": ["visual"],
+            }
+        )
+        with patch.object(
+            MoeWNA16Config, "is_linear_unquantized", side_effect=AssertionError
+        ):
+            moe = self._moe(cfg, "model.layers.3.mlp.experts")
+        self.assertIsInstance(moe.quant_method, MoeWNA16Method)
 
 
 if __name__ == "__main__":

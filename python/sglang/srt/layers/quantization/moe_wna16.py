@@ -226,6 +226,12 @@ class MoeWNA16Config(QuantizationConfig):
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, FusedMoE):
+            if self.linear_quant_method == "gptq" and self.is_linear_unquantized(
+                prefix
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_flashinfer_trtllm_moe, layer.use_deep_gemm
+                )
             return MoeWNA16Method(self)
         return None
 

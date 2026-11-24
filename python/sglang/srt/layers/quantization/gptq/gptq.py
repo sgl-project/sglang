@@ -665,6 +665,14 @@ class GPTQMarlinConfig(_GPTQCheckpointMixin, QuantizationConfig):
         )
 
         if isinstance(layer, FusedMoE):
+            if self.is_linear_unquantized(prefix):
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedFusedMoEMethod,
+                )
+
+                return UnquantizedFusedMoEMethod(
+                    layer.use_flashinfer_trtllm_moe, layer.use_deep_gemm
+                )
             return GPTQMarlinMoEMethod(self)
         handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
         if handled:
