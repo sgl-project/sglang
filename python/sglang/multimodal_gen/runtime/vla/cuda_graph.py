@@ -58,7 +58,9 @@ class _CapturedDenoiseGraph:
     static_x_t: torch.Tensor
     static_timestep: torch.Tensor
     static_output: torch.Tensor
-    current_context_id: int | None = None
+    # The K/V object last copied into static_prefix_context. Holding it keeps its
+    # address from being reused by a later request's object.
+    current_past_key_values: Any = None
     current_context_digest: str | None = None
 
 
@@ -360,7 +362,7 @@ class VLADenoiseGraphRunner:
         captured: _CapturedDenoiseGraph,
         prefix_context: PrefixContext,
     ) -> None:
-        context_id = id(prefix_context.past_key_values)
+        past_key_values = prefix_context.past_key_values
         context_digest = prefix_context.cache_key_digest
         mutable_graph_output = bool(
             prefix_context.layout.get("mutable_graph_output", False)
@@ -369,12 +371,15 @@ class VLADenoiseGraphRunner:
             context_digest is not None
             and captured.current_context_digest == context_digest
         ):
-            captured.current_context_id = context_id
+            captured.current_past_key_values = past_key_values
             return
-        if not mutable_graph_output and captured.current_context_id == context_id:
+        if (
+            not mutable_graph_output
+            and captured.current_past_key_values is past_key_values
+        ):
             return
         _copy_prefix_context_(captured.static_prefix_context, prefix_context)
-        captured.current_context_id = context_id
+        captured.current_past_key_values = past_key_values
         captured.current_context_digest = context_digest
 
     def _capture(
@@ -428,7 +433,7 @@ class VLADenoiseGraphRunner:
             static_x_t=static_x_t,
             static_timestep=static_timestep,
             static_output=static_output,
-            current_context_id=id(prefix_context.past_key_values),
+            current_past_key_values=prefix_context.past_key_values,
             current_context_digest=prefix_context.cache_key_digest,
         )
         logger.info(

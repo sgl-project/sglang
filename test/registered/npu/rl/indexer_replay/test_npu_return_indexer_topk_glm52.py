@@ -18,8 +18,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-2-npu-a3")
 
 
 NUM_INDEXER_LAYERS = 6
@@ -46,9 +46,7 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env={
                 **os.environ,
-                "PYTORCH_NPU_ALLOC_CONF": (
-                    "expandable_segments:True,pin_memory_expandable_segments:True"
-                ),
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             },
             other_args=[
                 "--device",
@@ -65,7 +63,8 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
                 "--attn-dp-size",
                 "2",
                 "--enable-dp-lm-head",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--enable-return-indexer-topk",
                 "--json-model-override-args",
                 '{"num_hidden_layers": 6, "quantization_config": null}',
