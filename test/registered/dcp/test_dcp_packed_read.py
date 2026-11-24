@@ -120,13 +120,13 @@ class TestChunkedGatherLandsLikeMonolithic(unittest.TestCase):
     def test_chunks_one_is_rank_major_identity(self):
         # The chunks == 1 sub-collective writes out[:gathered] from the same
         # send the monolithic gather would: offsets must match r*send_rows+i.
-        # layout.py reads SGLANG_NPU_DCP_GATHER_CHUNKS once at import; patch the
-        # module global (default is 8) to exercise the monolithic layout.
+        # layout.py holds the chunk count in a module constant (default 8);
+        # patch it to exercise the monolithic layout.
         import unittest.mock
 
         import sglang.srt.layers.dcp.layout as layout
 
-        with unittest.mock.patch.object(layout, "_dcp_gather_chunks_env", 1):
+        with unittest.mock.patch.object(layout, "_DCP_GATHER_CHUNKS", 1):
             plan = plan_dcp_packed_read(64, 16, 4)
         self.assertEqual(plan.chunks, 1)
         for r in range(plan.dcp_size):

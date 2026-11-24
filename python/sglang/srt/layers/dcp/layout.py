@@ -19,9 +19,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import print_info_once
 
 # NOTE(yhyang201): under DCP, Kimi-K3.1 shards the DSA index-K cache by token like
 # the MLA KV instead of replicating it; the indexer merges per-rank top-k exactly.
@@ -286,8 +284,8 @@ class DcpPackedReadPlan(NamedTuple):
     through ``sparse_indices``, so it does not care what order the rows are in,
     only that the indices point at the right ones. Remapping a ``[tokens, k]``
     index tensor is arithmetic on a few million integers; permuting the KV is a
-    gigabyte of traffic. Upstream reached the same conclusion for CUDA in
-    ``#39215``'s ``create_packed_dsa_dcp_kv_indices``.
+    gigabyte of traffic. (An open CUDA PR explores the same idea for SM120:
+    sgl-project/sglang#39215.)
 
     The packed buffer is exactly what the collective produces, in one piece::
 
@@ -324,6 +322,13 @@ class DcpPackedReadPlan(NamedTuple):
     chunks: int = 1
 
 
+# D2v2: split the per-layer context all-gather into this many sub-all-gathers.
+# Measured on GLM-5.2/A3 (DCP16, 972k context): the monolithic gather was one
+# 9-16 ms AIV episode (93% MTE2) that starved the compute stream's own AIV work;
+# 8 sub-collectives leave the inter-collective windows for it. 1 = monolithic.
+_DCP_GATHER_CHUNKS = 8
+
+
 def plan_dcp_packed_read(
     prefix_len: int, extend_len: int, dcp_size: int
 ) -> DcpPackedReadPlan:
@@ -344,13 +349,13 @@ def plan_dcp_packed_read(
 def dcp_gather_chunks_for(send_rows: int) -> int:
     """The effective D2v2 sub-all-gather count for a send this long.
 
-    The env value clamped to what the send can actually be cut into: a chunk of
-    zero rows would be a collective with nothing in it, and one row per chunk
-    (send shorter than the count) keeps the arithmetic honest rather than being
-    a special case. 1 is "off": the monolithic collective and the rank-major
-    layout, bit for bit.
+    The configured chunk count clamped to what the send can actually be cut
+    into: a chunk of zero rows would be a collective with nothing in it, and
+    one row per chunk (send shorter than the count) keeps the arithmetic honest
+    rather than being a special case. 1 is "off": the monolithic collective and
+    the rank-major layout, bit for bit.
     """
-    chunks = _dcp_gather_chunks_env
+    chunks = _DCP_GATHER_CHUNKS
     if chunks <= 1:
         return 1
     return min(chunks, max(1, int(send_rows)))
@@ -431,127 +436,3 @@ def remap_topk_to_packed(
     extend_row = plan.gathered_rows + (topk_indices - plan.prefix_len)
     packed = torch.where(topk_indices < plan.prefix_len, prefix_row, extend_row)
     return torch.where(topk_indices < 0, topk_indices, packed)
-
-
-_enable_dcp_packed_read = envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get()
-_dcp_gather_chunks_env = envs.SGLANG_NPU_DCP_GATHER_CHUNKS.get()
-
-
-class _PackedMissing:
-    """Distinguishes "not resolved yet" from "resolved, and it is None"."""
-
-
-_PACKED_MISSING = _PackedMissing()
-
-
-def _dsa_kv_store_is_fp8() -> bool:
-    """Whether the active DSA KV pool stores FP8 (``dsa_kv_cache_store_fp8`` /
-    MXFP8). The packed single-record read does not support it: under the FP8
-    store ``get_mla_kv_buffer`` returns the packed uint8 view with ``rope=None``,
-    which the packed path's ``_pad_dcp_packed_send`` cannot consume. Defensive:
-    the forward context is not always up (a plan probe can run before a forward),
-    so a missing context means "not FP8" and the other refusals still apply.
-    """
-    try:
-        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-
-        return bool(getattr(get_token_to_kv_pool(), "dsa_kv_cache_store_fp8", False))
-    except Exception:
-        return False
-
-
-def dcp_packed_read_plan(
-    forward_batch, index_topk: Optional[int]
-) -> Optional[DcpPackedReadPlan]:
-    """This forward's packed-buffer plan, or None to keep the permuting path.
-
-    Resolved once per forward and cached on the NPU DCP metadata (the subclass
-    built for the DSA-DCP extend path, whose fields these are). It lives here,
-    beside the arithmetic, rather than in the NPU model module, because BOTH the
-    model (to fill the buffer and remap the top-k) and the attention backend (to
-    set the operator's KV length and drop its causal crop) have to agree on it,
-    and a backend importing a model module inverts the layering -- the same
-    reason ``dsa_cp.py`` sits where it does.
-
-    Every refusal is logged once. A silent refusal here would look exactly like
-    a feature that is on and doing nothing.
-    """
-    if not _enable_dcp_packed_read:
-        return None
-    md = forward_batch.attn_dcp_metadata
-    if md.packed_read_plan_done:
-        return md.packed_read_plan
-
-    plan = None
-    extend_lens = forward_batch.extend_seq_lens_cpu
-    prefix_lens = forward_batch.extend_prefix_lens_cpu
-    if _dsa_kv_store_is_fp8():
-        # FP8 DSA KV store (dsa_kv_cache_store_fp8 / MXFP8): the packed
-        # single-record read is not supported for it (get_mla_kv_buffer returns
-        # rope=None). The permuting path handles FP8 (it packs uint8 and the
-        # backend's quant branch dequants), so decline to that fallback -- the
-        # v1 packed-read refusal, re-expressed as a plan admission.
-        print_info_once(
-            "DCP packed read is off: the DSA KV is stored in FP8 "
-            "(dsa_kv_cache_store_fp8); the packed single-record read is not "
-            "supported for it, so the permuting path is used"
-        )
-    elif index_topk is None:
-        # No top-k to measure, so the causal bound below cannot be checked.
-        # Refuse, and CACHE the refusal: a forward has to take one path the
-        # whole way down. Resolving later would leave earlier layers' top-k
-        # unremapped while later layers read a packed buffer.
-        print_info_once(
-            "DCP packed read is off: this forward reached the extend gather "
-            "with no top-k, so the causal bound cannot be checked"
-        )
-    elif not extend_lens or prefix_lens is None:
-        print_info_once("DCP packed read is off: no CPU length metadata on this extend")
-    elif len(extend_lens) != 1:
-        # ONE REQUEST, for the layout reason in DcpPackedReadPlan: the
-        # all-gather is rank-major over the WHOLE send, so with two requests a
-        # request's rows land in dcp_size separate blocks and the operator's
-        # cumulative actual_seq_lengths_kv cannot describe them. The permuting
-        # path handles those.
-        print_info_once(
-            f"DCP packed read is off for multi-request extends "
-            f"({len(extend_lens)} requests here); the all-gather is rank-major "
-            "over the whole send, so no request is contiguous in it"
-        )
-    elif not md.extend_crop_free:
-        # Computed once at prepare (dcp_extend_crop_free); it has already
-        # logged which request fell short.
-        print_info_once(
-            "DCP packed read is off: this chunk needs the operator's causal "
-            "crop, and the packed layout cannot use one"
-        )
-    else:
-        plan = plan_dcp_packed_read(
-            prefix_lens[0], extend_lens[0], get_parallel().dcp_size
-        )
-        print_info_once(
-            "DCP packed read is ON: the sparse operator reads the all-gather's "
-            "own rank-major output and the top-k is remapped instead"
-        )
-    md.packed_read_plan = plan
-    md.packed_read_plan_done = True
-    return plan
-
-
-def dcp_packed_kv_lens(forward_batch, plan: DcpPackedReadPlan, device) -> torch.Tensor:
-    """The operator's ``actual_seq_lengths_kv`` for a packed read, built once.
-
-    One request, so one entry, and it is the whole buffer: with the causal crop
-    off there is nothing to shorten, and the padding rows the ranks sent to keep
-    their sends equal are never named by any remapped index.
-
-    Cached on the DCP metadata rather than built where it is used, because that
-    use is once per layer and ``torch.tensor(list, device=npu)`` is a blocking
-    host-to-device copy -- 78 of them a forward, each draining the queue.
-    """
-    md = forward_batch.attn_dcp_metadata
-    cached = md.packed_kv_lens
-    if cached is None:
-        cached = torch.tensor([plan.rows], dtype=torch.int32, device=device)
-        md.packed_kv_lens = cached
-    return cached

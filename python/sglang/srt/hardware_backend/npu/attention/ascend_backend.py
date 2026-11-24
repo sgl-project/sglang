@@ -30,6 +30,8 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     NPUDecodeContextParallelMetadata,
     build_dcp_extend_gather_plan,
+    dcp_packed_kv_lens,
+    dcp_packed_read_plan,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
@@ -50,12 +52,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.layers.dcp.layout import (
-    dcp_packed_kv_lens,
-    dcp_packed_read_plan,
-    get_dcp_chain_spec_lens,
-    get_dcp_lens,
-)
+from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
