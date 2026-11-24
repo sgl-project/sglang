@@ -7,6 +7,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.utils.device import is_musa
+
+_is_musa = is_musa()
 
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
@@ -24,7 +27,9 @@ _L20_CONFIGS = [
 
 
 def _get_best_config(total_q: int):
-    if is_batch_invariant_mode_enabled():
+    # H20/L20 tables are CUDA-specific; avoid CUDA device probing on MUSA.
+    # Use the existing batch-invariant configuration until MUSA is tuned.
+    if _is_musa or is_batch_invariant_mode_enabled():
         return (32, 4, 2)
     table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
@@ -265,14 +270,19 @@ def _sparse_gqa_chunk_prefill(
         values = values.to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        # An all-masked first block has next_max == -inf. Subtract a finite
+        # value so its probabilities/accumulator remain zero, not NaN.
+        safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+        alpha = tl.math.exp2(max_value - safe_max)
+        probabilities = tl.math.exp2(scores - safe_max[:, None])
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    # Empty selections execute no blocks; define their attention output as zero.
+    safe_normalizer = tl.where(normalizer > 0.0, normalizer, 1.0)
+    output = accumulator / safe_normalizer[:, None]
     tl.store(
         out
         + query * so_m

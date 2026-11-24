@@ -10,8 +10,10 @@ import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils.device import is_musa
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
@@ -45,6 +47,35 @@ def qsa_fast_topk(
         # Upstream supplies contiguous bounds and finite scores within each
         # valid interval. Unsupported metadata/errors must not silently fall back.
         return fast_topk(logits, lengths, topk, starts)
+
+    if _is_musa:
+        # torchada exposes is_cuda=True on MUSA; neither CUDA JIT nor
+        # flashinfer is usable here. Keep selection and row bounds on-device.
+        rows, columns = logits.shape
+        output = torch.full(
+            (rows, topk), -1, dtype=torch.int32, device=logits.device
+        )
+        width = min(columns, topk)
+        if rows == 0 or width == 0:
+            return output
+        positions = torch.arange(columns, device=logits.device)
+        relative = positions.unsqueeze(0) - starts.unsqueeze(1)
+        valid = (relative >= 0) & (relative < lengths.unsqueeze(1))
+        # As in the platform kernels, valid intervals must contain finite scores.
+        scores = logits.masked_fill(~valid, float("-inf"))
+        if is_batch_invariant_mode_enabled():
+            # Match the deterministic CUDA path's SMALL index tie-break.
+            selected = torch.argsort(
+                scores, dim=-1, descending=True, stable=True
+            )[:, :width]
+        else:
+            selected = torch.topk(scores, width, dim=-1).indices
+        selected_relative = selected - starts.unsqueeze(1)
+        selected_valid = valid.gather(1, selected)
+        output[:, :width] = torch.where(
+            selected_valid, selected_relative, -1
+        ).to(torch.int32)
+        return output
 
     if logits.is_cuda:
         if is_batch_invariant_mode_enabled() and not is_hip():

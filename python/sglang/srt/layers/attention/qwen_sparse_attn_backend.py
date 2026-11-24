@@ -57,10 +57,12 @@ from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
+from sglang.srt.utils.device import is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 
@@ -105,7 +107,8 @@ def _resolve_trtllm_sparse_decode():
     # This path is numerically validated on SM100 and SM120. Do not widen it
     # to every SM12x device: it silently corrupts long-context decode on
     # SM121/GB10.
-    if not (is_sm100_supported() or is_sm120()):
+    # MUSA must not probe CUDA-only FlashInfer kernels through torchada.
+    if _is_musa or not (is_sm100_supported() or is_sm120()):
         return None
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
@@ -2148,7 +2151,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
-        if is_hip():
+        # torchada reports MUSA tensors as CUDA; use the portable Triton
+        # packed decode instead of probing CUDA FA2/FA4 CuTe implementations.
+        if _is_musa or is_hip():
             relative_indices = torch.arange(
                 topk, dtype=torch.int32, device=q.device
             ).expand(batch, -1)

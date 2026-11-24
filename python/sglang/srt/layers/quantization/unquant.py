@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.device import is_musa
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -914,7 +915,17 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
+        weight = layer.weight
+        if is_musa() and weight.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            # MUSA IndexSelect does not support FP8 tables. Gather their raw
+            # bytes instead: the view shares storage, so even large PLE tables
+            # need no full-table cast/copy. Restore FP8 before the caller's
+            # output-dtype conversion and weight scaling.
+            return F.embedding(input_, weight.view(torch.uint8)).view(weight.dtype)
+        return F.embedding(input_, weight)
 
 
 class UnquantizedLinearMethod(LinearMethodBase):

@@ -35,8 +35,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.device import is_musa
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -536,8 +538,10 @@ class QSAIndexer(MultiPlatformOp):
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
+        # MUSA uses qsa_fast_topk's Torch path, which needs short-row scores too.
         use_fast_topk = (
             not _is_npu
+            and not _is_musa
             and q.is_cuda
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
