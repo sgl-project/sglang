@@ -88,6 +88,10 @@ def build_fused_accept_indices(
 class FlashInferKDAKernel(LinearAttnKernelBase):
     """FlashInfer KDA kernel: decode + MTP (target_verify), topk=1."""
 
+    # recurrent_kda applies the safe gate (lower_bound) in decode and verify.
+    supports_safe_gate_decode = True
+    supports_safe_gate_verify = True
+
     def __init__(self):
         available, self._recurrent_kda = _get_flashinfer_kda_kernel()
         if not available or self._recurrent_kda is None:
