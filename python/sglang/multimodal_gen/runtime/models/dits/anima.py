@@ -187,9 +187,7 @@ class AnimaAdaLayerNorm(nn.Module):
         if (
             is_in_breakable_cuda_graph()
             and not torch.compiler.is_compiling()
-            and x.dtype == torch.bfloat16
-            and x.is_cuda
-            and torch.version.hip is None
+            and x.is_contiguous()
         ):
             out = layernorm_modulate_bitexact(
                 _ANIMA_LN_MOD,
@@ -198,7 +196,7 @@ class AnimaAdaLayerNorm(nn.Module):
                 scale.squeeze(1),
                 shift.squeeze(1),
                 lambda: self._modulate(x, scale, shift),
-                sig=(x.device, x.shape, x.stride(), scale.stride(), shift.stride(), self.norm.eps),
+                sig=(x.device, x.shape, scale.stride(0), self.norm.eps),
             )
         else:
             out = self._modulate(x, scale, shift)
