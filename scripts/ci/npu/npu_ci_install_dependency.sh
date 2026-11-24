@@ -68,9 +68,22 @@ ${UV_PIP_INSTALL} pybind11 decorator attrs evalscope
 
 ${PIP_INSTALL} cannbot-dsl==0.8.0
 
+case "${DEVICE_TYPE}" in
+    950)
+        MF_SOC_VERSION="A5"
+        ;;
+    a3)
+        MF_SOC_VERSION="A3"
+        ;;
+    *)
+        echo "Unsupported DEVICE_TYPE for mfcli kernel install: ${DEVICE_TYPE}" >&2
+        exit 1
+        ;;
+esac
 ${PIP_INSTALL} memfabric-hybrid==1.5.0.dev20261119 \
     --trusted-host ascend.devcloud.huaweicloud.com \
     -i https://ascend.devcloud.huaweicloud.com/pypi/simple
+mfcli kernel install --soc-version "${MF_SOC_VERSION}"
 
 ${PIP_INSTALL} "https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_${DEVICE_ARCH}.whl" \
     --force --no-deps
