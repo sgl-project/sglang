@@ -52,12 +52,13 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
     HiCacheDraftPlan,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class TestDecodeRetractionBackup(CustomTestCase):
@@ -367,6 +368,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             tree_cache=env.cache,
             token_to_kv_pool=env.target_pool,
             draft_token_to_kv_pool=env.draft_pool,
+            draft_kv_ring=None,
             token_to_kv_pool_allocator=env.allocator,
             req_to_token_pool=env.req_to_token_pool,
             req_to_metadata_buffer_idx_allocator=ReqToMetadataIdxAllocator(2),
@@ -680,6 +682,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 self.assertEqual(
                     queue.move_preallocated(queue.transfer_queue.queue), ([], [])
                 )
+                self.assertFalse(queue.host_pool_blocked)
                 receiver.send_metadata.assert_not_called()
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -753,6 +756,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 self.assertEqual(
                     queue.move_preallocated(queue.transfer_queue.queue), ([], [])
                 )
+                self.assertTrue(queue.host_pool_blocked)
                 self.assertEqual(list(queue.queue.items()), [pending])
                 self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)

@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    idle_penalty_status_pool,
+    release_only_retirer,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -40,6 +44,7 @@ class _Req(FakeReq):
             kv_committed_len=context_len + block_size,
         )
         self.finished_reason = None
+        self.ignored_stop_token_len = None
         self.finish_on_update = False
         self.retracted_stain = False
         self.sampling_params = SimpleNamespace(max_new_tokens=1024)
@@ -190,6 +195,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.rem_dllm_tokens = 1024
         adder.can_run_list = []
         adder._state_slots_for_req = lambda req: 0
+        adder._request_rows_for_req = lambda req: 0
         adder._replay_len = lambda req, prefix_len: 0
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
@@ -226,6 +232,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._get_dllm_remain_tokens = lambda req=None, **_: 64
         adder.memory_budget = SimpleNamespace(prices_by_demand=False)
         adder._state_slots_for_req = lambda req: 0
+        adder._request_rows_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
@@ -383,7 +390,9 @@ class TestGemma4RequestValidation(unittest.TestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
-        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
+        )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None
@@ -400,6 +409,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.beam_coordinator = Mock()
         scheduler.hisparse_coordinator = None
         scheduler.uocr_runtime = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,

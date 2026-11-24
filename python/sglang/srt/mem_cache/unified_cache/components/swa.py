@@ -439,7 +439,7 @@ class SWAComponent(TreeComponent):
             return
         result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
         full_cd.value = incoming_full.clone()
-        cache_actions.append(FreeDeviceKVFullOnly([old_full]))
+        cache_actions.append(FreeDeviceKVFullOnly([old_full], tree_owned=True))
         self._publish_window(node=node, cache_actions=cache_actions)
 
     def update_component_on_insert_overlap(
@@ -1035,8 +1035,6 @@ class SWAComponent(TreeComponent):
         return effective_cache_len
 
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
-        if self.sliding_window_size is None:
-            return
         self.cache.kv_storage().advance(
             req,
             pre_len,

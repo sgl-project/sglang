@@ -310,6 +310,12 @@ class LongcatFlashModelNextN(nn.Module):
 
 
 class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
+    @staticmethod
+    def own_quant_config(hf_config, quant_config):
+        if "mtp" in getattr(hf_config, "disable_quant_module", []):
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -317,11 +323,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.quant_config = (
-            None
-            if "mtp" in getattr(config, "disable_quant_module", [])
-            else quant_config
-        )
+        self.quant_config = self.own_quant_config(config, quant_config)
         self.model = LongcatFlashModelNextN(config, self.quant_config)
         self.lm_head = ParallelLMHead(
             config.vocab_size,

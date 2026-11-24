@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::native_api::native_error;
 
 /// The file header, Python's `HEADER_STRUCT` (`<4sHHI`): magic, version,
@@ -125,6 +126,8 @@ const SECTIONS: &[Section] = &[
             ("decode_retracted_queue_reqs", Some(Zero::Int)),
             ("kv_transfer_speed_gb_s", Some(Zero::Float)),
             ("kv_transfer_latency_ms", Some(Zero::Float)),
+            ("decode_host_pool_blocked", Some(Zero::Int)),
+            ("decode_host_staged_landed_reqs", Some(Zero::Int)),
         ],
     },
     Section {
@@ -144,7 +147,7 @@ const SECTIONS: &[Section] = &[
 const VALID_INCLUDES: &[&str] = &["all", "core", "disagg", "lora", "memory", "queues", "spec"];
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/loads", get(loads))
+    Router::new().declared_route("/v1/loads", get(loads))
 }
 
 #[derive(Deserialize)]
@@ -172,15 +175,22 @@ async fn loads(State(state): State<Arc<AppState>>, Query(query): Query<LoadsQuer
         Some(_) => Vec::new(),
     };
     let started = Instant::now();
-    let loads: Vec<Map<String, Value>> =
-        read_snapshots(Path::new(path), args.load_snapshot_dp_size, &ranks)
+    // The shared lock waits out the writer, which holds it exclusively for as
+    // long as its write takes: keep that wait off the async workers.
+    let path = path.to_owned();
+    let dp_size = args.load_snapshot_dp_size;
+    let loads: Vec<Map<String, Value>> = tokio::task::spawn_blocking(move || {
+        read_snapshots(Path::new(&path), dp_size, &ranks)
             .iter()
             .filter_map(|snapshot| to_dict(snapshot, include.as_ref()))
             .map(|mut load| {
                 load.insert("dp_rank".into(), Value::from(0));
                 load
             })
-            .collect();
+            .collect()
+    })
+    .await
+    .expect("reading load snapshots does not panic");
     if let Some(metrics) = state.core.metrics() {
         metrics.observe_get_loads(started.elapsed());
     }
@@ -400,6 +410,8 @@ mod tests {
     use super::*;
     use crate::message::config::ServerArgs;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../../../testdata/load_snapshot.json")).unwrap()
@@ -484,6 +496,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -572,5 +585,63 @@ mod tests {
 
         let (status, _) = get(ServerArgs::default(), "").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A writer holding the snapshot lock delays the polls waiting on it, not
+    /// the async workers they run on: with one poll per worker, a ticker on
+    /// the same workers keeps ticking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn locked_snapshot_does_not_block_workers() {
+        const HOLD: Duration = Duration::from_millis(500);
+        const TICK: Duration = Duration::from_millis(5);
+        let file = SnapshotFile::new(2);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let path = file.0.clone();
+            std::thread::spawn(move || {
+                let file = File::open(path).unwrap();
+                flock(&file, FlockOperation::LockExclusive).unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(HOLD);
+            })
+        };
+        locked_rx.recv().unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let done = done.clone();
+            async move {
+                let mut worst = Duration::ZERO;
+                while !done.load(Ordering::Relaxed) {
+                    let tick = Instant::now();
+                    tokio::time::sleep(TICK).await;
+                    worst = worst.max(tick.elapsed().saturating_sub(TICK));
+                }
+                worst
+            }
+        });
+        let started = Instant::now();
+        let polls: Vec<_> = (0..2)
+            .map(|_| {
+                let args = ServerArgs {
+                    load_snapshot_path: Some(file.0.display().to_string()),
+                    load_snapshot_dp_size: 2,
+                    ..Default::default()
+                };
+                tokio::spawn(get(args, "include=core"))
+            })
+            .collect();
+        for poll in polls {
+            let (status, body) = poll.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["loads"].as_array().unwrap().len(), 1, "{body}");
+        }
+        let waited = started.elapsed();
+        done.store(true, Ordering::Relaxed);
+        let worst = ticker.await.unwrap();
+        writer.join().unwrap();
+        assert!(waited >= HOLD / 2, "the polls waited only {waited:?}");
+        assert!(worst < HOLD / 2, "a worker stalled for {worst:?}");
     }
 }

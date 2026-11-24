@@ -17,7 +17,7 @@ import logging
 import re
 from array import array
 from functools import lru_cache
-from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -69,18 +69,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 cached_get_processor = lru_cache(get_processor)
-
-
-class Gemma4ImagePixelInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
-
-
-class Gemma4AudioInputs(TypedDict):
-    input_features_padded: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length, num_features)`"""
-    input_features_mask: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length)`"""
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
@@ -192,7 +180,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        # --language-model-only builds neither: multimodal requests are rejected
+        # before they reach the model.
+        if config.language_model_only:
+            self.vision_tower = None
+            self.embed_vision = None
+            self.audio_tower = None
+            self.embed_audio = None
+        elif self.pp_group.is_first_rank:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -299,11 +294,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
-
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Gemma 4 multimodal ties its LM head to the text embed_tokens
-        embed = self.language_model.embed_tokens.weight
-        return embed, embed
 
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
@@ -953,6 +943,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 continue
             if self.audio_tower is None and (
                 "audio_tower." in name or "embed_audio." in name
+            ):
+                continue
+            if self.vision_tower is None and (
+                "vision_tower." in name or "embed_vision." in name
             ):
                 continue
 
