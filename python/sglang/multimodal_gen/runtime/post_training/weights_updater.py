@@ -434,22 +434,28 @@ class WeightsUpdater:
                     self._module_weight_dirs[module_name] = weights_map[module_name]
                 if target_modules is None:
                     self.pipeline.model_path = local_model_path
-                for module_name, module in modules_to_update:
-                    if isinstance(module, BaseDiT):
-                        # Weight-derived caches must not survive a weight swap
-                        # (regardless of flush_cache, which only governs
-                        # optimization caches like TeaCache).
-                        module.refresh_weight_derived_caches(
-                            weights_path=weights_map[module_name]
-                        )
+                with maybe_record_function(
+                    "WEIGHT UPDATE refresh weight-derived caches"
+                ):
+                    for module_name, module in modules_to_update:
+                        if isinstance(module, BaseDiT):
+                            # Weight-derived caches must not survive a weight swap
+                            # (regardless of flush_cache, which only governs
+                            # optimization caches like TeaCache).
+                            module.refresh_weight_derived_caches(
+                                weights_path=weights_map[module_name]
+                            )
 
-            gc.collect()
-            torch.cuda.empty_cache()
+            with maybe_record_function("WEIGHT UPDATE collect Python garbage"):
+                gc.collect()
+            with maybe_record_function("WEIGHT UPDATE empty CUDA cache"):
+                torch.cuda.empty_cache()
 
             if success and flush_cache:
-                for _, module in modules_to_update:
-                    if isinstance(module, TeaCacheMixin):
-                        module.reset_teacache_state()
+                with maybe_record_function("WEIGHT UPDATE reset TeaCache"):
+                    for _, module in modules_to_update:
+                        if isinstance(module, TeaCacheMixin):
+                            module.reset_teacache_state()
 
         logger.info(message)
         return success, message

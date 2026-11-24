@@ -121,13 +121,16 @@ def test_disk_weight_update_trace_identifies_worker_phases(tmp_path, rollback):
 
     with gzip.open(tmp_path / "disk-update-rank-0.trace.json.gz", "rt") as trace:
         events = json.load(trace)["traceEvents"]
-    spans = {
-        event["name"]
+    spans = [
+        event
         for event in events
-        if event["ph"] == "X" and event["name"].startswith("WEIGHT UPDATE ")
+        if event.get("ph") == "X" and event.get("name", "").startswith("WEIGHT UPDATE ")
+    ]
+    cleanup_phases = {
+        "WEIGHT UPDATE collect Python garbage",
+        "WEIGHT UPDATE empty CUDA cache",
     }
     expected = {
-        "WEIGHT UPDATE disk",
         "WEIGHT UPDATE invalidate conditioning caches",
         "WEIGHT UPDATE resolve checkpoint",
         "WEIGHT UPDATE validate checkpoint",
@@ -137,7 +140,28 @@ def test_disk_weight_update_trace_identifies_worker_phases(tmp_path, rollback):
     }
     if rollback:
         expected.add("WEIGHT UPDATE rollback")
-    assert spans == expected
+    else:
+        cleanup_phases.update(
+            {
+                "WEIGHT UPDATE refresh weight-derived caches",
+                "WEIGHT UPDATE reset TeaCache",
+            }
+        )
+
+    totals = [span for span in spans if span["name"] == "WEIGHT UPDATE disk"]
+    assert len(totals) == 1
+    total = totals[0]
+    child_spans = [span for span in spans if span is not total]
+    assert sorted(span["name"] for span in child_spans) == sorted(
+        expected | cleanup_phases
+    )
+    cleanup = next(
+        span for span in child_spans if span["name"] == "WEIGHT UPDATE cleanup"
+    )
+    for span in child_spans:
+        parent = cleanup if span["name"] in cleanup_phases else total
+        assert parent["ts"] <= span["ts"]
+        assert span["ts"] + span["dur"] <= parent["ts"] + parent["dur"]
 
 
 if __name__ == "__main__":

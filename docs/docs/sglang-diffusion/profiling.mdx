@@ -76,10 +76,14 @@ On a running diffusion server, call `POST /start_profile`, submit
 returns. Open the worker's `*-rank-<rank>.trace.json.gz` and search for
 `WEIGHT UPDATE`. The worker trace breaks down conditioning-cache invalidation,
 checkpoint resolution and validation, weight loading for each selected module,
-and cleanup. If applying weights fails and the worker restores the previous
-weights, a separate rollback span captures that work.
+and cleanup. The cleanup span includes bookkeeping and separates weight-derived
+cache refresh, Python garbage collection, CUDA allocator cache release, and
+TeaCache reset when those phases run. If applying weights fails and the worker
+restores the previous weights, a separate rollback span captures that work.
 
-Use CPU profiling activities to see the named host spans. Include CUDA
+These host spans are recorded on the worker's scheduler thread, which also
+starts and stops the worker profiler. Use CPU profiling activities to see them.
+Include CUDA
 activities on supported deployments to see device work alongside those spans.
 Use a local checkpoint when measuring disk updates without download time.
 
