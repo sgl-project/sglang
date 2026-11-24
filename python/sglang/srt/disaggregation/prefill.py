@@ -75,6 +75,7 @@ from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
+from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -443,6 +444,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
+        kv_args.draft_rows_dcp_collapsed = (
+            draft_kv_pool is not None and draft_kv_pool.rows_are_dcp_collapsed
+        )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,
@@ -1922,7 +1926,9 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx,
                     req.disagg_decode_prefix_len,
                     seq_len,
-                    page_size,
+                    dsa_index_k_page_tokens(
+                        self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.page_size
+                    ),
                 )
 
             def _dsa_tail_payload():

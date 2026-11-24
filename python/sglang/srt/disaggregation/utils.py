@@ -1287,6 +1287,8 @@ def compute_mamba_state_slice_blocks(
     if src_attn_tp_size > dst_attn_tp_size:
         # Aggregation: several prefill ranks each write their shard into one decode slot.
         writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+        if local_tp_rank_in_group // writers_per_decode != dst_tp_rank_in_group:
+            return []
         local_writer_idx = local_tp_rank_in_group % writers_per_decode
         if not use_subdims:
             return [(0, local_writer_idx * src_dim, src_dim)]
@@ -1305,7 +1307,16 @@ def compute_mamba_state_slice_blocks(
             dst_off += dst_sub
         return blocks
 
-    # Scatter: 1 prefill rank feeds several decode ranks.
+    # Scatter: 1 prefill rank feeds several decode ranks. Under hybrid-MLA
+    # DCP-M -> DCP-N, a decode rank can also connect to a separate KV-owning
+    # prefill rank; only the TP head owner writes the state slice.
+    if src_attn_tp_size < dst_attn_tp_size:
+        owner_src_tp_rank = dst_tp_rank_in_group // (
+            dst_attn_tp_size // src_attn_tp_size
+        )
+        if local_tp_rank_in_group != owner_src_tp_rank:
+            return []
+
     if not use_subdims:
         src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
         return [(src_dim_start, 0, dst_dim)]
@@ -1356,6 +1367,16 @@ def compute_mamba_state_slice_byte_blocks(
                 "Replicated Mamba state item lengths differ between prefill and "
                 f"decode: {src_item_len} != {dst_item_len}"
             )
+        if src_attn_tp_size < dst_attn_tp_size:
+            owner_src_tp_rank = dst_tp_rank_in_group // (
+                dst_attn_tp_size // src_attn_tp_size
+            )
+            if local_tp_rank_in_group != owner_src_tp_rank:
+                return []
+        elif src_attn_tp_size > dst_attn_tp_size:
+            writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+            if local_tp_rank_in_group // writers_per_decode != dst_tp_rank_in_group:
+                return []
         if not should_send_replicated_state(
             src_attn_tp_size=src_attn_tp_size,
             dst_attn_tp_size=dst_attn_tp_size,

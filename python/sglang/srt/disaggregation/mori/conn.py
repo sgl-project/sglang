@@ -1520,9 +1520,23 @@ class MoriKVManager(CommonKVManager):
             src_page_offset=src_page_offset,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
+            src_dcp_size=self.dcp_size,
+            src_dcp_rank=self.dcp_rank,
+            src_draft_rows_collapsed=getattr(
+                self.kv_args, "draft_rows_dcp_collapsed", False
+            ),
+            send_replicated_draft=self._should_send_replicated_dcp_draft(
+                peer_info.dst_dcp_size, peer_info.dst_dcp_rank
+            ),
         )
-        target_plan = GroupedIndexPlan.from_indices(
-            plan.target_src_token_indices, plan.target_dst_token_indices
+        if plan.empty():
+            return []
+        target_plan = (
+            GroupedIndexPlan.from_indices(
+                plan.target_src_token_indices, plan.target_dst_token_indices
+            )
+            if plan.target_src_token_indices.size
+            else None
         )
         num_draft = self.kv_args.num_draft_entries
         num_target = len(self.kv_args.kv_item_lens) - num_draft
@@ -1530,7 +1544,7 @@ class MoriKVManager(CommonKVManager):
             GroupedIndexPlan.from_indices(
                 plan.draft_src_token_indices, plan.draft_dst_token_indices
             )
-            if num_draft
+            if num_draft and plan.draft_src_token_indices.size
             else None
         )
         token_item_lens = peer_info.dcp_token_item_lens
@@ -1548,9 +1562,11 @@ class MoriKVManager(CommonKVManager):
         for entry_idx, (src_desc, dst_desc) in enumerate(desc_pairs):
             item_len = token_item_lens[entry_idx]
             is_draft = entry_idx >= num_target
+            grouped_plan = draft_plan if is_draft else target_plan
+            if grouped_plan is None:
+                continue
             cache_key = (is_draft, item_len)
             if cache_key not in plan_cache:
-                grouped_plan = draft_plan if is_draft else target_plan
                 plan_cache[cache_key] = grouped_plan.materialize(item_len)
             transfer_plan = plan_cache[cache_key]
             statuses.extend(

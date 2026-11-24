@@ -187,43 +187,89 @@ def build_dcp_token_transfer_plan(
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
     draft_rows_collapsed: bool = False,
+    src_dcp_size: int = 1,
+    src_dcp_rank: int = 0,
+    src_draft_rows_collapsed: bool = False,
+    send_replicated_draft: bool = True,
 ) -> DCPTokenTransferPlan:
+    if src_dcp_size < 1 or dcp_size < 1:
+        raise ValueError(
+            f"PD DCP sizes must be >= 1, got src={src_dcp_size}, dst={dcp_size}"
+        )
+    if not (0 <= src_dcp_rank < src_dcp_size) or not (0 <= dcp_rank < dcp_size):
+        raise ValueError(
+            f"PD DCP rank out of range: src={src_dcp_rank}/{src_dcp_size}, "
+            f"dst={dcp_rank}/{dcp_size}"
+        )
+    if dcp_size % src_dcp_size != 0 and src_dcp_size % dcp_size != 0:
+        raise ValueError(
+            f"PD DCP sizes must divide each other, got src={src_dcp_size}, dst={dcp_size}"
+        )
+
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
-    virtual_page_size = physical_page_size * dcp_size
-    if decode_prefix_len % virtual_page_size != 0:
+    src_virtual_page_size = physical_page_size * src_dcp_size
+    dst_virtual_page_size = physical_page_size * dcp_size
+    prefix_align = max(src_virtual_page_size, dst_virtual_page_size)
+    if decode_prefix_len % prefix_align != 0:
         raise ValueError(
             "PD DCP transfer requires decode_prefix_len to align to the virtual "
-            f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+            f"DCP page size ({prefix_align}), got {decode_prefix_len}"
         )
     if num_kv_tokens is None:
-        num_kv_tokens = src_pages.size * physical_page_size
+        num_kv_tokens = src_pages.size * src_virtual_page_size
+    empty = np.empty((0,), dtype=np.int64)
     if num_kv_tokens == 0:
-        empty = np.empty((0,), dtype=np.int64)
         return DCPTokenTransferPlan(empty, empty.copy(), empty.copy(), empty.copy())
 
-    def rows(offsets, dst_page_size, dst_local):
-        return (
-            src_pages[offsets // physical_page_size] * physical_page_size
-            + offsets % physical_page_size,
-            dst_pages[dst_local // dst_page_size] * dst_page_size
-            + dst_local % dst_page_size,
+    def rows(
+        pages: npt.NDArray[np.int64], page_size: int, local: npt.NDArray[np.int64]
+    ):
+        if local.size == 0:
+            return empty.copy()
+        return pages[local // page_size] * page_size + local % page_size
+
+    chunk_token_offset = src_page_offset * src_virtual_page_size
+    chunk_start = decode_prefix_len + chunk_token_offset
+    gcd_dcp = min(src_dcp_size, dcp_size)
+    if src_dcp_rank % gcd_dcp != dcp_rank % gcd_dcp:
+        target_offsets = empty
+    else:
+        stride = max(src_dcp_size, dcp_size)
+        owner_mod = dcp_rank if dcp_size >= src_dcp_size else src_dcp_rank
+        target_offsets = np.arange(
+            (owner_mod - chunk_start) % stride,
+            num_kv_tokens,
+            stride,
+            dtype=np.int64,
         )
 
-    draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
-    draft_local = src_page_offset * physical_page_size + draft_offsets
-    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
-    target_offsets = np.arange(
-        (dcp_rank - chunk_start) % dcp_size,
-        num_kv_tokens,
-        dcp_size,
-        dtype=np.int64,
+    target_src = rows(src_pages, physical_page_size, target_offsets // src_dcp_size)
+    target_dst = rows(
+        dst_pages, physical_page_size, (chunk_token_offset + target_offsets) // dcp_size
     )
-    target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
-    target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
-    if draft_rows_collapsed:
+
+    if src_draft_rows_collapsed and draft_rows_collapsed:
         return DCPTokenTransferPlan(
             target_src, target_dst, target_src.copy(), target_dst.copy()
         )
-    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
+    if draft_rows_collapsed:
+        draft_src = rows(src_pages, src_virtual_page_size, target_offsets)
+        return DCPTokenTransferPlan(
+            target_src, target_dst, draft_src, target_dst.copy()
+        )
+    if src_draft_rows_collapsed:
+        draft_dst = rows(
+            dst_pages, dst_virtual_page_size, chunk_token_offset + target_offsets
+        )
+        return DCPTokenTransferPlan(
+            target_src, target_dst, target_src.copy(), draft_dst
+        )
+    if not send_replicated_draft:
+        return DCPTokenTransferPlan(target_src, target_dst, empty.copy(), empty.copy())
+    draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
+    draft_src = rows(src_pages, src_virtual_page_size, draft_offsets)
+    draft_dst = rows(
+        dst_pages, dst_virtual_page_size, chunk_token_offset + draft_offsets
+    )
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)

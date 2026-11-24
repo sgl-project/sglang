@@ -46,6 +46,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             "attn_cp_rank",
             "attn_dp_size",
             "attn_dp_rank",
+            "dcp_size",
             "pp_size",
             "pp_rank",
             "system_dp_size",
@@ -205,6 +206,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.attn_cp_rank = 0
         mgr.attn_dp_size = 1
         mgr.attn_dp_rank = 0
+        mgr.dcp_size = 1
         mgr.pp_size = 1
         mgr.pp_rank = 0
         mgr.system_dp_size = 1

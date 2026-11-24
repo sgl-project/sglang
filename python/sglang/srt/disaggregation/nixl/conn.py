@@ -1909,40 +1909,64 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
-                                pack_buffer = (
-                                    self._dcp_pack_buffers[worker_index]
-                                    if self._dcp_pack_buffers
-                                    else None
-                                )
-                                if kv_chunk.num_kv_tokens is None:
-                                    raise ValueError(
-                                        "PD DCP transfer requires num_kv_tokens"
+                                skip_dup_dcp_kv = (
+                                    self.is_hybrid_mla_backend
+                                    and self.attn_tp_size > decode_tp_size
+                                    and (
+                                        (self.kv_args.engine_rank % self.attn_tp_size)
+                                        % (self.attn_tp_size // decode_tp_size)
                                     )
-                                plan = build_dcp_token_transfer_plan(
-                                    src_prefill_kv_indices,
-                                    chunked_dst_kv_indice,
-                                    physical_page_size=self.kv_args.page_size,
-                                    dcp_size=dst_info.dst_dcp_size,
-                                    dcp_rank=dst_info.dst_dcp_rank,
-                                    src_page_offset=(kv_chunk.index_slice.start or 0),
-                                    decode_prefix_len=req.decode_prefix_len or 0,
-                                    num_kv_tokens=kv_chunk.num_kv_tokens,
-                                    draft_rows_collapsed=dst_info.dst_draft_rows_dcp_collapsed,
+                                    // self.dcp_size
+                                    != 0
                                 )
-                                packed_src = self._pack_dcp_rank_once(
-                                    pack_buffer,
-                                    dst_info,
-                                    plan.target_src_token_indices,
-                                    packed_source_by_dcp_rank,
-                                )
-                                handles.extend(
-                                    self.send_kvcache_dcp(
-                                        req.agent_name,
+                                if not skip_dup_dcp_kv:
+                                    pack_buffer = (
+                                        self._dcp_pack_buffers[worker_index]
+                                        if self._dcp_pack_buffers
+                                        else None
+                                    )
+                                    if kv_chunk.num_kv_tokens is None:
+                                        raise ValueError(
+                                            "PD DCP transfer requires num_kv_tokens"
+                                        )
+                                    plan = build_dcp_token_transfer_plan(
+                                        src_prefill_kv_indices,
+                                        chunked_dst_kv_indice,
+                                        physical_page_size=self.kv_args.page_size,
+                                        dcp_size=dst_info.dst_dcp_size,
+                                        dcp_rank=dst_info.dst_dcp_rank,
+                                        src_page_offset=(
+                                            kv_chunk.index_slice.start or 0
+                                        ),
+                                        decode_prefix_len=req.decode_prefix_len or 0,
+                                        num_kv_tokens=kv_chunk.num_kv_tokens,
+                                        draft_rows_collapsed=dst_info.dst_draft_rows_dcp_collapsed,
+                                        src_dcp_size=self.dcp_size,
+                                        src_dcp_rank=self.dcp_rank,
+                                        src_draft_rows_collapsed=getattr(
+                                            self.kv_args,
+                                            "draft_rows_dcp_collapsed",
+                                            False,
+                                        ),
+                                        send_replicated_draft=self._should_send_replicated_dcp_draft(
+                                            dst_info.dst_dcp_size,
+                                            dst_info.dst_dcp_rank,
+                                        ),
+                                    )
+                                    packed_src = self._pack_dcp_rank_once(
+                                        pack_buffer,
                                         dst_info,
-                                        plan,
-                                        packed_src,
+                                        plan.target_src_token_indices,
+                                        packed_source_by_dcp_rank,
                                     )
-                                )
+                                    handles.extend(
+                                        self.send_kvcache_dcp(
+                                            req.agent_name,
+                                            dst_info,
+                                            plan,
+                                            packed_src,
+                                        )
+                                    )
                             elif (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
@@ -3227,6 +3251,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
+
+        if not src_addrs:
+            return None
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")

@@ -57,8 +57,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "
-            "use the same DCP layout, but it usually adds communication "
-            "overhead without improving prefill performance."
+            "use matching or divisible DCP sizes (for MLA / hybrid-MLA), but "
+            "it usually adds communication overhead without improving prefill "
+            "performance."
         )
 
     if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
