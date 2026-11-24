@@ -68,7 +68,7 @@ def make_inputs(case: Case) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]
 
 
 @marker.parametrize("case_name", CASE_NAMES, ci_vals=CASE_NAMES[:2])
-@marker.benchmark("provider", ["triton", "cuda"])
+@marker.benchmark("provider", ["triton", "cuda"], gate=["cuda"])
 def benchmark(case_name: str, provider: str) -> marker.BenchResult:
     case = CASE_BY_NAME[case_name]
     x, cache_x, padding = make_inputs(case)
