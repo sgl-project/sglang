@@ -387,6 +387,48 @@ class XPUAttentionBackend(AttentionBackend):
         self.forward_metadata = metadata
         self.dcp_metadata = dcp_metadata
 
+    def _ensure_mla_workspaces(self, batch_size: int) -> None:
+        """Lazily (re)allocate flash_mla's decode/prefill scratch workspaces.
+
+        Needed on every per-batch metadata prep, not just the eager
+        ``init_forward_metadata`` body: CUDA-graph capture/replay call
+        ``init_forward_metadata_out_graph`` directly and skip that body, so
+        without this the first graph-captured MLA forward reads
+        ``workspace_decode``/``workspace_prefill`` before they ever exist.
+        """
+        if not self.use_mla:
+            return
+
+        workspace_kwargs = dict(
+            max_seq_len=self.max_context_len,
+            num_batches=batch_size,
+            num_heads=self.num_local_heads,
+            page_size=self.page_size,
+            num_kv_splits=-1,
+        )
+
+        workspace_decode_size = flash_mla_decode_get_workspace_size(
+            **workspace_kwargs
+        )
+        if (
+            not hasattr(self, "workspace_decode")
+            or self.workspace_decode.numel() < workspace_decode_size
+        ):
+            self.workspace_decode = torch.empty(
+                workspace_decode_size, device=self.device, dtype=torch.uint8
+            )
+
+        workspace_prefill_size = flash_mla_prefill_get_workspace_size(
+            **workspace_kwargs
+        )
+        if (
+            not hasattr(self, "workspace_prefill")
+            or self.workspace_prefill.numel() < workspace_prefill_size
+        ):
+            self.workspace_prefill = torch.empty(
+                workspace_prefill_size, device=self.device, dtype=torch.uint8
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         self.bidirectional_block_ids = None
@@ -697,36 +739,7 @@ class XPUAttentionBackend(AttentionBackend):
                     IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
                 )
 
-        if self.use_mla:
-            workspace_kwargs = dict(
-                max_seq_len=self.max_context_len,
-                num_batches=batch_size,
-                num_heads=self.num_local_heads,
-                page_size=self.page_size,
-                num_kv_splits=-1,
-            )
-
-            workspace_decode_size = flash_mla_decode_get_workspace_size(
-                **workspace_kwargs
-            )
-            if (
-                not hasattr(self, "workspace_decode")
-                or self.workspace_decode.numel() < workspace_decode_size
-            ):
-                self.workspace_decode = torch.empty(
-                    workspace_decode_size, device=self.device, dtype=torch.uint8
-                )
-
-            workspace_prefill_size = flash_mla_prefill_get_workspace_size(
-                **workspace_kwargs
-            )
-            if (
-                not hasattr(self, "workspace_prefill")
-                or self.workspace_prefill.numel() < workspace_prefill_size
-            ):
-                self.workspace_prefill = torch.empty(
-                    workspace_prefill_size, device=self.device, dtype=torch.uint8
-                )
+        self._ensure_mla_workspaces(batch_size)
 
         # Convert the page table to a strided format which is needed by FA3 API.
         # Encoder-decoder page_table holds token-slot indices for the varlen
@@ -1761,6 +1774,8 @@ class XPUAttentionBackend(AttentionBackend):
 
         Dispatches plain EXTEND (prefill full graph) vs decode / speculative modes.
         """
+        self._ensure_mla_workspaces(forward_batch.batch_size)
+
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_extend() and not (
             forward_mode.is_target_verify()
