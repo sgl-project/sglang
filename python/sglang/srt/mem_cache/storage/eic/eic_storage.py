@@ -164,7 +164,7 @@ class EICStorage(HiCacheStorage):
 
         remote_url = config.get("remote_url", None)
         if remote_url is None:
-            AssertionError("remote_url is None")
+            raise ValueError(f"eic config file {config_file} has no remote_url")
 
         endpoint = remote_url[len("eic://") :]
 
