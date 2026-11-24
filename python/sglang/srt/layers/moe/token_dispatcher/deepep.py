@@ -32,8 +32,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
-    dispose_tensor,
-    get_bool_env_var,
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
@@ -375,6 +373,14 @@ def _tp_ranks_share_one_host(group: dist.ProcessGroup) -> bool:
         return cached
     gathered: List[object] = [None] * group.size()
     dist.all_gather_object(gathered, _host_identity(), group=group)
+    # An unreadable boot id is not evidence of anything, and two containers on different
+    # hosts can share a hostname, so eight empty boot ids would compare equal and select
+    # the single-host config across two nodes. Decline instead: the tuning is an
+    # optimisation, and the cost of skipping it is far below the cost of 64 SMs and 64
+    # queue pairs per rank on a configuration that cannot carry them.
+    if any(not isinstance(ident, tuple) or not ident[1] for ident in gathered):
+        _SINGLE_HOST_TP_GROUPS[key] = False
+        return False
     same = len(set(gathered)) == 1
     _SINGLE_HOST_TP_GROUPS[key] = same
     return same
