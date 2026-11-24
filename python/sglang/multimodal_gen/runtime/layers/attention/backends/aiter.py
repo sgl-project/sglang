@@ -610,8 +610,9 @@ class AITerImpl(AttentionImpl):
     ) -> torch.Tensor:
         used = None
         # gfx950 only: the batch kernels and the key split were measured there;
-        # other architectures keep the varlen kernel
-        if USE_AITER_GFX95 and cu_seqlens_host is not None:
+        # other architectures keep the varlen kernel. The batch kernels take
+        # the query bounds for the keys too, so separate key bounds skip them.
+        if USE_AITER_GFX95 and cu_seqlens_host is not None and cu_seqlens_k is None:
             if tuple(cu_seqlens_host) == (0, query.shape[0]):
                 used = query.shape[0]
             elif self.packed_trailing_padding:

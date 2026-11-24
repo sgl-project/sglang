@@ -127,6 +127,40 @@ def test_one_live_sequence_keeps_the_varlen_kernel_off_gfx950():
     torch.testing.assert_close(out, q + 1)
 
 
+def test_key_bounds_keep_the_varlen_kernel_on_gfx950():
+    """The batch kernels use the query bounds for the keys too."""
+    impl = _build(4, 4)
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    rows, keys = 8, 12
+    q = torch.randn(rows, 4, HEAD_SIZE)
+    kv = torch.randn(keys, 4, HEAD_SIZE)
+    bounds = (0, rows)
+    seen = {}
+
+    def fake_varlen(**kwargs):
+        seen.update(kwargs)
+        return kwargs["q"] + 1
+
+    with (
+        patch.object(backend, "USE_AITER_GFX95", True),
+        patch.object(backend.aiter, "flash_attn_varlen_func", fake_varlen),
+    ):
+        out = impl.forward_varlen(
+            q,
+            kv,
+            kv,
+            cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+            max_seqlen=rows,
+            cu_seqlens_host=bounds,
+            cu_seqlens_k=torch.tensor((0, keys), dtype=torch.int32),
+            max_seqlen_k=keys,
+        )
+    torch.testing.assert_close(out, q + 1)
+    assert seen["cu_seqlens_k"].tolist() == [0, keys]
+    assert seen["max_seqlen_k"] == keys
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
 @pytest.mark.parametrize("pad", [0, 24])
 def test_one_live_sequence_matches_the_varlen_kernel(pad):
