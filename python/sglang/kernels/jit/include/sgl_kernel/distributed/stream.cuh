@@ -24,6 +24,9 @@ namespace sglang::device::distributed {
  * rank p % world. Rows that are already there are one rank's.
  */
 struct StreamRowOrder {
+  /// What `row_at` returns for a position that stands for no row.
+  static constexpr uint32_t kNoRow = 0xFFFFFFFFu;
+
   uint32_t world;
   uint32_t avg;
   uint32_t rem;
@@ -36,12 +39,12 @@ struct StreamRowOrder {
     return (avg + (rem != 0 ? 1 : 0)) * world;
   }
 
-  /// The row at `pos`; false when its rank has no such row.
-  SGL_DEVICE bool row_at(uint32_t pos, uint32_t& row) const {
+  /// The row at `pos`, or `kNoRow` when its rank has no such row.
+  SGL_DEVICE uint32_t row_at(uint32_t pos) const {
     const auto rank = pos % world;
     const auto idx = pos / world;
-    row = rank * avg + (rank < rem ? rank : rem) + idx;
-    return idx < avg + (rank < rem ? 1 : 0);
+    if (idx >= avg + (rank < rem ? 1 : 0)) return kNoRow;
+    return rank * avg + (rank < rem ? rank : rem) + idx;
   }
 };
 

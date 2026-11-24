@@ -294,8 +294,8 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       [[maybe_unused]] uint32_t row_parity[kNumStages] = {};
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
       for (auto pos = blockIdx.x; pos < num_pos; pos += gridDim.x) {
-        uint32_t token;
-        if (!order.row_at(pos, token)) continue;
+        const auto token = order.row_at(pos);
+        if (token == order.kNoRow) continue;
 #pragma unroll
         for (uint32_t ci = 0; ci < kNumChunks; ++ci, ++global_chunks) {
           const uint32_t base_row = ci * kChunkRows;
@@ -389,8 +389,8 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
 
     uint32_t global_chunks = 0;  // mirrors the producer's chunk counter
     for (auto pos = blockIdx.x; pos < num_pos; pos += gridDim.x) {
-      uint32_t token;
-      if (!order.row_at(pos, token)) continue;
+      const auto token = order.row_at(pos);
+      if (token == order.kNoRow) continue;
       float run_max = -FLT_MAX;  // online-softmax state
       float run_sum = 0.f;
       float2 acc[kAccPerThread / 2] = {};  // packed fp32x2 accumulator
