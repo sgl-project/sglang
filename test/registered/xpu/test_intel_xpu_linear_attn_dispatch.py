@@ -567,7 +567,7 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
     against the Triton recurrent reference."""
 
     def _gated_delta_net_layer(self, record, qkvz, ba):
-        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNormGated
+        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
         from sglang.srt.models import qwen3_5
 
         # Bare layer with only what forward() reads: the GEMM pair is the
@@ -579,7 +579,9 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
         layer.head_k_dim = layer.head_v_dim = 128
         layer.key_dim = 4 * 128
         layer.value_dim = 12 * 128
-        layer.norm = RMSNormGated(128, eps=1e-5, device="xpu", dtype=torch.bfloat16)
+        layer.norm = RMSNorm(
+            128, device="xpu", dtype=torch.bfloat16, norm_before_gate=True
+        )
         layer.out_proj = lambda x: (x, None)
         layer.attn = _GdnBoundarySpy(record)
         layer._forward_input_proj = lambda _hidden: (qkvz, ba)
@@ -688,9 +690,11 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
         prefix_lens = (0, 5, 33)
         total = sum(extend_lens)
         qkv_dim = 2 * key_dim + value_dim
-        lengths = torch.tensor(list(extend_lens), dtype=torch.int32)
-        starts = torch.cat([torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)]).to(
-            "xpu"
+        # CPU cumsum promotes int32 to int64; the SYCL op expects int32.
+        starts = torch.tensor(
+            [0] + [sum(extend_lens[: i + 1]) for i in range(len(extend_lens))],
+            device="xpu",
+            dtype=torch.int32,
         )
         packed = torch.randn(
             total, qkv_dim + value_dim, device="xpu", dtype=torch.bfloat16
@@ -844,10 +848,10 @@ class TestQwen35PrefillViewIntegration(CustomTestCase):
         ref_full_out, ref_full_pool = recurrent(draft)
         ref_part_out, ref_part_pool = recurrent(2)
 
-        # Commit: scatter_mamba_states_after_mtp_verify copies the
-        # accepted-length row (commit_lens - 1) into the work pool row.
-        pool[5] = buf_full[draft - 1]
-        pool[6] = buf_part[1]
+        # Commit: scatter_mamba_states_after_mtp_verify copies
+        # intermediate[scratch_row, commit_lens - 1] into the work pool row.
+        pool[5] = buf_full[0, draft - 1]
+        pool[6] = buf_part[0, 1]
 
         torch.testing.assert_close(out_full, ref_full_out, atol=0.05, rtol=0.03)
         torch.testing.assert_close(out_part[:, :2], ref_part_out, atol=0.05, rtol=0.03)
