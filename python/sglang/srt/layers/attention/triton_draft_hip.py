@@ -47,6 +47,14 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
         from sglang.kernels.ops.attention.verify_mla_draft import verify_mla_draft_fwd
 
         backend.verify_mla_draft_fwd = torch.compiler.disable(verify_mla_draft_fwd)
+    elif algorithm.is_dspark() and not backend.use_mla and is_gfx95_supported():
+        # DSpark verifies flat blocks (speculative_eagle_topk is None -> backend.topk == 0);
+        # verify_gqa_draft_fwd_hip rejects any custom_mask and falls back to extend_attention_fwd.
+        from sglang.kernels.ops.attention.dspark_draft_attn_hip import (
+            verify_gqa_draft_fwd_hip,
+        )
+
+        backend.verify_mla_draft_fwd = torch.compiler.disable(verify_gqa_draft_fwd_hip)
     if algorithm.is_dflash() and backend.use_mla and backend.dcp_size > 1:
         backend.mla_dcp_window_verify = MlaDcpWindowVerify(backend)
         # Each layer applies its own window there, so the backend builds no
