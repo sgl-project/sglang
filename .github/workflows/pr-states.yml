@@ -7,7 +7,8 @@ name: PR States
 #   - pull_request_target: push / open / label change (all PRs incl forks).
 #   - workflow_run: pr-test* requested / completed events (incl fork PRs).
 #     `requested` is absent on reruns, but `completed` still fires.
-#   - workflow_dispatch: manual refresh for a given PR number.
+#   - workflow_dispatch: refresh for a given PR number (manual, or the
+#     slash-command handler after a command).
 
 on:
   pull_request_target:
@@ -171,7 +172,7 @@ jobs:
             // `run-ci` (or approval), or a missing opt-in label skips the caller's tests, so
             // such a run is green (or, for Base, red) with nothing tested.
             async function skippedAtGate(run) {
-              // A skipped run ends failed (Base) or green; notify-pr-states
+              // A skipped run ends failed (Base) or green; its workflow_run `completed`
               // refreshes this block when it does.
               if (!isReal(run) || !['success', 'failure'].includes(run.conclusion)) return false;
               const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
