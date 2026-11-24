@@ -209,14 +209,14 @@ class DFlyWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         candidates = self.dfly.candidates_out[: bs * width].view(bs, width)
-        num_correct_drafts, bonus = self._accept(
+        num_correct_drafts, bonus, target_predict = self._accept(
             batch, draft_input, candidates, logits_output.next_token_logits
         )
         out_tokens, commit_lens = commit_accept(candidates, num_correct_drafts, bonus)
         if SIMULATE_ACC_LEN > 0:
             apply_dflash_simulated_acceptance(
                 candidates=candidates,
-                target_predict=None,
+                target_predict=target_predict,
                 accept_len=num_correct_drafts,
                 commit_lens=commit_lens,
                 bonus=bonus,
@@ -227,6 +227,9 @@ class DFlyWorkerV2(BaseSpecWorker):
                 next_token_logits=logits_output.next_token_logits,
                 generator=self._simulated_acc_len_rng,
             )
+            if target_predict is None:
+                self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, bonus)
+                self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, out_tokens)
         if batch.sampling_info is not None:
             commit_verify_accept(
                 batch.sampling_info,
@@ -325,12 +328,13 @@ class DFlyWorkerV2(BaseSpecWorker):
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, num_correct_drafts)
             self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_SAMPLE, bonus)
-            return num_correct_drafts, bonus
+            return num_correct_drafts, bonus, None
         target_predict = torch.argmax(next_token_logits, dim=-1).view(candidates.shape)
         self._tp_sync.sync(SpecTpSyncSite.DFLY_ACCEPT_GREEDY, target_predict)
-        return compute_dflash_correct_drafts_and_bonus(
+        num_correct_drafts, bonus = compute_dflash_correct_drafts_and_bonus(
             candidates=candidates, target_predict=target_predict
         )
+        return num_correct_drafts, bonus, target_predict
 
     def _commit_state(self, batch, hidden_states, source_rows) -> None:
         self.state.write(
