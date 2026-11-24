@@ -181,7 +181,8 @@ streaming. Eager remains the default.
 ### Hardware recommendations
 
 The picker provides measured recipes for H200/B300, AMD Instinct, single-card RTX PRO 6000 and DGX Spark,
-and **Derived** recipes for other listed GPUs. A derived recipe estimates placement and
+and **Derived** recipes for other listed GPUs, including the single-card A100 (a measured A100
+recipe is documented below). A derived recipe estimates placement and
 parallel layout for the selected GPU count from checkpoint sizes and measured
 H200 memory use. It has no hardware latency measurement or capacity guarantee.
 Apply **Use derived recipe** to set its placement, encoder fold and online
@@ -192,6 +193,7 @@ AdaLN together. Start with 2048 × 2048.
 | B200, GB200, GB300 | 1 GPU | Auto resident; Ulysses as GPU count grows |
 | MI355X / MI350X, MI325X / MI300X | 1 GPU; Ulysses as GPU count grows | Measured Auto resident recipes on 1, 2, 4 and 8 GPUs; Ulysses is faster, TP uses less memory |
 | H100 / H800, 80 GB | 1 GPU, or 2 for resident serving | Component offload on one; resident Ulysses2 with encoder fold on two |
+| A100, 80 GB PCIe | 1 GPU | Layerwise offload with a fixed number of resident DiT and encoder layers; see the measured A100 recipe below |
 | RTX PRO 6000 Blackwell, 96 GB | 1 GPU | Measured resident recipe with AdaLN precomputation; component offload saves memory |
 | DGX Spark, 128 GB shared | 1 GB10 | Measured Auto resident recipe with native AdaLN precomputation; requires at least 106 GiB available |
 | RTX 6000 Ada, RTX 5090 / 4090 and listed 12–48 GB cards without NVLink | 1 GPU | Layerwise offload with native AdaLN precomputation |
@@ -586,6 +588,56 @@ The guide's T2I and editing examples match the release reference images
 visually; outputs are not byte-identical to CUDA or across layouts. MI355X and
 MI300X use the same gfx950 and gfx942 recipes and were not measured separately.
 Multiple-reference, exact-quality and quantized AMD workloads remain unmeasured.
+
+### A100, 80 GB PCIe at 2K
+
+One A100 80 GB in the PCIe form factor has no NVLink, so the picker offers only
+the single-card shape. The 33B DiT does not fit resident next to the text
+encoder; stream the DiT blocks and pin a fixed number of DiT and encoder layers
+on the GPU. On one A100 80 GB at `46dc69747c` with
+`lmsysorg/sglang:v0.5.21-cu130`, six steps at 2048 × 2048 and native precision
+measured:
+
+| Workload | Pipeline median | Observed warm range |
+| --- | --- | --- |
+| T2I, 2048 × 2048 | 9.79 s | 9.77–9.85 s |
+
+The median covers three warm requests after one cold request, with seed 42, a
+CPU generator, lossless quality and no prompt cache. The same run split into
+text encoding 3.42 s (35%), six denoising steps 5.94 s (60%) and VAE decoding
+0.38 s (4%), with a CUDA peak of 75.97 GiB. Text encoding is a transfer wall:
+40.96 GB of non-resident encoder weights stream over PCIe Gen3 at 12.3 GB/s
+while the encoder compute takes about 50 ms.
+
+Launch with layerwise placement and explicit residency, which the picker does
+not expose:
+
+```bash
+python -m sglang.cli.main serve \
+  --model-path MiniMaxAI/MiniMax-H3-Image \
+  --host 0.0.0.0 --port 30042 --warmup-mode off \
+  --dit-layerwise-offload --dit-layerwise-resident-layers 50 \
+  --dit-layerwise-residency-lifetime permanent \
+  --layerwise-offload-components text_encoder \
+  --layerwise-resident-layers text_encoder=7 \
+  --layerwise-residency-lifetime text_encoder=permanent \
+  --layerwise-prefetch-size text_encoder=1
+```
+
+`--layerwise-resident-layers` values of 1 or more are per layerwise group, not
+ratios: one value applies to every group of that component, so `50` keeps all
+DiT blocks resident and `text_encoder=7` keeps 7 layers per encoder group (14 of
+77). Reserving the whole encoder instead exceeds the 80 GB budget. Use
+`--warmup-mode server` to move first-call kernel setup out of the first request.
+
+Two A100 PCIe cards without NVLink are outside the NVLink multi-GPU
+recommendation, but a Ulysses2 pair with pipeline-group P2P measured 4.34 s for
+the same workload, 1.48× the single card.
+
+Sources after the FA3 default switch import `sgl_fa3` on SM80, and the CUDA
+images through `v0.5.23-cu130` do not ship that wheel. Install
+`sgl_fa3==0.1.0` in the container or use an image that includes it; otherwise
+startup warmup fails with `No module named 'sgl_fa3'`.
 
 ### PNG encoding at 4K
 

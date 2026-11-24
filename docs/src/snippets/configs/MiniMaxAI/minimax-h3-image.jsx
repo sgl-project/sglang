@@ -5,7 +5,7 @@ export const config = (() => {
     ["b300", "B300", 288, 1], ["gb300", "GB300", 288, 1],
     ["b200", "B200", 192, 1], ["gb200", "GB200", 192, 1],
     ["h200", "H200", 141, 1], ["h20-3e", "H20-3e", 141, 1],
-    ["h100", "H100", 80, 1], ["h800", "H800", 80, 1],
+    ["h100", "H100", 80, 1], ["h800", "H800", 80, 1], ["a100", "A100", 80, 1],
     ["mi355x", "MI355X", 288, 1], ["mi350x", "MI350X", 288, 1],
     ["mi325x", "MI325X", 256, 1], ["mi300x", "MI300X", 192, 1],
     ["dgx-spark", "DGX Spark", 128, 1],
@@ -23,7 +23,8 @@ export const config = (() => {
   // MI355X/MI350X share gfx950 and MI325X/MI300X share gfx942; each pair uses
   // the measured MI350X or MI325X recipe. The DiT runs dense AITER attention.
   const isAmd = (hw) => ["mi355x", "mi350x", "mi325x", "mi300x"].includes(hw);
-  const maxRecipeGpus = (hw) => hw === "rtx3090" ? 2 : hw === "dgx-spark" || hw.startsWith("rtx") ? 1 : 8;
+  // A100 PCIe cards have no NVLink, so only the measured single-card recipe is offered.
+  const maxRecipeGpus = (hw) => hw === "rtx3090" ? 2 : hw === "dgx-spark" || hw === "a100" || hw.startsWith("rtx") ? 1 : 8;
   // Whole-component placement must fit the encoder; layerwise placement streams
   // its blocks and keeps the native BF16 checkpoint usable on smaller cards.
   const encoderFits = (hw, gpus) => (profile(hw)?.[2] || 0) * gpus >= 48.1;
@@ -77,7 +78,7 @@ export const config = (() => {
   supportedHardware: hardware.map(([id]) => id),
   hardware: hardware.map(([id, label, vram]) => ({ id, label,
     vram: `${vram}GB${id === "dgx-spark" ? " unified" : ""}`,
-    vendor: isAmd(id) ? "amd" : id.startsWith("rtx") ? "consumer" : ["h200", "h100", "h800", "h20-3e"].includes(id) ? "hopper" : "blackwell" })),
+    vendor: isAmd(id) ? "amd" : id === "a100" ? "nvidia" : id.startsWith("rtx") ? "consumer" : ["h200", "h100", "h800", "h20-3e"].includes(id) ? "hopper" : "blackwell" })),
   groupHardware: false,
   matchDims: [],
   overlayDims: [
