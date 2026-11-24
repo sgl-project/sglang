@@ -130,7 +130,7 @@ jobs:
     name: test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_a5
     needs: [metadata]
     # Single-machine PD separation (Ascend 950/a5): 4-card prefill + 4-card
-    # decode with Mooncake KV transfer, run directly on the runner.
+    # decode with Ascend (memfabric) KV transfer, run directly on the runner.
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-amd64-a5-8

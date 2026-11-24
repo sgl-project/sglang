@@ -1,8 +1,9 @@
 """Single-machine PD-separated DeepSeek-V4-Flash FP8 GPQA on Ascend 950.
 
 One 8-card machine runs a 4-card prefill worker (cards 0-3) and a 4-card
-decode worker (cards 4-7). KV is transferred with the Mooncake backend (TENT
-over the device SDMA path), and sgl-router fronts both workers so every GPQA
+decode worker (cards 4-7). KV is transferred by the Ascend transfer backend
+(memfabric_hybrid, SDMA over the device path, ranks handed out by an
+ASCEND_MF_STORE_URL store), and sgl-router fronts both workers so every GPQA
 question exercises the prefill -> decode handoff.
 """
 
@@ -16,10 +17,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
 )
-from sglang.test.ascend.test_ascend_utils import (
-    append_ld_library_path,
-    write_memfabric_tent_conf,
-)
+from sglang.test.ascend.test_ascend_utils import append_ld_library_path
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -72,7 +70,6 @@ DEEPSEEK_V4_FLASH_FP8_PD_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
-    "ASCEND_LAUNCH_BLOCKING": "1",
     # Dspark
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     # PD handshake budgets: the prefill->decode bootstrap can outlast the default.
@@ -130,7 +127,7 @@ DEEPSEEK_V4_FLASH_FP8_PD_SHARED_ARGS = [
     "--disable-radix-cache",
 ]
 
-# Prefill worker: 4 cards. The Mooncake transfer backend is appended by
+# Prefill worker: 4 cards. The transfer backend is appended by
 # PDDisaggregationServerBase from ``cls.transfer_backend``.
 DEEPSEEK_V4_FLASH_FP8_PD_PREFILL_ARGS = [
     *DEEPSEEK_V4_FLASH_FP8_PD_SHARED_ARGS,
@@ -175,7 +172,7 @@ DEEPSEEK_V4_FLASH_FP8_PD_GENERATION_CONFIG_MAX = {
 class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
     PDDisaggregationServerBase, TestNpuAccuracyTestCaseBase
 ):
-    """DeepSeek-V4-Flash FP8 GPQA: 4-card prefill + 4-card decode, Mooncake KV transfer.
+    """DeepSeek-V4-Flash FP8 GPQA: 4-card prefill + 4-card decode on Ascend.
 
     The accuracy helpers come from TestNpuAccuracyTestCaseBase (per-case metrics
     directory and metrics.json for release data), while the two workers and the
@@ -186,7 +183,8 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
     prefill_tp_size = 4
     decode_tp_size = 4
     decode_base_gpu_id = 4
-    # Ascend Mooncake runs TENT over the device SDMA path, not RDMA NICs.
+    # The Ascend backend moves KV through memfabric's device path, so neither
+    # worker needs an RDMA NIC list.
     use_rdma = False
 
     extra_prefill_args = DEEPSEEK_V4_FLASH_FP8_PD_PREFILL_ARGS
@@ -222,30 +220,25 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
         # release-data pipeline.
         cls._setup_per_case_output()
         super().setUpClass()
-        # Mooncake transfer runs on both workers, so both get the TENT config
-        # and the memfabric/mooncake library paths of this host.
-        mooncake_envs = {
-            "MC_USE_TENT": "1",
-            # device_urma fails on this board: memfabric's URMA topo table
-            # reports "unknown board id: 108" for the 950PR and refuses to open
-            # the transport, so the KV transfer runs over device SDMA instead.
-            "MF_PROTOCOL": "device_sdma",
-            "MF_TRANSFER_TIMEOUT": "10000",
-            "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
-            "MC_TENT_CONF": write_memfabric_tent_conf(),
-            "LD_LIBRARY_PATH": append_ld_library_path(
-                ("memfabric_hybrid", "lib"), ("mooncake", None)
-            ),
+        # Both workers join the same memfabric store on this host: it hands out
+        # the transfer ranks, and memfabric refuses to register KV memory
+        # without one (rank 1023 is rejected). ASCEND_MF_TRANSFER_PROTOCOL is
+        # left unset so the backend uses its default, SDMA: URMA is not usable
+        # on this runner, whose board is missing from memfabric's URMA topo
+        # table ("unknown board id: 108").
+        transfer_envs = {
+            "ASCEND_MF_STORE_URL": "tcp://127.0.0.1:24666",
+            "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
         }
         cls.extra_prefill_env = {
             **DEEPSEEK_V4_FLASH_FP8_PD_COMMON_ENVS,
-            **mooncake_envs,
+            **transfer_envs,
         }
         cls.extra_decode_env = {
             **DEEPSEEK_V4_FLASH_FP8_PD_COMMON_ENVS,
-            **mooncake_envs,
+            **transfer_envs,
         }
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
+        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
         cls.launch_all()
 
     @classmethod
@@ -268,7 +261,7 @@ class TestNPUDeepSeekV4FlashFP81P1D8PMooncakeGPQA(
         cls._backup_plog()
 
     def test_npu_deepseek_v4_flash_fp8_1p1d_8p_mooncake_gpqa(self):
-        """Run NPU accuracy for DSV4-Flash FP8 4P4D PD-Sep with Mooncake transfer."""
+        """Run NPU accuracy for DSV4-Flash FP8 4P4D PD-Sep with Ascend transfer."""
         self.run_accuracy()
 
 
