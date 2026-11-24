@@ -45,10 +45,22 @@ class TestDsaDcpBackendDefaults(CustomTestCase):
                 _backends(_dsa_dcp_overrides(_cfg())), ("triton", "triton")
             )
 
-    def test_cuda_defaults_to_trtllm(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False, is_npu=False)):
+    def test_blackwell_defaults_to_trtllm(self):
+        with patch(
+            _PLATFORM,
+            return_value=SimpleNamespace(is_hip=False, is_npu=False, is_sm90=False),
+        ):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("trtllm", "trtllm")
+            )
+
+    def test_hopper_defaults_to_triton(self):
+        with patch(
+            _PLATFORM,
+            return_value=SimpleNamespace(is_hip=False, is_npu=False, is_sm90=True),
+        ):
+            self.assertEqual(
+                _backends(_dsa_dcp_overrides(_cfg())), ("triton", "triton")
             )
 
     def test_explicit_backend_is_kept(self):
@@ -100,6 +112,43 @@ class TestKimiK31DsaBackendDefault(CustomTestCase):
 
 
 class TestDsaDcpBackendConstraints(CustomTestCase):
+    def test_cuda_bf16_dcp_triton_allowed(self):
+        _check_dsa_backend_constraints(
+            "bfloat16",
+            "triton",
+            "triton",
+            hip=False,
+            dcp_size=8,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+        )
+
+    def test_cuda_triton_rejects_unvalidated_fp8_storage(self):
+        with self.assertRaisesRegex(ValueError, "requires --kv-cache-dtype bfloat16"):
+            _check_dsa_backend_constraints(
+                "fp8_e4m3",
+                "triton",
+                "triton",
+                hip=False,
+                dcp_size=2,
+                kv_lora_rank=512,
+                qk_rope_head_dim=0,
+            )
+
+    def test_cuda_dcp_rejects_backends_without_localization_and_lse(self):
+        for prefill, decode in (("tilelang", "triton"), ("triton", "fa3")):
+            with self.subTest(prefill=prefill, decode=decode):
+                with self.assertRaisesRegex(ValueError, "no DCP path on CUDA"):
+                    _check_dsa_backend_constraints(
+                        "bfloat16",
+                        prefill,
+                        decode,
+                        hip=False,
+                        dcp_size=2,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=0,
+                    )
+
     def test_hip_dcp_triton_allowed(self):
         _check_dsa_backend_constraints(
             "fp8_e4m3",
