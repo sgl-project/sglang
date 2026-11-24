@@ -16,6 +16,9 @@ class LinearAttnKernelBase(ABC):
     supports_fused_chain_verify: bool = False
     # Opt in only when target-verify kernels honor non-unit token strides.
     supports_strided_target_verify_qkv: bool = False
+    # Opt in only for extend() kernels validated on the Q/K/V and g/beta that
+    # the fused Qwen3.8 GDN prefill prologue emits.
+    supports_fused_raw_qk_prefill: bool = False
 
     # True when extend() computes the gates itself, so the caller may pass
     # g/beta as None and skip the separate gating launch.

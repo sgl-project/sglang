@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
+    can_use_qwen38_gdn_prefill_prologue,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -14,6 +15,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
+    qwen38_gdn_prefill_prologue,
 )
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
@@ -62,10 +64,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import is_gfx95_supported, is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
+_enable_qwen38_gdn_prefill_prologue = (
+    _is_hip and envs.SGLANG_QWEN38_GDN_PREFILL_PROLOGUE_FUSION.get()
+)
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -84,12 +89,22 @@ if is_cuda() or is_hip() or is_xpu():
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
+_qwen38_prefill_prologue_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
+
+
+def _log_qwen38_prefill_prologue_once(*, eligible: bool, reason: str) -> None:
+    global _qwen38_prefill_prologue_logged
+    if _qwen38_prefill_prologue_logged:
+        return
+    status = "enabled" if eligible else f"disabled ({reason})"
+    rank0_log(f"Qwen3.8 fused GDN prefill prologue: {status}.")
+    _qwen38_prefill_prologue_logged = True
 
 
 class GDNMISBatchTensors(msgspec.Struct, frozen=True):
@@ -511,6 +526,10 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_supports_fused_raw_qk(self) -> bool:
+        return self.extend_kernel.supports_fused_raw_qk_prefill
 
     @property
     def extend_uses_state_checkpoints(self) -> bool:
@@ -1319,6 +1338,54 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
+    def _fused_prefill_prologue(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        *,
+        needs_state_gather: bool,
+    ) -> Optional[tuple[torch.Tensor, ...]]:
+        """Run the fused Qwen3.8 Conv1D/QKV/gate producer, or None if ineligible."""
+        forward_metadata = self.forward_metadata
+        if not (
+            _enable_qwen38_gdn_prefill_prologue
+            and is_gfx95_supported()
+            and self.kernel_dispatcher.extend_supports_fused_raw_qk
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not get_memory().enable_page_major_kv_layout
+            and not needs_state_gather
+            and not forward_metadata.has_mamba_track_mask
+            and forward_metadata.conv_block_table is None
+        ):
+            return None
+        # The producer reads the channel-major (dim, seq) view causal_conv1d_fn takes.
+        prologue_args = (
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            conv_states,
+            forward_metadata.query_start_loc,
+            forward_batch.extend_seq_lens_cpu,
+            cache_indices,
+            forward_batch.extend_prefix_lens > 0,
+            layer.A_log,
+            a,
+            b,
+            layer.dt_bias,
+            layer.activation,
+        )
+        eligible, reason = can_use_qwen38_gdn_prefill_prologue(*prologue_args)
+        _log_qwen38_prefill_prologue_once(eligible=eligible, reason=reason)
+        if not eligible:
+            return None
+        # q and k leave the producer L2-normalized: the chunk scan skips its own norm.
+        return qwen38_gdn_prefill_prologue(*prologue_args)
+
     @staticmethod
     def _split_prefill_qkv(
         layer: RadixLinearAttention, mixed_qkv: torch.Tensor
@@ -1496,6 +1563,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
+        prologue = None
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -1525,17 +1593,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = self._convolve_prefill(
+            prologue = self._fused_prefill_prologue(
                 layer,
                 forward_batch,
                 mixed_qkv,
+                a,
+                b,
                 conv_states_contig,
                 state_cache_indices,
+                needs_state_gather=needs_state_gather,
             )
+            if prologue is None:
+                mixed_qkv = self._convolve_prefill(
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    conv_states_contig,
+                    state_cache_indices,
+                )
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
+        if prologue is not None:
+            query, key, value, prologue_g, prologue_beta = prologue
+        elif (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
@@ -1620,7 +1701,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
-            if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
+            if prologue is not None:
+                g, beta = prologue_g, prologue_beta
+            elif self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
                 g = beta = None
             else:
                 g, beta = self._prefill_gates(layer, a, b)
@@ -1659,6 +1742,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
                 output=kwargs.get("linear_attn_output"),
+                qk_normalized=prologue is not None,
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
                 track_state=h_track_buf,
