@@ -16,6 +16,7 @@ only the MoE columns.
 import json
 import os
 import threading
+import time
 import unittest
 
 import numpy as np
@@ -34,6 +35,7 @@ register_npu_ci(est_time=600, suite="nightly-test-2-npu-a3", nightly=True)
 CASE = weights.GLM52_CASE
 TP_SIZE = 2
 MAX_NEW_TOKENS = 8
+REQUEST_TIMEOUT = 300
 # TP collectives need their own socket range on shared hosts.
 HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
@@ -98,7 +100,7 @@ def _generate(base_url, text, **extra):
         "return_routed_experts": True,
     }
     payload.update(extra)
-    body = post(base_url, "/generate", payload, timeout=300).json()
+    body = post(base_url, "/generate", payload, timeout=REQUEST_TIMEOUT).json()
     if isinstance(body, dict) and "error" in body:
         raise AssertionError(f"/generate returned error: {body['error']}")
     return body
@@ -231,20 +233,32 @@ class TestNpuReturnRoutedExperts(CustomTestCase):
         )
 
         results = {}
+        errors = {}
 
         def _worker(key, return_flag):
-            results[key] = _generate(
-                self.base_url, PROMPTS[key], return_routed_experts=return_flag
-            )
+            try:
+                results[key] = _generate(
+                    self.base_url, PROMPTS[key], return_routed_experts=return_flag
+                )
+            except Exception as exc:
+                errors[key] = exc
 
         threads = [
-            threading.Thread(target=_worker, args=(0, False)),
-            threading.Thread(target=_worker, args=(1, True)),
+            threading.Thread(target=_worker, args=(0, False), daemon=True),
+            threading.Thread(target=_worker, args=(1, True), daemon=True),
         ]
+        deadline = time.monotonic() + REQUEST_TIMEOUT + 10
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join()
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        pending = [index for index, thread in enumerate(threads) if thread.is_alive()]
+        errors = errors.copy()
+        if errors:
+            raise AssertionError(
+                f"concurrent requests failed: {errors!r}; still pending: {pending}"
+            ) from next(iter(errors.values()))
+        self.assertFalse(pending, f"concurrent requests timed out: {pending}")
 
         self.assertNotIn(
             "routed_experts",

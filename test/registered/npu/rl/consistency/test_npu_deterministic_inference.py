@@ -8,9 +8,8 @@ kernels (``torch.ops.batch_invariant_ops.npu_*``), so the same request must
 produce bitwise-identical token ids and logprobs at batch size 1, at batch size
 N, and after reordering the batch.
 
-The suite is capability-gated: the batch-invariant extension is a native build
-that may be absent from a container, in which case every case skips with an
-actionable reason instead of failing.
+The suite requires both the batch-invariant torch extension and its CANN
+vendor operators.
 """
 
 import os
@@ -65,18 +64,31 @@ def _batch_invariant_ops_available():
         import torch_npu  # noqa: F401
 
         torch.ops.batch_invariant_ops.npu_mm_batch_invariant
+        torch.ops.batch_invariant_ops.npu_matmul_batch_invariant
         torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
     except Exception:
         return False
     return True
 
 
-HAVE_BATCH_INVARIANT_OPS = _batch_invariant_ops_available()
+def _require_batch_invariant_ops():
+    if not _batch_invariant_ops_available():
+        raise unittest.SkipTest("batch_invariant_ops torch extension is unavailable")
 
-SKIP_REASON = (
-    "batch_invariant_ops native extension is not installed; build and install "
-    "the torch extension package plus the matching CANN vendor op package first"
-)
+    import torch
+
+    # PyTorch registration alone does not resolve the vendor symbols.
+    matrix = torch.zeros((16, 16), device="npu", dtype=torch.float16)
+    try:
+        torch.ops.batch_invariant_ops.npu_matmul_batch_invariant(matrix, matrix)
+        torch.npu.synchronize()
+    except RuntimeError as exc:
+        if "aclnnMatmulBatchInvariantGetWorkspaceSize not in" not in str(exc):
+            raise
+        raise unittest.SkipTest(
+            "CANN vendor op aclnnMatmulBatchInvariant is unavailable; "
+            "install the matching batch-invariant CANN vendor package"
+        ) from exc
 
 
 def _signature_of(body):
@@ -144,6 +156,7 @@ class _DeterministicServerCase:
 
     @classmethod
     def setUpClass(cls):
+        _require_batch_invariant_ops()
         env = npu_rl_env()
         cls._server = npu_server(
             QWEN3_0_6B_WEIGHTS_PATH,
@@ -159,7 +172,6 @@ class _DeterministicServerCase:
 
 
 @unittest.skipUnless(HAVE_MODEL, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
-@unittest.skipUnless(HAVE_BATCH_INVARIANT_OPS, SKIP_REASON)
 class TestNpuDeterministicInference(_DeterministicServerCase, CustomTestCase):
     """Same prompt, same tokens and logprobs at BS1, BSN and reversed order."""
 
@@ -168,7 +180,6 @@ class TestNpuDeterministicInference(_DeterministicServerCase, CustomTestCase):
 
 
 @unittest.skipUnless(HAVE_MODEL, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
-@unittest.skipUnless(HAVE_BATCH_INVARIANT_OPS, SKIP_REASON)
 class TestNpuDeterministicInferenceOnPolicyTarget(
     _DeterministicServerCase, CustomTestCase
 ):

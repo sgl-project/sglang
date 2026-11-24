@@ -106,9 +106,13 @@ def _fa3_available():
 
 def _available_backends():
     """Return [(name, env-overrides)] for every usable attention path."""
-    backends = [("default", {}), ("fia", {"ASCEND_USE_FIA": "1"})]
+    # Override both flags, including FIA inherited from the A5 RL environment.
+    backends = [
+        ("default", {"ASCEND_USE_FIA": "0", "ASCEND_USE_FA": "0"}),
+        ("fia", {"ASCEND_USE_FIA": "1", "ASCEND_USE_FA": "0"}),
+    ]
     if _fa3_available():
-        backends.append(("fa3", {"ASCEND_USE_FA": "1"}))
+        backends.append(("fa3", {"ASCEND_USE_FIA": "0", "ASCEND_USE_FA": "1"}))
     return backends
 
 
@@ -150,12 +154,12 @@ def _collect_chunked(base_url):
     return tuple(body["output_ids"])
 
 
-def _run_per_backend(extra_args, collectors):
+def _run_per_backend(extra_args, collectors, *, model_path=QWEN3_0_6B_WEIGHTS_PATH):
     """Collect once per available backend, one server at a time."""
     results = {}
     for name, env_extra in _available_backends():
         with npu_server(
-            QWEN3_0_6B_WEIGHTS_PATH,
+            model_path,
             extra_args=extra_args,
             env={**npu_rl_env(), **env_extra},
         ) as base_url:
@@ -234,7 +238,9 @@ class TestNpuAscendAttentionSpecConsistency(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.results = _run_per_backend(SPEC_ARGS, {"spec": _collect_single})
+        cls.results = _run_per_backend(
+            SPEC_ARGS, {"spec": _collect_single}, model_path=QWEN3_8B_WEIGHTS_PATH
+        )
 
     def test_01_speculative_decoding_consistency(self):
         for left, right in _pairs(self.results):
