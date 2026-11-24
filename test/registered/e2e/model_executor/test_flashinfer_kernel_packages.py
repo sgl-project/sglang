@@ -4,6 +4,8 @@ import os
 import sys
 
 import pytest
+import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from sglang import Engine
 from sglang.srt import runtime_context as rc
@@ -85,6 +87,39 @@ def seal(root, kernel=KERNEL, chunks=1):
     for name, data in files.items():
         (root / digest / "bundle" / name).write_bytes(data)
     return digest
+
+
+class Doubler:
+    @flashinfer_packages.kernel_site
+    def forward(self, x, k=None, scale=2.0):
+        return x * scale
+
+
+def test_site_fit_rules(monkeypatch):
+    stats = pytest.importorskip("flashinfer.trace_apply").stats
+    site = f"{__name__}.Doubler.forward"
+    inputs = {"x": {"shape": ["T", "H"]}, "k": {"optional": True}, "scale": {}}
+    pinned = {"inputs": inputs, "axes": {"T": {"type": "const", "value": 2}}}
+    routes = [
+        (pinned, lambda x, k, scale: x + 1),
+        ({"inputs": inputs}, lambda x, k, scale: x - 1),
+    ]
+    monkeypatch.setitem(flashinfer_packages._routes, site, routes)
+    forward = Doubler().forward
+
+    # A method, a parameter left at its default and an optional input at None fit.
+    assert forward(torch.zeros(2, 4)).sum() == 8
+    assert forward(torch.zeros(3, 4)).sum() == -12  # T is not 2: the next package
+    assert forward(torch.ones(4)).sum() == 8  # no package fits: the stock function
+    counts = stats()[site]
+    assert counts == {"hit": 2, "fallback_rank_x": 1}
+
+    # A compiler tracing the call: a pinned size is not matched against a symbolic
+    # one, the package that fits is compiled in, and no request is counted.
+    trace = make_fx(lambda x: forward(x), tracing_mode="symbolic")
+    traced = trace(torch.zeros(2, 4))
+    assert "sub" in traced.code and "add" not in traced.code
+    assert stats()[site] == counts
 
 
 @pytest.fixture
