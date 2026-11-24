@@ -1600,7 +1600,7 @@ class USPAttention(nn.Module):
                     v,
                     allow_strided_qkv=(
                         get_ring_parallel_world_size() <= 1
-                        and self.attn_impl.accepts_strided_qkv
+                        and getattr(self.attn_impl, "accepts_strided_qkv", False)
                     ),
                 )
 
