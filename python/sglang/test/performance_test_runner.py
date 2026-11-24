@@ -160,6 +160,22 @@ def run_performance_test(
             # Extract aggregate metrics from the largest batch size result
             largest_batch_result = max(results, key=lambda r: r.batch_size)
 
+            if (
+                any(
+                    baseline is not None
+                    for baseline in (
+                        baseline_output_throughput,
+                        baseline_ftl_s,
+                        baseline_itl_ms,
+                    )
+                )
+                and largest_batch_result.batch_size != max(batch_sizes)
+            ):
+                raise ValueError(
+                    "Missing benchmark result for requested largest batch size "
+                    f"{max(batch_sizes)}; cannot validate performance baselines"
+                )
+
             # Validate output throughput against baseline if provided
             if baseline_output_throughput is not None:
                 measured = largest_batch_result.output_throughput
