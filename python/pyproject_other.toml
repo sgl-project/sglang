@@ -68,7 +68,7 @@ runtime_base = [
   "soundfile==0.13.1",
   "tiktoken",
   "tqdm",
-  "transformers>=5.19.0,<5.23.0",  # exact pin lives in each srt_* platform extra; srt_empty gets the range
+  "transformers>=5.19.0,<5.25.0",  # exact pin lives in each srt_* platform extra; srt_empty gets the range
   "uvicorn",
   "uvloop",
   "xxhash",
@@ -134,7 +134,7 @@ srt_hip = [
   "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch",
-  "transformers==5.22.0",
+  "transformers==5.24.0",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
 ]
@@ -148,7 +148,7 @@ srt_hip_rocm724 = [
   "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch==2.11.0",
-  "transformers==5.22.0",
+  "transformers==5.24.0",
   "wave-lang==3.8.2",
 ]
 
@@ -159,7 +159,7 @@ srt_hip_rocm101 = [
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch==2.12.0",
-  "transformers==5.22.0",
+  "transformers==5.24.0",
   "wave-lang==3.8.2",
 ]
 
@@ -176,7 +176,7 @@ diffusion_hip = [
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = [
   "sglang[runtime_common]",
-  "transformers==5.22.0",
+  "transformers==5.24.0",
 ]
 
 # https://docs.sglang.io/hardware-platforms/sail
@@ -187,7 +187,7 @@ srt_sail = [
   "sailify==1.0.0",
   "sglang[runtime_common]",
   "torch-for-sail",
-  "transformers==5.22.0",
+  "transformers==5.24.0",
   "triton-for-sail",
 ]
 
@@ -196,6 +196,7 @@ srt_mlu = [
   "sglang[runtime_common]",
   "torch-mlu==1.34.1+torch2.13.0",
   "torch-mlu-ops==1.13.0+torch2.13.0",
+  "transformers==5.19.0",
   "triton==3.4.0+mlu2.1.3",
 ]
 
@@ -241,7 +242,7 @@ srt_mps = [
     "torchaudio==2.11.0",
     "torchcodec==0.15.0",
     "torchvision==0.28.0",
-    "transformers==5.22.0",
+    "transformers==5.24.0",
 ]
 
 diffusion_mps = [
