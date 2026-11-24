@@ -478,7 +478,58 @@ def handle_a2a_moe(server_args: Any):
                     "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
                     "--deepep-mode low_latency or auto."
                 )
-        if cfg.deepep_mode == "normal":
+        deepep_mode = cfg.deepep_mode
+        if get_platform().is_xpu:
+            from sglang.srt.hardware_backend.xpu.deepsymm import import_deepsymm_moe_ep
+
+            try:
+                import_deepsymm_moe_ep()
+            except Exception as e:
+                raise ValueError(
+                    f"--moe-a2a-backend deepep on XPU requires applications.ai.gpu.deepsymm: {e}"
+                ) from e
+            # deep_symm.moe_ep is wired up intranode only (PCIe P2P, no iSHMEM), for
+            # both normal and low-latency dispatch.
+            if cfg.nnodes > 1:
+                raise ValueError(
+                    "deep_symm.moe_ep supports intranode DeepEP only; got "
+                    f"--nnodes {cfg.nnodes}."
+                )
+            if deepep_mode != "normal":
+                # The low-latency expert step compacts valid rows with a host
+                # sync, so it cannot be captured into an XPU graph.
+                logger.warning(
+                    "XPU graph is disabled for decode because deepep_mode="
+                    f"`{deepep_mode}` on XPU (deep_symm.moe_ep)."
+                )
+                # handle_cuda_graph_config runs first in the pipeline; None only when
+                # the handler is called on its own (unit tests), with nothing to disable.
+                if cfg.cuda_graph_config is not None:
+                    declare_resolution(
+                        server_args,
+                        "_handle_a2a_moe",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.DECODE,
+                            backend=Backend.DISABLED,
+                        ),
+                    )
+            if cfg.deepep_dispatcher_output_dtype not in ("auto", "bf16"):
+                raise ValueError(
+                    "deep_symm.moe_ep only supports bf16 dispatch; "
+                    "use --deepep-dispatcher-output-dtype bf16."
+                )
+            # B60 gains nothing from TBO/SBO: deep_symm.moe_ep's low-latency recv hook
+            # is a no-op, and its comm kernels do not overlap with compute (measured
+            # overlap efficiency ~0); revisit when DeepSymm splits send/recv.
+            if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+                raise ValueError(
+                    "--enable-two-batch-overlap / --enable-single-batch-overlap are "
+                    "not supported with deep_symm.moe_ep on XPU: its communication "
+                    "does not overlap with compute, so they would add overhead with "
+                    "no speedup."
+                )
+        if deepep_mode == "normal":
             logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
             declare_resolution(
                 server_args,
@@ -712,6 +763,83 @@ def handle_a2a_moe(server_args: Any):
             )
 
 
+def validate_xpu_deepep_low_latency_budget(server_args: Any) -> None:
+    """Keep every XPU DeepEP low-latency dispatch within its per-rank token capacity.
+
+    deep_symm.moe_ep does not bound-check it, and a mid-forward failure would only
+    raise on the overflowing ranks while the others wait inside the all-to-all.
+    Runs after the speculative hook, so draft-token counts and its defaults are final.
+    """
+    cfg = resolving_view(server_args)
+    if (
+        not get_platform().is_xpu
+        or cfg.moe_a2a_backend != "deepep"
+        or cfg.deepep_mode == "normal"
+    ):
+        return
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    prefill_ceiling, scatter_ranks = _prefill_dispatch_ceiling_and_scatter_ranks(
+        server_args
+    )
+    tokens_per_request = (
+        max_speculative_num_draft_tokens(server_args) or 1
+        if cfg.speculative_algorithm
+        else 1
+    )
+    if cfg.disaggregation_mode != "prefill":
+        max_requests = max(
+            1, capacity * scatter_ranks * cfg.attn_dp_size // tokens_per_request
+        )
+        if cfg.max_running_requests is None:
+            declare_resolution(
+                server_args,
+                "validate_xpu_deepep_low_latency_budget",
+                max_running_requests=max_requests,
+            )
+            logger.warning(
+                f"Setting --max-running-requests to {max_requests} so that DeepEP "
+                f"{cfg.deepep_mode} decode on XPU stays within "
+                f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity} per rank "
+                f"({tokens_per_request} tokens per request)."
+            )
+        elif cfg.max_running_requests > max_requests:
+            raise ValueError(
+                f"--max-running-requests {cfg.max_running_requests} with --deepep-mode "
+                f"{cfg.deepep_mode} on XPU can dispatch more than "
+                f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity} decode "
+                f"tokens per rank ({tokens_per_request} tokens per request); use at "
+                f"most {max_requests} or raise that variable."
+            )
+    # In auto mode prefill uses normal dispatch, so only decode is bounded.
+    if cfg.deepep_mode != "low_latency" or cfg.disaggregation_mode == "decode":
+        return
+    prefill_tokens = -(-prefill_ceiling // scatter_ranks)
+    if cfg.enable_mixed_chunk:
+        # A mixed extend batch also carries every running decode request.
+        running = resolving_view(server_args).max_running_requests or 0
+        requests_per_dp = -(-running // cfg.attn_dp_size)
+        prefill_tokens += -(-requests_per_dp * tokens_per_request // scatter_ranks)
+    if prefill_tokens > capacity:
+        raise ValueError(
+            f"--deepep-mode low_latency on XPU dispatches up to {prefill_tokens} "
+            f"prefill tokens per rank (prefill buffer of {prefill_ceiling} tokens per "
+            f"DP rank over {scatter_ranks} ranks"
+            f"{', plus running decodes with --enable-mixed-chunk' if cfg.enable_mixed_chunk else ''}"
+            f"), above SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity}. "
+            "Raise that variable, or lower --chunked-prefill-size / "
+            "--max-prefill-tokens."
+        )
+
+
+def _prefill_dispatch_ceiling_and_scatter_ranks(server_args: Any) -> tuple[int, int]:
+    """(largest prefill forward in tokens per DP rank, ranks it is scattered over)."""
+    view = resolved_view(server_args)
+    ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
+    return ceiling, max(1, view.tp_size // view.attn_dp_size)
+
+
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
     """Reject an explicit or inherited DeepEP v2 draft backend."""
     view = resolved_view(server_args)
@@ -749,10 +877,7 @@ def resolve_ascend_ops_speculative_draft(view: Any) -> dict:
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
     """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
-    ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
-    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
-    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
-    scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
+    ceiling, scatter_ranks = _prefill_dispatch_ceiling_and_scatter_ranks(server_args)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,

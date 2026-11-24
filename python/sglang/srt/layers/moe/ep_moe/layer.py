@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -42,7 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -107,6 +109,16 @@ class DeepEPMoE(FusedMoE):
         elif _use_aiter:
             self.deprecate_flag = True
         elif _is_npu:
+            self.deprecate_flag = True
+        elif _is_xpu:
+            # Only UnquantizedFusedMoEMethod.forward_xpu reads the DeepEP dispatch
+            # formats, so anything else would fail on the first forward instead.
+            if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+                raise NotImplementedError(
+                    "DeepEP MoE on XPU supports unquantized weights only; got "
+                    f"{type(self.quant_method).__name__}. Use an unquantized "
+                    "checkpoint or drop --moe-a2a-backend deepep."
+                )
             self.deprecate_flag = True
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config
