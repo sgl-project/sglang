@@ -228,6 +228,38 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
         assert t.is_cuda, f"{name} must be on CUDA"
 
 
+def _check_fp8_kv_dequant_args(
+    *, k, v, qv, page_table, rel_bias, block_sparse_tensors, mma_pv_is_rs
+) -> None:
+    unsupported = {
+        "K/V other than fp8 e4m3": v.dtype != torch.float8_e4m3fn or k.dtype != v.dtype,
+        f"head_dim (k {k.shape[-1]}, v {v.shape[-1]}) other than 256 or 512": (
+            k.shape[-1] != v.shape[-1] or k.shape[-1] not in (256, 512)
+        ),
+        "a non-paged KV cache": page_table is None,
+        "qv": qv is not None,
+        "rel_bias": rel_bias is not None,
+        "block sparsity": block_sparse_tensors is not None,
+        # The fp8 staging tile only fits in smem when P stays in registers.
+        "mma_pv_is_rs=False": mma_pv_is_rs is False,
+    }
+    for feature, present in unsupported.items():
+        if present:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 KV cache (fp16/bf16 Q, fp8 e4m3 K/V cast in-kernel) "
+                f"does not support {feature}."
+            )
+
+
+def _complete_descales(descales, *, shape, device):
+    if all(t is None for t in descales):
+        return descales
+    return tuple(
+        torch.ones(shape, dtype=torch.float32, device=device) if t is None else t
+        for t in descales
+    )
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -385,6 +417,7 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    rel_bias_presheared: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -486,7 +519,9 @@ def _flash_attn_fwd(
         seqlen_k = num_pages * page_size
         # Paged KV: SF is interleaved (TMA-loadable) only when page_size == 128
         # so a page maps exactly onto the SF atom's 128-row tile.
-        kv_sf_interleaved = page_size == 128
+        kv_sf_interleaved = page_size == 128 and all(
+            sf is None or sf.ndim == 5 for sf in (sfk, sfv)
+        )
     else:
         num_pages, page_size = None, None
         seqlen_k = v.shape[-3]
@@ -558,11 +593,34 @@ def _flash_attn_fwd(
             torch.float8_e5m2,
         ], "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
 
+    # SM90 has no FP8 MMA path here: fp16/bf16 Q with an fp8 KV cache is cast to
+    # fp16 in-kernel instead. bf16 Q is narrowed to fp16 too, so |q| above 65504
+    # overflows to inf (Gemma-4's QK-norm keeps Q far below that).
+    fp8_kv_dequant = (
+        arch // 10 == 9
+        and q is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and not v_blockscaled
+    )
+    if fp8_kv_dequant:
+        _check_fp8_kv_dequant_args(
+            k=k,
+            v=v,
+            qv=qv,
+            page_table=page_table,
+            rel_bias=rel_bias,
+            block_sparse_tensors=block_sparse_tensors,
+            mma_pv_is_rs=mma_pv_is_rs,
+        )
+
     # qk_blockscaled: Q/K are fp8 (same dtype); V may be bf16 (no v_blockscaled) or
     # fp8 (v_blockscaled) -- exclude V from the cross-dtype check either way.
     # v_blockscaled without qk_blockscaled: Q/K bf16, V fp8 -- exclude V.
     if qk_blockscaled:
         input_tensors = {"q": q, "k": k, "qv": qv}
+    elif fp8_kv_dequant:
+        input_tensors = {"k": k, "v": v}
     elif v_blockscaled:
         input_tensors = {"q": q, "qv": qv}
     else:
@@ -633,9 +691,9 @@ def _flash_attn_fwd(
         # can't express; fall back to the dense (non-interleaved) SFQ path.
         q_sf_interleaved = False
 
-    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
-    if is_fp8 and requires_grad:
+    if (is_fp8 or fp8_kv_dequant) and requires_grad:
         raise NotImplementedError(
             "FA4 CuTe FP8 backward is not supported yet (forward-only)."
         )
@@ -645,6 +703,10 @@ def _flash_attn_fwd(
         out_torch_dtype = torch.bfloat16 if v_blockscaled else v.dtype
     else:
         out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
+    if out is not None:
+        if out.dtype not in (out_torch_dtype, torch.float32):
+            raise ValueError("Attention output must use its input dtype or float32")
+        out_torch_dtype = out.dtype
     device = v.device
     q_batch_seqlen_shape = (
         (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -700,7 +762,7 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse
 
-    if is_fp8:
+    if is_fp8 or fp8_kv_dequant:
         for t, name in (
             (q_descale, "q_descale"),
             (k_descale, "k_descale"),
@@ -715,7 +777,14 @@ def _flash_attn_fwd(
             q_descale is None and k_descale is None and v_descale is None
         ), "q_descale/k_descale/v_descale are only supported for FP8 inputs"
 
-    dtype = torch2cute_dtype_map[q_dtype]
+    if fp8_kv_dequant:
+        # The kernel's DescaleTensors arg is rebuilt positionally, so pass all
+        # three or none; a missing one is the identity.
+        q_descale, k_descale, v_descale = _complete_descales(
+            (q_descale, k_descale, v_descale), shape=(batch_size, num_head_kv), device=device
+        )
+    # fp8 -> fp16 is a single cvt on SM90, so FP8-KV computes in fp16 for any Q dtype.
+    dtype = torch2cute_dtype_map[torch.float16 if fp8_kv_dequant else q_dtype]
     if is_fp8:
         assert (
             arch // 10 == 10
@@ -788,6 +857,8 @@ def _flash_attn_fwd(
             tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap
         )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if fp8_kv_dequant:
+        mma_pv_is_rs = True  # an explicit False was rejected above
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -901,8 +972,16 @@ def _flash_attn_fwd(
         # The qv kernel has no split-KV variant.
         num_splits = 1
 
-    is_split_kv = num_splits > 1
-    if is_split_kv:
+    fp32_out_sm90 = arch // 10 == 9 and out.dtype == torch.float32 and num_splits == 1
+    is_split_kv = num_splits > 1 or fp32_out_sm90
+    if fp32_out_sm90:
+        out_partial = out.unsqueeze(0)
+        lse_partial = (
+            lse.unsqueeze(0)
+            if lse is not None
+            else torch.empty(1, *lse_shape, dtype=torch.float32, device=device)
+        )
+    elif is_split_kv:
         out_partial = torch.empty(
             num_splits,
             *q_batch_seqlen_shape,
@@ -1064,7 +1143,7 @@ def _flash_attn_fwd(
             "forward implementation"
         )
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
-        rel_extent = rel_bias.shape[-1]
+        rel_extent = rel_bias.shape[-1] - (256 if rel_bias_presheared else 0)
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
         assert tile_n == 128
@@ -1081,6 +1160,17 @@ def _flash_attn_fwd(
         tile_bias = (
             (seqlen_q_packgqa + 7) // 8 * 8 if seqlen_q_packgqa < tile_m else tile_m
         )
+    if rel_bias is not None and rel_bias_presheared:
+        # The caller already wrote the sheared layout this call's shear step
+        # would produce: (round_up(total_q, tile_m), num_head, rel_extent + 256).
+        assert cu_seqlens_q is not None
+        assert rel_bias.shape == (
+            _round_up_to_tile(total_q, tile_m),
+            num_head,
+            rel_extent_padded,
+        )
+        bias = rel_bias
+    elif rel_bias is not None:
         if cu_seqlens_q is None:
             bias_seqlen_q_rounded = _round_up_to_tile(seqlen_q, tile_m)
             assert rel_bias.shape == (batch_size, seqlen_q, num_head, rel_extent)
@@ -1270,9 +1360,13 @@ def _flash_attn_fwd(
             # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
             return out, lse
 
+    paged_kv_non_tma = page_size not in [None, tile_n] or (
+        (qk_blockscaled or v_blockscaled) and not kv_sf_interleaved
+    )
     batch_invariant = is_batch_invariant()
     compile_key = (
         dtype,
+        out_torch_dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -1307,7 +1401,7 @@ def _flash_attn_fwd(
         arch,
         arch_forward_config.compile_key if arch_forward_config is not None else None,
         arch_forward_plan.compile_key if arch_forward_plan is not None else None,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        paged_kv_non_tma,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1334,6 +1428,9 @@ def _flash_attn_fwd(
         sfv.ndim if sfv is not None else None,
         batch_invariant,
         fa_logging.get_fa_log_level(),
+        # dtype is the MMA dtype; FP8-KV also varies the Q/O and K/V tensor dtypes.
+        q_dtype,
+        v.dtype,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1448,7 +1545,8 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1 if max(head_dim, head_dim_v) > 256 else 2,
+                # FP8-KV casts into slot 0 of sK/sV behind one fp8 staging slot.
+                num_stages=1 if max(head_dim, head_dim_v) > 256 or fp8_kv_dequant else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1461,6 +1559,7 @@ def _flash_attn_fwd(
                 has_bias=bias is not None,
                 bias_block_size=tile_bias,
                 rel_extent_padded=rel_extent_padded,
+                fp8_kv_dequant=fp8_kv_dequant,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1538,7 +1637,7 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
+                    paged_kv_non_tma=paged_kv_non_tma,
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
@@ -1634,7 +1733,7 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink_tensor,
             ]
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend(
                 [
@@ -1669,7 +1768,7 @@ def _flash_attn_fwd(
         q_call, k_call, v_call, qv_call = [
             t.detach() if t is not None else None for t in (q, k, v, qv)
         ]
-        if is_fp8 or qk_blockscaled:
+        if is_fp8 or qk_blockscaled or fp8_kv_dequant:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export
             # is supported. Under qk_blockscaled/v_blockscaled some tensors stay
             # bf16 (e.g. bf16 V), so view only the actual fp8 tensors.
@@ -1730,7 +1829,7 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink,
             ]
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend(
                 [
@@ -1810,7 +1909,7 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                 )
             compiled_fwd(*call_args)
-    if is_split_kv:
+    if is_split_kv and not fp32_out_sm90:
         _flash_attn_fwd_combine(
             out_partial,
             lse_partial.transpose(-1, -2),
@@ -2017,6 +2116,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
+        rel_bias_presheared: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -2058,6 +2158,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             rel_bias=rel_bias,
+            rel_bias_presheared=rel_bias_presheared,
             sfq=sfq,
             sfk=sfk,
             sfv=sfv,
@@ -2183,6 +2284,7 @@ def flash_attn_varlen_func(
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
+    rel_bias_presheared: bool = False,
 ):
     """
     Tensor arguments:
@@ -2318,6 +2420,7 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
         out,
+        rel_bias_presheared,
     )
     needs_autograd = False
     if forward_host is not None or out is not None:

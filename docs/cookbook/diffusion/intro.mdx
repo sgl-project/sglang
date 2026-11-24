@@ -1,12 +1,18 @@
 ---
 title: Overview
 mode: wide
-description: Practical guides for deploying and using diffusion models with SGLang.
+description: Practical SGLang Diffusion guides for image, video, audio, and action generation.
 metatags:
-    description: "Explore SGLang diffusion model cookbooks for image and video generation deployment, invocation, optimization, and benchmarking examples."
+    description: "Explore SGLang Diffusion cookbooks for image, video, audio, and action generation, with deployment, invocation, and optimization examples."
 ---
 
-Choose a recipe by output modality. The sidebar stays organized by model family, while this overview separates image, video, and realtime/world workloads.
+import { DiffusionLogo } from '/src/snippets/diffusion/logo.jsx';
+
+<DiffusionLogo />
+
+SGLang Diffusion supports image, video, audio, and action generation. Choose a recipe by output modality: media and realtime/world models are listed below, while dedicated robot action policies are grouped in the [VLA cookbook](/cookbook/vla/intro).
+
+For action generation, start with the [action API](/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension) and the model-specific recipe. [Cosmos3](/cookbook/diffusion/Cosmos/Cosmos3) covers both media generation and robot policy modes.
 
 ## Image Models
 
@@ -73,6 +79,36 @@ Image models generate one image request as a bounded denoising job, usually with
     href="/cookbook/diffusion/Ernie-Image/Ernie-Image"
     img="/cards/logos/ernie.png"
   />
+  <Card
+    title="FLUX.3"
+    mode="card"
+    href="/cookbook/diffusion/FLUX/FLUX.3"
+    img="/cards/logos/flux.png"
+  />
+  <Card
+    title="MiniMax-H3-Image"
+    mode="card"
+    href="/cookbook/diffusion/MiniMax/MiniMax-H3-Image"
+    img="/cards/logos/minimax.png"
+  />
+  <Card
+    title="MOSS-Image"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/OpenMOSS/MOSS-Image"
+  />
+  <Card
+    title="Anima"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/CircleStone/Anima"
+  />
+  <Card
+    title="HiDream-O1-Image"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/HiDream/HiDream-O1-Image"
+  />
 </CardGroup>
 
 ## Video Models
@@ -80,12 +116,6 @@ Image models generate one image request as a bounded denoising job, usually with
 Video models denoise a bounded latent video sequence for each request. Use these recipes for offline text-to-video, image-to-video, and video generation serving.
 
 <CardGroup cols={3}>
-  <Card
-    title="FLUX.3"
-    mode="card"
-    href="/cookbook/diffusion/FLUX/FLUX.3"
-    img="/cards/logos/flux.png"
-  />
   <Card
     title="Cosmos"
     mode="card"
@@ -135,16 +165,16 @@ Video models denoise a bounded latent video sequence for each request. Use these
     img="/cards/logos/minimax.png"
   />
   <Card
-    title="MOSS-Image"
-    icon="image"
-    mode="card"
-    href="/cookbook/diffusion/OpenMOSS/MOSS-Image"
-  />
-  <Card
     title="LingBot Video MoE"
     mode="card"
     href="/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
     img="/cards/logos/inclusionai.png"
+  />
+  <Card
+    title="Kandinsky 6"
+    icon="video"
+    mode="card"
+    href="/cookbook/diffusion/Kandinsky/Kandinsky6"
   />
 </CardGroup>
 
@@ -164,6 +194,12 @@ Realtime models keep a session alive and generate chunk by chunk with causal sta
     mode="card"
     href="/cookbook/diffusion/SANA-WM/SANA-WM"
     img="/cards/logos/sana.png"
+  />
+  <Card
+    title="HY-Nomas"
+    mode="card"
+    href="/cookbook/diffusion/HY-Nomas/HY-Nomas"
+    img="/cards/logos/tencent.png"
   />
 </CardGroup>
 

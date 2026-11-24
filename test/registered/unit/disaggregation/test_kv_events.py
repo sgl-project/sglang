@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     EventPublisherFactory,
     KVEventBatch,
+    NullEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
     kv_event_namespace_seed,
@@ -86,6 +87,16 @@ class TestLocalKvEventSource(CustomTestCase):
                     break
             else:
                 self.fail("No event received from the advertised local source")
+
+
+class TestNullPublisherConfig(CustomTestCase):
+    def test_config_without_a_real_publisher_builds_the_noop(self):
+        """A config that names the "null" publisher, or omits the key (the schema
+        default), builds the no-op publisher instead of failing at startup."""
+        for config in ({"publisher": "null"}, {"endpoint": "tcp://*:5557"}):
+            with self.subTest(config=config):
+                publisher = EventPublisherFactory.create(json.dumps(config))
+                self.assertIsInstance(publisher, NullEventPublisher)
 
 
 class TestOffsetEndpointPort(CustomTestCase):

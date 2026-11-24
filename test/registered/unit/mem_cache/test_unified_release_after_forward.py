@@ -50,6 +50,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
     build_unified_bundle,
+    largest_take,
     setup_allocator_context,
 )
 
@@ -778,7 +779,7 @@ class TestACancelledLoadReleasesItsPins(CustomTestCase):
         setup_allocator_context()
         _, allocator = build_tri_pool(page_size=1)
         owner, window = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        state_room = allocator.state_slots_available()
+        state_room = largest_take(allocator, allocator.sub_pool_roles()[2])
         ids = allocator.alloc(8).to(torch.int64)
         event = mock.Mock(spec=["query", "wait"])
         event.query.return_value = False
@@ -804,7 +805,9 @@ class TestACancelledLoadReleasesItsPins(CustomTestCase):
         self.assertFalse(owner.usage.fixed.get(_LOAD_RESERVATION))
         owner.free(ids)
         allocator.forward_steps.forward_processed(launch)
-        self.assertGreaterEqual(allocator.state_slots_available(), state_room - 1)
+        self.assertGreaterEqual(
+            largest_take(allocator, allocator.sub_pool_roles()[2]), state_room - 1
+        )
         self.assertIsNotNone(allocator.alloc_state_slots(state_room - 1))
 
 

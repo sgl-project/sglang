@@ -57,17 +57,20 @@ jobs:
               - "test/**/!(*.md)"
               - "python/sglang/kernels/aot/**/*.!(md|txt)"
               - ".github/workflows/pr-test-arm64.yml"
+              - ".github/workflows/release-docker-arm64.yml"
               - "docker/arm64.Dockerfile"
 
   pr-gate:
     needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-arm64-extra
     secrets: inherit
 
   build-test:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
@@ -76,10 +79,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Build container
+        env:
+          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.head_ref }}
         run: |
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
-
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
@@ -102,7 +105,7 @@ jobs:
         timeout-minutes: 36
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_arm64 \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite base-b-test-cpu-arm64 --timeout-per-file 1500"
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite extra-test-cpu-arm64 --timeout-per-file 1500"
 
       - name: Change permission
         timeout-minutes: 2

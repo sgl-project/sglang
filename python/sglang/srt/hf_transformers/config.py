@@ -271,13 +271,23 @@ class HfModelConfigParser(ModelConfigParserBase):
         is_ocr2 = _is_deepseek_ocr2_model(config)
 
         if is_ocr2:
-            _override_v_head_dim_if_zero(config)
-            config.model_type = "deepseek-ocr"
-            _set_architectures(config, "DeepseekOCRForCausalLM")
             config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
             _apply_deepseek_ocr_overrides(config, model)
         elif isinstance(config, DeepseekV41Config):
             config._name_or_path = model
+        elif config.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
+            from sglang.srt.configs.lfm3 import Lfm3Config
+            from sglang.srt.configs.lfm3_audio import Lfm3AudioConfig
+            from sglang.srt.configs.lfm3_omni import Lfm3OmniConfig
+            from sglang.srt.configs.lfm3_vl import Lfm3VlConfig
+
+            config_class = {
+                "lfm3": Lfm3Config,
+                "lfm3_vl": Lfm3VlConfig,
+                "lfm3_audio": Lfm3AudioConfig,
+                "lfm3_omni": Lfm3OmniConfig,
+            }[config.model_type]
+            config = config_class.from_hf_config(config)
         elif config.model_type in _CONFIG_REGISTRY:
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:

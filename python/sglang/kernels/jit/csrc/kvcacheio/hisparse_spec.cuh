@@ -369,7 +369,9 @@ __device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* 
 
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
-  return __ffsll(mask) - 1;
+  // uint64_t (unsigned long) converts equally to HIP's __ffsll overloads
+  // (unsigned long long) and (long long); pin the call to the unsigned one.
+  return __ffsll(static_cast<unsigned long long>(mask)) - 1;
 #else
   return __ffs(mask) - 1;
 #endif
