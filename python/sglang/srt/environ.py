@@ -2415,6 +2415,11 @@ class Envs:
     # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
     # extend reuses the page tables / query offsets init_forward_metadata built.
     SGLANG_ROCM_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # Attention-DP rank (attention TP1): the decode / verify QKV + gate projection [18432, 8192] on its FP8 weight
+    # copy (the FP8 small-M GEMM, as the TP4 QKV), and the O projection [8192, 8192] on the BF16 row-major small-M
+    # GEMM. Off: hipBLASLt / aiter on the BF16 weights.
+    SGLANG_ROCM_MUSE_DP_QKV_FP8 = EnvBool(False)
+    SGLANG_ROCM_MUSE_DP_O_ROWMAJOR = EnvBool(False)
     # target-verify KV lengths once per batch / per graph replay, not per layer.
     SGLANG_ROCM_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
     # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.

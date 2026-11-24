@@ -443,6 +443,27 @@ _PREFILL_GEMM_TUNABLEOP = (
 )
 
 
+def _register_dp_tp1_gemms(fp8_shapes, rowmajor_shapes):
+    """Attention DP: the unsharded QKV + gate on the FP8 small-M GEMM (SGLANG_ROCM_MUSE_DP_QKV_FP8) and the O
+    projection on the BF16 row-major small-M GEMM (SGLANG_ROCM_MUSE_DP_O_ROWMAJOR), with their tuned launches."""
+    if _DENSE_FP8 and envs.SGLANG_ROCM_MUSE_DP_QKV_FP8.get():
+        from sglang.kernels.ops.gemm import fp8w_small_m_gemm
+
+        launches = fp8w_small_m_gemm.DP_TP1_CONFIGS
+        fp8w_small_m_gemm.CONFIGS.update(launches)
+        fp8_shapes += tuple({key[:2] for key in launches})
+    if envs.SGLANG_ROCM_MUSE_DP_O_ROWMAJOR.get():
+        from sglang.kernels.ops.gemm import bf16_tiled_small_m_gemm
+
+        launches = bf16_tiled_small_m_gemm.DP_TP1_ROW_MAJOR
+        bf16_tiled_small_m_gemm.ROW_MAJOR.update(launches)
+        bf16_tiled_small_m_gemm.ROW_MAJOR_ROT.update(
+            bf16_tiled_small_m_gemm.DP_TP1_ROW_MAJOR_ROT
+        )
+        rowmajor_shapes += tuple({key[:2] for key in launches})
+    return fp8_shapes, rowmajor_shapes
+
+
 @contextlib.contextmanager
 def _prefill_tuned_gemms():
     """TunableOp lookups (tuning off: the file is only read) for the GEMMs launched inside."""
@@ -2208,9 +2229,14 @@ class MuseSparkTextForCausalLM(nn.Module):
         fp8_shapes = _FP8W_LINEAR_SHAPES + (
             _ROWMAJOR_LINEAR_SHAPES if _PREFILL_DENSE_FP8 else ()
         )
+        rowmajor_shapes = _ROWMAJOR_LINEAR_SHAPES
+        if dp_ep.enabled():
+            fp8_shapes, rowmajor_shapes = _register_dp_tp1_gemms(
+                fp8_shapes, rowmajor_shapes
+            )
         register_gfx950_unquantized_gemm_shapes(
             tiled_weights=tuple(TILED_GEMM_LAYOUT),
-            rowmajor_weights=_ROWMAJOR_LINEAR_SHAPES,
+            rowmajor_weights=rowmajor_shapes,
             fp8_weights=fp8_shapes if _DENSE_FP8 else (),
             triton_a16w16=_DRAFT_TRITON_A16W16_GEMMS,
         )
