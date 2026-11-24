@@ -948,9 +948,19 @@ class KVCacheConfigurator:
             state=state,
         )
 
-        if self.sparse_kv_budget_plan is not None and not self.is_draft_worker:
-            self.sparse_kv_budget_plan.bind_native_pool(token_to_kv_pool)
-            token_to_kv_pool.sparse_kv_budget_plan = self.sparse_kv_budget_plan
+        budget = self.sparse_kv_budget_plan
+        if budget is not None and not self.is_draft_worker:
+            budget.bind_native_pool(token_to_kv_pool)
+            token_to_kv_pool.sparse_kv_budget_plan = budget
+            logger.info(
+                "Fused sparse KV pool allocated (per attention DP rank): "
+                "bs=%d, token_capacity=%d, C=%d, context_len=%d (model_context_len=%d)",
+                sizes.max_running_requests,
+                sizes.max_total_num_tokens,
+                budget.cache_tokens,
+                budget.context_len,
+                self.model_config.context_len,
+            )
 
         if self.kv_shard_rank is not None:
             # Hybrid pools stripe their inner full-attention pool.

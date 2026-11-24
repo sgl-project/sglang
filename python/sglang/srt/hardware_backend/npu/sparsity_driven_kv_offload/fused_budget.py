@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
 from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass
@@ -280,7 +279,7 @@ def fit_pd_sparse_budget(
     token_limit: int | None,
     num_reserved_decode_tokens: int,
 ) -> BudgetPlan:
-    """Select the largest P/D Decode resident pool within the HBM budget."""
+    """Size the P/D Decode resident pool from a full-context request budget."""
     requested_rows = requested.resident_rows - 1
     extra_rows = requested.request_rows - requested.resident_rows
     max_rows = requested_rows
@@ -295,25 +294,23 @@ def fit_pd_sparse_budget(
         # The native scheduler caps requests at half the usable token capacity.
         max_rows = min(max_rows, aligned_limit // 2)
 
-    def plan_for(rows: int) -> BudgetPlan:
-        if rows == requested_rows:
-            return requested
-        return build_plan(
-            request_rows=rows + extra_rows + 1,
-            resident_rows=rows + 1,
+    # Charge the resident window and the full context at the MLA KV rate.
+    bytes_per_request = (
+        (requested.cache_tokens + requested.context_len)
+        * requested.num_layers
+        * requested.kv_cache_dim
+        * requested.kv_dtype.itemsize
+    )
+    fitting_rows = min(max_rows, available_bytes // bytes_per_request)
+    if fitting_rows < 1:
+        raise RuntimeError(
+            "Cannot fit one sparse KV resident row: "
+            f"need {bytes_per_request} bytes per request, have {available_bytes} bytes "
+            f"(C={requested.cache_tokens}, context_len={requested.context_len})."
         )
-
-    def exceeds_budget(rows: int) -> bool:
-        return plan_for(rows).managed_hbm_bytes > available_bytes
-
-    # Buffer sizes are nondecreasing, including aligned graph and eager scratch.
-    fitting_rows = bisect_right(range(1, max_rows + 1), False, key=exceeds_budget)
-    if fitting_rows:
-        return plan_for(fitting_rows)
-
-    one_row = plan_for(1)
-    raise RuntimeError(
-        "Cannot fit one sparse KV resident row: "
-        f"manager needs {one_row.managed_hbm_bytes} bytes, have {available_bytes} bytes "
-        f"(max_total_tokens={token_limit})."
+    if fitting_rows == requested_rows:
+        return requested
+    return build_plan(
+        request_rows=fitting_rows + extra_rows + 1,
+        resident_rows=fitting_rows + 1,
     )

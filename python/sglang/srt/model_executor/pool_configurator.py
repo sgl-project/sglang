@@ -860,40 +860,55 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         budget = self._sparse_budget
+        fixed_overhead_bytes = self._fixed_overhead_bytes
         if budget is not None and not self._kvc.sparse_kv_budget_finalized:
             if self._pd_sparse_decode:
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
                     fit_pd_sparse_budget_from_config,
                 )
 
-                fixed_without_manager = (
-                    self._fixed_overhead_bytes - budget.managed_hbm_bytes
-                )
+                fixed_without_manager = fixed_overhead_bytes - budget.managed_hbm_bytes
                 budget = fit_pd_sparse_budget_from_config(
                     budget,
                     available_bytes - fixed_without_manager,
                     page_size,
                     self._pd_sparse_budget_options,
                 )
-                self._fixed_overhead_bytes = (
-                    fixed_without_manager + budget.managed_hbm_bytes
-                )
+                fixed_overhead_bytes = fixed_without_manager + budget.managed_hbm_bytes
             elif budget.prefill_workspace_tokens:
                 min_tokens = ceil_align(self._sparse_min_tokens, page_size)
-                required = self._fixed_overhead_bytes + min_tokens * self._cell_size
+                required = fixed_overhead_bytes + min_tokens * self._cell_size
                 if required > available_bytes:
-                    self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
+                    fixed_overhead_bytes -= budget.prefill_workspace_bytes
                     budget = budget.without_prefill_workspace()
-            self._sparse_budget = self._kvc.sparse_kv_budget_plan = budget
-            self._kvc.sparse_kv_budget_finalized = True
-        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
+        available_bytes = max(available_bytes - fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        if budget is not None and self._pd_sparse_decode:
+            running_rows = budget.resident_rows - 1
+            min_tokens = ceil_align(
+                page_size + get_disagg().num_reserved_decode_tokens, page_size
+            )
+            if max_total_num_tokens < min_tokens:
+                raise RuntimeError(
+                    "Not enough HBM for the P/D Decode native KV pool: "
+                    f"{max_total_num_tokens} tokens available with {running_rows} "
+                    f"resident requests, need at least {min_tokens} tokens."
+                )
+            max_total_num_tokens = min(
+                max_total_num_tokens,
+                max(running_rows * budget.context_len, min_tokens),
+            )
+        config = MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        if budget is not None:
+            self._fixed_overhead_bytes = fixed_overhead_bytes
+            self._sparse_budget = self._kvc.sparse_kv_budget_plan = budget
+            self._kvc.sparse_kv_budget_finalized = True
+        return config
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
