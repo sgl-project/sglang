@@ -23,8 +23,11 @@ def moe_fused_mul_sum_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_k = tl.program_id(0)
-    pid_m = tl.program_id(1).to(tl.int64)
+    # Flatten the grid so long prefills do not exceed CUDA's grid.y limit.
+    pid = tl.program_id(0).to(tl.int64)
+    num_k_blocks = tl.cdiv(size, BLOCK_K)
+    pid_k = pid % num_k_blocks
+    pid_m = pid // num_k_blocks
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -203,7 +206,7 @@ def moe_fused_mul_sum(
             size,
             inputs.element_size(),
         )
-        grid = (triton.cdiv(size, BLOCK_K), triton.cdiv(num_tokens, BLOCK_M))
+        grid = (triton.cdiv(size, BLOCK_K) * triton.cdiv(num_tokens, BLOCK_M),)
         moe_fused_mul_sum_kernel[grid](
             inputs,
             topk_weights,
