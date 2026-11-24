@@ -1,6 +1,7 @@
 """Unit tests for HiCache PP synchronization."""
 
 import socket
+import threading
 import time
 import unittest
 from collections import deque
@@ -12,6 +13,7 @@ import torch
 import torch.distributed
 import torch.multiprocessing
 
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import (
@@ -132,6 +134,18 @@ class TestPPSyncWindowGloo(CustomTestCase):
             elapsed = dict(result)
         self.assertGreater(elapsed["drain"], 0.5, elapsed)
         self.assertLess(elapsed["window"], 0.5, elapsed)
+
+
+class _StoreGroup:
+    """broadcast_object stand-in: PP0's store publishes its address, PP1 reads it."""
+
+    def __init__(self):
+        self._obj = None
+
+    def broadcast_object(self, obj, src=0):
+        if obj is not None:
+            self._obj = obj
+        return self._obj
 
 
 class TestUnifiedPPSyncBatching(CustomTestCase):
@@ -310,6 +324,82 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
             extra_release_counts={},
             log_metrics=True,
         )
+
+    def _storage_stage(self, pp_rank, group, backups):
+        cache = self._make_cache(pp_rank, [], [])
+        cache.tree_core.enable_storage = True
+        cache.tree_core.page_size = 1
+        cache._backup_requested_tokens = {}
+        cache.ongoing_backup = {}
+        cache._all_reduce_storage_drain = MagicMock()
+        cc = cache.cache_controller
+        for name in (
+            "prefetch_hit_queue",
+            "ack_prefetch_queue",
+            "ack_backup_queue",
+            "host_mem_release_queue",
+        ):
+            setattr(cc, name, Queue())
+        cc.extra_host_mem_release_queues = {}
+        cc.backup_skip = False
+        for _ in range(backups):
+            self._ack_backup(cache)
+        cache._pp_ready_store = PPConsensusStore(2, pp_rank, group)
+        self.addCleanup(cache._pp_ready_store.close)
+        return cache
+
+    def _ack_backup(self, cache):
+        cc = cache.cache_controller
+        cc.ack_backup_queue.put(
+            SimpleNamespace(id=cc.ack_backup_queue.qsize(), completed_tokens=0)
+        )
+
+    def _leader_round(self, leader):
+        leader.check_hicache_events()
+        counts = leader._all_reduce.call_args.args[0].clone()
+        return counts, counts.tolist()[4]  # [write, load, hit, prefetch, backup, ...]
+
+    def _follower_round(self, follower, leader, counts):
+        follower._all_reduce.side_effect = lambda data, _: data.copy_(counts)
+        done = threading.Event()
+
+        def run():
+            follower.check_hicache_events()
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        self.assertTrue(
+            done.wait(timeout=5), "PP1 blocked draining acks it has not received"
+        )
+        # Let PP1's latest totals reach PP0 before PP0's next round.
+        deadline = time.monotonic() + 5
+        while (
+            leader._pp_ready_store._peer_map.get(1, {})
+            != follower._pp_ready_store._local_map
+        ):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+    def test_cache_mode_pp_drains_only_what_every_stage_received(self):
+        """In cache mode PP1 drains the storage-ack count PP0 relays, blocking
+        until it has that many. PP0 must relay only what every stage has
+        received, even when a stage's last report predates its last drain."""
+        group = _StoreGroup()
+        leader = self._storage_stage(0, group, backups=2)
+        follower = self._storage_stage(1, group, backups=1)
+        relayed = []
+        for ack_after_round in (False, False, True, False, False):
+            counts, n_backup = self._leader_round(leader)
+            relayed.append(n_backup)
+            self._follower_round(follower, leader, counts)
+            if ack_after_round:
+                self._ack_backup(follower)
+
+        # Round 3: PP1 last reported 1 ack and has drained it, so PP0 relays 0;
+        # its second ack is reported in round 4 and drained in round 5.
+        self.assertEqual(relayed, [0, 1, 0, 0, 1])
+        for cache in (leader, follower):
+            self.assertEqual(cache.cache_controller.ack_backup_queue.qsize(), 0)
 
 
 if __name__ == "__main__":
