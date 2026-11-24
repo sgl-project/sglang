@@ -2311,7 +2311,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
-            # The C128 ring and pending pairs the peer writes only in part.
             reset_state = partial(
                 self.token_to_kv_pool.clear_request_scoped_state,
                 int(decode_req.req.kv.req_pool_idx),
@@ -2364,9 +2363,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return page_indices, metadata_index, state_indices
 
     def _send_waits_for_forward(self, *, non_blocking: bool, to_device: bool) -> bool:
-        """Whether a destination's send is held until the forward in flight is
-        done (`_send_kv_metadata`): under overlap, a device destination with
-        neither a pinned readback nor a deferred publish fencing that forward."""
+        """Whether the send waits for the forward in flight: under overlap, for a
+        device destination without a pinned readback or a deferred publish."""
         return (
             self.scheduler.enable_overlap
             and not self._defer_publish
@@ -2377,20 +2375,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _reset_before_send(
         self, reset_state: Callable[[], None], *, held: bool
     ) -> None:
-        """Issue ``reset_state``, device writes to a receive row that must land
-        after the row's previous owner and before the peer's writes.
+        """Run ``reset_state`` after the row's previous owner, before the peer.
 
-        Under overlap the previous owner can still have one redundant forward in
-        flight, and it writes the same row. A held send resets on the forward
-        stream: after its writes, and before the event the send waits for. A
-        deferred publish runs an iteration after its allocation, once that
-        forward's result was processed, and without overlap the forwards run on
-        this stream. Under PP a row is freed only once its owner's microbatch
-        result was processed, after `d2h_event`, which follows this stage's
-        forward of it (the next stage received its activations, sent behind
-        `launch_event`); no forward of the old owner is left. All of these reset
-        on this stream, and the send goes out only once this stream has run the
-        reset (`_send_kv_metadata`)."""
+        Under overlap the previous owner may still have a forward in flight, so a
+        held send resets on the forward stream, before the event it waits for.
+        Otherwise none is left: a deferred publish runs an iteration after its
+        allocation, without overlap forwards run on this stream, and under PP a
+        row is freed only after its owner's result (`d2h_event`, behind this
+        stage's forward via `launch_event`)."""
         if not held:
             reset_state()
             return
@@ -2413,13 +2405,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Send ``decode_req``'s destination, or hold it until the forward in
         flight is done; a held send's rows (``receive_rows``) are held, not
         recorded as the peer's, and re-read at the send (``refresh``).
-        ``reset_state`` writes device state the peer then writes in part; the
-        send goes out only after it (`_reset_before_send`)."""
+        ``reset_state`` runs before the send goes out."""
         if not metadata_buffer_preassigned:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
         assert decode_req.metadata_buffer_index is not None
+        # A pinned readback fences the forward only after the reset.
+        assert reset_state is None or not non_blocking
         to_device = metadata_kwargs.get("destination") != KVTransferDestination.HOST
         held = self._send_waits_for_forward(
             non_blocking=non_blocking, to_device=to_device
@@ -2447,7 +2440,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 forward_done = self.scheduler.device_module.Event()
                 forward_done.record(stream=self.scheduler.forward_stream)
                 torch.cuda.current_stream().wait_event(forward_done)
-            # The send waits for this event, recorded after any reset.
             readback_ready = torch.cuda.Event()
             readback_ready.record()
         else:
@@ -2460,9 +2452,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and not held
                 and (kv_indices.device.type == "cpu" or kv_indices.numel() == 0)
             ):
-                # Reading device indices back waited for this stream's reset;
-                # empty or host indices read nothing back (e.g. a HiSparse
-                # request too short to hold a compressed host entry).
+                # A device readback waited for the reset; empty indices (a short
+                # HiSparse request) or host indices did not.
                 self.scheduler.device_module.current_stream().synchronize()
         ready = readback_ready
         if held:
