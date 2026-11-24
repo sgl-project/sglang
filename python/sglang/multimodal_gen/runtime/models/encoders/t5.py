@@ -60,10 +60,6 @@ class AttentionType:
     DECODER = "decoder"
     # Encoder attention between previous layer Q/K/V for encoder-decoder
     ENCODER = "encoder"
-    # Encoder attention between previous layer Q/K/V
-    ENCODER_ONLY = "encoder_only"
-    # Attention between dec. Q and enc. K/V for encoder-decoder
-    ENCODER_DECODER = "encoder_decoder"
 
 
 @dataclass
@@ -430,45 +426,15 @@ class T5LayerSelfAttention(nn.Module):
         return hidden_states
 
 
-class T5LayerCrossAttention(nn.Module):
-    def __init__(
-        self, config, quant_config: QuantizationConfig | None = None, prefix: str = ""
-    ):
-        super().__init__()
-        self.EncDecAttention = T5Attention(
-            config,
-            AttentionType.ENCODER_DECODER,
-            has_relative_attention_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.EncDecAttention",
-        )
-        self.layer_norm = _t5_layer_norm(config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
-        normed_hidden_states = self.layer_norm(hidden_states)
-        attention_output = self.EncDecAttention(
-            hidden_states=normed_hidden_states,
-            attn_metadata=attn_metadata,
-        )
-        hidden_states = hidden_states + attention_output
-        return hidden_states
-
-
 class T5Block(nn.Module):
     def __init__(
         self,
         config: T5Config,
-        is_decoder: bool,
         has_relative_attention_bias=False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.is_decoder = is_decoder
         self.layer = nn.ModuleList()
         self.layer.append(
             T5LayerSelfAttention(
@@ -478,13 +444,6 @@ class T5Block(nn.Module):
                 prefix=f"{prefix}.self_attn",
             )
         )
-
-        if self.is_decoder:
-            self.layer.append(
-                T5LayerCrossAttention(
-                    config, quant_config=quant_config, prefix=f"{prefix}.cross_attn"
-                )
-            )
 
         self.layer.append(T5LayerFF(config, quant_config=quant_config))
 
@@ -506,11 +465,6 @@ class T5Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        if self.is_decoder:
-            hidden_states = self.layer[1](
-                hidden_states=hidden_states, attn_metadata=attn_metadata
-            )
-
         # Apply Feed Forward layer
         hidden_states = self.layer[-1](hidden_states)
 
@@ -521,7 +475,6 @@ class T5Stack(nn.Module):
     def __init__(
         self,
         config: T5Config,
-        is_decoder: bool,
         n_layers: int,
         embed_tokens=None,
         quant_config: QuantizationConfig | None = None,
@@ -535,7 +488,6 @@ class T5Stack(nn.Module):
                 [
                     T5Block(
                         config,
-                        is_decoder=is_decoder,
                         has_relative_attention_bias=True,
                         quant_config=quant_config,
                         prefix=f"{prefix}.blocks.{i}",
@@ -549,7 +501,6 @@ class T5Stack(nn.Module):
                 [
                     T5Block(
                         config,
-                        is_decoder=is_decoder,
                         has_relative_attention_bias=i == 0,
                         quant_config=quant_config,
                         prefix=f"{prefix}.blocks.{i}",
@@ -599,7 +550,6 @@ class T5EncoderModel(TextEncoder):
 
         self.encoder = T5Stack(
             config,
-            False,
             config.num_layers,
             self.shared,
             quant_config=quant_config,
@@ -669,7 +619,6 @@ class UMT5EncoderModel(TextEncoder):
 
         self.encoder = T5Stack(
             config,
-            False,
             config.num_layers,
             self.shared,
             quant_config=quant_config,

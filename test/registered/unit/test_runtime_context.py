@@ -1757,7 +1757,8 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         pre_capture_activation_reserve_mb(gpu_mem),
                     )
 
-    def test_remote_instance_transfer_engine_matches_the_member(self):
+    def test_remote_instance_transfer_engine_matches_the_record(self):
+        from sglang.srt.arg_groups.overrides import remote_instance_transfer_engine_of
         from sglang.srt.runtime_context import remote_instance_transfer_engine_enabled
 
         backends = ("nccl", "transfer_engine", "modelexpress")
@@ -1781,8 +1782,8 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                             get_context().set_server_args(args)
                             for override in (None, "remote_instance", "auto"):
                                 self.assertEqual(
-                                    ServerArgs.remote_instance_weight_loader_use_transfer_engine(
-                                        args, override
+                                    remote_instance_transfer_engine_of(
+                                        resolving_view(args), override
                                     ),
                                     remote_instance_transfer_engine_enabled(override),
                                 )
