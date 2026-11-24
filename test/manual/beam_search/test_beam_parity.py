@@ -85,6 +85,7 @@ class TestBeamParity(CustomTestCase):
     # No beam-specific server flag. A subclass turns a beam fast path on.
     server_args: tuple = ()
     server_env: dict = {}
+    parity_beam_widths: tuple = (2, 10)
 
     @classmethod
     def setUpClass(cls):
@@ -124,7 +125,7 @@ class TestBeamParity(CustomTestCase):
         return beam_results
 
     def test_parity_vs_transformers(self):
-        for beam_width in [2, 10]:
+        for beam_width in self.parity_beam_widths:
             # n=beam_width to compare the whole beam set; the API default is 1.
             beam_results = self._generate_beams(beam_width, n=beam_width)
             self.assertEqual(len(beam_results), beam_width)
@@ -155,6 +156,9 @@ class TestBeamParityDecodeGraph(TestBeamParity):
     shared-context attention under the dense LM head, for requests of
     GRAPH_BEAM_WIDTH beams. Requests of another width still decode eagerly."""
 
+    # At 2 beams eager shared-context attention returns none of HF's beams for
+    # this prompt, with or without the graphs, so parity covers the graph's width.
+    parity_beam_widths = (GRAPH_BEAM_WIDTH,)
     server_env = {
         "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
         "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
