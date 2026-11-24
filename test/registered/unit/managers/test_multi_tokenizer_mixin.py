@@ -1,4 +1,7 @@
+import asyncio
+import os
 import pickle
+import threading
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -32,6 +35,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
+    MultiTokenizerRouter,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
@@ -186,6 +190,13 @@ def _make_router(targets_by_rid=None) -> MultiDetokenizerRouter:
     return router
 
 
+async def _cancel_loop_tasks():
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class TestMultiTokenizerMixin(CustomTestCase):
     def test_each_tokenizer_worker_freezes_locally(self):
         threshold = [700, 10, 1000]
@@ -246,6 +257,57 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 self.assertEqual(
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
                 )
+
+    def test_tokenizer_router_loop_failure_kills_the_server(self):
+        """A failure in either router loop takes the whole server down; it must
+        not leave a live server that no longer forwards requests or outputs."""
+        port_args = SimpleNamespace(
+            tokenizer_ipc_name="from-detokenizer",
+            scheduler_input_ipc_name="to-scheduler",
+            tokenizer_worker_ipc_name="from-worker",
+        )
+        for failing_socket in ("from-worker", "from-detokenizer"):
+            with self.subTest(failing_socket=failing_socket):
+                killed = threading.Event()
+                kill_calls = []
+
+                def fake_kill(pid, include_parent=True):
+                    kill_calls.append((pid, include_parent))
+                    killed.set()
+
+                async def fake_recv(socket):
+                    if socket == failing_socket:
+                        raise RuntimeError("recv failed")
+                    await asyncio.Event().wait()
+
+                with (
+                    patch.multiple(
+                        multi_tokenizer_mixin,
+                        get_observability=MagicMock(
+                            return_value=SimpleNamespace(enable_trace=False)
+                        ),
+                        get_zmq_socket=lambda context, socket_type, endpoint, bind: (
+                            endpoint
+                        ),
+                        zmq_reader_owner=lambda caller: False,
+                        start_disagg_service=lambda: None,
+                        async_sock_recv=fake_recv,
+                        kill_process_tree=fake_kill,
+                    ),
+                    # The handler exits the router thread after the kill.
+                    patch.object(multi_tokenizer_mixin.sys, "exit"),
+                ):
+                    router = MultiTokenizerRouter(MagicMock(), port_args)
+                    try:
+                        self.assertTrue(killed.wait(timeout=5))
+                    finally:
+                        asyncio.run_coroutine_threadsafe(
+                            _cancel_loop_tasks(), router._loop
+                        ).result(timeout=5)
+                        router._loop.call_soon_threadsafe(router._loop.stop)
+                        router._thread.join(timeout=5)
+
+                self.assertEqual(kill_calls, [(os.getpid(), True)])
 
     def test_batch_str_output_keeps_request_stats_per_request(self):
         output = _make_batch_str_output()

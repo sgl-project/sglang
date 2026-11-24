@@ -450,6 +450,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             input_top_logprobs_val_flat=recv_obj.input_top_logprobs_val_flat,
             input_top_logprobs_idx_flat=recv_obj.input_top_logprobs_idx_flat,
             input_top_logprobs_flat_null_prefix=recv_obj.input_top_logprobs_flat_null_prefix,
+            input_top_logprobs_weights=recv_obj.input_top_logprobs_weights,
             output_top_logprobs_val=recv_obj.output_top_logprobs_val,
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
             input_token_ids_logprobs_val=recv_obj.input_token_ids_logprobs_val,

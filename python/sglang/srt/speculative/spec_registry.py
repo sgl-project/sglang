@@ -4,6 +4,7 @@ should use that classmethod API; do not import from this module directly.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
@@ -115,6 +116,33 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
+    def carries_draft_hidden_states(self) -> bool:
+        return False
+
+    def need_topk(self) -> bool:
+        return False
+
+    def create_future_map(
+        self,
+        device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
+    ) -> FutureMap:
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
+
+    def get_platform_worker_cls(self) -> Optional[type]:
+        # The registered factory already names the plugin's worker class.
+        return None
+
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 
@@ -201,11 +229,10 @@ def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     duck-typing contract.
 
     ``from_string`` returns either type and callers dispatch on the shared
-    ``is_*()`` / ``supports_*()`` interface without isinstance checks, so every
-    such method on the enum must also exist on the registered spec class —
-    otherwise a plugin-registered algo hits ``AttributeError`` at a call site
-    (this is how ``is_some`` / ``is_frozen_kv_mtp`` silently went missing). New
-    predicates are covered automatically; no second list to maintain.
+    interface without isinstance checks, so every public method on the enum
+    must also exist on the registered spec class; otherwise a plugin-registered
+    algo hits ``AttributeError`` at a call site. New methods are covered
+    automatically; no second list to maintain.
 
     Called from ``register_algorithm`` rather than at import time because
     ``spec_info`` imports this module, so ``SpeculativeAlgorithm`` does not yet
@@ -217,10 +244,12 @@ def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     # empty interface and turn this guard into a silent no-op.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+    # Plain functions only: the classmethods (from_string, register) are not
+    # part of the per-algorithm surface.
     interface = {
         name
-        for name in vars(SpeculativeAlgorithm)
-        if name.startswith(("is_", "supports_"))
+        for name, member in vars(SpeculativeAlgorithm).items()
+        if inspect.isfunction(member) and not name.startswith("_")
     }
     missing = sorted(interface - set(dir(spec_class)))
     if missing:
