@@ -331,11 +331,13 @@ class LTX2VideoCausalConv3d(nn.Module):
             out = run(bias)
             return out if residual is None else out + residual
 
+        # The conv output is a temporary this call owns: finish it in place,
+        # like aten's bias ``add_``, instead of holding a second full output.
         out = run(None)
         if residual is not None and can_use_conv_bias_epilogue(out, bias, residual):
-            return conv_bias_epilogue(out, bias, residual)
+            return conv_bias_epilogue(out, bias, residual, inplace=True)
         if can_use_conv_bias_epilogue(out, bias):
-            out = conv_bias_epilogue(out, bias)
+            out = conv_bias_epilogue(out, bias, inplace=True)
         else:
             # Same ops aten runs inside conv3d: bias cast to the activation
             # dtype (autocast), fp32 add, one rounding.
