@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -32,13 +31,11 @@ from sglang.srt.layers.cp.utils import (
     cp_shard_position_ids,
     get_cp_strategy,
 )
-from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import cdiv, is_npu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.device import is_gfx95_supported
 
 _is_npu = is_npu()
@@ -544,14 +541,11 @@ class QSAIndexer(MultiPlatformOp):
             del logits, block_indices, selected
         return output
 
-    def select_prefill_tokens_tp(self, q, logical_positions, metadata):
+    def select_prefill_tokens_tp(self, q, logical_positions, metadata, layout):
         """Score one contiguous query shard against the replicated compressed K."""
-        parallel = get_parallel()
         rows = q.shape[0]
-        shard_rows = cdiv(rows, parallel.attn_tp_size)
-        start = parallel.attn_tp_rank * shard_rows
-        layout = metadata.prefill_tp_layout
-        local = layout.indexer_slice if layout else slice(start, start + shard_rows)
+        shard_rows = layout.rows_per_rank
+        local = layout.indexer_slice
         request_ids = metadata.get_token_to_batch_idx()
         local_request_ids = request_ids[local]
         local_positions = logical_positions[local]
@@ -573,24 +567,16 @@ class QSAIndexer(MultiPlatformOp):
             padded = local_blocks.new_full((shard_rows, self.block_topk), -1)
             padded[: local_blocks.shape[0]].copy_(local_blocks)
             local_blocks = padded
-        if layout is not None:
-            peer = qsa_all_to_all(local_blocks, layout.peer_splits)
-            ordered = (peer, local_blocks) if layout.kv_group else (local_blocks, peer)
-            attn_rows = layout.attention_slice
-            request_ids = request_ids[attn_rows]
-            logical_positions = logical_positions[attn_rows]
-            if not request_ids.numel():
-                return local_blocks.new_empty(
-                    (0, self.token_topk + self.compress_ratio - 1)
-                )
-            blocks = torch.cat(ordered)[: request_ids.numel()]
-        else:
-            blocks = local_blocks.new_empty(
-                (shard_rows * parallel.attn_tp_size, self.block_topk)
+        peer = qsa_all_to_all(local_blocks, layout.peer_splits)
+        ordered = (peer, local_blocks) if layout.kv_group else (local_blocks, peer)
+        attn_rows = layout.attention_slice
+        request_ids = request_ids[attn_rows]
+        logical_positions = logical_positions[attn_rows]
+        if not request_ids.numel():
+            return local_blocks.new_empty(
+                (0, self.token_topk + self.compress_ratio - 1)
             )
-            # Gather compact block IDs before expanding to token positions.
-            attn_tp_all_gather_into_tensor(blocks, local_blocks)
-            blocks = blocks[:rows]
+        blocks = torch.cat(ordered)[: request_ids.numel()]
         return expand_qsa_block_indices(
             blocks,
             logical_positions,
@@ -853,16 +839,11 @@ class QSAIndexer(MultiPlatformOp):
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
-        if (
-            _is_npu
-            and forward_mode.is_context_parallel_extend()
-            and envs.SGLANG_NPU_QSA_PREFILL_TP_SHARD.get() in ("indexer", "attention")
-        ):
-            tp_size = get_parallel().attn_tp_size
-            if 1 < tp_size <= num_valid_tokens:
-                return self.select_prefill_tokens_tp(
-                    q, logical_positions, indexer_metadata
-                )
+        layout = indexer_metadata.prefill_tp_layout
+        if layout is not None:
+            return self.select_prefill_tokens_tp(
+                q, logical_positions, indexer_metadata, layout
+            )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)

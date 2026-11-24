@@ -1349,8 +1349,6 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
-    # Ascend QSA prefill TP modes: off, indexer, and attention.
-    SGLANG_NPU_QSA_PREFILL_TP_SHARD = EnvStr("off")
 
     # ===================================================================
     # MUSA

@@ -359,11 +359,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Keep each replicated KV-head group on its existing cache.
         self._use_npu_prefill_tp_attention = (
             _is_npu
-            and envs.SGLANG_NPU_QSA_PREFILL_TP_SHARD.get() == "attention"
             and getattr(config, "num_attention_heads", None) == 24
             and getattr(config, "num_key_value_heads", None) == 2
             and not runner.is_draft_worker
+            and self._kv_shard_pool is None
             and get_parallel().attn_tp_size == 8
+            and not get_parallel().dcp_enabled
         )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
