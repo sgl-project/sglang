@@ -6,8 +6,6 @@ each op is bound on its own: a missing one becomes a stub naming it, is recorded
 in `missing_ops`, and host pools refuse at construction via
 `require_kvcacheio_ops`. `unavailable_reason` is set when the module itself
 does not import. Off XPU nothing is bound and `missing_ops` stays empty.
-`hisparse_memory_pool.py` still imports `transfer_kv_all_layer_mla` directly,
-so on XPU a wheel without that op or without the module fails at import.
 """
 
 from __future__ import annotations
