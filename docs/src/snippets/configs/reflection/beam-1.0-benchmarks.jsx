@@ -197,11 +197,11 @@ export const benchmarks = [
       "strategy": "low-latency",
       "quant": "nvfp4"
     },
-    "sglang_version": "daf3854023",
+    "sglang_version": "cd11be88c0",
     "accuracy": {
-      "gsm8k_pct": 96.29
+      "gsm8k_pct": 96.59
     },
-    "notes": "sgl-eval 0.1.3 (temperature 0.7, top_p 0.99, max_tokens 32768): 1,319 GSM8K problems, 0 request errors, DFlash2 accept length 4.55."
+    "notes": "sgl-eval 0.1.3 (temperature 0.7, top_p 0.99, max_tokens 32768): 1,319 GSM8K problems, 0 request errors, FP8 KV cache."
   },
   {
     "match": {
@@ -209,10 +209,10 @@ export const benchmarks = [
       "strategy": "high-throughput",
       "quant": "nvfp4"
     },
-    "sglang_version": "daf3854023",
+    "sglang_version": "cd11be88c0",
     "accuracy": {
-      "gsm8k_pct": 96.21
+      "gsm8k_pct": 96.51
     },
-    "notes": "sgl-eval 0.1.3 (temperature 0.7, top_p 0.99, max_tokens 32768): 1,319 GSM8K problems, 0 request errors, DFlash2 accept length 4.54."
+    "notes": "sgl-eval 0.1.3 (temperature 0.7, top_p 0.99, max_tokens 32768): 1,319 GSM8K problems, 0 request errors, FP8 KV cache."
   }
 ];

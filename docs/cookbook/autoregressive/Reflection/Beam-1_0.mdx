@@ -22,7 +22,7 @@ Select your hardware, strategy, and quantization to generate the launch command.
 
 - **Low-Latency** uses TP with the [DFlash2 drafter](https://huggingface.co/reflection/Beam-1.0-501B-A23B-DFlash2) at block size 8.
 - **High-Throughput** disables DFlash2. H200 BF16 uses TP8 with an automatic static memory fraction; the other recipes use TP + DPA. B300 and GB300 NVFP4 also enable EP and FlashInfer MegaMoE.
-- **RTX PRO 6000** serves NVFP4 only, with TP4 and DFlash2 in both strategies; High-Throughput raises the running-request limit to 64. The recipe enables FlashInfer's PCIe-IPC all-reduce, since these GPUs have no NVLink.
+- **RTX PRO 6000** serves NVFP4 only, with TP4 and DFlash2 in both strategies; High-Throughput raises the running-request limit to 64. The recipe enables FlashInfer's PCIe-IPC all-reduce, since these GPUs have no NVLink. It stores the KV cache in FP8 with FlashInfer prefill, because TRT-LLM prefill on these GPUs does not read an FP8 KV cache.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/reflection/beam-1.0.jsx";
@@ -32,7 +32,7 @@ import { benchmarks } from "/src/snippets/configs/reflection/beam-1.0-benchmarks
 
 Each GSM8K score covers all 1,319 test problems; the benchmark notes identify the evaluation harness.
 
-NVFP4 requires Blackwell: B300, GB300, or RTX PRO 6000. On four RTX PRO 6000 GPUs the KV cache holds about 150K tokens, so the recipe caps the context at 128K tokens. **GB300 BF16 uses two four-GPU nodes**: set the head-node address and node rank in **Env**, then run the command on both nodes with rank 0 on the head and rank 1 on the peer.
+NVFP4 requires Blackwell: B300, GB300, or RTX PRO 6000. On four RTX PRO 6000 GPUs, the FP8 KV cache and unified memory let one request use the full 512K-token context. **GB300 BF16 uses two four-GPU nodes**: set the head-node address and node rank in **Env**, then run the command on both nodes with rank 0 on the head and rank 1 on the peer.
 
 ## TPU Support
 
