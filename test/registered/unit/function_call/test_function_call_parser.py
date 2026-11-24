@@ -5810,6 +5810,13 @@ class TestQwen25Detector(unittest.TestCase):
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
 
+    def test_finish_releases_held_back_end_token_prefix(self):
+        """Text held back as a possible end-token prefix is released at stream end."""
+        text = "Close the tag with </"
+        streamed = self.detector.parse_streaming_increment(text, self.tools).normal_text
+        streamed += self.detector.finish(self.tools).normal_text
+        self.assertEqual(streamed, text)
+
 
 class TestGemma4Detector(unittest.TestCase):
     def setUp(self):
