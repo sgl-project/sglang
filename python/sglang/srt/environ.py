@@ -756,12 +756,12 @@ class Envs:
     # Replay all-beam decode batches that run the compact trie head or
     # shared-context attention as CUDA graphs.
     SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
-    # The one beam width those graphs serve under shared-context attention; a
-    # decode graph size holds this many rows per request.
-    SGLANG_BEAM_DECODE_GRAPH_WIDTH = EnvInt(2000)
-    # Most tokens a beam request generates inside a shared-context graph when the
-    # model bundles no trie; a trie fixes it at its codebook count.
-    SGLANG_BEAM_DECODE_GRAPH_MAX_NEW_TOKENS = EnvInt(None)
+    # The requests' beam width for those graphs under shared-context attention;
+    # unset captures none. A decode graph size holds this many rows per request.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
+    # Tokens such a graph holds per request when the model bundles no trie; a
+    # trie fixes it at its codebook count. A longer request decodes eagerly.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS = EnvInt(None)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
