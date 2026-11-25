@@ -116,10 +116,6 @@ def is_supported(
     )
 
 
-def _compile(name, src):
-    return cu.build_module(name, src, [b"--gpu-architecture=sm_90a", b"-std=c++17"])
-
-
 class _Module:
     def __init__(self):
         sp_cfgs = [(c, m) for _, c, m in _SP_CONFIGS]
@@ -131,8 +127,10 @@ class _Module:
         src = cu.read_source("moe_w4a16.cuh").replace(
             "// @WGMMA_RS@\n", _wgmma_src(range(24, 136, 8))
         )
-        self.module = _compile(
-            "moe_w4a16.cu", src + inst((("", _CONFIGS), ("SP", sp_cfgs)))
+        self.module = cu.build_module(
+            "moe_w4a16.cu",
+            src + inst((("", _CONFIGS), ("SP", sp_cfgs))),
+            cu.SM90A_OPTS,
         )
         self.funcs = {
             c: cu.function(self.module, "moe_" + "_".join(map(str, c)), m)
@@ -155,7 +153,7 @@ class _Module:
             + "\n"
             + src
         )
-        self.big_module = _compile("moe_w4a16_big.cu", src)
+        self.big_module = cu.build_module("moe_w4a16_big.cu", src, cu.SM90A_OPTS)
         self.big = cu.function(self.big_module, "pfm_main", _BIG_SMEM)
         self.fin = cu.function(self.big_module, "moe_w4a16_sp_fin", 65536 + 32)
         self.fin_ctas = 2 * torch.cuda.get_device_properties().multi_processor_count

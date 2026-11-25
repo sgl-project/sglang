@@ -9,7 +9,6 @@ import torch
 
 from sglang.kernels.jit import muse_spark_cuda as cu
 from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
-    _compile,
     nvfp4_w4a16_moe_sp_finalize,
 )
 
@@ -300,7 +299,7 @@ extern "C" __global__ void __launch_bounds__(512) sp_slot_sum(const uint4* __res
 @functools.cache
 def _push_function(device_index: int):
     with torch.cuda.device(device_index):
-        module = _compile("sp_push_a2a.cu", _PUSH_SRC)
+        module = cu.build_module("sp_push_a2a.cu", _PUSH_SRC, cu.SM90A_OPTS)
         return {
             n: cu.function(module, n)
             for n in (

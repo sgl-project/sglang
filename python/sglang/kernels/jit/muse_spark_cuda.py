@@ -34,6 +34,9 @@ def driver():
     return d
 
 
+SM90A_OPTS = [b"--gpu-architecture=sm_90a", b"-std=c++17"]
+
+
 def build_module(name, src, opts):
     from cuda.bindings import nvrtc
 
