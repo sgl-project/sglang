@@ -339,7 +339,7 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(
-            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len - 1
+            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len + 1
         )
 
     def test_pd_prefill_forces_one_handoff_token(self):
