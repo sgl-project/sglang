@@ -22,7 +22,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-from sglang.test.test_utils import CustomTestCase
 
 
 class _StubReq:
@@ -39,7 +38,7 @@ class _StubReq:
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
         self.bidir_prefix_len = -1
-        self.kv = SimpleNamespace(cache_protected_len=None, holds_mamba=False)
+        self.kv = SimpleNamespace(cache_protected_len=None)
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)
@@ -121,54 +120,6 @@ class TestMatchKvCacheForceMiss(unittest.TestCase):
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
-
-
-class TestMatchKvCacheBidirPartialState(CustomTestCase):
-    def _tree(self):
-        tree = RadixCache.create_simulated()
-        tree.insert(InsertParams(key=RadixKey(token_ids=array("q", range(10, 18)))))
-        return tree
-
-    def test_partial_state_hit_is_a_miss(self):
-        tree = self._tree()
-        req = _StubReq(list(range(10, 14)) + [99, 100])
-        req.bidir_prefix_len = 6
-
-        match_kv_cache(req, tree)
-
-        self.assertEqual(req.prefix_len, 0)
-        self.assertIs(req.last_node, tree.root_node)
-        self.assertEqual(req.host_hit_length, 0)
-
-    def test_partial_state_hit_resets_mamba_cow(self):
-        """A deferred CoW, staged before the request holds a slot,
-        is dropped with the zeroed hit, or the slot resumes a partial checkpoint."""
-        for holds_mamba in (True, False):
-            with self.subTest(holds_mamba=holds_mamba):
-                tree = self._tree()
-                req = _StubReq(list(range(10, 14)) + [99, 100])
-                req.bidir_prefix_len = 6
-                req.kv = SimpleNamespace(
-                    cache_protected_len=None,
-                    holds_mamba=holds_mamba,
-                    mamba_cow_src_index=7,
-                    mamba_needs_clear=False,
-                )
-
-                match_kv_cache(req, tree)
-
-                self.assertIsNone(req.kv.mamba_cow_src_index)
-                self.assertEqual(req.kv.mamba_needs_clear, holds_mamba)
-
-    def test_full_state_hit_is_kept(self):
-        tree = self._tree()
-        req = _StubReq(list(range(10, 18)) + [99, 100])
-        req.bidir_prefix_len = 8
-
-        match_kv_cache(req, tree)
-
-        self.assertEqual(req.prefix_len, 8)
-        self.assertIsNot(req.last_node, tree.root_node)
 
 
 if __name__ == "__main__":

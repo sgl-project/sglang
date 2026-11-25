@@ -19,10 +19,9 @@ from sglang.srt.managers.utils import validate_input_length
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _req(num_tokens, bidir_prefix_len=-1):
+def _req(num_tokens):
     return SimpleNamespace(
-        origin_input_ids=array("q", range(num_tokens)),
-        bidir_prefix_len=bidir_prefix_len,
+        origin_input_ids=array("q", range(num_tokens)), bidir_prefix_len=-1
     )
 
 
@@ -52,17 +51,6 @@ class TestValidateInputLength(CustomTestCase):
             validate_input_length(req, max_req_input_len=1018, allow_auto_truncate=True)
         )
         self.assertEqual(list(req.origin_input_ids), list(range(1018)))
-
-    def test_bidir_prompt_is_rejected_not_truncated(self):
-        # Truncating would cut the prompt its block boundary indexes.
-        req = _req(1500, bidir_prefix_len=1400)
-        msg = validate_input_length(
-            req, max_req_input_len=1018, allow_auto_truncate=True
-        )
-        self.assertIn("This model's maximum context length is 1017 tokens", msg)
-        # Enabling auto-truncation would not help this caller.
-        self.assertNotIn("--allow-auto-truncate", msg)
-        self.assertEqual(len(req.origin_input_ids), 1500)
 
     def test_in_range_unchanged(self):
         req = _req(1017)

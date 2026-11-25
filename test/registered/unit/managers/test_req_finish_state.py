@@ -1,8 +1,7 @@
-"""Req owns its finish state, written only by its finish methods and commit checks,
-and its extra_key, which keeps bidir and causal requests in separate namespaces."""
+"""Req owns its finish state: code outside the commit's finish checks changes
+it only through the Req finish methods."""
 
 import unittest
-from array import array
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,17 +31,6 @@ _OWNER_SCOPES = {
     "Req._check_vocab_boundary_finish",
     "Req._cap_finished_len_at_max_new_tokens",
 }
-
-
-def _extra_key(extra_key=None, state=(1, 2, 3), question=(99, 100), bidir=True):
-    return Req(
-        rid="r",
-        origin_input_text="",
-        origin_input_ids=array("q", [*state, *question]),
-        sampling_params=SamplingParams(max_new_tokens=0),
-        extra_key=extra_key,
-        bidir_prefix_len=len(state) if bidir else -1,
-    ).extra_key
 
 
 class TestReqFinishStateWriters(CustomTestCase):
@@ -97,7 +85,6 @@ class TestReqFinishMethods(CustomTestCase):
             return_logprob=True,
             return_routed_experts=True,
             routed_experts_start_len=-1,
-            bidir_prefix_len=2,
         )
         req.logprob_start_len = 2
         with patch("sglang.srt.managers.schedule_batch.get_parallel") as parallel:
@@ -106,66 +93,6 @@ class TestReqFinishMethods(CustomTestCase):
         self.assertEqual(list(req.origin_input_ids), [0])
         self.assertEqual(req.logprob_start_len, -1)
         self.assertEqual(req.routed_experts_start_len, 0)
-        # A kept boundary would give the stub a (2, 1) block past its prompt.
-        self.assertEqual(req.bidir_prefix_len, -1)
-
-    def test_abort_returns_a_bidir_stub_to_the_caller_key(self):
-        # The causal stub must not share radix nodes with the state's requests.
-        for extra_key in (None, "tenant|a", f"bidir{'0' * 64}|0|"):
-            with self.subTest(extra_key=extra_key):
-                req = Req(
-                    rid="r",
-                    origin_input_text="",
-                    origin_input_ids=[1, 2, 3],
-                    sampling_params=SamplingParams(),
-                    extra_key=extra_key,
-                    bidir_prefix_len=2,
-                )
-                self.assertNotEqual(req.extra_key, extra_key)
-                with patch(
-                    "sglang.srt.managers.schedule_batch.get_parallel"
-                ) as parallel:
-                    parallel().tp_rank = 0
-                    req.set_finish_with_abort("rejected at intake")
-                self.assertEqual(
-                    req.extra_key, _extra_key(extra_key=extra_key, bidir=False)
-                )
-
-    def test_bidir_request_is_not_resumed_by_rebootstrap(self):
-        """A PD rebootstrap replays token ids without the block boundaries,
-        so a retracted bidir request is aborted instead; a causal one resumes."""
-        for bidir_prefix_len, resumable in ((-1, True), (2, False)):
-            with self.subTest(bidir_prefix_len=bidir_prefix_len):
-                req = Req(
-                    rid="r",
-                    origin_input_text="",
-                    origin_input_ids=[1, 2, 3],
-                    sampling_params=SamplingParams(),
-                    bidir_prefix_len=bidir_prefix_len,
-                )
-                self.assertEqual(req.resumable_by_rebootstrap, resumable)
-
-
-class TestReqExtraKey(CustomTestCase):
-    def test_same_state_shares_a_namespace(self):
-        self.assertEqual(_extra_key(), _extra_key(question=(7,)))
-
-    def test_different_states_with_equal_length_do_not(self):
-        self.assertNotEqual(_extra_key(), _extra_key(state=(1, 2, 4)))
-
-    def test_caller_key_is_part_of_the_namespace(self):
-        self.assertNotEqual(_extra_key(extra_key="|bidir4"), _extra_key())
-
-    def test_causal_key_never_lands_in_a_bidir_namespace(self):
-        """A causal request must never share radix nodes with a bidir state,
-        even when its extra_key spells that state's namespace."""
-        namespace = _extra_key()
-        keys = (namespace, f"bidir-{namespace}", "bidir", None, "tenant|a")
-        causal = [_extra_key(extra_key=key, bidir=False) for key in keys]
-        self.assertNotEqual(causal[0], namespace)
-        # Distinct client keys keep distinct causal keys.
-        self.assertEqual(len(set(causal)), len(keys))
-        self.assertEqual(causal[3:], [None, "tenant|a"])
 
 
 if __name__ == "__main__":

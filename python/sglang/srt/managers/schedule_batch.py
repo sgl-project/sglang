@@ -604,8 +604,7 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         if bidir_prefix_len >= 0:
-            # State KV depends on the whole state block: states never share radix nodes;
-            # the caller key is a length-delimited component.
+            # State KV depends on the whole state block: states never share radix nodes.
             state_hash = hashlib.sha256(
                 array("q", origin_input_ids[:bidir_prefix_len]).tobytes()
             ).hexdigest()
@@ -1740,7 +1739,7 @@ class Req(ReqDllmMixin):
             "q", [0]
         )  # set it to one token to skip the long prefill
         # The boundary indexed the dropped prompt; the one-token stub runs causal,
-        # under the key a causal request with the namespace's caller key gets.
+        # under the key a causal request with the same caller key gets.
         if self.bidir_prefix_len >= 0:
             self.extra_key = _causal_extra_key(self.extra_key.split("|", 2)[2] or None)
         self.bidir_prefix_len = -1

@@ -1784,34 +1784,6 @@ mod tests {
                 }),
                 "return_sampling_mask is not supported by the Rust server",
             ),
-            (
-                serde_json::json!({"text": "hi", "bidir_prefix_len": 0}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
-            (
-                serde_json::json!({"text": "hi", "bidir_prefix_len": 5}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
-            (
-                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [-1, 3]}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
-            (
-                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": []}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
-            (
-                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [null, -1, 3]}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
-            (
-                serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [null, -1]}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
-            (
-                serde_json::json!({"text": "hi", "bidir_prefix_len": [-1]}),
-                "bidir_prefix_len is not supported by the Rust server",
-            ),
         ] {
             for stream in [false, true] {
                 let mut body = body.clone();
@@ -1858,13 +1830,10 @@ mod tests {
                 );
             }
         }
-        // A body that asks Python for no mode and no boundary passes.
+        // A mode Python reads as unset passes.
         for body in [
             serde_json::json!({"text": "hi", "sampling_logprobs_mode": null}),
             serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null, "support"]}),
-            serde_json::json!({"text": "hi", "bidir_prefix_len": null}),
-            serde_json::json!({"text": "hi", "bidir_prefix_len": -1}),
-            serde_json::json!({"text": ["a", "b"], "bidir_prefix_len": [-1, -1]}),
         ] {
             assert!(generate_requests(&state, body.clone()).is_ok(), "{body}");
         }

@@ -1515,9 +1515,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
-        # Validate input length. A bidir prompt is refused rather than truncated,
-        # since its block boundary indexes the whole prompt.
+        # Validate input length
         if input_token_num >= self.context_len:
+            # The block boundary indexes the whole prompt: refuse, never truncate.
             if self.allow_auto_truncate and (
                 isinstance(obj, EmbeddingReqInput) or obj.bidir_prefix_len in (None, -1)
             ):
@@ -1652,8 +1652,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.bidir_prefix_len < 0:
             return
-        # The shortest-prefill budget can cap every pass below the whole prompt;
-        # an unset ratio resolves to 1/8, as in ShortestPrefillLoadScaling.resolve.
         budget_ratio = get_schedule().shortest_prefill_budget_min_ratio
         if (
             attention_backends()[0] != "triton"
@@ -1665,6 +1663,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or get_parallel().attn_dcp_size > 1
             # Two-batch overlap cannot split the block boundaries.
             or get_exec().overlap.enable_two_batch_overlap
+            # The shortest-prefill budget can cap every pass below the whole prompt;
+            # an unset ratio resolves to 1/8, as in ShortestPrefillLoadScaling.resolve.
             or (
                 get_schedule().shortest_prefill_boundary_halving_chunks
                 and (budget_ratio is None or 0 < budget_ratio < 1)

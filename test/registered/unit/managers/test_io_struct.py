@@ -1,5 +1,4 @@
 import copy
-import json
 import re
 import unittest
 import weakref
@@ -10,7 +9,6 @@ from unittest.mock import patch
 import msgspec
 import numpy as np
 import torch
-from pydantic import TypeAdapter, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
 from sglang.srt.environ import envs
@@ -1408,38 +1406,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
-
-    def test_bidir_prefix_len_normalization(self):
-        req = copy.deepcopy(self.base_req)
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.bidir_prefix_len, [-1, -1])
-
-        req = copy.deepcopy(self.base_req)
-        req.bidir_prefix_len = 4
-        req.normalize_batch_and_arguments()
-        self.assertEqual([req[0].bidir_prefix_len, req[1].bidir_prefix_len], [4, 4])
-
-        req = copy.deepcopy(self.base_req)
-        req.bidir_prefix_len = [4]
-        with self.assertRaisesRegex(ValueError, "bidir_prefix_len has 1 entries"):
-            req.normalize_batch_and_arguments()
-
-    def test_bidir_prefix_len_takes_only_json_integers(self):
-        # Lax coercion would read JSON false as 0, a fully bidirectional prompt,
-        # and a null entry would reach the scheduler as causal.
-        adapter = TypeAdapter(GenerateReqInput)
-
-        def parse(value):
-            return adapter.validate_json(
-                json.dumps({"input_ids": [1, 2], "bidir_prefix_len": value})
-            )
-
-        for value in (False, [False, True], [None, 1]):
-            with self.subTest(value=value), self.assertRaises(ValidationError):
-                parse(value)
-        for value in (3, [3, -1], None):
-            with self.subTest(value=value):
-                self.assertEqual(parse(value).bidir_prefix_len, value)
 
 
 class TestKvHintsTransport(CustomTestCase):

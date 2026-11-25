@@ -3099,10 +3099,10 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
-        # PD prefill never decodes: budget the single handoff token and return
-        # before the clamps, which could only lower it to a dummy prefill-only
-        # 0. Constant output: every PP rank must derive the same
-        # sampling_params (rank consensus hashes them).
+        # PD prefill never decodes: budget the single handoff token and, for a
+        # causal prompt, return before the clamps, which could only lower it to a
+        # dummy prefill-only 0. Constant output: every PP rank must derive the
+        # same sampling_params (rank consensus hashes them).
         prefill_handoff = self.disaggregation_mode == DisaggregationMode.PREFILL
         if prefill_handoff:
             req.sampling_params.max_new_tokens = 1
@@ -3158,9 +3158,8 @@ class Scheduler(
             shares_prefixes=self.tree_cache.supports_prefix_sharing()
         )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
-            input_len,
-            # A PD prefill server decodes exactly the handoff token.
-            1 if prefill_handoff else max_new_tokens,
+            input_tokens=input_len,
+            max_new_tokens=1 if prefill_handoff else max_new_tokens,
             token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
             # Admission never splits a block-bidirectional prompt: price it whole.

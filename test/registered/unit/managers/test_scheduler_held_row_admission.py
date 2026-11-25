@@ -38,8 +38,6 @@ NUM_ROWS = 4
 class _Req:
     owner_list = None
 
-    bidir_prefix_len = -1
-
     def __init__(self, holds_row, rid=None, input_len=0, prefix_len=0):
         self.rid = rid
         self.origin_input_ids = [0] * input_len

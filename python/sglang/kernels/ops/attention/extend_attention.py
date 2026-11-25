@@ -1012,9 +1012,8 @@ def extend_attention_fwd(
     ``bf16_dot``: with an FP8 cache and BF16 q, upcast the cached K/V and run the
     prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
     prefix or zero-prefix kernel). No effect on a BF16 cache.
-    ``block_boundaries``: [num_seqs, 2] int32 (state end, question end) positions,
-    absolute, with (-1, -1) for a causal sequence;
-    only the causal path applies it, not a custom mask or ``is_causal=False``.
+    ``block_boundaries``: [num_seqs, 2] int32, absolute (state end, question end),
+    (-1, -1) = causal; ignored with a custom mask or ``is_causal=False``.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
