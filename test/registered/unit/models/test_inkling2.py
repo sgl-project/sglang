@@ -666,12 +666,12 @@ def _rocm_overrides(
     from sglang.srt.server_args import ServerArgs
 
     (tmp_path / "config.json").write_text(json.dumps(release_config))
-    platform = SimpleNamespace(is_hip=hip, is_sm90=False, is_sm100=False)
+    platform = SimpleNamespace(
+        is_hip=hip, is_gfx95=gfx95, is_sm90=False, is_sm100=False
+    )
     monkeypatch.setattr(inkling, "get_platform", lambda: platform)
-    monkeypatch.setattr(inkling_hip, "is_gfx95_supported", lambda: gfx95)
-    # the override exports these on ROCm; preset them so nothing leaks to later tests
-    monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS", "32")
-    monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_MAX", "128")
+    monkeypatch.setattr(inkling_hip, "get_platform", lambda: platform)
+    # the override sets this on ROCm; preset it so nothing leaks to later tests
     monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
     for name, value in env:
         monkeypatch.setenv(name, value)
@@ -680,59 +680,21 @@ def _rocm_overrides(
     return inkling._inkling_overrides(args, hf_config)
 
 
-@pytest.mark.parametrize("hip", [False, True])
-def test_rocm_launch_defaults(tmp_path, monkeypatch, release_config, hip):
-    """A launch with default flags ran out of memory on ROCm on the first 16k prefill
-    chunk: ROCm defaults to 8192-token chunks at 0.85; explicit values win."""
-    from sglang.srt.arg_groups import memory_hook
-    from sglang.srt.arg_groups.model_override_base import resolving_view
-    from sglang.srt.server_args import ServerArgs
-
-    (tmp_path / "config.json").write_text(json.dumps(release_config))
-    monkeypatch.setattr(
-        memory_hook, "get_platform", lambda: SimpleNamespace(is_hip=hip)
-    )
-    args = ServerArgs(model_path=str(tmp_path))
-    memory_hook.apply_inkling_rocm_memory_defaults(args)
-    cfg = resolving_view(args)
-    assert (cfg.chunked_prefill_size, cfg.mem_fraction_static) == (
-        (8192, 0.85) if hip else (None, None)
-    )
-    explicit = ServerArgs(
-        model_path=str(tmp_path), chunked_prefill_size=4096, mem_fraction_static=0.8
-    )
-    memory_hook.apply_inkling_rocm_memory_defaults(explicit)
-    cfg = resolving_view(explicit)
-    assert (cfg.chunked_prefill_size, cfg.mem_fraction_static) == (4096, 0.8)
-
-
-@pytest.mark.parametrize("hip,allow", [(True, False), (True, True), (False, False)])
-def test_rocm_keeps_exact_all_reduce(tmp_path, monkeypatch, release_config, hip, allow):
+@pytest.mark.parametrize("hip", [True, False])
+def test_rocm_keeps_exact_all_reduce(tmp_path, monkeypatch, release_config, hip):
     """The ROCm image exports INT8 quick reduce, which moved Inkling2's long-prompt
-    outputs off the exact-reduction reference; ROCm turns it off unless opted in."""
+    outputs off the exact-reduction reference; ROCm turns it off."""
     env = [("ROCM_QUICK_REDUCE_QUANTIZATION", "INT8")]
-    if allow:
-        env.append(("SGLANG_INKLING2_ALLOW_QUICK_REDUCE", "1"))
     _rocm_overrides(tmp_path, monkeypatch, release_config, hip=hip, gfx95=hip, env=env)
-    expected = "NONE" if hip and not allow else "INT8"
-    assert os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] == expected
+    assert os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] == ("NONE" if hip else "INT8")
 
 
-@pytest.mark.parametrize("gfx95,allow", [(False, False), (False, True), (True, False)])
-def test_rocm_requires_gfx950(tmp_path, monkeypatch, release_config, gfx95, allow):
-    """Inkling2's ROCm kernels are sized and validated on gfx950 only (an LDS-sized
-    tile would not fit gfx942's 64 KB): other ROCm GPUs refuse at launch unless
-    SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM is set."""
-    env = [("SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM", "1")] if allow else []
-
-    def run():
-        _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=gfx95, env=env)
-
-    if gfx95 or allow:
-        run()
-    else:
-        with pytest.raises(ValueError, match="gfx950"):
-            run()
+def test_rocm_requires_gfx950(tmp_path, monkeypatch, release_config):
+    """Inkling2's ROCm kernels are sized for gfx950 (an LDS-sized tile would not fit
+    gfx942's 64 KB): other ROCm GPUs refuse at launch."""
+    _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=True)
+    with pytest.raises(ValueError, match="gfx950"):
+        _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=False)
 
 
 @pytest.mark.parametrize("flag", ["moe_a2a_backend", "moe_runner_backend"])

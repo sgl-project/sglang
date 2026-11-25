@@ -2,8 +2,8 @@
 state for the gfx950 M3.1 DSpark draft (its grouped-head verify kernel reads a sliding
 window, its target verify reads only the window KV indices, and its KV store skips the
 defensive k/v clone when the pool stores them as given), and Inkling2's relative-bias
-attention kernels, the DSpark draft's block-anchored windows and the one-launch verify
-indptrs."""
+attention kernels, length-based decode splits and the DSpark draft's block-anchored
+windows."""
 
 from __future__ import annotations
 
@@ -14,13 +14,15 @@ import triton
 
 from sglang.kernels.ops.attention.metadata_hip import (
     get_num_kv_splits_by_length_triton,
-    verify_indptrs,
 )
 from sglang.srt.configs.model_config import is_dspark_draft
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import is_gfx95_supported
+
+_DECODE_SPLIT_MIN_TOKENS = 32
+_DECODE_SPLIT_MAX = 128
 
 
 def _windows_every_layer(hf_config) -> bool:
@@ -90,6 +92,17 @@ def init_inkling2_state(backend, model_runner, max_bs) -> None:
     backend.is_hip_dspark_draft = (
         model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
     )
+    arch = model_runner.model_config.hf_config.architectures[0]
+    if (
+        arch.startswith("Inkling2ForConditionalGeneration")
+        and not backend.use_mla
+        and not backend.enable_deterministic
+        and not backend.static_kv_splits
+        and backend.split_tile_size is None
+    ):
+        # KV splits of 32 keys, up to 128 per request (swept on MI350X)
+        backend.decode_split_min_tokens = _DECODE_SPLIT_MIN_TOKENS
+        backend.max_kv_splits = max(backend.max_kv_splits, _DECODE_SPLIT_MAX)
 
 
 def _window_rail(backend):
@@ -99,7 +112,7 @@ def _window_rail(backend):
         return None, None
     if len(backend.window_lengths) > 1:
         raise NotImplementedError(
-            "The ROCm Triton verify and full-graph prefill paths build one window rail"
+            "The ROCm Triton full-graph prefill path builds one window rail"
         )
     ((name, window),) = backend.window_lengths.items()
     return name, window
@@ -109,58 +122,6 @@ def rel_verify_max_extend():
     from sglang.kernels.ops.attention.inkling2_attn_hip import REL_VERIFY_MAX_EXTEND
 
     return REL_VERIFY_MAX_EXTEND
-
-
-def update_target_verify_buffers(
-    backend, plan, bs, seq_lens, spec_info, req_pool_indices
-):
-    """_update_target_verify_buffers on ROCm: the indptrs (and the window's lengths
-    and starts) in one launch instead of the base's ten, the same integers."""
-    from sglang.srt.layers.attention.triton_backend import pack_sliding_window_indices
-
-    num_tokens_per_req = backend._target_verify_num_tokens_per_req(spec_info)
-    name, window = _window_rail(backend)
-    qo_indptr = backend.qo_indptr[: bs + 1]
-    kv_indptr = backend.kv_indptr[: bs + 1]
-    mask_indptr = backend.mask_indptr[: bs + 1]
-    window_kv_lens, window_kv_start_idx = verify_indptrs(
-        seq_lens[:bs],
-        num_tokens_per_req,
-        qo_indptr,
-        kv_indptr,
-        mask_indptr,
-        window,
-        backend.window_kv_indptr[name] if name is not None else None,
-        backend.cuda_graph_window_kv_offsets[name] if name is not None else None,
-    )
-    if not backend.verify_reads_window_kv_only:
-        backend.runner_ids.pack_read_stream(
-            plan,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens[:bs],
-            indptr=kv_indptr,
-            out=backend.cuda_graph_kv_indices,
-        )
-    if name is not None:
-        pack_sliding_window_indices(
-            backend.window_kv_indptr[name][: bs + 1],
-            backend.runner_ids,
-            plan,
-            req_pool_indices,
-            window_kv_lens,
-            window_kv_start_idx,
-            token_to_kv_pool=backend.token_to_kv_pool,
-            window_kv_indices=backend.cuda_graph_window_kv_indices[name],
-            kind=name,
-        )
-    custom_mask = (
-        backend._verify_mask.buffer if backend._verify_mask is not None else None
-    )
-    if spec_info is not None and spec_info.custom_mask is not None:
-        custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-    else:
-        custom_mask = None
-    return qo_indptr, kv_indptr, custom_mask, mask_indptr
 
 
 def init_full_cg_extend_metadata(backend, forward_batch, in_capture):

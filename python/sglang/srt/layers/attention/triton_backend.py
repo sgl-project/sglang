@@ -416,20 +416,10 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
-        # ROCm: cdiv(kv_len, N) decode splits per request (triton_backend_hip)
-        self.decode_split_min_tokens = (
-            0
-            if not _is_hip
-            or self.use_mla
-            or self.enable_deterministic
-            or self.static_kv_splits
-            or self.split_tile_size is not None
-            else envs.SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS.get()
-        )
-        if self.decode_split_min_tokens:
-            self.max_kv_splits = max(
-                self.max_kv_splits, envs.SGLANG_TRITON_DECODE_SPLIT_MAX.get()
-            )
+        # ROCm Inkling2: cdiv(kv_len, N) decode splits per request
+        self.decode_split_min_tokens = 0
+        if _is_hip:
+            _hip.init_inkling2_state(self, model_runner, max_bs)
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -460,8 +450,6 @@ class TritonAttnBackend(AttentionBackend):
             )
             for name in self.window_lengths
         }
-        if _is_hip:
-            _hip.init_inkling2_state(self, model_runner, max_bs)
 
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
@@ -845,15 +833,6 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
-        # The fused ROCm fill covers one window rail and packs the read stream itself.
-        if (
-            _is_hip
-            and self.mla_dcp_window_verify is None
-            and len(self.window_lengths) <= 1
-        ):
-            return _hip.update_target_verify_buffers(
-                self, plan, bs, seq_lens, spec_info, req_pool_indices
-            )
         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
@@ -2116,9 +2095,6 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd is not None
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
-            # The split-KV kernel serves causal chains only: skip the call, and its
-            # contiguous k / v copies, where it declines (the DSpark draft's blocks).
-            and (causal or verify_fwd is not self.verify_splitkv_fwd)
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 # the grouped-head kernel reads the draft rows through their strides
@@ -3143,48 +3119,19 @@ def update_sliding_window_buffer(
     captured. Static SWA pools gather full-token ids from req_to_token and keep
     the legacy full->swa translate below.
     """
+    if kind is None:
+        kind = runner_ids.window_storage
     window_kv_lens = torch.minimum(
         seq_lens,
         torch.tensor(sliding_window_size),
     )
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
-    window_kv_start_idx = seq_lens - window_kv_lens
-    window_kv_indices = pack_sliding_window_indices(
-        window_kv_indptr,
-        runner_ids,
-        plan,
-        req_pool_indices,
-        window_kv_lens,
-        window_kv_start_idx,
-        device=device,
-        token_to_kv_pool=token_to_kv_pool,
-        window_kv_indices=window_kv_indices,
-        kind=kind,
-    )
-    return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
-
-
-def pack_sliding_window_indices(
-    window_kv_indptr,
-    runner_ids,
-    plan,
-    req_pool_indices,
-    window_kv_lens,
-    window_kv_start_idx,
-    device=None,
-    token_to_kv_pool=None,
-    window_kv_indices=None,
-    kind=None,
-):
-    """update_sliding_window_buffer's gather of the window KV indices, given the
-    window lengths, start offsets and indptr."""
-    if kind is None:
-        kind = runner_ids.window_storage
     if window_kv_indices is None:
         window_kv_indices = torch.empty(
             window_kv_indptr[-1], dtype=torch.int64, device=device
         )
+    window_kv_start_idx = seq_lens - window_kv_lens
     token_mapping = (
         token_to_kv_pool.full_to_swa_index_mapping
         if token_to_kv_pool is not None
@@ -3212,4 +3159,4 @@ def pack_sliding_window_indices(
         window_kv_indices[:kv_last_index] = runner_ids.ids_in(
             kind, window_kv_indices[:kv_last_index]
         )
-    return window_kv_indices
+    return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
