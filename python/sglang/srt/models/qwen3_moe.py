@@ -254,6 +254,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         from sglang.srt.layers.quantization.gguf import GGUFConfig
 
         norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        # CUDA GGUF uses the router weights directly, so only override the
+        # model's normalization setting on Ascend NPU.
         if _is_npu and isinstance(quant_config, GGUFConfig):
             norm_topk_prob = False
 

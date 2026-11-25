@@ -607,7 +607,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # The expert loader collects packed shards in temporary containers.
+        # The loader buffers each expert's shards. The gate/up and down weights
+        # stay uninitialized until those shards are assembled.
         layer.materialize_gguf_weights()
 
     def create_moe_runner(
