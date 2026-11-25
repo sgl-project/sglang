@@ -1,0 +1,25 @@
+{
+  "auto_map": {
+    "AutoImageProcessor": "image_processing_nemotron_h_omni.NemotronH_Omni_Reasoning_V3ImageProcessor",
+    "AutoProcessor": "processing_nemotron_h_omni.NemotronH_Omni_Reasoning_V3Processor"
+  },
+  "downsample_ratio": 0.5,
+  "image_processor_type": "NemotronH_Omni_Reasoning_V3ImageProcessor",
+  "max_model_len": 16384,
+  "max_num_patches": 13312,
+  "min_num_patches": 1024,
+  "norm_mean": [
+    0.48145466,
+    0.4578275,
+    0.40821073
+  ],
+  "norm_std": [
+    0.26862954,
+    0.26130258,
+    0.27577711
+  ],
+  "patch_size": 16,
+  "rescale_factor": 0.00392156862745098,
+  "video_maintain_aspect_ratio": true,
+  "video_target_num_patches": 1024
+}

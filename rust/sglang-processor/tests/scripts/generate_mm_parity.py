@@ -30,6 +30,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hf_transformers.processor import get_processor  # noqa: E402
 from sglang.srt.managers.multimodal_processor import import_processors  # noqa: E402
 from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
     QwenVLImageProcessor,
@@ -37,7 +38,6 @@ from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
 from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
-from sglang.srt.utils.hf_transformers.processor import get_processor  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "mm_parity"
 IMAGES = FIXTURES / "images"

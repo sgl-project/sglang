@@ -1100,7 +1100,7 @@ pub struct MmSpec {
     /// The family pipeline and its resolved processor parameters.
     pub pipeline: sglang_processor::dynamo_multimodal::registry::ProcessorSpec,
     /// SGLang's video sampling; `None` refuses video.
-    pub video: Option<sglang_processor::VideoSampling>,
+    pub video: Option<sglang_processor::VideoPolicy>,
 }
 
 /// Video input for an `MmSpec`, from `RustMmVideoSpec`: the token ids and HF
@@ -1199,9 +1199,8 @@ impl MmVideoSpec {
 
 #[pyo3::pymethods]
 impl MmSpec {
-    /// The parameter list is flat because every family so far shares the
-    /// Qwen-VL processor geometry; a family with different knobs adds its own
-    /// keywords and match arm here.
+    /// The Qwen-VL spec from the loaded HF processor's parameters; families
+    /// resolved from the checkpoint use [`Self::from_model_dir`].
     #[new]
     #[pyo3(signature = (*,
         family,
@@ -1231,7 +1230,7 @@ impl MmSpec {
         image_std: [f32; 3],
         resample: MmResample,
         video: Option<MmVideoSpec>,
-    ) -> Self {
+    ) -> pyo3::PyResult<Self> {
         use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
         use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
         let pipeline = match family {
@@ -1247,12 +1246,97 @@ impl MmSpec {
                 resample: resample.into(),
                 video: video.as_ref().map(|v| v.family.clone()),
             }),
+            MmFamily::Glm5Next | MmFamily::NemotronVl => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{family:?} specs come from MmSpec.from_model_dir"
+                )));
+            }
         };
-        Self {
+        Ok(Self {
             feature_shm,
             pipeline,
-            video: video.map(|v| v.sampling),
-        }
+            video: video.map(|v| sglang_processor::VideoPolicy::Qwen(v.sampling)),
+        })
+    }
+
+    /// A family `dynamo-multimodal` resolves from the checkpoint of
+    /// `model_path` (a directory or a Hugging Face repo id in the local cache),
+    /// with the `resample` of the image processor SGLang loaded. NemotronVl
+    /// also takes the values its Python processor reads from the server and
+    /// from `hf_config` (`RustMmNemotronSpec`).
+    #[staticmethod]
+    #[pyo3(signature = (*,
+        family,
+        model_path,
+        revision,
+        resample,
+        feature_shm,
+        max_model_len=None,
+        video_target_num_patches=None,
+        video_maintain_aspect_ratio=None,
+        video_pruning_rate=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_model_dir(
+        family: MmFamily,
+        model_path: &str,
+        revision: Option<&str>,
+        resample: MmResample,
+        feature_shm: bool,
+        max_model_len: Option<u32>,
+        video_target_num_patches: Option<u32>,
+        video_maintain_aspect_ratio: Option<bool>,
+        video_pruning_rate: Option<f64>,
+    ) -> pyo3::PyResult<Self> {
+        let invalid = |e: String| pyo3::exceptions::PyValueError::new_err(e);
+        let family = match (
+            family,
+            max_model_len,
+            video_target_num_patches,
+            video_maintain_aspect_ratio,
+            video_pruning_rate,
+        ) {
+            (MmFamily::Glm5Next, None, None, None, None) => sglang_processor::MmDirFamily::Glm5Next,
+            (
+                MmFamily::NemotronVl,
+                Some(max_model_len),
+                Some(target),
+                Some(aspect),
+                Some(pruning),
+            ) => sglang_processor::MmDirFamily::NemotronVl {
+                max_model_len,
+                video_target_num_patches: target,
+                video_maintain_aspect_ratio: aspect,
+                video_pruning_rate: pruning,
+            },
+            (MmFamily::QwenVl, ..) => {
+                return Err(invalid("qwen_vl specs come from MmSpec(...)".into()));
+            }
+            (family, ..) => {
+                return Err(invalid(format!(
+                    "{family:?} takes max_model_len, video_target_num_patches, \
+                     video_maintain_aspect_ratio and video_pruning_rate exactly when it is NemotronVl"
+                )));
+            }
+        };
+        let config = sglang_processor::resolve_model_file(model_path, revision, "config.json")
+            .ok_or_else(|| invalid(format!("no config.json for {model_path}")))?;
+        let dir = std::path::Path::new(&config)
+            .parent()
+            .expect("a file has a parent");
+        let (pipeline, video) = sglang_processor::spec_from_model_dir(family, dir, resample.into())
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            feature_shm,
+            pipeline,
+            video,
+        })
+    }
+
+    /// Whether the spec serves video; the server refuses a video request otherwise.
+    #[getter]
+    fn takes_video(&self) -> bool {
+        self.video.is_some()
     }
 }
 
@@ -1268,6 +1352,8 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    Glm5Next,
+    NemotronVl,
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see

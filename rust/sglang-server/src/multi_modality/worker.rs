@@ -216,6 +216,15 @@ impl dynamo::TextEncoder for TimestampText {
         (self.0.encode(text, false))
             .map_err(|e| sglang_processor::dynamo_multimodal::MmError::internal(e.to_string()))
     }
+
+    /// `tokenizer.decode(ids, skip_special_tokens=False)`, as `nano_nemotron_vl.py`
+    /// reads a prompt of ids before its text path.
+    fn decode(&self, ids: &[i32]) -> sglang_processor::dynamo_multimodal::Result<String> {
+        let ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+        (self.0.tokenizer().decode(&ids, false))
+            .map(String::from)
+            .map_err(|e| sglang_processor::dynamo_multimodal::MmError::internal(e.to_string()))
+    }
 }
 
 impl MmProcessor for BuiltinMmProcessor {
@@ -252,6 +261,13 @@ impl MmProcessor for BuiltinMmProcessor {
                     .map_err(|_| MediaError::Server(format!("mm: token id {id} out of range")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let input_ids = match &self.text {
+            Some(text) if !media.videos.is_empty() => (self.pipeline)
+                .rewrite_prompt(&input_ids, (media.images.len(), media.videos.len()), text)
+                .map_err(|error| MediaError::Server(error.to_string()))?
+                .unwrap_or(input_ids),
+            _ => input_ids,
+        };
         let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
         let videos: Vec<sglang_processor::MmVideo> = (media.videos.iter())
             .zip(&media.video_hints)
@@ -305,6 +321,7 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
                         let meta = aux_meta(&name, tensor(aux)?)?;
                         Ok((name, meta))
                     })
+                    .chain(layout_meta(item.feature_token_count, item.geometry).map(Ok))
                     .collect::<Result<_, String>>()?,
             })
         })
@@ -324,11 +341,30 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
     })
 }
 
+/// The counts a drain derives a family's model kwargs from: the item's feature
+/// tokens and, for a video laid out by frame groups, the number of groups.
+fn layout_meta(
+    feature_tokens: usize,
+    geometry: Option<dynamo::Geometry>,
+) -> impl Iterator<Item = (String, MmMetaValue)> {
+    let groups = match geometry {
+        Some(dynamo::Geometry::FrameGroups { tokens, .. }) => Some(tokens.len()),
+        _ => None,
+    };
+    [
+        ("feature_tokens", Some(feature_tokens)),
+        ("frame_groups", groups),
+    ]
+    .into_iter()
+    .filter_map(|(name, count)| Some((name.to_owned(), MmMetaValue::Int(count? as i64))))
+}
+
 /// Dynamo's tensor as the one every processor hands the worker.
 fn tensor(tensor: dynamo::Tensor) -> Result<Tensor, String> {
     let data = match tensor.data {
         dynamo::TensorData::F32(values) => TensorData::F32(values),
         dynamo::TensorData::I64(values) => TensorData::I64(values),
+        dynamo::TensorData::Bf16(values) => TensorData::Bf16(values),
         _ => return Err("mm: unsupported tensor dtype from dynamo-multimodal".into()),
     };
     Ok(Tensor {
@@ -819,6 +855,8 @@ mod tests {
                     dynamo_tensor(vec![], dynamo::TensorData::I64(vec![7])),
                 ),
             ],
+            feature_token_count: 2,
+            geometry: None,
             offsets,
             hash,
         };
@@ -849,6 +887,11 @@ mod tests {
             items[0].model_specific_data["clip_index"],
             MmMetaValue::Int(7)
         );
+        assert_eq!(
+            items[0].model_specific_data["feature_tokens"],
+            MmMetaValue::Int(2)
+        );
+        assert!(!items[0].model_specific_data.contains_key("frame_groups"));
         let mrope = encoded.result.mrope.as_ref().unwrap();
         assert_eq!((mrope.positions.len(), mrope.delta), (12, -2));
 
@@ -868,6 +911,8 @@ mod tests {
                     "scale".into(),
                     dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 )],
+                feature_token_count: 1,
+                geometry: None,
                 offsets: vec![(0, 0)],
                 hash: 1,
             }],
@@ -891,6 +936,8 @@ mod tests {
                     "video_grid_thw".into(),
                     dynamo_tensor(vec![3], dynamo::TensorData::I64(vec![2, 1, 1])),
                 )],
+                feature_token_count: 2,
+                geometry: None,
                 offsets: vec![(2, 2), (5, 5)],
                 hash: 3,
             }],
@@ -899,6 +946,71 @@ mod tests {
         let item = &encode_output(output).unwrap().result.items[0];
         assert_eq!(item.modality, MmModality::Video);
         assert_eq!(item.offsets, [(2, 2), (5, 5)]);
+    }
+
+    /// The family's prompt rewrite splits the decoded prompt at `<video>`, so decode
+    /// keeps special tokens, as `nano_nemotron_vl.py` does.
+    #[test]
+    fn decode_keeps_special_tokens() {
+        let source = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        );
+        let dir = std::env::temp_dir().join(format!("sglang-decode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tokenizer.json");
+        std::fs::copy(source, &file).unwrap();
+        let tokenizer = sglang_processor::DynamoTokenizer::load(file.to_str().unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+        let text = TimestampText(Arc::new(tokenizer.unwrap()));
+        assert_eq!(
+            dynamo::TextEncoder::decode(&text, &[0, 3, 1]).unwrap(),
+            "a<eot>b"
+        );
+    }
+
+    /// A bfloat16 feature rides as its bits (numpy uint16), with no aux and no
+    /// M-RoPE; a video laid out by frame groups reports the group count.
+    #[test]
+    fn bf16_feature_and_frame_groups_carry_over() {
+        let bits = vec![0x3F80, 0xBF80, 0x0000, 0x7F80, 0x3F81, 0x0001];
+        let output = MmOutput {
+            input_ids: vec![9; 12],
+            items: vec![MmOutputItem {
+                modality: dynamo::Modality::Video,
+                feature: dynamo_tensor(vec![3, 1, 1, 2], dynamo::TensorData::Bf16(bits.clone())),
+                aux: vec![],
+                feature_token_count: 5,
+                geometry: Some(dynamo::Geometry::FrameGroups {
+                    tokens: vec![3, 2],
+                    timestamps: vec![0.0, 0.5, 1.0],
+                }),
+                offsets: vec![(2, 4), (8, 9)],
+                hash: 4,
+            }],
+            positions: PositionOutput::Rope1D,
+        };
+        let mut encoded = encode_output(output).unwrap();
+        assert!(encoded.result.mrope.is_none());
+        let item = encoded.result.items.remove(0);
+        assert_eq!(item.feature.shape, [3, 1, 1, 2]);
+        let TensorData::Bf16(carried) = &item.feature.data else {
+            panic!("bf16 stays bf16");
+        };
+        assert_eq!(carried, &bits);
+        assert_eq!(
+            item.model_specific_data,
+            BTreeMap::from([
+                ("feature_tokens".to_owned(), MmMetaValue::Int(5)),
+                ("frame_groups".to_owned(), MmMetaValue::Int(2)),
+            ])
+        );
+        let buffers = place_features(vec![item.feature], false, |_| unreachable!());
+        assert_eq!(buffers[0].shape, [3, 1, 1, 2]);
+        let BufferStore::Inline(BufferData::U16(values)) = &buffers[0].store else {
+            panic!("a bf16 feature is a u16 buffer");
+        };
+        assert_eq!(values, &bits);
     }
 
     /// Video is refused before any fetch when the pipeline cannot honor it: a

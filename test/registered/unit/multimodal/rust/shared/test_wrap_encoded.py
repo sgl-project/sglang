@@ -22,6 +22,8 @@ from sglang.srt.managers.req_types import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.rust_server.multimodal import (  # noqa: E402
+    RustMmModelDirSpec,
+    RustMmNemotronSpec,
     RustMmProcessor,
     RustMmSpec,
 )
@@ -152,6 +154,153 @@ class TestWrapEncoded(CustomTestCase):
             expected.set_identity(bytes([item_hash] * 32))
             self.assertEqual(item.padding_values(), expected.padding_values())
             self.assertEqual(len(item.padding_values()), 4)
+
+
+class TestWrapEncodedNemotron(CustomTestCase):
+    """A family with bfloat16 features, 1-D positions and no grid: the drain
+    views the uint16 bits as bfloat16 and adds the model kwargs
+    ``nano_nemotron_vl.py`` sets, from the worker's per-item counts."""
+
+    SPEC = RustMmModelDirSpec(
+        family="nemotron_vl",
+        feature_shm=False,
+        model_path="m",
+        revision=None,
+        resample="pil",
+        image_token_id=18,
+        video_token_id=18,
+        vision_start_token_id=19,
+        vision_end_token_id=20,
+        nemotron=RustMmNemotronSpec(
+            max_model_len=16384,
+            video_target_num_patches=0,
+            video_maintain_aspect_ratio=True,
+            video_pruning_rate=0.7,
+            patch_size=16,
+            downsample_factor=2,
+        ),
+    )
+
+    @staticmethod
+    def meta(items):
+        return np.frombuffer(
+            msgspec.msgpack.encode(
+                {"items": items, "token_ids": None, "mrope_delta": None}
+            ),
+            dtype=np.uint8,
+        )
+
+    @staticmethod
+    def item(modality, offsets, counts):
+        return {
+            "modality": modality,
+            "hash": 5,
+            "identity": [5] * 32,
+            "offsets": offsets,
+            "model_specific_data": counts,
+        }
+
+    def test_images_are_dynamic_bfloat16_views(self):
+        import torch
+
+        bits = np.array([0x3F80, 0xBF80, 0x4000, 0x0000] * 3, dtype=np.uint16)
+        buffers = {
+            "input_ids": np.array([19, 18, 20], dtype=np.int64),
+            "mm.feature.0": bits.reshape(1, 3, 2, 2),
+            "mm.meta": self.meta([self.item("image", [[1, 1]], {"feature_tokens": 1})]),
+        }
+        output = RustMmProcessor.wrap_encoded(self.SPEC, buffers)
+        (image,) = output.mm_items
+        self.assertEqual(image.feature.dtype, torch.bfloat16)
+        self.assertEqual(tuple(image.feature.shape), (1, 3, 2, 2))
+        self.assertEqual(image.feature.flatten()[:4].tolist(), [1.0, -1.0, 2.0, 0.0])
+        bits[0] = 0x4040
+        self.assertEqual(image.feature.flatten()[0].item(), 3.0, "a view, not a copy")
+        self.assertEqual(
+            image.model_specific_data, {"num_tokens": 1, "is_dynamic": True}
+        )
+        self.assertEqual(image.offsets, [(1, 1)])
+        self.assertIsNone(output.mrope_positions)
+        self.assertIsNone(output.mrope_position_delta)
+        self.assertEqual(
+            (output.im_token_id, output.im_start_id, output.im_end_id), (18, 19, 20)
+        )
+        self.assertEqual(output.video_token_id, 18)
+
+    def test_video_carries_frames_and_evs_kwargs(self):
+        """``thw_grids`` holds the frame-group count and the unpruned grid of
+        one 64x96 frame tile (2 x 3 tokens); ``pre_chunked_input_ids`` the ids."""
+        input_ids = np.array([7, 19, 18, 18, 20, 19, 18, 20], dtype=np.int64)
+        buffers = {
+            "input_ids": input_ids,
+            "mm.feature.0": np.zeros((3, 3, 64, 96), dtype=np.uint16),
+            "mm.meta": self.meta(
+                [
+                    self.item(
+                        "video",
+                        [[2, 3], [6, 6]],
+                        {"feature_tokens": 3, "frame_groups": 2},
+                    )
+                ]
+            ),
+        }
+        (video,) = RustMmProcessor.wrap_encoded(self.SPEC, buffers).mm_items
+        self.assertEqual(video.modality, Modality.VIDEO)
+        self.assertEqual(video.offsets, [(2, 3), (6, 6)])
+        self.assertEqual(
+            video.model_specific_data,
+            {
+                "frames_per_video": [3],
+                "thw_grids": [(2, 2, 3)],
+                "pre_chunked_input_ids": [7, 19, 18, 18, 20, 19, 18, 20],
+            },
+        )
+
+    def test_shm_stub_takes_the_buffer_dtype(self):
+        """A bfloat16 feature parked in shm materializes as bfloat16, not float32."""
+        from multiprocessing import shared_memory
+
+        import torch
+
+        bits = np.array([0x3F80, 0xBF80, 0x4000, 0x0000] * 3, dtype=np.uint16)
+        segment = shared_memory.SharedMemory(create=True, size=bits.nbytes)
+        segment.buf[:] = bits.tobytes()
+        segment.close()
+        buffer = FakeShmBuffer(segment.name, (1, 3, 2, 2))
+        buffer.dtype = "uint16"
+        buffers = {
+            "input_ids": np.array([19, 18, 20], dtype=np.int64),
+            "mm.feature.0": buffer,
+            "mm.meta": self.meta([self.item("image", [[1, 1]], {"feature_tokens": 1})]),
+        }
+        (image,) = RustMmProcessor.wrap_encoded(self.SPEC, buffers).mm_items
+        tensor = image.feature.materialize()
+        self.assertEqual(
+            (tensor.dtype, tuple(tensor.shape)), (torch.bfloat16, (1, 3, 2, 2))
+        )
+        self.assertEqual(tensor.flatten()[:4].tolist(), [1.0, -1.0, 2.0, 0.0])
+
+    def test_video_without_evs_carries_only_frames(self):
+        """With EVS off (pruning rate 0), Python sets no EVS key."""
+        spec = msgspec.structs.replace(
+            self.SPEC,
+            nemotron=msgspec.structs.replace(
+                self.SPEC.nemotron, video_pruning_rate=0.0
+            ),
+        )
+        buffers = {
+            "input_ids": np.array([19, 18, 20], dtype=np.int64),
+            "mm.feature.0": np.zeros((2, 3, 64, 64), dtype=np.uint16),
+            "mm.meta": self.meta(
+                [
+                    self.item(
+                        "video", [[1, 1]], {"feature_tokens": 1, "frame_groups": 1}
+                    ),
+                ]
+            ),
+        }
+        (video,) = RustMmProcessor.wrap_encoded(spec, buffers).mm_items
+        self.assertEqual(video.model_specific_data, {"frames_per_video": [2]})
 
 
 class FakeShmBuffer:

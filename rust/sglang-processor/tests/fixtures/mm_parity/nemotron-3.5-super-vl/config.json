@@ -1,0 +1,27 @@
+{
+  "model_type": "nemotron_h_omni",
+  "downsample_ratio": 0.5,
+  "force_image_size": 512,
+  "norm_mean": [
+    0.48145466,
+    0.4578275,
+    0.40821073
+  ],
+  "norm_std": [
+    0.26862954,
+    0.26130258,
+    0.27577711
+  ],
+  "img_context_token": "<image>",
+  "img_context_token_id": 18,
+  "video_context_token": "<video>",
+  "video_context_token_id": null,
+  "video_pruning_rate": 0.7,
+  "vision_config": {
+    "patch_size": 16,
+    "image_size": 224,
+    "min_num_patches": 1024,
+    "max_num_patches": 13312,
+    "video_temporal_patch_size": 2
+  }
+}

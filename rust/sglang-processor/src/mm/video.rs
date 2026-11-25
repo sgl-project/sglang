@@ -4,6 +4,7 @@
 //! (`preprocess_video`), all from `multimodal/qwen_vl_media_processing.py`.
 
 use dynamo_multimodal::MmError;
+use dynamo_multimodal::image::resize::Resample;
 
 /// The keys of `--mm-process-config {"video": ...}` that `preprocess_video`
 /// reads; a request's hints replace some of them ([`VideoConfig::with_hints`]).
@@ -47,6 +48,22 @@ pub struct VideoSampling {
     pub max_pixels: f64,
     pub total_pixels: f64,
 }
+
+/// How SGLang picks a video's frames ahead of the model's family processor.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VideoPolicy {
+    /// `qwen_vl_media_processing.py`: `smart_nframes`, then the pre-resize.
+    Qwen(VideoSampling),
+    /// `glm4v.py::glm_sample_frame_indices` at the source size; the family
+    /// resizes the frames itself.
+    Glm { fps: f64, max_frames: u32 },
+    /// `nano_nemotron_vl.py::parse_video` at the source size.
+    Nemotron,
+}
+
+/// `DESIRED_FPS` and `MAX_FRAMES` of `nano_nemotron_vl.py`.
+pub(crate) const NEMOTRON_FPS: f64 = 2.0;
+pub(crate) const NEMOTRON_MAX_FRAMES: u64 = 128;
 
 /// `MAX_RATIO` of SGLang's `smart_resize`.
 const MAX_RATIO: f64 = 200.0;
@@ -161,6 +178,27 @@ pub fn frame_indices(total_frames: u64, num_frames: u64) -> Vec<u64> {
     indices
 }
 
+/// `media_io.py::sample_video_frames`: up to `max_frames` frames at
+/// `min(desired_fps, average_fps)`, at least one, spread by an int `np.linspace`.
+pub fn sample_video_frames(
+    total_frames: u64,
+    average_fps: f64,
+    desired_fps: f64,
+    max_frames: u64,
+) -> Result<Vec<u64>, MmError> {
+    if total_frames == 0 {
+        return Err(MmError::invalid_input("Video must have at least one frame"));
+    }
+    let duration = if average_fps > 0.0 {
+        total_frames as f64 / average_fps
+    } else {
+        0.0
+    };
+    let num_frames = (duration * desired_fps.min(average_fps)).floor() as u64;
+    let num_frames = num_frames.min(max_frames).min(total_frames).max(1);
+    Ok(frame_indices(total_frames, num_frames))
+}
+
 /// SGLang's own `smart_resize` (not HF's): sides round to `factor` with a
 /// floor of `factor`, then shrink or grow toward the pixel bounds.
 fn smart_resize(
@@ -204,9 +242,53 @@ fn floor_by_factor(number: f64, factor: f64) -> f64 {
     (number / factor).floor() * factor
 }
 
+/// The kernel of `preprocess_video`'s bilinear pre-resize under the CPU dispatch
+/// torch picks (ATen's `compute_cpu_capability`): `ATEN_CPU_CAPABILITY=default`
+/// forces DEFAULT; otherwise x86 with AVX2 and FMA runs AVX2 or AVX-512, which
+/// sum alike and round unlike DEFAULT.
+fn presize_filter(aten_cpu_capability: Option<&str>, avx2_fma: bool) -> Resample {
+    match aten_cpu_capability {
+        Some("default") => Resample::AtenF32Bilinear,
+        _ if avx2_fma => Resample::AtenF32BilinearAvx2,
+        _ => Resample::AtenF32Bilinear,
+    }
+}
+
+pub(crate) fn host_presize_filter() -> Resample {
+    #[cfg(target_arch = "x86_64")]
+    let avx2_fma =
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2_fma = false;
+    presize_filter(
+        std::env::var("ATEN_CPU_CAPABILITY").ok().as_deref(),
+        avx2_fma,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Values from torch 2.14.1's `torch.backends.cpu.get_cpu_capability()`
+    /// under each `ATEN_CPU_CAPABILITY`, on hosts with and without AVX2.
+    #[test]
+    fn presize_filter_follows_torch_dispatch() {
+        let vector = Resample::AtenF32BilinearAvx2;
+        let default = Resample::AtenF32Bilinear;
+        let cases = [
+            (None, true, vector),
+            (Some("avx2"), true, vector),
+            (Some("avx512"), true, vector),
+            (Some("default"), true, default),
+            (Some("bogus"), true, vector),
+            (None, false, default),
+            (Some("default"), false, default),
+        ];
+        for (env, avx2_fma, want) in cases {
+            assert_eq!(presize_filter(env, avx2_fma), want, "{env:?} {avx2_fma}");
+        }
+    }
 
     /// `qwen_vl_media_processing.py`'s constants with `VIDEO_MAX_PIXELS` unset.
     fn sampling() -> VideoSampling {
@@ -301,6 +383,29 @@ mod tests {
         // np.unique(np.linspace(0, 4, 9, dtype=np.int64))
         assert_eq!(frame_indices(5, 9), [0, 1, 2, 3, 4]);
         assert!(frame_indices(0, 2).is_empty());
+    }
+
+    /// Values from Python's `media_io.sample_video_frames(video, desired_fps=2, max_frames=128)`.
+    #[test]
+    fn sample_video_frames_matches_python() {
+        let sample = |total, fps| sample_video_frames(total, fps, 2.0, 128).unwrap();
+        assert_eq!(
+            sample(180, 30.0),
+            [0, 16, 32, 48, 65, 81, 97, 113, 130, 146, 162, 179]
+        );
+        assert_eq!(sample(96, 24.0), [0, 13, 27, 40, 54, 67, 81, 95]);
+        assert_eq!(sample(75, 15.0), [0, 8, 16, 24, 32, 41, 49, 57, 65, 74]);
+        assert_eq!(sample(30, 30.0), [0, 29]);
+        assert_eq!(sample(25, 23.976), [0, 24]);
+        assert_eq!(sample(10, 2.0), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(sample(1, 30.0), [0]);
+        assert_eq!(sample(3, 30.0), [0]);
+        assert_eq!(sample(7, 0.0), [0]);
+        let capped = sample(3000, 10.0);
+        assert_eq!(capped.len(), 128);
+        assert_eq!(capped[..4], [0, 23, 47, 70]);
+        assert_eq!(capped[123..], [2904, 2928, 2951, 2975, 2999]);
+        assert!(sample_video_frames(0, 30.0, 2.0, 128).is_err());
     }
 
     /// Values from Python's `preprocess_video` sizing.

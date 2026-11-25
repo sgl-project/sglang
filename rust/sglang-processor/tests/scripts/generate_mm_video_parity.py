@@ -2,15 +2,16 @@
 
 The reference is SGLang's Python CPU path on x86-64: torchcodec on the CPU
 (FFmpeg's SIMD swscale converts YUV to RGB), the fp32 pre-resize of torch's
-DEFAULT CPU dispatch, and the HF video processor on the CPU. Run it where
+CPU dispatch, and the HF video processor on the CPU. Run it where
 torchcodec finds FFmpeg 6.1 (Ubuntu 24.04's, as the SGLang image ships):
 
-    ATEN_CPU_CAPABILITY=default \\
-        python tests/scripts/generate_mm_video_parity.py Qwen/Qwen3-VL-2B-Instruct
+    python tests/scripts/generate_mm_video_parity.py Qwen/Qwen3-VL-2B-Instruct
 
 The video path pins frames to page-locked memory, so a CUDA device must be
-visible; every stage still runs on the CPU. `ATEN_CPU_CAPABILITY=default`
-matters: torch's AVX2 build fuses part of the pre-resize sum into FMA. Each case records every stage as sha256: the frames
+visible; every stage still runs on the CPU. The fixture records torch's CPU
+dispatch (`ATEN_CPU_CAPABILITY` selects it), because DEFAULT rounds the
+pre-resize unlike AVX2 and AVX-512; the test replays it with the matching
+kernel. Each case records every stage as sha256: the frames
 sampled, the decoded frames, the pre-resized frames, then the processor's
 outputs. Writes the clips it needs into `tests/fixtures/mm_parity/videos/`.
 """
@@ -257,10 +258,6 @@ def main():
     model_dir = Path(
         snapshot_download(args.model, revision=revision, allow_patterns=PROCESSOR_FILES)
     )
-    assert torch.backends.cpu.get_cpu_capability() == "DEFAULT", (
-        "set ATEN_CPU_CAPABILITY=default"
-    )
-
     fixture = {
         "model": args.model,
         "revision": revision,

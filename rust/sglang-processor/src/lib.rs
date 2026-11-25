@@ -37,8 +37,8 @@ pub use deepseek_output::{
 pub use error::ProcessorError;
 #[cfg(feature = "mm")]
 pub use mm::{
-    MmDecoded, MmOutput, MmOutputItem, MmProcessor, MmVideo, VideoConfig, VideoHints,
-    VideoSampling, frame_indices,
+    MmDecoded, MmDirFamily, MmOutput, MmOutputItem, MmProcessor, MmVideo, VideoConfig, VideoHints,
+    VideoPolicy, VideoSampling, frame_indices, sample_video_frames, spec_from_model_dir,
 };
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]

@@ -1,0 +1,44 @@
+{
+  "image_processor": {
+    "do_rescale": true,
+    "patch_expand_factor": 1,
+    "merge_size": 2,
+    "image_mean": [
+      0.48145466,
+      0.4578275,
+      0.40821073
+    ],
+    "image_std": [
+      0.26862954,
+      0.26130258,
+      0.27577711
+    ],
+    "temporal_patch_size": 2,
+    "patch_size": 14,
+    "min_image_tokens": 16,
+    "max_image_tokens": 8000,
+    "image_processor_type": "Glm5NextImageProcessor"
+  },
+  "video_processor": {
+    "do_rescale": true,
+    "video_processor_type": "Glm5NextVideoProcessor",
+    "patch_expand_factor": 1,
+    "merge_size": 2,
+    "image_mean": [
+      0.48145466,
+      0.4578275,
+      0.40821073
+    ],
+    "image_std": [
+      0.26862954,
+      0.26130258,
+      0.27577711
+    ],
+    "temporal_patch_size": 2,
+    "patch_size": 14,
+    "min_image_tokens": 16,
+    "max_image_tokens": 240000,
+    "fps": 2
+  },
+  "processor_class": "Glm5NextProcessor"
+}
