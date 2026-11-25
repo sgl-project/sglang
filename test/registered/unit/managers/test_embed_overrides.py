@@ -255,6 +255,7 @@ class _FakeMixin(TokenizerManagerScoreMixin):
         self.server_args = _FakeServerArgs(enable_mis)
         self.tokenizer = None
         self.is_generation = True
+        self.model_config = SimpleNamespace(token_id_vocab_size=128)
 
 
 class TestResolveOverridesForSequence(CustomTestCase):

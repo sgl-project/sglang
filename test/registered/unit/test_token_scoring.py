@@ -24,12 +24,17 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class ScoringManager(TokenizerManagerScoreMixin):
     """Replace only model execution; keep request construction and score extraction real."""
 
-    def __init__(self, enable_mis=False, generation=True):
+    def __init__(self, enable_mis=False, generation=True, token_id_vocab_size=None):
         self.server_args = ServerArgs(model_path="dummy", enable_mis=enable_mis)
         publish(self.server_args, role="test")
         self.is_generation = generation
         self.tokenizer = SimpleNamespace(vocab_size=8)
         self.logits = torch.tensor([-1000.0, -999.0, -997.0, -996.0, 0, 1, 2, 3])
+        self.model_config = SimpleNamespace(
+            token_id_vocab_size=(
+                len(self.logits) if token_id_vocab_size is None else token_id_vocab_size
+            )
+        )
         self.requests = []
 
     async def generate_request(self, request, raw_request):
@@ -214,6 +219,111 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
                             f"Token ID {token_id} is out of vocabulary (vocab size: 8)",
                         )
                         self.assertEqual(manager.requests, [])
+
+    async def test_http_allows_added_special_and_model_vocab_tokens(self):
+        base_vocab = {"[UNK]": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5}
+        raw_tokenizer = Tokenizer(WordLevel(base_vocab, unk_token="[UNK]"))
+        raw_tokenizer.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=raw_tokenizer, unk_token="[UNK]"
+        )
+        tokenizer.add_special_tokens(
+            {"eos_token": "<|im_end|>", "additional_special_tokens": ["<think>"]}
+        )
+        eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        think_id = tokenizer.convert_tokens_to_ids("<think>")
+        self.assertEqual(tokenizer.vocab_size, 6)
+        self.assertEqual(len(tokenizer), 8)
+        self.assertGreaterEqual(eos_id, tokenizer.vocab_size)
+        self.assertGreaterEqual(think_id, tokenizer.vocab_size)
+
+        model_vocab_size = 10
+        logits = torch.arange(model_vocab_size, dtype=torch.float32)
+
+        for enable_mis in (False, True):
+            for with_tokenizer in (True, False):
+                with self.subTest(enable_mis=enable_mis, with_tokenizer=with_tokenizer):
+                    manager = ScoringManager(
+                        enable_mis=enable_mis,
+                        token_id_vocab_size=model_vocab_size,
+                    )
+                    manager.tokenizer = tokenizer if with_tokenizer else None
+                    manager.logits = logits
+                    handler = OpenAIServingScore(manager)
+
+                    single_req = ScoringRequest(
+                        query=[],
+                        items=[[1]],
+                        label_token_ids=[eos_id],
+                        apply_softmax=True,
+                    )
+                    single_resp = await handler._handle_non_streaming_request(
+                        single_req, single_req, None
+                    )
+                    self.assertEqual(single_resp.status_code, 200)
+                    self.assertEqual(json.loads(single_resp.body)["scores"], [[1.0]])
+
+                    ragged_req = ScoringRequest(
+                        query=[],
+                        items=[[1], [2]],
+                        label_token_ids=[[eos_id, think_id], [5, model_vocab_size - 1]],
+                        apply_softmax=True,
+                    )
+                    ragged_resp = await handler._handle_non_streaming_request(
+                        ragged_req, ragged_req, None
+                    )
+                    self.assertEqual(ragged_resp.status_code, 200)
+                    ragged_body = json.loads(ragged_resp.body)
+                    for labels, scores in zip(
+                        ragged_req.label_token_ids, ragged_body["scores"]
+                    ):
+                        torch.testing.assert_close(
+                            torch.tensor(scores),
+                            torch.softmax(logits[labels], dim=0),
+                        )
+
+                    manager.requests.clear()
+                    oob_req = ScoringRequest(
+                        query=[],
+                        items=[[1]],
+                        label_token_ids=[model_vocab_size],
+                        apply_softmax=True,
+                    )
+                    oob_resp = await handler._handle_non_streaming_request(
+                        oob_req, oob_req, None
+                    )
+                    self.assertEqual(oob_resp.status_code, 400)
+                    oob_body = json.loads(oob_resp.body)
+                    self.assertEqual(oob_body["type"], "BadRequestError")
+                    self.assertEqual(
+                        oob_body["message"],
+                        f"Token ID {model_vocab_size} is out of vocabulary (vocab size: {model_vocab_size})",
+                    )
+                    self.assertEqual(manager.requests, [])
+
+    async def test_http_enforces_tighter_model_token_id_vocab_size(self):
+        manager = ScoringManager(token_id_vocab_size=6)
+        handler = OpenAIServingScore(manager)
+
+        ok_req = ScoringRequest(
+            query=[], items=[[1]], label_token_ids=[5], apply_softmax=True
+        )
+        ok_resp = await handler._handle_non_streaming_request(ok_req, ok_req, None)
+        self.assertEqual(ok_resp.status_code, 200)
+        self.assertEqual(json.loads(ok_resp.body)["scores"], [[1.0]])
+
+        manager.requests.clear()
+        oob_req = ScoringRequest(
+            query=[], items=[[1]], label_token_ids=[6], apply_softmax=True
+        )
+        oob_resp = await handler._handle_non_streaming_request(oob_req, oob_req, None)
+        self.assertEqual(oob_resp.status_code, 400)
+        oob_body = json.loads(oob_resp.body)
+        self.assertEqual(
+            oob_body["message"],
+            "Token ID 6 is out of vocabulary (vocab size: 6)",
+        )
+        self.assertEqual(manager.requests, [])
 
     async def test_small_temperature_is_finite(self):
         for enable_mis in (False, True):

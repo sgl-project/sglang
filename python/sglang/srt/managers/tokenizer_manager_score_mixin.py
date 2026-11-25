@@ -947,6 +947,7 @@ class TokenizerManagerScoreMixin:
                     raise ValueError("label_token_ids must have one list per item")
             else:
                 label_token_ids = [label_token_ids] * num_items
+            vocab_size = self.model_config.token_id_vocab_size
             for labels in label_token_ids:
                 if not isinstance(labels, list) or not labels:
                     raise ValueError("each item must have a nonempty candidate list")
@@ -958,13 +959,11 @@ class TokenizerManagerScoreMixin:
                     raise ValueError(
                         "label_token_ids must not contain duplicate tokens"
                     )
-                if self.tokenizer is not None:
-                    vocab_size = self.tokenizer.vocab_size
-                    for token_id in labels:
-                        if token_id >= vocab_size:
-                            raise ValueError(
-                                f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
-                            )
+                for token_id in labels:
+                    if token_id >= vocab_size:
+                        raise ValueError(
+                            f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
+                        )
 
         # Normalize an omitted query by item type so path selection sees a concrete
         # prefix: [] for pre-tokenized items (token-ID path), "" for text items.

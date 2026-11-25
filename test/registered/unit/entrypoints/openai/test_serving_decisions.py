@@ -158,6 +158,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
                 architectures=[architecture or "Qwen3_5MoeForConditionalGeneration"],
                 model_type="qwen3_5_moe",
             ),
+            token_id_vocab_size=len(tokenizer),
             decision_config=None,
             joint_head_config=None,
             pointer_head=None,
