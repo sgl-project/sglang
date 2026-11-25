@@ -30,6 +30,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import huggingface_hub.constants
 import yaml
 
 from sglang.srt.utils import kill_process_tree
@@ -127,7 +128,8 @@ def _bind_point(e2e: Path, config_key: str, commit: str, point: str) -> tuple:
         "FRAMEWORK": master["framework"],
         "PRECISION": master["precision"],
         "TP": str(tp),
-        "EP_SIZE": str(entry["ep"]),
+        # A row without ep, or with ep: null, runs EP 1 as InferenceX's matrix does.
+        "EP_SIZE": str(entry.get("ep") or 1),
         "PP_SIZE": "1",
         "DCP_SIZE": str(dcp),
         "PCP_SIZE": "1",
@@ -266,7 +268,9 @@ def _server_launch(recipe: dict) -> tuple:
             "--load-publish-endpoint",
             "auto",
         ]
-    env = os.environ.copy()
+    # Models stay in the CI's hub cache when a recipe moves HF_HOME, as they stay
+    # in srt-slurm's shared HF_HUB_CACHE.
+    env = {"HF_HUB_CACHE": huggingface_hub.constants.HF_HUB_CACHE, **os.environ}
     for scope in (recipe.get("environment") or {}, role.get("env") or {}):
         env.update((key, str(value)) for key, value in scope.items())
     return model, served_model_name, other_args, env

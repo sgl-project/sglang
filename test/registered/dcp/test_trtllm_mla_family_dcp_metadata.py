@@ -120,6 +120,7 @@ class _DCPMetadataTests:
         heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
         backend = object.__new__(self.backend_cls)
         backend.data_type = backend.q_data_type = torch.bfloat16
+        backend._megakernel = False
 
         def real_path(*args, **kwargs):
             raise _RealVerifyPath

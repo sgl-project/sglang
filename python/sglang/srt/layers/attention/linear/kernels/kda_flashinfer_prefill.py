@@ -59,13 +59,13 @@ def build_flashinfer_kda_checkpoint_plan(
         "KDA checkpoint rows disagree with the prefill tracking metadata"
     )
     metadata.state_checkpoint_cu_starts = torch.tensor(
-        checkpoint_starts, dtype=torch.int64, device=device
-    )
+        checkpoint_starts, dtype=torch.int64, pin_memory=True
+    ).to(device, non_blocking=True)
     metadata.num_state_checkpoints = num_tracked_checkpoints
     metadata.state_checkpoint_every_n_tokens = chunk_size
     metadata.state_checkpoint_indices = torch.tensor(
-        checkpoint_destinations, dtype=torch.int32, device=device
-    )
+        checkpoint_destinations, dtype=torch.int32, pin_memory=True
+    ).to(device, non_blocking=True)
 
 
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
@@ -79,8 +79,8 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     supports_safe_gate = True
 
     def __init__(self):
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            raise ValueError("FlashInfer KDA prefill requires SM100 or SM103")
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+            raise ValueError("FlashInfer KDA prefill requires SM100, SM103 or SM107")
         from flashinfer import kda
 
         self._recurrent_kda = kda.recurrent_kda

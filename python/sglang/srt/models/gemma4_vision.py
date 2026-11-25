@@ -33,7 +33,6 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
-    get_platform,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -196,16 +195,12 @@ class Gemma4VisionAttention(nn.Module):
 
     @staticmethod
     def _select_backend() -> str:
-        """Mirror VisionAttention._determine_attention_backend for consistency."""
-
         override = get_mm().mm_attention_backend
         if override is not None:
             return override
         if is_cuda():
             major, _ = get_device_capability()
             if major == 9:
-                if get_platform().is_blackwell:
-                    return "triton_attn"
                 return "fa3"
             return "triton_attn"
         if is_hip():
@@ -481,11 +476,10 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
 
 class Gemma4VisionPooler(nn.Module):
-    def __init__(self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = False):
+    def __init__(self, config: Gemma4VisionConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.root_hidden_size = self.hidden_size**0.5
-        self.mask_pad_before_pool = mask_pad_before_pool
 
     def _avg_pool_by_positions(
         self, x: torch.Tensor, patch_positions: torch.Tensor, length: int
@@ -529,16 +523,16 @@ class Gemma4VisionPooler(nn.Module):
         if isinstance(length, (list, tuple)):
             length = length[0]
         if hidden_states.shape[1] == length:
-            mask = padding_positions
+            mask = ~padding_positions
         else:
-            if self.mask_pad_before_pool:
-                hidden_states = hidden_states.masked_fill(
-                    padding_positions.unsqueeze(-1), 0.0
-                )
+            hidden_states = hidden_states.masked_fill(
+                padding_positions.unsqueeze(-1), 0.0
+            )
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
             )
-        hidden_states = hidden_states * self.root_hidden_size
+        # Scaling can exceed the FP16 range before standardization.
+        hidden_states = hidden_states.float() * self.root_hidden_size
         return hidden_states, mask
 
 
@@ -555,7 +549,6 @@ class Gemma4VisionEncoder(nn.Module):
         config: Gemma4VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        mask_pad_before_pool: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -568,9 +561,7 @@ class Gemma4VisionEncoder(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
-        self.pooler = Gemma4VisionPooler(
-            config, mask_pad_before_pool=mask_pad_before_pool
-        )
+        self.pooler = Gemma4VisionPooler(config)
 
         # Post-pooling standardization (normalizes vision tokens before projection)
         self.standardize = getattr(config, "standardize", False)
@@ -624,4 +615,4 @@ class Gemma4VisionEncoder(nn.Module):
         if self.standardize:
             pooled = (pooled - self.std_bias) * self.std_scale
 
-        return pooled, pooler_mask
+        return pooled.to(inputs_embeds.dtype), pooler_mask

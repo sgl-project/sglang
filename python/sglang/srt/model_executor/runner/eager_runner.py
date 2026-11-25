@@ -24,6 +24,7 @@ import torch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -56,13 +57,11 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -276,6 +275,11 @@ class EagerRunner(BaseRunner):
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )
                 and forward_batch.extend_prefix_lens is not None
+                # MLA target verify reads rank-local decode KV, not the gathered layout.
+                and not (
+                    forward_batch.forward_mode.is_target_verify()
+                    and model_runner.model_config.attention_arch == AttentionArch.MLA
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
