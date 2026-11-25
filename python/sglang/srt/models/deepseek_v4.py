@@ -96,7 +96,13 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    Engram,
+    EngramHasher,
+    EngramLayout,
+    begin_host_lookups,
+    host_lookup_schedule,
+)
 from sglang.srt.layers.layer_boundary import append_stages, get_attn_tp_context
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -3918,6 +3924,7 @@ class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    _host_lookup_schedule = None
 
     def __init__(
         self,
@@ -4018,6 +4025,12 @@ class DeepseekV4Model(nn.Module):
                 self.hc_head_scale,
             ) = make_hc_head_params(hc_mult, config.hidden_size)
         self.engram_hasher = None
+        if self.engram_layout is not None and self.hc_pre_from_prev_sublayer:
+            self._host_lookup_schedule = host_lookup_schedule(
+                (i, self.layers[i].engram)
+                for i in sorted(self.engram_layout.layer_ids)
+                if self.start_layer <= i < self.end_layer
+            )
         if self.engram_layout is not None:
             self.engram_hasher = EngramHasher.from_config(
                 config,
@@ -4185,6 +4198,8 @@ class DeepseekV4Model(nn.Module):
                 bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids, hash_ids)
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+            if self._host_lookup_schedule:
+                begin_host_lookups(self._host_lookup_schedule, None, hash_ids)
         tail = None
         if (
             self.late_layer_start is not None
@@ -4370,6 +4385,8 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
                 )
+                if self._host_lookup_schedule:
+                    begin_host_lookups(self._host_lookup_schedule, i, hash_ids)
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
