@@ -621,6 +621,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         )
         runner = SimpleNamespace(
             token_to_kv_pool=pool,
+            device="cpu",
             req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 128)),
             model_config=SimpleNamespace(
                 context_len=128, hf_config=config, hf_text_config=config
@@ -632,6 +633,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
             patch.object(
                 backend, "msa_v1_qmul4_decode_capability", return_value=(True, None)
             ),
+            patch.object(backend, "make_msa_v1_indexer_decode_cp", return_value=None),
         ):
             attention = backend.MiniMaxSparseNvfp4AttnBackend(runner)
         self.assertEqual(attention.speculative_num_draft_tokens, 8)
@@ -669,6 +671,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         obj._msa_v1_num_q_heads, obj._msa_v1_num_kv_heads = 32, 2
         obj._msa_v1_num_index_heads = 2
         obj._msa_v1_index_fp8_scratch = None
+        obj._msa_v1_indexer_cp = None
         obj._msa_v1_cuda_graph_plans = {}
         obj._msa_v1_cuda_graph_attention_plans = {}
         obj.forward_metadata = SimpleNamespace()
@@ -707,6 +710,60 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
             )
         # One refresh per prepare, on the cached plan.
         self.assertEqual((first.refreshes, decode.refreshes), (2, 1))
+
+    def test_make_msa_v1_indexer_decode_cp_resolves_string_cuda_device(self):
+        from sglang.srt.layers.attention.minimax_sparse_ops import (
+            msa_indexer_decode_cp,
+        )
+
+        seen_devices = []
+        fake_group = SimpleNamespace(world_size=2, cpu_group=object())
+        fake_parallel = SimpleNamespace(attn_tp_group=fake_group)
+        sentinel = SimpleNamespace(cp_size=2)
+
+        with (
+            patch.object(
+                msa_indexer_decode_cp, "get_parallel", return_value=fake_parallel
+            ),
+            patch.object(msa_indexer_decode_cp, "_MSA_IMPORT_ERROR", None),
+            patch.object(torch.cuda, "current_device", return_value=1),
+            patch.object(
+                msa_indexer_decode_cp,
+                "in_one_nvlink_domain",
+                side_effect=lambda cpu_group, dev: seen_devices.append(dev) or True,
+            ),
+            patch.object(
+                msa_indexer_decode_cp,
+                "MSAV1IndexerDecodeCP",
+                side_effect=lambda **kw: seen_devices.append(kw["device"]) or sentinel,
+            ),
+        ):
+            # Non-CUDA device cleanly disables without touching NVLink checks.
+            self.assertIsNone(
+                msa_indexer_decode_cp.make_msa_v1_indexer_decode_cp(
+                    num_local_index_heads=2,
+                    max_rows=16,
+                    max_pages=64,
+                    qmul4_available=True,
+                    device="cpu",
+                )
+            )
+            self.assertEqual(seen_devices, [])
+
+            # Bare "cuda" string (as passed by ModelRunner.device) must resolve
+            # to an indexed torch.device("cuda", current_device).
+            cp = msa_indexer_decode_cp.make_msa_v1_indexer_decode_cp(
+                num_local_index_heads=2,
+                max_rows=16,
+                max_pages=64,
+                qmul4_available=True,
+                device="cuda",
+            )
+            self.assertIs(cp, sentinel)
+            self.assertEqual(
+                seen_devices,
+                [torch.device("cuda", 1), torch.device("cuda", 1)],
+            )
 
 
 if __name__ == "__main__":
