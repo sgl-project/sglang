@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.fields.exec_ import ExecKernel
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
+    _k31_sparse_prefill_reader_decision,
     _resolve_k31_sparse_prefill_reader,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -500,7 +501,31 @@ def _resolve(**changes):
         available=lambda: True,
     )
     args.update(changes)
-    return _resolve_k31_sparse_prefill_reader(**args)
+    mode, why = _k31_sparse_prefill_reader_decision(**args)
+    assert mode == _resolve_k31_sparse_prefill_reader(**args)
+    assert why
+    return mode
+
+
+def _why(**changes):
+    args = dict(
+        requested="packed",
+        deterministic=False,
+        is_cuda=True,
+        is_sm100=True,
+        shards_index_k=True,
+        prefill_cp=False,
+        index_kpool=1,
+        kv_cache_store_fp8=True,
+        kv_format="V32",
+        physical_page_size=64,
+        local_num_q_heads=12,
+        hisparse=False,
+        available=lambda: True,
+        prefill_impl="flashmla_kv",
+    )
+    args.update(changes)
+    return _k31_sparse_prefill_reader_decision(**args)
 
 
 class TestEligibility(CustomTestCase):
@@ -544,6 +569,56 @@ class TestEligibility(CustomTestCase):
 
     def test_missing_operators_stay_off(self):
         self.assertEqual(_resolve(available=lambda: False), "off")
+
+    def test_other_dsa_backends_stay_off_without_looking_for_operators(self):
+        # Kimi-K3.1 defaults to prims_ts on SM100-family GPUs: another KV layout,
+        # and the extend never reaches the flashmla_kv branch the reader hooks.
+        available = MagicMock(return_value=True)
+        for backend in ("prims_ts", "trtllm", "flashmla_sparse", None):
+            with self.subTest(backend=backend):
+                mode, why = _why(prefill_impl=backend, available=available)
+                self.assertEqual(mode, "off")
+                self.assertIn("--dsa-prefill-backend", why)
+                self.assertIn("flashmla_kv", why)
+        available.assert_not_called()
+
+    def test_every_off_decision_names_its_reason(self):
+        cases = (
+            (dict(is_cuda=False), "CUDA"),
+            (dict(is_sm100=False), "SM100"),
+            (dict(shards_index_k=False), "index-K"),
+            (dict(prefill_cp=True), "prefill CP"),
+            (dict(index_kpool=2), "K-pool is 2"),
+            (dict(kv_cache_store_fp8=False), "fp8_ds_mla"),
+            (dict(kv_format="V32_NO_ROPE"), "V32_NO_ROPE"),
+            (dict(physical_page_size=32), "page size is 32"),
+            (dict(local_num_q_heads=48), "48 heads"),
+            (dict(hisparse=True), "HiSparse"),
+            (dict(available=lambda: False), "sgl-flash-mla"),
+        )
+        for change, text in cases:
+            with self.subTest(change=change):
+                mode, why = _why(**change)
+                self.assertEqual(mode, "off")
+                self.assertIn(text, why)
+        mode, why = _why(prefill_impl="prims_ts", kv_cache_store_fp8=False)
+        self.assertIn("--dsa-prefill-backend", why)
+        self.assertIn("fp8_ds_mla", why)  # every failed requirement is listed
+
+    def test_active_decisions_say_so(self):
+        self.assertEqual(_why(), ("packed", "all requirements met"))
+        self.assertEqual(_why(requested="off")[0], "off")
+        mode, why = _why(deterministic=True)
+        self.assertEqual(mode, "unpacked")
+        self.assertIn("deterministic", why)
+
+    def test_constructor_logs_the_reason(self):
+        import inspect
+
+        source = inspect.getsource(DeepseekSparseAttnBackend.__init__)
+        self.assertIn("requested %s, active %s (%s)", source)
+        self.assertIn("_k31_sparse_prefill_reader_decision(", source)
+        self.assertIn("prefill_impl=get_exec().kernel.dsa_prefill_backend", source)
 
 
 class TestDispatch(CustomTestCase):

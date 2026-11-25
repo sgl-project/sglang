@@ -576,32 +576,84 @@ def _resolve_k31_sparse_prefill_reader(
     local_num_q_heads: int,
     hisparse: bool,
     available: Callable[[], bool],
+    prefill_impl: Optional[str] = "flashmla_kv",
 ) -> str:
     """Active mode of --k31-sparse-prefill-reader: "off", "packed" or "unpacked".
+    See _k31_sparse_prefill_reader_decision."""
+    return _k31_sparse_prefill_reader_decision(
+        requested=requested,
+        deterministic=deterministic,
+        is_cuda=is_cuda,
+        is_sm100=is_sm100,
+        shards_index_k=shards_index_k,
+        prefill_cp=prefill_cp,
+        index_kpool=index_kpool,
+        kv_cache_store_fp8=kv_cache_store_fp8,
+        kv_format=kv_format,
+        physical_page_size=physical_page_size,
+        local_num_q_heads=local_num_q_heads,
+        hisparse=hisparse,
+        available=available,
+        prefill_impl=prefill_impl,
+    )[0]
 
-    The reader dequantizes every row of the buffer it is given, so it only takes the
-    request-ordered rows dcp_gather_kv_cache builds (sharded index-K, no prefill CP),
-    never the KV pool. ``available`` is asked last, so a deployment the reader does not
-    cover never looks for the FlashMLA operators. Packing is not batch invariant; deterministic
-    inference runs unpacked."""
+
+def _k31_sparse_prefill_reader_decision(
+    *,
+    requested: str,
+    deterministic: bool,
+    is_cuda: bool,
+    is_sm100: bool,
+    shards_index_k: bool,
+    prefill_cp: bool,
+    index_kpool: int,
+    kv_cache_store_fp8: bool,
+    kv_format: Optional[str],
+    physical_page_size: int,
+    local_num_q_heads: int,
+    hisparse: bool,
+    available: Callable[[], bool],
+    prefill_impl: Optional[str] = "flashmla_kv",
+) -> Tuple[str, str]:
+    """(active mode of --k31-sparse-prefill-reader, why): the mode is "off", "packed"
+    or "unpacked"; the reason says which requirement keeps a requested reader off.
+
+    The reader replaces the flashmla_kv extend (the FlashMLA decode kernel on the FP8
+    V32 cache), so it needs that backend; the raw-FP8 backends (trtllm, prims_ts) keep
+    another cache layout and never reach it. It dequantizes every row of the buffer it
+    is given, so it only takes the request-ordered rows dcp_gather_kv_cache builds
+    (sharded index-K, no prefill CP), never the KV pool. ``available`` is asked last,
+    so a deployment the reader does not cover never looks for the FlashMLA operators.
+    Packing is not batch invariant; deterministic inference runs unpacked."""
     if requested == "off":
-        return "off"
-    if not (
-        is_cuda
-        and is_sm100
-        and shards_index_k
-        and not prefill_cp
-        and index_kpool == 1
-        and kv_cache_store_fp8
-        and kv_format == "V32"
-        and physical_page_size == 64
-        and 1 <= local_num_q_heads <= 32
-        and not hisparse
-    ):
-        return "off"
+        return "off", "not requested"
+    requirements = (
+        (is_cuda, "not a CUDA device"),
+        (is_sm100, "not an SM100-family GPU"),
+        (
+            prefill_impl == "flashmla_kv",
+            f"--dsa-prefill-backend is {prefill_impl!r}, the reader needs 'flashmla_kv'",
+        ),
+        (shards_index_k, "DCP with sharded index-K is not active"),
+        (not prefill_cp, "prefill CP is on"),
+        (index_kpool == 1, f"index K-pool is {index_kpool}, not 1"),
+        (kv_cache_store_fp8, "the KV pool is not the FP8 fp8_ds_mla cache"),
+        (kv_format == "V32", f"KV format is {kv_format!r}, not 'V32'"),
+        (physical_page_size == 64, f"KV page size is {physical_page_size}, not 64"),
+        (
+            1 <= local_num_q_heads <= 32,
+            f"{local_num_q_heads} heads per TP rank, outside 1..32",
+        ),
+        (not hisparse, "HiSparse is on"),
+    )
+    failed = [why for ok, why in requirements if not ok]
+    if failed:
+        return "off", "; ".join(failed)
     if not available():
-        return "off"
-    return "unpacked" if deterministic else requested
+        return "off", "the installed sgl-flash-mla has no token-packed sparse prefill"
+    if deterministic and requested != "unpacked":
+        return "unpacked", "deterministic inference runs unpacked"
+    return requested, "all requirements met"
 
 
 def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
@@ -943,6 +995,7 @@ class DeepseekSparseAttnBackend(
         # the DCP-gathered rows (see kernels/ops/attention/dsa/k31_prefill_reader.py).
         _k31_reader = get_exec().kernel.k31_sparse_prefill_reader
         self.k31_sparse_prefill_reader = "off"
+        _k31_reader_why = "not requested"
         if _k31_reader != "off":
             # Nothing below is evaluated, and the reader module is not imported, when
             # the flag is off.
@@ -950,8 +1003,12 @@ class DeepseekSparseAttnBackend(
                 k31_prefill_reader_available,
             )
 
-            self.k31_sparse_prefill_reader = _resolve_k31_sparse_prefill_reader(
+            (
+                self.k31_sparse_prefill_reader,
+                _k31_reader_why,
+            ) = _k31_sparse_prefill_reader_decision(
                 requested=_k31_reader,
+                prefill_impl=get_exec().kernel.dsa_prefill_backend,
                 deterministic=get_exec().deterministic.enable_deterministic_inference,
                 is_cuda=_is_cuda,
                 is_sm100=bool(_is_cuda and get_platform().is_sm100),
@@ -966,10 +1023,16 @@ class DeepseekSparseAttnBackend(
                 available=k31_prefill_reader_available,
             )
         if _k31_reader != "off":
-            logger.info(
-                "Kimi-K3.1 sparse prefill reader: requested %s, active %s",
+            # A requested reader that stays off says why, at warning level.
+            (
+                logger.warning
+                if self.k31_sparse_prefill_reader == "off"
+                else logger.info
+            )(
+                "Kimi-K3.1 sparse prefill reader: requested %s, active %s (%s)",
                 _k31_reader,
                 self.k31_sparse_prefill_reader,
+                _k31_reader_why,
             )
         # Opt-in exact fast path for the Triton sparse-MLA prefill kernel.
         self.dsa_triton_union: int = _resolve_dsa_triton_union(

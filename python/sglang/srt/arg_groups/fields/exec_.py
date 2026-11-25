@@ -421,7 +421,8 @@ class ExecKernel(msgspec.Struct):
             "the token-packed FlashMLA decode kernel; 'packed' dequantizes the gathered KV "
             "rows to BF16 once per call and runs FlashMLA's sparse prefill kernel with token "
             "packing; 'unpacked' is the same without packing (run-to-run deterministic). "
-            "Requires SM100-family, DCP with sharded index-K, FP8 V32 KV cache, at most 32 "
+            "Requires SM100-family, --dsa-prefill-backend flashmla_kv (not the prims_ts "
+            "default of Kimi-K3.1), DCP with sharded index-K, FP8 V32 KV cache, at most 32 "
             "heads per TP rank and an sgl-flash-mla with token-packed sparse prefill "
             "(flash_mla_sparse_fwd_packed); otherwise the stock path runs. "
             "Deterministic inference forces 'unpacked'.",
