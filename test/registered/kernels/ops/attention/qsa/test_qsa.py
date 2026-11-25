@@ -503,6 +503,8 @@ def test_qsa_fa2_scratch_outlives_a_larger_eager_batch():
     shape = packed_k.shape
     del packed_k, packed_v
     backend._get_fa2_scratch(8192, *args, in_graph=False)
+    # Default caching allocator: if the captured pair was freed, its two 16 MiB
+    # blocks are the only free ones of that size, so these two take them.
     others = [torch.zeros(shape, dtype=torch.bfloat16, device="cuda") for _ in range(2)]
     graph.replay()
     torch.cuda.synchronize()
