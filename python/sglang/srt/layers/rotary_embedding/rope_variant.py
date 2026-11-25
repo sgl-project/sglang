@@ -28,12 +28,10 @@ from sglang.srt.utils import (
     get_device,
     is_cuda,
     is_gfx1250_supported,
-    is_hip,
     is_npu,
 )
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter_rope_gfx1250 = _use_aiter and is_gfx1250_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
