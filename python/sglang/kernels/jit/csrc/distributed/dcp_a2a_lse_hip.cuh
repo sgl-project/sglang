@@ -16,6 +16,7 @@
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <hip/hip_bf16.h>
@@ -266,8 +267,8 @@ struct DcpA2ALseKernel {
    * @param max_grid     Workgroup cap (runtime CU count * 4) for persistent slot iteration.
    * @param is_lse_base_on_e  True for natural-log LSE, false for base-2 LSE.
    */
-  static void run(
-      const tvm::ffi::TensorView cp_attn_out,
+  static void
+  run(const tvm::ffi::TensorView cp_attn_out,
       const tvm::ffi::TensorView cp_attn_lse,
       tvm::ffi::TensorView out,
       int64_t comm,
@@ -280,17 +281,9 @@ struct DcpA2ALseKernel {
     SymbolicDevice device;
     device.set_options<kDLGPU>();
 
-    TensorMatcher({B, H, kDim})
-        .with_dtype<T>()
-        .with_device(device)
-        .ensure_alignment(16)
-        .verify(cp_attn_out);
+    TensorMatcher({B, H, kDim}).with_dtype<T>().with_device(device).ensure_alignment(16).verify(cp_attn_out);
     TensorMatcher({B, H}).with_dtype<float>().with_device(device).verify(cp_attn_lse);
-    TensorMatcher({B, H_local, kDim})
-        .with_dtype<T>()
-        .with_device(device)
-        .ensure_alignment(16)
-        .verify(out);
+    TensorMatcher({B, H_local, kDim}).with_dtype<T>().with_device(device).ensure_alignment(16).verify(out);
     TensorMatcher({max_slots}).with_dtype<int32_t>().with_device(device).verify(epochs);
 
     const int64_t b = B.unwrap();
@@ -298,7 +291,8 @@ struct DcpA2ALseKernel {
     const int64_t hl = H_local.unwrap();
     const int64_t num_slots = b * hl;
     CHECK_HOST(h == kWorld * hl) << "H (" << h << ") must equal world_size (" << kWorld << ") * H_local (" << hl << ")";
-    CHECK_HOST(b >= 1 && num_slots <= max_slots) << "num_slots (" << num_slots << ") out of range [1, " << max_slots << "]";
+    CHECK_HOST(b >= 1 && num_slots <= max_slots)
+        << "num_slots (" << num_slots << ") out of range [1, " << max_slots << "]";
     CHECK_HOST(max_grid >= 1) << "max_grid must be positive, got " << max_grid;
 
     auto* communicator = reinterpret_cast<aiter::CustomAllreduce*>(comm);

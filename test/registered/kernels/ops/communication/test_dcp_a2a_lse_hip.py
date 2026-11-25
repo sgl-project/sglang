@@ -7,6 +7,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+
 from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
@@ -20,7 +21,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, stage="stage-c", runner_config="large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=120, stage="base-c", runner_config="large-8-gpu-amd-mi35x")
 
 WORLD_SIZE = 8
 H_LOCAL = 12
