@@ -260,6 +260,11 @@ class _MHAPool:
         return torch.empty(1, 1, 8, 128)
 
 
+_MHA_CONTEXT_LEN = 4096
+# The req_to_token row carries headroom past context_len for speculative decoding.
+_MHA_ROW_WIDTH = _MHA_CONTEXT_LEN + 12
+
+
 def _init_mha_backend(kv_cache_layout):
     pool = _MHAPool(kv_cache_layout)
     model_config = SimpleNamespace(
@@ -269,13 +274,18 @@ def _init_mha_backend(kv_cache_layout):
         head_dim=128,
         get_num_kv_heads=lambda _tp_size: 8,
         attention_arch=AttentionArch.MHA,
-        context_len=4096,
+        context_len=_MHA_CONTEXT_LEN,
     )
     model_runner = SimpleNamespace(
         model_config=model_config,
         device=torch.device("cpu"),
         kv_cache_dtype=torch.bfloat16,
-        req_to_token_pool=SimpleNamespace(req_to_token=None, size=_BATCH_SIZE),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(
+                (_BATCH_SIZE + 1, _MHA_ROW_WIDTH), dtype=torch.int32
+            ),
+            size=_BATCH_SIZE,
+        ),
         runner_ids=None,
         token_to_kv_pool=pool,
         is_draft_worker=False,
@@ -309,6 +319,23 @@ class TestAiterDecodeWorkspace(CustomTestCase):
             for layout in ("nhd", "vectorized_5d")
         }
         self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
+
+
+class TestAiterVerifyPageTableWidth(CustomTestCase):
+    def test_verify_page_table_spans_the_req_to_token_row(self):
+        """Verify reads past context_len at the length cap,
+        so its page table is as wide as the req_to_token row."""
+        backend = _init_mha_backend("nhd")
+        with patch.object(
+            aiter_backend, "scatter_req_to_token_to_page_table_kernel", _NoopKernel()
+        ):
+            page_table, *_ = backend._build_verify_unified_metadata(
+                bs=_BATCH_SIZE,
+                seq_lens=torch.full((_BATCH_SIZE,), fill_value=_MHA_CONTEXT_LEN - 4),
+                req_pool_indices=torch.arange(_BATCH_SIZE),
+                draft_num=8,
+            )
+        self.assertEqual(page_table.shape, (_BATCH_SIZE, _MHA_ROW_WIDTH))
 
 
 if __name__ == "__main__":
