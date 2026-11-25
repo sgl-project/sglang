@@ -575,6 +575,14 @@ def _even_split_batch_size(*, num_tokens: int, max_batch_size: int) -> int:
     )
 
 
+def _round_up_hybrid_autotune_bucket(num_tokens: int) -> int:
+    try:
+        from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
+    except ImportError:
+        return num_tokens
+    return max(num_tokens, int(map_to_hybrid_bucket_uncapped(num_tokens)))
+
+
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
@@ -591,8 +599,6 @@ def maybe_flashinfer_autotune_extend(
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-    if num_tokens <= (decode_num_tokens or 0):
-        return  # decode-shaped autotune already covered these buckets
     # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
     wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
@@ -601,11 +607,16 @@ def maybe_flashinfer_autotune_extend(
         # ranks, so a model that has nothing to tune must decline before it.
         prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
+        model_num_tokens = _round_up_hybrid_autotune_bucket(
+            max(num_tokens, decode_num_tokens or 0)
+        )
         with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
+            tuned = prefill_autotune(model_num_tokens, dtype=mr.dtype)
         if tuned:
             return
 
+    if num_tokens <= (decode_num_tokens or 0):
+        return  # decode-shaped autotune already covered these buckets
     if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
         return
     if not mr.is_generation or mr.is_draft_worker:

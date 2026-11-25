@@ -352,6 +352,64 @@ class TestModelPrefillAutotune(CustomTestCase):
                 self.hook.assert_not_called()
                 self.flashinfer_autotune_context.assert_not_called()
 
+    def test_verify_rows_above_prefill_chunk_round_up_to_hybrid_bucket(self):
+        # Verify batches above the per-rank prefill chunk must tune the hybrid
+        # bucket holding those verify rows, even when prefill_chunk <= verify_rows.
+        bucket_mod = SimpleNamespace(
+            map_to_hybrid_bucket_uncapped=lambda m: 1280 if 1024 < m <= 1280 else m
+        )
+        fake_modules = {
+            "flashinfer": SimpleNamespace(),
+            "flashinfer.fused_moe": SimpleNamespace(utils=bucket_mod),
+            "flashinfer.fused_moe.utils": bucket_mod,
+        }
+        with patch.dict(sys.modules, fake_modules):
+            self.max_prefill_buffer_tokens.return_value = 1024
+            autotune.maybe_flashinfer_autotune_extend(
+                self.runner, decode_num_tokens=1152
+            )
+            self.hook.assert_called_once_with(1280, dtype=torch.bfloat16)
+
+            self.hook.reset_mock()
+            self.max_prefill_buffer_tokens.return_value = 4096
+            autotune.maybe_flashinfer_autotune_extend(
+                self.runner, decode_num_tokens=768
+            )
+            self.hook.assert_called_once_with(4096, dtype=torch.bfloat16)
+
+    def test_decode_autotune_num_tokens_scales_speculative_verify(self):
+        from sglang.srt.model_executor.runner import base_runner
+
+        cases = (
+            ("decode", True, False, 6, 192 * 6),
+            ("prefill", True, False, 6, 192),
+            ("decode", False, False, 1, 192),
+        )
+        for mode, speculative, draft, tokens_per_req, expected in cases:
+            with self.subTest(mode=mode, speculative=speculative, draft=draft):
+                mr = SimpleNamespace(
+                    is_draft_worker=draft,
+                    spec_algorithm=SimpleNamespace(is_speculative=lambda: speculative),
+                    decode_num_tokens_per_req=Mock(return_value=tokens_per_req),
+                )
+                runner = SimpleNamespace(model_runner=mr)
+                with (
+                    patch.object(
+                        base_runner,
+                        "get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=mode),
+                    ),
+                    patch.object(
+                        base_runner,
+                        "max_speculative_num_draft_tokens",
+                        return_value=tokens_per_req,
+                    ),
+                ):
+                    got = base_runner.BaseRunner._decode_autotune_num_tokens(
+                        runner, 192
+                    )
+                self.assertEqual(got, expected)
+
 
 class TestExtendAutotuneDummy(CustomTestCase):
     """SGLANG_FLASHINFER_AUTOTUNE_EXTEND must tune exactly the per-rank prefill
