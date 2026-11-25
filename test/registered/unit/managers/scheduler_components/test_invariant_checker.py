@@ -178,6 +178,17 @@ class TestEndedRequests(CustomTestCase):
         dropped.exit_via = "release"
         checker._check_ended_requests()
 
+    def test_admission_drops_ended_requests_without_an_idle_check(self):
+        checker = _checker_over({})
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            checker.expect_output(self._req("ended", sent=True, exited=True))
+            open_ = self._req("open", sent=True, exited=False)
+            checker.expect_output(open_)
+            new = self._req("new", sent=False, exited=False)
+            checker.expect_output(new)
+
+        self.assertEqual({req.rid for req in checker.unended}, {"open", "new"})
+
 
 class TestListedRequestsUnfinished(CustomTestCase):
     def test_only_the_deferred_list_holds_a_finished_request_at_idle(self):
