@@ -61,6 +61,9 @@ class CompressedTensorsLinearScheme(BaseLinearScheme):
         """
         raise NotImplementedError
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        return
+
 
 class CompressedTensorsMoEScheme(BaseMoEScheme):
     """
