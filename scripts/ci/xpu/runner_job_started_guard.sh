@@ -25,18 +25,23 @@ mode="${XPU_RUNNER_GUARD_MODE:-log}"
 allowed="${XPU_RUNNER_GUARD_WORKFLOWS:-}"
 event="${GITHUB_EVENT_NAME:-}"
 workflow_ref="${GITHUB_WORKFLOW_REF:-}"
-workflow_file="${workflow_ref%%@*}"
-workflow_file="${workflow_file##*/}"
+# <owner>/<repo>/.github/workflows/<file>@<ref>; split at the first '@' so a ref can never
+# smuggle in a second '@refs/heads/...'.
+workflow_path="${workflow_ref%%@*}"
+workflow_git_ref="${workflow_ref#*@}"
+workflow_file="${workflow_path##*/}"
 
 reason=""
 if [[ "${GITHUB_REPOSITORY:-}" != "${repo}" ]]; then
   reason="repository '${GITHUB_REPOSITORY:-unset}' is not ${repo}"
 elif [[ "${event}" == "pull_request" ]]; then
   reason="pull_request runs the PR's own workflow files"
+elif [[ "${workflow_ref}" != *@* || "${workflow_path}" != "${repo}/.github/workflows/${workflow_file}" ]]; then
+  reason="workflow ref '${workflow_ref:-unset}' is not a workflow file of ${repo}"
 else
-  case "${workflow_ref}" in
-    "${repo}/.github/workflows/"*"@refs/heads/"* | "${repo}/.github/workflows/"*"@refs/tags/"*) ;;
-    *) reason="workflow ref '${workflow_ref:-unset}' is not a branch or tag of ${repo}" ;;
+  case "${workflow_git_ref}" in
+    refs/heads/* | refs/tags/*) ;;
+    *) reason="workflow ref '${workflow_ref}' is not a branch or tag of ${repo}" ;;
   esac
 fi
 if [[ -z "${reason}" && -n "${allowed}" && " ${allowed} " != *" ${workflow_file} "* ]]; then
