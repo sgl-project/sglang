@@ -60,6 +60,49 @@ def _mxfp8_e4m3_quantize_torch(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
     return x_fp8, scales_uint8
 
 
+@triton.jit
+def _mxfp8_quant_rows_kernel(
+    x_ptr,
+    xq_ptr,
+    s_ptr,
+    M,
+    sxm,
+    sqm,
+    ssm,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """_mxfp8_quant_kernel's per-group math on [BLOCK_M, BLOCK_K] row tiles (contiguous
+    rows instead of 64 rows x one 32-column group a program)."""
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_k[None, :],
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    xg = tl.reshape(x, (BLOCK_M * (BLOCK_K // 32), 32))
+    amax = tl.maximum(tl.max(tl.abs(xg), axis=1), 1e-30)
+    scale_biased = tl.ceil(tl.log2(amax / 448.0)) + 127.0
+    scale_biased = tl.minimum(tl.maximum(scale_biased, 0.0), 254.0)
+    descale = tl.exp2(scale_biased - 127.0)
+    xq = tl.clamp(xg / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
+    tl.store(
+        xq_ptr + offs_m[:, None] * sqm + offs_k[None, :],
+        tl.reshape(xq, (BLOCK_M, BLOCK_K)),
+        mask=m_mask[:, None],
+    )
+    offs_g = pid_k * (BLOCK_K // 32) + tl.arange(0, BLOCK_K // 32)
+    tl.store(
+        s_ptr + offs_m[:, None] * ssm + offs_g[None, :],
+        tl.reshape(scale_biased.to(tl.uint8), (BLOCK_M, BLOCK_K // 32)),
+        mask=m_mask[:, None],
+    )
+
+
 def _mxfp8_e4m3_quantize_triton(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -70,6 +113,23 @@ def _mxfp8_e4m3_quantize_triton(
     scales = torch.empty(
         (M, K // MXFP8_BLOCK_SIZE), dtype=MXFP8_SCALE_DTYPE, device=x.device
     )
+    if K % 256 == 0:
+        # 8 x 256 tiles, two warps: 2x faster at [16384, 8192] than one 32-column group a program
+        BLOCK_M, BLOCK_K = 8, 256
+        if M:
+            _mxfp8_quant_rows_kernel[(triton.cdiv(M, BLOCK_M), K // BLOCK_K)](
+                x,
+                xq,
+                scales,
+                M,
+                x.stride(0),
+                xq.stride(0),
+                scales.stride(0),
+                BLOCK_M=BLOCK_M,
+                BLOCK_K=BLOCK_K,
+                num_warps=2,
+            )
+        return xq, scales
     BLOCK_M = 64
     grid = (triton.cdiv(M, BLOCK_M), K // MXFP8_BLOCK_SIZE)
     _mxfp8_quant_kernel[grid](
