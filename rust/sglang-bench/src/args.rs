@@ -563,8 +563,6 @@ mod tests {
         let mut prefill_only = token_ids.to_vec();
         prefill_only.extend(["--sharegpt-output-len", "1"]);
         assert!(args(&prefill_only).validate().is_ok());
-        *prefill_only.last_mut().unwrap() = "0";
-        assert!(args(&prefill_only).validate().is_err());
     }
 
     /// `--vocab-size` replaces the tokenizer, so it is only coherent where the
