@@ -315,7 +315,7 @@ We trained a **DSpark** draft model for Qwen3.8 with SpecForge. Turn it on with 
 
 - **`--pp-size` must be 1.** The H200, B200, B300 (FP8) and MI300X cells are all pipelined, so DSpark is unavailable on them.
 - **With DP-Attention it additionally requires `--enable-dp-lm-head`**, the built-in TP MoE (`--moe-a2a-backend none`), and no context parallel. That rules out the GB300 wide-EP tiers, which run DP attention over DeepEP v2 or FlashInfer A2A.
-- `--speculative-num-steps` is forced to 1, and an omitted `--speculative-draft-model-path` only works if the target checkpoint bundles the draft weights.
+- `--speculative-num-steps` must be 1 (or omitted), and an omitted `--speculative-draft-model-path` only works if the target checkpoint bundles the draft weights.
 
 The Playground greys the DSpark chip out on the combinations above.
 

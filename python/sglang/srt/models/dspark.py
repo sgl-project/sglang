@@ -183,6 +183,10 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
+    # Step logits = softcap(base + bias), masked from step_vocab_limit on.
+    step_softcap: Optional[float] = None
+    step_vocab_limit: Optional[int] = None
+
 
 class VanillaMarkov(BaseDSparkMarkovHead):
     # This rank's lm_head vocab rows of markov_w2; None biases the whole vocab.
@@ -735,9 +739,7 @@ class DSparkDraftMixin:
         layer-major.
         """
         layers = list(self.layers)
-        if not layers or not (
-            hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
-        ):
+        if not layers:
             return None
         # The fused kernel shares one location vector across every layer.
         if any(

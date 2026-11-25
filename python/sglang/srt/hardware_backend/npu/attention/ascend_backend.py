@@ -5,10 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.attention.sinks_attention import (
-    attention_sinks_prefill_triton,
-    attention_sinks_triton,
-)
+from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
@@ -29,6 +26,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_cache import (
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
+)
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+    build_dcp_extend_gather_plan,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
@@ -578,6 +579,13 @@ class AscendAttnBackend(AttentionBackend):
             return False
         mode = forward_batch.forward_mode
         if self.use_dsa:
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            if (
+                isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+                and dcp_metadata.extend_gather_plan is not None
+            ):
+                # This extend gathered the prefix KV; not a partial decode.
+                return False
             return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
         return self.use_mla and (mode.is_decode() or mode.is_target_verify())
 
@@ -887,6 +895,18 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.dcp_seq_lens_cpu_int.to(
                         device=self.device, dtype=torch.int32
                     )
+                )
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            # Here, not in the model's prepare: deciding needs the forward mode
+            # and extend_seq_lens_cpu, which prepare is not given. Dense MLA
+            # DCP (main) takes no gather; planning for it would plan unread.
+            if self.use_dsa and isinstance(
+                dcp_metadata, NPUDecodeContextParallelMetadata
+            ):
+                dcp_metadata.extend_gather_plan = build_dcp_extend_gather_plan(
+                    forward_batch,
+                    interleave_size=self.page_size,
+                    device=self.device,
                 )
 
         if (
@@ -1481,6 +1501,57 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = True
 
+    def _forward_sparse_dcp_gathered(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: Optional[torch.Tensor],
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        dcp_metadata: NPUDecodeContextParallelMetadata,
+    ) -> torch.Tensor:
+        """DCP extend over the context the model gathered, one contiguous run
+        per request: TND keys, cumulative lengths, no block table.
+
+        Relative indices, cumulative lengths. Three of the four conventions
+        return plausible garbage: re-probe before changing.
+        """
+        if self.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                f"KV cache dtype {self.kv_cache_dtype} with decode context "
+                "parallelism is not supported: the gathered extend path is "
+                "bf16/fp16 only."
+            )
+        key_nope, key_rope = dcp_metadata.extend_kv
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
+            key=key_nope,
+            value=key_nope,
+            query_rope=q_pe,
+            key_rope=key_rope,
+            sparse_indices=_expand_dsa_sparse_indices(topk_indices),
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            sparse_block_size=1,
+            layout_query="TND",
+            # layout_kv must equal layout_query unless it is PA_BSND. The block
+            # table is omitted, not passed as None: to a tiling function the two
+            # are not always the same thing.
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        return attn_out
+
     def _prepare_paged_mtp_metadata(
         self,
         metadata: ForwardMetadata,
@@ -2050,9 +2121,27 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.reshape(
                 k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
             )
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if getattr(self.token_to_kv_pool, "layer_shard_enabled", False):
+                # The split pool caches the CP-gathered full-sequence copy on
+                # non-owner ranks, skipping the get-time owner broadcast.
+                # Only safe when this write covers the whole read range: a
+                # cached prefix leaves earlier scratch rows stale, and those
+                # reads must keep the owner broadcast.
+                prefix_lens = forward_batch.extend_prefix_lens_cpu
+                no_prefix = prefix_lens is not None and all(n == 0 for n in prefix_lens)
+                use_cp = dsa_use_prefill_cp(forward_batch)
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    k_rope,
+                    cp_gathered_full=(use_cp and no_prefix),
+                    cp_gathered_chunk=(use_cp and not no_prefix),
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -2138,6 +2227,21 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            # extend_kv is set by the model only for a DCP extend that gathered the KV.
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            if (
+                isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+                and dcp_metadata.extend_kv is not None
+            ):
+                return self._forward_sparse_dcp_gathered(
+                    q_nope,
+                    q_pe,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    dcp_metadata,
+                )
+
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
@@ -2166,6 +2270,29 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
+                # npu_sparse_flash_attention requires the GQA group size
+                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
+                # has 96 q heads / 32 kv heads (group size 3), so pad the query
+                # heads to the next power of two by duplicating the last head
+                # and slice the padding off the output.
+                num_q_heads = q_nope.shape[1]
+                pad_heads = next_power_of_2(num_q_heads)
+                if pad_heads != num_q_heads:
+                    extra = pad_heads - num_q_heads
+                    q_nope = torch.cat(
+                        (
+                            q_nope,
+                            q_nope[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
+                    q_pe = torch.cat(
+                        (
+                            q_pe,
+                            q_pe[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                     query=q_nope,
                     key=k_nope,
@@ -2188,6 +2315,8 @@ class AscendAttnBackend(AttentionBackend):
                     attention_mode=2,
                     return_softmax_lse=False,
                 )
+                if pad_heads != num_q_heads:
+                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
@@ -2532,7 +2661,7 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
                 else:
-                    attn_out = attention_sinks_prefill_triton(
+                    attn_out = attention_sinks_prefill(
                         q,
                         k_cache,
                         v_cache,
@@ -3922,7 +4051,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                attn_out = attention_sinks_triton(
+                attn_out = attention_sinks(
                     q,
                     k_cache,
                     v_cache,
@@ -4330,7 +4459,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
-                    attn_out = attention_sinks_triton(
+                    attn_out = attention_sinks(
                         q,
                         k_cache,
                         v_cache,
