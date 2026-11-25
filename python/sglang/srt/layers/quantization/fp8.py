@@ -2193,10 +2193,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # AMD FP4 experts: use aiter's native MXFP4 MoE path.
             elif not self.dequant_fp4_to_fp8:
-                gu_intv = (
-                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.is_set()
-                    and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                requires_interleave_default = (
+                    _is_gfx1250_supported
+                    or getattr(layer, "fp8_activations", None) is not None
                 )
+                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.is_set():
+                    gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                else:
+                    gu_intv = requires_interleave_default
                 fp4_weight_dtype = _require_fp4_dtype()
 
                 # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
