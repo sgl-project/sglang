@@ -14,14 +14,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx942_supported
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import _ue8m0
 from sglang.kernels.ops.moe.inkling2_route import ROUTE_MAX_IDS, route_metadata
 from sglang.kernels.ops.moe.inkling_moe import (
     compute_expert_block_metadata,
     compute_grouped_gemm_metadata,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx942_supported, is_hip
 
 
 @triton.jit
