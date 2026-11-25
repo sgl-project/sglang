@@ -31,7 +31,7 @@ runs:
   using: composite
   steps:
     # No token here: pip runs without user-site, pip config, or PIP_* left on
-    # the persistent runner, and installs only hash-pinned wheels.
+    # the persistent runner, and installs only exact-pinned wheels from pypi.org.
     - name: Install prefetch dependencies
       shell: bash
       run: |
