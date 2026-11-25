@@ -33,9 +33,10 @@ from sglang.srt.hardware_backend.npu.eplb.placement import (
     plan_migration,
 )
 from sglang.srt.hardware_backend.npu.eplb.weights import (
+    _allocate_migration_warmup_buffers,
     _ExpertWeightAdapter,
     _validate_migration_topology,
-    prewarm_eplb_communication,
+    _warm_migration_group,
 )
 from sglang.srt.utils import get_bool_env_var
 
@@ -671,18 +672,16 @@ class NpuEplbRuntime:
         self._owner_stream.synchronize()
         self._routing_plan = None
 
-    def open_transport(self, timeout, p2p_options) -> None:
+    def open_transport(self, timeout, p2p_options, tp_probe, warmup_buffers) -> None:
         self.plan_group = dist.new_group(backend="gloo", timeout=timeout)
         # Background P2P and foreground TP can be submitted in different orders.
         self.p2p_group = dist.new_group(
             backend="hccl", timeout=timeout, pg_options=p2p_options
         )
         # Warm the recorder's TP reduction before KV sizing.
-        dist.all_reduce(
-            torch.zeros(1, dtype=torch.int32, device=self.device),
-            group=get_eplb_group(),
-        )
-        prewarm_eplb_communication(self.p2p_group)
+        dist.all_reduce(tp_probe, group=get_eplb_group())
+        if warmup_buffers is not None:
+            _warm_migration_group(self.p2p_group, *warmup_buffers)
 
     def close(self) -> None:
         dist.destroy_process_group(self.p2p_group)
@@ -724,6 +723,23 @@ def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
     )
 
 
+def _hccl_blocking_wait() -> bool:
+    # Match c10d's boolean parsing and TorchNPU's preference for the newer name.
+    blocking = False
+    for name in ("HCCL_BLOCKING_WAIT", "TORCH_HCCL_BLOCKING_WAIT"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        value = value.lower()
+        if value in ("y", "yes", "1", "t", "true"):
+            blocking = True
+        elif value in ("n", "no", "0", "f", "false"):
+            blocking = False
+        else:
+            raise ValueError(f"Invalid value for environment variable: {name}")
+    return blocking
+
+
 def create_npu_async_eplb(model_config, model, *, startup_weight_load):
     from sglang.srt.runtime_context import (
         get_disagg,
@@ -760,6 +776,7 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
             raise ValueError("HCCL_BUFFSIZE must be positive")
         p2p_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
         p2p_options.hccl_config = {"hccl_buffer_size": p2p_buffer_mib}
+        blocking_wait = _hccl_blocking_wait()
         runtime = NpuEplbRuntime(
             weights,
             metadata,
@@ -786,6 +803,11 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
             raise ValueError(
                 "Async EPLB weight rows do not match the local expert count"
             )
+        # Vote on local allocations before any rank posts a device collective.
+        tp_probe = torch.zeros(1, dtype=torch.int32, device=runtime.device)
+        warmup_buffers = (
+            _allocate_migration_warmup_buffers(world_size) if world_size > 1 else None
+        )
         signature = (
             runtime.layer_ids,
             runtime.weight_format_digest,
@@ -823,17 +845,25 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
         )
     for _, narrowed_layers in peers:
         runtime.narrowed_replica_layers.update(narrowed_layers)
-    runtime.open_transport(timeout, p2p_options)
+    runtime.open_transport(timeout, p2p_options, tp_probe, warmup_buffers)
+    del tp_probe, warmup_buffers
+    torch.npu.empty_cache()
+    if decode_worker and blocking_wait:
+        logger.warning(
+            "Async NPU EPLB decode waits for each layer's HCCL transfers with "
+            "TORCH_HCCL_BLOCKING_WAIT enabled (including its HCCL_BLOCKING_WAIT alias)"
+        )
     weight_staging_bytes = sum(t.nbytes for t in runtime.staging)
     packed_fields = runtime._packed_fields
     if packed_fields is not None:
         weight_staging_bytes += packed_fields.send.nbytes
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d layers_per_chunk=1 packed_fields=%d",
+        "hccl_buffer_mib=%d hccl_blocking_wait=%s layers_per_chunk=1 packed_fields=%d",
         weight_staging_bytes,
         sum(row.nbytes for row in runtime._routing_buffers.values()),
         p2p_buffer_mib,
+        blocking_wait,
         len(packed_fields.small) if packed_fields is not None else 0,
     )
     return AsyncEplbCoordinator(control, runtime)

@@ -426,25 +426,40 @@ class _ExpertWeightAdapter:
         ]
 
 
-def prewarm_eplb_communication(group: dist.ProcessGroup | None = None) -> None:
+def prewarm_eplb_communication() -> None:
     """Warm the migration communicator before KV sizing."""
-    if group is None:
-        from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-        # The async runtime warms its dedicated group after weight loading.
-        if get_exec().moe.eplb_async_rebalance:
-            return
-        group = get_parallel().tp_group.device_group
+    # The async runtime warms its dedicated group after weight loading.
+    if get_exec().moe.eplb_async_rebalance:
+        return
+    group = get_parallel().tp_group.device_group
     world_size = dist.get_world_size(group)
     _validate_migration_topology(world_size)
     if world_size == 1:
         return
+    buffers = _allocate_migration_warmup_buffers(world_size)
+    _warm_migration_group(group, *buffers)
+    del buffers
+    torch.npu.empty_cache()
+
+
+def _allocate_migration_warmup_buffers(
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     send = torch.empty(_EPLB_WARMUP_BYTES_PER_PEER, dtype=torch.uint8, device="npu")
     recv = torch.empty(
         (world_size - 1, send.numel()), dtype=send.dtype, device=send.device
     )
+    return send, recv
+
+
+def _warm_migration_group(
+    group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor
+) -> None:
     ops = []
     rank = dist.get_rank()
+    world_size = dist.get_world_size(group)
     for slot, peer in enumerate(p for p in range(world_size) if p != rank):
         ops.extend(
             [
@@ -456,5 +471,3 @@ def prewarm_eplb_communication(group: dist.ProcessGroup | None = None) -> None:
         work.wait()
     dist.all_reduce(send.view(torch.int32), group=group)
     torch.npu.synchronize()
-    del ops, send, recv
-    torch.npu.empty_cache()

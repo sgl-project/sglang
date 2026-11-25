@@ -428,7 +428,9 @@ def _balance_recorded_steps(
     samples = counts.numpy()
     order = np.tile(slots, (layers, 1, 1))
     totals = samples.sum(axis=2)
-    eligible = np.flatnonzero(np.count_nonzero(totals, axis=0) >= 2)
+    eligible = np.intersect1d(
+        np.flatnonzero(np.count_nonzero(totals, axis=0) >= 2), layer_ids
+    )
     if not len(eligible):
         return physical, logical
     replicas = np.stack([np.bincount(row, minlength=logical.shape[1]) for row in ids])
@@ -458,7 +460,7 @@ def _balance_recorded_steps(
 
     baseline = {}
     headroom = {}
-    for layer in np.intersect1d(eligible, layer_ids):
+    for layer in eligible:
         baseline[layer], lower = evaluate(layer, order[layer])
         headroom[layer] = (1 - lower / baseline[layer]).sum()
 
