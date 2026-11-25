@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the ``sglang.srt.layers.attention.minimax_sparse`` subpackage."""
 
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.minimax_sparse import (
     MiniMaxBF16SparseAttnBackend,
@@ -15,15 +18,17 @@ from sglang.srt.layers.attention.minimax_sparse import (
     MiniMaxNPUSparseAttnBackend,
     MiniMaxROCmSparseAttnBackend,
     MiniMaxSparseAttnBackend,
-    MiniMaxSparseBaseBackend,
-    MiniMaxSparseNvfp4AttnBackend,
 )
 from sglang.srt.layers.attention.minimax_sparse import base as base_module
 from sglang.srt.layers.attention.minimax_sparse import (
     build_minimax_attn_backend,
     resolve_minimax_sparse_backend_cls,
 )
+from sglang.srt.layers.attention.minimax_sparse_ops import indexer_cp as indexer_cp_mod
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,18 +50,84 @@ class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
             model_config=SimpleNamespace(quantization=quantization),
         )
 
-    def test_subclass_hierarchy(self):
-        for cls in (
-            MiniMaxBF16SparseAttnBackend,
-            MiniMaxROCmSparseAttnBackend,
-            MiniMaxNPUSparseAttnBackend,
-            MiniMaxMSAV1AttnBackend,
-        ):
-            self.assertTrue(issubclass(cls, MiniMaxSparseBaseBackend))
-            self.assertTrue(issubclass(cls, MiniMaxSparseAttnBackend))
-            self.assertTrue(issubclass(cls, AttentionBackend))
+    def test_package_import_keeps_concrete_backends_lazy(self):
+        """Importing ``minimax_sparse`` must not eagerly load ``msa_v1_backend`` /
+        ``msa_plan`` (which mutates ``FMHA_SM100_ALLOW_JIT`` and scans package metadata)."""
+        code = "\n".join(
+            [
+                "import os, sys",
+                "os.environ.pop('FMHA_SM100_ALLOW_JIT', None)",
+                "import sglang.srt.layers.attention.minimax_sparse",
+                "assert 'FMHA_SM100_ALLOW_JIT' not in os.environ",
+                "for mod in ('msa_v1_backend', 'bf16_backend', 'rocm_backend', 'npu_backend'):",
+                "    assert f'sglang.srt.layers.attention.minimax_sparse.{mod}' not in sys.modules",
+                "assert 'sglang.srt.layers.attention.minimax_sparse_ops.msa_plan' not in sys.modules",
+            ]
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)
 
-        self.assertIs(MiniMaxSparseNvfp4AttnBackend, MiniMaxMSAV1AttnBackend)
+    def test_indexer_cp_reads_subclass_fields_after_subclass_init(self):
+        """``make_indexer_cp`` inspects ``use_dense_sparse_decode`` and ``kv_is_nvfp4``,
+        which subclasses set after ``super().__init__()``."""
+        hf_config = SimpleNamespace(
+            text_config=None,
+            sparse_attention_config={
+                "sparse_index_dim": 128,
+                "sparse_block_size": 128,
+                "sparse_topk_blocks": 16,
+                "sparse_num_index_heads": 4,
+                "sparse_init_block": 0,
+                "sparse_local_block": 1,
+                "sparse_attention_freq": [1, 1, 1, 1],
+                "sparse_disable_index_value": [1, 1, 1, 1],
+                "sparse_score_type": "max",
+            },
+        )
+        seen = []
+
+        def record_make_indexer_cp(backend, runner, sparse_cfg):
+            seen.append((backend.use_dense_sparse_decode, backend.kv_is_nvfp4))
+            return "cp-sentinel"
+
+        for pool_cls, backend_cls, expect_nvfp4 in (
+            (MiniMaxSparseKVPool, MiniMaxBF16SparseAttnBackend, False),
+            (MiniMaxM3Nvfp4KVPool, MiniMaxROCmSparseAttnBackend, True),
+        ):
+            pool = object.__new__(pool_cls)
+            pool.page_size = 128
+            pool.main_pool = SimpleNamespace(dtype=torch.bfloat16, head_num=1)
+            runner = SimpleNamespace(
+                token_to_kv_pool=pool,
+                hisparse_coordinator=None,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 128)),
+                model_config=SimpleNamespace(
+                    context_len=1024,
+                    num_attention_heads=64,
+                    hf_config=hf_config,
+                    quantization=None,
+                    get_total_num_kv_heads=lambda: 4,
+                ),
+                server_args=SimpleNamespace(
+                    m3_fp8_attn_gemm=False, kv_cache_dtype="auto"
+                ),
+            )
+            with (
+                get_context().override_server_args(
+                    speculative_algorithm=None,
+                    speculative_eagle_topk=None,
+                    speculative_num_draft_tokens=None,
+                ),
+                envs.SGLANG_DISABLE_MSA.override(True),
+                envs.SGLANG_MINIMAX_M3_INDEXER_CP.override(True),
+                patch.object(
+                    indexer_cp_mod,
+                    "make_indexer_cp",
+                    side_effect=record_make_indexer_cp,
+                ),
+            ):
+                backend = backend_cls(runner)
+            self.assertEqual(backend.indexer_cp, "cp-sentinel")
+            self.assertEqual(seen[-1], (False, expect_nvfp4))
 
     def test_resolve_backend_cls_by_platform_and_quantization(self):
         with (
@@ -126,7 +197,13 @@ class TestMiniMaxSparseSubpackageDispatch(CustomTestCase):
         sentinel = object()
         with (
             patch.object(pkg, "uses_minimax_m3_nvfp4_native_stack", return_value=True),
-            patch.object(pkg, "MiniMaxMSAV1AttnBackend", return_value=sentinel),
+            patch.object(
+                sys.modules[
+                    "sglang.srt.layers.attention.minimax_sparse.msa_v1_backend"
+                ],
+                "MiniMaxMSAV1AttnBackend",
+                return_value=sentinel,
+            ),
         ):
             self.assertIs(build_minimax_attn_backend(runner, dense), sentinel)
 

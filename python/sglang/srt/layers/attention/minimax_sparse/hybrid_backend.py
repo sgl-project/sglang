@@ -12,7 +12,6 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.minimax_sparse.base import MiniMaxSparseBaseBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.utils import is_gfx95_supported, is_hip
 
 
 class MiniMaxHybridAttnBackend(AttentionBackend):
@@ -30,14 +29,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
-        skip_fn = getattr(sparse_backend, "skips_unused_dense_metadata", None)
-        if skip_fn is not None:
-            skip_dense_meta = skip_fn()
-        else:
-            skip_dense_meta = (
-                is_hip() and is_gfx95_supported() and not sparse_backend.dense_layer_ids
-            )
-        self._builds_dense_metadata = not skip_dense_meta
+        self._builds_dense_metadata = not sparse_backend.skips_unused_dense_metadata()
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)

@@ -36,6 +36,8 @@ class MiniMaxSparseBaseBackend(AttentionBackend):
     preserving ``isinstance(..., MiniMaxSparseAttnBackend)`` across all subclasses.
     """
 
+    _linear_verify: bool = False
+
     def __new__(cls, runner: Optional[ModelRunner] = None, *args, **kwargs):
         if cls is MiniMaxSparseBaseBackend and runner is not None:
             target_cls = resolve_minimax_sparse_backend_cls(runner)
@@ -120,12 +122,7 @@ class MiniMaxSparseBaseBackend(AttentionBackend):
 
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.dense_backend: Optional[AttentionBackend] = None
-
-        from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
-            make_indexer_cp,
-        )
-
-        self.indexer_cp = make_indexer_cp(self, runner, sparse_cfg)
+        self.indexer_cp = None
 
     def skips_unused_dense_metadata(self) -> bool:
         return False
@@ -247,10 +244,7 @@ class MiniMaxSparseBaseBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
         out_quant: str = "",
     ):
-        if (
-            getattr(self, "_linear_verify", False)
-            and forward_batch.forward_mode.is_target_verify()
-        ):
+        if self._linear_verify and forward_batch.forward_mode.is_target_verify():
             return self._forward_linear_verify_funnel(
                 q,
                 k,
@@ -284,8 +278,7 @@ def resolve_minimax_sparse_backend_cls(
 
         return MiniMaxROCmSparseAttnBackend
 
-    quantization = getattr(getattr(runner, "model_config", None), "quantization", None)
-    if uses_minimax_m3_nvfp4_native_stack(quantization):
+    if uses_minimax_m3_nvfp4_native_stack(runner.model_config.quantization):
         from sglang.srt.layers.attention.minimax_sparse.msa_v1_backend import (
             MiniMaxMSAV1AttnBackend,
         )

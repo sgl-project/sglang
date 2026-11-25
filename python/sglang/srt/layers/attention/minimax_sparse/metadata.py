@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
+import msgspec
 import torch
 
 
@@ -17,8 +17,7 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
     return q.to(torch.float8_e4m3fn)
 
 
-@dataclass
-class MiniMaxSparseForwardMetadata:
+class MiniMaxSparseForwardMetadata(msgspec.Struct):
     """Per-forward plan container for MiniMax sparse attention backends."""
 
     msa_v1_decode_plan: Any = None

@@ -123,6 +123,12 @@ class MiniMaxBF16SparseAttnBackend(MiniMaxSparseBaseBackend):
         # decode kernels with one causal query per draft row.
         self._linear_verify = not self._use_msa_decode
 
+        from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
+            make_indexer_cp,
+        )
+
+        self.indexer_cp = make_indexer_cp(self, runner, self._sparse_cfg)
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "

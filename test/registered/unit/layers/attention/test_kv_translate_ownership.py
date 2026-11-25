@@ -129,6 +129,9 @@ class _Inner(AttentionBackend):
         self.max_context_len = 8
         self.dense_layer_ids = []
 
+    def skips_unused_dense_metadata(self):
+        return False
+
 
 class _InnerModelConfig:
     context_len = 8
