@@ -135,10 +135,10 @@ def _decode_partials(
         tile_lo = first // BLOCK_N + split * per_split
         tile_hi = tl.minimum(tile_lo + per_split, first // BLOCK_N + tiles)
     else:
-        # No window: keys [0, inner) are at least EXTENT behind every query row and
-        # run as INTERIOR-key tiles, the rest as BLOCK_N-key masked tiles. A split
-        # takes an equal share of the tiles of both kinds, interior ones first, so a
-        # sequence with no interior tile is split as main splits it.
+        # No window: keys [0, inner) are at least EXTENT behind every query row; whole
+        # INTERIOR-key tiles of them run unmasked, the rest as BLOCK_N-key masked tiles.
+        # A split takes an equal share of the tiles of both kinds, interior ones first,
+        # so a sequence with no interior tile is split as main splits it.
         tl.static_assert(WINDOW < 0)
         tl.static_assert(INTERIOR % BLOCK_N == 0)
         inner = tl.maximum(seqlen - QLEN - EXTENT + 1, 0)
@@ -309,8 +309,8 @@ def decode_partials(
         prefetch,
         num_warps=4,
         num_stages=2 if qlen == 1 or prefetch else 3,
-        # 64 rows: 204 registers, 212-217 without; with it 8-token blocks ran up to 2.8%
-        # faster at 1 unit, 4.9% slower at 16 (H200). 32-row blocks were timed with it.
+        # 64-row launches: 203-204 registers (212-217 uncapped), and up to 2.8% faster
+        # at 1 sequence x KV head, 4.9% slower at 16 (H200); 32 rows were timed capped.
         maxnreg=232 if prefetch else None,
         launch_pdl=True,
     )

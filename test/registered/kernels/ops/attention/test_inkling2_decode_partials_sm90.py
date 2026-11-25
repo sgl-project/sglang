@@ -161,16 +161,18 @@ def test_sequences_without_interior_tiles_keep_main_split(monkeypatch):
     outputs and row sums up to the order of their FP32 sums."""
     from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
 
-    inputs = _attention_inputs(6, 1, 8, None, 128)
+    qlen = 8
+    inputs = _attention_inputs(6, 1, qlen, None, 128)
     seqused = inputs[4]
-    tile, _ = attn._verify_path(8, 6, None)
-    has_interior = (seqused - 8 - EXTENT + 1) // tile > 0
+    tile, _ = attn._verify_path(qlen, 6, None)
+    has_interior = (seqused - qlen - EXTENT + 1) // tile > 0
     assert has_interior.any() and not has_interior.all()
     mixed = attn.decode_partials(*inputs, SCALE)
     monkeypatch.setattr(attn, "_verify_path", lambda *args: (0, False))
     plain = attn.decode_partials(*inputs, SCALE)
-    rows = (~has_interior).repeat_interleave(8)
-    (o, m, l), (o0, m0, l0) = ([x[:, rows] for x in out] for out in (mixed, plain))
+    rows = (~has_interior).repeat_interleave(qlen)
+    o, m, l = (x[:, rows] for x in mixed)
+    o0, m0, l0 = (x[:, rows] for x in plain)
     assert torch.equal(m, m0)
     torch.testing.assert_close(o, o0, rtol=1e-6, atol=0)
     torch.testing.assert_close(l, l0, rtol=1e-6, atol=0)
