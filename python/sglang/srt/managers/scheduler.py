@@ -337,7 +337,6 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -1558,9 +1557,13 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
+    def create_schedule_policy(self, *args, **kwargs) -> SchedulePolicy:
+        # Override point for deployments that need a specialized policy.
+        return SchedulePolicy(*args, **kwargs)
+
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(
+        self.policy = self.create_schedule_policy(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
@@ -1574,13 +1577,6 @@ class Scheduler(
             uniboost_rank_invariant=get_parallel().tp_size > 1
             or get_parallel().pp_size > 1,
             uniboost_step_clock=lambda: self.forward_ct,
-            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
-                chunked_prefill_size=self.chunked_prefill_size,
-                halving_chunks=get_schedule().shortest_prefill_boundary_halving_chunks,
-                decay_start_chunks=get_schedule().shortest_prefill_boundary_decay_start_chunks,
-                budget_min_ratio=get_schedule().shortest_prefill_budget_min_ratio,
-                budget_doubling_chunks=get_schedule().shortest_prefill_budget_doubling_chunks,
-            ),
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
