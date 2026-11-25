@@ -69,6 +69,18 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         assert all(disallowed_token_ids == c["token_ids"] for c in custom_param_list), (
             f"{custom_param_list=}"
         )
+        # Validate before indexing: a negative id wraps around and silently
+        # bans an unrelated token, while an id >= vocab_size aborts the CUDA
+        # context with a device-side assert.
+        vocab_size = logits.shape[-1]
+        if not all(
+            type(token_id) is int and 0 <= token_id < vocab_size
+            for token_id in disallowed_token_ids
+        ):
+            raise ValueError(
+                f"Disallowed token ids must be integers in [0, {vocab_size}), "
+                f"got {disallowed_token_ids}."
+            )
         logits[..., disallowed_token_ids] = -float("inf")
         return logits
 
