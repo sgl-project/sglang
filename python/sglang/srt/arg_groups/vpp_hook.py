@@ -24,6 +24,8 @@ def validate_vpp_options(server_args: Any) -> None:
                 "--pp-vpp-layer-partition requires --pp-virtual-stages > 1"
             )
         return
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError("VPP requires --disaggregation-mode prefill")
     device = cfg.device
     if (device is not None and device != "cuda") or (
         device is None and not get_platform().is_cuda
@@ -62,22 +64,16 @@ def validate_vpp_options(server_args: Any) -> None:
     for feature, enabled in unsupported:
         if enabled:
             raise ValueError(f"VPP does not support {feature} yet")
-    if cfg.disaggregation_mode != "null":
-        if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
-            raise ValueError("VPP PD requires Mooncake or NIXL")
-        if cfg.optimistic_prefill_attempts or (
-            cfg.disaggregation_decode_allocation_policy != "early"
-        ):
-            raise ValueError(
-                "VPP PD requires early allocation without optimistic prefill"
-            )
-        if (
-            cfg.disaggregation_decode_enable_offload_kvcache
-            or cfg.enable_pd_role_switch
-        ):
-            raise ValueError(
-                "VPP PD does not support KV offload or runtime role switch yet"
-            )
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+        raise ValueError("VPP PD requires Mooncake or NIXL")
+    if cfg.optimistic_prefill_attempts or (
+        cfg.disaggregation_decode_allocation_policy != "early"
+    ):
+        raise ValueError("VPP PD requires early allocation without optimistic prefill")
+    if cfg.disaggregation_decode_enable_offload_kvcache or cfg.enable_pd_role_switch:
+        raise ValueError(
+            "VPP PD does not support KV offload or runtime role switch yet"
+        )
     if cfg.scheduler_recv_interval > 1:
         raise ValueError("VPP requires one input poll per iteration")
     if os.getenv("SGLANG_PP_LAYER_PARTITION") is not None:

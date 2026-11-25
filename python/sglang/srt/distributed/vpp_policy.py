@@ -20,7 +20,6 @@ class PipelineControlKind(str, Enum):
     REQUEST = "request"
     BOOTSTRAP_STATUS = "bootstrap_status"
     TRANSFER_STATUS = "transfer_status"
-    DECODE_STATUS = "decode_status"
     ADMIT = "admit"
     CANCEL = "cancel"
     FIRST_PASS_DONE = "first_pass_done"
@@ -189,8 +188,8 @@ class PipelineRankSchedule:
         if not available:
             return None
         if self.prefill_burst_size == 1:
-            decode = [item for item in available if item[1] >= self.physical_size]
-            selected = decode if decode else available
+            later_stages = [item for item in available if item[1] >= self.physical_size]
+            selected = later_stages if later_stages else available
         else:
             preferred_stage = self.physical_rank + (
                 0 if self._burst_first_pass else self.physical_size

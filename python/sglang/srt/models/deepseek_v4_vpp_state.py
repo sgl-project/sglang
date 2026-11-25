@@ -19,8 +19,6 @@ def stage_hash_ids(stage_id, hasher, input_ids, batch, tensors):
 
 def request_rows(batch, extend_lens=None, num_rows=None):
     requests = batch.req_pool_indices.to(torch.int64)
-    if batch.forward_mode.is_decode():
-        return requests
     return torch.repeat_interleave(
         requests,
         (batch.extend_seq_lens if extend_lens is None else extend_lens).to(torch.int64),
@@ -58,14 +56,11 @@ def logical_selection(slots, batch, req_to_token, page_size, ratio, extend_lens=
     )
     physical, logical = table.sort(dim=1)
     rows = torch.arange(table.shape[0], device=table.device)
-    if not batch.forward_mode.is_decode():
-        rows = torch.repeat_interleave(
-            rows,
-            (batch.extend_seq_lens if extend_lens is None else extend_lens).to(
-                torch.int64
-            ),
-            output_size=slots.shape[0],
-        )
+    rows = torch.repeat_interleave(
+        rows,
+        (batch.extend_seq_lens if extend_lens is None else extend_lens).to(torch.int64),
+        output_size=slots.shape[0],
+    )
     compressed_page = page_size // ratio
     selected_pages = slots.to(torch.int64).clamp_min(0) // compressed_page
     indices = torch.searchsorted(
@@ -147,7 +142,7 @@ def install_state(tensors, *, batch, pool, req_to_token, metadata):
                 raw, batch, req_to_token, ratio, extend_lens
             ),
             topk_lengths=tensors["vpp_index_lengths"],
-            raw_indices=raw if not batch.forward_mode.is_decode() else None,
+            raw_indices=raw,
         )
     if "vpp_candidate_kind" in tensors:
         metadata.candidate_metadata = _install_candidates(
@@ -159,7 +154,6 @@ def _export_candidates(tensors, candidate):
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         _SparsePrefillTable,
-        _SparseTable,
     )
 
     if candidate is None:
@@ -170,18 +164,17 @@ def _export_candidates(tensors, candidate):
         tensors["vpp_candidate_rows"] = candidate.rows_per_request
         if candidate.decode_mask is not None:
             tensors["vpp_candidate_mask"] = candidate.decode_mask
-    elif isinstance(candidate, _SparseTable):
+    elif isinstance(candidate, _SparsePrefillTable):
         # The source publishes on a side stream. Join it before the scheduler
         # snapshots these tensors and records the stage's producer-ready event.
         torch.cuda.current_stream().wait_event(candidate.ready)
         tensors["vpp_candidate_kind"] = "sparse"
         tensors["vpp_candidate_blocks"] = candidate.blocks
         tensors["vpp_candidate_lengths"] = candidate.valid_lens
-        if isinstance(candidate, _SparsePrefillTable):
-            tensors["vpp_candidate_compress_lens"] = candidate.compress_lens
-            tensors["vpp_candidate_request_ids"] = candidate.request_ids
-            tensors["vpp_candidate_rows"] = candidate.rows_per_request
-            tensors["vpp_candidate_q_dtype"] = str(candidate.q_dtype).split(".")[-1]
+        tensors["vpp_candidate_compress_lens"] = candidate.compress_lens
+        tensors["vpp_candidate_request_ids"] = candidate.request_ids
+        tensors["vpp_candidate_rows"] = candidate.rows_per_request
+        tensors["vpp_candidate_q_dtype"] = str(candidate.q_dtype).split(".")[-1]
     else:
         raise TypeError(f"Unsupported VPP candidate metadata: {type(candidate)}")
 
@@ -213,17 +206,12 @@ def _install_candidates(tensors, batch, pool, req_to_token, extend_lens=None):
         ].to(torch.int32)
         // index_page_size
     )
-    prefill = not batch.forward_mode.is_decode()
     return _build_prefill_table(
         blocks=blocks,
-        compress_lens=tensors["vpp_candidate_compress_lens"]
-        if prefill
-        else batch.seq_lens.to(torch.int32),
+        compress_lens=tensors["vpp_candidate_compress_lens"],
         page_table=table.contiguous(),
         page_size=index_page_size,
-        request_ids=tensors["vpp_candidate_request_ids"]
-        if prefill
-        else torch.arange(blocks.shape[0], device=blocks.device, dtype=torch.int32),
+        request_ids=tensors["vpp_candidate_request_ids"],
         rows_per_request=tensors.get("vpp_candidate_rows"),
         q_dtype=getattr(torch, tensors.get("vpp_candidate_q_dtype", "uint8")),
         valid_lens=tensors["vpp_candidate_lengths"],

@@ -90,7 +90,9 @@ class TestDSV4CompressedPools(CustomTestCase):
             req_pool_indices=torch.tensor([1, 0]),
             seq_lens_cpu=[8, 8],
             seq_lens=torch.tensor([8, 8]),
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor([1, 1]),
+            input_ids=torch.zeros(2, dtype=torch.int64),
         )
         mapping = torch.tensor(
             [[8, 9, 10, 11, 4, 5, 6, 7], [20, 21, 22, 23, 12, 13, 14, 15]]
@@ -99,6 +101,8 @@ class TestDSV4CompressedPools(CustomTestCase):
             "vpp_candidate_kind": "sparse",
             "vpp_candidate_blocks": torch.tensor([[0], [0]], dtype=torch.int32),
             "vpp_candidate_lengths": torch.tensor([8, 8], dtype=torch.int32),
+            "vpp_candidate_compress_lens": torch.tensor([8, 8], dtype=torch.int32),
+            "vpp_candidate_request_ids": torch.tensor([0, 1], dtype=torch.int32),
         }
         with patch(
             "sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table._build_prefill_table"
@@ -191,30 +195,27 @@ class TestDSV4CompressedPools(CustomTestCase):
         consumer = torch.tensor(
             [[0, 1, 2, 3, 24, 25, 26, 27], [16, 17, 18, 19, 28, 29, 30, 31]]
         )
-        for mode in (ForwardMode.DECODE, ForwardMode.EXTEND):
-            for ratio in (1, 2):
-                with self.subTest(mode=mode, ratio=ratio):
-                    batch = SimpleNamespace(
-                        forward_mode=mode,
-                        req_pool_indices=torch.tensor([1, 0]),
-                        seq_lens=torch.tensor([8, 6]),
-                        seq_lens_cpu=[8, 6],
-                        extend_seq_lens=torch.tensor([2, 1]),
-                        input_ids=torch.zeros(3, dtype=torch.int64),
-                    )
-                    logical = torch.tensor([[0, 2, -1], [1, 2, -1]])
-                    if mode.is_extend():
-                        logical = logical[[0, 0, 1]]
-                    slots = physical_selection(logical, batch, producer, ratio)
-                    transported = logical_selection(slots, batch, producer, 4, ratio)
-                    self.assertTrue(torch.equal(transported, logical))
-                    actual = physical_selection(transported, batch, consumer, ratio)
-                    expected = physical_selection(logical, batch, consumer, ratio)
-                    self.assertTrue(torch.equal(actual, expected))
-                    self.assertFalse(torch.equal(actual, slots))
-                    self.assertEqual(
-                        full_page_ids(batch, producer, 4).tolist(), [5, 3, 2, 1]
-                    )
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    req_pool_indices=torch.tensor([1, 0]),
+                    seq_lens=torch.tensor([8, 6]),
+                    seq_lens_cpu=[8, 6],
+                    extend_seq_lens=torch.tensor([2, 1]),
+                    input_ids=torch.zeros(3, dtype=torch.int64),
+                )
+                logical = torch.tensor([[0, 2, -1], [0, 2, -1], [1, 2, -1]])
+                slots = physical_selection(logical, batch, producer, ratio)
+                transported = logical_selection(slots, batch, producer, 4, ratio)
+                self.assertTrue(torch.equal(transported, logical))
+                actual = physical_selection(transported, batch, consumer, ratio)
+                expected = physical_selection(logical, batch, consumer, ratio)
+                self.assertTrue(torch.equal(actual, expected))
+                self.assertFalse(torch.equal(actual, slots))
+                self.assertEqual(
+                    full_page_ids(batch, producer, 4).tolist(), [5, 3, 2, 1]
+                )
 
     def test_v41_tail_selections_keep_compact_rows_and_full_kv_pages(self):
         producer = torch.tensor(

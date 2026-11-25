@@ -1515,15 +1515,9 @@ class CommonKVManager(BaseKVManager):
 
         check_vpp_transfer_layers(
             info.vpp_layers,
-            self.vpp_layers,
             prefill_tp=info.attn_tp_size,
             decode_tp=self.attn_tp_size,
             decode_pp_size=self.pp_size,
-            allow_pp1_prefill=(
-                info.pp_size == 1
-                and get_disagg().disaggregation_transfer_backend == "mooncake"
-                and bool(self.kv_args.mla_compression_ratios)
-            ),
         )
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
@@ -1732,19 +1726,10 @@ class CommonKVManager(BaseKVManager):
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
         # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        pp1_to_vpp = (
-            info.pp_size == 1
-            and getattr(self, "vpp_layers", None) is not None
-            and get_disagg().disaggregation_transfer_backend == "mooncake"
-            and bool(self.kv_args.mla_compression_ratios)
-        )
-        assert self.pp_size == info.pp_size or self.pp_size == 1 or pp1_to_vpp, (
+        assert self.pp_size == info.pp_size or self.pp_size == 1, (
             f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
         )
-        if pp1_to_vpp:
-            target_pp_ranks = [0]
-            required_dst_info_num *= self.pp_size
-        elif info.pp_size == self.pp_size:
+        if info.pp_size == self.pp_size:
             target_pp_ranks = [self.pp_rank]
         else:
             target_pp_ranks = list(range(info.pp_size))

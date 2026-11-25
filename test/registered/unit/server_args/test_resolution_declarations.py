@@ -847,7 +847,7 @@ class TestVPPResolution(CustomTestCase):
         with tempfile.TemporaryDirectory(prefix="vpp_resolution_") as path:
             with open(os.path.join(path, "config.json"), "w") as handle:
                 json.dump(config, handle)
-            for role in ("null", "prefill", "decode"):
+            for role in ("prefill",):
                 with self.subTest(role=role):
                     args = ServerArgs(
                         model_path=path,
@@ -899,6 +899,7 @@ class TestVPPResolution(CustomTestCase):
             pp_size=parsed.pp_size,
             pp_virtual_stages=parsed.pp_virtual_stages,
             pp_vpp_layer_partition=parsed.pp_vpp_layer_partition,
+            disaggregation_mode="prefill",
         )
         model_config = self.model_config()
         with unittest.mock.patch(
@@ -926,11 +927,11 @@ class TestVPPResolution(CustomTestCase):
         self.assertFalse(args.disable_cuda_graph)  # The startup seed stays raw.
         self.assertFalse(args.disable_overlap_schedule)
 
-    def test_pd_keeps_eager_resolution_on_both_roles(self):
+    def test_pd_prefill_keeps_eager_resolution(self):
         from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.arg_groups.vpp_hook import handle_vpp
 
-        for role in ("prefill", "decode"):
+        for role in ("prefill",):
             for backend in ("mooncake", "nixl"):
                 with self.subTest(role=role, backend=backend):
                     args = ServerArgs(
@@ -958,11 +959,13 @@ class TestVPPResolution(CustomTestCase):
             ({"pp_virtual_stages": 0}, "positive integer"),
             ({"pp_size": 1}, "--pp-size"),
             ({"pp_async_batch_depth": -1}, "async batch"),
+            ({"disaggregation_mode": "decode"}, "--disaggregation-mode prefill"),
+            ({"disaggregation_mode": "null"}, "--disaggregation-mode prefill"),
             ({"attn_cp_size": 2}, "context parallelism"),
             ({"enable_attn_tp_input_scattered": True}, "input scattering"),
             ({"enable_two_batch_overlap": True}, "two-batch overlap"),
             (
-                {"disaggregation_mode": "decode", "enable_pd_role_switch": True},
+                {"enable_pd_role_switch": True},
                 "runtime role switch",
             ),
             (
@@ -971,21 +974,18 @@ class TestVPPResolution(CustomTestCase):
             ),
             (
                 {
-                    "disaggregation_mode": "decode",
                     "disaggregation_decode_allocation_policy": "prefill_complete",
                 },
                 "early allocation",
             ),
             (
                 {
-                    "disaggregation_mode": "decode",
                     "disaggregation_transfer_backend": "mori",
                 },
                 "Mooncake or NIXL",
             ),
             (
                 {
-                    "disaggregation_mode": "decode",
                     "disaggregation_decode_enable_offload_kvcache": True,
                 },
                 "KV offload",
@@ -1002,6 +1002,7 @@ class TestVPPResolution(CustomTestCase):
                         "device": "cuda",
                         "pp_size": 2,
                         "pp_virtual_stages": 2,
+                        "disaggregation_mode": "prefill",
                         **changes,
                     },
                 )
@@ -1021,7 +1022,11 @@ class TestVPPResolution(CustomTestCase):
         ):
             validate_vpp_options(
                 ServerArgs(
-                    model_path="dummy", device="cuda", pp_size=2, pp_virtual_stages=2
+                    model_path="dummy",
+                    device="cuda",
+                    pp_size=2,
+                    pp_virtual_stages=2,
+                    disaggregation_mode="prefill",
                 )
             )
 
@@ -1048,6 +1053,7 @@ class TestVPPResolution(CustomTestCase):
                         device="cuda",
                         pp_size=2,
                         pp_virtual_stages=2,
+                        disaggregation_mode="prefill",
                         **fields,
                     )
                 )
@@ -1122,7 +1128,7 @@ class TestVPPResolution(CustomTestCase):
         with tempfile.TemporaryDirectory(prefix="v41_vpp_resolution_") as path:
             with open(os.path.join(path, "config.json"), "w") as handle:
                 json.dump(config, handle)
-            for role in ("null", "prefill", "decode"):
+            for role in ("prefill",):
                 with self.subTest(role=role):
                     args = ServerArgs(
                         model_path=path,
@@ -1139,7 +1145,7 @@ class TestVPPResolution(CustomTestCase):
                     self.assertEqual(cfg.cuda_graph_config.decode.backend, "disabled")
                     self.assertEqual(cfg.cuda_graph_config.prefill.backend, "disabled")
                     self.assertTrue(cfg.enable_decoder_swa_bounded_replay)
-            with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            with self.assertRaisesRegex(ValueError, "outside PD prefill"):
                 ServerArgs(
                     model_path=path,
                     device="cuda",
@@ -1154,6 +1160,16 @@ class TestVPPResolution(CustomTestCase):
         args = ServerArgs(model_path="dummy", device="cpu", pp_size=2)
         handle_vpp(args)
         self.assertIsNone(resolve_vpp_layout(object(), args))
+        self.assertEqual(_stash_overlay(args), {})
+
+    def test_pp1_decode_keeps_default_resolution(self):
+        from sglang.srt.arg_groups.vpp_hook import handle_vpp
+
+        args = ServerArgs(
+            model_path="dummy", device="cuda", disaggregation_mode="decode"
+        )
+        handle_vpp(args)
+        self.assertEqual(args.pp_virtual_stages, 1)
         self.assertEqual(_stash_overlay(args), {})
 
 

@@ -362,7 +362,6 @@ from sglang.srt.mem_cache.kv.alloc.forward_steps import (
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
@@ -4459,10 +4458,7 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
-        elif (
-            getattr(self, "_vpp_admit_manifest", None) is not None
-            and self._vpp_admit_manifest["forward_mode"] == ForwardMode.DECODE.value
-        ) or self._should_defer_prefill(running_batch):
+        elif self._should_defer_prefill(running_batch):
             new_batch = None
             self._negotiate_prefill_delayer_while_deferring()
         else:

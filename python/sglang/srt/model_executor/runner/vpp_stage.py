@@ -12,8 +12,8 @@ def execute_vpp_stage(
     if not any(stage.stage_id == stage_id for stage in model.vpp_stages):
         raise ValueError("VPP stage does not belong to this model rank")
     mode = forward_batch.forward_mode
-    if not (mode.is_decode() or mode.is_extend() or mode.is_mixed()):
-        raise NotImplementedError("VPP execution supports extend and decode batches")
+    if not mode.is_extend() or mode.is_mixed():
+        raise NotImplementedError("VPP execution supports prefill batches only")
     if forward_batch.global_num_tokens_cpu is not None:
         raise NotImplementedError("VPP execution requires full rows without MLP sync")
     # No eager registry copy: each retained batch keeps its own input/KV-index
@@ -29,7 +29,7 @@ def execute_vpp_stage(
         kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
     if forward_batch.replace_embeds is not None:
         raise NotImplementedError("VPP replacement embeddings are not wired")
-    with device_timer_ctx(device_timer, "decode" if mode.is_decode() else "extend"):
+    with device_timer_ctx(device_timer, "extend"):
         return model.forward_vpp_stage(
             stage_id,
             forward_batch.input_ids,

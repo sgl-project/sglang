@@ -3007,19 +3007,6 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
 
         self.assertIsNone(info.num_draft_entries)
 
-    def test_vpp_layer_ownership_round_trips_and_is_optional(self):
-        manager = self._manager(2)
-        manager.kv_args.vpp_layers = [[0, 1, 4], [2, 3, 5]]
-        manager.kv_args.pp_rank = 1
-        msg = manager.build_receiver_registration_message()
-
-        info = KVArgsRegisterInfo.from_zmq(msg)
-        self.assertEqual(info.dst_vpp_layers, [2, 3, 5])
-        self.assertEqual(info.num_draft_entries, 2)
-        legacy = KVArgsRegisterInfo.from_zmq(msg[:23])
-        self.assertIsNone(legacy.dst_vpp_layers)
-        self.assertEqual(legacy.num_draft_entries, 2)
-
     def test_zero_draft_entries_round_trips(self):
         msg = self._manager(0).build_receiver_registration_message()
 

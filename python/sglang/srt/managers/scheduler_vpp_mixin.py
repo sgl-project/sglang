@@ -11,12 +11,10 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.distributed.vpp_policy import PipelineControlEnvelope
-from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
@@ -38,6 +36,8 @@ def _snapshot_tensors(tensors: dict) -> dict:
 class SchedulerVPPMixin(SchedulingVPPCore):
     @DynamicGradMode()
     def event_loop_vpp(self):
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            raise NotImplementedError("VPP scheduling supports prefill only")
         self._vpp_layout = self.tp_worker.model_runner.model.vpp_layout
         if self._vpp_layout.physical_size != 2 or self._vpp_layout.virtual_stages != 2:
             raise NotImplementedError("VPP scheduling requires PP2/VPP2")
@@ -203,62 +203,6 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         result.update(dict.fromkeys(failed, True))
         return result
 
-    def _pp_vpp_decode_poll(self, operation, slot_id):
-        self.disagg_decode_transfer_queue.resolve_deferred_releases()
-        self.disagg_decode_prealloc_queue.publish_pending_destinations()
-        self.disagg_decode_transfer_queue.publish_pending_metadata()
-        if operation == "retract":
-            queue = self.disagg_decode_prealloc_queue.retracted_queue
-            for req in queue:
-                if req.retraction_mb_id is None:
-                    req.retraction_mb_id = slot_id
-            return [req.rid for req in queue if req.retraction_mb_id == slot_id]
-        if operation == "prealloc":
-            queue = self.disagg_decode_prealloc_queue.queue
-            good, bad = self.get_rids(
-                list(queue.items()), False, [KVPoll.WaitingForInput], [KVPoll.Failed]
-            )
-            return self._route_aborts_to_bad(
-                good,
-                bad,
-                {
-                    req.rid
-                    for req in queue
-                    if isinstance(req.finished_reason, FINISH_ABORT)
-                },
-            )
-        if operation == "transfer":
-            queue = self.disagg_decode_transfer_queue
-            # Success must include staged scatters and metadata publication.
-            polls = (
-                queue._poll_with_staging()
-                if queue.enable_staging
-                else queue._poll_with_metadata_gate()
-            )
-            return {
-                req.req.rid: poll == KVPoll.Failed
-                for req, poll in zip(queue.queue.items(), polls)
-                if poll in (KVPoll.Success, KVPoll.Failed)
-            }
-        raise RuntimeError(f"Invalid VPP decode queue operation {operation}")
-
-    def _pp_vpp_decode_apply(self, operation, outcomes):
-        if operation == "retract":
-            return self.process_retract_queue(outcomes)
-        if operation == "prealloc":
-            return self.process_prealloc_queue(outcomes)
-        if operation == "transfer":
-            return self.process_decode_transfer_queue(outcomes)
-        raise RuntimeError(f"Invalid VPP decode queue operation {operation}")
-
-    def _pp_vpp_decode_queues_pending(self):
-        return bool(
-            self.disagg_decode_prealloc_queue.queue
-            or self.disagg_decode_prealloc_queue.retracted_queue
-            or self.disagg_decode_transfer_queue.queue
-            or self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-        )
-
     def _pp_vpp_bootstrap_prefix_boundaries(self, rids):
         wanted = set(rids)
         return {
@@ -293,8 +237,6 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         return not remaining_good and not remaining_bad
 
     def _pp_vpp_register_prefix_batch(self, batch):
-        if batch.forward_mode.is_decode():
-            return
         for req, start, length in zip(batch.reqs, batch.prefix_lens, batch.extend_lens):
             generation = int(getattr(req, "session_generation", None) or 0)
             entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
@@ -338,10 +280,7 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         )
         self.running_batch = self.running_mbs[slot_id]
         self.last_batch = self.last_mbs[slot_id]
-        if (
-            expected_manifest is not None
-            and expected_manifest.get("forward_mode") != ForwardMode.DECODE.value
-        ):
+        if expected_manifest is not None:
             spans = {
                 rid: (start, end) for rid, start, end in expected_manifest["requests"]
             }
@@ -351,44 +290,29 @@ class SchedulerVPPMixin(SchedulingVPPCore):
         self._vpp_admit_manifest = expected_manifest
         try:
             with self._pp_vpp_select_chunk(request_ids):
-                if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                    self.process_pending_chunked_abort()
-                    self.process_prefill_chunk(
-                        last_batch=self.last_batch, running_batch=self.running_batch
-                    )
-                    plan = self.get_new_batch_prefill(self.running_batch)
-                elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                    plan = self.get_next_disagg_decode_batch_to_run(
-                        running_batch=self.running_batch
-                    )
-                    self._flush_staging_scatters()
-                else:
-                    plan = self.get_next_batch_to_run(
-                        running_batch=self.running_batch, last_batch=self.last_batch
-                    )
+                self.process_pending_chunked_abort()
+                self.process_prefill_chunk(
+                    last_batch=self.last_batch, running_batch=self.running_batch
+                )
+                plan = self.get_new_batch_prefill(self.running_batch)
         finally:
             self._vpp_admit_manifest = None
         batch = plan.batch_to_run
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=batch.chunked_req if batch is not None else None
-            )
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        batch = self.ngram_embedding_manager.prepare_for_forward(
+            batch, chunked_req=batch.chunked_req if batch is not None else None
+        )
         if batch is not None:
             if batch.return_hidden_states or any(
                 req.beam_group is not None for req in batch.reqs
             ):
                 raise NotImplementedError("VPP hidden-state output and beam search")
-            batch.disagg_prefill_chunk_end_by_rid = (
-                {}
-                if batch.forward_mode.is_decode()
-                else {
-                    req.rid: min(int(start + length), len(req.origin_input_ids))
-                    for req, start, length in zip(
-                        batch.reqs, batch.prefix_lens or (), batch.extend_lens or ()
-                    )
-                }
-            )
+            batch.disagg_prefill_chunk_end_by_rid = {
+                req.rid: min(int(start + length), len(req.origin_input_ids))
+                for req, start, length in zip(
+                    batch.reqs, batch.prefix_lens or (), batch.extend_lens or ()
+                )
+            }
             for req in batch.reqs:
                 req.vpp_prefix_limit = None
         self.running_batch = plan.running_batch
@@ -575,12 +499,6 @@ class SchedulerVPPMixin(SchedulingVPPCore):
                         req.rid, int(getattr(req, "session_generation", None) or 0)
                     )
         self._vpp_forward_batches.pop(batch_seq)
-        if self.disaggregation_mode != DisaggregationMode.PREFILL and all(
-            req.finished() for req in batch.reqs
-        ):
-            # A follower only plans when another manifest arrives. Clear its
-            # completed view now so cache flush need not wait for another batch.
-            batch.filter_batch()
         self.last_mbs[slot_id] = batch
         self.mbs[slot_id] = None
         self.mb_metadata[slot_id] = None
