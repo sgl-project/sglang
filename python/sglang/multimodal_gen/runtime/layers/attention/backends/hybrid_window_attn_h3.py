@@ -380,14 +380,14 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 value,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                cu_seqlens_host=cu_seqlens_host,
+                cu_seqlens_host=cu_seqlens_host or None,
             )
 
         meta = attn_metadata
         layout = meta.layout
         bounds = (
             cu_seqlens_host
-            if cu_seqlens_host is not None
+            if cu_seqlens_host
             else tuple(int(item) for item in cu_seqlens.tolist())
         )
         used = int(bounds[1])
@@ -406,7 +406,7 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 value,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                cu_seqlens_host=cu_seqlens_host,
+                cu_seqlens_host=bounds,
             )
         else:
             out = self._decomposed(query, key, value, meta.decomposed, used)

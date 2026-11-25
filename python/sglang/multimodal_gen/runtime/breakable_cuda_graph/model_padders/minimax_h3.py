@@ -131,12 +131,31 @@ def _with_tail(cu: torch.Tensor) -> torch.Tensor:
     return cu if cu.numel() == 3 else torch.cat((cu, cu[-1:]))
 
 
+def _uses_hybrid_window_attention(current_model: Any) -> bool:
+    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+    resolved = getattr(current_model, "_resolved_attention_backend", None)
+    if (
+        resolved is None
+        and getattr(getattr(current_model, "arch", None), "hybrid_attention", None)
+        is not None
+    ):
+        resolve = getattr(current_model, "_resolve_attention_backend_once", None)
+        if callable(resolve):
+            resolve()
+            resolved = getattr(current_model, "_resolved_attention_backend", None)
+    return resolved is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+
+
 def pad_minimax_h3_prompt_kwargs(
     call_kwargs: dict, current_model: Any, buckets: tuple[int, ...]
 ) -> dict:
     branch = live_packed_prompt.get()
-    if branch is None:
-        # Unscoped callers must retain all host metadata in their signature.
+    if branch is None or _uses_hybrid_window_attention(current_model):
+        # Unscoped callers and VDN-H3 hybrid attention must retain host bounds
+        # in the BCG signature: single-GPU hybrid readout slices
+        # out[video_start:video_end] inside the captured graph, which shifts
+        # with text_len across prompts.
         return call_kwargs
     text_len = branch.text_len
     bucket = bcg_utils.select_text_bucket(text_len, buckets)

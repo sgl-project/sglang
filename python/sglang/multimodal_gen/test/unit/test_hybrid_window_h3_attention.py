@@ -283,5 +283,215 @@ def test_metadata_layout_mismatch_is_rejected() -> None:
         )
 
 
+def test_empty_cu_seqlens_host_falls_back_to_device_bounds(monkeypatch) -> None:
+    """Isolated backend calls receiving BCG's empty cu_seqlens_host=() sentinel
+    must fall back to cu_seqlens instead of raising IndexError on bounds[1]."""
+    from unittest.mock import Mock
+
+    layout = _layout()
+    q = torch.zeros(layout.seq_len, HEADS, HEAD_DIM)
+    cu = torch.tensor([0, layout.used, layout.seq_len], dtype=torch.int32)
+
+    impl = HybridWindowAttentionH3Impl(
+        num_heads=HEADS,
+        head_size=HEAD_DIM,
+        causal=False,
+        softmax_scale=HEAD_DIM**-0.5,
+        num_kv_heads=HEADS,
+        prefix="blocks.3.attn",
+    )
+    decomposed_out = torch.ones_like(q)
+    decomposed_mock = Mock(return_value=decomposed_out)
+    monkeypatch.setattr(impl, "_decomposed", decomposed_mock)
+    window_meta = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=layout, hybrid=_hybrid(), device=torch.device("cpu")
+    )
+    got_window = impl.forward_varlen(
+        q,
+        q,
+        q,
+        cu_seqlens=cu,
+        max_seqlen=layout.seq_len,
+        cu_seqlens_host=(),
+        attn_metadata=window_meta,
+    )
+    assert decomposed_mock.call_count == 1
+    assert decomposed_mock.call_args.args[-1] == layout.used
+    assert torch.all(got_window[layout.used :] == 0)
+
+    dense_out = torch.ones_like(q)
+    dense_mock = Mock(return_value=dense_out)
+    monkeypatch.setattr(impl._dense_fallback, "forward_varlen", dense_mock)
+    full_meta = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=layout, hybrid=_hybrid(radius=NUM_FRAMES), device=torch.device("cpu")
+    )
+    impl.forward_varlen(
+        q,
+        q,
+        q,
+        cu_seqlens=cu,
+        max_seqlen=layout.seq_len,
+        cu_seqlens_host=(),
+        attn_metadata=full_meta,
+    )
+    assert dense_mock.call_count == 1
+    assert dense_mock.call_args.kwargs["cu_seqlens_host"] == (
+        0,
+        layout.used,
+        layout.seq_len,
+    )
+
+    refiner_impl = HybridWindowAttentionH3Impl(
+        num_heads=HEADS,
+        head_size=HEAD_DIM,
+        causal=False,
+        softmax_scale=HEAD_DIM**-0.5,
+        num_kv_heads=HEADS,
+        prefix="token_refiner.blocks.0.attn",
+    )
+    refiner_dense = Mock(return_value=torch.zeros_like(q))
+    monkeypatch.setattr(refiner_impl._dense_fallback, "forward_varlen", refiner_dense)
+    refiner_impl.forward_varlen(
+        q,
+        q,
+        q,
+        cu_seqlens=cu,
+        max_seqlen=layout.seq_len,
+        cu_seqlens_host=(),
+    )
+    assert refiner_dense.call_args.kwargs["cu_seqlens_host"] is None
+
+
+def test_hybrid_attention_core_restores_bcg_live_bounds(monkeypatch) -> None:
+    """_minimax_h3_hybrid_attention_core_impl restores live bounds from the
+    request branch when called with BCG's cu_seqlens_host=() sentinel."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        H3PackedPrompt,
+        live_packed_prompt,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as h3
+    from sglang.multimodal_gen.runtime.models.dits import (
+        minimax_h3_vdn_attention as vdn_attn,
+    )
+
+    layout = _layout()
+    full_meta = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=layout, hybrid=_hybrid(radius=NUM_FRAMES), device=torch.device("cpu")
+    )
+    q = torch.zeros(layout.seq_len, HEADS, HEAD_DIM)
+    x = torch.zeros(layout.seq_len, HEADS * HEAD_DIM)
+    rope_cache = (torch.zeros(layout.seq_len, HEAD_DIM), torch.arange(layout.seq_len))
+
+    impl = HybridWindowAttentionH3Impl(
+        num_heads=HEADS,
+        head_size=HEAD_DIM,
+        causal=False,
+        softmax_scale=HEAD_DIM**-0.5,
+        num_kv_heads=HEADS,
+        prefix="blocks.3.attn",
+    )
+    dense_mock = Mock(return_value=torch.zeros_like(q))
+    monkeypatch.setattr(impl._dense_fallback, "forward_varlen", dense_mock)
+    monkeypatch.setattr(vdn_attn, "_hybrid_attention_metadata", lambda: full_meta)
+    monkeypatch.setattr(h3, "_apply_qk_norm", lambda qq, kk, *a, **kw: (qq, kk))
+    monkeypatch.setattr(h3, "_apply_rope_qk", lambda qq, kk, *a, **kw: (qq, kk))
+
+    attention = SimpleNamespace(
+        _use_fused_qknorm_rope=False,
+        q_norm=None,
+        k_norm=None,
+        head_dim=HEAD_DIM,
+        rotary_emb=None,
+        _attention_impl=impl,
+    )
+
+    cu = torch.tensor([0, layout.used, layout.seq_len], dtype=torch.int32)
+    bounds = (0, layout.used, layout.seq_len)
+    token = live_packed_prompt.set(H3PackedPrompt(bounds, layout.text_len))
+    try:
+        softmax_out, linear_out = vdn_attn._minimax_h3_hybrid_attention_core_impl(
+            attention,
+            x,
+            q,
+            q,
+            q,
+            None,
+            torch.zeros(layout.seq_len, HEADS),
+            torch.zeros(layout.seq_len, 4),
+            rope_cache=rope_cache,
+            cu_seqlens=cu,
+            cu_seqlens_host=(),
+            max_seqlen=layout.seq_len,
+            ulysses_active=False,
+        )
+    finally:
+        live_packed_prompt.reset(token)
+
+    assert linear_out is None
+    assert softmax_out.shape == q.shape
+    assert dense_mock.call_count == 1
+    assert dense_mock.call_args.kwargs["cu_seqlens_host"] == bounds
+    assert dense_mock.call_args.kwargs["max_seqlen"] == max(
+        layout.used, layout.seq_len - layout.used
+    )
+    assert dense_mock.call_args.kwargs["cu_seqlens"].tolist() == list(bounds)
+
+    # Aligned 2-element live bounds also trim the canonical 3-element device tensor.
+    aligned_layout = VDNH3Layout(
+        seq_len=layout.used,
+        used=layout.used,
+        text_len=layout.text_len,
+        video_start=layout.video_start,
+        num_frames=layout.num_frames,
+        tokens_per_frame=layout.tokens_per_frame,
+        frame_height=layout.frame_height,
+        frame_width=layout.frame_width,
+    )
+    aligned_meta = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=aligned_layout,
+        hybrid=_hybrid(radius=NUM_FRAMES),
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(vdn_attn, "_hybrid_attention_metadata", lambda: aligned_meta)
+    q_aligned = torch.zeros(aligned_layout.seq_len, HEADS, HEAD_DIM)
+    x_aligned = torch.zeros(aligned_layout.seq_len, HEADS * HEAD_DIM)
+    dense_mock.reset_mock()
+    dense_mock.return_value = torch.zeros_like(q_aligned)
+    canonical_cu = torch.tensor(
+        [0, aligned_layout.used, aligned_layout.used], dtype=torch.int32
+    )
+    aligned_bounds = (0, aligned_layout.used)
+    token = live_packed_prompt.set(
+        H3PackedPrompt(aligned_bounds, aligned_layout.text_len)
+    )
+    try:
+        vdn_attn._minimax_h3_hybrid_attention_core_impl(
+            attention,
+            x_aligned,
+            q_aligned,
+            q_aligned,
+            q_aligned,
+            None,
+            torch.zeros(aligned_layout.seq_len, HEADS),
+            torch.zeros(aligned_layout.seq_len, 4),
+            rope_cache=(
+                torch.zeros(aligned_layout.seq_len, HEAD_DIM),
+                torch.arange(aligned_layout.seq_len),
+            ),
+            cu_seqlens=canonical_cu,
+            cu_seqlens_host=(),
+            max_seqlen=aligned_layout.seq_len,
+            ulysses_active=False,
+        )
+    finally:
+        live_packed_prompt.reset(token)
+
+    assert dense_mock.call_args.kwargs["cu_seqlens_host"] == aligned_bounds
+    assert dense_mock.call_args.kwargs["cu_seqlens"].tolist() == list(aligned_bounds)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
