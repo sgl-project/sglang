@@ -323,5 +323,28 @@ def test_kpool_tail_guard_still_rejects_q8_over_a_packed_fp8_pool():
         )
 
 
+def test_kpool_tail_guard_admits_flashinfer_sparse_mla():
+    """flashinfer_sparse_mla is the SM120 stand-in for the trtllm DSA path: it
+    forwards the full kpool index tensor to the same
+    trtllm_batch_decode_with_kv_cache_mla entry, so the appended tail columns
+    reach the kernel on both phases and the guard must not fire."""
+    backend = SimpleNamespace(
+        dsa_index_kpool=4, device_sm_major=12, dsa_kv_cache_store_fp8=True
+    )
+    indices = torch.full((2, 2051), -1, dtype=torch.int32)
+    for phase in ("prefill", "decode"):
+        assert (
+            DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+                backend, indices, "flashinfer_sparse_mla", phase
+            )
+            is None
+        )
+    # Backends without a tail-aware kernel keep tripping the guard.
+    with pytest.raises(NotImplementedError):
+        DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+            backend, indices, "flashmla_kv", "decode"
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
