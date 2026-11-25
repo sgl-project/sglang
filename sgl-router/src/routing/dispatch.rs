@@ -14,12 +14,11 @@ use axum::body::Body;
 use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
 use futures::StreamExt;
-use sglang_runtime_v1_types::DisaggregatedParams;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::DpRankPolicy;
 use crate::policies::dp_rank::{expected_rank_tokens, select_dp_rank};
-use crate::proxy::grpc::{Additions, EngineRpc};
+use crate::proxy::grpc::{Additions, BootstrapFields};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem};
 use crate::proxy::Proxy;
 use crate::routing::selection::nonempty_header;
@@ -33,10 +32,7 @@ use crate::server::routes::chat::{
         dispatch_outcome, response_before_expiry, Blame, DispatchMetrics, Dispatched, Grpc, Http,
         Leg, LoadGuards, RequestDurationGuard, Transport, X_DATA_PARALLEL_RANK, X_SGL_DECODE_URL,
     },
-    preparation::{
-        append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields,
-        PreparedRequest,
-    },
+    preparation::{append_fields, generate_room_id, generate_room_id_for_rank, PreparedRequest},
 };
 use crate::state::kv_events::prefix_provider::RankDepths;
 use crate::workers::{DecodeSlot, DpRankGuard, Worker};
@@ -116,13 +112,10 @@ pub(crate) async fn dispatch<T: PrefillTransport>(
     let engine_rid = request.engine_rid();
     let additions = Additions {
         rid: engine_rid.clone(),
-        bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
-            bootstrap_host: bootstrap.host.clone(),
-            bootstrap_port: bootstrap.port.map_or(0, i32::from),
-            bootstrap_room: bootstrap.room as i64,
-        }),
+        bootstrap: pd.as_ref().map(|(_, bootstrap)| bootstrap.clone()),
         sampling_defaults: request.sampling_defaults(),
         routed_dp_rank: None,
+        disagg_prefill_dp_rank: None,
     };
     let body = request.outgoing_body(
         &ctx.metrics,
@@ -324,6 +317,7 @@ impl Leg {
         let routed_dp_rank = dp_aware.then_some(rank);
         let additions = Additions {
             routed_dp_rank,
+            disagg_prefill_dp_rank: prefill_rank,
             ..additions.clone()
         };
         Self {
@@ -389,7 +383,7 @@ impl PrefillTransport for Http {
         prefill_outcome(result).await
     }
 }
-impl<R: EngineRpc> PrefillTransport for Grpc<R> {
+impl PrefillTransport for Grpc {
     async fn prefill(
         self,
         proxy: Arc<Proxy>,
@@ -397,11 +391,10 @@ impl<R: EngineRpc> PrefillTransport for Grpc<R> {
         _path: &'static str,
         leg: Leg,
     ) -> PrefillOutcome<Self::Response> {
-        let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
+        let (headers, additions) = (&leg.headers, &leg.additions);
         let result = proxy
             .forward_grpc(
-                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
-                None,
+                &worker, &self.0, headers, additions, None, false, None, None, None, None, None,
             )
             .await;
         let status = match result {

@@ -5,7 +5,7 @@
 
 use super::preparation::PreparedRequest;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
+use crate::proxy::grpc::{Additions, GrpcResponse};
 use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -19,6 +19,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
+use sglang_api_types::api::v1::GenerateRequest;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,17 +78,14 @@ pub(super) async fn forward_request(
 
 /// [`forward_request`] for a gRPC client: the engines are called with `rpc`.
 /// The log context is `None` when the request failed before dispatch.
-pub(super) async fn forward_request_grpc<R: EngineRpc>(
-    rpc: R,
+pub(super) async fn forward_request_grpc(
+    rpc: GenerateRequest,
     ctx: &AppContext,
     request: &mut PreparedRequest,
     routing: &super::ModelRouting<'_>,
     headers: HeaderMap,
     request_started_at: Instant,
-) -> (
-    Result<GrpcResponse<R::Reply>, ApiError>,
-    Option<RequestLogContext>,
-) {
+) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
     let transport = Grpc(Arc::new(rpc));
     let mut excluded = Vec::new();
     let mut failed = None;
@@ -248,17 +246,12 @@ impl Transport for Http {
     }
 }
 
-/// Reaches engines through the native RPC the client called.
-pub(crate) struct Grpc<R>(pub(crate) Arc<R>);
+/// Forwards the shared Generate request to the selected engines.
+#[derive(Clone)]
+pub(crate) struct Grpc(pub(crate) Arc<GenerateRequest>);
 
-impl<R> Clone for Grpc<R> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<R: EngineRpc> Transport for Grpc<R> {
-    type Response = GrpcResponse<R::Reply>;
+impl Transport for Grpc {
+    type Response = GrpcResponse;
     async fn respond(
         _request: &mut PreparedRequest,
         response: Self::Response,
@@ -300,9 +293,8 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         ctx.proxy
             .forward_grpc(
                 worker,
-                &*self.0,
+                &self.0,
                 &leg.headers,
-                leg.body,
                 &leg.additions,
                 engine_rid,
                 metrics.streaming,
