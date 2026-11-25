@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import torch
+
 from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_ascend_ops_config
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -72,6 +74,16 @@ class BreakableNPUGraphBackend(BreakableCudaGraphBackend):
                 "alltoallv reads live expert counts from the host, which capture "
                 "cannot do"
             )
+
+        # Initialize HCCL's AICPU resources on the inference stream before
+        # attention metadata initializes its own AICPU context. Lazy HCCL
+        # initialization during capture warmup can invalidate that context.
+        if self._tp_group.world_size > 1:
+            probe = torch.zeros(
+                1, device=self._model_runner.device, dtype=torch.bfloat16
+            )
+            torch.distributed.all_reduce(probe, group=self._tp_group.device_group)
+            self._device_module.synchronize()
 
     def capture_one(
         self,

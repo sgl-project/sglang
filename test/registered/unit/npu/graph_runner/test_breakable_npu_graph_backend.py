@@ -51,7 +51,9 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
     def test_construction_reuses_parent_backend(self):
         runner = _make_runner()
         with (
-            get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+            get_parallel().override(
+                tp_group=SimpleNamespace(barrier=mock.Mock(), world_size=1)
+            ),
             mock.patch.object(mod, "get_flags", return_value=_flags()),
         ):
             backend = mod.BreakableNPUGraphBackend(runner)
@@ -60,10 +62,36 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
         self.assertIsInstance(backend, BreakableCudaGraphBackend)
         self.assertIs(backend._cuda_graph_runner, runner)
 
+    def test_hccl_is_initialized_before_capture(self):
+        runner = _make_runner()
+        tp_group = SimpleNamespace(world_size=4, device_group=object())
+        calls = mock.Mock()
+        with (
+            get_parallel().override(tp_group=tp_group),
+            mock.patch.object(mod, "get_flags", return_value=_flags()),
+            mock.patch.object(mod.torch, "zeros") as zeros,
+            mock.patch.object(mod.torch.distributed, "all_reduce") as all_reduce,
+        ):
+            calls.attach_mock(zeros, "zeros")
+            calls.attach_mock(all_reduce, "all_reduce")
+            calls.attach_mock(runner.device_module.synchronize, "synchronize")
+            mod.BreakableNPUGraphBackend(runner)
+
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                mock.call.zeros(1, device="npu", dtype=torch.bfloat16),
+                mock.call.all_reduce(zeros.return_value, group=tp_group.device_group),
+                mock.call.synchronize(),
+            ],
+        )
+
     def test_torch_compile_is_rejected(self):
         runner = _make_runner()
         with (
-            get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+            get_parallel().override(
+                tp_group=SimpleNamespace(barrier=mock.Mock(), world_size=1)
+            ),
             mock.patch.object(
                 mod, "get_flags", return_value=_flags(enable_torch_compile=True)
             ),
@@ -77,7 +105,9 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
     def test_ascend_ops_alltoallv_capture_is_rejected(self):
         runner = _make_runner()
         with (
-            get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+            get_parallel().override(
+                tp_group=SimpleNamespace(barrier=mock.Mock(), world_size=1)
+            ),
             mock.patch.object(mod, "get_flags", return_value=_flags()),
             mock.patch.object(
                 mod,
@@ -96,7 +126,9 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
     def test_ascend_ops_allgather_capture_is_allowed(self):
         runner = _make_runner()
         with (
-            get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+            get_parallel().override(
+                tp_group=SimpleNamespace(barrier=mock.Mock(), world_size=1)
+            ),
             mock.patch.object(mod, "get_flags", return_value=_flags()),
             mock.patch.object(
                 mod,
@@ -115,7 +147,9 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
 
     def test_capture_publishes_allgather_row_sizes(self):
         runner = _make_runner()
-        tp_group = SimpleNamespace(barrier=mock.Mock(), world_size=4)
+        tp_group = SimpleNamespace(
+            barrier=mock.Mock(), world_size=4, device_group=object()
+        )
         seen = []
 
         def fake_capture_one(
@@ -129,6 +163,8 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
             mock.patch.object(
                 BreakableCudaGraphBackend, "capture_one", fake_capture_one
             ),
+            mock.patch.object(mod.torch, "zeros"),
+            mock.patch.object(mod.torch.distributed, "all_reduce"),
         ):
             backend = mod.BreakableNPUGraphBackend(runner)
             backend.capture_one(SimpleNamespace(size=128), lambda: None)

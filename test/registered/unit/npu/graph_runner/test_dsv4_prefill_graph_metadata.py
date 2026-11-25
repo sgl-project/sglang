@@ -85,6 +85,80 @@ def _live_batch(batch_size, num_tokens, *, idle=False):
 
 
 class TestDsv4PrefillGraphMetadata(CustomTestCase):
+    def test_capture_preserves_each_kernel_metadata_abi_size(self):
+        backend = _backend()
+        seed = _seed(128)
+        sizes = {
+            "c1a_metadata": 2048,
+            "c4a_metadata": 2048,
+            "c128a_metadata": 2048,
+            "li_quant_metadata": 1024,
+        }
+        seed.kernel_metadata = {
+            key: torch.zeros(size, dtype=torch.int32) for key, size in sizes.items()
+        }
+        state = Dsv4PrefillGraphMetadata.allocate(
+            backend=backend, seed=seed, num_tokens=128
+        )
+        pointers = {}
+        for key, size in sizes.items():
+            self.assertEqual(tuple(state.kernel_metadata[key].shape), (size,), key)
+            pointers[key] = state.kernel_metadata[key].data_ptr()
+
+        rebuilt = {
+            key: torch.full((size,), i + 1, dtype=torch.int32)
+            for i, (key, size) in enumerate(sizes.items())
+        }
+        live = _seed(64)
+        live.kernel_metadata = rebuilt
+        state.refresh(backend=backend, live=live, forward_batch=_live_batch(1, 64))
+        for key, source in rebuilt.items():
+            self.assertEqual(state.kernel_metadata[key].data_ptr(), pointers[key])
+            torch.testing.assert_close(state.kernel_metadata[key], source)
+
+    def test_context_bound_sizes_all_page_tables(self):
+        backend = _backend()
+        backend.req_to_token_pool.c128_page_size = 4
+        seed = _seed(128)
+        state = Dsv4PrefillGraphMetadata.allocate(
+            backend=backend, seed=seed, num_tokens=128, max_context_len=1024
+        )
+        self.assertEqual(tuple(state.swa_page_table.shape), (1, 8))
+        self.assertEqual(tuple(state.c4_page_table.shape), (1, 8))
+        self.assertEqual(tuple(state.c128_page_table.shape), (1, 2))
+        self.assertEqual(backend.max_context_len, 4096)
+
+    def test_bounded_replay_accepts_live_widths_and_clears_stale_columns(self):
+        backend = _backend()
+        backend.req_to_token_pool.c128_page_size = 4
+        state = Dsv4PrefillGraphMetadata.allocate(
+            backend=backend, seed=_seed(128), num_tokens=128, max_context_len=1024
+        )
+        tables = [state.swa_page_table, state.c4_page_table, state.c128_page_table]
+        pointers = [table.data_ptr() for table in tables]
+        shapes = [table.shape for table in tables]
+        for cols in (7, 2, 8, 1):
+            with self.subTest(live_columns=cols):
+                live = _seed(64)
+                live.actual_seq_lengths_kv.fill_(cols * 128)
+                live.start_pos.fill_(cols * 128 - 64)
+                live.swa_page_table = torch.full((1, cols), cols).int()
+                live.c4_page_table = torch.full((1, cols), cols + 10).int()
+                c128_cols = (cols + 3) // 4
+                live.c128_page_table = torch.full((1, c128_cols), cols + 20).int()
+                state.refresh(
+                    backend=backend, live=live, forward_batch=_live_batch(1, 64)
+                )
+                for dst, src in zip(
+                    tables,
+                    (live.swa_page_table, live.c4_page_table, live.c128_page_table),
+                ):
+                    width = src.shape[1]
+                    torch.testing.assert_close(dst[:, :width], src)
+                    self.assertTrue((dst[:, width:] == 0).all().item())
+                self.assertEqual([table.data_ptr() for table in tables], pointers)
+                self.assertEqual([table.shape for table in tables], shapes)
+
     def test_capture_allocates_fixed_isolated_buffers(self):
         seed = _seed(128)
         state = Dsv4PrefillGraphMetadata.allocate(
