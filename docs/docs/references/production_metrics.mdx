@@ -179,27 +179,27 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
       --enable-metrics \
       --enable-mfu-metrics
     ```
-    Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`). Ensure the server is accessible from the monitoring stack (you might need `--host 0.0.0.0` if running in Docker). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
+    Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`). The example stack uses host networking, so the default `--host 127.0.0.1` is reachable from it. If you bind SGLang to `0.0.0.0` instead, also set `--api-key` (see [Server Arguments](../advanced_features/server_arguments#http-server)). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
 
 2.  **Navigate to the monitoring example directory:**
     ```bash Command
     cd examples/monitoring
     ```
 
-3.  **Start the monitoring stack:**
+3.  **Start the monitoring stack, choosing a Grafana admin password:**
     ```bash Command
+    (umask 077; echo "GRAFANA_ADMIN_PASSWORD='<a strong password>'" > .env)
     docker compose up -d
     ```
-    This command will start Prometheus and Grafana in the background.
+    This starts Prometheus and Grafana in the background. Docker Compose reads the password from `.env` (excluded by the repository's `.gitignore`) for every later command too, such as `docker compose ps` or `docker compose down`; exporting `GRAFANA_ADMIN_PASSWORD` in your shell works as well. Every `docker compose` command for this stack fails while the variable is unset.
+
+    Grafana applies the password only when it first creates its database. To change it later, change it in Grafana under your profile, or run `docker compose exec grafana grafana cli admin reset-admin-password '<new password>'`, then update `.env`. Do not use `docker compose down` and a restart to change it: the example does not persist Grafana's database or Prometheus's data, so that discards dashboards, users and alert rules created in Grafana and Prometheus's metric history.
 
 4.  **Access the monitoring interfaces:**
     *   **Grafana:** Open your web browser and go to [http://localhost:3000](http://localhost:3000).
     *   **Prometheus:** Open your web browser and go to [http://localhost:9090](http://localhost:9090).
 
-5.  **Log in to Grafana:**
-    *   Default Username: `admin`
-    *   Default Password: `admin`
-    You will be prompted to change the password upon your first login.
+5.  **Log in to Grafana:** as `admin`, with the password you set. Grafana and Prometheus listen on `127.0.0.1` only; to view them from another machine, use an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 <host>`) instead of exposing the ports.
 
 6.  **View the Dashboard:**
     The SGLang dashboard is pre-configured and should be available automatically. Navigate to `Dashboards` -> `Browse` -> `SGLang Monitoring` folder -> `SGLang Dashboard`.
@@ -208,21 +208,13 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
 
 *   **Port Conflicts:** If you encounter errors like "port is already allocated," check if other services (including previous instances of Prometheus/Grafana) are using ports `9090` or `3000`. Use `docker ps` to find running containers and `docker stop <container_id>` to stop them, or use `lsof -i :<port>` to find other processes using the ports. You might need to adjust the ports in the `docker-compose.yaml` file if they permanently conflict with other essential services on your system.
 
-To modify Grafana's port to the other one(like 3090) in your Docker Compose file, you need to explicitly specify the port mapping under the grafana service.
+    To move Grafana to another port (like 3090), append `GF_SERVER_HTTP_PORT` to the existing `environment` list of the `grafana` service. Both services use host networking, so a `ports:` mapping has no effect.
 
-    Option 1: Add GF_SERVER_HTTP_PORT to the environment section:
-    ```
-      environment:
-    - GF_AUTH_ANONYMOUS_ENABLED=true
-    - GF_SERVER_HTTP_PORT=3090  # <-- Add this line
-    ```
-    Option 2: Use port mapping:
-    ```
-    grafana:
-      image: grafana/grafana:latest
-      container_name: grafana
-      ports:
-      - "3090:3000"  # <-- Host:Container port mapping
+    ```yaml
+      grafana:
+        environment:
+          # ...keep the existing entries...
+          - GF_SERVER_HTTP_PORT=3090  # <-- Add this line
     ```
 *   **Connection Issues:**
     *   Ensure both Prometheus and Grafana containers are running (`docker ps`).
