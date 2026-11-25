@@ -94,7 +94,7 @@ class PagedKVManager(ParamsBase):
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
         # Cover short tiles and the remaining rows of a partial final thread group.
-        page_entry_per_thread = (n_block_size + num_threads - 1) // num_threads
+        page_entry_per_thread = cute.ceil_div(n_block_size, num_threads)
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(

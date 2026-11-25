@@ -1,8 +1,11 @@
 """Small fixtures around production boundaries; no parallel layout recipes."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import patch
 
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import factories
 from sglang.srt.layers.layer_boundary.construction import StagePlan
 from sglang.srt.layers.layer_boundary.factories import (
@@ -14,6 +17,8 @@ from sglang.srt.layers.layer_boundary.factories import (
 from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL_OPS
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
+from sglang.srt.layers.moe import utils as moe_utils
+from sglang.test.communicator_patch import patch_communicator
 
 
 def build_stages(*stages, previous=None, terminal=False):
@@ -189,3 +194,130 @@ def postprocess_output(boundary, hidden, residual, forward_batch):
 
 def identity_input(hidden_states, forward_batch):
     return hidden_states
+
+
+def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
+    fields = dict(
+        tp_size=attn_dp * attn_cp * attn_tp,
+        tp_rank=0,
+        attn_dp_size=attn_dp,
+        attn_tp_size=attn_tp,
+        attn_tp_rank=0,
+        attn_cp_size=attn_cp,
+        attn_cp_rank=0,
+        moe_dense_tp_size=None,
+        enable_prefill_cp=False,
+        enable_cp_tp_group_sharing=False,
+        moe_ep_size=1,
+        moe_tp_size=attn_dp * attn_cp * attn_tp,
+        moe_dp_size=1,
+        dwdp_size=1,
+        attn_dp_enabled=attn_dp > 1,
+        enable_attn_tp_input_scattered=False,
+        disable_attn_tp_gather=False,
+        tp_group=SimpleNamespace(
+            name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
+        ),
+        attn_tp_group=SimpleNamespace(name="attn_tp", ranks=list(range(attn_tp))),
+        attn_cp_group=SimpleNamespace(name="attn_cp", ranks=list(range(attn_cp))),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+@contextmanager
+def planning(
+    parallel,
+    *,
+    sp=False,
+    a2a=False,
+    dsa_cp=False,
+    boundary_reduction="rs+rsv",
+):
+    """What layer planning and communicator construction read, without the
+    process-wide parallel state. ``parallel`` may be a callable, for a
+    per-thread parallel state. ``dsa_cp``: the prefill CP is DSA's (MLA's is
+    the same to the communicator)."""
+    get_parallel = parallel if callable(parallel) else (lambda: parallel)
+
+    def moe_cp_gathers():
+        return get_parallel().attn_cp_size > get_parallel().moe_dp_size
+
+    with (
+        patch_communicator("get_parallel", get_parallel),
+        patch_communicator("is_dsa_enable_prefill_cp", lambda: dsa_cp),
+        patch_communicator("is_mla_cp_enabled", lambda: False),
+        patch_communicator(
+            "get_moe_cp_size",
+            lambda: get_parallel().attn_cp_size if moe_cp_gathers() else 1,
+        ),
+        patch.object(layernorm_sp, "layernorm_sp_enabled", lambda: sp),
+        patch_communicator(
+            "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
+        ),
+        patch_communicator(
+            "get_moe_a2a_backend",
+            lambda: SimpleNamespace(is_none=lambda: not a2a),
+        ),
+        patch_communicator("is_moe_input_scattered_across_dp_ranks", lambda: a2a),
+        patch_communicator("is_enable_moe_cp_allgather", moe_cp_gathers),
+        patch_communicator("get_lora", lambda: SimpleNamespace(enable_lora=False)),
+        # A MoE whose EP and TP sums merge: its output's group is the TP group.
+        patch_communicator(
+            "post_experts_reduction_group", lambda: get_parallel().tp_group
+        ),
+        # Planning asks whether a dense layer gathers for two-batch overlap.
+        patch_communicator(
+            "get_exec",
+            lambda: SimpleNamespace(
+                comm=SimpleNamespace(
+                    boundary_reduction=boundary_reduction,
+                    enable_quant_communications=False,
+                ),
+                overlap=SimpleNamespace(enable_two_batch_overlap=False),
+            ),
+        ),
+        # What the MoE predicates an exit's decisions read, in their module.
+        patch.object(moe_utils, "get_parallel", get_parallel),
+        patch.object(
+            moe_utils,
+            "get_moe_a2a_backend",
+            lambda: SimpleNamespace(
+                is_none=lambda: not a2a,
+                is_flashinfer=lambda: False,
+                is_pplx=lambda: False,
+                is_flashinfer_megamoe=lambda: False,
+            ),
+        ),
+        patch.object(moe_utils, "get_lora", lambda: SimpleNamespace(enable_lora=False)),
+        patch.object(
+            moe_utils,
+            "get_exec",
+            lambda: SimpleNamespace(
+                comm=SimpleNamespace(enable_quant_communications=False)
+            ),
+        ),
+        patch.object(
+            moe_utils, "post_experts_reduction_group", lambda: get_parallel().tp_group
+        ),
+        patch.object(
+            moe_utils, "should_use_flashinfer_cutlass_moe_fp4_allgather", lambda: False
+        ),
+        patch.object(
+            moe_utils,
+            "is_dp_attention_enabled",
+            lambda: get_parallel().attn_dp_size > 1,
+        ),
+    ):
+        yield
+
+
+class Norm:
+    """add + norm stand-in: (2 * (h + r), h + r); one input: 2 * h."""
+
+    def __call__(self, x, residual=None, post_residual_addition=None):
+        assert post_residual_addition is None
+        if residual is None:
+            return x * 2
+        s = x + residual
+        return s * 2, s

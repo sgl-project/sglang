@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 
@@ -22,7 +22,7 @@ def eager_relu2(x):
 
 
 @marker.parametrize("case", ["qk_400", "qk_1024", "relu2_400", "relu2_8190"])
-@marker.benchmark("provider", ["eager", "fused"])
+@marker.benchmark("provider", ["eager", "fused"], gate=["fused"])
 def benchmark(case, provider):
     operation, tokens = case.split("_")
     tokens = int(tokens)

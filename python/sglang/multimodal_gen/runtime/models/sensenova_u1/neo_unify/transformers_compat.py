@@ -57,11 +57,6 @@ def causal_mask_kwargs(
     return {name: value for name, value in candidates.items() if name in parameters}
 
 
-def pretrained_dtype_kwargs(dtype: torch.dtype) -> dict[str, torch.dtype]:
-    """Use the public dtype keyword supported throughout Transformers 4.57+."""
-    return {"dtype": dtype}
-
-
 def tied_weights_keys(output_key: str, input_key: str) -> list[str] | dict[str, str]:
     """Return the `_tied_weights_keys` shape expected by Transformers 4 or 5."""
     import transformers

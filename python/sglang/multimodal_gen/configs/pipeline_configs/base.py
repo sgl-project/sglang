@@ -142,7 +142,9 @@ def maybe_unpad_latents(latents, batch):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
-    native_only_components: ClassVar[tuple[str, ...]] = ()
+    # Components that cannot fall back to a native Transformers/Diffusers
+    # implementation because their pipeline requires SGLang-specific behavior.
+    native_only_components: tuple[str, ...] = ()
     # Default task; supported_task_types is a model capability, not a user knob.
     task_type: ModelTaskType = ModelTaskType.I2I
     supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
@@ -150,9 +152,6 @@ class PipelineConfig:
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
     supports_auto_residency: bool = True
-    # Components that cannot fall back to a native Transformers/Diffusers
-    # implementation because their pipeline requires SGLang-specific behavior.
-    native_only_components: tuple[str, ...] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -168,6 +167,9 @@ class PipelineConfig:
     generator_device: str | None = None
     flow_shift: float | None = None
     scheduler_class_override: str | None = None
+    # Registered DiT class to load instead of the checkpoint's ``_class_name``,
+    # for pipelines that drive shared weights with a different forward.
+    transformer_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -197,6 +199,10 @@ class PipelineConfig:
     image_encoder_precision: str = "fp32"
     image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
+    # Audio encoder configuration
+    audio_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
+    audio_encoder_precision: str = "fp32"
+
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
@@ -219,7 +225,6 @@ class PipelineConfig:
     )
 
     # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
@@ -229,6 +234,12 @@ class PipelineConfig:
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
+
+    def extra_dit_components(self, server_args: Any) -> tuple[str, ...]:
+        """DiTs this deployment loads next to the checkpoint's ``transformer``
+        that model_index.json does not list, for the automatic memory policy."""
+        del server_args
+        return ()
 
     def get_supported_task_types(self) -> tuple[ModelTaskType, ...]:
         """Return the tasks implemented by this configured pipeline.
@@ -572,6 +583,10 @@ class PipelineConfig:
         slices[dim] = slice(orig_len)
         return tensor[tuple(slices)]
 
+    def prepare_decoding_latents(self, batch, server_args=None, vae=None):
+        del server_args, vae
+        return batch.latents
+
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         return self._gather_sp_tensor(latents, dim=2)
@@ -778,6 +793,10 @@ class PipelineConfig:
         return latents
 
     def post_decoding(self, frames, server_args):
+        return frames
+
+    def postprocess_decoded_batch(self, frames, batch, server_args):
+        del batch, server_args
         return frames
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -995,11 +1014,6 @@ class PipelineConfig:
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
 
-        # Add T5 configuration arguments
-        from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
-
-        T5Config.add_cli_args(parser, prefix=f"{prefix_with_dot}t5-config")
-
         return parser
 
     def update_config_from_dict(self, args: dict[str, Any], prefix: str = "") -> None:
@@ -1131,8 +1145,8 @@ class PipelineConfig:
                 # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
                 # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
                 # config so realtime-only wiring (the /v1/realtime_video adapter) is
-                # selected. Only applies when the explicit config strictly subclasses
-                # the model default, so non-realtime pipelines are unaffected.
+                # selected. A registered explicit config also replaces the generic
+                # Diffusers fallback used for package roots without model_index.json.
                 if pipeline_class_name:
                     explicit_config_classes = get_pipeline_config_classes(
                         pipeline_class_name
@@ -1143,7 +1157,11 @@ class PipelineConfig:
                             isinstance(explicit_config_cls, type)
                             and isinstance(pipeline_config_cls, type)
                             and explicit_config_cls is not pipeline_config_cls
-                            and issubclass(explicit_config_cls, pipeline_config_cls)
+                            and (
+                                issubclass(explicit_config_cls, pipeline_config_cls)
+                                or pipeline_config_cls.__name__
+                                == "DiffusersGenericPipelineConfig"
+                            )
                         ):
                             logger.info(
                                 f"Refining pipeline config {pipeline_config_cls.__name__} "
@@ -1191,10 +1209,6 @@ class PipelineConfig:
     def check_pipeline_config(self) -> None:
         self.task_type = ModelTaskType.parse(self.task_type)
         self.get_supported_task_types()
-        if self.vae_sp and not self.vae_tiling:
-            raise ValueError(
-                "Currently enabling vae_sp requires enabling vae_tiling, please set --vae-tiling to True."
-            )
 
         if len(self.text_encoder_configs) != len(self.text_encoder_precisions):
             raise ValueError(
@@ -1341,24 +1355,6 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return self._gather_sp_tensor(latents, dim=2)
-
-
-@dataclass
-class SlidingTileAttnConfig(PipelineConfig):
-    """Configuration for sliding tile attention."""
-
-    # Override any BaseConfig defaults as needed
-    # Add sliding tile specific parameters
-    window_size: int = 16
-    stride: int = 8
-
-    # You can provide custom defaults for inherited fields
-    height: int = 576
-    width: int = 1024
-
-    # Additional configuration specific to sliding tile attention
-    pad_to_square: bool = False
-    use_overlap_optimization: bool = True
 
 
 def parse_int_list(value: str) -> list[int]:

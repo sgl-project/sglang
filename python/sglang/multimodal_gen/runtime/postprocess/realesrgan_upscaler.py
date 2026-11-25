@@ -12,6 +12,7 @@ The ImageUpscaler wrapper and integration code are original work.
 import math
 import os
 import time
+from collections import OrderedDict
 from hashlib import sha256
 from typing import Optional
 from urllib.parse import unquote, urlparse
@@ -22,6 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+    cache_get,
+    cache_put,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -42,8 +47,11 @@ _REALESRGAN_TILE_SIZE = 256
 _REALESRGAN_TILE_PAD = 32
 
 # Module-level cache: model_path -> UpscalerModel instance
-_MODEL_CACHE: dict[str, "UpscalerModel"] = {}
-_RESOLVED_MODEL_PATH_CACHE: dict[str, str] = {}
+_MODEL_CACHE: "OrderedDict[str, UpscalerModel]" = OrderedDict()
+_RESOLVED_MODEL_PATH_CACHE: "OrderedDict[str, str]" = OrderedDict()
+# Arbitrary; paths are client-chosen, so both caches must be bounded.
+_MAX_CACHED_MODELS = 4
+_MAX_CACHED_RESOLVED_PATHS = 256
 
 
 def _default_model_path_for_scale(scale: int) -> str:
@@ -568,8 +576,9 @@ class ImageUpscaler:
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
 
-        if resolved_path in _MODEL_CACHE:
-            return _MODEL_CACHE[resolved_path]
+        cached_model = cache_get(_MODEL_CACHE, resolved_path)
+        if cached_model is not None:
+            return cached_model
 
         logger.info("Loading Real-ESRGAN weights from %s", resolved_path)
         try:
@@ -614,7 +623,7 @@ class ImageUpscaler:
             native_scale = net.scale
 
         model = UpscalerModel(net=net, scale=native_scale)
-        _MODEL_CACHE[resolved_path] = model
+        cache_put(_MODEL_CACHE, resolved_path, model, max_size=_MAX_CACHED_MODELS)
         logger.info(
             "Real-ESRGAN model loaded on device: %s (native_scale=%dx, outscale=%s)",
             device,
@@ -688,12 +697,17 @@ def _resolve_model_path(model_path: str) -> str:
     - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
       allowing users to specify custom weight files hosted on HF.
     """
-    cached_path = _RESOLVED_MODEL_PATH_CACHE.get(model_path)
+    cached_path = cache_get(_RESOLVED_MODEL_PATH_CACHE, model_path)
     if cached_path is not None:
         return cached_path
 
     if os.path.isfile(model_path):
-        _RESOLVED_MODEL_PATH_CACHE[model_path] = model_path
+        cache_put(
+            _RESOLVED_MODEL_PATH_CACHE,
+            model_path,
+            model_path,
+            max_size=_MAX_CACHED_RESOLVED_PATHS,
+        )
         return model_path
 
     parsed_url = urlparse(model_path)
@@ -712,7 +726,12 @@ def _resolve_model_path(model_path: str) -> str:
             logger.info("Downloading Real-ESRGAN weights from URL %s", model_path)
             torch.hub.download_url_to_file(model_path, tmp_path, progress=False)
             os.replace(tmp_path, local_path)
-        _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
+        cache_put(
+            _RESOLVED_MODEL_PATH_CACHE,
+            model_path,
+            local_path,
+            max_size=_MAX_CACHED_RESOLVED_PATHS,
+        )
         return local_path
 
     # Parse optional "repo_id:filename" syntax; fall back to default filename.
@@ -748,7 +767,12 @@ def _resolve_model_path(model_path: str) -> str:
             f"'repo_id:filename' format (e.g. 'my-org/my-esrgan:weights.pth'). "
             f"Original error: {e}"
         ) from e
-    _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
+    cache_put(
+        _RESOLVED_MODEL_PATH_CACHE,
+        model_path,
+        local_path,
+        max_size=_MAX_CACHED_RESOLVED_PATHS,
+    )
     return local_path
 
 

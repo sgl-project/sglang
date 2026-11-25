@@ -5,8 +5,24 @@
 # index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
+# Hugging Face tokens on self-hosted runners come from the runner environment,
+# not from GitHub secrets, so GitHub does not mask them. Register them as
+# masks so later steps print *** instead. Tracing is off here: with -x on,
+# the echo line itself would print the token before GitHub masks it.
+{ set +x; } 2>/dev/null
+for _hf_token in "${HF_TOKEN:-}" "${HUGGING_FACE_HUB_TOKEN:-}" \
+    "$(cat "${HF_HOME:-${HOME}/.cache/huggingface}/token" 2>/dev/null || true)"; do
+    if [ -n "${_hf_token}" ]; then
+        echo "::add-mask::${_hf_token}"
+    fi
+done
+unset _hf_token
+set -x
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+# docker/ci.Dockerfile points this at a fixed path: a job container's HOME changes per job.
+CI_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}"
 
 # shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
 source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
@@ -55,36 +71,67 @@ configure_environment() {
     USE_VENV="${USE_VENV:-0}"
     echo "USE_VENV=${USE_VENV}"
 
-    python3 -m pip install --upgrade pip
-    if ! command -v uv >/dev/null 2>&1; then
-        pip install uv
+    # A stale uv only knows the managed Python builds released before it.
+    python3 -m pip install --upgrade pip uv
+    # Put that uv ahead of any older copy on PATH (runner image, standalone installer).
+    UV_BIN_DIR="$(dirname "$(python3 -c 'import uv; print(uv.find_uv_bin())')")"
+    export PATH="${UV_BIN_DIR}:${PATH}"
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+        echo "$UV_BIN_DIR" >> "$GITHUB_PATH" || true
+    fi
+    uv --version
+
+    # Every job installs into a uv-managed venv, whatever Python the runner image ships.
+    # Keep in sync with the python-version matrix in _pr-test-rust-ext-build.yml.
+    CI_PYTHON_VER="3.12"
+
+    # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
+    # The download comes from github.com, which some pools reach slowly enough to time
+    # out this step, so keep the installed build unless it predates os.memfd_create
+    # (python-build-standalone before 20260718). --upgrade repoints uv's minor-version
+    # link at the latest patch; a kept venv follows it.
+    CI_PYTHON_BIN="$(uv python find "$CI_PYTHON_VER" --system --python-preference only-managed 2>/dev/null || true)"
+    if [ -z "$CI_PYTHON_BIN" ] || ! "$CI_PYTHON_BIN" -c 'import os; os.memfd_create' 2>/dev/null; then
+        uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
     fi
 
-    SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-
+    UV_VENV_COMPLETE_MARKER=""
     if [ "$USE_VENV" = "1" ]; then
         UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
-        uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
-        # shellcheck disable=SC1091
-        source "$UV_VENV/bin/activate"
-        [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
-        [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
-
-        if [ -n "${GITHUB_ENV:-}" ]; then
-            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
-            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
-            touch "$UV_VENV/env.sh"
-        fi
-        if [ -n "${GITHUB_PATH:-}" ]; then
-            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
-        fi
+        uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
     else
-        echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
-        UV_VENV=""
+        # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
+        UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
+        # A cancelled install leaves dist-info that later installs treat as satisfied;
+        # rebuild unless the last install ran to completion.
+        UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
+        if [ ! -f "$UV_VENV_COMPLETE_MARKER" ]; then
+            rm -rf "$UV_VENV"
+            uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
+        fi
+        rm -f "$UV_VENV_COMPLETE_MARKER"
+    fi
+
+    # shellcheck disable=SC1091
+    source "$UV_VENV/bin/activate"
+    [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
+    [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
+
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+        mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+        echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+        # ci_cleanup_venv.sh deletes this path, so only the per-job venv exports it.
+        if [ "$USE_VENV" = "1" ]; then
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+        fi
+        echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
+        : > "$UV_VENV/env.sh"
+    fi
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+        echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -189,6 +236,10 @@ install_apt_packages() {
         libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        # gpu worker NUMA discovery needs the numactl executable, not just libnuma
+        CI_APT_PACKAGES+=(numactl)
+    fi
 
     # The images bake these in, so the usual run pays apt-get update's round
     # trips to install nothing. Skipping it costs no currency either: apt-get
@@ -217,15 +268,27 @@ install_apt_packages() {
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
     # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
-    local gpu_count=0
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        gpu_count=$(
-            (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
-                awk 'NF {count++} END {print count + 0}'
-        )
+    # INSTALL_GDRCOPY overrides the GPU count either way, e.g. docker/ci.Dockerfile
+    # builds with no GPU visible.
+    local install=0
+    if [ "${INSTALL_GDRCOPY+set}" = set ]; then
+        case "$INSTALL_GDRCOPY" in 1 | true | yes) install=1 ;; esac
+        echo "INSTALL_GDRCOPY=${INSTALL_GDRCOPY} (manually set via environment)"
+    else
+        local gpu_count=0
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            gpu_count=$(
+                (nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true) |
+                    awk 'NF {count++} END {print count + 0}'
+            )
+        fi
+        echo "${gpu_count}-GPU runner"
+        if [ "${gpu_count}" -ge 4 ]; then
+            install=1
+        fi
     fi
-    if [ "${gpu_count}" -lt 4 ]; then
-        echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
+    if [ "${install}" != 1 ]; then
+        echo "Skipping GDRCopy install"
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -336,15 +399,15 @@ setup_cargo_cache() {
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
-    # Runner containers built from different images share ${HOME}/.cache, and
+    # Runner containers built from different images share CI_CACHE_DIR, and
     # cargo reruns a cached build-script binary without rebuilding it when only
     # the libc changed, so each glibc gets its own tree.
-    local cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_root="${CI_CACHE_DIR}/sglang-cargo-target"
     local libc_tag
     libc_tag="$(getconf GNU_LIBC_VERSION 2>/dev/null | tr ' ' '-')"
     export CARGO_TARGET_DIR="${cargo_target_root}/${libc_tag:-unknown-libc}"
-    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
-    mkdir -p "${HOME}/.cache"
+    local cargo_target_lock="${CI_CACHE_DIR}/sglang-cargo-target.lock"
+    mkdir -p "${CI_CACHE_DIR}"
     exec 9>"${cargo_target_lock}"
     echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
     flock --exclusive 9
@@ -369,11 +432,22 @@ setup_cargo_cache() {
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
+    # Cargo checks path crates by mtime and all runners share one checkout path,
+    # so rebuild them unless this target dir was built from the same rust/ tree.
+    CARGO_TREE_STAMP="${CARGO_TARGET_DIR}/.rust-tree"
+    CARGO_TREE_KEY="$(git -C "${REPO_ROOT}" rev-parse HEAD:rust 2>/dev/null || true)"
+    if [ -z "${CARGO_TREE_KEY}" ] || [ "$(cat "${CARGO_TREE_STAMP}" 2>/dev/null)" != "${CARGO_TREE_KEY}" ]; then
+        git -C "${REPO_ROOT}" ls-files -z rust | (cd "${REPO_ROOT}" && xargs -0 touch)
+    fi
+    rm -f "${CARGO_TREE_STAMP}"
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
 release_cargo_cache_lock() {
     if [ "${CARGO_TARGET_LOCK_HELD:-0}" = "1" ]; then
+        # Only reached after a successful build.
+        [ -z "${CARGO_TREE_KEY:-}" ] || echo "${CARGO_TREE_KEY}" > "${CARGO_TREE_STAMP}"
         flock --unlock 9
         exec 9>&-
         CARGO_TARGET_LOCK_HELD=0
@@ -382,14 +456,8 @@ release_cargo_cache_lock() {
 }
 
 setup_pip_toolchain() {
-    if [ "$USE_VENV" = "1" ]; then
-        # The bootstrap upgrade hit system pip; this upgrades the venv's own.
-        python3 -m pip install --upgrade pip
-    fi
-
-    if [ "$USE_VENV" != "1" ]; then
-        export UV_SYSTEM_PYTHON=1
-    fi
+    # The bootstrap upgrade hit system pip; this upgrades the venv's own.
+    python3 -m pip install --upgrade pip
 
     export UV_LINK_MODE=copy
     PIP_CMD="uv pip"
@@ -548,9 +616,8 @@ require_prebuilt_rust_exts() {
     # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
-    # silently skipped. Stages have no setup-python, so the interpreter is whatever
-    # the image ships, and the pools are not on one version (h20 is 3.12 while
-    # h100 is 3.10) - a mismatch is drift to route around, not a failure.
+    # silently skipped. A CI_PYTHON_VER outside the build matrix has no module;
+    # build it from source rather than fail.
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
@@ -585,7 +652,13 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    # editable checkout paths are identical across runner containers; keep
+    # distribution locks separate while reusing each runner's warm cache
+    local editable_cache_dir="${UV_CACHE_DIR:-${CI_CACHE_DIR}/uv}"
+    if [ -n "${RUNNER_NAME:-}" ]; then
+        editable_cache_dir="${editable_cache_dir}/runners/${RUNNER_NAME}"
+    fi
+    UV_CACHE_DIR="$editable_cache_dir" $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -601,9 +674,9 @@ install_sglang() {
 }
 
 install_nccl() {
-    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # DeepEP needs NCCL 2.31.2 whatever torch pins, so this must run
     # after every command that resolves Python dependencies (including lmms-eval).
-    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+    $PIP_CMD install "nvidia-nccl-cu13==2.31.2" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
@@ -655,7 +728,7 @@ install_sglang_kernel() {
         else
             WHEEL_ARCH="x86_64"
         fi
-        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
+        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp311-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
         if [ -z "$KERNEL_WHL" ]; then
             echo "ERROR: No matching sgl-kernel wheel found in python/sglang/kernels/aot/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
             ls -alh python/sglang/kernels/aot/dist/
@@ -696,12 +769,6 @@ install_sglang_kernel() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_sglang_router() {
-    $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 install_flashinfer_cubin() {
     if [ "$UNINSTALL_CUBIN" = false ]; then
         echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
@@ -719,6 +786,7 @@ download_flashinfer_cache() {
         CU_VERSION="$CU_VERSION" \
         PIP_CMD="$PIP_CMD" \
         PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
+        CI_CACHE_DIR="$CI_CACHE_DIR" \
         bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
 
     mark_step_done "${FUNCNAME[0]}"
@@ -732,10 +800,10 @@ stabilize_flashinfer_jit_paths() {
         return
     fi
 
-    STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
+    STABLE_FI_DIR="${CI_CACHE_DIR}/flashinfer/_stable_src"
 
     # Clear stale cached_ops (keep valid compiled kernels)
-    if [ -d "${HOME}/.cache/flashinfer" ]; then
+    if [ -d "${CI_CACHE_DIR}/flashinfer" ]; then
         STALE_COUNT=0
         while IFS= read -r ninja_file; do
             STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
@@ -745,7 +813,7 @@ stabilize_flashinfer_jit_paths() {
                     STALE_COUNT=$((STALE_COUNT + 1))
                 fi
             fi
-        done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
+        done < <(find "${CI_CACHE_DIR}/flashinfer" -name "build.ninja" -type f 2>/dev/null)
         echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
     fi
 
@@ -776,7 +844,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.13.post1"
+    MOONCAKE_VERSION="0.3.14"
     NIXL_VERSION="1.3.0"
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -809,13 +877,59 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        $PIP_CMD install "lmms_eval==0.5.0" $PIP_INSTALL_SUFFIX
+        # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
+        # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
+        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
         $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_msa() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+    # MiniMax MSA sparse-attention kernels: MiniMax-M3.1 imports them at startup on
+    # Blackwell. Same commit and layout as docker/Dockerfile.cu134; editable because
+    # prefill JIT-compiles against its CUTLASS submodule.
+    if [ "$IS_BLACKWELL" != "1" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+    local msa_commit msa_dir
+    msa_commit=$(sed -n 's/^ARG MSA_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${REPO_ROOT}/docker/Dockerfile.cu134")
+    if [ -z "$msa_commit" ]; then
+        echo "FATAL: no MSA_COMMIT default in docker/Dockerfile.cu134"
+        exit 1
+    fi
+    msa_dir="${CI_CACHE_DIR}/sglang-ci/minimax-msa/${msa_commit}"
+    # Runner containers share CI_CACHE_DIR: without the lock, one job's rm -rf
+    # deletes the tree another job is still cloning.
+    mkdir -p "${CI_CACHE_DIR}/sglang-ci"
+    exec 8>"${CI_CACHE_DIR}/sglang-ci/minimax-msa.lock"
+    flock --exclusive 8
+    if [ ! -f "${msa_dir}/.complete" ]; then
+        rm -rf "$msa_dir"
+        git init -q "$msa_dir"
+        git -C "$msa_dir" remote add origin https://github.com/MiniMax-AI/MSA.git
+        _git_with_github_auth git -C "$msa_dir" fetch -q --depth 1 origin "$msa_commit"
+        git -C "$msa_dir" checkout -q --detach FETCH_HEAD
+        _git_with_github_auth git -C "$msa_dir" submodule update -q --init --recursive
+        touch "${msa_dir}/.complete"
+    fi
+    $PIP_CMD install --no-deps -e "$msa_dir" $PIP_INSTALL_SUFFIX
+    if [ -f "${msa_dir}/integrations/sglang/pyproject.toml" ]; then
+        $PIP_CMD install --no-deps -e "${msa_dir}/integrations/sglang" $PIP_INSTALL_SUFFIX
+    fi
+    flock --unlock 8
+    exec 8>&-
+    python3 -c "import inference, msa_v1; print(f'MSA {inference.__file__}')"
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -835,9 +949,7 @@ setup_ld_library_path() {
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    if [ "$USE_VENV" = "1" ] && [ -n "$UV_VENV" ]; then
-        echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
-    fi
+    echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
     if [ -n "${GITHUB_ENV:-}" ]; then
         echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: GITHUB_ENV write failed; LD_LIBRARY_PATH will be set via BASH_ENV instead"
     fi
@@ -856,17 +968,17 @@ import ctypes
 import importlib.metadata
 import os
 
-if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.31.2":
     raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
 nccl = ctypes.CDLL("libnccl.so.2")
 nccl_version = ctypes.c_int()
 status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
-if status != 0 or nccl_version.value != 23007:
+if status != 0 or nccl_version.value != 23102:
     raise SystemExit(
-        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"expected NCCL runtime 2.31.2, got status={status}, "
         f"raw_version={nccl_version.value}"
     )
-print("NCCL package and runtime versions are 2.30.7")
+print("NCCL package and runtime versions are 2.31.2")
 
 import torch
 print(torch.version.cuda)
@@ -928,21 +1040,19 @@ main() {
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock
-    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
-    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
-    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
-        setup_ld_library_path
-    fi
     install_sglang_kernel
-    install_sglang_router
     install_flashinfer_cubin
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
     install_extra_deps
+    install_msa
     install_nccl
     prepare_runner
     setup_ld_library_path
     verify_imports
+    if [ -n "$UV_VENV_COMPLETE_MARKER" ]; then
+        touch "$UV_VENV_COMPLETE_MARKER"
+    fi
 }
 
 main "$@"

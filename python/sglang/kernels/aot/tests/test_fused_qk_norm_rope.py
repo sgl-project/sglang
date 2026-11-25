@@ -8,21 +8,9 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_npu = is_npu()
-_is_xpu = is_xpu()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -91,7 +79,6 @@ def torch_ref_rms_norm_rope(
         base=10000,
         is_neox_style=is_neox,
         rope_scaling=None,
-        dual_chunk_attention_config=None,
         partial_rotary_factor=partial_rotary_factor,
     )
     rotary_emb = rotary_emb.to(qkv.device)

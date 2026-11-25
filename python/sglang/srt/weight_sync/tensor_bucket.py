@@ -83,6 +83,34 @@ class FlattenedTensorBucket:
         """Get the flattened tensor containing all bucket tensors"""
         return self.flattened_tensor
 
+    @classmethod
+    def empty(cls, names, dtypes, shapes, device):
+        """Allocate a receive bucket without constructing or copying its tensors."""
+        metadata = []
+        offset = 0
+        for name, dtype, shape in zip(names, dtypes, shapes, strict=True):
+            dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            shape = torch.Size(shape)
+            if any(dim < 0 for dim in shape):
+                raise ValueError(
+                    f"Negative dimension in received tensor {name}: {shape}"
+                )
+            if offset % dtype.itemsize:
+                raise ValueError(
+                    f"Unaligned received tensor {name}: byte offset {offset}, dtype {dtype}"
+                )
+            size = shape.numel() * dtype.itemsize
+            metadata.append(
+                FlattenedTensorMetadata(name, shape, dtype, offset, offset + size, size)
+            )
+            offset += size
+        if not metadata:
+            raise ValueError("Cannot create empty tensor bucket")
+        return cls(
+            flattened_tensor=torch.empty(offset, dtype=torch.uint8, device=device),
+            metadata=metadata,
+        )
+
     def get_metadata(self) -> List[FlattenedTensorMetadata]:
         """Get metadata for all tensors in the bucket"""
         return self.metadata
