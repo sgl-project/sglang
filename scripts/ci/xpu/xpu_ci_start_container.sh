@@ -55,6 +55,12 @@ retry_with_backoff() {
 # Authenticate to Docker Hub when credentials are present (avoids anonymous pull
 # rate limits). Both vars are optional; falls back to unauthenticated pulls.
 if [[ -n "${DOCKERHUB_INTEL_USERNAME:-}" && -n "${DOCKERHUB_INTEL_TOKEN:-}" ]]; then
+  # The runners are long-lived and also run approved PR code: log in to a throwaway
+  # config so the token never lands in the runner user's ~/.docker/config.json.
+  # RUNNER_TEMP is emptied after every job, should the trap not run.
+  DOCKER_CONFIG="$(mktemp -d "${RUNNER_TEMP:-/tmp}/docker-config.XXXXXX")"
+  export DOCKER_CONFIG
+  trap 'rm -rf "${DOCKER_CONFIG}"' EXIT
   echo "Logging in to Docker Hub..."
   if retry_with_backoff 6 sh -c 'echo "${DOCKERHUB_INTEL_TOKEN}" | docker login -u "${DOCKERHUB_INTEL_USERNAME}" --password-stdin >/dev/null 2>&1'; then
     echo "Docker Hub login successful"
