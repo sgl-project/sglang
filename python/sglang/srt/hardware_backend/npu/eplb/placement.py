@@ -22,6 +22,8 @@ _MAX_SCORING_STEPS = 64
 _EXCHANGE_BATCH_LAYERS = 16
 _LAYERS_PER_ALTERNATE_SEARCH = 8
 _MIN_COMPACTION_SKIP_FRACTION = 0.25
+# Approximate the fixed per-layer vote and writeback cost in receive rows.
+_LAYER_INSTALL_OVERHEAD_ROWS = 4
 
 
 class MigrationPlacement(NamedTuple):
@@ -345,31 +347,34 @@ def _send_upper_bound(resident, wanted):
 
 
 def _assign_ranks(receives, endpoint):
-    """Minimize total receives, then the maximum estimated endpoint load."""
+    """Map live ranks to planned rank groups, prioritizing total receives."""
     from scipy.optimize import linear_sum_assignment
 
     ranks = np.arange(len(receives))
     _, assignment = linear_sum_assignment(receives)
-    assigned = receives[ranks, assignment]
-    total = assigned.sum()
-    high = endpoint[ranks, assignment].max()
-    low = max(
-        (total + len(ranks) - 1) // len(ranks),
+    min_total_receives = receives[ranks, assignment].sum()
+    endpoint_upper = endpoint[ranks, assignment].max()
+    endpoint_lower = max(
+        (min_total_receives + len(ranks) - 1) // len(ranks),
         endpoint.min(axis=0).max(),
         endpoint.min(axis=1).max(),
     )
-    # A cap is feasible if an assignment still attains the original total.
-    # A forbidden edge alone costs more than that total.
-    while low < high:
-        cap = (low + high) // 2
-        limited = np.where(endpoint <= cap, receives, total + 1)
-        _, candidate = linear_sum_assignment(limited)
-        if limited[ranks, candidate].sum() == total:
+    # Lower the busiest endpoint while preserving the minimum total receives.
+    # An edge above the cap costs more by itself than an optimal assignment.
+    while endpoint_lower < endpoint_upper:
+        cap = (endpoint_lower + endpoint_upper) // 2
+        capped_receives = np.where(endpoint <= cap, receives, min_total_receives + 1)
+        _, candidate = linear_sum_assignment(capped_receives)
+        if capped_receives[ranks, candidate].sum() == min_total_receives:
             assignment = candidate
-            high = endpoint[ranks, candidate].max()
+            endpoint_upper = endpoint[ranks, candidate].max()
         else:
-            low = cap + 1
-    if receives.trace() == total and endpoint.diagonal().max() <= high:
+            endpoint_lower = cap + 1
+    # Keep the solver's rank order when identity reaches both optima.
+    if (
+        receives.trace() == min_total_receives
+        and endpoint.diagonal().max() <= endpoint_upper
+    ):
         return ranks
     return assignment
 
@@ -377,12 +382,15 @@ def _assign_ranks(receives, endpoint):
 def _reindex_placement(physical, logical, order):
     """Move slots while preserving the planner's replica order and -1 padding."""
     layers, capacity = physical.shape
-    order = torch.from_numpy(order.reshape(layers, capacity)).long()
-    inverse = logical.new_empty((layers, capacity + 1))
-    inverse[:, -1] = -1
-    slot_ids = torch.arange(capacity, dtype=logical.dtype).expand_as(order)
-    inverse.scatter_(1, order, slot_ids)
-    return physical.gather(1, order), inverse[
+    old_slot_at_new_slot = torch.from_numpy(order.reshape(layers, capacity)).long()
+    new_slot_for_old_slot = logical.new_empty((layers, capacity + 1))
+    # The extra entry preserves -1 replica padding when indexed from the end.
+    new_slot_for_old_slot[:, -1] = -1
+    new_slot_ids = torch.arange(capacity, dtype=logical.dtype).expand_as(
+        old_slot_at_new_slot
+    )
+    new_slot_for_old_slot.scatter_(1, old_slot_at_new_slot, new_slot_ids)
+    return physical.gather(1, old_slot_at_new_slot), new_slot_for_old_slot[
         torch.arange(layers)[:, None, None], logical.long()
     ]
 
@@ -682,32 +690,35 @@ def _admit_dispatch_layers(
     gains = {}
     for row in candidate_rows:
         gain = score(row, physical[row], logical[row])
-        if not gain and row in fallbacks:
-            base, inverse = _align_placement(
-                current[row : row + 1],
-                *fallbacks[row],
-                spec.local_experts,
-                ranks_per_node,
-            )
-            if not torch.equal(inverse[0], logical[row]):
-                gain = score(row, base[0], inverse[0])
-                if gain:
-                    physical[row].copy_(base[0])
-                    logical[row].copy_(inverse[0])
         if gain:
             gains[row] = gain
+            continue
+
+        fallback = fallbacks.get(row)
+        if fallback is None:
+            continue
+        fallback_physical, fallback_logical = _align_placement(
+            current[row : row + 1], *fallback, spec.local_experts, ranks_per_node
+        )
+        if torch.equal(fallback_logical[0], logical[row]):
+            continue
+        fallback_gain = score(row, fallback_physical[0], fallback_logical[0])
+        if fallback_gain:
+            physical[row].copy_(fallback_physical[0])
+            logical[row].copy_(fallback_logical[0])
+            gains[row] = fallback_gain
     return gains, static_dispatch
 
 
 def _select_layers_for_migration(
-    changed, old, physical, counts, local_experts, known_gains, *, observed_peaks
+    candidate_rows, old, physical, counts, local_experts, known_gains, *, observed_peaks
 ):
-    """Skip marginal improvements and stage the most useful layers first."""
+    """Order admitted layers by load saved per estimated migration cost."""
     load = counts.numpy()
     before = old.numpy()
     after = physical.numpy()
     priorities = {}
-    for layer in changed:
+    for layer in candidate_rows:
         live = before[layer].reshape(-1, local_experts)
         target = after[layer].reshape(live.shape)
         gain = known_gains.get(layer)
@@ -717,10 +728,9 @@ def _select_layers_for_migration(
             )
         if not gain:
             continue
-        receives = max(
+        peak_receive_rows = max(
             len(set(dst) - set(src)) for src, dst in zip(live, target, strict=True)
         )
-        # Account for the per-layer vote and writeback even with no remote rows.
-        priorities[layer] = gain / (receives + 4)
+        priorities[layer] = gain / (peak_receive_rows + _LAYER_INSTALL_OVERHEAD_ROWS)
 
     return tuple(sorted(priorities, key=priorities.get, reverse=True))

@@ -66,69 +66,97 @@ def _random_rank_peak_bound(samples, probability, before, totals, active_sources
         ),
         axis=1,
     )
-    mean, variance_sum, reachable, random_counts = np.split(
+    mean, variance_sum, max_assignments, random_assignments = np.split(
         samples @ weights, 4, axis=1
     )
     # Sources can share a generator state. With K active sources,
     # Cauchy-Schwarz bounds the combined variance by K times their sum.
-    source_ranks = (
+    source_count_bound = (
         np.maximum(active_sources, 1)[:, None]
         if active_sources is not None
         else np.full((len(totals), 1), probability.shape[1])
     )
     if not _random_window_tail_is_safe(
-        before, totals, mean, variance_sum, reachable, random_counts, source_ranks
+        before,
+        totals,
+        mean,
+        variance_sum,
+        max_assignments,
+        random_assignments,
+        source_count_bound,
     ):
         return None
-    variance = source_ranks * variance_sum
+    variance = source_count_bound * variance_sum
     # For any threshold c, max(X) <= c + sum((X_i - c)_+).
     # Cauchy-Schwarz bounds each expected excess using its variance.
     threshold = mean.max(1, keepdims=True)
     gap = mean - threshold
     excess = (np.sqrt(variance + gap * gap) + gap) / 2
     peak = threshold[:, 0] + np.minimum(
-        excess, np.maximum(reachable - threshold, 0)
+        excess, np.maximum(max_assignments - threshold, 0)
     ).sum(1)
-    return np.minimum(peak, reachable.max(1))
+    return np.minimum(peak, max_assignments.max(1))
 
 
 def _random_window_tail_is_safe(
-    before, totals, mean, variance_sum, reachable, random_counts, source_ranks
+    before_peak,
+    totals,
+    mean,
+    variance_sum,
+    max_assignments,
+    random_assignments,
+    source_count_bound,
 ):
+    """Bound the probability that the candidate raises the recorded rank-share P95."""
     active = totals > 0
-    tail = window_p95_index(np.count_nonzero(active))
-    if tail < 0:
+    p95_index = window_p95_index(np.count_nonzero(active))
+    if p95_index < 0:
         return True
-    before_p95 = np.partition(before[active] / totals[active], tail)[tail]
+    active_totals = totals[active]
+    before_share = before_peak[active] / active_totals
+    before_p95 = np.partition(before_share, p95_index)[p95_index]
     # A step breaches the old P95 when any rank reaches this integer load.
     first_breach = (
-        np.floor((before_p95 + _P95_ROUNDING_TOLERANCE) * totals[active])[:, None] + 1
+        np.floor((before_p95 + _P95_ROUNDING_TOLERANCE) * active_totals)[:, None] + 1
     )
-    mean = mean[active]
-    random_counts = random_counts[active]
-    forced = ((random_counts == 0) & (mean >= first_breach)).any(axis=1)
-    # The nearest-rank P95 rises once one more step than the tail can hold
-    # breaches. Always count steps that already breach with probability one.
-    breaches_to_raise_p95 = len(forced) - tail
-    remaining_breaches = breaches_to_raise_p95 - int(forced.sum())
-    if remaining_breaches <= 0:
+    active_mean = mean[active]
+    active_random_assignments = random_assignments[active]
+    certain_breach = (
+        (active_random_assignments == 0) & (active_mean >= first_breach)
+    ).any(axis=1)
+    # P95 rises when more than the top 5% of active steps breach.
+    # Count certain breaches before bounding the random ones.
+    breaches_to_raise_p95 = len(certain_breach) - p95_index
+    random_breaches_needed = breaches_to_raise_p95 - int(certain_breach.sum())
+    if random_breaches_needed <= 0:
         return False
-    possible = (
-        (reachable[active] >= first_breach) & (random_counts > 0) & ~forced[:, None]
+    possible_breach = (
+        (max_assignments[active] >= first_breach)
+        & (active_random_assignments > 0)
+        & ~certain_breach[:, None]
     )
-    gap = np.maximum(first_breach - mean, 0)[possible]
-    risk = np.zeros_like(mean)
+    gap = np.maximum(first_breach - active_mean, 0)[possible_breach]
     # Apply Hölder to the K source moment-generating functions before using
     # Bernstein and Hoeffding within each source. The exponents lose a factor
     # of K, so sources may be arbitrarily correlated (including identical draws).
-    squared_gap = gap**2 / np.broadcast_to(source_ranks[active], mean.shape)[possible]
-    bernstein = squared_gap / (2 * (variance_sum[active][possible] + gap / 3))
-    hoeffding = 2 * squared_gap / random_counts[possible]
-    risk[possible] = np.exp(-np.maximum(bernstein, hoeffding))
+    sources = np.broadcast_to(source_count_bound[active], active_mean.shape)
+    scaled_gap_squared = gap**2 / sources[possible_breach]
+    bernstein_exponent = scaled_gap_squared / (
+        2 * (variance_sum[active][possible_breach] + gap / 3)
+    )
+    hoeffding_exponent = (
+        2 * scaled_gap_squared / active_random_assignments[possible_breach]
+    )
+    rank_breach_bound = np.zeros_like(active_mean)
+    rank_breach_bound[possible_breach] = np.exp(
+        -np.maximum(bernstein_exponent, hoeffding_exponent)
+    )
     # Union bound over destination ranks, then Markov over the window. Neither
     # needs independence across destination ranks or across steps.
-    expected_breaches = np.minimum(risk.sum(axis=1), 1).sum()
-    return expected_breaches <= remaining_breaches * _MAX_WINDOW_TAIL_REGRESSION_RISK
+    expected_breach_bound = np.minimum(rank_breach_bound.sum(axis=1), 1).sum()
+    return expected_breach_bound <= (
+        random_breaches_needed * _MAX_WINDOW_TAIL_REGRESSION_RISK
+    )
 
 
 def _replica_rank_probabilities(inverse, ranks, local_experts):
@@ -168,11 +196,11 @@ def score_dispatch_migration(
     slot_ranks = np.arange(len(current_layout)) // local_experts
     totals = logical_counts.sum(1)
     remote_saved = 0
-    fixed_destinations = static_dispatch is not None or len(current_layout) == len(
+    deterministic_dispatch = static_dispatch is not None or len(current_layout) == len(
         candidate_replicas
     )
     compare_nodes = score_locality and ranks > ranks_per_node
-    if fixed_destinations:
+    if deterministic_dispatch:
         if static_dispatch is None:
             # A single copy fixes the destination for every source node.
             destinations = candidate_replicas[current_layout, 0] // local_experts
@@ -224,13 +252,20 @@ def score_dispatch_migration(
         peak,
         totals,
         ranks,
-        check_tail=fixed_destinations,
+        # Random dispatch already checked the window risk using the load distribution.
+        compare_peak_share_p95=deterministic_dispatch,
         remote_saved=remote_saved,
     )
 
 
 def _peak_gain(
-    before_peak, after_peak, totals, ranks, *, check_tail=True, remote_saved=0
+    before_peak,
+    after_peak,
+    totals,
+    ranks,
+    *,
+    compare_peak_share_p95=True,
+    remote_saved=0,
 ):
     gain = (before_peak - after_peak).sum()
     min_saving = MIN_RANK_LOAD_SAVING * totals.sum() / ranks
@@ -238,7 +273,7 @@ def _peak_gain(
         return 0.0
     # Compare the busiest rank's share of each step. With mixed batch sizes
     # this percentile differs from the P95 of absolute assignment counts.
-    if check_tail:
+    if compare_peak_share_p95:
         active = totals > 0
         tail = window_p95_index(np.count_nonzero(active))
         shares = np.stack([before_peak[active], after_peak[active]]) / totals[active]
