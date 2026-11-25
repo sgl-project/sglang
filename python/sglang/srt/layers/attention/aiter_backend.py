@@ -4377,10 +4377,19 @@ class AiterAttnBackend(AttentionBackend):
                         verify_seqlen_k_i32=verify_seqlen_k_i32,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    # DSpark block-verification leaves spec_info.custom_mask None
+                    # (no per-token tree mask). The eager verify path passes that
+                    # None straight through; mirror it here instead of copying into
+                    # the preallocated graph buffer, which crashes on None
+                    # ("'NoneType' object has no attribute 'shape'") for MLA+DSpark
+                    # under TP (e.g. MiniMax-M3.1-Flash on gfx942 TP2).
+                    if spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                    else:
+                        custom_mask = None
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
