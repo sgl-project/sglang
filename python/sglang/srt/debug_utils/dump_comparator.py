@@ -243,11 +243,10 @@ def _try_unify_shape(x: torch.Tensor, target_shape):
 def _calc_rel_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
-    if denominator == 0:
-        # Both all-zero: identical, and 0 / 0 would make the diff NaN.
-        return torch.zeros_like(denominator)
     sim = 2 * (x * y).sum() / denominator
-    return 1 - sim
+    # Both all-zero: identical, and 0 / 0 would make the diff NaN. torch.where
+    # keeps this free of a host sync, so it is safe under graph capture.
+    return torch.where(denominator == 0, torch.zeros_like(sim), 1 - sim)
 
 
 def _load_object(path):
