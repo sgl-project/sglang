@@ -340,7 +340,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-    # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+    # RoPE reservation). Keep them at 1 to avoid surprising memory behavior.
     #
     # For DFlash, the natural unit is `block_size` (verify window length).
     if cfg.speculative_num_steps is None:
@@ -350,14 +350,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_steps=1,
         )
     elif int(cfg.speculative_num_steps) != 1:
-        logger.warning(
-            "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            cfg.speculative_num_steps,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_steps=1,
+        raise ValueError(
+            "DFLASH only supports --speculative-num-steps 1, "
+            f"got {cfg.speculative_num_steps}."
         )
 
     if cfg.speculative_eagle_topk is None:
@@ -784,14 +779,9 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             speculative_num_steps=1,
         )
     elif int(cfg.speculative_num_steps) != 1:
-        logger.warning(
-            "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            cfg.speculative_num_steps,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            speculative_num_steps=1,
+        raise ValueError(
+            "DSpark only supports --speculative-num-steps 1, "
+            f"got {cfg.speculative_num_steps}."
         )
 
     if cfg.speculative_eagle_topk is None:
@@ -1643,23 +1633,6 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     if model_arch in ["LlamaForCausalLM"]:
         return (5, 4, 8)
-    elif model_arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     elif model_arch == ERNIE5_5_MOE_ARCH:
