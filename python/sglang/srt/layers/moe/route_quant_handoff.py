@@ -111,8 +111,6 @@ def try_route_quant_fused(
         and _handoff.fused_routing_ok
         and k3_deepgemm_routed.handles(layer, x.shape[0])
     ):
-        # Routed experts on DeepGEMM's MegaMoE: one launch writes the packed top-k
-        # words, x and x_sf into that kernel's buffer; no trtllm-gen routing metadata.
         routed = k3_deepgemm_routed.route_quant_into_buffer(
             gating_output,
             correction_bias,

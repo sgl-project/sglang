@@ -2633,18 +2633,10 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
-    # Die-local routed experts for DFlash target verify on a GPU with two
-    # locality domains (opt-in; Kimi K3.1 with 112 experts per EP rank on SM
-    # 10.7). Each EP rank keeps its routed-expert weights once, in the
-    # trtllm-gen layout, on pages homed on the die that reads them, and
-    # target-verify calls whose row count is in a per-width table run DeepGEMM's
-    # one-rank MegaMoE kernel on those weights; every other call runs
-    # trtllm-gen as before. Needs a DeepGEMM with the one-rank API; a layer,
-    # device or DeepGEMM that does not qualify keeps the default path and logs
-    # one warning. See srt/layers/moe/k3_die_local_moe.py.
+    # Die-local routed experts on DeepGEMM's one-rank MegaMoE for DFlash target
+    # verify on two-die GPUs (srt/layers/moe/k3_die_local_moe.py).
     SGLANG_K3_ROUTED_MOE_DEEPGEMM = EnvBool(False)
-    # JSON file that replaces the in-tree per-width table
-    # (srt/layers/moe/k3_die_local_moe_widths.json, same format). Empty: in-tree.
+    # JSON file replacing the in-tree per-width table (k3_die_local_moe_widths.json).
     SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS = EnvStr("")
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)

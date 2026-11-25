@@ -111,8 +111,6 @@ def route_quant_fused(
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
     out_packed = torch.empty((M, topk), dtype=torch.int32, device=device)
-    # K3 routed experts on DeepGEMM's MegaMoE read the activations from that
-    # kernel's buffer: write them there when it exists
     from sglang.srt.layers.moe import k3_deepgemm_routed
 
     dest = k3_deepgemm_routed.activation_dest(M)

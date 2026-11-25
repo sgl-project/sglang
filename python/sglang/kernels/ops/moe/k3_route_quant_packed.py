@@ -1,11 +1,3 @@
-"""One-launch Kimi-K3 routing + MXFP8 quant with packed top-k words, for layers whose routed experts run on
-DeepGEMM's MegaMoE (srt/layers/moe/k3_deepgemm_routed.py).
-
-Stock device code (route_radix_block + per-token group quant, as in kimi_k3_fused_routing's first launch) with the
-packed top-k output and padded rows masked; no trtllm-gen routing-metadata launch. The caller passes the output
-tensors (the MegaMoE buffer's x / x_sf / top-k regions), so nothing is copied afterwards.
-"""
-
 from __future__ import annotations
 
 from typing import Optional
@@ -64,10 +56,7 @@ def route_quant(
     num_token_non_padded: Optional[torch.Tensor],
     out_wbuf: Optional[torch.Tensor] = None,
 ):
-    """Returns ``(weights [M, topk] fp32, ids [M, topk] int32)``; the packed words,
-    x_q and x_s are written into the given tensors. With ``out_wbuf`` (fp32
-    ``[rows >= M, topk]``) the words carry bit 30 instead of bf16 weight bits and
-    the fp32 weights go to ``out_wbuf``."""
+    """Returns (weights [M, topk] fp32, ids [M, topk] int32)."""
     M = scores.shape[0]
     out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=scores.device)

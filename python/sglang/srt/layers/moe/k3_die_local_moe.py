@@ -1,31 +1,3 @@
-"""Die-local routed experts for Kimi K3 DFlash target verify
-(SGLANG_K3_ROUTED_MOE_DEEPGEMM): weight placement and per-width dispatch.
-
-On a GPU with two locality domains (dies) the trtllm-gen MoE kernel reads the
-expert weights from wherever the allocator put them, so about half of the
-weight bytes cross the die-to-die link. DeepGEMM's MegaMoE kernel gives the
-first half of every expert's rows to the SMs of domain 0 and the second half
-to domain 1. This module
-
-  load      keeps each EP rank's routed-expert weights ONCE, in the layout
-            trtllm-gen already uses, on pages homed on the domain that reads
-            most of each page (`stack_final`), and exposes them to the MegaMoE
-            kernel as zero-copy views (`finish`);
-  dispatch  sends a target-verify call whose row count is in the per-width
-            table to the MegaMoE kernel (`takes`); prefill, extend, plain
-            decode and every other width run trtllm-gen on the same tensors.
-
-The per-width table is `k3_die_local_moe_widths.json` next to this file
-(`widths`, or `widths_ar_fusion` under SGLANG_K3_AR_FUSION, where a call of up
-to 73 rows would otherwise fold its finalize into the push all-reduce);
-SGLANG_K3_ROUTED_MOE_DEEPGEMM_VERIFY_WIDTHS names a file of the same format
-that replaces it.
-
-Off by default. With the switch on, a layer, device, model shape or DeepGEMM
-build that does not qualify keeps the default path and logs one warning
-(`wanted`).
-"""
-
 from __future__ import annotations
 
 import functools
@@ -49,8 +21,7 @@ _SWITCH = "SGLANG_K3_ROUTED_MOE_DEEPGEMM"
 _DEFAULT_TABLE = Path(__file__).with_name("k3_die_local_moe_widths.json")
 # Rows of the MegaMoE buffer; no dispatched width may exceed it
 MAX_VERIFY_ROWS = 256
-# (num_experts, num_local_experts, w13 shape, w2 shape) the kernel's shared
-# weight layout and the per-width table were validated for: Kimi K3.1, EP8
+# (num_experts, num_local_experts, w13 shape, w2 shape) validated: Kimi K3.1, EP8
 _VALIDATED_SHAPES = ((896, 112, (112, 6144, 1792), (112, 3584, 1536)),)
 _VALIDATED_SM = (10, 7)
 
@@ -72,8 +43,7 @@ def table_path() -> Path:
 
 @functools.lru_cache(maxsize=1)
 def verify_widths() -> FrozenSet[int]:
-    """Row counts of a target-verify call that run on the MegaMoE kernel. Read
-    once per process; a malformed table raises (at model load, see `wanted`)."""
+    """Row counts of a target-verify call that run on the MegaMoE kernel."""
     if not enabled():
         return frozenset()
     path = table_path()
@@ -105,8 +75,7 @@ _summary = dict(layers=0, logged=False)
 
 
 def target_forward(fn):
-    """Decorator of the K3 model forward: marks target-verify forwards for
-    `takes`. Returns `fn` itself when the switch is off."""
+    """Decorator of the K3 model forward: marks target-verify forwards for `takes`."""
     if not enabled():
         return fn
 
@@ -128,8 +97,7 @@ def target_forward(fn):
 
 
 def takes(rows: int) -> bool:
-    """Whether a routed call of `rows` rows in the current forward runs on the
-    MegaMoE kernel (on a layer `finish` prepared)."""
+    """Whether a routed call of `rows` rows in the current forward runs on MegaMoE."""
     return _verify.get()[0] and rows in verify_widths()
 
 
@@ -177,10 +145,7 @@ def _ineligible(layer: torch.nn.Module) -> Optional[str]:
 
 
 def wanted(layer: torch.nn.Module, with_bias: bool, precision: str) -> bool:
-    """Whether this layer keeps die-local weights shared by both kernels;
-    decided once per layer, before its flashinfer_mxfp4 weights are prepared.
-    With the switch on and a requirement missing, the layer stays on the
-    default path and one warning says why."""
+    """Whether this layer keeps die-local weights shared by both kernels."""
     if not enabled():
         return False
     from sglang.srt.layers.moe import k3_deepgemm_routed
@@ -197,17 +162,8 @@ def wanted(layer: torch.nn.Module, with_bias: bool, precision: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Placement
-# ---------------------------------------------------------------------------
-
-
 def page_homes(shape: Sequence[int], itemsize: int, page: int) -> List[int]:
-    """Home domain (0 or 1) of every `page`-byte page of a contiguous
-    `[E, N, K]` weight whose rows `[0, N / 2)` of every expert are read by
-    domain 0 and rows `[N / 2, N)` by domain 1: the domain that reads most of
-    the page's bytes; an evenly split page alternates by page index, which
-    keeps the two domains' page counts equal."""
+    """Home domain of each page; domain 0 reads rows [0, N / 2) of every expert."""
     total = math.prod(shape) * itemsize
     half = total // (shape[0] * 2)
     homes = []
@@ -243,8 +199,7 @@ def _domain_props(device_index: int):
 
 @functools.lru_cache(maxsize=None)
 def _page_bytes(device_index: int) -> int:
-    """Allocation granularity of the device's two locality domains (equal), or
-    raises when the driver bindings or the device have no locality domains."""
+    """Allocation granularity of the device's two locality domains."""
     from cuda.bindings import driver as cu
 
     from sglang.srt.utils.cuda_vmm_utils import get_allocation_granularity
@@ -298,8 +253,7 @@ class _PlacedPages:
 
 
 def _domain_of(address: int) -> Optional[int]:
-    """Locality domain the page at `address` is homed on, None when the driver
-    bindings cannot tell."""
+    """Locality domain the page at `address` is homed on, or None."""
     from cuda.bindings import driver as cu
 
     attr = getattr(
@@ -312,9 +266,7 @@ def _domain_of(address: int) -> Optional[int]:
 
 
 def _empty_die_local(shape, dtype: torch.dtype, device) -> torch.Tensor:
-    """Uninitialized contiguous `shape` tensor on `device` whose pages are homed
-    as `page_homes` says. The memory comes from the CUDA driver, not from
-    torch's allocator, and goes back to the device when the tensor dies."""
+    """Uninitialized tensor on driver-allocated pages homed as `page_homes` says."""
     from cuda.bindings import driver as cu
 
     from sglang.srt.utils.cuda_vmm_utils import VmmReservation, check_drv
@@ -330,8 +282,7 @@ def _empty_die_local(shape, dtype: torch.dtype, device) -> torch.Tensor:
         offset = 0
         for home, run in groupby(homes):
             pages = len(list(run))
-            # one allocation per power-of-two run of pages: the driver rounds a
-            # locality-domain allocation up to a power of two pages
+            # the driver rounds a locality-domain allocation up to a power of two pages
             while pages:
                 size = (1 << (pages.bit_length() - 1)) * page
                 handle = check_drv(
@@ -362,14 +313,11 @@ def _empty_die_local(shape, dtype: torch.dtype, device) -> torch.Tensor:
 
 
 def stack_final(parts: List[torch.Tensor]) -> torch.Tensor:
-    """`torch.stack(parts)` as the layer's final `[E, N, K]` weight, on
-    die-local pages."""
+    """`torch.stack(parts)` on die-local pages."""
     first = parts[0]
     device = first.device
-    # Die-local weights are allocated outside torch's allocator, which would
-    # keep the checkpoint and permute slabs it no longer uses: hand idle blocks
-    # back before the next final allocation (the engine sizes its KV pool from
-    # free device memory). Model loading only.
+    # the pages come from the driver, not torch's allocator: hand torch's idle
+    # blocks back first (the engine sizes its KV pool from free device memory)
     reserved = torch.cuda.memory_reserved(device)
     allocated = torch.cuda.memory_allocated(device)
     free_before = torch.cuda.mem_get_info(device)[0]
@@ -391,8 +339,7 @@ def stack_final(parts: List[torch.Tensor]) -> torch.Tensor:
 
 
 def finish(layer: torch.nn.Module, prefix: str) -> None:
-    """Expose the layer's trtllm-layout weights and scales to the MegaMoE
-    kernel as zero-copy typed views; the four parameters stay authoritative."""
+    """Expose the layer's weights and scales to MegaMoE as zero-copy views."""
     w13, s13 = layer.w13_weight, layer.w13_weight_scale
     w2, s2 = layer.w2_weight, layer.w2_weight_scale
     layer.mega_l1_weights = (w13.view(torch.int8), s13.view(torch.int32))

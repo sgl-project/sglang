@@ -1,12 +1,4 @@
-// Kimi-K3 routing + MXFP8 activation quant in one launch, for layers whose routed experts run on DeepGEMM's MegaMoE
-// (srt/layers/moe/k3_deepgemm_routed.py). It is the first launch of kimi_k3_fused_routing (route_radix_block on CTAs
-// [0, M), per-token group quant on CTAs [M, 2M)) with the packed top-k words `(id << 16) | bf16(weight)` enabled and
-// without the trtllm-gen routing-metadata launch, which MegaMoE does not read. The caller passes the outputs, so the
-// words, x and x_sf land in the MegaMoE buffer and nothing is copied afterwards.
-// Padded rows (row >= num_valid) get id -1 and packed word -1 (never a local expert), as the stock kernel does for
-// ids. With `out_wbuf` (calls of more than 64 tokens, where trtllm-gen takes FP32 routing weights) a word keeps only
-// the id and bit 30, and the FP32 weight is stored to `out_wbuf` (DeepGEMM `topk_format='packed'`).
-// Both halves are the stock device code: weights, ids, words, x_q and x_s are bit-identical to the stock kernels'.
+// K3 routing + MXFP8 activation quant in one launch, for DeepGEMM's MegaMoE.
 #include "route_quant_fused.cuh"
 
 namespace sglang {
@@ -41,7 +33,6 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
       params.route.out_i[row * params.route.out_i_stride + tx] = -1;
       params.route.out_packed[row * params.route.out_packed_stride + tx] = -1;
     } else if (tx < T::kTopK && params.flag_w) {
-      // thread tx wrote slot tx of out_w / out_i itself (sorted == 0)
       const int32_t id = params.route.out_i[row * params.route.out_i_stride + tx];
       params.out_wbuf[row * T::kTopK + tx] = params.route.out_w[row * params.route.out_w_stride + tx];
       params.route.out_packed[row * params.route.out_packed_stride + tx] = ((id & 0x3fff) << 16) | 0x40000000;

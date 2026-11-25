@@ -1,21 +1,3 @@
-"""Kimi K3 routed experts on DeepGEMM's one-rank MegaMoE kernel, for the calls
-SGLANG_K3_ROUTED_MOE_DEEPGEMM dispatches to it (layers/moe/k3_die_local_moe.py
-decides which and prepares the weights).
-
-Each EP rank is a one-rank MegaMoE group over its local experts. The kernel
-reads the layer's trtllm-gen weight tensors directly (`weight_layout='trtllm'`)
-and is asked for trtllm-gen's rounding and combine order (`numerics='trtllm'`),
-so a call it takes is bit-identical to the same call on trtllm-gen:
-
-  route  routing + activation quant in one launch that writes the packed top-k
-         words, x and x_sf into the MegaMoE buffer (`route_quant_into_buffer`)
-  call   one `deep_gemm.fp8_fp4_mega_moe` launch into the caller's output; when
-         the inputs were routed elsewhere, one staging launch first (`run`)
-
-Needs a DeepGEMM with the one-rank API listed in `missing_capability`; without
-it the layer is never prepared and every call stays on trtllm-gen.
-"""
-
 from __future__ import annotations
 
 import functools
@@ -34,16 +16,12 @@ MegaWeights = Tuple[torch.Tensor, torch.Tensor]
 _SITU_BETA = 4.0
 _SITU_LINEAR_BETA = 25.0
 
-# trtllm-gen's finalize (flashinfer 0.7.x) sums a token's top-k rows in four
-# interleaved accumulators for calls of at most this many tokens and in one
-# chain above. Only used to ask DeepGEMM for the same order.
+# trtllm-gen's finalize (flashinfer 0.7.x) changes its top-k combine order above this
 _TRTLLM_SPLIT4_COMBINE_MAX_TOKENS = 84
 
-# Largest M tile of the MegaMoE buffer. With the 256 rows of
-# k3_die_local_moe.MAX_VERIFY_ROWS the kernel never picks a larger one.
+# Largest M tile of the MegaMoE buffer
 _MAX_BLOCK_M = 64
 
-# Keywords of the one-rank, shared-weight MegaMoE API this path calls
 _CALL_KEYWORDS = (
     "weight_layout",
     "numerics",
@@ -64,12 +42,7 @@ def _deep_gemm():
 
 @functools.lru_cache(maxsize=1)
 def missing_capability() -> Optional[str]:
-    """What the installed DeepGEMM lacks for this path, or None. The path needs
-    `fp8_fp4_mega_moe(weight_layout='trtllm', numerics='trtllm',
-    split4_combine_max_tokens=, topk_format='packed', topk_first_expert=)` on
-    FP8 x FP4 SiTU experts and `SymmBuffer(exact_num_max_tokens=,
-    max_block_m=)`; the buffer keywords arrived together with the FP8 x FP4
-    `weight_layout='trtllm'`, which the call's signature alone does not show."""
+    """What the installed DeepGEMM lacks for this path, or None."""
     deep_gemm = _deep_gemm()
     if deep_gemm is None:
         return "deep_gemm cannot be imported"
@@ -79,8 +52,6 @@ def missing_capability() -> Optional[str]:
         call_keywords = inspect.signature(call).parameters
         buffer_keywords = inspect.signature(buffer_cls.__init__).parameters
     except Exception as e:
-        # no such entry point, or one whose signature Python cannot read (a
-        # build that exposes it as a bound native op): not the API this path calls
         return f"this deep_gemm has no inspectable fp8_fp4_mega_moe / mega.SymmBuffer ({type(e).__name__}: {e})"
     missing = [name for name in _CALL_KEYWORDS if name not in call_keywords] + [
         name for name in _BUFFER_KEYWORDS if name not in buffer_keywords
@@ -97,8 +68,7 @@ def missing_capability() -> Optional[str]:
 
 
 def mismatch(layer: torch.nn.Module, with_bias: bool, precision: str) -> Optional[str]:
-    """The first requirement of this path that the layer or the installed
-    DeepGEMM misses, or None."""
+    """The first requirement of this path the layer or DeepGEMM misses, or None."""
     cfg = layer.moe_runner_config
     if (
         cfg.activation != "situ"
@@ -122,20 +92,12 @@ def mismatch(layer: torch.nn.Module, with_bias: bool, precision: str) -> Optiona
     except Exception as e:
         return f"deep_gemm cannot report locality domains ({type(e).__name__}: {e})"
     if num_domains < 2:
-        # the kernel splits every expert's rows between two domains' SMs
         return "the device has no second locality domain"
     return None
 
 
 def handles(layer: torch.nn.Module, num_tokens: int) -> bool:
-    """Whether a routed call of `num_tokens` rows on this layer runs on the
-    MegaMoE kernel. Under SGLANG_K3_AR_FUSION such a call changes two things in
-    KimiK3MoE._forward_fused. The kernel finalizes (top-k weighted combine)
-    in-kernel, so the finalize is not deferred into the all-reduce. And the
-    kernel is persistent, one CTA per SM, so the shared experts' pull cannot
-    overlap it as it overlaps trtllm-gen (measured on Kimi K3.1, EP8: +7.0 ms
-    per verify round at 80 rows): latent and shared are reduced in one pull
-    behind the kernel instead."""
+    """Whether a routed call of `num_tokens` rows on this layer runs on MegaMoE."""
     if getattr(layer, "mega_l1_weights", None) is None:
         return False
     from sglang.srt.layers.moe.k3_die_local_moe import takes
@@ -164,9 +126,7 @@ def reserve_buffer(
     device,
     first_expert: int,
 ):
-    """The process's MegaMoE buffer (`MAX_VERIFY_ROWS` rows, shared by its
-    layers), created on first use. Called at weight load so the buffer is
-    counted before the engine sizes its memory pools."""
+    """The process's MegaMoE buffer, created on first use (shared by its layers)."""
     shape = (num_experts, top_k, hidden, intermediate)
     if _group.buf is None:
         import deep_gemm
@@ -174,10 +134,7 @@ def reserve_buffer(
 
         from sglang.srt.layers.moe.k3_die_local_moe import MAX_VERIFY_ROWS
 
-        # new_group is a collective over the default group: every rank creates
-        # all of them in the same order and keeps its own. DeepGEMM takes only
-        # size(), rank() and barrier() from a one-rank group, so the group needs
-        # no device communicator (an NCCL one costs ~0.4 GB of device memory).
+        # new_group is a collective: every rank creates all groups in the same order
         backend = "gloo" if dist.is_gloo_available() else None
         groups = [
             dist.new_group([r], backend=backend) for r in range(dist.get_world_size())
@@ -196,8 +153,7 @@ def reserve_buffer(
         )
         _group.stats = torch.zeros(num_experts, dtype=torch.int, device=device)
         _group.shape = shape
-        # deep_gemm `topk_format='packed'`: int32 words at the start of the int64
-        # topk_idx region
+        # topk_format='packed': int32 words at the start of the int64 topk_idx region
         rows = _group.buf.topk_idx.shape[0]
         words = _group.buf.topk_idx.view(torch.int32).view(-1)
         _group.packed = words[: rows * top_k].view(rows, top_k)
@@ -209,9 +165,7 @@ def reserve_buffer(
 
 
 def activation_dest(num_tokens: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Rows of the MegaMoE buffer a quantizer may write `num_tokens` MXFP8
-    activations and their packed scales to, so that `run` need not copy them;
-    None when the MegaMoE kernel does not take this call."""
+    """(x, x_sf) rows of the MegaMoE buffer to quantize into, or None."""
     buf = _group.buf
     if buf is None or num_tokens > buf.x.shape[0]:
         return None
@@ -232,10 +186,7 @@ def route_quant_into_buffer(
     apply_scale: bool,
     num_token_non_padded: Optional[torch.Tensor],
 ):
-    """Routing + MXFP8 quant of the activations in ONE launch that writes the packed
-    top-k words, x and x_sf into the MegaMoE buffer, so that `run` issues the
-    MegaMoE launch alone. Returns `(weights, ids, packed, x_q, x_s)` or None
-    (the caller then routes as before and `run` stages the inputs)."""
+    """Route and quantize into the MegaMoE buffer in one launch, or None."""
     buf = _group.buf
     num_tokens = x.shape[0]
     if buf is None or num_tokens > buf.x.shape[0] or top_k != _group.packed.shape[1]:
@@ -246,8 +197,7 @@ def route_quant_into_buffer(
         moe_route_quant_fused,
     )
 
-    # trtllm-gen takes bf16 routing weights where the fused route + quant kernel
-    # applies and fp32 above: the same split keeps the outputs bit-identical
+    # same bf16 / fp32 routing-weight split as trtllm-gen, to stay bit-identical
     bf16_weights = moe_route_quant_fused.covered(scores, bias, top_k, x)
     if (
         not (bf16_weights or kimi_k3_fused_routing.covered(scores, bias, top_k, x))
@@ -280,10 +230,7 @@ _pack_kernel = None
 
 
 def _get_pack_kernel():
-    """Staging launch for `topk_format='packed'`: packed words into the buffer (from
-    packed words, or from ids + weights: bf16 weights go into the word, fp32
-    weights into the buffer's topk_weights with bit 30 set in the word), and the
-    activations when they are not in place."""
+    """Triton launch that stages packed top-k words (and x, x_sf) into the buffer."""
     global _pack_kernel
     if _pack_kernel is not None:
         return _pack_kernel
@@ -349,9 +296,7 @@ def _get_pack_kernel():
 
 
 def _call_keywords(num_call_tokens: int) -> dict:
-    """Keywords of every MegaMoE call of this path. trtllm-gen picks its combine
-    order from the engine call's size; the same threshold keeps the outputs
-    bit-identical."""
+    """Keywords of every MegaMoE call of this path."""
     limit = _TRTLLM_SPLIT4_COMBINE_MAX_TOKENS
     return dict(
         cumulative_local_expert_recv_stats=_group.stats,
@@ -367,15 +312,7 @@ def _call_keywords(num_call_tokens: int) -> dict:
 
 
 def select_routing(prepared_ids, prepared_routing, standard_routing):
-    """What `run` gets as `routing`, from what the K3 routing handoff published:
-
-    - `kimi_k3_fused_routing` ran (`prepared_routing` = its (metadata, body)):
-      `prepared_ids` are PLAIN global expert ids and the weights are in the
-      trtllm-gen routing metadata -> `(ids, weights)`;
-    - `route_quant_fused` (or this module's one-launch route) ran: `prepared_ids`
-      are packed words `(id << 16) | bf16(weight)` -> the words;
-    - nothing was prepared -> `standard_routing()` (ids, weights of the top-k).
-    """
+    """The `routing` argument of `run`: packed words, or (ids, weights)."""
     if prepared_routing is not None:
         return prepared_ids, prepared_routing[0].expert_weights
     if prepared_ids is not None:
@@ -392,8 +329,7 @@ def run(
     local_expert_offset: int,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """`routing`: packed int32 `[T, k]` words `(id << 16) | bf16(weight)`, or
-    `(ids, weights)`. Writes the combined expert output (bf16 `[T, H]`) to `out`."""
+    """Writes the combined expert output (bf16 [T, H]) to `out`."""
     import deep_gemm
 
     num_tokens = x_quant.shape[0]
@@ -409,10 +345,8 @@ def run(
     packed = not isinstance(routing, tuple)
     ids, weights = (routing, routing) if packed else routing
     ids, weights = ids.contiguous(), weights.contiguous()
-    # activation_dest: the rows are already in place
     copy_x = x_quant.data_ptr() != buf.x.data_ptr()
     if not (packed and not copy_x and ids.data_ptr() == _group.packed.data_ptr()):
-        # the inputs were not all written in place by route_quant_into_buffer
         hidden = x_quant.shape[1]
         xs_words = x_scale.view(torch.uint8).reshape(num_tokens, -1).view(torch.int32)
         buf_xs = (

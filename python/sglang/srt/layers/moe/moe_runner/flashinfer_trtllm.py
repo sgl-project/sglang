@@ -1416,8 +1416,7 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     routing_bias: Optional[torch.Tensor] = None
     # CUDA MXFP4 decode MoE kernels usable for this layer (cuda_mxfp4_decode_moe_supported)
     use_cuda_mxfp4_decode_moe: bool = False
-    # (weights, scales) views of the trtllm-gen tensors for DeepGEMM's one-rank
-    # MegaMoE kernel, set on layers k3_die_local_moe prepared
+    # (weights, scales) views for DeepGEMM's one-rank MegaMoE (k3_die_local_moe.finish)
     mega_l1_weights: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     mega_l2_weights: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
@@ -1714,7 +1713,6 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     else:
         run_mega_moe = False
     if run_mega_moe:
-        # SGLANG_K3_ROUTED_MOE_DEEPGEMM: a target-verify width of the table
         from sglang.srt.layers.moe import k3_deepgemm_routed, route_quant_handoff
 
         assert is_standard and not _deferred_finalize_enabled.get(), (

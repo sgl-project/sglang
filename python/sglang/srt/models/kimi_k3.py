@@ -1765,10 +1765,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
-            # A call on the MegaMoE kernel cannot share the GPU with the shared
-            # experts' AR (see k3_deepgemm_routed.handles): latent and shared are
-            # reduced in one pull behind the kernel. A sequence-parallel pass
-            # (scatters) is prefill, which the kernel never takes.
+            # the MegaMoE kernel is persistent, one CTA per SM: no AR may overlap it
             fused_pull = not scatters and k3_deepgemm_routed.handles(
                 self.experts, num_tokens
             )
@@ -1803,9 +1800,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                         else:
                             k3_ar_fusion.all_reduce_low_sm(shared_output)
             elif fused_pull:
-                # unsharded front: the shared GEMM runs ahead of the kernel
-                # here too, so that the one pull behind the kernel finds both
-                # halves of the buffer written
+                # the pull behind the kernel needs both halves of the buffer written
                 with torch.cuda.stream(self.alt_stream):
                     self._forward_shared(gate_up, shared_output)
                 current_stream.wait_stream(self.alt_stream)
@@ -1845,8 +1840,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     *self._get_fused_norm_params(),
                 )
             elif fused_pull:
-                # one collective over the flat [latent | shared] pair, as in the
-                # single-stream branch below; both halves are already written
+                # one collective over the flat [latent | shared] pair
                 if self.fuse_ar_norm:
                     fused_norm = True
                     k3_ar_fusion.all_reduce_norm(

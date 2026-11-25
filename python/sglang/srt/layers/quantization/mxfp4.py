@@ -789,8 +789,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             from sglang.srt.layers.moe import k3_deepgemm_routed, k3_die_local_moe
 
-            # SGLANG_K3_ROUTED_MOE_DEEPGEMM: one weight copy on die-local pages,
-            # shared by trtllm-gen and the MegaMoE kernel
             die_local = k3_die_local_moe.wanted(
                 layer, self.with_bias, self.flashinfer_mxfp4_moe_precision
             )
@@ -951,8 +949,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
             if die_local:
-                # These experts have no bias and both kernels are passed None:
-                # keep one-element stubs of the parameters' shape
+                # no expert bias here: both kernels are passed None
                 for name in ("w13_weight_bias", "w2_weight_bias"):
                     param = getattr(layer, name)
                     param.data = torch.zeros(
