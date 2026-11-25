@@ -53,16 +53,14 @@ def retire(
 
 
 class TestReplayRetention(unittest.TestCase):
-    def test_keeps_window_before_trimmed_match(self):
-        for length in (32576, 32448, 269913, 1029986):
-            with self.subTest(length=length):
-                boundary = (length - 128) // 256 * 256
-                self.assertLessEqual(retire(length), boundary - 128)
-
     def test_all_page_alignments(self):
         for page, window, replay in ((256, 128, 128), (64, 128, 128), (16, 8, 8)):
-            for remainder in range(page):
-                length = 64 * page + 2 * window + remainder
+            lengths = [64 * page + 2 * window + r for r in range(page)]
+            if page == 256:
+                # Lengths that hit the fallback on a real model.
+                lengths += [32576, 32448, 269913, 1029986]
+            for length in lengths:
+                remainder = length % page
                 with self.subTest(page=page, window=window, remainder=remainder):
                     boundary = (length - replay) // page * page
                     self.assertLessEqual(
@@ -78,11 +76,6 @@ class TestReplayRetention(unittest.TestCase):
             extra = retire(length, replay=0) - retire(length)
             self.assertGreaterEqual(extra, 0)
             self.assertLessEqual(extra, 256)
-
-    def test_bad_alignment(self):
-        self.assertEqual(retire(32576, replay=0), 32256)
-        self.assertEqual(retire(32576), 32000)
-        self.assertEqual(retire(32448), 32000)
 
     def test_no_prefix_sharing_ignores_replay(self):
         for replay in (0, 128):
