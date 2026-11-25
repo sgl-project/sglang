@@ -3,6 +3,7 @@
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import dcp_packed_gather_capacity
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 
@@ -51,7 +52,8 @@ def runtime_gather_reserve_bytes(
         if envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get() and prefill_requests == 1
         else 2
     )
-    prefix_bytes = context_tokens * prefill_requests * prefix_row_bytes * slots * copies
+    prefix_rows = context_tokens * prefill_requests
+    prefix_bytes = prefix_rows * prefix_row_bytes * slots * copies
     local_sends = (
         (2 + slots) * context_tokens * prefill_requests * prefix_row_bytes
         + get_parallel().attn_tp_size
@@ -70,6 +72,11 @@ def runtime_gather_reserve_bytes(
             else context_tokens * prefill_requests
         )
         serial_scratch = (piece_rows + tokens) * prefix_row_bytes
+    prefix_bytes += (
+        (dcp_packed_gather_capacity(prefix_rows) - prefix_rows)
+        * prefix_row_bytes
+        * slots
+    )
     ep_size = get_parallel().moe_ep_size
     native_headroom = (1 << 30) if ep_size > 1 else 0
     if native_headroom and get_exec().moe.fuseep_mode == 3:

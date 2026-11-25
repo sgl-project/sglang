@@ -11,6 +11,7 @@ import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
+from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp import (
     forward_mla_attention_npu,
@@ -676,7 +677,7 @@ def prepare_dcp_extend_metadata_npu(
         **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
         extend_crop_free=dcp_extend_crop_free(
             extend_prefix_lens_cpu,
-            m.indexer.index_topk if m.indexer is not None else None,
+            get_dsa_index_topk(m.config),
         ),
     )
 

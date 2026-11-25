@@ -26,8 +26,10 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.dsa import dsa_npu_indexer
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _get_indexer_query_shard,
+    _get_npu_quant_indexer_plan,
     _IndexerQueryShard,
     plan_indexer_query_shard,
 )
@@ -128,6 +130,88 @@ class TestIndexerQueryShardGate(CustomTestCase):
         # More rows than the plan covers: the gathered top-k would come back
         # shorter than the query tensor.
         self.assertIsNone(_shard_for([989184], [10828], 16, 0, 10833))
+
+
+class TestQuantIndexerPlanCache(CustomTestCase):
+    def _build_plan(self, batch, backend, query, query_ends, key_lens):
+        return _get_npu_quant_indexer_plan(
+            batch,
+            backend,
+            query,
+            query_ends,
+            key_lens,
+            head_dim=128,
+            index_topk=2048,
+        )
+
+    def test_mtp_steps_do_not_share_length_dependent_plans(self):
+        batch = types.SimpleNamespace()
+        backends = [object(), object()]
+        query = torch.zeros(2, 64, 128, dtype=torch.int8)
+        query_ends = torch.tensor([1, 2], dtype=torch.int32)
+        key_lens = [
+            torch.tensor([10, 20], dtype=torch.int32),
+            torch.tensor([11, 21], dtype=torch.int32),
+        ]
+        metadata = mock.Mock(side_effect=lambda *args, **kwargs: object())
+
+        with mock.patch.object(
+            dsa_npu_indexer,
+            "quant_lightning_indexer_metadata",
+            metadata,
+            create=True,
+        ):
+            step0 = self._build_plan(batch, backends[0], query, query_ends, key_lens[0])
+            step0_other_layer = self._build_plan(
+                batch, backends[0], query, query_ends, key_lens[0]
+            )
+            step1 = self._build_plan(batch, backends[1], query, query_ends, key_lens[1])
+
+        self.assertIs(step0, step0_other_layer)
+        self.assertIsNot(step0, step1)
+        self.assertEqual(metadata.call_count, 2)
+        self.assertTrue(torch.equal(step0[0]["seqused_k"], key_lens[0]))
+        self.assertTrue(torch.equal(step1[0]["seqused_k"], key_lens[1]))
+
+    def test_capture_does_not_reuse_warmup_plan_or_lengths(self):
+        batch = types.SimpleNamespace()
+        backend = object()
+        query = torch.zeros(2, 64, 128, dtype=torch.int8)
+        query_ends = torch.tensor([1, 2], dtype=torch.int32)
+        key_lens = torch.tensor([10, 20], dtype=torch.int64)
+        metadata = mock.Mock(side_effect=lambda *args, **kwargs: object())
+
+        with (
+            mock.patch.object(
+                dsa_npu_indexer,
+                "quant_lightning_indexer_metadata",
+                metadata,
+                create=True,
+            ),
+            mock.patch.object(
+                dsa_npu_indexer, "get_is_capture_mode", return_value=True
+            ),
+            mock.patch.object(
+                dsa_npu_indexer, "is_device_stream_capturing", return_value=False
+            ),
+        ):
+            warmup0 = self._build_plan(batch, backend, query, query_ends, key_lens)
+            warmup1 = self._build_plan(batch, backend, query, query_ends, key_lens)
+            key_lens.add_(2)
+            with mock.patch.object(
+                dsa_npu_indexer, "is_device_stream_capturing", return_value=True
+            ):
+                captured = self._build_plan(batch, backend, query, query_ends, key_lens)
+                captured_other_layer = self._build_plan(
+                    batch, backend, query, query_ends, key_lens
+                )
+
+        self.assertIsNot(warmup0, warmup1)
+        self.assertIsNot(warmup1, captured)
+        self.assertIs(captured, captured_other_layer)
+        self.assertEqual(metadata.call_count, 3)
+        self.assertEqual(warmup0[0]["seqused_k"].tolist(), [10, 20])
+        self.assertEqual(captured[0]["seqused_k"].tolist(), [12, 22])
 
 
 class TestLocalTopkWithTokenShard(CustomTestCase):

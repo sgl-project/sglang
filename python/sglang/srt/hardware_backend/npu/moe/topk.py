@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -73,8 +74,16 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
-        topk_weights, topk_ids, _ = moe_gating_top_k(
-            x=router_logits.to(torch.float32),
+        gating_op = moe_gating_top_k
+        if (
+            topk_config.scoring_func == "sigmoid"
+            and os.path.basename(os.environ.get("ASCEND_HOME_PATH", "").rstrip("/"))
+            == "cann-9.2.0-beta.2"
+        ):
+            # The public dispatcher cannot read the beta SDK's release metadata.
+            gating_op = torch.ops.npu.npu_moe_gating_top_k
+        topk_weights, topk_ids, _ = gating_op(
+            router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
@@ -97,6 +106,7 @@ def fused_topk_npu(
             eps=float(1e-20),
         )
         topk_weights = topk_weights.to(torch.float32)
+        topk_ids = topk_ids.to(torch.int32)
 
     # torch native is not yet supported num_token_non_padded
     # Fallback to torch native implementation

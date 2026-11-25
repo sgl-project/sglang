@@ -381,6 +381,16 @@ class TestDcpExtendGatherBuffer(CustomTestCase):
         second = dcp_extend_gather_buffer("latent", self.ref, 1024)
         self.assertEqual(first.data_ptr(), second.data_ptr())
 
+    def test_packed_buffer_reuses_capacity_and_returns_exact_rows(self):
+        first = dcp_extend_gather_buffer("packed_latent_0", self.ref, 32768)
+        within_bucket = dcp_extend_gather_buffer("packed_latent_0", self.ref, 131072)
+        grown = dcp_extend_gather_buffer("packed_latent_0", self.ref, 131073)
+        self.assertEqual(first.data_ptr(), within_bucket.data_ptr())
+        self.assertNotEqual(within_bucket.data_ptr(), grown.data_ptr())
+        self.assertEqual(
+            (len(first), len(within_bucket), len(grown)), (32768, 131072, 131073)
+        )
+
     def test_the_result_is_a_view_and_writes_reach_the_next_caller(self):
         # The gather writes through the returned tensor (index_select(out=...)).
         dcp_extend_gather_buffer("latent", self.ref, 8).fill_(3.5)
