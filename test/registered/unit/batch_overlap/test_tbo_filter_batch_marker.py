@@ -72,6 +72,17 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertEqual(second.extend_is_final_cpu, [True, False])
         self.assertEqual(parent.extend_is_final_cpu, [False, False, True, False])
 
+    def test_filter_batch_counts_extend_start_loc_from_the_child(self):
+        # Attention indexes a child's rows with these offsets.
+        parent = _make_target_verify_batch(4)
+        parent.forward_mode = ForwardMode.EXTEND
+        parent.extend_num_tokens = 4
+        parent.extend_start_loc = torch.arange(4, dtype=torch.int32)
+
+        second = _filter(parent, lo=2, hi=4)
+
+        self.assertEqual(second.extend_start_loc.tolist(), [0, 1])
+
     def test_filter_batch_inherits_prefill_completion(self):
         for completing in (False, True):
             with self.subTest(completing=completing):

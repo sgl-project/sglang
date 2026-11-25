@@ -759,6 +759,9 @@ class TboForwardBatchPreparer:
                 f"{key=} {old_value=} {num_seqs=} {batch=}"
             )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
+            if key == "extend_start_loc":
+                # A child's offsets count from its own first token.
+                output_dict[key] = output_dict[key] - start_token_index
 
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(
