@@ -90,27 +90,29 @@ jobs:
       # workflow's own commit before any step runs PR code: the tests hold no token.
       - name: Check out the prefetch scripts
         id: prefetch_scripts
+        if: inputs.partition_plan != ''
         continue-on-error: true
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: .ci-prefetch
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            .github/actions/prefetch-hf-models
-            scripts/ci
-            python/sglang/test/ci
+            .github/actions/prefetch-hf-models/
+            scripts/ci/utils/prefetch_hf_models.py
+            scripts/ci/utils/prefetch_policy.json
+            scripts/ci/utils/prefetch_requirements.txt
 
       - name: Prefetch Hugging Face models
         if: steps.prefetch_scripts.outcome == 'success'
         continue-on-error: true
-        timeout-minutes: 60
+        timeout-minutes: 30
         uses: ./.ci-prefetch/.github/actions/prefetch-hf-models
         with:
           hf-token: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          suite: ${{ env.SUITE }}
-          diffusion-plan-json: ${{ inputs.partition_plan }}
-          diffusion-part: ${{ matrix.part }}
+          repo-ids: ${{ join(fromJson(inputs.partition_plan).partitions[matrix.part].repo_ids, ' ') }}
+
       - name: Resolve runner_config
         id: rc
         run: |

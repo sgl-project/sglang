@@ -1,5 +1,5 @@
 {
-  "_comment": "Manual overrides for list_stage_models.py. by_file/by_suite ADD models the static scan cannot see (models built dynamically, read from configs, passed via CLI args). deny REMOVES false-positive ids the heuristic mistakes for models. Keys in by_file are repo-relative test paths (e.g. test/registered/foo/test_bar.py). suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites. prefetch is read by utils/prefetch_hf_models.py, which downloads every loadable file of a repo at main unless its entry here names `revisions` (instead of main), `patterns` (the only files to fetch), or `skip` (why it is never prefetched); it also leaves out the ids unused_by_file lists for a test file, which names them but never loads them on CUDA.",
+  "_comment": "Manual overrides for hf_repo_scan.py, which list_stage_models.py and check-changes' prefetch lists both use. by_file/by_suite ADD models the static scan cannot see (models built dynamically, read from configs, passed via CLI args). unused_by_file REMOVES ids a test file names but never loads on CUDA. deny lists strings the heuristic mistakes for repo ids; datasets lists Hub dataset ids tests read, which are not models. Keys in by_file and unused_by_file are repo-relative test paths (e.g. test/registered/foo/test_bar.py). suite_labels maps legacy suite= registrations (no runner_config) to the GH runner label(s) their dispatching workflow hardcodes in runs-on -- a list, because one suite can run on several labels. $b200_runner is the dynamic-b200 placeholder from runner_configs.yml. Suites registered with stage=/runner_config= need no entry: their label resolves through runner_configs.yml. Anything unmappable stays visible in unmapped_suites.",
   "by_file": {},
   "by_suite": {},
   "suite_labels": {
@@ -17,18 +17,14 @@
     "triton/disabled",
     "Qwen3-8B/Llama-3.1-8B",
     "LLM-Research/Llama-3.2-1B-Instruct",
+    "sgl-project/ci-data-diffusion"
+  ],
+  "datasets": [
     "MMMU/MMMU",
     "THUDM/LongBench-v2",
     "xai-org/RealworldQA",
     "anon8231489123/ShareGPT_Vicuna_unfiltered"
   ],
-  "prefetch": {
-    "Qwen/Qwen2-1.5B-Instruct-GGUF": {"patterns": ["qwen2-1_5b-instruct-q4_k_m.gguf"]},
-    "baidu/Unlimited-OCR": {"revisions": ["07dea832e22aefee32ad281d4b80551282e1c168"]},
-    "baidu/Unlimited-OCR-2": {"revisions": ["5632329a32e103d5f1add270681e0f5c1233c6e4"]},
-    "meta-models/Muse-Spark-Open-816B-A42B-NVFP4": {"skip": "its stage downloads it with HF_MUSE_SPARK_TOKEN, never on PR runs"},
-    "thinkingmachines/Inkling": {"revisions": ["test"]}
-  },
   "unused_by_file": {
     "test/registered/reasoning/test_reasoning.py": ["Qwen/Qwen3-30B-A3B"],
     "test/registered/unit/models/test_qwen4_exp_ple_table.py": ["RadixArk/Qwen3.8-Flash-Next-NVFP4"]

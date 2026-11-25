@@ -1,5 +1,4 @@
 import argparse
-import glob
 import math
 import os
 import sys
@@ -12,7 +11,9 @@ from sglang.test.ci.ci_register import (
     HWBackend,
     auto_partition,
     collect_tests,
+    filter_tests,
     load_live_est,
+    registered_test_files,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
 
@@ -285,33 +286,13 @@ def validate_all_suites(all_tests: List[CIRegistry]):
         raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
-def filter_tests(
-    ci_tests: List[CIRegistry],
-    hw: HWBackend,
-    suites: List[str],
-    nightly: bool = False,
-) -> tuple[List[CIRegistry], List[CIRegistry]]:
-    # `suites` may hold more than one suite (comma-separated --suite): the
-    # matched tests are unioned so a single runner can partition several
-    # suites as one balanced pool (e.g. base-b + base-c on a Xeon SPR box).
-    suite_set = set(suites)
-    ci_tests = [
-        t
-        for t in ci_tests
-        if t.backend == hw and t.effective_suite in suite_set and t.nightly == nightly
-    ]
-
+def warn_unknown_suites(hw: HWBackend, suites: List[str]):
     # Union of all three dicts, not just the per-commit or nightly half:
     # CUDA nightly suites are selected by name alone, without --nightly.
     valid = _valid_suites_by_backend().get(hw, set())
     for suite in suites:
         if suite not in valid:
             print(f"Warning: Unknown suite {suite} for backend {hw.name}")
-
-    enabled_tests = [t for t in ci_tests if t.disabled is None]
-    skipped_tests = [t for t in ci_tests if t.disabled is not None]
-
-    return enabled_tests, skipped_tests
 
 
 def pretty_print_tests(
@@ -384,22 +365,14 @@ def run_a_suite(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
 
-    # Registered tests under test/registered/
-    files = [
-        f
-        for f in glob.glob(
-            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
-        )
-        # conftest.py / __init__.py are pytest+package structure, never
-        # registered tests, and must not be executed as one.
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
-    ]
-
     # Strict: all discovered files must have proper registration
     sanity_check = True
 
-    all_tests = collect_tests(files, sanity_check=sanity_check)
+    all_tests = collect_tests(
+        registered_test_files(repo_root), sanity_check=sanity_check
+    )
     validate_all_suites(all_tests)
+    warn_unknown_suites(hw, suites)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suites, nightly)
 
     # Precision-test mode: keep only the coverage-recommended files before

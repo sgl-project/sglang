@@ -1,4 +1,5 @@
 import ast
+import glob
 import json
 import os
 import warnings
@@ -9,7 +10,9 @@ from typing import Dict, List, Optional, Tuple
 __all__ = [
     "HWBackend",
     "CIRegistry",
+    "registered_test_files",
     "collect_tests",
+    "filter_tests",
     "auto_partition",
     "load_live_est",
     "register_cpu_ci",
@@ -482,3 +485,38 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
         ci_tests.extend(registries)
 
     return ci_tests
+
+
+def registered_test_files(repo_root: str) -> List[str]:
+    return [
+        f
+        for f in glob.glob(
+            os.path.join(repo_root, "test", "registered", "**", "*.py"),
+            recursive=True,
+        )
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+    ]
+
+
+def filter_tests(
+    ci_tests: List[CIRegistry],
+    hw: HWBackend,
+    suites: List[str],
+    nightly: bool = False,
+) -> Tuple[List[CIRegistry], List[CIRegistry]]:
+    """`(enabled, disabled)` tests of backend `hw` in any of `suites`.
+
+    `suites` may hold more than one suite (comma-separated --suite): the
+    matched tests are unioned so a single runner can partition several
+    suites as one balanced pool (e.g. base-b + base-c on a Xeon SPR box)."""
+    suite_set = set(suites)
+    ci_tests = [
+        t
+        for t in ci_tests
+        if t.backend == hw and t.effective_suite in suite_set and t.nightly == nightly
+    ]
+    enabled_tests = [t for t in ci_tests if t.disabled is None]
+    skipped_tests = [t for t in ci_tests if t.disabled is not None]
+    return enabled_tests, skipped_tests

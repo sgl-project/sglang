@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hf_repo_scan as scan  # noqa: E402
 import list_stage_models as lsm  # noqa: E402
 
 # Repo root inferred from this file's location: <root>/scripts/ci/<this>.
@@ -62,7 +63,7 @@ class LooksLikeModelId(unittest.TestCase):
             "lmsys/sglang-ci-dsv3-test",
             "Qwen/Qwen2-1.5B-Instruct-GGUF",  # -GGUF suffix, not .gguf extension
         ):
-            self.assertTrue(lsm.looks_like_model_id(value), value)
+            self.assertTrue(scan.looks_like_model_id(value), value)
 
     def test_rejects_non_models(self):
         for value in (
@@ -80,62 +81,93 @@ class LooksLikeModelId(unittest.TestCase):
             "./relative",  # leading dot
             "just-a-string",  # no slash
         ):
-            self.assertFalse(lsm.looks_like_model_id(value), value)
+            self.assertFalse(scan.looks_like_model_id(value), value)
 
     def test_deny_set_overrides(self):
         value = "org/looks-like-a-model"
-        self.assertTrue(lsm.looks_like_model_id(value))
-        self.assertFalse(lsm.looks_like_model_id(value, deny={value}))
+        self.assertTrue(scan.looks_like_model_id(value))
+        self.assertFalse(scan.looks_like_model_id(value, deny={value}))
 
 
-class ConstantTable(unittest.TestCase):
+def _scan(source, helper=None, deny=()):
+    """Repo ids test/registered/test_x.py with ``source`` names, next to
+    python/sglang/test/helper.py with ``helper``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(tmp, "test/registered/test_x.py", source)
+        if helper is not None:
+            _write(tmp, "python/sglang/test/helper.py", helper)
+        overrides = scan.load_overrides(None)
+        overrides["deny"] = list(deny)
+        return scan.RepoIdScanner(tmp, overrides).file_repo_ids(
+            "test/registered/test_x.py"
+        )
+
+
+class ModuleConstants(unittest.TestCase):
     def test_single_and_tuple_values(self):
-        source = (
+        helper = (
             'DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"\n'
             'PAIR = ("OPEA/Qwen2.5-0.5B-int4", "Intel/Qwen2-0.5B-int4")\n'
             'NOT_A_MODEL = "https://example.com/x"\n'
             "PORT = 30000\n"
         )
-        table = lsm.extract_constants_from_source(source)
-        self.assertEqual(table["DEFAULT_MODEL"], {"meta-llama/Llama-3.1-8B-Instruct"})
         self.assertEqual(
-            table["PAIR"], {"OPEA/Qwen2.5-0.5B-int4", "Intel/Qwen2-0.5B-int4"}
+            _scan(
+                "from sglang.test.helper import DEFAULT_MODEL\nx = DEFAULT_MODEL\n",
+                helper,
+            ),
+            {"meta-llama/Llama-3.1-8B-Instruct"},
         )
-        self.assertNotIn("NOT_A_MODEL", table)
-        self.assertNotIn("PORT", table)
+        self.assertEqual(
+            _scan("from sglang.test.helper import PAIR\nx = PAIR\n", helper),
+            {"OPEA/Qwen2.5-0.5B-int4", "Intel/Qwen2-0.5B-int4"},
+        )
+        self.assertEqual(
+            _scan(
+                "from sglang.test.helper import NOT_A_MODEL, PORT\nx = (NOT_A_MODEL, PORT)\n",
+                helper,
+            ),
+            set(),
+        )
 
     def test_annotated_assignment(self):
-        source = 'DEFAULT: str = "meta-llama/Llama-3.1-8B-Instruct"\n'
-        table = lsm.extract_constants_from_source(source)
-        self.assertEqual(table["DEFAULT"], {"meta-llama/Llama-3.1-8B-Instruct"})
+        helper = 'DEFAULT: str = "meta-llama/Llama-3.1-8B-Instruct"\n'
+        self.assertEqual(
+            _scan("from sglang.test.helper import DEFAULT\nx = DEFAULT\n", helper),
+            {"meta-llama/Llama-3.1-8B-Instruct"},
+        )
 
     def test_implicit_concatenation(self):
         # Python folds adjacent string literals at parse time into one Constant.
-        source = 'M = (\n    "meta-llama/"\n    "Llama-3.1-8B-Instruct"\n)\n'
-        table = lsm.extract_constants_from_source(source)
-        self.assertEqual(table["M"], {"meta-llama/Llama-3.1-8B-Instruct"})
+        helper = 'M = (\n    "meta-llama/"\n    "Llama-3.1-8B-Instruct"\n)\n'
+        self.assertEqual(
+            _scan("from sglang.test.helper import M\nx = M\n", helper),
+            {"meta-llama/Llama-3.1-8B-Instruct"},
+        )
 
     def test_deny_excludes_from_constant_table(self):
-        source = 'BAD = "weird/thing"\nGOOD = "meta-llama/Llama-3.1-8B-Instruct"\n'
-        table = lsm.extract_constants_from_source(source, deny={"weird/thing"})
-        self.assertNotIn("BAD", table)
-        self.assertIn("GOOD", table)
+        helper = 'BAD = "weird/thing"\nGOOD = "meta-llama/Llama-3.1-8B-Instruct"\n'
+        self.assertEqual(
+            _scan(
+                "from sglang.test.helper import BAD, GOOD\nx = (BAD, GOOD)\n",
+                helper,
+                deny={"weird/thing"},
+            ),
+            {"meta-llama/Llama-3.1-8B-Instruct"},
+        )
 
 
 class ExtractModels(unittest.TestCase):
     def test_inline_and_name_reference(self):
-        const_table = {
-            "DEFAULT_MODEL_NAME_FOR_TEST": {"meta-llama/Llama-3.1-8B-Instruct"}
-        }
         source = (
-            "from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST\n"
+            "from sglang.test.helper import DEFAULT_MODEL_NAME_FOR_TEST\n"
             "class T:\n"
             "    model = DEFAULT_MODEL_NAME_FOR_TEST\n"
             '    draft = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"\n'
         )
-        models = lsm.extract_models_from_source(source, const_table)
+        helper = 'DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"\n'
         self.assertEqual(
-            models,
+            _scan(source, helper),
             {
                 "meta-llama/Llama-3.1-8B-Instruct",
                 "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B",
@@ -146,17 +178,14 @@ class ExtractModels(unittest.TestCase):
         # An f-string with a placeholder yields a truncated, non-existent id;
         # it must NOT be picked up.
         source = 'msg = f"meta-llama/Llama-3.1-8B-Instruct-{suffix}"\n'
-        self.assertEqual(lsm.extract_models_from_source(source, {}), set())
+        self.assertEqual(_scan(source), set())
 
     def test_fstring_name_placeholder_still_resolves(self):
         # The literal fragment is skipped, but a constant referenced inside the
         # f-string placeholder is still resolved.
-        const_table = {"DRAFT": {"lmsys/sglang-EAGLE-llama2-chat-7B"}}
-        source = 'path = f"prefix/{DRAFT}/topk"\n'
-        self.assertEqual(
-            lsm.extract_models_from_source(source, const_table),
-            {"lmsys/sglang-EAGLE-llama2-chat-7B"},
-        )
+        source = 'from sglang.test.helper import DRAFT\npath = f"prefix/{DRAFT}/topk"\n'
+        helper = 'DRAFT = "lmsys/sglang-EAGLE-llama2-chat-7B"\n'
+        self.assertEqual(_scan(source, helper), {"lmsys/sglang-EAGLE-llama2-chat-7B"})
 
     def test_model_less_file_yields_nothing(self):
         source = (
@@ -164,33 +193,25 @@ class ExtractModels(unittest.TestCase):
             "def test_kernel():\n"
             "    assert torch.cuda.is_available() or True\n"
         )
-        self.assertEqual(lsm.extract_models_from_source(source, {}), set())
+        self.assertEqual(_scan(source), set())
 
-    def test_deny_removes_name_resolved_model(self):
-        # deny must apply to constant-resolved ids too, not just inline literals.
-        const_table = {"M": {"weird/thing"}}
-        source = "x = M\n"
-        self.assertIn(
-            "weird/thing", lsm.extract_models_from_source(source, const_table)
-        )
-        self.assertEqual(
-            lsm.extract_models_from_source(source, const_table, deny={"weird/thing"}),
-            set(),
-        )
+    def test_name_resolves_through_its_import_only(self):
+        # Another module's `M` is not this file's: an unimported name adds nothing.
+        self.assertEqual(_scan("x = M\n", 'M = "org/other-model"\n'), set())
 
 
 class Overrides(unittest.TestCase):
     def test_load_defaults_when_missing(self):
-        ov = lsm.load_overrides(None)
+        ov = scan.load_overrides(None)
         self.assertEqual(
             ov,
             {
                 "by_file": {},
                 "by_suite": {},
-                "deny": [],
-                "suite_labels": {},
-                "prefetch": {},
                 "unused_by_file": {},
+                "deny": [],
+                "datasets": [],
+                "suite_labels": {},
             },
         )
 
@@ -199,16 +220,16 @@ class Overrides(unittest.TestCase):
             path = os.path.join(tmp, "ov.json")
             with open(path, "w", encoding="utf-8") as f:
                 f.write('{"deny": null, "by_file": null}')
-            ov = lsm.load_overrides(path)
+            ov = scan.load_overrides(path)
             self.assertEqual(
                 ov,
                 {
                     "by_file": {},
                     "by_suite": {},
-                    "deny": [],
-                    "suite_labels": {},
-                    "prefetch": {},
                     "unused_by_file": {},
+                    "deny": [],
+                    "datasets": [],
+                    "suite_labels": {},
                 },
             )
 
@@ -323,7 +344,7 @@ class BuildInventory(unittest.TestCase):
     def test_resolution_and_unresolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            inv = lsm.build_inventory(tmp, "cuda", lsm.load_overrides(None), "sha123")
+            inv = lsm.build_inventory(tmp, "cuda", scan.load_overrides(None), "sha123")
             self.assertEqual(inv["generated_at_commit"], "sha123")
             suite = inv["suites"]["base-x-test-1-gpu"]
             self.assertEqual(suite["models"], ["meta-llama/Llama-3.1-8B"])
@@ -335,11 +356,8 @@ class BuildInventory(unittest.TestCase):
     def test_by_file_override_adds_and_clears_unresolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            overrides = {
-                "by_file": {"test/registered/b/test_b.py": ["org/extra-model"]},
-                "by_suite": {},
-                "deny": [],
-            }
+            overrides = scan.load_overrides(None)
+            overrides["by_file"] = {"test/registered/b/test_b.py": ["org/extra-model"]}
             inv = lsm.build_inventory(tmp, "cuda", overrides, "sha")
             suite = inv["suites"]["base-x-test-1-gpu"]
             self.assertIn("org/extra-model", suite["models"])
@@ -349,11 +367,8 @@ class BuildInventory(unittest.TestCase):
     def test_by_suite_override_adds_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            overrides = {
-                "by_file": {},
-                "by_suite": {"base-x-test-1-gpu": ["org/suite-model"]},
-                "deny": [],
-            }
+            overrides = scan.load_overrides(None)
+            overrides["by_suite"] = {"base-x-test-1-gpu": ["org/suite-model"]}
             inv = lsm.build_inventory(tmp, "cuda", overrides, "sha")
             self.assertIn(
                 "org/suite-model", inv["suites"]["base-x-test-1-gpu"]["models"]
@@ -524,7 +539,7 @@ class RunnerLabelAggregation(unittest.TestCase):
     def test_union_per_label_and_unmapped(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            inv = lsm.build_inventory(tmp, "cuda", lsm.load_overrides(None), "sha")
+            inv = lsm.build_inventory(tmp, "cuda", scan.load_overrides(None), "sha")
             self.assertEqual(inv["runner_label_count"], 2)
             # Shared label carries the UNION of both suites' models.
             shared = inv["runner_labels"]["1-gpu-h100"]
@@ -555,7 +570,7 @@ class RunnerLabelAggregation(unittest.TestCase):
             inv = lsm.build_inventory(
                 tmp,
                 "cuda",
-                lsm.load_overrides(None),
+                scan.load_overrides(None),
                 "sha",
                 b200_runner="4-gpu-b200-dyn",
             )
@@ -568,7 +583,7 @@ class RunnerLabelAggregation(unittest.TestCase):
     def test_suite_labels_override_maps_legacy_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
-            overrides = lsm.load_overrides(None)
+            overrides = scan.load_overrides(None)
             # Legacy suite dispatched by two workflows -> two labels; the
             # sentinel in an override is substituted like a yml-derived one.
             overrides["suite_labels"] = {
@@ -592,7 +607,7 @@ class RunnerLabelAggregation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._repo(tmp)
             os.remove(os.path.join(tmp, "scripts", "ci", "runner_configs.yml"))
-            inv = lsm.build_inventory(tmp, "cuda", lsm.load_overrides(None), "sha")
+            inv = lsm.build_inventory(tmp, "cuda", scan.load_overrides(None), "sha")
             self.assertEqual(inv["runner_labels"], {})
             self.assertEqual(len(inv["unmapped_suites"]), 4)
 
