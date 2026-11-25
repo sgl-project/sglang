@@ -2530,13 +2530,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert isinstance(output, PPProxyTensors)
         return _slice_output_rows(output, self.raw_num_tokens)
 
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
-
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the pool accessors. BCG's dynamic KDA waits do not
         # cover Full graph's KV/state reads, so Full still needs this barrier;
