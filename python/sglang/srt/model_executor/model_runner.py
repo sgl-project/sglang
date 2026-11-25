@@ -83,6 +83,7 @@ from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
 from sglang.srt.kernel_plugins.nvidia.binding import (
+    built_megakernel,
     install_megakernel,
     megakernel_state,
 )
@@ -220,6 +221,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_flags,
     get_global_dwdp_manager,
     get_lora,
     get_memory,
@@ -676,6 +678,13 @@ class ModelRunner:
     def init_kv_cache_configurator(
         self, draft_parallel_layout: DraftParallelLayout | None = None
     ):
+        from sglang.srt.layers.communication import kda_tp
+
+        if kda_tp.enabled() and built_megakernel(self.model) is not None:
+            # Lazy-slot admission and the state mirrors bypass the megakernel's resets and commit.
+            raise NotImplementedError(
+                "--enable-kda-tp does not support an installed megakernel"
+            )
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
@@ -2030,6 +2039,17 @@ class ModelRunner:
         COW/clear only happen at prefix match on extend.
         """
         pool = self.req_to_token_pool
+        if pool.holds_state_slots and not self.is_draft_worker:
+            from sglang.srt.layers.communication import kda_tp
+
+            if kda_tp.enabled():
+                from sglang.srt.layers.communication.kda_tp.staging import (
+                    mirror_deferred_state_ops,
+                )
+
+                # Head-sharded KDA state: every rank applies every DP rank's ops.
+                mirror_deferred_state_ops(self, forward_batch)
+                return
         if (
             not pool.holds_state_slots
             or self.is_draft_worker
@@ -2129,6 +2149,13 @@ class ModelRunner:
                     replays_graph=can_run_graph,
                     decode_graph_runner=self.decode_cuda_graph_runner,
                 )
+
+            if get_flags().dp.kda_tp:
+                from sglang.srt.layers.communication.kda_tp.staging import (
+                    maybe_run_imports,
+                )
+
+                maybe_run_imports(self, forward_batch)
 
             # Replay cuda graph if applicable
             if can_run_graph:

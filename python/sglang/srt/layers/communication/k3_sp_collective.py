@@ -155,6 +155,25 @@ def enabled() -> bool:
     return _init_state() is not None
 
 
+@cache
+def tp_state() -> Optional[_State]:
+    """This module's table-dispatched collectives over the TP group, on
+    k3_ar_fusion's TP workspace; None without it or when another communicator
+    already owns sp_collective at this TP size (NCCL then)."""
+    plane = k3_ar_fusion.tp_plane()
+    group = get_parallel().tp_group
+    ready = (
+        plane is not None
+        and group.world_size in _SUPPORTED_WORLD_SIZES
+        and k3_ar_fusion.register_sp_collective_comm()
+    )
+    logger.info(
+        "K3 KDA TP collectives: %s",
+        "push/pull on the TP multicast workspace" if ready else "NCCL",
+    )
+    return _State(group, plane.lease) if ready else None
+
+
 def _symm_buffer(
     state: _State, name: str, rows: int, width: int, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -165,10 +184,14 @@ def _symm_buffer(
 
 
 def requires_symmetric_rs(
-    num_tokens: int, device: torch.device, element_size: int
+    num_tokens: int,
+    device: torch.device,
+    element_size: int,
+    state: Optional[_State] = None,
+    fused: bool = True,
 ) -> bool:
     """Whether standalone or fused RS reads o_proj through its NVLS alias."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None:
         return False
     from sglang.kernels.ops.communication import sp_collective
@@ -184,7 +207,7 @@ def requires_symmetric_rs(
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
-    if not envs.SGLANG_K3_SP_ATTN_RES.get():
+    if not fused or not envs.SGLANG_K3_SP_ATTN_RES.get():
         return False
     fusion = sp_collective.get_fusion_dispatch(
         "reduce_scatter_attn_res",
@@ -197,12 +220,16 @@ def requires_symmetric_rs(
 
 
 def get_o_proj_output_buffer(
-    num_tokens: int, dtype: torch.dtype, hidden_size: int = _HIDDEN_SIZE
+    num_tokens: int,
+    dtype: torch.dtype,
+    hidden_size: int = _HIDDEN_SIZE,
+    state: Optional[_State] = None,
+    name: str = _O_PROJ,
 ) -> torch.Tensor:
     """Persistent symmetric storage for a TP-partial o_proj output."""
-    state = _init_state()
+    state = state or _init_state()
     assert state is not None, "K3 SP collective is not initialized"
-    return _symm_buffer(state, _O_PROJ, num_tokens, hidden_size, dtype)
+    return _symm_buffer(state, name, num_tokens, hidden_size, dtype)
 
 
 def register_o_proj_output(result: torch.Tensor, output: torch.Tensor) -> None:
@@ -261,10 +288,12 @@ def _eligible(
 
 
 def reduce_scatter_res(
-    tensor: torch.Tensor, residual: Optional[torch.Tensor]
+    tensor: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    state: Optional[_State] = None,
 ) -> Optional[torch.Tensor]:
     """Return a fused local shard, or None when the NCCL fallback should run."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None or not _eligible(state, tensor, residual):
         return None
     from sglang.kernels.ops.communication import sp_collective
@@ -372,9 +401,13 @@ def reduce_scatter_attn_res(
     return normed, prefix
 
 
-def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+def all_gather(
+    tensor: torch.Tensor,
+    state: Optional[_State] = None,
+    buffer_name: str = _ALL_GATHER,
+) -> Optional[torch.Tensor]:
     """Return the reassembled full batch, or None for the NCCL fallback."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None:
         return None
     global_tokens = tensor.shape[0] * state.group.world_size
@@ -410,7 +443,7 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         )
     if dispatch.strategy == "direct":
         output = _symm_buffer(
-            state, _ALL_GATHER, global_tokens, tensor.shape[1], tensor.dtype
+            state, buffer_name, global_tokens, tensor.shape[1], tensor.dtype
         )
         return sp_collective.all_gather_direct(
             state.group.world_size,

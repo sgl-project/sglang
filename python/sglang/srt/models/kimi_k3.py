@@ -38,8 +38,13 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective, kda_tp
 from sglang.srt.layers.communication.kda_dwdp import KdaDwdp
+from sglang.srt.layers.communication.kda_tp.forward import (
+    KdaTp,
+    source_scratch_rows,
+    source_tokens,
+)
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -1988,6 +1993,7 @@ class KimiK3DeltaAttention(nn.Module):
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
         sp_moe: bool = False,
         kda_dwdp: Optional[KdaDwdp] = None,
+        kda_tp: Optional[KdaTp] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -2007,6 +2013,12 @@ class KimiK3DeltaAttention(nn.Module):
         self.head_group = linear_attn_parallel_group()
         self.head_tp_size = linear_attn_tp_size()
         self.head_tp_rank = linear_attn_tp_rank()
+        # --enable-kda-tp: heads sharded over the TP group across attention-DP ranks.
+        self._kda_tp = kda_tp
+        if kda_tp is not None:
+            self.head_group = "tp"
+            self.head_tp_size = get_parallel().tp_size
+            self.head_tp_rank = get_parallel().tp_rank
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -2765,6 +2777,8 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        if self._kda_tp is not None:
+            return self.forward_kda_tp(hidden_states)
         core_attn_out = self.forward_pre_o_proj(
             hidden_states=hidden_states,
             positions=positions,
@@ -2776,6 +2790,126 @@ class KimiK3DeltaAttention(nn.Module):
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
         return self.o_proj(core_attn_out)[0]
+
+    def _run_kda_tp_core(
+        self,
+        backend,
+        batch,
+        metadata,
+        mixed_qkv: torch.Tensor,
+        forget_gate: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        verify_rows: Optional[torch.Tensor] = None,
+        defer_f_b: bool = False,
+    ) -> torch.Tensor:
+        if not batch.forward_mode.is_decode() and not defer_f_b:
+            forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim)).unsqueeze(0)
+        linear = backend.linear_attn_backend
+        own_metadata = linear.forward_metadata
+        own_rows = linear.verify_intermediate_state_indices
+        linear.forward_metadata = metadata
+        if verify_rows is not None:
+            linear.verify_intermediate_state_indices = verify_rows
+        try:
+            return backend.forward(
+                layer=self.attn,
+                forward_batch=batch,
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta.unsqueeze(0),
+            )
+        finally:
+            linear.forward_metadata = own_metadata
+            linear.verify_intermediate_state_indices = own_rows
+
+    def forward_kda_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        ctx = self._kda_tp.context()
+        x = self._kda_tp.all_gather_rows(hidden_states, ctx.R)
+        backend = get_attn_backend()
+        H, D = self.local_num_heads, self.head_dim
+        if ctx.sources is None:
+            mode = ctx.mode
+            defer_f_b = self._kda_hip_fused_decode_ready and mode.is_decode()
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
+                x, defer_f_b=defer_f_b
+            )
+            fused_onorm = (self._kda_fused_decode_ready or defer_f_b) and (
+                mode.is_decode() or mode.is_target_verify()
+            )
+            if fused_onorm:
+                self.attn._k3_onorm_gate = g_proj_states
+                self.attn._k3_onorm_consumed = False
+            if defer_f_b:
+                self.attn._k3_deferred_f_b = True
+            try:
+                core = self._run_kda_tp_core(
+                    backend,
+                    ctx.batch,
+                    ctx.metadata,
+                    mixed_qkv,
+                    forget_gate,
+                    beta,
+                    verify_rows=ctx.verify_rows,
+                    defer_f_b=defer_f_b,
+                )
+            finally:
+                if fused_onorm:
+                    self.attn._k3_onorm_gate = None
+                    fused_onorm = self.attn._k3_onorm_consumed
+                if defer_f_b:
+                    self.attn._k3_deferred_f_b = False
+            core = core.reshape(-1, H, D)
+        else:
+            # General path (eager, some DP rank in extend): one core call per source rank.
+            fused_onorm = False
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
+                x, defer_f_b=False
+            )
+            core = x.new_zeros((x.shape[0], H, D))
+            linear = backend.linear_attn_backend
+            for src in ctx.sources:
+                start = src.rank * ctx.R
+                rows = slice(start, start + source_tokens(src))
+                verify_rows = (
+                    source_scratch_rows(linear, src)
+                    if src.batch.forward_mode.is_target_verify()
+                    else None
+                )
+                out = self._run_kda_tp_core(
+                    backend,
+                    src.batch,
+                    src.metadata,
+                    mixed_qkv[rows],
+                    forget_gate[rows],
+                    beta[rows],
+                    verify_rows=verify_rows,
+                )
+                core[rows] = out.reshape(-1, H, D)
+        return self._kda_tp_output(
+            core, g_proj_states, hidden_states.shape[0], fused_onorm=fused_onorm
+        )
+
+    def _kda_tp_output(
+        self,
+        core: torch.Tensor,
+        g_proj_states: torch.Tensor,
+        local_rows: int,
+        *,
+        fused_onorm: bool,
+    ) -> torch.Tensor:
+        H, D = self.local_num_heads, self.head_dim
+        if not fused_onorm:
+            core = self.o_norm(core, g_proj_states.unflatten(-1, (-1, D)))
+        core = core.reshape(core.shape[0], H * D)
+        out = self._kda_tp.o_proj_output(core.shape[0], self.hidden_size, core.dtype)
+        if out is not None:
+            partial, _ = self.o_proj(core, output_tensor=out)
+        else:
+            partial = self.o_proj(core)[0]
+        return self._kda_tp.reduce_scatter_rows(partial, local_rows)
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
@@ -3206,6 +3340,7 @@ class KimiK3DecoderLayer(nn.Module):
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         attn_bank: Optional[AttnBank] = None,
         kda_dwdp: Optional[KdaDwdp] = None,
+        kda_tp: Optional[KdaTp] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -3218,6 +3353,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.all_reduce_fusion = not self._sp_moe and _fuses_attn_all_reduce(config)
 
         # Attention
+        self._kda_tp = kda_tp if config.is_kda_layer(layer_idx) else None
         if config.is_kda_layer(layer_idx):
             self.self_attn = KimiK3DeltaAttention(
                 layer_idx=layer_idx,
@@ -3228,6 +3364,7 @@ class KimiK3DecoderLayer(nn.Module):
                 all_reduce_fusion=self.all_reduce_fusion,
                 sp_moe=self._sp_moe,
                 kda_dwdp=kda_dwdp,
+                kda_tp=kda_tp,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
@@ -3377,6 +3514,9 @@ class KimiK3DecoderLayer(nn.Module):
         # attention metadata; pass hidden_states through shape-preserving
         # (matching the idle skip in other DP-attention models).
         if forward_batch.forward_mode.is_idle():
+            if self._kda_tp is not None:
+                # KDA TP: the other DP ranks' rows need this rank's heads.
+                return self.self_attn.forward_kda_tp(hidden_states)
             return hidden_states
 
         # MLA layers with q_lora_rank read their latent inputs from the
@@ -3542,6 +3682,7 @@ class KimiK3LinearModel(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
+        self.kda_tp = KdaTp() if kda_tp.enabled() else None
         self.kda_dwdp = None
         dwdp_size = get_parallel().kda_dwdp_size
         if dwdp_size is not None:
@@ -3569,6 +3710,7 @@ class KimiK3LinearModel(nn.Module):
                 alt_streams=self.alt_streams,
                 attn_bank=self.attn_bank,
                 kda_dwdp=self.kda_dwdp,
+                kda_tp=self.kda_tp,
             ),
             prefix=f"{prefix}.layers",
             final_read=self._final_read if self.pp_group.is_last_rank else None,
@@ -3604,6 +3746,16 @@ class KimiK3LinearModel(nn.Module):
         else:
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
+            )
+
+        if self.kda_tp is not None:
+            # Every rank, idle ones included: gathers this forward's KDA metadata.
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            self.kda_tp.begin_forward(
+                forward_batch,
+                get_attn_backend().linear_attn_backend,
+                hidden_states.shape[0],
             )
 
         total_num_layers = self.end_layer - self.start_layer

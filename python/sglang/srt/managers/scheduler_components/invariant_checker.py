@@ -327,7 +327,8 @@ class SchedulerInvariantChecker:
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(1, mamba_allocator.size + 1))
+            first = getattr(mamba_allocator, "first_slot", 1)
+            expected_mamba_pages = set(range(first, first + mamba_allocator.size))
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )

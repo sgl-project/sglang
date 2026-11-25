@@ -99,6 +99,29 @@ def _get_state() -> Optional[_State]:
                 a2a_backend,
             )
             return None
+    state = _tp_lease()
+    if state is None:
+        if explicit:
+            logger.warning(
+                "SGLANG_K3_AR_FUSION requested but a multicast symmetric workspace "
+                "is unavailable; falling back to the regular all-reduce path."
+            )
+        else:
+            logger.info(
+                "K3 all-reduce fusion auto-probe: a multicast symmetric workspace "
+                "is unavailable; using the regular all-reduce path."
+            )
+        return None
+    from sglang.kernels.ops.communication import all_reduce_residual as mod
+
+    mod.register_comm(state.lease.get_communicator, world_size=state.world_size)
+    logger.info("K3 all-reduce fusion enabled (world_size=%d)", state.world_size)
+    return state
+
+
+@cache_once
+def _tp_lease() -> Optional[_State]:
+    """The TP group's multicast symmetric workspace, requested once for every user."""
     from sglang.srt.distributed.device_communicators.symm_workspace import (
         V2_PUSH_SLOT,
         WorkspaceRequest,
@@ -117,22 +140,18 @@ def _get_state() -> Optional[_State]:
         ),
     )
     if lease is None or not lease.has_multicast:
-        if explicit:
-            logger.warning(
-                "SGLANG_K3_AR_FUSION requested but a multicast symmetric workspace "
-                "is unavailable; falling back to the regular all-reduce path."
-            )
-        else:
-            logger.info(
-                "K3 all-reduce fusion auto-probe: a multicast symmetric workspace "
-                "is unavailable; using the regular all-reduce path."
-            )
         return None
-    from sglang.kernels.ops.communication import all_reduce_residual as mod
-
-    mod.register_comm(lease.get_communicator, world_size=lease.world_size)
-    logger.info("K3 all-reduce fusion enabled (world_size=%d)", lease.world_size)
     return _State(lease, group.cpu_group.group_name)
+
+
+def tp_plane() -> Optional[_State]:
+    """The TP multicast workspace on SM100/SM103 regardless of the all-reduce
+    fusion policy (which skips EP a2a); None when there is none."""
+    from sglang.srt.utils.device import get_device_sm
+
+    if get_device_sm() not in (100, 103):
+        return None
+    return _tp_lease()
 
 
 def enabled() -> bool:
@@ -253,7 +272,7 @@ def register_sp_collective_comm() -> bool:
     direct ops barrier on it; False when another communicator owns this TP size."""
     from sglang.kernels.ops.communication import sp_collective
 
-    state = _get_state()
+    state = _tp_lease()
     assert state is not None
     try:
         sp_collective.register_comm(

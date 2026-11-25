@@ -29,7 +29,7 @@ import logging
 import math
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import KW_ONLY, dataclass, fields
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
@@ -529,6 +529,8 @@ class MambaPool:
     # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
     # class-level default for subclasses that skip MambaPool.__init__.
     _slot_siblings: Tuple = ()
+    # KDA TP PD decode: full-width slots that replace this pool's as the transfer target.
+    pd_staging = None
 
     def register_slot_state(self, state) -> None:
         """Attach a state that rides along on clear / copy / host round-trip,
@@ -702,14 +704,7 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        with (
-            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
-            (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ),
-        ):
+        with self.state_allocation_region():
             if envelope_layout:
                 # Page-granularity envelope layout (page_size==1 for state): all
                 # mamba layers/slots share one contiguous byte buffer; conv and
@@ -1321,8 +1316,18 @@ class MambaPool:
         }
     )
 
+    def state_allocation_region(self):
+        stack = ExitStack()
+        stack.enter_context(self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE))
+        if self.enable_custom_mem_pool:
+            stack.enter_context(torch.cuda.use_mem_pool(self.custom_mem_pool))
+        return stack
+
     def _iter_transfer_state_entries(self):
         """Yield ``[slot, ...]`` state entries and their transfer metadata."""
+        if self.pd_staging is not None:
+            yield from self.pd_staging.iter_transfer_state_entries()
+            return
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
@@ -1532,9 +1537,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             replayssm_request_ring=replayssm_request_ring,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
         )
+        from sglang.srt.layers.communication import kda_tp
+
+        # KDA TP: global slot ids; this DP rank allocates its 1/W of them.
+        first_slot, size = kda_tp.slot_partition(mamba_size)
         self.mamba_allocator = MambaSlotAllocator(
-            size=mamba_size,
-            device=device,
+            size=size, device=device, first_slot=first_slot
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
@@ -1751,6 +1759,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
+
+    def free(self, req: Req):
+        # Handoff cancellation can precede admission and state-slot ownership.
+        if getattr(req, "kda_tp_lazy_mamba", False):
+            self.state.release(self, req)
+        super().free(req)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

@@ -629,6 +629,8 @@ class DpFlags(_FlagGroupBase):
     # Set during prefill-graph capture by breaks that capture graphs of their own
     # behind TP-group barriers; every DP rank must then take the same path.
     prefill_graph_has_rank_barrier: bool = False
+    # --enable-kda-tp, seeded at publish so generic pool code never reads parallel.
+    kda_tp: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None
@@ -1064,6 +1066,9 @@ class RuntimeContext:
         self.flags.capture.enable_torch_compile = bool(
             _resolved_or_field(server_args, "enable_torch_compile", False)
         )
+        self.flags.dp.kda_tp = bool(
+            _resolved_or_field(server_args, "enable_kda_tp", False)
+        )
         self._server_args = server_args
         # Preserve the launcher-assigned device when rebuilding config bags.
         stated = {}
@@ -1233,6 +1238,7 @@ class _ServerArgsOverride:
         "_prev_publish_role",
         "_prev_parallel_config",
         "_prev_capture",
+        "_prev_kda_tp",
         "_installed",
     )
 
@@ -1254,6 +1260,7 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
+        self._prev_kda_tp = ctx.flags.dp.kda_tp
         from sglang.srt.arg_groups.overrides import declare_resolution
 
         server_args = ServerArgs(model_path="dummy")
@@ -1291,6 +1298,7 @@ class _ServerArgsOverride:
         ctx._publish_role = self._prev_publish_role
         ctx.parallel._config = self._prev_parallel_config
         ctx.flags.capture.enable_torch_compile = self._prev_capture
+        ctx.flags.dp.kda_tp = self._prev_kda_tp
         self._prev_server_args = None
         self._prev_bags = None
         self._prev_overrides_log = None
