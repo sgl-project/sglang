@@ -6399,34 +6399,13 @@ class Scheduler(
         self, recv_req: UpdateCacheLinkerReqInput
     ) -> UpdateCacheLinkerReqOutput:
         if not self.enable_unified_cache_external_linker:
-            return UpdateCacheLinkerReqOutput(
-                success=False,
-                message="Launch with --enable-unified-cache-external-linker to manage an external linker.",
-            )
-        if get_memory().enable_linker_mla_dedup:
-            return UpdateCacheLinkerReqOutput(
-                success=False,
-                message="--enable-linker-mla-dedup does not support runtime attach or detach.",
-            )
-        if not self.is_fully_idle():
-            return UpdateCacheLinkerReqOutput(
-                success=False,
-                message=(
-                    "Reject external linker update: scheduler is not idle. "
-                    f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
-                ),
-            )
-        if not recv_req.attach:
-            # A failed detach is fatal on every rank; let it terminate the scheduler.
-            message = self.tree_cache.linker_attachment.detach()
-            return UpdateCacheLinkerReqOutput(success=True, message=message)
-        try:
-            message = self.tree_cache.linker_attachment.attach()
-        except Exception as e:
-            logger.exception("Attach external linker failed with exception.")
-            return UpdateCacheLinkerReqOutput(success=False, message=str(e))
-        return UpdateCacheLinkerReqOutput(success=True, message=message)
+            message = "Launch with --enable-unified-cache-external-linker to manage an external linker."
+        elif not self.is_fully_idle():
+            message = "Reject external linker update: scheduler is not idle."
+        else:
+            success, message = self.tree_cache.linker_attachment.update(recv_req.attach)
+            return UpdateCacheLinkerReqOutput(success=success, message=message)
+        return UpdateCacheLinkerReqOutput(success=False, message=message)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

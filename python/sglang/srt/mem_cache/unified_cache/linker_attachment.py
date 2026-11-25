@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_memory
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
         UnifiedCacheLinker,
@@ -38,6 +40,20 @@ class LinkerAttachment:
     def launch(self) -> None:
         self._link(self._build_linker())
 
+    def update(self, attach: bool) -> tuple[bool, str]:
+        if get_memory().enable_linker_mla_dedup:
+            return False, (
+                "--enable-linker-mla-dedup does not support runtime attach or detach."
+            )
+        if not attach:
+            # A failed detach is fatal on every rank; let it terminate the scheduler.
+            return True, self.detach()
+        try:
+            return True, self.attach()
+        except Exception as e:
+            logger.exception("Failed to attach the external linker.")
+            return False, str(e)
+
     def attach(self) -> str:
         if self._cache.linker is not None:
             return "External linker is already attached."
@@ -45,7 +61,6 @@ class LinkerAttachment:
         try:
             cache_linker = self._build_linker()
         except Exception as e:
-            logger.exception("Failed to build the external linker.")
             error = e
         # The linker hooks run collectives, so every rank links or none does.
         if not self._all_ranks_succeeded(error is None):
