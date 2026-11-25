@@ -451,6 +451,7 @@ class SchedulingVPPCore:
         ready = True
         new_requests = 0
         tokens = 0
+        checkpoint_reqs = []
         for rid, start, end in requests:
             if not 0 <= start < end:
                 raise RuntimeError("invalid VPP admission request span")
@@ -481,8 +482,34 @@ class SchedulingVPPCore:
                 raise RuntimeError("VPP admission prefix order mismatch")
 
             ready = ready and not req.finished()
+            if (
+                not decode
+                and req in getattr(self, "chunked_reqs", (self.chunked_req,))
+                and req.extend_end == start
+                and req.prefix_len < start
+            ):
+                if entry is None or entry.committed_end < start:
+                    ready = False
+                else:
+                    checkpoint_reqs.append(req)
             new_requests += int(not req.kv.holds_kv)
             tokens += end - start + self.page_size
+
+        if manifest.get("forward_mode") != ForwardMode.DECODE.value and any(
+            start > 0 for _, start, _ in requests
+        ):
+            # Checkpoint the completed chunk before pricing its continuation.
+            # Every TP lane must enter the cache collectives with the same rows.
+            states = self._pp_vpp_all_gather_cpu_state(
+                (int(ready), len(checkpoint_reqs))
+            )
+            if not bool(states[:, 0].min()) or (
+                states[:, 1].min() != states[:, 1].max()
+            ):
+                return False
+            for req in checkpoint_reqs:
+                req.skip_radix_cache_insert = req._vpp_original_skip_radix_cache_insert
+                self.stash_chunked_request(req)
 
         available_tokens = self._pp_vpp_available_prefill_tokens()
 

@@ -28,6 +28,7 @@ from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_vpp_core import SchedulingVPPCore
 from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin, _snapshot_tensors
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.vpp_stage import execute_vpp_stage
@@ -320,6 +321,8 @@ class TestSchedulingVPPCore(CustomTestCase):
             session_generation=1,
             bootstrap_room=3,
             origin_input_ids=list(range(16)),
+            extend_end=None,
+            prefix_len=0,
             kv=SimpleNamespace(holds_kv=False),
             finished=lambda: False,
         )
@@ -340,6 +343,27 @@ class TestSchedulingVPPCore(CustomTestCase):
             payload={"manifest": manifest},
         )
         return scheduler, req, envelope
+
+    def _retained_remote_admission(self, *, committed):
+        scheduler, req, envelope = self._remote_admission(rank=1)
+        req.extend_end = 4
+        req.kv.holds_kv = True
+        req.skip_radix_cache_insert = True
+        req._vpp_original_skip_radix_cache_insert = False
+        scheduler.chunked_req = req
+        scheduler.waiting_queue = []
+        registry = scheduler._pp_vpp_prefix_registry
+        registry.plan(req.rid, 1, 1, 0, 4, range(4))
+        if committed:
+            for stage in range(4):
+                registry.mark_materialized(req.rid, 1, stage, 4)
+            registry.commit(req.rid, 1, 4)
+        cached_ends = []
+        cache = SimpleNamespace(
+            checkpoint=lambda row, *, up_to: cached_ends.append(up_to)
+        )
+        scheduler.stash_chunked_request = lambda row: checkpoint_kv_cache(row, cache)
+        return scheduler, req, envelope, cached_ends
 
     def _downstream_admission(self, *, batch_seq=0, owner=None):
         scheduler, req, _ = self._remote_admission(rank=1, core_type=_AdmissionCore)
@@ -1185,6 +1209,53 @@ class TestSchedulingVPPCore(CustomTestCase):
         scheduler.mbs[0] = None
         self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
 
+    def test_remote_admission_checkpoints_completed_chunk_before_capacity_check(self):
+        scheduler, req, envelope, cached_ends = self._retained_remote_admission(
+            committed=True
+        )
+        scheduler._pp_vpp_available_prefill_tokens = lambda: 9 if cached_ends else 8
+
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        self.assertEqual(cached_ends, [4])
+        self.assertEqual(req.prefix_len, 4)
+        self.assertFalse(req.skip_radix_cache_insert)
+        self.assertTrue(scheduler._pp_vpp_remote_manifest_ready(envelope))
+        self.assertEqual(cached_ends, [4])
+
+    def test_remote_admission_waits_for_retained_chunk_commit(self):
+        for missing_entry in (False, True):
+            with self.subTest(missing_entry=missing_entry):
+                scheduler, req, envelope, cached_ends = self._retained_remote_admission(
+                    committed=False
+                )
+                if missing_entry:
+                    scheduler._pp_vpp_prefix_registry.release(req.rid, 1)
+
+                self.assertFalse(scheduler._pp_vpp_remote_manifest_ready(envelope))
+                self.assertEqual(cached_ends, [])
+                self.assertEqual(req.prefix_len, 0)
+                self.assertTrue(req.skip_radix_cache_insert)
+
+    def test_remote_chunk_checkpoint_requires_tp_readiness_and_matching_counts(self):
+        for peer_state in ((0, 1), (1, 0), (1, 1)):
+            with self.subTest(peer_state=peer_state):
+                scheduler, req, envelope, cached_ends = self._retained_remote_admission(
+                    committed=True
+                )
+
+                def gather(local):
+                    peer = peer_state if len(local) == 2 else (1,)
+                    return torch.tensor([local, peer], dtype=torch.int64)
+
+                scheduler._pp_vpp_all_gather_cpu_state = gather
+                ready = peer_state == (1, 1)
+                self.assertEqual(
+                    scheduler._pp_vpp_remote_manifest_ready(envelope), ready
+                )
+                self.assertEqual(cached_ends, [4] if ready else [])
+                self.assertEqual(req.prefix_len, 4 if ready else 0)
+                self.assertEqual(req.skip_radix_cache_insert, not ready)
+
     def test_decode_manifest_uses_running_slot_and_current_sequence_length(self):
         scheduler, req, _ = self._remote_admission()
         scheduler.mbs = [None, None]
@@ -1253,7 +1324,9 @@ class TestSchedulingVPPCore(CustomTestCase):
 
                 def gather(output, local, *, group):
                     self.assertIs(group, cpu_group)
-                    output.copy_(torch.cat((local, torch.tensor([other_ready]))))
+                    peer = local.clone()
+                    peer[0] = other_ready
+                    output.copy_(torch.cat((local, peer)))
 
                 with patch(
                     "torch.distributed.all_gather_into_tensor", side_effect=gather
