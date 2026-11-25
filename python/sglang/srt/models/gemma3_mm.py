@@ -20,14 +20,12 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
 from transformers import Gemma3Config, PreTrainedModel
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -50,8 +48,6 @@ from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import flatten_nested_list, is_xpu
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Gemma3MultiModalProjector(nn.Module):
@@ -149,10 +145,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
     # Pattern to match language model layers only (skip vision_tower and multi_modal_projector)
     lora_pattern = re.compile(
         r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
@@ -383,42 +375,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         input_embeds: torch.Tensor = None,
         **kwargs: object,
     ) -> LogitsProcessor:
-        r"""
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.text_config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.text_config.vocab_size]`.
-
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, Gemma3ForConditionalGeneration
-
-        >>> model = Gemma3ForConditionalGeneration.from_pretrained("google/Gemma3-test-224px-hf")
-        >>> processor = AutoProcessor.from_pretrained("google/Gemma3-test-224px-hf")
-
-        >>> prompt = "answer en Where is the cow standing?"
-        >>> url = "https://huggingface.co/gv-hf/Gemma3-test-224px-hf/resolve/main/cow_beach_1.png"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> inputs = processor(images=image, text=prompt,  return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(**inputs, max_length=30)
-        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "answer en Where is the cow standing?\nbeach"
-        ```"""
 
         # Important: position_ids in Gemma3 are 1-indexed
         # This really does cost me sometime
@@ -511,31 +467,16 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     )
                     weight_loader(param, loaded_weight)
                 loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            pass
-            # raise RuntimeError(
-            #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
         return loaded_params
 
     def get_embed_and_head(self):
-        # For EAGLE3, we delegate to the language model which should have this method
-        # If the language model doesn't have lm_head (like EAGLE3), we return None for head
-        embed = self.language_model.get_embed()
-        if hasattr(self.language_model, "get_embed_and_head"):
-            return self.language_model.get_embed_and_head()
-        elif hasattr(self.language_model, "lm_head"):
-            return embed, self.language_model.lm_head.weight
-        else:
-            # For EAGLE3, head might not be needed
-            return embed, None
+        return self.language_model.get_embed_and_head()
 
     def get_embed_and_head_for_draft(self, draft_embedding):
         return self.language_model.get_embed_and_head_for_draft(draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
-            self.language_model.set_eagle3_layers_to_capture(layer_ids)
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
 
 EntryClass = Gemma3ForConditionalGeneration
