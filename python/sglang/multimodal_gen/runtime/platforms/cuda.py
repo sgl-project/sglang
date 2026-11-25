@@ -619,6 +619,11 @@ class CudaPlatformBase(Platform):
         torch.cuda.empty_cache()
 
     @classmethod
+    def uses_complex_rope_freqs(cls) -> bool:
+        # forward_cuda (flashinfer) and fused QKNorm+RoPE read only cos_sin_cache.
+        return False
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
