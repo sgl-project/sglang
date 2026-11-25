@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -34,36 +33,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-
-
-def get_weight_perm(num_bits: int):
-    perm_list: List[int] = []
-    for i in range(32):
-        perm1: List[int] = []
-        col = i // 4
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
-            perm_list.extend([p + 256 * j for p in perm1])
-
-    perm = np.array(perm_list)
-
-    if num_bits == 4:
-        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    elif num_bits == 8:
-        interleave = np.array([0, 2, 1, 3])
-    else:
-        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
-
-    perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
-    perm = torch.from_numpy(perm)
-    return perm
+    from sglang.srt.models.utils import WeightsMapper
 
 
 class MoeWNA16Config(QuantizationConfig):
@@ -88,15 +58,26 @@ class MoeWNA16Config(QuantizationConfig):
         self.linear_quant_method = linear_quant_method
         self.full_config = full_config
         self.use_marlin = False
+        self._gptq_config: Optional[GPTQConfig | GPTQMarlinConfig] = None
         # Avoid circular import
 
         if self.linear_quant_method == "gptq":
             self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(full_config)
+            gptq_cfg_dict = dict(full_config)
+            gptq_cfg_dict.setdefault("bits", self.weight_bits)
+            gptq_cfg_dict.setdefault("group_size", self.group_size)
+            gptq_cfg_dict.setdefault("desc_act", False)
+            gptq_cfg_dict.setdefault("sym", not self.has_zp)
+            gptq_cfg_dict.setdefault("lm_head", self.lm_head_quantized)
+            cfg_cls = GPTQMarlinConfig if self.use_marlin else GPTQConfig
+            self._gptq_config = cfg_cls.from_config(gptq_cfg_dict)
+            if self._gptq_config.packed_modules_mapping:
+                self.packed_modules_mapping = self._gptq_config.packed_modules_mapping
         elif self.linear_quant_method == "awq":
             capability_tuple = get_device_capability()
             device_capability = (
                 -1
-                if capability_tuple is None
+                if all(capability is None for capability in capability_tuple)
                 else capability_tuple[0] * 10 + capability_tuple[1]
             )
             awq_min_capability = AWQConfig.get_min_capability()
@@ -192,6 +173,38 @@ class MoeWNA16Config(QuantizationConfig):
 
         return gptq_compatible or awq_compatible
 
+    @property
+    def uses_checkpoint_tensor_manifest(self) -> bool:
+        return self._gptq_config is not None
+
+    def _get_gptq_config(self) -> Optional[GPTQConfig | GPTQMarlinConfig]:
+        if self._gptq_config is None:
+            return None
+        if self.packed_modules_mapping:
+            self._gptq_config.packed_modules_mapping = self.packed_modules_mapping
+        return self._gptq_config
+
+    def set_checkpoint_tensor_names(
+        self, tensor_names: Optional[Iterable[str]]
+    ) -> None:
+        if self._gptq_config is not None:
+            self._gptq_config.set_checkpoint_tensor_names(tensor_names)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper) -> None:
+        if self._gptq_config is not None:
+            self._gptq_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        super().update_packed_modules_mapping(mapping)
+        if self._gptq_config is not None:
+            self._gptq_config.packed_modules_mapping = mapping
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        gptq_config = self._get_gptq_config()
+        if gptq_config is not None:
+            return gptq_config.is_linear_unquantized(prefix)
+        return super().is_linear_unquantized(prefix)
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -205,14 +218,7 @@ class MoeWNA16Config(QuantizationConfig):
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
             if self.linear_quant_method == "gptq":
-                if self.use_marlin:
-                    return GPTQMarlinConfig.from_config(
-                        self.full_config
-                    ).get_quant_method(layer, prefix)
-                else:
-                    return GPTQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
+                return self._get_gptq_config().get_quant_method(layer, prefix)
             elif self.linear_quant_method == "awq":
                 return AWQConfig.from_config(self.full_config).get_quant_method(
                     layer, prefix

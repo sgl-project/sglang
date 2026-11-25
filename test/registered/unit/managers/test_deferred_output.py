@@ -31,7 +31,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import empty_request_lists, leaving_retirer
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -61,6 +61,7 @@ def _scheduler():
     streamer.is_generation = True
     streamer.defer_outputs = False
     scheduler.output_streamer = streamer
+    scheduler.request_retirer = leaving_retirer()
     scheduler.init_deferred_responses()
     return scheduler
 
@@ -235,6 +236,7 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler.deferred_responses = DeferredResponses(
         disaggregation_mode=DisaggregationMode.NULL,
         output_streamer=scheduler.output_streamer,
+        request_retirer=leaving_retirer(),
         send_abort=None,
     )
     scheduler.is_fully_idle.return_value = state == "idle"

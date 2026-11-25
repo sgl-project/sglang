@@ -10,7 +10,7 @@ kernels, and DSpark verify.
 GSM8K settings and the 0.93 threshold match the H200 and B300 M3.1 nightlies,
 so the three gates read the same way.
 
-Registry: nightly-amd-4-gpu-mi35x-minimax-m31-flash-mxfp4 suite
+Registry: nightly-test-4-gpu-amd-mi35x-minimax-m31-flash-mxfp4 suite
 """
 
 import unittest
@@ -21,7 +21,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_amd_ci(
     est_time=1800,
-    suite="nightly-amd-4-gpu-mi35x-minimax-m31-flash-mxfp4",
+    suite="nightly-test-4-gpu-amd-mi35x-minimax-m31-flash-mxfp4",
     nightly=True,
 )
 

@@ -83,8 +83,6 @@ from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     cpu_has_amx_support,
-    get_bool_env_var,
-    get_device_sm,
     is_cpu,
     is_cuda,
     is_hip,
@@ -95,10 +93,8 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_device_sm = get_device_sm()
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
@@ -310,6 +306,12 @@ class LongcatFlashModelNextN(nn.Module):
 
 
 class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
+    @staticmethod
+    def own_quant_config(hf_config, quant_config):
+        if "mtp" in getattr(hf_config, "disable_quant_module", []):
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -317,11 +319,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.quant_config = (
-            None
-            if "mtp" in getattr(config, "disable_quant_module", [])
-            else quant_config
-        )
+        self.quant_config = self.own_quant_config(config, quant_config)
         self.model = LongcatFlashModelNextN(config, self.quant_config)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
