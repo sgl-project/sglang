@@ -81,7 +81,8 @@ class TestCheckSchemeSupportedError(CustomTestCase):
         self.assertTrue(ok)
 
     def test_no_device_returns_false(self):
-        with patch(_GET_CAP, return_value=None):
+        # get_device_capability() reports a device without one as (None, None).
+        with patch(_GET_CAP, return_value=(None, None)):
             ok = _bare_config()._check_scheme_supported(min_capability=70)
         self.assertFalse(ok)
 

@@ -81,6 +81,10 @@ class TestResolveRocmForwardMethod(CustomTestCase):
                 AttnForwardMethod.MHA_ONE_SHOT_ROCM,
             )
             self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MHA_CHUNKED_KV),
+                AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
+            )
+            self.assertEqual(
                 abh.resolve_rocm_forward_method(AttnForwardMethod.MLA),
                 AttnForwardMethod.MLA_ROCM,
             )
