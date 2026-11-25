@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm
-from sglang.srt.hardware_backend.npu.eplb import coordinator
+from sglang.srt.hardware_backend.npu.eplb import coordinator, placement
 from sglang.srt.hardware_backend.npu.eplb.placement import (
     PlanningSpec,
     plan_migration,
@@ -20,34 +20,40 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestAsyncEplbPlanning(unittest.TestCase):
-    def test_dynamic_replica_checks_full_window_p95(self):
+    @staticmethod
+    def _plan_two_replicas(ordinary_peak, total):
         # The 50 fixed hot steps already occupy the entire top 5% of this
         # window. One ordinary step over the old peak would raise the P95.
         current = torch.tensor([[0, 1, 0, 2]])
         local_replicas = torch.tensor([[[0], [1], [3]]])
         spec = PlanningSpec(4, 2, None, 1, EplbAlgorithm.deepseek, "random")
 
-        def plan(ordinary_peak):
-            counts = torch.tensor(
-                [[[ordinary_peak, 0, 128 - ordinary_peak, 0]]] * 950
-                + [[[0, 128, 0, 0]]] * 50,
-                dtype=torch.int32,
-            )
-            return plan_migration(
-                counts,
-                current,
-                spec,
-                2,
-                (0,),
-                current_replicas=local_replicas,
-                narrowed_layers={0},
-            )
+        counts = torch.tensor(
+            [[[ordinary_peak, 0, total - ordinary_peak, 0]]] * 950
+            + [[[0, total, 0, 0]]] * 50,
+            dtype=torch.int32,
+        )
+        return plan_migration(
+            counts,
+            current,
+            spec,
+            2,
+            (0,),
+            current_replicas=local_replicas,
+            narrowed_layers={0},
+        )
 
-        self.assertIsNone(plan(80))
-        safer = plan(96)
+    def test_dynamic_replica_checks_full_window_p95(self):
+        self.assertIsNone(self._plan_two_replicas(80, 128))
+        safer = self._plan_two_replicas(104, 128)
         self.assertIsNotNone(safer)
-        self.assertTrue(torch.equal(safer.physical_to_logical, current))
+        self.assertEqual(safer.physical_to_logical.tolist(), [[0, 1, 0, 2]])
         self.assertEqual(safer.logical_to_physical[0, 0].tolist(), [0, 2])
+
+    def test_dynamic_replica_bounds_correlated_source_draws(self):
+        # Aligned generators can repeat the first 201 draws across both
+        # sources. The independent bound used to admit this route-only plan.
+        self.assertIsNone(self._plan_two_replicas(311, 512))
 
     def test_balanced_single_copy_window_skips_solver(self):
         current = torch.tensor([[2, 0, 3, 1]])
@@ -57,6 +63,19 @@ class TestAsyncEplbPlanning(unittest.TestCase):
         with patch.object(PlanningSpec, "compute", autospec=True) as compute:
             self.assertIsNone(plan_migration(counts, current, spec, 2, (0,)))
         compute.assert_not_called()
+
+    def test_low_migration_search_receives_only_eligible_layers(self):
+        current = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
+        spec = PlanningSpec(4, 2, None, 1, EplbAlgorithm.deepseek)
+        counts = torch.tensor([[[2, 2, 2, 2], [30, 10, 1, 1]]]).repeat(16, 1, 1)
+        with patch.object(
+            placement, "_prefer_fewer_moves", wraps=placement._prefer_fewer_moves
+        ) as search:
+            plan = plan_migration(counts, current, spec, 2, (0, 1))
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.layers, (1,))
+        self.assertEqual(search.call_args.args[-1], (1,))
 
 
 class TestAsyncEplbCoordinator(unittest.TestCase):

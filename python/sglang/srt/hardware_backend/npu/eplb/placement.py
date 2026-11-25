@@ -166,7 +166,7 @@ def plan_migration(
     static_dispatch = None
     if score_steps and not replicated:
         physical, logical, known_gains = _prefer_fewer_moves(
-            current, physical, logical, counts, spec.local_experts
+            current, physical, logical, counts, spec.local_experts, layer_ids
         )
     candidates = layer_ids
     if spec.physical_count_mode != "row":
@@ -523,23 +523,23 @@ def _balance_recorded_steps(
     return _reindex_placement(physical, logical, order)
 
 
-def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
+def _prefer_fewer_moves(old, physical, logical, counts, local_experts, layer_ids):
     """Save remote rows within 2% of the reference peak on the recorded load."""
     layers, capacity = old.shape
     live = old.numpy().reshape(layers, -1, local_experts)
     target = physical.numpy().reshape(live.shape)
     result = target.copy()
-    weights = counts.sum(dim=0, dtype=torch.float64).numpy()
+    samples = counts.numpy()
     cheaper_gains = {}
-    for layer, (source, reference, weight) in enumerate(
-        zip(live, target, weights, strict=True)
-    ):
+    for layer in layer_ids:
+        source, reference = live[layer], target[layer]
         if np.array_equal(source, reference):
             continue
         # Only unique-expert layers qualify. With no replicas, every changed
         # destination is a remote row after resident slots have been aligned.
         if not np.array_equal(np.sort(source, axis=None), np.arange(capacity)):
             continue
+        weight = samples[:, layer].sum(axis=0, dtype=np.float64)
         peak_limit = weight[reference].sum(axis=1).max() * 1.02
         candidate = source.copy()
         load = weight[candidate].sum(axis=1)
@@ -564,7 +564,7 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
             np.count_nonzero(reference != source)
         ):
             # Keep the aligned plan unless the cheaper move also passes admission.
-            gain = _migration_gain(counts[:, layer].numpy(), source, candidate)
+            gain = _migration_gain(samples[:, layer], source, candidate)
             if gain:
                 result[layer] = candidate
                 cheaper_gains[layer] = gain
@@ -679,13 +679,28 @@ def _static_rank_peak_bound(slots, destinations, sources, ranks):
 
 def _random_rank_peak_bound(samples, probability, before, totals):
     """Bound the mean busiest-rank load and reject unsafe window tails."""
-    # Accumulate mean, variance and the reachable count in one pass.
+    # Accumulate moments and support bounds from the assignment marginals.
     weights = np.concatenate(
-        (probability, probability * (1 - probability), probability > 0), axis=1
+        (
+            probability,
+            probability * (1 - probability),
+            probability > 0,
+            (probability > 0) & (probability < 1),
+        ),
+        axis=1,
     )
-    mean, variance, reachable = np.split(samples @ weights, 3, axis=1)
-    if not _random_window_tail_is_safe(before, totals, mean, variance, reachable):
+    mean, variance_sum, reachable, random_counts = np.split(
+        samples @ weights, 4, axis=1
+    )
+    # Any EP rank can be a source, and sources can share a generator state.
+    # Cauchy-Schwarz bounds the variance of their sum by K times the sum of
+    # their variances, using independent draws only within each source.
+    source_ranks = probability.shape[1]
+    if not _random_window_tail_is_safe(
+        before, totals, mean, variance_sum, reachable, random_counts, source_ranks
+    ):
         return None
+    variance = source_ranks * variance_sum
     # For any threshold c, max(X) <= c + sum((X_i - c)_+).
     # Cauchy-Schwarz bounds each expected excess using its variance.
     threshold = mean.max(1, keepdims=True)
@@ -697,7 +712,9 @@ def _random_rank_peak_bound(samples, probability, before, totals):
     return np.minimum(peak, reachable.max(1))
 
 
-def _random_window_tail_is_safe(before, totals, mean, variance, reachable):
+def _random_window_tail_is_safe(
+    before, totals, mean, variance_sum, reachable, random_counts, source_ranks
+):
     active = totals > 0
     tail = int(np.ceil(0.95 * active.sum())) - 1
     if tail < 0:
@@ -705,19 +722,28 @@ def _random_window_tail_is_safe(before, totals, mean, variance, reachable):
     before_p95 = np.partition(before[active] / totals[active], tail)[tail]
     # A step breaches the old P95 when any rank reaches this integer load.
     first_breach = np.floor((before_p95 + 1e-12) * totals[active])[:, None] + 1
-    mean, variance, reachable = mean[active], variance[active], reachable[active]
-    forced = ((variance == 0) & (mean >= first_breach)).any(axis=1)
+    mean = mean[active]
+    random_counts = random_counts[active]
+    forced = ((random_counts == 0) & (mean >= first_breach)).any(axis=1)
     # The nearest-rank P95 rises once one more step than the tail can hold
     # breaches. Always count steps that already breach with probability one.
     remaining = len(forced) - tail - int(forced.sum())
     if remaining <= 0:
         return False
-    possible = (reachable >= first_breach) & (variance > 0) & ~forced[:, None]
+    possible = (
+        (reachable[active] >= first_breach) & (random_counts > 0) & ~forced[:, None]
+    )
     gap = np.maximum(first_breach - mean, 0)[possible]
     risk = np.zeros_like(mean)
-    risk[possible] = np.exp(-(gap**2) / (2 * (variance[possible] + gap / 3)))
-    # Bernstein bounds each rank, a union bound gives each step's risk, and
-    # Markov bounds the number of breaches without assuming independent steps.
+    # Apply Hölder to the K source moment-generating functions before using
+    # Bernstein and Hoeffding within each source. The exponents lose a factor
+    # of K, so sources may be arbitrarily correlated (including identical draws).
+    squared_gap = gap**2 / source_ranks
+    bernstein = squared_gap / (2 * (variance_sum[active][possible] + gap / 3))
+    hoeffding = 2 * squared_gap / random_counts[possible]
+    risk[possible] = np.exp(-np.maximum(bernstein, hoeffding))
+    # Union bound over destination ranks, then Markov over the window. Neither
+    # needs independence across destination ranks or across steps.
     expected_breaches = np.minimum(risk.sum(axis=1), 1).sum()
     return expected_breaches <= remaining * _MAX_WINDOW_TAIL_REGRESSION_RISK
 
