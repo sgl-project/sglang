@@ -1862,9 +1862,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             bootstrap_room = obj.bootstrap_room
-            if (
-                bootstrap_room is None
-                and get_disagg().disaggregation_transfer_backend == "fake"
+            # Neither has a decode that would look the room up.
+            if bootstrap_room is None and (
+                get_disagg().disaggregation_transfer_backend == "fake"
+                or (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and obj.bootstrap_host is None
+                )
             ):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1

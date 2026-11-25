@@ -339,6 +339,29 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
+def lacks_decode_peer(req: Req) -> bool:
+    """Whether a request to a prefill server names no bootstrap host, so that
+    no decode can find its KV."""
+    disagg = get_disagg()
+    return (
+        req.bootstrap_host is None
+        and disagg.disaggregation_mode == "prefill"
+        and disagg.disaggregation_transfer_backend != "fake"
+    )
+
+
+def is_prefill_only(req: Req) -> bool:
+    """Whether the prefill server answers this admitted request by itself: it
+    has no decode peer, and the one token prefill samples is all it asks for."""
+    if not lacks_decode_peer(req):
+        return False
+    assert req.sampling_params.max_new_tokens == 1, (
+        f"{req.rid=} has no decode peer but asks for "
+        f"{req.sampling_params.max_new_tokens} tokens"
+    )
+    return True
+
+
 def pre_alloc_fill_len(req: Req) -> int:
     """The last output id is the pending decode input, so its KV is not written."""
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)

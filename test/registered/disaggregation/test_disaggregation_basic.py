@@ -137,6 +137,42 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         # ensure the output is a valid JSON
         json.loads(output)
 
+    def test_prefill_answers_one_token_request_alone(self):
+        def generate(url, prompt, max_new_tokens):
+            return requests.post(
+                url + "/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                    },
+                },
+                timeout=60,
+            )
+
+        # A request for one token that names no decode gets from the prefill
+        # server the answer the prefill and decode give through the router.
+        prompt = "The capital of France is"
+        routed = generate(self.lb_url, prompt, 1).json()
+        alone = generate(self.prefill_url, prompt, 1)
+        self.assertEqual(alone.status_code, 200, alone.text)
+        alone = alone.json()
+        self.assertEqual(alone["output_ids"], routed["output_ids"])
+        self.assertEqual(
+            alone["meta_info"]["finish_reason"], routed["meta_info"]["finish_reason"]
+        )
+
+        # Its prompt is cached like any other, unlike a fake-bootstrap probe's.
+        unseen = " ".join(["An unseen prompt about cached prefixes."] * 40)
+        first = generate(self.prefill_url, unseen, 1).json()["meta_info"]
+        again = generate(self.prefill_url, unseen, 1).json()["meta_info"]
+        self.assertGreater(again["cached_tokens"], first["cached_tokens"])
+
+        # Nothing would continue a longer request.
+        longer = generate(self.prefill_url, prompt, 2)
+        self.assertEqual(longer.status_code, 400, longer.text)
+
     def test_first_token_finish(self):
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")
         tokenizer = AutoTokenizer.from_pretrained(self.model)

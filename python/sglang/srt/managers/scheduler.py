@@ -114,6 +114,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     decode_offloads_kvcache,
     get_dsa_seed_metadata_dim,
+    lacks_decode_peer,
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
@@ -3471,6 +3472,7 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not lacks_decode_peer(req)
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -3600,6 +3602,15 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if lacks_decode_peer(req) and req.sampling_params.max_new_tokens != 1:
+            self._reject_bad_request(
+                req,
+                "A prefill request without a bootstrap host has no decode to "
+                "continue it, so it must set max_new_tokens=1; got "
+                f"max_new_tokens={req.sampling_params.max_new_tokens}.",
+            )
             return
 
         if (
