@@ -5,7 +5,7 @@ import logging
 
 import torch
 
-from sglang.srt.multimodal.cache.identity import build_cache_key
+from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.multimodal_processor_mixin import (
@@ -186,8 +186,9 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         item_features = [None] * len(media_items)
         if self._item_feature_cache is not None:
             item_keys = [
-                build_cache_key(
+                structured_digest(
                     (
+                        "token-space-item-feature-cache-v1",
                         self.hf_config.name_or_path,
                         self.mm_process_config,
                         self.image_processor_backend,
@@ -196,7 +197,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                         item_kwargs,
                         request_options,
                     )
-                )
+                ).hex()
                 for modality, source, _, item_kwargs in media_items
             ]
             item_features = [self._item_feature_cache.get(key) for key in item_keys]
