@@ -247,6 +247,9 @@ class TestDraftKVRingLayout(CustomTestCase):
         self.assertTrue(bool(kept[-ring.span :].all()))
         self.assertEqual(first[kept].unique().numel(), ring.span)
         self.assertTrue(bool((second != 0).all()))
+        kept_rows = ring.extend_kept_rows(lens.tolist())
+        self.assertEqual(kept_rows.tolist(), locs.nonzero().flatten().tolist())
+        self.assertIsNone(ring.extend_kept_rows([ring.span, 40]))
 
     def test_the_floor_resets_when_the_slot_is_allocated_again(self):
         pool = ReqToTokenPool(

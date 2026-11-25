@@ -3068,6 +3068,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
+            target_hidden = logits_output.hidden_states
             if self.draft_kv_ring is not None:
                 self.draft_kv_ring.record_floors(
                     batch.reqs,
@@ -3080,11 +3081,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     extend_lens=ctx_lens,
                     seq_ends=draft_seq_lens + ctx_lens,
                 )
+                # Project and write only the rows the ring keeps.
+                kept_rows = self.draft_kv_ring.extend_kept_rows(batch.extend_lens)
+                if kept_rows is not None:
+                    target_hidden = target_hidden.index_select(0, kept_rows)
+                    draft_cache_loc = draft_cache_loc[kept_rows]
+                    positions = positions[kept_rows]
+                    ctx_lens = ctx_lens.clamp(max=self.draft_kv_ring.span)
             else:
                 # The draft KV goes to the slots the target prefill just wrote.
                 draft_cache_loc = self._draft_write_ids(iteration_ids)
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
+                target_hidden=target_hidden,
                 cache_loc=draft_cache_loc,
                 swa_cache_loc=(
                     None

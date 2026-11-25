@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils import async_h2d
 
 DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa4")
 
@@ -339,6 +340,25 @@ class DFlashDraftKVRing:
         locs = self.locs(req_of_token, positions)
         keep = positions.to(torch.int64) >= end_of_token - self.span
         return torch.where(keep, locs, torch.zeros_like(locs))
+
+    def extend_kept_rows(self, extend_lens: List[int]) -> Optional[torch.Tensor]:
+        """Batch rows (request-major) of one extend that ``extend_locs`` gives a
+        ring row, each request's last ``span``; None when that is every row."""
+        kept_lens = [min(extend_len, self.span) for extend_len in extend_lens]
+        if kept_lens == list(extend_lens):
+            return None
+        # A request's kept rows are consecutive: batch row = kept row + offset.
+        offsets, batch_end, num_kept = [], 0, 0
+        for extend_len, kept_len in zip(extend_lens, kept_lens):
+            batch_end += extend_len
+            num_kept += kept_len
+            offsets.append(batch_end - num_kept)
+        device = self.min_pos.device
+        return torch.repeat_interleave(
+            async_h2d(offsets, dtype=torch.int64, device=device),
+            async_h2d(kept_lens, dtype=torch.int64, device=device),
+            output_size=num_kept,
+        ) + torch.arange(num_kept, device=device)
 
     def record_floors(self, reqs, prefix_lens, req_generation: torch.Tensor) -> None:
         """Sets a slot's floor on the first extend after the slot is allocated;
