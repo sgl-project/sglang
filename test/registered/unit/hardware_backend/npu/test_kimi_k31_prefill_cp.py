@@ -94,6 +94,7 @@ class TestKimiK31PrefillCP(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             attn_cp_metadata=object() if cp_enabled else None,
+            attn_dcp_metadata=None,
         )
         layer = SimpleNamespace(layer_id=0, tp_q_head_num=heads, scaling=0.5)
 
