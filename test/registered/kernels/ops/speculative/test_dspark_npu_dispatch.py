@@ -7,6 +7,17 @@ import torch
 import torch_npu  # noqa: F401
 from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
+# triton>=3.6 picks its backend through CudaDriver.is_active(), which becomes
+# active as soon as torch.cuda.is_available() is True. transfer_to_npu maps
+# torch.cuda onto NPU, so both the Ascend and the NVIDIA driver look active.
+# torch_npu<=2.10 shipped this same patch inside transfer_to_npu.
+try:
+    from triton.backends.nvidia.driver import CudaDriver
+
+    CudaDriver.is_active = staticmethod(lambda: False)
+except ImportError:
+    pass
+
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
@@ -22,7 +33,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import DSparkSchedu
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=90, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=90, suite="extra-b-test-1-npu-a3")
 
 
 class TestDSparkNpuDispatch(CustomTestCase):

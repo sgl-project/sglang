@@ -85,6 +85,7 @@ from sglang.multimodal_gen.test.test_utils import (
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
+from sglang.test.test_utils import admin_post
 
 logger = init_logger(__name__)
 
@@ -1223,7 +1224,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 1: unmerge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing unmerge_lora_weights for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
         )
         assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
@@ -1237,7 +1238,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 2: merge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing merge_lora_weights for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/merge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
         )
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
@@ -1252,7 +1253,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing set_lora for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1318,7 +1319,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         logger.info(
             "[LoRA Switch E2E] Switching to second LoRA adapter for %s", case.id
         )
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "lora2", "lora_path": second_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1338,7 +1339,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 3: Switch back to original LoRA and generate
         logger.info("[LoRA Switch E2E] Switching back to original LoRA for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1383,7 +1384,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             "[Dynamic LoRA] Loading LoRA dynamically via set_lora API for %s", case.id
         )
         logger.info("[Dynamic LoRA] LoRA path: %s", dynamic_lora_path)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1407,7 +1408,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         client = self._client(ctx)
 
         # Test 1: Basic multi-LoRA with list format
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
@@ -1426,7 +1427,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert rid is not None
 
         # Test 2: Different strengths
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
@@ -1444,18 +1445,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
         assert rid is not None
 
-        # Test 3: Different targets
-        requests.post(
+        # Test 3: Select the Z-Image transformer for both cached adapters
+        admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
-                "lora_path": [first_lora_path, second_lora_path],
-                "target": ["transformer", "transformer_2"],
+                "lora_path": [None, None],
+                "target": ["transformer", "transformer"],
                 "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1469,7 +1470,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert rid is not None
 
         # Test 4: Switch back to single LoRA
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1540,14 +1541,14 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_effect_check:
             base_url = f"http://localhost:{ctx.port}/v1"
             # unmerge turns the adapter off in every merge mode; merge restores it
-            resp = requests.post(
+            resp = admin_post(
                 f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
             )
             assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
             try:
                 without_lora = self._generate_key_frames(ctx, case)
             finally:
-                resp = requests.post(
+                resp = admin_post(
                     f"{base_url}/merge_lora_weights",
                     timeout=_CONTROL_API_TIMEOUT_SECS,
                 )

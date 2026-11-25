@@ -24,6 +24,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Installed package that registers out-of-tree diffusion pipelines and component models. The package is imported once in every process.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ADMIN_API_KEY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Admin API key used when <code>--admin-api-key</code> is not given. The admin endpoints (weight updates, LoRA loading, memory release and resume, profiling) answer HTTP 403 while neither is set.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_PLATFORM_OVERRIDE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Select <code>cpu</code>, <code>cuda</code>, <code>rocm</code>, <code>mps</code>, <code>npu</code>, <code>musa</code>, or an installed <code>sglang.multimodal_gen.platforms</code> entry-point name. XPU remains automatic-only. When unset, SGLang Diffusion detects installed platform plugins before trying built-in platforms.</td>
@@ -46,7 +51,7 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_TORCH_PROFILER_DIR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Directory for torch profiler traces (absolute path). Enables profiling when set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Directory for the torch profiler traces of requests that ask for profiling (<code>profile</code> / <code>--profile</code>); it does not enable profiling by itself. Falls back to <code>SGLANG_TORCH_PROFILER_DIR</code>, then <code>./logs</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_CACHE_ROOT</code></td>
@@ -56,7 +61,12 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>true</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable CUDA-IPC all-to-all for eligible same-host, peer-accessible TP1 + two-rank Ulysses groups. Unsupported topology falls back to NCCL; set <code>0</code> to force NCCL.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable the dedicated CUDA-IPC path for eligible same-host, peer-accessible TP1 + two-rank Ulysses groups. Set <code>0</code> to disable this path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A_MULTI</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset (automatic)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Select the copy engine for the plain Ulysses all-to-all. See <a href="/docs/sglang-diffusion/parallelism#the-ulysses-transport">The Ulysses transport</a> for payload thresholds and overrides. Does not disable pipelined attention.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS</code></td>
@@ -72,6 +82,16 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>-1</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Head groups for pipelining the Ulysses exchange against dense attention over the copy engine. <code>-1</code> picks the largest count that divides the heads per rank while each group still fills the GPU; <code>0</code> keeps the sequential exchange; <code>N</code> forces <code>N</code> groups. Results are bit-identical either way.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>true</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 image: quantize and LANCZOS-resize the decoded canvas on the GPU when a request is smaller than the minimum generation area. The first request of each geometry checks the result against Pillow and falls back to Pillow on any difference. Set to <code>0</code> to always resize with Pillow on the host. The output is byte-identical either way.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Threads for the Pillow LANCZOS resize of MiniMax-H3 image output when it runs on the host (GPU resize disabled or not verified). The result is byte-identical for any value.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_RUNAI_MODEL_STREAMER</code></td>
@@ -423,12 +443,12 @@ These variables configure S3-compatible cloud storage for automatically uploadin
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_S3_ACCESS_KEY_ID`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AWS Access Key ID</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optional explicit access key ID. Leave both key variables unset to use Boto3's credential providers.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_S3_SECRET_ACCESS_KEY`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AWS Secret Access Key</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Secret key for the explicit access key ID. Not needed for an IAM role.</td>
     </tr>
   </tbody>
 </table>

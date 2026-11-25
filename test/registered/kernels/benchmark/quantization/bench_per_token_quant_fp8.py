@@ -24,7 +24,7 @@ FN_MAP = {
 @marker.parametrize("num_tokens", [1, 39, 128, 512, 1392, 7807], [39, 1392])
 @marker.parametrize("hidden_dim", [512, 1076, 1368, 1536, 2048, 4096], [1536])
 @marker.parametrize("dtype", [torch.float16, torch.bfloat16])
-@marker.benchmark("impl", ["jit", "aot"])
+@marker.benchmark("impl", ["jit", "aot"], gate=["jit"])
 def benchmark(num_tokens: int, hidden_dim: int, dtype: torch.dtype, impl: str):
     input = create_random(num_tokens, hidden_dim, dtype=dtype)
     output = torch.empty_like(input, dtype=torch.float8_e4m3fn)

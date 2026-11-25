@@ -44,17 +44,7 @@ def sample_mmmu_requests(
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
-    """
-    Sample requests from the MMMU dataset using HuggingFace datasets.
-
-    Args:
-        num_requests: Number of requests to sample.
-        fixed_output_len: If provided, use this fixed output length for all requests.
-        random_sample: Whether to randomly sample or take the first N.
-
-    Returns:
-        List of tuples (prompt, prompt_token_len, output_token_len).
-    """
+    """Sample requests from the MMMU dataset using HuggingFace datasets."""
     print("Loading MMMU dataset from HuggingFace...")
 
     try:
