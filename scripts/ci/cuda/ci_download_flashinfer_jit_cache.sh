@@ -8,12 +8,14 @@
 #   CU_VERSION                   — e.g. cu130
 #   PIP_CMD                      — e.g. "pip" or "uv pip"
 #   PIP_INSTALL_SUFFIX           — extra pip args for this runner
+#   CI_CACHE_DIR                 - cache root the downloaded wheels are kept under
 set -euxo pipefail
 
 : "${UNINSTALL_JIT_CACHE:?must be set}"
 : "${FLASHINFER_PYTHON_REQUIRED:?must be set}"
 : "${CU_VERSION:?must be set}"
 : "${PIP_CMD:?must be set}"
+: "${CI_CACHE_DIR:?must be set}"
 
 FLASHINFER_JIT_CACHE_INSTALLED=false
 if [ "$UNINSTALL_JIT_CACHE" = false ]; then
@@ -22,7 +24,7 @@ if [ "$UNINSTALL_JIT_CACHE" = false ]; then
 fi
 
 if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
-    FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+    FLASHINFER_CACHE_DIR="${CI_CACHE_DIR}/flashinfer-wheels"
     mkdir -p "${FLASHINFER_CACHE_DIR}"
 
     # The per-arch wheel names are unclaimed on PyPI, so resolve the whole set
