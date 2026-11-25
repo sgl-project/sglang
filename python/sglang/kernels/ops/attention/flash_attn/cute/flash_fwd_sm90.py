@@ -86,14 +86,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # K and V are TMA'd by page; the PV ordering below needs the overlap loop.
             assert intra_wg_overlap and not paged_kv_non_tma
             # P is scaled before its e4m3 cast so small probabilities keep precision
-            # over long contexts; the inverse joins the final O scale.
+            # over long contexts; the inverse joins the final O scale. The residual
+            # term is cast to e5m2 (WGMMA takes e5m2 x e4m3): its range reaches 2^-16,
+            # so probabilities down to ~2^-25 of the row max still reach PV, and both
+            # terms sum into one accumulator.
             self.fp8_p_scale = 256.0
+            self.fp8_p_res_dtype = cutlass.Float8E5M2
+            # Q has no known range, so its high term is cast unscaled; its residual is
+            # at most 2^-4 of the high term and takes the same x16, which keeps small Q
+            # components (down to ~2^-14) and residuals that would be e4m3 subnormals.
+            self.fp8_q_res_scale = 16.0
             # K needs no conversion, so it is TMA'd into one of two sK slots and the
             # next K load overlaps the current QK.
             self.num_k_slots_mma = 2
-            # Causal/local builds split the QK sum across two accumulators; one
-            # accumulator chain there makes ptxas serialize the WGMMAs (C7511).
-            self.qk_split_mma = self.is_causal or self.is_local
+            # QK sums the high and residual Q terms into two accumulators, folded with
+            # the residual's inverse scale; one chain makes ptxas serialize the WGMMAs
+            # in causal/local builds (C7511). Every mask uses the split, so a row's
+            # scores do not depend on whether another request in the batch brings an
+            # image mask (deterministic inference).
         if fp8_kv_dequant:
             assert self.dtype == Float16, "FP8-KV dequant computes in fp16"
             # hdim 512: two MMA warpgroups share 64 Q rows and each owns one
@@ -2756,7 +2766,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self._gemm_qk_fp8_compensated,
             tiled_mma_qk,
             (self.tile_m, self.tile_n),
-            # The residual term goes first, while the running sum is still small.
+            # The residual term goes first, so the V transpose (mid) overlaps it.
             tSrQ_res,
             tSrQ,
             tSrK,
@@ -2765,7 +2775,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qk_fn=qk_fn,
             pv=pv,
             tOrP=tOrP,
-            tOrP_res=cute.make_rmem_tensor_like(tOrP),
+            tOrP_res=cute.make_rmem_tensor(tOrP.layout, self.fp8_p_res_dtype),
             pipeline_k=pipeline_k,
             pipeline_stage=pipeline_stage,
             warp_group_idx=warp_group_idx,
@@ -2790,7 +2800,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         q = rQ.load().to(Float32)
         q_hi = q.to(self.kv_dtype)
         rHi.store(q_hi)
-        rRes.store((q - q_hi.to(Float32)).to(self.kv_dtype))
+        rRes.store(((q - q_hi.to(Float32)) * Float32(self.fp8_q_res_scale)).to(self.kv_dtype))
         cute.autovec_copy(rHi, m.tQhi)
         # Every thread holds its Q values in registers before sQ is overwritten.
         cute.arch.barrier(
@@ -2801,35 +2811,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.NarrowQ), number_of_threads=self.num_mma_threads
         )
-
-    @cute.jit
-    def _gemm_two_fp8_a(
-        self,
-        tiled_mma: cute.TiledMma,
-        acc: cute.Tensor,
-        tA_first: cute.Tensor,
-        tA_second: cute.Tensor,
-        tB: cute.Tensor,
-        zero_init: cutlass.Constexpr[bool],
-        wg_wait: cutlass.Constexpr[int],
-        mid: Optional[Callable] = None,
-    ):
-        """Two FP8 A terms against one B in one WGMMA commit group; mid() runs
-        between them."""
-        warpgroup.fence()
-        mma_atom = cute.make_mma_atom(tiled_mma.op)
-        mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
-        for k in cutlass.range_constexpr(cute.size(tA_first.shape[2])):
-            cute.gemm(mma_atom, acc, tA_first[None, None, k], tB[None, None, k], acc)
-            mma_atom.set(warpgroup.Field.ACCUMULATE, True)
-        if const_expr(mid is not None):
-            mid()
-            warpgroup.fence()
-        for k in cutlass.range_constexpr(cute.size(tA_second.shape[2])):
-            cute.gemm(mma_atom, acc, tA_second[None, None, k], tB[None, None, k], acc)
-        warpgroup.commit_group()
-        if const_expr(wg_wait >= 0):
-            warpgroup.wait_group(wg_wait)
 
     @cute.jit
     def _gemm_qk_fp8_compensated(
@@ -2846,9 +2827,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
         rK = tK if const_expr(B_idx is None) else tK[None, None, None, B_idx]
-        if const_expr(not self.qk_split_mma):
-            self._gemm_two_fp8_a(tiled_mma, acc, tQ_first, tQ_second, rK, True, wg_wait, mid)
-        elif const_expr(split_acc is None):
+        if const_expr(split_acc is None):
             # First block: a private second accumulator, waited for and folded here.
             acc2 = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
             self._gemm_qk_fp8_split(tiled_mma, acc, acc2, tQ_first, tQ_second, rK, None)
@@ -2870,32 +2849,28 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         rK: cute.Tensor,
         mid: Optional[Callable],
     ):
-        """One commit group: the first half of the k-steps sums into acc, the rest
-        into acc2. Causal/local builds otherwise serialize the WGMMAs (ptxas C7511)."""
+        """One commit group: the first Q term (the scaled residual) sums into acc2,
+        the second (the high term) into acc."""
         nk = const_expr(cute.size(tA_first.shape[2]))
         warpgroup.fence()
-        a1 = cute.make_mma_atom(tiled_mma.op)
-        a2 = cute.make_mma_atom(tiled_mma.op)
-        a1.set(warpgroup.Field.ACCUMULATE, False)
-        a2.set(warpgroup.Field.ACCUMULATE, False)
         for t in cutlass.range_constexpr(2):
             tA = tA_first if const_expr(t == 0) else tA_second
+            tC = acc2 if const_expr(t == 0) else acc
             if const_expr(t == 1 and mid is not None):
                 mid()
                 warpgroup.fence()
+            atom = cute.make_mma_atom(tiled_mma.op)
+            atom.set(warpgroup.Field.ACCUMULATE, False)
             for k in cutlass.range_constexpr(nk):
-                if const_expr(k < nk // 2):
-                    cute.gemm(a1, acc, tA[None, None, k], rK[None, None, k], acc)
-                    a1.set(warpgroup.Field.ACCUMULATE, True)
-                else:
-                    cute.gemm(a2, acc2, tA[None, None, k], rK[None, None, k], acc2)
-                    a2.set(warpgroup.Field.ACCUMULATE, True)
+                cute.gemm(atom, tC, tA[None, None, k], rK[None, None, k], tC)
+                atom.set(warpgroup.Field.ACCUMULATE, True)
         warpgroup.commit_group()
 
     @cute.jit
     def _fold_qk_split(self, acc: cute.Tensor, acc2: cute.Tensor):
+        inv_res = Float32(1.0 / self.fp8_q_res_scale)
         for i in cutlass.range_constexpr(cute.size(acc)):
-            acc[i] = acc[i] + acc2[i]
+            acc[i] = acc[i] + acc2[i] * inv_res
 
     def _make_pv_scratch(self, sVt: cute.Tensor, wg_thr_layout, pv_cols: int):
         """PV in pv_cols-wide column chunks: one 64 x pv_cols WGMMA per warpgroup into
@@ -2904,6 +2879,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert half % pv_cols == 0
         tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
             self.kv_dtype,
+            self.kv_dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            Float32,
+            atom_layout_mnk=(self.tile_m // 64, 2, 1),
+            tiler_mn=(64, pv_cols),
+            a_source=warpgroup.OperandSource.RMEM,
+        )
+        tiled_mma_res = sm90_utils_basic.make_trivial_tiled_mma(
+            self.fp8_p_res_dtype,
             self.kv_dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
@@ -2926,16 +2911,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 wg_mma, (self.tile_m, 2 * pv_cols, self.tile_n), None, sVt_c
             )
             tVs.append(tV_c)
-        return SimpleNamespace(tiled_mma=tiled_mma, acc=acc, tVs=tVs, n8=pv_cols // 8)
+        return SimpleNamespace(
+            tiled_mma=tiled_mma, tiled_mma_res=tiled_mma_res, acc=acc, tVs=tVs, n8=pv_cols // 8
+        )
 
     @cute.jit
     def _gemm_pv_fp8_promoted(self, m: SimpleNamespace, acc_O: cute.Tensor, B_idx):
-        """O += P @ V for one KV block, each column chunk added to O in fp32."""
+        """O += P @ V for one KV block, each column chunk added to O in fp32. The
+        e4m3 high term and the e5m2 residual of P sum into one scratch."""
         pv = m.pv
         for c in cutlass.range_constexpr(len(pv.tVs)):
-            self._gemm_two_fp8_a(
-                pv.tiled_mma, pv.acc, m.tOrP, m.tOrP_res, pv.tVs[c][None, None, None, B_idx], True, 0
-            )
+            tV = pv.tVs[c][None, None, None, B_idx]
+            warpgroup.fence()
+            a_hi = cute.make_mma_atom(pv.tiled_mma.op)
+            a_res = cute.make_mma_atom(pv.tiled_mma_res.op)
+            a_hi.set(warpgroup.Field.ACCUMULATE, False)
+            a_res.set(warpgroup.Field.ACCUMULATE, True)
+            for k in cutlass.range_constexpr(cute.size(m.tOrP.shape[2])):
+                cute.gemm(a_hi, pv.acc, m.tOrP[None, None, k], tV[None, None, k], pv.acc)
+                a_hi.set(warpgroup.Field.ACCUMULATE, True)
+            for k in cutlass.range_constexpr(cute.size(m.tOrP_res.shape[2])):
+                cute.gemm(a_res, pv.acc, m.tOrP_res[None, None, k], tV[None, None, k], pv.acc)
+            warpgroup.commit_group()
+            warpgroup.wait_group(0)
             fo = cute.group_modes(acc_O, 1, cute.rank(acc_O))
             fc = cute.group_modes(pv.acc, 1, cute.rank(pv.acc))
             for mi in cutlass.range_constexpr(cute.size(fc.shape[1])):
@@ -3033,7 +3031,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def _prepare_fp8_probabilities(self, acc_S: cute.Tensor, m: SimpleNamespace):
-        """Softmax probabilities -> the compensated e4m3 pair of PV A fragments."""
+        """Softmax probabilities -> the compensated (e4m3, e5m2) pair of PV A
+        fragments."""
         self._permute_Cregs_fp8(acc_S)
         layout = acc_S.layout
         n8 = layout.shape[0][2]
@@ -3048,8 +3047,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         p = tP_acc.load() * Float32(self.fp8_p_scale)
         p_hi = p.to(self.kv_dtype)
+        p_res = (p - p_hi.to(Float32)).to(self.fp8_p_res_dtype)
         m.tOrP.store(p_hi)
-        m.tOrP_res.store((p - p_hi.to(Float32)).to(self.kv_dtype))
+        m.tOrP_res.store(p_res)
 
     @cute.jit
     def first_half_block_overlap_fp8_mma(
@@ -3128,15 +3128,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self._transpose_v_fp8(m, phase=smem_pipe_read_v.index)
 
         # The V transpose runs between the residual and high Q terms of QK.
-        if const_expr(self.qk_split_mma):
-            acc_S = m.qk_fn(B_idx=k_slot, wg_wait=-1, mid=transpose_v, split_acc=m.pv.acc)
-        else:
-            acc_S = m.qk_fn(B_idx=k_slot, wg_wait=-1, mid=transpose_v)
+        acc_S = m.qk_fn(B_idx=k_slot, wg_wait=-1, mid=transpose_v, split_acc=m.pv.acc)
         softmax.rescale_O(acc_O, scores_scale)
-        if const_expr(self.qk_split_mma):
-            # PV reuses the scratch: QK lands and folds first.
-            warpgroup.wait_group(0)
-            self._fold_qk_split(acc_S, m.pv.acc)
+        # PV reuses the scratch: QK lands and folds first.
+        warpgroup.wait_group(0)
+        self._fold_qk_split(acc_S, m.pv.acc)
         # Each PV chunk waits for all prior WGMMAs, so QK[n] is complete after it.
         self._gemm_pv_fp8_promoted(m, acc_O, B_idx=0)
         m.pipeline_k.consumer_release_w_index(k_slot)

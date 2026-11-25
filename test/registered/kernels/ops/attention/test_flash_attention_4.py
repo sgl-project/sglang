@@ -1802,6 +1802,117 @@ class TestFlashAttention4SM90(CustomTestCase):
                     )
                     _assert_fp8_kv_close(out, ref, fp8_mma=dim == 512)
 
+    def test_fp8_kv_cache_long_tail(self):
+        """FP8 MMA at 64k context: the newest key scores 13, the other 65,535
+        score 0. Their probabilities (e^-13 of the max) are below e4m3's range
+        after the P scale and must reach PV through the e5m2 residual term
+        (V = 1 everywhere gives 1; dropped, it gives 0.87)."""
+        length = 65536
+        inputs = _gemma4_fp8_kv_inputs((length,), 1, 64, seed=0)
+        one, thirteen = (
+            torch.tensor(x, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
+            for x in (1.0, 13.0)
+        )
+        q = torch.zeros_like(inputs["q"])
+        q[..., 0] = 1.0
+        newest = (inputs["page_table"][0, -1].item(), (length - 1) % 64)
+        k, v = (inputs[x].view(torch.uint8) for x in ("k", "v"))
+        k.zero_()
+        k[newest[0], newest[1], :, 0] = thirteen
+        inputs.update(q=q, k_descale=torch.ones_like(inputs["k_descale"]))
+        inputs["v_descale"] = torch.ones_like(inputs["v_descale"])
+        for newest_v in (1.0, 0.0):
+            with self.subTest(newest_v=newest_v):
+                v.copy_(one.expand_as(v))
+                if newest_v == 0.0:
+                    v[newest[0], newest[1]] = 0
+                out, _ = _flash_attn_fwd(
+                    q,
+                    inputs["k"],
+                    inputs["v"],
+                    cu_seqlens_q=inputs["cu_seqlens_q"],
+                    seqused_k=inputs["cache_seqlens"],
+                    max_seqlen_q=1,
+                    page_table=inputs["page_table"],
+                    softmax_scale=1.0,
+                    causal=True,
+                    k_descale=inputs["k_descale"],
+                    v_descale=inputs["v_descale"],
+                    num_splits=1,
+                )
+                ref = _fp8_kv_reference(inputs, 1)
+                # newest_v=0: ref = 0.129, the tail's share of the mass.
+                torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.0)
+
+    def test_fp8_kv_cache_small_q(self):
+        """FP8 MMA with every Q component at +-2^-11, below e4m3's range: the
+        high term rounds to 0, so the scores must come from the scaled residual
+        (unscaled, every score is 0 and attention goes uniform)."""
+        for q_len, lengths in ((1, (7, 1103)), (64, (100, 1103))):
+            with self.subTest(q_len=q_len):
+                inputs = _gemma4_fp8_kv_inputs(lengths, q_len, 64, seed=3)
+                q = inputs["q"].sign() * 2.0**-11
+                # Scores of a few units, so attention is far from uniform.
+                softmax_scale = 1024.0
+                out, _ = _flash_attn_fwd(
+                    q,
+                    inputs["k"],
+                    inputs["v"],
+                    cu_seqlens_q=inputs["cu_seqlens_q"],
+                    seqused_k=inputs["cache_seqlens"],
+                    max_seqlen_q=q_len,
+                    page_table=inputs["page_table"],
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    k_descale=inputs["k_descale"],
+                    v_descale=inputs["v_descale"],
+                    num_splits=1,
+                )
+                ref = _fp8_kv_reference(inputs, q_len, q=q * softmax_scale)
+                _assert_fp8_kv_close(out, ref, fp8_mma=True)
+
+    def test_fp8_kv_cache_mask_paths_bit_identical(self):
+        """A text request gets the same bits whether it runs alone (causal) or
+        batched with an image request (image mask_mod), as deterministic
+        inference requires: both mask paths reduce QK in the same order."""
+        lengths = (1137, 1100)
+        inputs = _gemma4_fp8_kv_inputs(lengths, 81, 64, seed=7)
+        q = inputs["q"][:100]
+        cu_q = torch.tensor([0, 81, 100], device="cuda", dtype=torch.int32)
+        ranges = torch.full((100, 2), -1, device="cuda", dtype=torch.int32)
+        prefix = lengths[0] - 81
+        ranges[3:48] = torch.tensor([prefix + 3, prefix + 47], device="cuda")
+        common = dict(softmax_scale=1.0, num_splits=1, pack_gqa=False, ver=4)
+        batched = flash_attn_with_kvcache(
+            q,
+            inputs["k"],
+            inputs["v"],
+            page_table=inputs["page_table"],
+            cache_seqlens=inputs["cache_seqlens"],
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=81,
+            causal=False,
+            k_descale=inputs["k_descale"],
+            v_descale=inputs["v_descale"],
+            mask_mod=make_image_mask_mod(-1),
+            aux_tensors=[ranges, cu_q],
+            **common,
+        )
+        alone = flash_attn_with_kvcache(
+            q[81:],
+            inputs["k"],
+            inputs["v"],
+            page_table=inputs["page_table"][1:],
+            cache_seqlens=inputs["cache_seqlens"][1:],
+            cu_seqlens_q=torch.tensor([0, 19], device="cuda", dtype=torch.int32),
+            max_seqlen_q=19,
+            causal=True,
+            k_descale=inputs["k_descale"][1:],
+            v_descale=inputs["v_descale"][1:],
+            **common,
+        )
+        self.assertTrue(torch.equal(batched[81:], alone))
+
     def test_fp8_kv_cache_decode_replays_in_cuda_graph(self):
         """A captured FP8-KV decode reads the cache and descales afresh on replay."""
         inputs = _gemma4_fp8_kv_inputs((1103, 4100, 17), q_len=1, page_size=64, seed=0)
