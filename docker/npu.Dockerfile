@@ -127,7 +127,7 @@ ENV LC_ALL=en_US.UTF-8
 
 RUN git lfs install --system
 
-### Install MemFabric and MemCache
+### Install MemFabric
 RUN set -eux; \
     case "$DEVICE_TYPE" in \
       950) MF_SOC_VERSION="A5" ;; \

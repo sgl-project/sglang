@@ -20,8 +20,8 @@ SGLang supports the following Ascend inference hardware:
 
 <Note>
 Throughout these docs, **A3 Series** and **950PR/DT Series** are used as shorthand for the hardware above.
-Docker image tags use `a3` for the A3 Series. For example, `cann9.1.0-a3-B105`.
-Tags for the 950PR/DT Series use `950`. For example, `cann9.1.0-950-B105`.
+Docker image tags use `a3` for the A3 Series. For example, `cann9.2.0-a3-B051`.
+Tags for the 950PR/DT Series use `950`. For example, `cann9.2.0-950-B051`.
 
 On the A3 Series, each card has 2 dies, giving 16 devices per node.
 Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on the A3 Series means `--tp-size 8`.
@@ -42,7 +42,7 @@ When a container is started with [Ascend Docker Runtime](/docs/hardware-platform
 On an A3 Series server, run `npu-smi info` to view NPU information such as device
 health, memory usage, and chip status. If the command is not found or reports no devices,
 the driver is likely not installed. Follow the
-[Ascend driver installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/instg/instg_0005.html?OS=openEuler&InstallType=local)
+[Ascend driver installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920/softwareinst/instg/instg_0005.html?OS=openEuler&InstallType=local)
 to install it.
 
 ## Communication libraries
