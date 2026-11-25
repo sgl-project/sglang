@@ -38,7 +38,7 @@ Connect to a standalone SGLang Diffusion server.
    - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO`).
    - Both nodes have an `enhance_prompt` toggle (the server needs `--prompt-enhancer-config`); the rewritten prompt comes out as `revised_prompt`.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
-4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
+4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`. LoRA changes are admin endpoints: launch the server with `--admin-api-key`, and set `SGLANG_ADMIN_API_KEY` to the same key in ComfyUI's environment, or the server answers HTTP 403.
 
 ### Mode 2: Integrated Mode (Tight Integration)
 ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only the DiT and

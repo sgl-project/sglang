@@ -728,6 +728,44 @@ def _compact_candidates(
     return candidates[..., :width], num_valid
 
 
+def _first_match(
+    candidates: torch.Tensor,
+    valid: torch.Tensor,
+    owner_of_candidate: torch.Tensor,
+    owner_of_rank: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """For every rank, count the valid candidates whose owner is the rank's owner
+    and pick the earliest of them (-1 when there is none).
+
+    candidates, valid, owner_of_candidate: [..., width]; owner_of_rank: [ep_size].
+    Returns (count, picked), both [..., ep_size].
+    """
+    width = candidates.shape[-1]
+    num_owners = int(torch.maximum(owner_of_candidate.max(), owner_of_rank.max())) + 1
+    # Column num_owners collects the invalid slots.
+    owner = torch.where(valid, owner_of_candidate, num_owners)
+    first_slot = torch.full(
+        (*candidates.shape[:-1], num_owners + 1),
+        width,
+        dtype=torch.int64,
+        device=candidates.device,
+    ).scatter_reduce_(
+        -1,
+        owner,
+        torch.arange(width, device=candidates.device).expand_as(owner),
+        reduce="amin",
+    )
+    count = torch.zeros_like(first_slot).scatter_add_(-1, owner, torch.ones_like(owner))
+    first_slot = first_slot[..., owner_of_rank]
+    count = count[..., owner_of_rank]
+    picked = torch.where(
+        first_slot < width,
+        candidates.gather(-1, first_slot.clamp(max=width - 1)),
+        -1,
+    )
+    return count, picked
+
+
 def _nearest_expert_dispatch(
     candidates: torch.Tensor,
     num_valid: torch.Tensor,
@@ -742,24 +780,15 @@ def _nearest_expert_dispatch(
     valid = torch.arange(width, device=device) < num_valid[..., None]
     ranks = torch.arange(ep_size, device=device)
 
-    def first_match(owner_of_candidate, owner_of_rank):
-        count = torch.zeros(
-            (*candidates.shape[:-1], ep_size), dtype=torch.int64, device=device
-        )
-        picked = torch.full_like(count, -1)
-        # Walk the slots backwards so the earliest matching replica wins.
-        for k in reversed(range(width)):
-            match = valid[..., k, None] & (
-                owner_of_candidate[..., k, None] == owner_of_rank
-            )
-            count += match
-            picked = torch.where(match, candidates[..., k, None], picked)
-        return count, picked
-
-    _, result = first_match(candidates // num_local_gpu_physical_experts, ranks)
+    _, result = _first_match(
+        candidates, valid, candidates // num_local_gpu_physical_experts, ranks
+    )
     if num_gpus_per_node is not None and num_local_node_physical_experts is not None:
-        node_count, node_pick = first_match(
-            candidates // num_local_node_physical_experts, ranks // num_gpus_per_node
+        node_count, node_pick = _first_match(
+            candidates,
+            valid,
+            candidates // num_local_node_physical_experts,
+            ranks // num_gpus_per_node,
         )
         narrows = (node_count > 0) & (node_count < num_valid[..., None])
         result = torch.where((result == -1) & narrows, node_pick, result)
