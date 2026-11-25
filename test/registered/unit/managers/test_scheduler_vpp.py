@@ -1998,6 +1998,73 @@ class TestNativeVPPAdapter(CustomTestCase):
         self.assertEqual(slots, [None, None])
         self.assertFalse(scheduler._vpp_forward_batches)
 
+    def test_completion_restores_cache_policy_after_fence_without_prefix_wait(self):
+        for committed in (False, True):
+            for original_skip in (False, True):
+                with self.subTest(committed=committed, original_skip=original_skip):
+                    req = SimpleNamespace(
+                        rid="request",
+                        session_generation=1,
+                        prefix_len=4,
+                        extend_end=8,
+                        finished=lambda: False,
+                        skip_radix_cache_insert=True,
+                        _vpp_original_skip_radix_cache_insert=original_skip,
+                    )
+                    registry = PipelinePrefixRegistry()
+                    registry.plan(req.rid, 1, 1, 0, 8, range(4))
+                    if committed:
+                        for stage in range(4):
+                            registry.mark_materialized(req.rid, 1, stage, 8)
+                        registry.commit(req.rid, 1, 8)
+                    order = []
+                    cached_ends = []
+                    cache = SimpleNamespace(
+                        checkpoint=lambda row, *, up_to: cached_ends.append(up_to)
+                    )
+
+                    def process(batch, result):
+                        order.append(("processed", req.skip_radix_cache_insert))
+                        checkpoint_kv_cache(req, cache)
+
+                    event = SimpleNamespace(
+                        record=lambda stream: None,
+                        synchronize=lambda: order.append(
+                            ("copy_ready", req.skip_radix_cache_insert)
+                        ),
+                    )
+                    batch = SimpleNamespace(
+                        reqs=[req], contains_last_prefill_chunk=False
+                    )
+                    scheduler = object.__new__(SchedulerVPPMixin)
+                    scheduler.__dict__.update(
+                        mbs=[batch, None],
+                        mb_metadata=[SimpleNamespace(forward_done=object()), None],
+                        last_mbs=[None, None],
+                        _vpp_forward_batches={0: object()},
+                        _pp_vpp_prefix_registry=registry,
+                        copy_stream_ctx=nullcontext(),
+                        copy_stream=_Stream(),
+                        schedule_stream=object(),
+                        device="cpu",
+                        device_module=SimpleNamespace(Event=lambda: event),
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        _pp_prep_batch_result=lambda *args: SimpleNamespace(),
+                        _pp_process_batch_result=process,
+                    )
+                    slots = [0, None]
+                    scheduler._pp_vpp_finalize_rank_local_batch(0, slots, {})
+
+                    self.assertEqual(
+                        order, [("copy_ready", True), ("processed", original_skip)]
+                    )
+                    self.assertEqual(cached_ends, [] if original_skip else [8])
+                    self.assertEqual(req.prefix_len, 8)
+                    self.assertEqual(req.skip_radix_cache_insert, original_skip)
+                    self.assertIs(scheduler.last_mbs[0], batch)
+                    self.assertIsNone(scheduler.mbs[0])
+                    self.assertEqual(slots, [None, None])
+
     def test_snapshot_preserves_owned_outputs_and_freezes_reused_metadata(self):
         hidden = torch.arange(6).reshape(2, 3)
         source = torch.arange(8)

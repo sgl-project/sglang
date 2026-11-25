@@ -543,15 +543,6 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             raise RuntimeError("VPP completion missing batch or forward metadata")
         # Order local writes and the relayed output on the copy stream, then
         # fence once before processing results and retiring launch leases.
-        for req in batch.reqs:
-            generation = int(getattr(req, "session_generation", None) or 0)
-            entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
-            if (
-                entry is not None
-                and entry.committed_end >= entry.planned_end
-                and not entry.locked
-            ):
-                req.skip_radix_cache_insert = req._vpp_original_skip_radix_cache_insert
         with self.copy_stream_ctx:
             self.copy_stream.wait_stream(self.schedule_stream)
             self.copy_stream.wait_event(metadata.forward_done)
@@ -567,6 +558,12 @@ class SchedulerVPPMixin(SchedulingVPPCore):
             copy_done = self.device_module.Event()
             copy_done.record(self.copy_stream)
         copy_done.synchronize()
+        # Fenced logical-batch completion proves the local KV is readable.
+        # Prefix notifications can lag; restore caching before processing the
+        # final chunk so its insertion does not depend on another control tick.
+        for req in batch.reqs:
+            if hasattr(req, "_vpp_original_skip_radix_cache_insert"):
+                req.skip_radix_cache_insert = req._vpp_original_skip_radix_cache_insert
         with self._pp_vpp_select_chunk(
             {req.rid for req in batch.reqs}, include_retained=True
         ):
