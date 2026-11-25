@@ -7,7 +7,6 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import msgspec
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -19,7 +18,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot
-from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest, StorageMeta
+from sglang.srt.weight_cache.schema import SnapshotManifest, StorageMeta
 from sglang.srt.weight_cache.transport import WeightTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,10 +28,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _CPU = DeviceConfig("cpu")
 
 
-def _model_config(hf_config=None, model_path="m"):
+def _model_config():
     return SimpleNamespace(
-        hf_config=PretrainedConfig() if hf_config is None else hf_config,
-        model_path=model_path,
+        hf_config=PretrainedConfig(),
+        model_path="m",
         revision=None,
         quantization=None,
         dtype=torch.float32,
@@ -56,16 +55,6 @@ def _topology(tp_rank=0, tp_size=2):
         mock.patch("sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1),
     ):
         yield
-
-
-def _spec(tp_rank, tp_size=2, *, hf_config=None, model_path="m", draft_model_idx=None):
-    with _topology(tp_rank, tp_size):
-        return build_load_spec(
-            checkpoint_id="rev1",
-            model_config=_model_config(hf_config, model_path),
-            load_config=LoadConfig(draft_model_idx=draft_model_idx),
-            target_device=_CPU.device,
-        )
 
 
 def _pre_load(loader, model_config, *, checkpoint_id="rev1"):
@@ -429,43 +418,6 @@ class TestSnapshotLoader(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, step):
                     self._read(**{f"{step}_error": RuntimeError(step)})
                 self.assertTrue(self.transport.closed)
-
-    def test_load_spec_separates_shard_identity_from_shared_settings(self):
-        spec = _spec(0)
-        self.assertEqual(
-            msgspec.json.decode(msgspec.json.encode(spec), type=LoadSpec), spec
-        )
-        unknown_field = {**msgspec.to_builtins(spec), "future_layout": "new"}
-        with self.assertRaisesRegex(msgspec.ValidationError, "future_layout"):
-            msgspec.json.decode(msgspec.json.encode(unknown_field), type=LoadSpec)
-        for field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
-            with self.subTest(field=field):
-                peer = msgspec.structs.replace(spec, **{field: 1})
-                self.assertNotEqual(spec.digest(), peer.digest())
-                self.assertEqual(
-                    spec.digest(include_rank=False), peer.digest(include_rank=False)
-                )
-        staged = _spec(
-            0,
-            hf_config=PretrainedConfig(name_or_path="/tmp/staging"),
-            model_path="/tmp/staging",
-        )
-        self.assertEqual(spec.digest(), staged.digest())
-        self.assertEqual(
-            spec.digest(include_rank=False), staged.digest(include_rank=False)
-        )
-        for other in (
-            _spec(0, tp_size=4),
-            _spec(0, draft_model_idx=1),
-            _spec(0, hf_config=PretrainedConfig(hidden_size=128)),
-            msgspec.structs.replace(spec, checkpoint_id="rev2"),
-            msgspec.structs.replace(spec, flashinfer_cutedsl_swap_ab=True),
-            msgspec.structs.replace(spec, fp4_gemm_runner_backend="flashinfer_trtllm"),
-        ):
-            self.assertNotEqual(spec.digest(), other.digest())
-            self.assertNotEqual(
-                spec.digest(include_rank=False), other.digest(include_rank=False)
-            )
 
     def test_pre_load_check_votes_on_every_outcome_but_the_rank(self):
         ballots = []

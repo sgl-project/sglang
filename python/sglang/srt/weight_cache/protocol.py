@@ -13,20 +13,47 @@ import signal
 import struct
 from typing import Any, Dict, Optional
 
+import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.utils.serialization import safe_pickle_loads
-
-from .schema import WeightConfig
 
 logger = logging.getLogger(__name__)
 
 
-class CacheConfig(WeightConfig):
+class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
     between a daemon's cached state and a requesting engine process.
 
     Any mismatch triggers a fallback to disk loading.
     """
+
+    model_path: str
+    model_arch: str
+    tp_size: int
+    tp_rank: int
+    pp_size: int
+    pp_rank: int
+    dp_size: int
+    ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    attn_dp_size: int
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
+    quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
+    quant_config_hash: str  # SHA-256 hash of quantization config
+    dtype: str  # e.g. "torch.float16"
+    revision: str  # model revision the weights were loaded from ("" if unset)
+    # Environment stamp: a daemon and a client that ran different post-processing
+    # branches (different GPU compute capability or torch/kernel version) can
+    # produce incompatible weights that would map cleanly yet serve garbage.
+    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
+    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
+    torch_version: str  # torch.__version__ of the process that built the weights
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""

@@ -24,9 +24,8 @@ from sglang.srt.model_loader.loader import (
     _get_quantization_config,
     _initialize_model,
     get_model_loader,
-    on_model_constructed,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.utils import on_model_constructed, set_default_torch_dtype
 from sglang.srt.weight_cache import load_diff, validator
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot, vote

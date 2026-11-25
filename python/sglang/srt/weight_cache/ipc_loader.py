@@ -24,12 +24,15 @@ from sglang.srt.model_loader.loader import (
     _initialize_model,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 
-from .config import build_cache_config, resolve_cache_quantization
 from .protocol import (
+    CacheConfig,
     check_ipc_quant_support,
+    compute_env_stamp,
+    get_quant_method_name,
     get_socket_path,
+    hash_quant_config,
     recv_msg,
     send_msg,
 )
@@ -146,7 +149,7 @@ class WeightCacheModelLoader(BaseModelLoader):
         # unsupported model fails explicitly instead of silently disk-loading
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
-        quant_method, engine_quant_config = resolve_cache_quantization(model_config)
+        quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
@@ -289,6 +292,20 @@ class WeightCacheModelLoader(BaseModelLoader):
             f"[WeightCacheModelLoader] Started daemon-liveness watchdog for "
             f"pid={daemon_pid}"
         )
+
+    def _resolve_engine_quant(self, model_config):
+        """Return (quant_method, quant_config) matching the daemon's fingerprint.
+
+        Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
+        two can never drift apart. ModelConfig always exposes
+        hf_config/quantization directly; quantization_config is the only
+        genuinely-optional attribute.
+        """
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
+        quant_method = get_quant_method_name(model_config.quantization)
+        if not quant_method and quant_config is not None:
+            quant_method = get_quant_method_name(quant_config)
+        return quant_method, quant_config
 
     @staticmethod
     def _rebuild_stale_views(model):
@@ -558,14 +575,49 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
-            quant_method, quant_config = resolve_cache_quantization(model_config)
-            engine_config = build_cache_config(
-                model_config,
-                quant_method=quant_method,
-                quant_config=quant_config,
+            # Build engine's config fingerprint
+            parallel = get_parallel()
+            tp_size = parallel.tp_size
+            tp_rank = parallel.tp_rank
+
+            pp_size = parallel.pp_size
+            pp_rank = parallel.pp_rank
+
+            ep_size = parallel.moe_ep_size
+            # The configured width, as the daemon states it: the MoE
+            # communicator is wider when it aliases attention CP.
+            moe_dp_size = parallel.moe_dp_size
+            moe_dp_rank = parallel.moe_dp_rank
+            moe_ep_rank = parallel.moe_ep_rank
+
+            quant_method, quant_config = self._resolve_engine_quant(model_config)
+
+            engine_config = CacheConfig(
                 model_path=model_config.model_path,
-                revision=model_config.revision,
-                ep_size=get_parallel().moe_ep_size,
+                model_arch=(
+                    model_config.hf_config.architectures[0]
+                    if model_config.hf_config.architectures
+                    else ""
+                ),
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                dp_size=parallel.dp_size,
+                ep_size=ep_size,
+                moe_dp_size=moe_dp_size,
+                moe_dp_rank=moe_dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                attn_dp_size=parallel.attn_dp_size,
+                enable_dp_lm_head=parallel.enable_dp_lm_head,
+                attn_cp_size=parallel.attn_cp_size,
+                moe_dense_tp_size=parallel.moe_dense_tp_size,
+                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+                quant_method=quant_method,
+                quant_config_hash=hash_quant_config(quant_config),
+                dtype=str(model_config.dtype),
+                revision=model_config.revision or "",
+                **compute_env_stamp(),
             )
 
             logger.info(

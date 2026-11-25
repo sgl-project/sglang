@@ -7,7 +7,6 @@ from __future__ import annotations
 # ruff: noqa: SIM117
 import collections
 import concurrent.futures
-import contextvars
 import dataclasses
 import fnmatch
 import gc
@@ -28,11 +27,9 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Dict,
     Generator,
     Iterable,
-    Iterator,
     List,
     Optional,
     Tuple,
@@ -104,6 +101,7 @@ from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_paddin
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
+    notify_model_constructed,
     set_default_torch_dtype,
 )
 from sglang.srt.utils.device import is_cuda_alike
@@ -143,10 +141,6 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
     rank0_log,
-)
-from sglang.srt.weight_cache.weight_layout import (
-    flashinfer_cutedsl_swap_ab,
-    normalize_init_expert_location,
 )
 
 if TYPE_CHECKING:
@@ -302,23 +296,6 @@ def built_quant_config(
     return own_quant_config(model_config.hf_config, quant_config)
 
 
-# Set only inside on_model_constructed.
-_on_model_constructed: contextvars.ContextVar[Optional[Callable[[nn.Module], None]]] = (
-    contextvars.ContextVar("on_model_constructed", default=None)
-)
-
-
-@contextmanager
-def on_model_constructed(callback: Callable[[nn.Module], None]) -> Iterator[None]:
-    """Call ``callback`` with each model _initialize_model builds in this scope,
-    right after construction and before any weights load."""
-    token = _on_model_constructed.set(callback)
-    try:
-        yield
-    finally:
-        _on_model_constructed.reset(token)
-
-
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -346,9 +323,7 @@ def _initialize_model(
         model = model_class(**kwargs)
         check_stage_producers(model)
     model.shared_experts_config = shared_experts
-    callback = _on_model_constructed.get()
-    if callback is not None:
-        callback(model)
+    notify_model_constructed(model)
     return model
 
 
@@ -386,16 +361,11 @@ class BaseModelLoader(ABC):
     def lookup(
         self, *, spec: LoadSpec, device_config: DeviceConfig
     ) -> Optional[SnapshotManifest]:
-        """Return the snapshot published for exactly ``spec``, or None to load raw.
-
-        Every rank calls it before load_model, and the ranks vote on the results
-        before any bytes move, so it is read-only and bounded in time. It raises if
-        this rank cannot load at all. load_model then loads exactly what it returned.
-        """
+        """Look up the exact snapshot before loading. A miss selects a raw load."""
         return None
 
     def close(self) -> None:
-        """Release what lookup or load_model holds, once the ranks rejected the load."""
+        """Release resources held for a rejected load."""
 
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
@@ -1901,6 +1871,10 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         from sglang.srt.layers.dp_attention import get_moe_cp_size
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
 
         parallel = get_parallel()
         shard_config = {
@@ -1921,12 +1895,32 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
-        swap_ab = flashinfer_cutedsl_swap_ab(target_device)
-        if swap_ab is not None:
-            shard_config["flashinfer_cutedsl_swap_ab"] = swap_ab
+        a2a_backend = get_moe_a2a_backend()
+        if get_moe_runner_backend().is_flashinfer_cutedsl() and (
+            a2a_backend.is_none() or a2a_backend.is_flashinfer()
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                use_cutedsl_moe_swap_ab,
+            )
+
+            # Presharded files contain processed rows; equal shapes do not
+            # distinguish old up64/gate64 weights from swap-AB up16/gate16.
+            shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
+                target_device or torch.device(current_platform.device_type)
+            )
         return shard_config
 
-    _normalize_init_expert_location = staticmethod(normalize_init_expert_location)
+    @staticmethod
+    def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
+        if value is None or value == "trivial":
+            return value
+        if value.endswith((".json", ".pt")) and os.path.isfile(value):
+            h = hashlib.sha1()
+            with open(value, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return f"file:{os.path.basename(value)}:sha1:{h.hexdigest()[:16]}"
+        return value
 
     def _build_subfolder_name(self, shard_config: Dict[str, Any]) -> str:
         combined = hashlib.sha1(
