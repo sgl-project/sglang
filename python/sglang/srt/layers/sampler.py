@@ -118,7 +118,7 @@ def _select_sampling_mask_rows(
 
 
 def _all_reduce_sync(tensor: torch.Tensor, op: dist.ReduceOp, group) -> None:
-    pynccl_comm = pynccl_comm_for_device_group(group)
+    pynccl_comm = pynccl_comm_for_device_group(group, tensor)
     if pynccl_comm is not None:
         pynccl_comm.all_reduce(tensor, op=op)
     else:

@@ -6193,6 +6193,7 @@ class Scheduler(
 
         self.invariant_checker.run(CheckPhase.IDLE)
         self.gc_freezer.on_idle(self.forward_ct)
+        warn_on_device_group_nccl_comms("while serving", step=self.forward_ct)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()

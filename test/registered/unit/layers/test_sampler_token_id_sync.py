@@ -95,7 +95,7 @@ class TestSamplerTokenIdSync(CustomTestCase):
             mock.patch.object(
                 sampler_module,
                 "pynccl_comm_for_device_group",
-                side_effect=lambda g: pynccl_comm if g is group else None,
+                side_effect=lambda g, t: pynccl_comm if g is group else None,
             ),
             mock.patch.object(dist, "get_world_size", return_value=2),
             mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
