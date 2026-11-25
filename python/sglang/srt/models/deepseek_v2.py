@@ -679,6 +679,7 @@ class DeepseekV2MoE(nn.Module):
         is_deepseek_v4: bool = False,
         vl_correction_bias: bool = False,
         reduce_results: bool = True,
+        enable_glm5_next_moe_kernels: bool = False,
     ):
         super().__init__()
         # False when a stage boundary completes this output's sum.
@@ -783,6 +784,7 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
             uses_expert_location=uses_expert_location,
+            enable_glm5_next_moe_kernels=enable_glm5_next_moe_kernels,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):

@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
 from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.device import get_device, is_hip
+from sglang.srt.utils.device import get_compiler_backend, get_device, is_cuda, is_hip
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -99,6 +99,29 @@ def _map_topk_ids_to_local_experts(
     )
 
 
+_compiled_local_expert_mapper = None
+
+
+def _map_glm5_next_cuda_expert_ids(
+    topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
+) -> torch.Tensor:
+    global _compiled_local_expert_mapper
+    if torch.compiler.is_compiling():
+        # An outer compilation can fuse the lookup itself.
+        return _map_topk_ids_to_local_experts(topk_ids, local_expert_mapping)
+    if torch.cuda.is_current_stream_capturing():
+        if _compiled_local_expert_mapper is None:
+            return _map_topk_ids_to_local_experts(topk_ids, local_expert_mapping)
+        # A warmed dynamic graph can still miss a guard (e.g. a single token).
+        with torch.compiler.set_stance("eager_on_recompile"):
+            return _compiled_local_expert_mapper(topk_ids, local_expert_mapping)
+    if _compiled_local_expert_mapper is None:
+        _compiled_local_expert_mapper = torch.compile(
+            _map_topk_ids_to_local_experts, backend=get_compiler_backend(), dynamic=True
+        )
+    return _compiled_local_expert_mapper(topk_ids, local_expert_mapping)
+
+
 def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
     return backend is not None and (
         backend.is_flashinfer_cutlass()
@@ -128,6 +151,9 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.use_aiter_moe_runner = backend is not None and backend.is_aiter()
         self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
+        self.use_fused_expert_mapping = (
+            moe_runner_config.enable_glm5_next_moe_kernels and is_cuda()
+        )
         if (
             self.moe_ep_size > 1
             and (
@@ -272,9 +298,13 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = _map_topk_ids_to_local_experts(
-                        topk_output.topk_ids, self.local_expert_mapping
+                    topk_ids = topk_output.topk_ids
+                    map_ids = (
+                        _map_glm5_next_cuda_expert_ids
+                        if self.use_fused_expert_mapping and topk_ids.is_cuda
+                        else _map_topk_ids_to_local_experts
                     )
+                    topk_ids_local = map_ids(topk_ids, self.local_expert_mapping)
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure

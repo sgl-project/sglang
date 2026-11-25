@@ -16,16 +16,21 @@ import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import standard
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopKConfig,
+)
 from sglang.srt.layers.moe.utils import (
     MoeA2ABackend,
     MoeRunnerBackend,
     RoutingMethodType,
 )
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
+register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 NUM_EXPERTS = 8
 NUM_LOCAL_EXPERTS = 4
@@ -100,6 +105,94 @@ def test_triton_runner_gets_local_ids_under_cutlass_pin(cutlass_pin):
     # Rank 0 holds global experts 0-3; experts on the other rank become the
     # -1 drop sentinel instead of indexing past the local weights.
     assert local_ids.tolist() == [[0, -1], [3, -1]]
+
+
+@pytest.mark.parametrize(
+    "opt_in, ep_size, backend, device, native_cuda",
+    [
+        (False, 2, MoeRunnerBackend.TRITON, "cuda", True),
+        (True, 1, MoeRunnerBackend.TRITON, "cuda", True),
+        (True, 2, MoeRunnerBackend.FLASHINFER_CUTLASS, "cuda", True),
+        (True, 2, MoeRunnerBackend.TRITON, "cpu", True),
+        (True, 2, MoeRunnerBackend.TRITON, "cuda", False),
+    ],
+)
+def test_ineligible_layer_never_requests_cuda_mapper(
+    ep2_rank0, monkeypatch, opt_in, ep_size, backend, device, native_cuda
+):
+    if device == "cuda" and not standard.is_cuda():
+        pytest.skip("requires a CUDA tensor")
+    monkeypatch.setattr(standard, "get_device", lambda: device)
+    monkeypatch.setattr(standard, "is_cuda", lambda: native_cuda)
+    config = _config(backend)
+    if opt_in:
+        config.enable_glm5_next_moe_kernels = True
+    if ep_size == 1:
+        config.num_local_experts = config.num_experts
+    with (
+        get_parallel().override(moe_ep_size=ep_size, moe_tp_size=2 // ep_size),
+        patch.object(standard, "_map_glm5_next_cuda_expert_ids") as cuda_mapper,
+    ):
+        dispatcher = standard.StandardDispatcher(config)
+        ids = torch.tensor([[-1, 3], [4, 0]], dtype=torch.int32, device=device)
+        result = _dispatch_ids(dispatcher, ids)
+        cuda_mapper.assert_not_called()
+    if ep_size == 1 or backend.is_flashinfer_cutlass():
+        assert result is ids
+    else:
+        assert result.tolist() == [[-1, 3], [-1, 0]]
+
+
+@pytest.mark.skipif(not standard.is_cuda(), reason="requires native CUDA")
+def test_opted_in_local_cuda_mapper_warms_once_and_replays(ep2_rank0, monkeypatch):
+    monkeypatch.setattr(standard, "get_device", lambda: "cuda")
+    monkeypatch.setattr(standard, "_compiled_local_expert_mapper", None)
+    config = _config(MoeRunnerBackend.TRITON)
+    config.enable_glm5_next_moe_kernels = True
+    dispatcher = standard.StandardDispatcher(config)
+    ids = torch.tensor([[-1, 3], [4, 0]], dtype=torch.int32, device="cuda")
+    expected = [[-1, 3], [-1, 0]]
+
+    hidden = torch.empty((2, 16), device="cuda")
+    lazy_routes = BypassedTopKOutput(
+        hidden, torch.empty((2, NUM_EXPERTS), device="cuda"), TopKConfig(top_k=2)
+    )
+    assert dispatcher.dispatch(hidden, lazy_routes).topk_output is lazy_routes
+    assert standard._compiled_local_expert_mapper is None
+
+    # A first-ever dispatch inside capture must not start the compiler.
+    cold_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cold_graph):
+        cold = _dispatch_ids(dispatcher, ids)
+    cold_graph.replay()
+    assert cold.tolist() == expected
+    assert standard._compiled_local_expert_mapper is None
+
+    assert _dispatch_ids(dispatcher, ids).tolist() == expected
+    compiled = standard._compiled_local_expert_mapper
+    assert compiled is not None
+    # A different layer and token count reuse the same wrapper.
+    other_layer = standard.StandardDispatcher(config)
+    assert _dispatch_ids(other_layer, ids.repeat(3, 1)).tolist() == expected * 3
+    assert standard._compiled_local_expert_mapper is compiled
+
+    graph = torch.cuda.CUDAGraph()
+    with patch.object(standard, "_compiled_local_expert_mapper", wraps=compiled) as run:
+        with torch.cuda.graph(graph):
+            captured = _dispatch_ids(dispatcher, ids)
+        run.assert_called_once()
+    ids.copy_(torch.tensor([[2, 7], [-1, 1]], device="cuda", dtype=ids.dtype))
+    graph.replay()
+    assert captured.tolist() == [[2, -1], [-1, 1]]
+
+    # Dynamo specializes singletons even with dynamic=True. Capture a row count
+    # that neither layer warmed, then change its IDs to exercise actual replay.
+    single_graph = torch.cuda.CUDAGraph()
+    with torch.compiler.set_stance("fail_on_recompile"), torch.cuda.graph(single_graph):
+        single = _dispatch_ids(dispatcher, ids[:1])
+    ids[0].copy_(torch.tensor([7, 1], device="cuda", dtype=ids.dtype))
+    single_graph.replay()
+    assert single.tolist() == [[-1, 1]]
 
 
 def test_runner_that_keeps_global_ids_changes_nothing(cutlass_pin):

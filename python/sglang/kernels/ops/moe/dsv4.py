@@ -63,6 +63,7 @@ def _jit_silu_mul_quant_varlen_module(
     scale_ue8m0: bool,
     swizzle: bool,
     apply_swiglu_limit: bool,
+    transposed_fp32: bool = False,
 ):
     args = make_cpp_args(
         quant_group_size,
@@ -71,6 +72,9 @@ def _jit_silu_mul_quant_varlen_module(
         is_arch_support_pdl(),
         apply_swiglu_limit,
     )
+    # Keep the existing JIT key and CUDA variants for normal and packed scales.
+    if transposed_fp32:
+        args.extend(make_cpp_args(True))
     return load_jit(
         make_name("silu_mul_quant_varlen"),
         *args,
@@ -180,7 +184,11 @@ def silu_and_mul_masked_post_quant(
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
     module = _jit_silu_mul_quant_varlen_module(
-        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        apply_swiglu_limit,
+        transposed_fp32=transposed and not scale_ue8m0,
     )
     module.run(
         input,

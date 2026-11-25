@@ -113,7 +113,6 @@ silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
   static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
-  static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto work_id = threadIdx.x / kWorkThreads;
 
@@ -123,13 +122,15 @@ silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t
   [[maybe_unused]]
   const auto output_scale = [&] {
     const auto num_groups = params.hidden_dim / kGroupSize;
-    if constexpr (kTransposed) {
+    if constexpr (kTransposed && kScaleUE8M0) {
       const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
       // Physical layout is [E, G//4, N] int32.  Each int32 packs 4 consecutive
       // group scales for the same token, so the byte address is:
       //   expert_offset + (group/4)*N*4 + token*4 + group%4
       return base + expert_id * num_groups * params.num_tokens + (work_id / 4u) * (params.num_tokens * 4u) +
              token_id * 4u + (work_id % 4u);
+    } else if constexpr (kTransposed) {
+      return params.output_scale + (expert_id * num_groups + work_id) * params.num_tokens + token_id;
     } else {
       return params.output_scale + offset * num_groups + work_id;
     }
@@ -185,8 +186,12 @@ silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t
   PDLTriggerSecondary<kUsePDL>();
 
   out_vec.store(output, threadIdx.x);
-  if constexpr (kTransposed) {
+  if constexpr (kTransposed && kScaleUE8M0) {
     *output_scale = ue8m0_exp;
+  } else if constexpr (kTransposed) {
+    // The reduction broadcasts its FP32 maximum to every lane of this
+    // group. Give the scale one writer; all lanes still store their FP8s.
+    if (threadIdx.x % kWorkThreads == 0) *output_scale = scale;
   } else {
     *output_scale = scale;
   }
@@ -266,13 +271,24 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    int64_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kEnableTransposedFP32 = false>
 struct SiluAndMulMaskedPostQuantKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 128);
+#if defined(SGL_CUDA_ARCH) && SGL_CUDA_ARCH == 900
+  static constexpr bool kSupportsTransposedFP32 = kEnableTransposedFP32;
+#else
+  static constexpr bool kSupportsTransposedFP32 = false;
+#endif
   static constexpr auto kernel_normal =
       silu_mul_quant_varlen_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
-  static constexpr auto kernel_transposed =
-      silu_mul_quant_varlen_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+  static constexpr auto kernel_transposed = silu_mul_quant_varlen_kernel < kGroupSize,
+                        kScaleUE8M0 || !kSupportsTransposedFP32, true, kSwizzle, kUsePDL, kApplySwigluLimit > ;
 
   static void
   run(const tvm::ffi::TensorView input,
@@ -305,14 +321,16 @@ struct SiluAndMulMaskedPostQuantKernel {
           .with_dtype<fp32_t>()
           .with_device(device)
           .verify(output_scale);
-    } else {
-      RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
+    } else if constexpr (kScaleUE8M0) {
       auto G_ = SymbolicSize{"G // 4"};
       TensorMatcher({E, G_, T})  //
           .with_dtype<int32_t>()
           .with_device(device)
           .verify(output_scale);
       G.set_value(G_.unwrap() * 4);
+    } else {
+      RuntimeCheck(kSupportsTransposedFP32, "transposed FP32 masked scales require SM90");
+      TensorMatcher({E, G, T}).with_dtype<fp32_t>().with_device(device).verify(output_scale);
     }
     TensorMatcher({E})  //
         .with_dtype<int32_t>()
