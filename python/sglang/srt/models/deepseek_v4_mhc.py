@@ -22,7 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -656,6 +656,11 @@ def _combine(
 # ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=1)
+def _is_910b():
+    return torch.npu.get_device_name().replace(" ", "").startswith("Ascend910B")
+
+
 def post(
     cfg: HcConfig,
     x: torch.Tensor,
@@ -669,6 +674,10 @@ def post(
 
     if _is_npu:
         if cfg.pre_from_prev:
+            if _is_910b():
+                from sglang.srt.hardware_backend.npu.dsv4.mhc_post import post_910b
+
+                return post_910b(x, residual, post_mix, comb)
             # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
             # the base stream, comb its res-mixing matrix, x the sublayer
             # output and post its post-mix.
