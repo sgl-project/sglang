@@ -1099,7 +1099,7 @@ pub mod finish_reason {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParams {
     /// JSON: absent = 128, explicit null = no limit (Python `Optional\[int\] =  128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
-    /// gRPC entry); no limit needs an explicit large value.
+    /// gRPC entry), and no limit is `use_remaining_context`.
     #[prost(int64, optional, tag = "1")]
     pub max_new_tokens: ::core::option::Option<i64>,
     #[prost(message, optional, tag = "2")]
@@ -1163,6 +1163,10 @@ pub struct SamplingParams {
     /// grammar compilation, matching the legacy native gRPC contract.
     #[prost(string, repeated, tag = "28")]
     pub choice: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Protobuf's `"max_new_tokens": null`: with max_new_tokens unset, no default
+    /// fills it and generation runs to a stop condition or the context limit.
+    #[prost(bool, optional, tag = "29")]
+    pub use_remaining_context: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatermarkRequestConfig {

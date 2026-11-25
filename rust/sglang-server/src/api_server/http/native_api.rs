@@ -785,10 +785,11 @@ pub(super) fn generate_requests(
     let sampling_logprobs_mode = body.get("sampling_logprobs_mode").cloned();
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
-    let body: api::GenerateRequest = match serde_json::from_value(body) {
+    let mut body: api::GenerateRequest = match serde_json::from_value(body) {
         Ok(body) => body,
         Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string(), false)),
     };
+    client_max_new_tokens.clear_remaining_context(body.sampling_params.as_mut());
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
@@ -1952,6 +1953,32 @@ mod tests {
                 submitted_max_new_tokens(server_args, body.clone(), expected.len()).await;
             assert_eq!(submitted, expected, "{body}");
         }
+    }
+
+    /// `use_remaining_context` without a `max_new_tokens` reads as an explicit
+    /// null, past the preferred value; a named limit still wins, object by object.
+    #[tokio::test]
+    async fn use_remaining_context_reads_as_an_explicit_null() {
+        use crate::message::config::{PreferredSamplingParams, ServerArgs};
+        let server_args = ServerArgs {
+            preferred_sampling_params: Some(PreferredSamplingParams(
+                serde_json::json!({"max_new_tokens": 4096}),
+            )),
+            ..Default::default()
+        };
+        let body = serde_json::json!({
+            "input_ids": [[1], [2], [3]],
+            "sampling_params": [
+                {"use_remaining_context": true},
+                {"use_remaining_context": true, "max_new_tokens": 8},
+                {"use_remaining_context": false},
+            ],
+        });
+        let submitted = submitted_max_new_tokens(server_args, body, 3).await;
+        assert_eq!(
+            submitted,
+            vec![(None, false), (Some(8), false), (Some(4096), true)]
+        );
     }
 
     /// An omitted `max_new_tokens` takes the launch default, beneath the

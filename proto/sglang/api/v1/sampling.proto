@@ -22,7 +22,7 @@ message SamplingParams {
 
   // JSON: absent = 128, explicit null = no limit (Python `Optional[int] =
   // 128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
-  // gRPC entry); no limit needs an explicit large value.
+  // gRPC entry), and no limit is `use_remaining_context`.
   optional int64 max_new_tokens = 1 [
     (sglang.json.v1.field_json).null_policy = NULL_POLICY_IS_NONE,
     (sglang.json.v1.field_json).default_i64 = 128
@@ -101,6 +101,9 @@ message SamplingParams {
   // Literal alternatives. The server lowers these to an escaped regex before
   // grammar compilation, matching the legacy native gRPC contract.
   repeated string choice = 28;
+  // Protobuf's `"max_new_tokens": null`: with max_new_tokens unset, no default
+  // fills it and generation runs to a stop condition or the context limit.
+  optional bool use_remaining_context = 29;
 }
 
 message WatermarkRequestConfig {

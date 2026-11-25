@@ -299,36 +299,93 @@ pub fn fill_preferred_sampling(
     serde_json::from_value(body["sampling_params"].take()).map_err(|e| e.to_string())
 }
 
-/// Which requests of a `/generate` body sent their own `max_new_tokens`, read
+/// Where one request's `max_new_tokens` comes from, read before any
+/// launch-time fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxNewTokensSource {
+    /// The client sent a value, an explicit JSON null included.
+    Client,
+    /// The client sent none: the preferred, launch, or schema default fills it.
+    Default,
+    /// The client sent none but set `use_remaining_context`: no limit, as an
+    /// explicit JSON null.
+    RemainingContext,
+}
+
+impl MaxNewTokensSource {
+    fn of(sent: bool, use_remaining_context: Option<bool>) -> Self {
+        if sent {
+            Self::Client
+        } else if use_remaining_context == Some(true) {
+            Self::RemainingContext
+        } else {
+            Self::Default
+        }
+    }
+}
+
+/// Where each request of a `/generate` body gets its `max_new_tokens`, read
 /// before any launch-time fill: a single (or absent) `sampling_params` object
 /// answers for every item, a list answers per object. Only a value the client
 /// sent is checked against the context window; see
 /// [`GenerateRequest::max_new_tokens_defaulted`].
 #[derive(Debug)]
 pub enum ClientMaxNewTokens {
-    One(bool),
-    Many(Vec<bool>),
+    One(MaxNewTokensSource),
+    Many(Vec<MaxNewTokensSource>),
 }
 
 impl ClientMaxNewTokens {
     /// From a JSON body: a present key counts, even an explicit null.
     pub fn of_json(body: &serde_json::Value) -> Self {
-        let sent = |params: &serde_json::Value| params.get("max_new_tokens").is_some();
+        let source = |params: &serde_json::Value| {
+            MaxNewTokensSource::of(
+                params.get("max_new_tokens").is_some(),
+                params
+                    .get("use_remaining_context")
+                    .and_then(serde_json::Value::as_bool),
+            )
+        };
         match body.get("sampling_params") {
-            Some(serde_json::Value::Array(items)) => Self::Many(items.iter().map(sent).collect()),
-            Some(params) => Self::One(sent(params)),
-            None => Self::One(false),
+            Some(serde_json::Value::Array(items)) => Self::Many(items.iter().map(source).collect()),
+            Some(params) => Self::One(source(params)),
+            None => Self::One(MaxNewTokensSource::Default),
         }
     }
 
     /// From a protobuf request, which has no null: a set field counts.
     pub fn of_proto(params: Option<&api::SamplingParamsOrList>) -> Self {
         use api::sampling_params_or_list::Value;
-        let sent = |params: &api::SamplingParams| params.max_new_tokens.is_some();
+        let source = |params: &api::SamplingParams| {
+            MaxNewTokensSource::of(
+                params.max_new_tokens.is_some(),
+                params.use_remaining_context,
+            )
+        };
         match params.and_then(|params| params.value.as_ref()) {
-            Some(Value::Many(list)) => Self::Many(list.items.iter().map(sent).collect()),
-            Some(Value::One(params)) => Self::One(sent(params)),
-            None => Self::One(false),
+            Some(Value::Many(list)) => Self::Many(list.items.iter().map(source).collect()),
+            Some(Value::One(params)) => Self::One(source(params)),
+            None => Self::One(MaxNewTokensSource::Default),
+        }
+    }
+
+    /// Clear the limit the fills gave a `RemainingContext` request. Runs before
+    /// `into_requests`, whose verification checks `min_new_tokens` against it.
+    pub fn clear_remaining_context(&self, params: Option<&mut api::SamplingParamsOrList>) {
+        use api::sampling_params_or_list::Value;
+        let clear = |params: &mut api::SamplingParams, source: MaxNewTokensSource| {
+            if source == MaxNewTokensSource::RemainingContext {
+                params.max_new_tokens = None;
+            }
+        };
+        match (self, params.and_then(|params| params.value.as_mut())) {
+            (Self::One(source), Some(Value::One(params))) => clear(params, *source),
+            (Self::Many(sources), Some(Value::Many(list))) => {
+                for (params, source) in list.items.iter_mut().zip(sources) {
+                    clear(params, *source);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -336,14 +393,14 @@ impl ClientMaxNewTokens {
     /// matched a list's length to the batch.
     pub fn mark(&self, requests: &mut [GenerateRequest]) {
         match self {
-            Self::One(sent) => {
+            Self::One(source) => {
                 for request in requests {
-                    request.max_new_tokens_defaulted = !sent;
+                    request.max_new_tokens_defaulted = *source == MaxNewTokensSource::Default;
                 }
             }
-            Self::Many(sent) => {
-                for (request, sent) in requests.iter_mut().zip(sent) {
-                    request.max_new_tokens_defaulted = !sent;
+            Self::Many(sources) => {
+                for (request, source) in requests.iter_mut().zip(sources) {
+                    request.max_new_tokens_defaulted = *source == MaxNewTokensSource::Default;
                 }
             }
         }
