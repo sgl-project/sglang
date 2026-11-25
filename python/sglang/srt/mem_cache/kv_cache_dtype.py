@@ -40,20 +40,17 @@ def is_fp8_family_kv_cache_dtype(kv_cache_dtype: Optional[str]) -> bool:
     return kv_cache_dtype in ("fp8_e4m3", "nvfp4_ds_mla")
 
 
-def uses_nvfp4_ds_mla_kv(*, hf_config, kv_cache_dtype: Optional[str] = None) -> bool:
-    """Whether this model's DSA MLA pool stores nvfp4_ds_mla records.
+def uses_nvfp4_ds_mla_kv(*, hf_config, kv_cache_dtype: Optional[str]) -> bool:
+    """Whether a runner's DSA MLA pool stores nvfp4_ds_mla records.
 
-    The one source of truth for the pool row width, the pool writer and the DSA
-    backend's Prims-TS cache format; startup validation guarantees prims_ts on
-    every local DSA phase when it holds. ``kv_cache_dtype`` is the runner's KV
-    label (a KV pool configurator passes its own); None reads --kv-cache-dtype.
+    ``kv_cache_dtype`` is that runner's KV label (``configure_kv_cache_dtype``),
+    so the pool row width, the pool writer and the DSA backend's Prims-TS cache
+    format all follow the same runner, including a draft whose label differs from
+    the target's. Startup validation guarantees prims_ts on every local DSA phase
+    when it holds.
     """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
-    if kv_cache_dtype is None:
-        from sglang.srt.runtime_context import get_model
-
-        kv_cache_dtype = get_model().kv_cache_dtype
     return kv_cache_dtype == "nvfp4_ds_mla" and is_deepseek_dsa(hf_config)
 
 
@@ -109,6 +106,13 @@ def configure_kv_cache_dtype(
     elif server_args_kv_cache_dtype == "nvfp4_ds_mla":
         if _is_hip or current_platform.is_cpu():
             raise ValueError("--kv-cache-dtype nvfp4_ds_mla requires CUDA.")
+        if not is_draft_worker and not _is_dsa_config(hf_config):
+            # Only a DSA MLA pool stores the records; any other target would get
+            # a plain FP8 cache under an nvfp4_ds_mla label.
+            raise ValueError(
+                "--kv-cache-dtype nvfp4_ds_mla stores DSA MLA records and requires "
+                "a DSA model."
+            )
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "fp8_e4m3":
         if _is_hip:  # Using natively supported format

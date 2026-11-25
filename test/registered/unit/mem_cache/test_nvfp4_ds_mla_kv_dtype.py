@@ -47,7 +47,10 @@ def _resolve(**kwargs):
 
 class TestNvfp4DsMlaDtype(CustomTestCase):
     def test_target_resolves_to_e4m3_not_the_fp4_recipe(self):
-        self.assertEqual(_resolve(), ("nvfp4_ds_mla", torch.float8_e4m3fn))
+        self.assertEqual(
+            _resolve(hf_config=SimpleNamespace(dsa=True)),
+            ("nvfp4_ds_mla", torch.float8_e4m3fn),
+        )
         # The FP4 pool branches key off this registry; nvfp4_ds_mla must miss it.
         self.assertIsNone(resolve_kv_cache_quant("nvfp4_ds_mla"))
         self.assertTrue(kv_cache_dtype.is_fp8_family_kv_cache_dtype("nvfp4_ds_mla"))
@@ -69,9 +72,18 @@ class TestNvfp4DsMlaDtype(CustomTestCase):
                     (expected, torch.float8_e4m3fn),
                 )
 
+    def test_non_dsa_target_rejected(self):
+        """Only a DSA MLA pool stores the records; a non-DSA target must fail at
+        startup rather than run a plain FP8 cache under the nvfp4_ds_mla label."""
+        for hf_config in (SimpleNamespace(dsa=False), None):
+            with self.subTest(hf_config=hf_config):
+                with self.assertRaisesRegex(ValueError, "requires a DSA model"):
+                    _resolve(hf_config=hf_config)
+
 
 class TestNvfp4DsMlaRowWidth(CustomTestCase):
-    """calculate_mla_kv_cache_dim sizes the pool from the local role only."""
+    """calculate_mla_kv_cache_dim sizes the pool from the local role and the
+    runner's own KV label."""
 
     @staticmethod
     def _dim(*, kv_dtype, mode, prefill, decode):
@@ -86,10 +98,6 @@ class TestNvfp4DsMlaRowWidth(CustomTestCase):
         with (
             patch.object(kv_cache_configurator, "is_deepseek_dsa", return_value=True),
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch(
-                "sglang.srt.runtime_context.get_model",
-                return_value=SimpleNamespace(kv_cache_dtype=kv_dtype),
-            ),
             patch.object(kv_cache_configurator, "get_exec", return_value=exec_),
             patch.object(
                 kv_cache_configurator,
@@ -98,7 +106,9 @@ class TestNvfp4DsMlaRowWidth(CustomTestCase):
             ),
         ):
             return kv_cache_configurator.calculate_mla_kv_cache_dim(
-                model_config=model_config, kv_cache_dtype=torch.float8_e4m3fn
+                model_config=model_config,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                kv_cache_dtype_str=kv_dtype,
             )
 
     def test_local_role_layout(self):
@@ -108,6 +118,14 @@ class TestNvfp4DsMlaRowWidth(CustomTestCase):
             ),
             352,
         )
+        self.assertEqual(
+            self._dim(
+                kv_dtype="fp8_e4m3", mode="null", prefill="prims_ts", decode="prims_ts"
+            ),
+            576,
+        )
+        # A DSA draft whose own label is fp8_e4m3 (--speculative-draft-kv-cache-dtype)
+        # gets raw FP8 rows even when the target runs nvfp4_ds_mla.
         self.assertEqual(
             self._dim(
                 kv_dtype="fp8_e4m3", mode="null", prefill="prims_ts", decode="prims_ts"

@@ -487,6 +487,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
+                    kv_cache_dtype_str=kvc.kv_cache_dtype_str,
                 )
                 * kv_size
             )
@@ -838,6 +839,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
+                    kv_cache_dtype_str=kvc.kv_cache_dtype_str,
                 )
                 * kv_size
             )

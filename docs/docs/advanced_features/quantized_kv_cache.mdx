@@ -157,7 +157,7 @@ Rows are quantized as they are written, and only the `prims_ts` DSA backend read
 Requirements:
 - `--dsa-prefill-backend prims_ts` and `--dsa-decode-backend prims_ts`. An unset phase defaults to `prims_ts` with this dtype; any other DSA backend is rejected at startup.
 - An SM100 or SM103 GPU.
-- `--dcp-size` > 1 is supported.
+- `--dcp-size` > 1 is supported only for Kimi-K3.1 (sharded index-K), as for `prims_ts` with `fp8_e4m3`.
 - With PD disaggregation, launch the prefill and decode servers with the same `--kv-cache-dtype`.
 - The records carry their own block scales, so a per-tensor KV scale loaded from the checkpoint is rejected.
 - A speculative draft model that is not a DSA model keeps an FP8 E4M3 KV cache.

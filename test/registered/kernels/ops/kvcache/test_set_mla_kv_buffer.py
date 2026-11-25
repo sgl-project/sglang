@@ -6,7 +6,6 @@ import torch
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.kvcache.mla_buffer import (
     dequantize_nvfp4_ds_mla,
-    quantize_nvfp4_ds_mla_reference,
     set_mla_kv_buffer_naive,
     set_mla_kv_buffer_nvfp4_ds_mla_triton,
     set_mla_kv_buffer_triton,
@@ -18,6 +17,7 @@ from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
     set_mla_kv_buffer,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.nvfp4_ds_mla_reference import quantize_nvfp4_ds_mla_reference
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=15, stage="base-a-jit-kernel-unit", runner_config="amd")

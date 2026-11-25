@@ -191,7 +191,9 @@ def page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
             )
 
             kv_dim = calculate_mla_kv_cache_dim(
-                model_config=model_config, kv_cache_dtype=kvc.kv_cache_dtype
+                model_config=model_config,
+                kv_cache_dtype=kvc.kv_cache_dtype,
+                kv_cache_dtype_str=kvc.kv_cache_dtype_str,
             )
             index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
             # FP8 index K plus one FP32 scale per 128 elements. The scratch

@@ -1070,7 +1070,9 @@ class KVCacheConfigurator:
                 "--enable-unified-memory."
             )
         row_bytes = calculate_mla_kv_cache_dim(
-            model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+            model_config=self.model_config,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype_str=self.kv_cache_dtype_str,
         )
         if (
             self.kv_cache_dtype != torch.float8_e4m3fn
@@ -2110,7 +2112,9 @@ class KVCacheConfigurator:
                 or get_dsa_index_kpool_compress(self.model_config.hf_config)
                 or index_head_dim != target_pool.index_head_dim
                 or calculate_mla_kv_cache_dim(
-                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype_str=self.kv_cache_dtype_str,
                 )
                 != target_pool.kv_cache_dim
             ):
@@ -2460,7 +2464,9 @@ class KVCacheConfigurator:
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
-                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype_str=self.kv_cache_dtype_str,
                 )
                 if use_dsa_fp8_kv_cache_storage
                 else None
@@ -2574,6 +2580,7 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype_str=self.kv_cache_dtype_str,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -2624,6 +2631,7 @@ class KVCacheConfigurator:
                 kv_cache_dim=calculate_mla_kv_cache_dim(
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    kv_cache_dtype_str=self.kv_cache_dtype_str,
                 ),
                 use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             )
@@ -2865,6 +2873,7 @@ class KVCacheConfigurator:
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
                         kv_cache_dtype=self.kv_cache_dtype,
+                        kv_cache_dtype_str=self.kv_cache_dtype_str,
                     ),
                     index_kpool=dsa_index_kpool,
                     index_kpool_compress=get_dsa_index_kpool_compress(
@@ -3914,7 +3923,10 @@ class KVCacheConfigurator:
 
 
 def calculate_mla_kv_cache_dim(
-    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
+    *,
+    model_config: ModelConfig,
+    kv_cache_dtype: torch.dtype,
+    kv_cache_dtype_str: Optional[str],
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_cache_dtype = kv_cache_dtype
@@ -3943,7 +3955,9 @@ def calculate_mla_kv_cache_dim(
         )
     uses_raw_fp8_kv_layout = any(uses_raw_fp8_dsa_kv_layout(b) for b in local_backends)
 
-    if uses_nvfp4_ds_mla_kv(hf_config=model_config.hf_config):
+    if uses_nvfp4_ds_mla_kv(
+        hf_config=model_config.hf_config, kv_cache_dtype=kv_cache_dtype_str
+    ):
         from sglang.kernels.ops.kvcache.mla_buffer import NVFP4_DS_MLA_ROW_BYTES
 
         # Startup validation already enforces this; a pool sized for 352 B rows

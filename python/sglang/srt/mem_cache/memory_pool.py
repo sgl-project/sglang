@@ -4442,10 +4442,6 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "use_fp4_indexer", False)
 
     @property
-    def dsa_kv_nvfp4(self) -> bool:
-        return getattr(self.full_kv_pool, "dsa_kv_nvfp4", False)
-
-    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 

@@ -824,7 +824,9 @@ class DeepseekSparseAttnBackend(
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         # --kv-cache-dtype nvfp4_ds_mla: the same resolved flag sized the pool
         # rows (calculate_mla_kv_cache_dim) and selects the pool writer.
-        self.dsa_kv_nvfp4 = uses_nvfp4_ds_mla_kv(hf_config=hf_config)
+        self.dsa_kv_nvfp4 = uses_nvfp4_ds_mla_kv(
+            hf_config=hf_config, kv_cache_dtype=model_runner.kv_cache_dtype_str
+        )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         kimi_k31 = is_kimi_k31(hf_config)
         self.plans_padded_extend_rows = kimi_k31

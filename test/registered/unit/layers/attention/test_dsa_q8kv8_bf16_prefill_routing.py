@@ -213,7 +213,9 @@ def test_q8_raw_fp8_pool_allocation_matches_layout_guard(rank, rope, expected_di
     ):
         assert (
             configurator.calculate_mla_kv_cache_dim(
-                model_config=model, kv_cache_dtype=torch.float8_e4m3fn
+                model_config=model,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                kv_cache_dtype_str="fp8_e4m3",
             )
             == expected_dim
         )
