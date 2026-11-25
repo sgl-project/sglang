@@ -821,9 +821,10 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_activates_cuda_fallback(
-        self, mock_envs, mock_is_cuda_available, mock_load
+        self, mock_envs, _mock_is_cpu, mock_is_cuda_available, mock_load
     ):
         """When CUDA is available and no plugin activates, return CUDA defaults."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -835,9 +836,15 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms._is_mps_available", return_value=False)
     @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_no_cuda_activates_base_fallback(
-        self, mock_envs, mock_is_cuda_available, _mock_is_mps_available, mock_load
+        self,
+        mock_envs,
+        _mock_is_cpu,
+        mock_is_cuda_available,
+        _mock_is_mps_available,
+        mock_load,
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -870,9 +877,10 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.torch")
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_rocm_does_not_activate_cuda_fallback(
-        self, mock_envs, mock_torch, mock_load
+        self, mock_envs, _mock_is_cpu, mock_torch, mock_load
     ):
         """ROCm exposes torch.cuda but must not use the CUDA fallback platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -884,6 +892,28 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.distribution", return_value=object())
+    @patch("sglang.srt.platforms.load_plugins_by_group", return_value={})
+    @patch("sglang.srt.platforms.os")
+    @patch("sglang.srt.platforms.envs")
+    def test_cpu_install_enables_platform_and_kernels_without_env(
+        self, mock_envs, mock_os, _mock_load, _mock_distribution
+    ):
+        """A CPU install must select CPU paths before server args are parsed."""
+        from sglang.srt.utils.device import is_cpu
+
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_os.getenv.return_value = "0"
+        platform = _resolve_platform()
+        self.assertIsInstance(platform, CpuSRTPlatform)
+        is_cpu.cache_clear()
+        self.addCleanup(is_cpu.cache_clear)
+        with patch("sglang.srt.utils.device.current_platform", platform):
+            self.assertTrue(is_cpu())
+        is_cpu.cache_clear()
+        with patch("sglang.srt.utils.device.current_platform", CudaSRTPlatform()):
+            self.assertFalse(is_cpu())
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms._is_cuda_available")
