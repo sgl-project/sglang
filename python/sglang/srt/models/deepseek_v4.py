@@ -175,6 +175,9 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
+from sglang.srt.models.deepseek_common.amd import (
+    deepseek_v4_token_parallel as token_parallel,
+)
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
 )
@@ -2288,6 +2291,11 @@ class MQALayer(MqaAttentionBase):
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        tp_state = token_parallel.token_parallel_state(forward_batch)
+        if tp_state is not None:
+            return token_parallel.forward_prepare(
+                self, x, positions, forward_batch, attn_backend, q_out, tp_state
+            )
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -2702,6 +2710,15 @@ class MQALayer(MqaAttentionBase):
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
+
+        tp_state = token_parallel.token_parallel_state(forward_batch)
+        if tp_state is not None:
+            # x holds this rank's rows; from here on x is a [T, hidden] stand-in and
+            # the projections of the real rows come from tp_state.
+            x = token_parallel.attention_inputs(
+                self, x, x_quant, positions, forward_batch, tp_state
+            )
+            x_quant = None
 
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
@@ -3202,6 +3219,9 @@ class MQALayer(MqaAttentionBase):
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 
+        tp_state = token_parallel.active_state()
+        if tp_state is not None:
+            return token_parallel.project_wo_b(self, o, tp_state)
         defer_all_reduce = defer_all_reduce and (
             self.attn_tp_size > 1
             and (
@@ -4239,6 +4259,19 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
+        tp_state = token_parallel.enter_token_parallel(
+            self,
+            forward_batch,
+            hidden_states,
+            input_ids,
+            tail=tail,
+            tail_in_graph=tail_in_graph,
+            use_tail_graph=use_tail_graph,
+            capture_dspark=capture_dspark,
+        )
+        if tp_state is not None:
+            # Layers [start_layer, late_layer_start) keep this rank's rows only.
+            hidden_states = tp_state.scatter(hidden_states)
         state = mhc.HcState(hidden_states)
         fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
@@ -4268,7 +4301,13 @@ class DeepseekV4Model(nn.Module):
                         hidden_states, forward_batch, next=next_boundary
                     )
             if tail is not None and i == self.late_layer_start:
-                if self.tail_writes_source_kv:
+                if tp_state is not None:
+                    # Writes the source layer's compressed KV for every row and returns
+                    # the tail rows of the state: what take_rows(tail.rows) gives below.
+                    state = token_parallel.write_source_kv_and_gather_tail(
+                        self, tp_state, state, tail, positions, forward_batch
+                    )
+                elif self.tail_writes_source_kv:
                     source = self.layers[i]
                     if fused_step and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
@@ -4321,7 +4360,9 @@ class DeepseekV4Model(nn.Module):
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                state = state.take_rows(tail.rows)
+                if tp_state is None:
+                    state = state.take_rows(tail.rows)
+                tp_state = None
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
@@ -4371,7 +4412,18 @@ class DeepseekV4Model(nn.Module):
                         else None
                     )
             engram = self.layers[i].engram
-            if engram is not None:
+            if engram is not None and tp_state is not None:
+                state = state.with_residual(
+                    token_parallel.run_engram(
+                        engram,
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        input_ids,
+                        tp_state,
+                    )
+                )
+            elif engram is not None:
                 # No local name holds the pre-Engram residual: it would stay alive
                 # until the next Engram layer.
                 hidden_states = engram(
@@ -4384,7 +4436,15 @@ class DeepseekV4Model(nn.Module):
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
-            if capture_dspark and i in self.dspark_layers_to_capture:
+            if (
+                tp_state is not None
+                and capture_dspark
+                and i in self.dspark_layers_to_capture
+            ):
+                token_parallel.capture_dspark_aux(
+                    tp_state, state, tail, forward_batch, dspark_aux_hidden_states
+                )
+            elif capture_dspark and i in self.dspark_layers_to_capture:
                 from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
 
                 # The draft head reads the attention input of its target layers.
@@ -4399,6 +4459,17 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
+                if tp_state is not None:
+                    state = token_parallel.forward_layer(
+                        self.layers[i],
+                        positions=positions,
+                        state=state,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                        tp_state=tp_state,
+                    )
+                    continue
                 if _is_cuda:
                     hidden_states = self.layers[i](
                         positions=positions,
@@ -4427,6 +4498,11 @@ class DeepseekV4Model(nn.Module):
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
                     )
+        if tp_state is not None:
+            token_parallel.exit_token_parallel(forward_batch)
+            raise RuntimeError(
+                "token-parallel prefill left the layer loop without its exit"
+            )
         if _is_cuda:
             state = residual_batch.read_output(
                 hidden_states, forward_batch, hc_boundary.FinalRead(), None
@@ -4786,6 +4862,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
+        if token_parallel.G3_DUMP_DIR:
+            token_parallel.g3_dump(hidden_states, tail, forward_batch)
 
         # DSpark's model-boundary hook gathers compact tail rows. Other CP
         # outputs are gathered with this rank's full shard layout.
