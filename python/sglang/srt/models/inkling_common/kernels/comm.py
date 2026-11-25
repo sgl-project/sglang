@@ -422,9 +422,7 @@ def symm_mem_all_reduce(
     input: torch.Tensor,
     group: GroupCoordinator,
     *,
-    output: torch.Tensor | None = None,
     input_is_ar_buffer: bool = False,
-    num_sms: int = 32,
     shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """All-reduce ``input`` across ``group`` in the communicator's symm buffer.
@@ -442,19 +440,14 @@ def symm_mem_all_reduce(
     fallback PRE-ADDS during its stage-in copy, so passing ``shared`` is
     always numerics-identical to {torch.add -> all_reduce}.
     """
-    _ = num_sms
     if group.world_size == 1:
         if shared is not None:
             input = input + shared
-        if output is None:
-            return input
-        output.copy_(input)
-        return output
+        return input
 
     comm = group.torch_symm_mem_comm
     if (
-        output is None
-        and comm is not None
+        comm is not None
         and not comm.disabled
         and group.world_size in _INKLING_AR_WORLD_SIZES
         and comm.should_torch_symm_mem_allreduce(input)
@@ -591,11 +584,7 @@ def symm_mem_all_reduce(
 
     if shared is not None:
         input = input + shared
-    result = group.all_reduce(input)
-    if output is None:
-        return result
-    output.copy_(result)
-    return output
+    return group.all_reduce(input)
 
 
 # --- scattered sconv (--enable-scattered-sconv) comm helpers -----------------
@@ -800,9 +789,7 @@ def ar_scattered_sconv_fused(
     # optimal (n/P in + n/P out per rank, no window staging) and each rank
     # convs only its own channels. The price, accepted by design: decode pays
     # a second cross-rank sync round (consumers need full rows, so the
-    # post-conv shard exchange must publish). The one-shot decode and
-    # banded-scattered variants (window-shard push) remain available in the
-    # JIT module / bench harness as alternatives.
+    # post-conv shard exchange must publish).
 
     buf = comm.buffer[:n].view(t, h)
     if input.data_ptr() != buf.data_ptr():

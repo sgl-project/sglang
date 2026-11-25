@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from functools import partial
 from typing import Any
@@ -136,36 +136,58 @@ class DevicePoolEntry:
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
         return self._rows(indices)
 
-    def get_prepared_layer_range_meta(
-        self, locations: list[int] | np.ndarray, layer: int
-    ):
-        """Range metadata for one layer, one nested list per object.
+    def get_prepared_layer_range_meta(self, locations: Sequence[int], layer: int):
+        return self.get_prepared_layers_range_meta(locations, (layer,))
 
-        Every row emits the same (size, offset) items, so all rows share one
-        read-only list each; the pointers are affine in the row.
+    def get_prepared_layers_range_meta(
+        self, locations: Sequence[int], layers: Iterable[int]
+    ) -> tuple[list, list, list] | None:
+        """Ranges that read every mapped layer of ``layers`` for each location.
+
+        Packed entries return one range list per location (layer-major); other
+        entries return one per location and component item, holding that item's
+        slice of every layer. None when no layer is mapped.
         """
-        mapped = self.layer_mapping.get(layer)
-        if mapped is None:
+        per_layer = []
+        for layer in layers:
+            mapped = self.layer_mapping.get(layer)
+            if mapped is None:
+                continue
+            buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+            per_layer.append(
+                [
+                    (*component[index], offsets[index])
+                    for component, offsets in zip(
+                        self.buffer_meta, self._component_offsets
+                    )
+                    for index in buffer_indices
+                ]
+            )
+        if not per_layer:
             return None
-        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
-        items = [
-            (*component[buffer_index], offsets[buffer_index])
-            for component, offsets in zip(self.buffer_meta, self._component_offsets)
-            for buffer_index in buffer_indices
-        ]
-        base = np.array([item[0] for item in items], dtype=np.int64)
-        stride = np.array([item[1] for item in items], dtype=np.int64)
+        # Per-row Python loops dominated large loads; build the grid in numpy.
         rows = np.asarray(locations, dtype=np.int64)
-        ptrs = rows[:, None] * stride + base
-        row_sizes = [item[2] for item in items]
-        row_offsets = [item[3] for item in items]
         if self.packed:
-            return ptrs.tolist(), [row_sizes] * len(rows), [row_offsets] * len(rows)
+            items = np.array(
+                [item for items in per_layer for item in items], dtype=np.int64
+            )
+            ptrs = rows[:, None] * items[:, 1] + items[:, 0]
+            # Every row shares one read-only size and offset list.
+            sizes, offsets = items[:, 2].tolist(), items[:, 3].tolist()
+            return ptrs.tolist(), [sizes] * len(rows), [offsets] * len(rows)
+
+        if len({len(items) for items in per_layer}) != 1:
+            raise ValueError(
+                f"Pool {self.name} maps a different number of buffers per layer."
+            )
+        # (item, layer, field): one range list per item gathers all layers.
+        items = np.array(per_layer, dtype=np.int64).transpose(1, 0, 2)
+        ptrs = rows[:, None, None] * items[None, :, :, 1] + items[None, :, :, 0]
         return (
-            ptrs.reshape(-1, 1).tolist(),
-            [[value] for value in row_sizes] * len(rows),
-            [[value] for value in row_offsets] * len(rows),
+            ptrs.reshape(-1, items.shape[1]).tolist(),
+            items[:, :, 2].tolist() * len(rows),
+            items[:, :, 3].tolist() * len(rows),
         )
 
 
@@ -757,21 +779,23 @@ def _build_mamba_device_pool_group(
                     index_mapper=dcp_mapper,
                 )
             )
+    num_layers = 1 + max(layer for entry in entries for layer in entry.layer_mapping)
+    num_layers = max(
+        [num_layers, *(pool.layer_num for pool in params.sidecar_draft_device_pools)]
+    )
     entries.extend(
         _sidecar_draft_entries(
-            params, page_size, dcp_size=dcp_size, dcp_mapper=dcp_mapper
+            params, page_size, num_layers, dcp_size=dcp_size, dcp_mapper=dcp_mapper
         )
     )
-    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(
-        entries, num_layers + 1, page_size, restores_sidecar_drafts=True
-    )
+    return DevicePoolGroup(entries, num_layers, page_size, restores_sidecar_drafts=True)
 
 
 def _sidecar_draft_entries(
     params: Any,
     page_size: int,
+    num_layers: int,
     *,
     dcp_size: int = 1,
     dcp_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
@@ -784,9 +808,11 @@ def _sidecar_draft_entries(
         draft_page_size = page_size // dcp_size if draft_dcp_sharded else page_size
         if draft_pool.page_size != draft_page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
-        # Draft layer i rides transfer layer i; the draft reads it only after
-        # the batch's loads finish.
-        layer_mapping = {layer: layer for layer in range(draft_pool.layer_num)}
+        if draft_pool.layer_num > num_layers:
+            raise ValueError("Draft KV has more layers than the target transfers.")
+        # Draft depth i waits on the tail transfer layer carrying its KV.
+        offset = num_layers - draft_pool.layer_num
+        layer_mapping = {offset + layer: layer for layer in range(draft_pool.layer_num)}
         if type(draft_pool) is MLATokenToKVPool:
             entry = DevicePoolEntry(
                 name=PoolName.DRAFT,
@@ -861,7 +887,7 @@ def _build_minimax_m3_nvfp4_device_pool_group(
             page_size=page_size,
             rows_are_pages=True,
         ),
-        *_sidecar_draft_entries(params, page_size),
+        *_sidecar_draft_entries(params, page_size, main_pool.layer_num),
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
     return DevicePoolGroup(
