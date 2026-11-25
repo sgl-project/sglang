@@ -53,9 +53,12 @@ def _pack_placement(
     if static_dispatch is not None:
         if static_dispatch.shape != (count, num_logical, num_ranks):
             raise ValueError("EPLB placement changed the static routing geometry")
-        static_rows_by_rank = list(
-            static_dispatch.permute(2, 0, 1).long().contiguous().unbind()
+        rank_major = static_dispatch.permute(2, 0, 1).to(
+            dtype=torch.int64, memory_format=torch.contiguous_format
         )
+        # A dtype-changing copy already uses the final layout. The int64 case
+        # can still be a view and needs contiguous rows for Gloo scatter.
+        static_rows_by_rank = list(rank_major.contiguous().unbind())
     return payload, width, static_rows_by_rank
 
 
