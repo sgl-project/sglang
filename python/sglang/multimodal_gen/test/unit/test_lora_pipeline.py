@@ -104,6 +104,102 @@ def test_worker_metrics_count_individual_adapters_in_multi_lora():
     ]
 
 
+@pytest.fixture
+def file_lora_pipeline():
+    pipeline = _make_pipeline(_make_layer())
+    pipeline._temporarily_disable_offload = lambda **kwargs: nullcontext()
+    pipeline.device = "cpu"
+    pipeline.server_args.lora_path = None
+    pipeline.modules["transformer"].param_names_mapping = {}
+    pipeline.modules["transformer"].lora_param_names_mapping = {}
+    pipeline.server_args.pipeline_config = SimpleNamespace(
+        dit_config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                param_names_mapping={}, lora_param_names_mapping={}
+            )
+        )
+    )
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["unknown_layout", "wrong_target", "missing_B", "offset_only", "missing_target"],
+)
+def test_invalid_lora_switch_keeps_active_weights_and_cache(
+    file_lora_pipeline, tmp_path, invalid
+):
+    pipeline = file_lora_pipeline
+    layer = pipeline.lora_layers["linear"]
+    pipeline.lora_layers_transformer_2 = {"other": _make_layer()}
+    previous = pipeline.lora_adapters["adapter"]
+    # Exercise rollback both when the replacement itself is invalid and when a later adapter is invalid.
+    replacement = str(tmp_path / "new.safetensors")
+    prefix = "unmapped" if invalid == "unknown_layout" else "linear"
+    save_file(
+        {k.replace("linear", prefix) + ".weight": v * 2 for k, v in previous.items()},
+        replacement,
+    )
+    invalid_weights = {
+        "unknown_layout": previous,
+        "wrong_target": {k.replace("linear", "other"): v for k, v in previous.items()},
+        "missing_B": {"linear.lora_A": previous["linear.lora_A"]},
+        "offset_only": {"linear.lora_output_offset": torch.ones(2)},
+        "missing_target": previous,
+    }
+    pipeline.lora_adapters["second"] = invalid_weights[invalid]
+    pipeline.loaded_adapter_paths["second"] = "/second"
+    x = torch.ones(1, 2)
+    with patch(_RANK_PATCH, return_value=0), torch.no_grad():
+        base = layer(x)
+        pipeline.set_lora("adapter", target="transformer", merge_mode="merge")
+        original = layer(x)
+        assert not torch.equal(original, base)
+        with pytest.raises(
+            ValueError, match="no matching A/B pair|critic .*does not exist"
+        ):
+            pipeline.set_lora(
+                ["adapter", "second"],
+                [replacement, None],
+                target=[
+                    "transformer",
+                    "critic" if invalid == "missing_target" else "transformer",
+                ],
+                merge_mode="merge",
+            )
+        assert pipeline.lora_adapters["adapter"] is previous
+        assert pipeline.loaded_adapter_paths["adapter"] == "/adapter"
+        assert "adapter" not in pipeline.loaded_adapter_files
+        assert pipeline.get_lora_status()["active"]["transformer"][0]["nicknames"] == [
+            "adapter"
+        ]
+        torch.testing.assert_close(layer(x), original, rtol=0, atol=0)
+
+
+def test_set_lora_requires_one_applicable_layer_across_selected_components(
+    file_lora_pipeline, tmp_path
+):
+    pipeline = file_lora_pipeline
+    layer = pipeline.lora_layers["linear"]
+    pipeline.lora_layers = {}
+    with patch(_RANK_PATCH, return_value=0):
+        with pytest.raises(ValueError, match="no matching A/B pair on target 'all'"):
+            pipeline.set_lora("adapter")
+        pipeline.lora_layers_transformer_2 = {"linear": layer}
+        pipeline.modules["transformer_2"] = torch.nn.Module()
+        path = str(tmp_path / "partial.safetensors")
+        weights = pipeline.lora_adapters["adapter"] | {
+            "excluded.lora_A": torch.ones(1, 2)
+        }
+        save_file({k + ".weight": v for k, v in weights.items()}, path)
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.logger.info"
+        ) as info:
+            pipeline.set_lora("adapter", path, target="all", merge_mode="merge")
+        assert any(call.args[-1] == "excluded" for call in info.call_args_list)
+        assert layer.merged
+
+
 @pytest.mark.parametrize("operation", ["set", "merge", "unmerge", "deactivate"])
 @torch.no_grad()
 def test_lora_mutations_preserve_independent_conditioning(operation):

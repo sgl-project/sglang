@@ -20,6 +20,7 @@ from sglang.srt.multimodal.media_io import (
     load_audio,
     load_image,
     load_video,
+    local_media_decoder_source,
     media_url_timeout,
 )
 from sglang.srt.multimodal.modality import Modality
@@ -199,6 +200,14 @@ class TestLocalMediaFiles(_PolicyTestCase):
                     self.assertRaisesRegex(ValueError, "not allowed"),
                 ):
                     fn(value)
+
+    def test_decoder_uses_authorized_file_contents(self):
+        self.assertEqual(local_media_decoder_source(self.path), self.path)
+        configure_media_url_security([], allowed_local_media_paths=[self.dir])
+        source = local_media_decoder_source(self.path)
+        with open(self.path, "wb") as f:
+            f.write(b"replacement fixture")
+        self.assertEqual(source, _image_bytes("PNG"))
 
     def test_processor_initialization_preserves_local_path_allowlist(self):
         blocked_path = os.path.join(self.dir, "blocked.png")

@@ -36,7 +36,7 @@ import torch
 from PIL import Image, ImageOps, UnidentifiedImageError
 from typing_extensions import Literal
 
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_npu
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -158,9 +158,11 @@ def media_url_security_config() -> tuple:
         _media_url_max_file_size_bytes // (1024 * 1024),
         _media_url_timeout,
         _allow_local_media_files,
-        None
-        if _allowed_local_media_paths is None
-        else sorted(_allowed_local_media_paths),
+        (
+            None
+            if _allowed_local_media_paths is None
+            else sorted(_allowed_local_media_paths)
+        ),
     )
 
 
@@ -304,6 +306,24 @@ def shorten_media_source(value: str) -> str:
     return value if len(value) <= 100 else value[:100] + "..."
 
 
+def _open_allowlisted_path(path: str, flags: int) -> int:
+    # Walk the already-authorized canonical path relative to open directories.
+    # A replaced component must never redirect the read to a different tree.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = path.split(os.sep)[1:]
+    parent = os.open(os.sep, directory_flags)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        return os.open(
+            parts[-1] or ".", flags | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent
+        )
+    finally:
+        os.close(parent)
+
+
 def _open_local_media_file(path: str) -> BinaryIO:
     if not _allow_local_media_files:
         raise ValueError("Local media files are not allowed")
@@ -321,7 +341,12 @@ def _open_local_media_file(path: str) -> BinaryIO:
         )
     try:
         # A FIFO opens at once instead of waiting for a writer; fstat rejects it.
-        f = open(path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK))
+        if _allowed_local_media_paths is not None:
+            f = open(path, "rb", opener=_open_allowlisted_path)
+        else:
+            f = open(
+                path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK)
+            )
     except OSError as e:
         if e.errno not in _CLIENT_PATH_ERRNOS:
             raise
@@ -344,8 +369,10 @@ def _open_local_media_file(path: str) -> BinaryIO:
     return f
 
 
-def check_local_media_file(path: str) -> str:
-    """Raise ValueError unless ``path`` is an allowed, in-cap regular file."""
+def local_media_decoder_source(path: str) -> Union[str, bytes]:
+    """Give codecs a snapshot of an allowlisted file, or a vetted ordinary path."""
+    if _allowed_local_media_paths is not None:
+        return read_local_media_file(path)
     _open_local_media_file(path).close()
     return path
 
@@ -402,9 +429,9 @@ def load_audio(
         timeout = media_url_timeout(5)
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
-        source = check_local_media_file(unquote(urlparse(audio_file).path))
+        source = local_media_decoder_source(unquote(urlparse(audio_file).path))
     elif isinstance(audio_file, str):
-        source = check_local_media_file(audio_file)
+        source = local_media_decoder_source(audio_file)
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
@@ -591,7 +618,7 @@ def _load_image(
     gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
-    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    Try device JPEG decoding and return a torch device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
@@ -618,6 +645,15 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
+    elif is_npu() and gpu_image_decode is True:
+        # DVPP supports ordinary decoding; models requesting "nvjpeg_fancy" use PIL.
+        from sglang.srt.hardware_backend.npu.jpeg import (
+            decode_jpeg as decode_jpeg_with_dvpp,
+        )
+
+        image_tensor = decode_jpeg_with_dvpp(image_bytes)
+        if image_tensor is not None:
+            return image_tensor
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:
@@ -716,9 +752,9 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return check_local_media_file(unquote(urlparse(video_file).path))
+            return local_media_decoder_source(unquote(urlparse(video_file).path))
         elif is_local_media_path(video_file):
-            return check_local_media_file(video_file)
+            return local_media_decoder_source(video_file)
         else:
             return _decode_bare_base64(video_file)
     else:
