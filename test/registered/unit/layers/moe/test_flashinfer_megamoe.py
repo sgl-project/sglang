@@ -609,7 +609,7 @@ def _fake_megamoe_run(monkeypatch):
     class Mega:
         supports_output_view = False
 
-        def forward(self, tensors):
+        def forward(self, tensors, workspace=None):
             seen.append(int(owned.item()))
             return tensors.hidden_states
 
