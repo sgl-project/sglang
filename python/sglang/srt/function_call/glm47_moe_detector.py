@@ -350,6 +350,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._defer_quoted_value = False
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
         self._buffer_arguments = None
@@ -422,6 +423,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         """Format a value that completed in one chunk; number/integer/auto never
         reach here (they are parsed at value close instead)."""
         if value_type == "string":
+            if value.lstrip().startswith(('"', "'")):
+                parsed, _ = parse_arguments(value, "string")
+                if isinstance(parsed, str):
+                    return json.dumps(parsed)
             return json.dumps(value, ensure_ascii=False)
         # object/array/boolean values arrive as JSON already
         return value
@@ -471,6 +476,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._xml_tag_buffer = ""
                     self._value_started = False
+                    self._defer_quoted_value = False
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
@@ -485,7 +491,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         parsed = self._parse_argument_pairs(
                             [(self._current_key, self._current_value)], func_name, tools
                         )[self._current_key]
-                        json_output += json.dumps(parsed, ensure_ascii=False)
+                        json_output += json.dumps(parsed)
                     elif self._value_started:
                         if final_value:
                             if value_type == "string":
@@ -507,37 +513,63 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None
+                    self._defer_quoted_value = False
                 else:
                     closing_tag = "</arg_value>"
-                    is_potential_closing = len(self._xml_tag_buffer) <= len(
-                        closing_tag
-                    ) and closing_tag.startswith(self._xml_tag_buffer)
+                    suffix_length = next(
+                        (
+                            size
+                            for size in range(
+                                min(len(self._xml_tag_buffer), len(closing_tag) - 1),
+                                0,
+                                -1,
+                            )
+                            if closing_tag.startswith(self._xml_tag_buffer[-size:])
+                        ),
+                        0,
+                    )
+                    content_end = len(self._xml_tag_buffer) - suffix_length
+                    content = self._xml_tag_buffer[:content_end]
+                    if not content:
+                        continue
+                    value_type = self._cached_value_type or "string"
 
-                    if not is_potential_closing:
-                        content = self._xml_tag_buffer
-                        value_type = self._cached_value_type or "string"
-
-                        if value_type in ("auto", "number", "integer"):
-                            self._current_value += content
-                            self._xml_tag_buffer = ""
-                        elif value_type == "string":
-                            if not self._value_started:
-                                json_output += '"'
-                                self._value_started = True
-                            if content:
-                                json_output += json.dumps(content, ensure_ascii=False)[
-                                    1:-1
+                    if value_type in ("auto", "number", "integer"):
+                        self._current_value += content
+                        self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
+                    elif value_type == "string":
+                        # Quoted strings need the same whole-value parsing as the
+                        # non-streaming path; plain strings still stream as bytes.
+                        if not self._value_started and not self._defer_quoted_value:
+                            if content.lstrip().startswith(('"', "'")):
+                                self._defer_quoted_value = True
+                            elif not content.strip():
+                                self._current_value += content
+                                self._xml_tag_buffer = self._xml_tag_buffer[
+                                    content_end:
                                 ]
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        else:
-                            # object/array/boolean values stream through verbatim
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
+                                continue
+                        if self._defer_quoted_value:
+                            self._current_value += content
+                            self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
+                            continue
+                        if not self._value_started:
+                            json_output += '"'
+                            self._value_started = True
+                            if self._current_value:
+                                json_output += json.dumps(
+                                    self._current_value, ensure_ascii=False
+                                )[1:-1]
+                        json_output += json.dumps(content, ensure_ascii=False)[1:-1]
+                        self._current_value += content
+                        self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
+                    else:
+                        # object/array/boolean values stream through verbatim
+                        if not self._value_started:
+                            self._value_started = True
+                        json_output += content
+                        self._current_value += content
+                        self._xml_tag_buffer = self._xml_tag_buffer[content_end:]
 
         return json_output
 
@@ -697,7 +729,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             arguments = self._parse_argument_pairs(
                 self.func_arg_regex.findall(func_args_raw), func_name, tools
             )
-            serialized = json.dumps(arguments, ensure_ascii=False)
+            serialized = json.dumps(arguments)
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id, name=None, parameters=serialized

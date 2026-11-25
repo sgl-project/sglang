@@ -108,6 +108,28 @@ class TestGlm47SchemaTypes(CustomTestCase):
             {"value": '"null"'},
         )
 
+    def test_streaming_angle_bracket_at_value_end(self):
+        for field in ({"type": "string"}, {"type": ["string", "null"]}):
+            for value in ("<", "nul<"):
+                self.check_arguments(
+                    {"type": "object", "properties": {"value": field}},
+                    {"value": value},
+                )
+
+    def test_streaming_json_quoted_strings_match_non_streaming(self):
+        for raw, expected in (
+            ('"null"', "null"),
+            ('"hello"', "hello"),
+            ('"123"', "123"),
+            (' "null" ', "null"),
+            (" 'hello' ", " 'hello' "),
+        ):
+            self.check_arguments(
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+                {"value": expected},
+                {"value": raw},
+            )
+
     def test_local_references_and_cycles(self):
         for value, field in [
             (7, {"type": "integer"}),
