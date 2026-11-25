@@ -36,7 +36,7 @@ class _RecordingAudioTower(nn.Module):
     def dtype(self):
         return self.anchor.dtype
 
-    def forward(self, input_features, feature_lens):
+    def forward(self, input_features, feature_lens, feature_lens_cpu=None):
         self.calls.append((input_features.clone(), feature_lens.clone()))
         return SimpleNamespace(last_hidden_state=input_features.transpose(0, 1))
 
@@ -65,7 +65,7 @@ def test_pack_audio_features_with_heterogeneous_request_lengths():
         _audio_item(features_700, torch.ones(1, 700, dtype=torch.long)),
     ]
 
-    packed, feature_lens = _pack_audio_features(
+    packed, feature_lens, _ = _pack_audio_features(
         items, device=torch.device("cpu"), dtype=torch.float32
     )
 
@@ -87,6 +87,8 @@ def test_cross_request_mm_batch_encodes_heterogeneous_audio_once():
     item_700 = _audio_item(features_700, torch.ones(1, 700, dtype=torch.long))
     item_900.hash = 900
     item_700.hash = 700
+    item_900.offsets = [(0, 899)]
+    item_700.offsets = [(0, 699)]
 
     requests = [
         mm_schedule.PerImageRequestInfo(
@@ -121,8 +123,12 @@ def test_cross_request_mm_batch_encodes_heterogeneous_audio_once():
         packed,
         torch.cat([features_900[0], features_700[0]], dim=1),
     )
-    torch.testing.assert_close(embeddings[900], features_900[0].transpose(0, 1))
-    torch.testing.assert_close(embeddings[700], features_700[0].transpose(0, 1))
+    torch.testing.assert_close(
+        embeddings[(item_900.cache_key, 900)], features_900[0].transpose(0, 1)
+    )
+    torch.testing.assert_close(
+        embeddings[(item_700.cache_key, 700)], features_700[0].transpose(0, 1)
+    )
 
 
 def test_qwen3_asr_packs_multi_sample_and_heterogeneous_items_once():
@@ -134,6 +140,8 @@ def test_qwen3_asr_packs_multi_sample_and_heterogeneous_items_once():
     item_700 = _audio_item(features_700, torch.ones(1, 700, dtype=torch.long))
     item_900.hash = 1_800
     item_700.hash = 700
+    item_900.offsets = [(0, 1799)]
+    item_700.offsets = [(0, 699)]
 
     requests = [
         mm_schedule.PerImageRequestInfo(
@@ -169,8 +177,12 @@ def test_qwen3_asr_packs_multi_sample_and_heterogeneous_items_once():
         packed,
         torch.cat([expected_900, features_700[0]], dim=1),
     )
-    torch.testing.assert_close(embeddings[1_800], expected_900.transpose(0, 1))
-    torch.testing.assert_close(embeddings[700], features_700[0].transpose(0, 1))
+    torch.testing.assert_close(
+        embeddings[(item_900.cache_key, 1_800)], expected_900.transpose(0, 1)
+    )
+    torch.testing.assert_close(
+        embeddings[(item_700.cache_key, 700)], features_700[0].transpose(0, 1)
+    )
 
 
 def test_pack_audio_features_preserves_equal_length_behavior():
@@ -184,7 +196,7 @@ def test_pack_audio_features_preserves_equal_length_behavior():
     ]
     items = [_audio_item(feature, mask) for feature, mask in zip(features, masks)]
 
-    packed, feature_lens = _pack_audio_features(
+    packed, feature_lens, _ = _pack_audio_features(
         items, device=torch.device("cpu"), dtype=torch.float32
     )
 

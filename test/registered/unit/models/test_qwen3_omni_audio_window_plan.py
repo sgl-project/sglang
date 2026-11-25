@@ -8,15 +8,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.models.qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoder,
+    _pack_audio_features,
+)
+from sglang.srt.multimodal.mrope_rope_index import _get_feat_extract_output_lengths
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
-from sglang.srt.models.qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoder,
-    pack_audio_features,
-)
-from sglang.srt.multimodal.mrope_rope_index import _get_feat_extract_output_lengths
 
 
 def _reference_plan(feature_lens, n_window, n_window_infer):
@@ -82,8 +81,10 @@ def test_pack_audio_features_matches_boolean_mask():
     mask = torch.zeros(len(lengths), 3000, dtype=torch.long)
     for i, n in enumerate(lengths):
         mask[i, :n] = 1
-    packed, lens, lens_cpu = pack_audio_features(
-        features, mask, torch.device("cpu"), torch.bfloat16
+    packed, lens, lens_cpu = _pack_audio_features(
+        [SimpleNamespace(feature=features, feature_attention_mask=mask)],
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
     )
     expected, expected_lens = _reference_pack(features.to(torch.bfloat16), mask)
     assert torch.equal(packed, expected)
@@ -96,8 +97,10 @@ def test_pack_audio_features_left_padded_mask_falls_back():
     features = torch.randn(2, 8, 10)
     mask = torch.ones(2, 10, dtype=torch.long)
     mask[0, :3] = 0
-    packed, _, lens_cpu = pack_audio_features(
-        features, mask, torch.device("cpu"), torch.float32
+    packed, _, lens_cpu = _pack_audio_features(
+        [SimpleNamespace(feature=features, feature_attention_mask=mask)],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
     )
     expected, _ = _reference_pack(features, mask)
     assert torch.equal(packed, expected)
