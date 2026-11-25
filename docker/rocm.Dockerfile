@@ -188,6 +188,13 @@ ARG ROCM1000_TORCH_VERSION="2.11.0"
 ARG ROCM1000_TORCHVISION_VERSION="0.26.0"
 ARG ROCM1000_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM1000_TRITON_VERSION="3.8.0+git4cff872c"
+# torch 2.11.0+rocm10.0.0 pins triton==3.8.0+git4cff872c, which lacks
+# triton-lang/triton#11256 (ROCm/triton#963): a masked async buffer load to
+# LDS never writes its `other` value, so masked lanes read stale LDS. On gfx950
+# this turns AITER's Triton gemm_afp4wfp4 output into NaNs (ROCm/aiter#7595).
+# Replace it with AMD's 3.8.0 build for the same SDK that contains the fix, and
+# point torch's pin at it. Leave empty to keep the SDK's Triton.
+ARG ROCM1000_TRITON_OVERRIDE_VERSION="3.8.0+git669b31ac"
 
 ARG ROCM1010_SDK_VERSION="10.1.0"
 ARG ROCM1010_TORCH_VERSION="2.12.0"
@@ -234,11 +241,12 @@ RUN set -eux; \
       rocm1000) \
         sdk="${ROCM1000_SDK_VERSION}"; torch="${ROCM1000_TORCH_VERSION}"; \
         vision="${ROCM1000_TORCHVISION_VERSION}"; audio="${ROCM1000_TORCHAUDIO_VERSION}"; \
-        triton="${ROCM1000_TRITON_VERSION}" ;; \
+        triton="${ROCM1000_TRITON_VERSION}"; \
+        triton_override="${ROCM1000_TRITON_OVERRIDE_VERSION}" ;; \
       rocm1010) \
         sdk="${ROCM1010_SDK_VERSION}"; torch="${ROCM1010_TORCH_VERSION}"; \
         vision="${ROCM1010_TORCHVISION_VERSION}"; audio="${ROCM1010_TORCHAUDIO_VERSION}"; \
-        triton="${ROCM1010_TRITON_VERSION}" ;; \
+        triton="${ROCM1010_TRITON_VERSION}"; triton_override="" ;; \
       *) echo "No pinned ROCm stack for GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
     esac; \
     python3 -m pip install --no-cache-dir \
@@ -273,7 +281,12 @@ RUN set -eux; \
           exit 1; \
         fi; \
       done; \
-    done
+    done; \
+    if [ -n "${triton_override}" ]; then \
+      python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+          --index-url ${ROCM_INDEX_URL} "triton==${triton_override}.rocm${sdk}"; \
+      python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); assert v=='${triton_override}.rocm${sdk}', v; t,n=re.subn(r'^Requires-Dist: triton==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t); print('[Triton] torch now requires triton', v)"; \
+    fi
 
 RUN rocm-sdk init && rocm-sdk targets
 
@@ -332,13 +345,14 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 950 with ROCm 10.0.0 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV BUILD_VLLM="0"
-# Keeps the SDK's Triton. uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton
-# with plugin support, which the SDK's lacks, so then it is replaced by the
-# commit the SDK's wheel comes from, built from source like gfx1250's; the
-# suffix keeps the version torch pins.
+# Keeps the Triton wheel from rocm1000-base (ROCM1000_TRITON_OVERRIDE_VERSION).
+# uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton with plugin support,
+# which that wheel lacks, so then it is replaced by the commit that wheel
+# comes from, built from source like gfx1250's; the suffix keeps the version
+# torch's (patched) pin names. Must include ROCm/triton#963.
 ENV BUILD_TRITON="0"
 ENV TRITON_REPO_DEFAULT="https://github.com/ROCm/triton.git"
-ENV TRITON_COMMIT_DEFAULT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
+ENV TRITON_COMMIT_DEFAULT="669b31acc1dd1b3fd93286afd5db67f65d9f7557"
 ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
