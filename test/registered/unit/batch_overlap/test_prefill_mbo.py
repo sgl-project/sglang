@@ -23,6 +23,7 @@ def _batch(prefix, tokens, *, mode=ForwardMode.EXTEND, batch_size=1):
     return SimpleNamespace(
         forward_mode=mode,
         batch_size=batch_size,
+        mamba_track_mask=None,
         extend_seq_lens_cpu=[tokens],
         extend_prefix_lens_cpu=[prefix],
         input_ids=torch.zeros(tokens, dtype=torch.int64),
@@ -162,6 +163,8 @@ class TestSplitPoint(CustomTestCase):
         batch.mamba_track_mask = torch.ones(1, dtype=torch.bool)
         batch.mamba_prefill_track_mask_cpu = None
         batch.mamba_track_seqlens_cpu = None
+        with envs.SGLANG_PREFILL_MBO.override(True):
+            self.assertFalse(prefill_mbo.splits(_runner(True), batch))
         self.assertFalse(prefill_mbo.maybe_split(batch))
         self.assertIsNone(prefill_mbo.active_child_backends())
 

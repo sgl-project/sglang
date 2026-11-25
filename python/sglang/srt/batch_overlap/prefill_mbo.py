@@ -83,6 +83,12 @@ def _split_tokens(forward_batch: ForwardBatch) -> Optional[int]:
         torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
     ):
         return None
+    # The tracked state's owner is chosen from the CPU track metadata.
+    if forward_batch.mamba_track_mask is not None and (
+        forward_batch.mamba_prefill_track_mask_cpu is None
+        or forward_batch.mamba_track_seqlens_cpu is None
+    ):
+        return None
     num_tokens = forward_batch.extend_seq_lens_cpu[0]
     if num_tokens < envs.SGLANG_PREFILL_MBO_MIN_TOKENS.get():
         return None
@@ -115,12 +121,6 @@ def maybe_split(forward_batch: ForwardBatch) -> bool:
     _active = False
     split = _split_tokens(forward_batch)
     if split is None:
-        return False
-    # The tracked state's owner is chosen from the CPU track metadata.
-    if forward_batch.mamba_track_mask is not None and (
-        forward_batch.mamba_prefill_track_mask_cpu is None
-        or forward_batch.mamba_track_seqlens_cpu is None
-    ):
         return False
 
     from sglang.srt.batch_overlap.two_batch_overlap import (
