@@ -776,34 +776,6 @@ def update_full_checkpoint_per_rank(
         del keepalive, payloads
 
 
-def update_weights_from_disk(
-    base_url: str,
-    model_path: str,
-    *,
-    load_format: Optional[str] = None,
-    weight_version: Optional[str] = None,
-    keep_pause: bool = False,
-    flush_cache: bool = True,
-    timeout: float = 900,
-) -> Dict[str, Any]:
-    """Refit from a checkpoint on disk and return the response body."""
-    body: Dict[str, Any] = {
-        "model_path": model_path,
-        "flush_cache": flush_cache,
-        "keep_pause": keep_pause,
-    }
-    if load_format is not None:
-        body["load_format"] = load_format
-    if weight_version is not None:
-        body["weight_version"] = weight_version
-    result = post(base_url, "/update_weights_from_disk", body, timeout=timeout).json()
-    if not result.get("success"):
-        raise RuntimeError(
-            f"update_weights_from_disk({model_path}) failed: {result.get('message')}"
-        )
-    return result
-
-
 def update_weight_version(
     base_url: str,
     new_version: str,
@@ -825,30 +797,6 @@ def current_weight_version(base_url: str) -> str:
 
 def abort_all_requests(base_url: str, *, timeout: float = 120) -> None:
     post(base_url, "/abort_request", {"abort_all": True}, timeout=timeout)
-
-
-# ---------------------------------------------------------------------------
-# Polling helpers
-# ---------------------------------------------------------------------------
-
-
-def output_stays_frozen(
-    counter, *, window: float = 3.0, interval: float = 0.05
-) -> bool:
-    """Whether ``counter()`` keeps returning the same value for ``window`` seconds.
-
-    A negative assertion ("the engine produced nothing while paused") cannot be
-    polled for a positive state, so it is carried by a bounded observation
-    window instead of a blind sleep: the check still fails fast if a token
-    arrives, and it never asserts on a guessed duration.
-    """
-    baseline = counter()
-    deadline = time.time() + window
-    while time.time() < deadline:
-        time.sleep(interval)
-        if counter() != baseline:
-            return False
-    return True
 
 
 # ---------------------------------------------------------------------------
