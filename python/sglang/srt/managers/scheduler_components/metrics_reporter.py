@@ -587,6 +587,18 @@ class SchedulerMetricsReporter:
         # vs. bundled FFN labeling, see has_dedicated_ffn_layers below).
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
         _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
+        # Whether the dedicated-FFN layers (if any) are actually routed MoE,
+        # per the layer-type labels themselves -- not per hf_text_config's
+        # separate moe_intermediate_size/num_experts_per_tok fields, which a
+        # model's own HF config class may default to MoE-shaped values
+        # regardless of whether a specific checkpoint's layers_block_type
+        # ever emits "moe" (e.g. NemotronHConfig defaults num_experts_per_tok
+        # to 2 even for dense Nemotron-Nano-9B-v2-style checkpoints whose own
+        # config.json and real weights -- plain up_proj/down_proj per "mlp"
+        # layer, no expert tensors at all -- contain no MoE signal
+        # whatsoever). None means "unknown, defer to hf_text_config" (the
+        # prior behavior) for configs with no recognized layers_block_type.
+        layer_types_confirm_moe = None
         if (
             layers_block_type
             and set(layers_block_type) <= _EXCLUSIVE_HYBRID_BLOCK_TYPES
@@ -600,6 +612,8 @@ class SchedulerMetricsReporter:
                 if has_dedicated_ffn_layers
                 else num_layers
             )
+            if has_dedicated_ffn_layers:
+                layer_types_confirm_moe = "moe" in layers_block_type
         else:
             # Check model_config (sglang-computed) before hf_text_config (native field).
             full_attention_layer_ids = getattr(
@@ -748,7 +762,11 @@ class SchedulerMetricsReporter:
             )
             if total_experts:
                 moe_intermediate_size = raw_intermediate_size
-        if moe_intermediate_size and num_experts_per_tok:
+        if (
+            moe_intermediate_size
+            and num_experts_per_tok
+            and layer_types_confirm_moe is not False
+        ):
             moe_intermediate_size = float(moe_intermediate_size) / moe_tp_size
             shared_expert_count = float(
                 getattr(hf_text_config, "n_shared_experts", None)
@@ -778,6 +796,7 @@ class SchedulerMetricsReporter:
                 "ArceeForCausalLM",
                 "OPTForCausalLM",
                 "PhiForCausalLM",
+                "NemotronHForCausalLM",
             }
             model_architectures = (
                 getattr(getattr(model_config, "hf_config", None), "architectures", None)
