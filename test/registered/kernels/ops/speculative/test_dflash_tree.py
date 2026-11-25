@@ -39,8 +39,10 @@ def test_tree(K):
     pred = t.tok.scatter(1, t.parent[:, 1:].long(), t.tok[:, 1:])
     pred[torch.rand(B, N, device="cuda") < 0.3] = -1
     loc = torch.arange(B * N, device="cuda").view(B, N)
-    kv = loc.view(-1, 1).repeat(1, 2)  # K / V row i holds i
-    mv = dt.TreeKVMove(types.SimpleNamespace(k_buffer=[kv], v_buffer=[kv]), "cuda")
+    # two layers with separate K and V: row i of buffer n holds i + 1000 * n
+    kv = [loc.view(-1, 1).repeat(1, 2) + 1000 * n for n in range(4)]
+    pool = types.SimpleNamespace(k_buffer=kv[0::2], v_buffer=kv[1::2])
+    mv = dt.TreeKVMove(pool, "cuda")
     res = dt.accept_tree(tree=t, target_predict=pred, verify_cache_loc=loc, kv_move=mv)
     for b in range(B):
         tok, par, p = (x[b].tolist() for x in (t.tok, t.parent, pred))
@@ -51,7 +53,9 @@ def test_tree(K):
         out = [tok[j] for j in w[1 : a + 1]] + [p[w[a]]] + [0] * (N - 1 - a)
         assert [x[b].tolist() for x in res] == [out, a + 1, out[a]]
         assert t.perm[b].tolist() == [b * N + j for j in w]
-        assert kv[b * N : b * N + a + 1, 0].tolist() == t.perm[b, : a + 1].tolist()
+        for n, buf in enumerate(kv):  # each K and V row of the path moved to its slot
+            moved = buf[b * N : b * N + a + 1, 0] - 1000 * n
+            assert moved.tolist() == t.perm[b, : a + 1].tolist()
 
 
 if __name__ == "__main__":
