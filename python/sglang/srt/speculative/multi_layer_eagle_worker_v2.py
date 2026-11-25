@@ -98,7 +98,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import fast_topk
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -127,7 +127,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.draft_extend_attn_backend_list = []
         self.model_config = target_worker.model_config
@@ -899,7 +898,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if can_run_decode_cuda_graph:
             # Graph replay bypasses ModelRunner.forward, which emits the
             # step[...] trace span for every other phase; emit it here.
-            with profile_range(build_step_span_name(forward_batch)):
+            with forward_nvtx_range(build_step_span_name(forward_batch)):
                 cgr = self.cuda_graph_runner_for_draft_extend
                 # Populate the single shared buffer set once; each step replays
                 # against it and the chain is advanced in place between steps.
@@ -1103,12 +1102,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         self.draft_parallel_layout = self._draft_worker.parallel_layout
 
-        # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     def init_attention_backends(self):
@@ -1237,7 +1230,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             topk=self.topk,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
-            metadata_ready_pre_pad=False,
             finalize_tree_path=False,
             grammar_barrier=grammar_barrier,
         )

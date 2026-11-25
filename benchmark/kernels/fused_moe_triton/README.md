@@ -145,6 +145,21 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --tune
 ```
 
+#### Intel XPU
+
+Ray only registers Intel GPUs as `GPU` resources when `dpctl` is installed
+(`pip install dpctl`, also part of the `ray` extra in `pyproject_xpu.toml`).
+Select the cards to tune on with `ZE_AFFINITY_MASK`; each Ray worker then sees
+its card as device 0:
+
+```bash
+ZE_AFFINITY_MASK=2 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --model Qwen/Qwen3-30B-A3B \
+    --tp-size 4 \
+    --batch-sizes 1 2 4 8 16 32 \
+    --tune
+```
+
 ### Configuration Files
 
 After tuning, configuration files will be generated:
@@ -182,23 +197,26 @@ Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/trito
 
 - `benchmark_vllm_vs_sglang_fused_moe_triton.py`: A tool for comparing the performance of fused MoE kernels between vllm and sglang implementations. Supports various model architectures and data types.
 
+Run this comparison tool as a module from the repository root so its relative
+imports resolve correctly.
+
 Example usage:
 ```bash
 # Compare with default settings (Mixtral model)
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py
+python -m benchmark.kernels.fused_moe_triton.benchmark_vllm_vs_sglang_fused_moe_triton
 
 # Compare with FP8 mode for Qwen2-57B
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+python -m benchmark.kernels.fused_moe_triton.benchmark_vllm_vs_sglang_fused_moe_triton \
     --model Qwen/Qwen2-57B-A14B-Instruct \
     --use-fp8-w8a8
 
 # Compare with custom TP size
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+python -m benchmark.kernels.fused_moe_triton.benchmark_vllm_vs_sglang_fused_moe_triton \
     --model deepseek-ai/DeepSeek-V3-0324 \
     --tp-size 8
 
 # Compare with custom TP size
-python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+python -m benchmark.kernels.fused_moe_triton.benchmark_vllm_vs_sglang_fused_moe_triton \
     --model deepseek-ai/DeepSeek-V3-0324 \
     --tp-size 8
 ```
