@@ -20,10 +20,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointWrapper,
-)
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
 from transformers import PretrainedConfig
 
 from sglang.srt.models.phi4mm_utils import (
@@ -36,7 +32,6 @@ from sglang.srt.models.phi4mm_utils import (
     NemoConvSubsampling,
     T5RelativeAttentionLogitBias,
     adaptive_enc_mask,
-    get_offset,
     unfold_tensor,
 )
 
@@ -484,20 +479,7 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
 
         return chunk_size_train_eff, left_chunk_train_eff
 
-    def _get_embed_class(self, embed):
-        # pylint: disable=protected-access
-        is_embed_using_act_chkpt = isinstance(embed, CheckpointWrapper)
-        is_embed_fsdp_wrapped = isinstance(embed, FullyShardedDataParallel)
-        embed_class = embed
-        if is_embed_using_act_chkpt:
-            embed_class = embed._checkpoint_wrapped_module
-        if is_embed_fsdp_wrapped:
-            embed_class = embed.module
-        return embed_class
-
     def _forward_embeddings_core(self, input_tensor, masks):
-        embed_class = self._get_embed_class(self.embed)
-        assert isinstance(embed_class, NemoConvSubsampling)
         input_tensor, masks = self.embed(input_tensor, masks)
         return input_tensor, masks
 
@@ -588,15 +570,6 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         if chunk_size_nc is None:
             return input_tensor, pos_k, pos_v, hs_mask, masks
         return input_tensor, pos_k, pos_v, hs_mask, masks, hs_mask_nc
-
-    def get_offset(self):
-        """Returns offset used when retaining inputs for decoding.
-
-        This is essentially, how many additional frames have to be added to
-        the front-end CNN input to ensure it can produce a single output.
-        So if the "padding" parameter is 0, typically offset will be > 0.
-        """
-        return get_offset(self.input_layer, self.time_reduction)
 
 
 class ConformerEncoder(TransformerEncoderBase):
@@ -1170,14 +1143,6 @@ class AudioEmbedding(nn.Module):
 
         # TODO: audio sequence compression - Qformer
         self.vocab_size = config.vocab_size
-        self.input_embeds = None
-        self.audio_embed_sizes = None
-
-    def set_audio_embeds(self, input_embeds: torch.FloatTensor) -> None:
-        self.input_embeds = input_embeds
-
-    def set_audio_embed_sizes(self, audio_embed_sizes: torch.LongTensor) -> None:
-        self.audio_embed_sizes = audio_embed_sizes
 
     def get_audio_features(
         self,
