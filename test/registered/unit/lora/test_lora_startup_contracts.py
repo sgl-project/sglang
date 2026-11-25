@@ -14,12 +14,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.beam import BeamConfig
+from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.utils import get_hidden_dim
 from sglang.srt.models.beam import BeamModel
+from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.laguna import LagunaModel
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -131,6 +134,41 @@ class TestLagunaPerLayerAttentionDims(CustomTestCase):
                 self.assertEqual(
                     model.get_hidden_dim("o_proj", layer_idx),
                     (head_dim * heads, hidden),
+                )
+
+
+class TestGlm5NextPerLayerAttentionDims(CustomTestCase):
+    def test_lora_projection_widths_with_explicit_kda_config(self):
+        """An explicit KDA config can omit layer_types. KDA LoRA buffers must
+        still use the linear attention widths, even with global head_dim=0.
+        """
+        config = Glm5NextTextConfig(
+            hidden_size=4096,
+            num_hidden_layers=2,
+            num_attention_heads=64,
+            num_key_value_heads=64,
+            head_dim=0,
+            v_head_dim=256,
+            linear_attn_config={
+                "kda_layers": [0],
+                "full_attn_layers": [1],
+                "num_heads": 64,
+                "head_dim": 128,
+            },
+        )
+        model = Glm5NextForConditionalGeneration.__new__(
+            Glm5NextForConditionalGeneration
+        )
+        model.config = config
+
+        for layer_idx, name, expected in (
+            (0, "o_proj", (8192, 4096)),
+            (0, "qkv_proj", (4096, 24576)),
+            (1, "o_proj", (16384, 4096)),
+        ):
+            with self.subTest(layer=layer_idx, projection=name):
+                self.assertEqual(
+                    get_hidden_dim(name, config, model, layer_idx), expected
                 )
 
 

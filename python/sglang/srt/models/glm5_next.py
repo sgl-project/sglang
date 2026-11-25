@@ -1416,7 +1416,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
     fall_back_to_pt_during_load = False
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
-        if self.config.layer_types[layer_idx] == "linear_attention":
+        if self.config.is_kda_layer(layer_idx):
             linear = self.config.linear_attn_config
             width = linear["num_heads"] * linear["head_dim"]
             if module_name == "qkv_proj":
