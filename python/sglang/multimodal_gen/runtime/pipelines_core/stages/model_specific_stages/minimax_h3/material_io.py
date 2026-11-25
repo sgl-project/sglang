@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
+from sglang.srt.multimodal.media_budget import charge_media_bytes
 from sglang.srt.multimodal.media_io import media_url_timeout, open_remote_media
 
 MINIMAX_H3_MATERIAL_CACHE_EXTRA_KEY = "minimax_h3_material_localization"
@@ -594,6 +595,9 @@ def _material_workdir(batch: Any) -> str:
 
 def _decode_base64_chunk(encoded: bytes | bytearray) -> bytes:
     try:
+        charge_media_bytes(
+            (len(encoded) // 4) * 3 - (len(encoded) - len(encoded.rstrip(b"=")))
+        )
         return base64.b64decode(encoded, altchars=b"-_", validate=True)
     except Exception as exc:
         raise ValueError("material URI has an invalid base64 payload") from exc
@@ -726,6 +730,7 @@ def _stream_tar_member_material(
         condition_index=condition_index,
         source_name=member,
     )
+    charge_media_bytes(size)
     remaining = size
     try:
         with source_path.open("rb") as source, partial_path.open("wb") as output:

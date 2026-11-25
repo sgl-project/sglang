@@ -1,8 +1,9 @@
 import asyncio
-import concurrent.futures
 import copy
 import threading
 from typing import Any, Callable, Optional, TypeVar
+
+from sglang.srt.multimodal.media_budget import MediaThreadPool
 
 T = TypeVar("T")
 
@@ -29,7 +30,7 @@ class MultimodalProcessorExecutor:
         # Probe once, so a processor that cannot be cloned still falls back to
         # synchronous processing at startup instead of failing inside a worker.
         copy.deepcopy(resolve_processor())
-        self._executor = concurrent.futures.ThreadPoolExecutor(
+        self._executor = MediaThreadPool(
             max_workers=max_workers,
             thread_name_prefix="sglang-mm-processor",
             initializer=initializer,

@@ -151,6 +151,7 @@ from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.media_budget import media_budget
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     register_token_space_models,
@@ -1365,38 +1366,55 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            if contains_mm_input:
-                self._validate_mm_limits(obj)
-                # mm_content_hashes is a GenerateReqInput field; EmbeddingReqInput
-                # has no such attribute.
-                if isinstance(obj, GenerateReqInput):
-                    self._normalize_mm_content_hashes(obj)
+            with media_budget():
+                if contains_mm_input:
+                    self._validate_mm_limits(obj)
+                    # mm_content_hashes is a GenerateReqInput field; EmbeddingReqInput
+                    # has no such attribute.
+                    if isinstance(obj, GenerateReqInput):
+                        self._normalize_mm_content_hashes(obj)
 
-            mm_inputs = None
-            mm_processor_input = (
-                input_ids
-                if self.mm_processor.prefer_tokenized_input and input_ids is not None
-                else (input_text or input_ids)
-            )
+                mm_inputs = None
+                mm_processor_input = (
+                    input_ids
+                    if self.mm_processor.prefer_tokenized_input
+                    and input_ids is not None
+                    else (input_text or input_ids)
+                )
 
-            if (
-                not get_disagg().language_only
-                or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
-            ):
-                if get_disagg().language_only:
-                    mm_inputs = await self.mm_receiver.recv_mm_data(
-                        request_obj=obj,
-                        mm_processor=self.mm_processor,
-                        prompt=mm_processor_input,
-                        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                    )
-                    _reject_missing_dispatched_encoder_embedding(obj, mm_inputs)
-                if mm_inputs is None:
+                if (
+                    not get_disagg().language_only
+                    or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
+                ):
                     if get_disagg().language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
+                        mm_inputs = await self.mm_receiver.recv_mm_data(
+                            request_obj=obj,
+                            mm_processor=self.mm_processor,
+                            prompt=mm_processor_input,
+                            need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                         )
+                        _reject_missing_dispatched_encoder_embedding(obj, mm_inputs)
+                    if mm_inputs is None:
+                        if get_disagg().language_only:
+                            logger.warning(
+                                "Encoder embedding not available, "
+                                "falling back to local mm processing"
+                            )
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=mm_processor_input,
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
+                elif (
+                    get_disagg().language_only
+                    and get_disagg().encoder_transfer_backend
+                    in ["zmq_to_scheduler", "mooncake"]
+                    and not obj.need_wait_for_mm_inputs
+                ):
+                    # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
+                    # to encoder (e.g., only one image), process locally like non-language_only mode
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
@@ -1404,47 +1422,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
-            elif (
-                get_disagg().language_only
-                and get_disagg().encoder_transfer_backend
-                in ["zmq_to_scheduler", "mooncake"]
-                and not obj.need_wait_for_mm_inputs
-            ):
-                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
 
-            if mm_inputs and mm_inputs.input_ids is not None:
-                input_ids = mm_inputs.input_ids
-            if mm_inputs and mm_inputs.token_type_ids is not None:
-                token_type_ids = mm_inputs.token_type_ids
-                if not isinstance(token_type_ids, list):
-                    token_type_ids = token_type_ids.flatten().tolist()
-            # Routing hints are not proof of feature identity. Actual contents
-            # remain authoritative even if a caller reuses a stale hash.
-            if isinstance(obj, GenerateReqInput) and obj.mm_hashes:
-                logger.warning(
-                    "mm_hashes no longer override multimodal cache identities; "
-                    "the server hashes actual encoder inputs."
-                )
-            if mm_inputs and mm_inputs.mm_items:
-                self.mm_processor.finalize_cache_identities(mm_inputs)
-            if mm_inputs and isinstance(obj, GenerateReqInput):
-                attach_mm_routing_labels(
-                    mm_inputs.mm_items, obj.mm_routing_labels_by_modality()
-                )
-            if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
-                and mm_inputs
-                and mm_inputs.mm_items
-            ):
-                await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
+                if mm_inputs and mm_inputs.input_ids is not None:
+                    input_ids = mm_inputs.input_ids
+                if mm_inputs and mm_inputs.token_type_ids is not None:
+                    token_type_ids = mm_inputs.token_type_ids
+                    if not isinstance(token_type_ids, list):
+                        token_type_ids = token_type_ids.flatten().tolist()
+                # Routing hints are not proof of feature identity. Actual contents
+                # remain authoritative even if a caller reuses a stale hash.
+                if isinstance(obj, GenerateReqInput) and obj.mm_hashes:
+                    logger.warning(
+                        "mm_hashes no longer override multimodal cache identities; "
+                        "the server hashes actual encoder inputs."
+                    )
+                if mm_inputs and mm_inputs.mm_items:
+                    self.mm_processor.finalize_cache_identities(mm_inputs)
+                if mm_inputs and isinstance(obj, GenerateReqInput):
+                    attach_mm_routing_labels(
+                        mm_inputs.mm_items, obj.mm_routing_labels_by_modality()
+                    )
+                if (
+                    envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                    and mm_inputs
+                    and mm_inputs.mm_items
+                ):
+                    await self.mm_processor.hash_executor.set_pad_values(
+                        mm_inputs.mm_items
+                    )
         else:
             mm_inputs = None
 

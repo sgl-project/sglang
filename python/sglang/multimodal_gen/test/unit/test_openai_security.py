@@ -253,6 +253,8 @@ def test_input_storage_modes_admit_identical_bytes(
 ):
     from PIL import Image
 
+    from sglang.srt.multimodal.media_budget import media_budget
+
     buffer = io.BytesIO()
     Image.new("RGB", (4, 4), "navy").save(buffer, format="PNG")
     data = buffer.getvalue()
@@ -281,6 +283,14 @@ def test_input_storage_modes_admit_identical_bytes(
         assert path.read_bytes() == data
         with Image.open(path) as decoded:
             assert decoded.getpixel((0, 0)) == (0, 0, 128)
+        with media_budget(2 * len(data) - 1):
+            upload = UploadFile(io.BytesIO(data), filename="first.png")
+            asyncio.run(utils.save_image_to_path(upload, str(Path(root) / "first.png")))
+            with pytest.raises(Exception, match="budget|download"):
+                asyncio.run(
+                    utils.save_image_to_path(source, str(Path(root) / "second"))
+                )
+            assert not list(Path(root).glob("second*"))
     assert path.exists() is persistent
 
 

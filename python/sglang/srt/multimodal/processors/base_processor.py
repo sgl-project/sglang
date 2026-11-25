@@ -29,6 +29,7 @@ from sglang.srt.multimodal.cache import (
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.media_budget import clear_inherited_media_budget
 from sglang.srt.multimodal.media_io import (
     configure_media_url_security,
     media_url_security_config,
@@ -218,6 +219,7 @@ def _forget_parent_executor_wakeups():
 
 def _init_cpu_worker(media_url_policy: tuple) -> None:
     _forget_parent_executor_wakeups()
+    clear_inherited_media_budget()
     # A spawned worker starts from the default media policy, not the server's.
     configure_media_url_security(*media_url_policy)
 

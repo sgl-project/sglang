@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.srt.multimodal.media_budget import MAX_REQUEST_BYTES, media_budget
 
 logger = init_logger(__name__)
 
@@ -433,7 +434,14 @@ class PipelineStage(StageDedupMixin, ABC):
                 and not (self.server_args and self.server_args.comfyui_mode),
                 perf_dump_path_provided=batch.perf_dump_path is not None,
             ):
-                result = self.forward(batch, server_args)
+                with media_budget(
+                    min(
+                        getattr(batch, "media_bytes_remaining", MAX_REQUEST_BYTES),
+                        MAX_REQUEST_BYTES,
+                    )
+                ) as budget:
+                    result = self.forward(batch, server_args)
+                    batch.media_bytes_remaining = budget.remaining
         finally:
             self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False

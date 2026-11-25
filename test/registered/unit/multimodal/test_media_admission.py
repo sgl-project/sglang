@@ -18,6 +18,11 @@ import pytest
 from PIL import Image
 
 from sglang.srt.multimodal import media_io
+from sglang.srt.multimodal.media_budget import (
+    MediaBudgetExceeded,
+    MediaThreadPool,
+    media_budget,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -81,6 +86,27 @@ def test_encoder_and_spawned_cpu_worker_inherit_monolithic_policy(tmp_path):
             assert pool.submit(_worker_policy, str(path)).result(90) == reference
     finally:
         media_io.configure_media_url_security(*previous)
+
+
+def test_request_budget_spans_threads_and_source_forms(tmp_path):
+    data = _png()
+    path = tmp_path / "image with spaces.png"
+    path.write_bytes(data)
+    inline = "data:image/png;base64," + base64.b64encode(data).decode()
+    with MediaThreadPool(2) as pool:
+        with media_budget(2 * len(data)):
+            futures = [
+                pool.submit(media_io.get_image_bytes, src)
+                for src in (inline, path.as_uri(), data)
+            ]
+            successes = [f.result() for f in futures if f.exception() is None]
+            assert successes == [data, data]
+            assert (
+                sum(isinstance(f.exception(), MediaBudgetExceeded) for f in futures)
+                == 1
+            )
+        with media_budget(len(data)):
+            assert pool.submit(media_io.get_image_bytes, data).result() == data
 
 
 def test_pinned_https_preserves_original_sni_host_and_redirect_policy(

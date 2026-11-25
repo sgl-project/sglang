@@ -41,6 +41,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.media_budget import decoding_admitted_media
 from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS, load_image
 from sglang.srt.multimodal.modality import Modality
 
@@ -158,7 +159,8 @@ class MediaArtifactCacheMixin:
             data.load()
             return data
         try:
-            image, _ = load_image(data, self.gpu_image_decode)
+            with decoding_admitted_media(data):
+                image, _ = load_image(data, self.gpu_image_decode)
             if isinstance(image, Image.Image):
                 image.load()
         except CLIENT_MEDIA_EXCEPTIONS as e:

@@ -9,6 +9,7 @@ per-request from ``batch.data_type`` and the presence of
 ``batch.preprocessed_image`` / ``batch.preprocessed_video``.
 """
 
+import base64
 import copy
 import json
 import math
@@ -18,10 +19,10 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack, closing, contextmanager
 from fractions import Fraction
+from io import BytesIO
 from itertools import islice
 from typing import Any
-from urllib.parse import urlparse
-from urllib.request import DataHandler, Request
+from urllib.parse import unquote_to_bytes, urlparse
 
 import numpy as np
 import PIL.Image
@@ -110,6 +111,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     preprocess_image,
 )
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_budget import charge_base64, charge_media_bytes
 from sglang.srt.utils.device import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -260,12 +262,18 @@ def _open_video_stream(video_path: str):
                 download_video_to_stream(video_path, stream)
                 stream.seek(0)
             elif scheme == "data":
-                # DataHandler only reads inline bytes; it does not dispatch URLs.
-                stream = files.enter_context(
-                    DataHandler().data_open(Request(video_path))
-                )
+                metadata, encoded = video_path.split(",", 1)
+                payload = unquote_to_bytes(encoded)
+                if metadata.lower().endswith(";base64"):
+                    encoded = b"".join(payload.split()).decode("ascii")
+                    charge_base64(encoded)
+                    payload = base64.b64decode(encoded, validate=True)
+                else:
+                    charge_media_bytes(len(payload))
+                stream = files.enter_context(BytesIO(payload))
             elif not scheme or len(scheme) == 1:
                 stream = files.enter_context(open(video_path, "rb"))
+                charge_media_bytes(os.fstat(stream.fileno()).st_size)
             else:
                 stream = None
         except (ValueError, OSError) as exc:

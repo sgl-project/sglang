@@ -5,6 +5,8 @@ import re
 import tempfile
 from pathlib import Path
 
+from sglang.srt.multimodal.media_budget import charge_base64
+
 
 def ensure_path_within_root(target_path: str, root_dir: str) -> str:
     root_path = Path(root_dir).resolve()
@@ -58,7 +60,9 @@ def save_base64_image_to_path(
     if uploads_root is not None:
         target_path = ensure_path_within_root(target_path, uploads_root)
     try:
-        image_data = base64.b64decode(data)
+        data = "".join(data.split())
+        charge_base64(data)
+        image_data = base64.b64decode(data, validate=True)
     except Exception as exc:
         raise Exception(f"Failed to decode base64 image: {str(exc)}") from exc
 

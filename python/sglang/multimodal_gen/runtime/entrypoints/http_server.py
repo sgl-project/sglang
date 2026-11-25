@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_budget import media_budget
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
     init_http_request_metrics,
@@ -736,7 +737,8 @@ def create_app(
                 return orjson_response(
                     {"error": async_scheduler_client.failure_reason}, status_code=503
                 )
-        return await call_next(request)
+        with media_budget():
+            return await call_next(request)
 
     app.include_router(health_router)
     app.include_router(vertex_router)

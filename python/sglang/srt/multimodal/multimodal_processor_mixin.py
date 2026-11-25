@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.multimodal.media_budget import MediaThreadPool
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_worker_media_policy,
@@ -89,7 +90,7 @@ class MultimodalProcessorMixin:
         else:
             self.mm_io_worker_num = self.auto_mm_io_worker_num
             io_worker_source = "auto"
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+        self.io_executor = MediaThreadPool(
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
             initializer=self._worker_thread_initializer(),
