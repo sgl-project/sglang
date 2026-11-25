@@ -18,7 +18,7 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{Policy, PrefixLookupResult};
-use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
+use crate::proxy::grpc::{GrpcResponse, RoutingView};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::{PolicySelectionFailureReason, RequestLogContext};
@@ -33,6 +33,7 @@ use preparation::{
     parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
     COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
+use sglang_api_types::api::v1::{token_ids_or_list, GenerateRequest, TokenIds, TokenIdsOrList};
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -189,68 +190,46 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
+    let (request, routing) = prepare(&ctx, endpoint, &headers, body).await?;
     routing.dispatch(&ctx, request, headers, start).await
 }
 
-/// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
-/// The log context is `None` when the call failed before dispatch.
-pub async fn route_grpc<R: EngineRpc>(
+/// Route one native Generate request without converting it through JSON.
+pub async fn route_generate(
     ctx: &AppContext,
-    endpoint: Endpoint,
-    rpc: R,
+    mut request: GenerateRequest,
     headers: HeaderMap,
-    body: Bytes,
-) -> (
-    Result<GrpcResponse<R::Reply>, ApiError>,
-    Option<RequestLogContext>,
-) {
+) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
     let start = Instant::now();
-    match prepare(ctx, endpoint, &headers, body, true).await {
-        Ok((mut request, routing)) => {
-            forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await
-        }
-        Err(error) => (Err(error), None),
-    }
-}
-
-/// [`route_grpc`] for a typed request, prepared from its fields as `endpoint` prepares a body.
-pub async fn route_typed<R: TypedRpc>(
-    ctx: &AppContext,
-    endpoint: Endpoint,
-    request: R,
-    headers: HeaderMap,
-) -> (
-    Result<GrpcResponse<R::Reply>, ApiError>,
-    Option<RequestLogContext>,
-) {
-    let start = Instant::now();
-    let prepared = async {
+    let prepared = (|| {
         let model = ModelId(ctx.config.model.id.clone());
         let routing = ModelRouting::lookup(ctx, &model)?;
-        let path = endpoint.path();
-        if path != GENERATE_PATH {
-            require_plain_workers(ctx, &model, path)?;
+        let view = RoutingView::try_from(&request)?;
+        let prepared = ctx.preprocessor.typed(model, &view)?;
+        if view.text.is_some()
+            && !ctx.config.model.disable_input_ids_forwarding
+            && request.return_text_in_logprobs != Some(true)
+            && request.image_data.is_none()
+            && request.video_data.is_none()
+            && request.audio_data.is_none()
+        {
+            if let Some(tokens) = &prepared.tokens {
+                request.input_ids = Some(TokenIdsOrList {
+                    value: Some(token_ids_or_list::Value::One(TokenIds {
+                        ids: tokens.ids.iter().copied().map(i64::from).collect(),
+                    })),
+                });
+                request.text = None;
+            }
         }
-        let prepared = ctx.preprocessor.typed(path, model, &request.view())?;
         Ok::<_, ApiError>((prepared, routing))
-    };
-    match prepared.await {
+    })();
+    match prepared {
         Ok((mut prepared, routing)) => {
             forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await
         }
         Err(error) => (Err(error), None),
     }
-}
-
-/// `text` as the ids `endpoint` would forward in its place over HTTP; `None`
-/// when it keeps the text, as under `--disable-input-ids-forwarding`.
-pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Vec<i32>> {
-    let model = ModelId(ctx.config.model.id.clone());
-    let ids = ctx
-        .preprocessor
-        .forwarded_prompt_ids(&model, endpoint.path(), text)?;
-    ids.into_iter().map(|id| i32::try_from(id).ok()).collect()
 }
 
 impl Endpoint {
@@ -275,11 +254,8 @@ async fn prepare<'a>(
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
-    grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
-    off_worker::run_for_body(body.len(), || {
-        prepare_now(ctx, endpoint, headers, body, grpc)
-    })
+    off_worker::run_for_body(body.len(), || prepare_now(ctx, endpoint, headers, body))
 }
 
 fn prepare_now<'a>(
@@ -287,7 +263,6 @@ fn prepare_now<'a>(
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
-    grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
     // One model is served, so any `model` name routes to it; the engine still
     // reads the name the body carries, with any `:adapter` suffix.
@@ -307,23 +282,15 @@ fn prepare_now<'a>(
             } else {
                 COMPLETIONS_PATH
             };
-            if grpc && matches!(endpoint, Endpoint::Completions) {
-                ctx.preprocessor
-                    .completion(model, fields, body, needs_tokens)?
-            } else if grpc {
-                ctx.preprocessor
-                    .openai_grpc(path, model, fields, headers, body, needs_tokens)?
-            } else {
-                ctx.preprocessor.openai(
-                    model_openai_settings(ctx, &model).as_deref(),
-                    path,
-                    model,
-                    fields,
-                    headers,
-                    body,
-                    needs_tokens,
-                )?
-            }
+            ctx.preprocessor.openai(
+                model_openai_settings(ctx, &model).as_deref(),
+                path,
+                model,
+                fields,
+                headers,
+                body,
+                needs_tokens,
+            )?
         }
         Endpoint::Generate => ctx.preprocessor.generate(model, body)?,
         Endpoint::Embeddings | Endpoint::Classify => {
@@ -1017,7 +984,7 @@ mod tests {
         let body = Bytes::from(body.to_string());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (took, ticked_after) = time_beside_a_timer(move || async move {
-            let tokens = prepare(&ctx, Endpoint::Chat, &HeaderMap::new(), body, false)
+            let tokens = prepare(&ctx, Endpoint::Chat, &HeaderMap::new(), body)
                 .await
                 .map(|(request, _)| request.tokens.is_some())
                 .map_err(|e| format!("{e:?}"));
