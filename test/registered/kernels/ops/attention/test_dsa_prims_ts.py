@@ -132,36 +132,27 @@ class TestShardedDcpPrimsTs(CustomTestCase):
         # Past the exact-plan limit: power-of-two packed capacity with qo_indptr.
         self._check_dcp8_partials_merge_to_full(rows=_EXACT_PLAN_MAX_ROWS + 1)
 
-    def test_prepare_compiles_every_plan_before_serving(self):
-        """After prepare() serving compiles nothing, and each plan runs the same
-        compiled kernel, with the same output, as an unprepared lazy plan."""
+    def test_prepare_compiles_every_kernel_before_serving(self):
+        """After prepare() a forward of any row count up to max_rows compiles nothing."""
         self._require_prims_ts()
         from flashinfer.attention.prims_ts import mla_decode
 
-        heads = 96
-        prepared = PrimsTSSparseMLA(torch.device("cuda"))
-        prepared.prepare(heads=[heads], width=TOPK)
+        heads, max_rows = 96, _EXACT_PLAN_MAX_ROWS + 1
+        runner = PrimsTSSparseMLA(torch.device("cuda"))
+        runner.prepare(heads=heads, max_rows=max_rows, width=TOPK)
         misses = mla_decode._get_compiled_mla_decode.cache_info().misses
-        lazy = PrimsTSSparseMLA(torch.device("cuda"))
         gen = torch.Generator(device="cuda").manual_seed(5)
         kv = (torch.randn(4096, DIM, generator=gen, device="cuda") * 0.5).to(FP8)
-        for rows in (1, 5, 24, 153, _EXACT_PLAN_MAX_ROWS, _EXACT_PLAN_MAX_ROWS + 1):
-            q = torch.randn(rows, heads, DIM, generator=gen, device="cuda").to(FP8)
-            slots = torch.randint(
-                0, 4096, (rows, TOPK), generator=gen, device="cuda", dtype=torch.int32
-            )
-            lens = torch.randint(
-                1, TOPK + 1, (rows,), generator=gen, device="cuda", dtype=torch.int32
-            )
-            kwargs = dict(
-                q=q, kv_cache=kv, indices=slots, lengths=lens, sm_scale=SM_SCALE
-            )
-            out, lse = prepared.forward(kv_scale=1.0, **kwargs)
-            ref, ref_lse = lazy.forward(kv_scale=1.0, **kwargs)
-            self.assertTrue(torch.equal(out, ref) and torch.equal(lse, ref_lse))
-        for key, wrapper in lazy._plans.items():
-            self.assertIs(
-                prepared._plans[key]._state["compiled"], wrapper._state["compiled"]
+        for rows in (1, 5, 24, 153, _EXACT_PLAN_MAX_ROWS, max_rows):
+            runner.forward(
+                q=torch.randn(rows, heads, DIM, generator=gen, device="cuda").to(FP8),
+                kv_cache=kv,
+                indices=torch.randint(
+                    0, 4096, (rows, TOPK), generator=gen, device="cuda"
+                ).int(),
+                lengths=torch.full((rows,), TOPK, device="cuda", dtype=torch.int32),
+                sm_scale=SM_SCALE,
+                kv_scale=1.0,
             )
         self.assertEqual(
             mla_decode._get_compiled_mla_decode.cache_info().misses, misses
@@ -208,100 +199,39 @@ class TestPrimsTsDcpLseBase(CustomTestCase):
 # CPU torch: no stream is capturing.
 @mock.patch.object(torch.cuda, "is_current_stream_capturing", new=lambda: False)
 class TestPrimsTsPrepare(CustomTestCase):
-    """prepare() plans once per kernel FlashInfer compiles over every row count a
-    launch can plan, so serving compiles nothing. A stand-in FlashInfer resolves
-    plans from their arguments and, like 0.7.4 plan(), compiles the resolved spec
-    with the profile's split count (2CTA fuses the epilogue only unsplit)."""
+    """prepare() plans every plan key a launch of up to max_rows rows can use, so
+    serving plans nothing prepare() did not. A stand-in FlashInfer records plans."""
 
-    def _flashinfer(self, *, resolve: bool = True):
-        compiled, plans = [], []
-
-        def resolve_plan(device, batch_size, heads, **kwargs):
-            rows = batch_size * kwargs["max_q_len"]
-            # Schedules change with rows: one only between powers of two, one
-            # far past the exact plans.
-            schedule = (min(rows.bit_length(), 6), 600 < rows <= 1000, rows >= 2**20)
-            spec = (heads, schedule, *sorted(kwargs.items()))
-            # The split count is not part of the spec.
-            profile = ("2cta", 1 + rows % 2)
-            return device, profile, spec, None, None, None, None
+    def test_prepare_plans_every_key_forward_can_plan(self):
+        planned = []
 
         class Wrapper:
             def plan(self, *args, **kwargs):
-                _, profile, spec, *_ = resolve_plan(*args, **kwargs)
-                self.kernel = (spec, profile[1] == 1)
-                plans.append(self.kernel)
-                if self.kernel not in compiled:
-                    compiled.append(self.kernel)
+                planned.append((args, tuple(sorted(kwargs.items()))))
 
             def run(self, *args, **kwargs):
                 pass
 
-        modules = {
-            name: ModuleType(name)
-            for name in (
-                "flashinfer",
-                "flashinfer.attention",
-                "flashinfer.attention.prims_ts",
-                "flashinfer.attention.prims_ts.mla_decode",
-            )
-        }
-        modules[
-            "flashinfer.attention.prims_ts"
-        ].BatchSparseMLADecodePagedTSWrapper = Wrapper
-        if resolve:
-            modules[
-                "flashinfer.attention.prims_ts.mla_decode"
-            ]._resolve_sparse_mla_plan = resolve_plan
-        return mock.patch.dict(sys.modules, modules), compiled, plans
-
-    @staticmethod
-    def _forward(runner, rows: int, heads: int):
-        runner.forward(
-            q=torch.empty(1, heads, DIM, dtype=FP8).expand(rows, -1, -1),
-            kv_cache=torch.empty(1, DIM, dtype=FP8),
-            indices=torch.empty(1, TOPK, dtype=torch.int32).expand(rows, -1),
-            lengths=torch.empty(1, dtype=torch.int32).expand(rows),
-            sm_scale=SM_SCALE,
-            kv_scale=1.0,
-        )
-
-    def test_prepare_plans_each_compile_spec_once_and_serving_compiles_none(self):
-        modules, compiled, plans = self._flashinfer()
+        names = ("flashinfer", "flashinfer.attention", "flashinfer.attention.prims_ts")
+        modules = {name: ModuleType(name) for name in names}
+        modules[names[-1]].BatchSparseMLADecodePagedTSWrapper = Wrapper
+        heads, max_rows = 12, 2 * _EXACT_PLAN_MAX_ROWS + 1
         runner = PrimsTSSparseMLA(torch.device("cpu", 0))
-        with modules:
-            # A head count repeated across phases (no DCP) prepares once.
-            runner.prepare(heads=[12, 96, 12], width=TOPK)
-            prepared = list(plans)
-            self.assertEqual(len(prepared), len(set(prepared)))
-            self.assertEqual(compiled, prepared)
-            # Equal specs with different split counts plan both kernels.
-            self.assertGreater(len(prepared), len({spec for spec, _ in prepared}))
-            for heads in (12, 96):
-                for rows in range(1, 2 * _EXACT_PLAN_MAX_ROWS + 2):
-                    self._forward(runner, rows, heads)
-                # Larger launches plan per power-of-two capacity, up to FlashInfer's
-                # int32 rows x heads; forward plans each through _wrapper.
-                capacity = 4 * _EXACT_PLAN_MAX_ROWS
-                while capacity * heads < 2**31:
-                    for rows in (capacity // 2 + 1, capacity):
-                        runner._wrapper(rows=rows, heads=heads, width=TOPK)
-                    capacity *= 2
-        self.assertEqual(compiled, prepared)
-        self.assertEqual({w.kernel for w in runner._plans.values()}, set(prepared))
-
-    def test_prepare_without_flashinfer_spec_resolver_compiles_lazily(self):
-        modules, compiled, plans = self._flashinfer(resolve=False)
-        runner = PrimsTSSparseMLA(torch.device("cpu", 0))
-        with modules:
-            with self.assertLogs(
-                "sglang.srt.layers.attention.dsa.prims_ts", "WARNING"
-            ) as logs:
-                runner.prepare(heads=[12, 96], width=TOPK)
-            self.assertEqual(len(logs.output), 1)
-            self.assertEqual(plans, [])
-            self._forward(runner, 3, 12)
-        self.assertEqual(len(compiled), 1)
+        with mock.patch.dict(sys.modules, modules):
+            runner.prepare(heads=heads, max_rows=max_rows, width=TOPK)
+            prepared = set(planned)
+            self.assertEqual(len(prepared), len(planned))
+            self.assertEqual(runner._plans, {})
+            for rows in range(1, max_rows + 1):
+                runner.forward(
+                    q=torch.empty(1, heads, DIM, dtype=FP8).expand(rows, -1, -1),
+                    kv_cache=torch.empty(1, DIM, dtype=FP8),
+                    indices=torch.empty(1, TOPK, dtype=torch.int32).expand(rows, -1),
+                    lengths=torch.empty(1, dtype=torch.int32).expand(rows),
+                    sm_scale=SM_SCALE,
+                    kv_scale=1.0,
+                )
+        self.assertEqual(set(planned), prepared)
 
 
 if __name__ == "__main__":

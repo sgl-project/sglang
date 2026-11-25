@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Iterable, Optional
+from typing import Optional
 
 import torch
 
@@ -73,7 +73,7 @@ class PrimsTSSparseMLA:
 
     Plans compile and allocate, so they are made on eager calls; the CUDA graph
     runner's eager warmups plan every captured row count before its capture.
-    prepare() compiles every kernel those plans can need before serving.
+    prepare() compiles the kernels those plans need before serving.
     """
 
     def __init__(self, device: torch.device):
@@ -102,43 +102,23 @@ class PrimsTSSparseMLA:
         )
         return key, args, kwargs
 
-    def prepare(self, *, heads: Iterable[int], width: int) -> None:
-        """Compile every kernel a launch of these head counts and top-k ``width``
-        can plan: one plan per kernel FlashInfer compiles, at its fewest rows."""
-        try:
-            # FlashInfer 0.7.4 has no public precompile; this private helper
-            # resolves a plan without compiling or allocating. 0.7.4 plan()
-            # (mla_decode.py:2946-2978) compiles the resolved spec's kernel with
-            # fields set from the profile (family, split count, D576 reload) and
-            # the output quantization, so those key the plans too.
-            from flashinfer.attention.prims_ts.mla_decode import (
-                _resolve_sparse_mla_plan,
-            )
-        except ImportError as exc:
-            logger.warning("Prims-TS sparse MLA kernels compile on first use: %s", exc)
-            return
+    def prepare(self, *, heads: int, max_rows: int, width: int) -> None:
+        """Compile every kernel a launch of up to ``max_rows`` rows can plan."""
+        from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
+
         start = time.perf_counter()
-        first_rows = {}
-        for num_heads in sorted(set(heads)):
-            rows = 1
-            # FlashInfer plans fewer than 2**31 query rows x heads (int32 extents).
-            while rows * num_heads < 2**31:
-                _, args, kwargs = self._plan_args(
-                    rows=rows, heads=num_heads, width=width
-                )
-                _, profile, spec, *_, output_quant = _resolve_sparse_mla_plan(
-                    *args, **kwargs
-                )
-                first_rows.setdefault((spec, profile, output_quant), (rows, num_heads))
-                # Rows past the exact limit share one plan per power-of-two capacity.
-                rows = rows + 1 if rows < _EXACT_PLAN_MAX_ROWS else 2 * rows
-        # plan() is the public compile path; the kept plans serve these rows.
-        for rows, num_heads in first_rows.values():
-            self._wrapper(rows=rows, heads=num_heads, width=width)
+        last_rows = _plan_capacity(max_rows) or max_rows
+        rows = 1
+        while rows <= last_rows:
+            _, args, kwargs = self._plan_args(rows=rows, heads=heads, width=width)
+            # FlashInfer caches the compiled kernel; the plan itself is dropped.
+            BatchSparseMLADecodePagedTSWrapper().plan(*args, **kwargs)
+            # Rows past the exact limit share one plan per power-of-two capacity.
+            rows = rows + 1 if rows < _EXACT_PLAN_MAX_ROWS else 2 * rows
         logger.info(
-            "Prims-TS sparse MLA: made %d plans at (rows, heads) %s in %.1f s",
-            len(first_rows),
-            list(first_rows.values()),
+            "Prims-TS sparse MLA: compiled the %d-head kernels for up to %d rows in %.1f s",
+            heads,
+            last_rows,
             time.perf_counter() - start,
         )
 
