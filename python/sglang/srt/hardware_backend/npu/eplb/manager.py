@@ -89,7 +89,7 @@ class _AsyncStatAccumulator(_StatAccumulator):
         return vote(ControlPoint.SNAPSHOT_ADMISSION, needed, failed)
 
     def _prepare_snapshot(
-        self, counts: torch.Tensor, spec: PlanningSpec, rank: int, source_local: bool
+        self, counts: torch.Tensor, spec: PlanningSpec, rank: int
     ) -> RecordedWindow:
         slot_counts = torch.empty_like(counts) if rank == 0 else None
         source_totals = active_sources = None
@@ -102,7 +102,7 @@ class _AsyncStatAccumulator(_StatAccumulator):
                 (source_groups, *counts.shape[1:]), dtype=torch.int64
             )
             torch.sum(counts, dim=0, out=source_totals[source])
-        if spec.dispatch_mode == "random" and source_local:
+        if spec.collect_active_sources:
             # Count the ranks with local assignments before counts is reduced.
             active_sources = counts.amax(dim=-1).gt(0).to(torch.int32)
         return RecordedWindow(slot_counts, source_totals, active_sources)
@@ -112,8 +112,6 @@ class _AsyncStatAccumulator(_StatAccumulator):
         spec: PlanningSpec,
         rebalance_needed: Callable[[float], bool],
         vote: SnapshotVote,
-        *,
-        source_local: bool,
     ) -> RecordedWindow | None:
         """Return a consumed window on all ranks, or None to skip the plan."""
         needed, failed = self._vote_on_utilization(rebalance_needed, vote)
@@ -128,7 +126,7 @@ class _AsyncStatAccumulator(_StatAccumulator):
             # A completed migration resets the window before the next epoch.
             assert not self._previous_layouts
             counts = self._global_physical_count_of_buffered_step.get_all()
-            window = self._prepare_snapshot(counts, spec, rank, source_local)
+            window = self._prepare_snapshot(counts, spec, rank)
         except Exception:
             logger.exception("Async EPLB could not prepare a recorder snapshot")
             failed = True
@@ -189,7 +187,7 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
             raise ValueError("Async EPLB requires expert location metadata")
         super().__init__(metadata, rank, accumulator_factory=_AsyncStatAccumulator)
         # Only TopK counts describe the source rank, before dispatch.
-        self._source_local = all(
+        self.records_source_counts = all(
             isinstance(gatherer, _SelectExpertsSinglePassGatherer)
             for gatherer in self._single_pass_gatherers.values()
         )
@@ -210,7 +208,7 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
             # Per-pass gatherers reset at the next forward. The accumulator
             # owns the recorder window and clears it after taking a snapshot.
             return self._accumulator.take_rebalance_snapshot(
-                spec, rebalance_needed, vote, source_local=self._source_local
+                spec, rebalance_needed, vote
             )
 
 

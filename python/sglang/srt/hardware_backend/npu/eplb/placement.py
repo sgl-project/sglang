@@ -64,6 +64,8 @@ class PlanningSpec:
     algorithm: EplbAlgorithm
     dispatch_mode: Literal["unique", "random", "static"] = "unique"
     score_locality: bool = True
+    # Adds a TP reduction to the recorder snapshot.
+    collect_active_sources: bool = False
 
     @property
     def source_groups(self) -> int:

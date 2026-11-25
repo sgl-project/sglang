@@ -8,7 +8,7 @@ import os
 import time
 from collections import defaultdict
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from typing import NamedTuple
 
@@ -740,7 +740,9 @@ class NpuEplbRuntime:
         dist.destroy_process_group(self.plan_group)
 
 
-def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
+def _make_planning_spec(
+    model_config, metadata, moe, nodes, *, decode_worker, records_source_counts
+):
     """Choose the recorder counts and placement policy for this dispatcher."""
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
 
@@ -767,6 +769,7 @@ def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
         algorithm=algorithm,
         dispatch_mode=dispatch_mode,
         score_locality=score_locality,
+        collect_active_sources=dispatch_mode == "random" and records_source_counts,
     )
 
 
@@ -785,6 +788,38 @@ def _hccl_blocking_wait() -> bool:
         else:
             raise ValueError(f"Invalid value for environment variable: {name}")
     return blocking
+
+
+def _check_startup_agreement(
+    peers: list[tuple[dict[str, object], list[int]] | str],
+    local_error: Exception | None,
+) -> set[int]:
+    """Check the gathered setup before any rank creates the transport groups."""
+    peer_settings = []
+    narrowed_layers = set()
+    for rank, result in enumerate(peers):
+        if isinstance(result, str):
+            raise RuntimeError(
+                f"Async EPLB setup failed on rank {rank}: {result}"
+            ) from local_error
+        settings, layers = result
+        peer_settings.append(settings)
+        narrowed_layers.update(layers)
+
+    reference = peer_settings[0]
+    for rank, settings in enumerate(peer_settings[1:], start=1):
+        if settings != reference:
+            different = sorted(
+                key
+                for key in settings.keys() | reference.keys()
+                if key not in settings
+                or key not in reference
+                or settings[key] != reference[key]
+            )
+            raise ValueError(
+                f"Async EPLB rank {rank} differs from rank 0 in {', '.join(different)}"
+            )
+    return narrowed_layers
 
 
 def create_npu_async_eplb(model_config, model, *, startup_weight_load):
@@ -821,8 +856,14 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
         # Resolving the model's lazy weight table can fail independently on each rank.
         weights = model.routed_experts_weights_of_layer
         metadata = get_global_expert_location_metadata()
+        recorder = get_global_expert_distribution_recorder()
         spec = _make_planning_spec(
-            model_config, metadata, moe, parallel.nnodes, decode_worker=decode_worker
+            model_config,
+            metadata,
+            moe,
+            parallel.nnodes,
+            decode_worker=decode_worker,
+            records_source_counts=recorder.records_source_counts,
         )
         p2p_buffer_mib = int(os.environ.get("HCCL_BUFFSIZE") or 64)
         if p2p_buffer_mib < 1:
@@ -861,44 +902,36 @@ def create_npu_async_eplb(model_config, model, *, startup_weight_load):
         warmup_buffers = (
             _allocate_migration_warmup_buffers(world_size) if world_size > 1 else None
         )
-        signature = (
-            runtime.layer_ids,
-            runtime.weight_format_digest,
-            serving_mode,
-            runtime.use_prefill_admission,
-            runtime._p2p_batch_size,
-            p2p_buffer_mib,
-            hccl_timeout,
-            moe.eplb_rebalance_num_iterations,
-            moe.expert_distribution_recorder_buffer_size,
-            moe.eplb_min_rebalancing_utilization_threshold
+        signature = {
+            "layers": runtime.layer_ids,
+            "expert_weight_format": runtime.weight_format_digest,
+            "serving_mode": serving_mode,
+            "prefill_admission": runtime.use_prefill_admission,
+            "p2p_batch_size": runtime._p2p_batch_size,
+            "HCCL_BUFFSIZE": p2p_buffer_mib,
+            "hccl_timeout": hccl_timeout,
+            "rebalance_interval": moe.eplb_rebalance_num_iterations,
+            "recorder_window": moe.expert_distribution_recorder_buffer_size,
+            "utilization_threshold": moe.eplb_min_rebalancing_utilization_threshold
             if reports_expert_balancedness()
             else None,
-            spec,
-            metadata.num_logical_experts,
-            moe.ep_dispatch_algorithm,
-            hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
-        )
+            "num_logical_experts": metadata.num_logical_experts,
+            "dispatch_algorithm": moe.ep_dispatch_algorithm,
+            "initial_layout": hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
+            **{f"placement.{key}": value for key, value in asdict(spec).items()},
+        }
         setup = (signature, sorted(runtime.narrowed_replica_layers))
     except Exception as exc:
         error = exc
         setup = f"{type(exc).__name__}: {exc}"
     peers = [None] * world_size
     dist.all_gather_object(peers, setup, group=control.group)
-    for rank, result in enumerate(peers):
-        if isinstance(result, str):
-            control.close()
-            raise RuntimeError(
-                f"Async EPLB setup failed on rank {rank}: {result}"
-            ) from error
-    if any(s != signature for s, _ in peers):
+    try:
+        narrowed_layers = _check_startup_agreement(peers, error)
+    except (RuntimeError, ValueError):
         control.close()
-        raise ValueError(
-            "Async EPLB ranks disagree on transport, placement, expert weight format, "
-            "batching, scheduling or recorder configuration"
-        )
-    for _, narrowed_layers in peers:
-        runtime.narrowed_replica_layers.update(narrowed_layers)
+        raise
+    runtime.narrowed_replica_layers.update(narrowed_layers)
     runtime.open_transport(
         cpu_timeout, hccl_timeout, p2p_options, tp_probe, warmup_buffers
     )

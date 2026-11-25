@@ -146,9 +146,7 @@ class TestAsyncEplbSnapshot(unittest.TestCase):
                     manager.dist, get_rank=Mock(return_value=1), all_reduce=Mock()
                 ):
                     self.assertIsNone(
-                        accumulator.take_rebalance_snapshot(
-                            spec, lambda _: True, vote, source_local=True
-                        )
+                        accumulator.take_rebalance_snapshot(spec, lambda _: True, vote)
                     )
                     self.assertEqual(
                         manager.dist.all_reduce.call_count,
@@ -227,7 +225,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expert-parallel MoE backend"):
             validate_async_eplb_args(cfg)
 
-    def test_single_rank_warmup_allocation_failure_closes_control_group(self):
+    def test_rank_setup_failure_or_disagreement_closes_control_group(self):
         from sglang.srt.hardware_backend.npu.eplb import runtime
 
         control_group = object()
@@ -240,7 +238,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
             ep_dispatch_algorithm="static",
         )
         metadata = SimpleNamespace(
-            physical_to_logical_map_cpu=torch.tensor([[0, 1]]),
+            physical_to_logical_map_cpu=torch.tensor([[0, 1, 0, 1]]),
             num_logical_experts=2,
         )
         transport = Mock(
@@ -249,7 +247,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
             use_prefill_admission=False,
             _p2p_batch_size=1,
             narrowed_replica_layers=set(),
-            staging=(torch.zeros(1),),
+            staging=(torch.zeros(2),),
             device="cpu",
         )
         torch_npu = SimpleNamespace(_C=SimpleNamespace())
@@ -272,9 +270,16 @@ class TestAsyncEplbStartup(unittest.TestCase):
             if failed_rank == 0:
                 self.assertEqual(local, f"RuntimeError: {failure}")
                 peers[:] = [local, None]
-            else:
+            elif failed_rank == 1:
                 self.assertIsInstance(local, tuple)
                 peers[:] = [local, f"RuntimeError: {failure}"]
+            else:
+                local_settings, _ = local
+                peer_settings = {
+                    **local_settings,
+                    "placement.collect_active_sources": True,
+                }
+                peers[:] = [local, (peer_settings, [])]
 
         with (
             patch.dict(
@@ -284,11 +289,18 @@ class TestAsyncEplbStartup(unittest.TestCase):
             patch.multiple(
                 runtime,
                 _validate_migration_topology=Mock(),
-                _make_planning_spec=Mock(return_value=SimpleNamespace(local_experts=1)),
+                _make_planning_spec=Mock(
+                    return_value=PlanningSpec(
+                        4, 2, None, 1, EplbAlgorithm.deepseek, "random"
+                    )
+                ),
                 _allocate_migration_warmup_buffers=allocate,
                 _hccl_blocking_wait=Mock(return_value=False),
                 NpuEplbRuntime=Mock(return_value=transport),
                 get_global_expert_location_metadata=Mock(return_value=metadata),
+                get_global_expert_distribution_recorder=Mock(
+                    return_value=SimpleNamespace(records_source_counts=False)
+                ),
             ),
             patch.multiple(
                 runtime.dist,
@@ -299,7 +311,7 @@ class TestAsyncEplbStartup(unittest.TestCase):
             ),
         ):
             model = SimpleNamespace(routed_experts_weights_of_layer={})
-            for failed_rank in (0, 1):
+            for failed_rank in (0, 1, None):
                 with self.subTest(failed_rank=failed_rank):
                     allocate.reset_mock()
                     allocate.side_effect = (
@@ -308,9 +320,15 @@ class TestAsyncEplbStartup(unittest.TestCase):
                     allocate.return_value = (None, None)
                     runtime.dist.new_group.reset_mock()
                     runtime.dist.destroy_process_group.reset_mock()
-                    with self.assertRaisesRegex(
-                        RuntimeError, f"rank {failed_rank}:.*{failure}"
-                    ):
+                    expected = (
+                        (
+                            ValueError,
+                            r"rank 1 differs from rank 0 in placement\.collect_active_sources",
+                        )
+                        if failed_rank is None
+                        else (RuntimeError, f"rank {failed_rank}:.*{failure}")
+                    )
+                    with self.assertRaisesRegex(*expected):
                         runtime.create_npu_async_eplb(
                             None, model, startup_weight_load=None
                         )
