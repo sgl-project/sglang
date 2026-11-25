@@ -24,6 +24,8 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, same image on another device -> loaded again
   item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
   one map, processors of another checkpoint, mm_process_config or library version -> loaded again
+  one map, one checkpoint, configs the strategy's fingerprint tells apart -> each loads its own;
+      a fingerprint the key cannot hold -> ValueError at construction
   item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten;
       the global random stream is untouched
   item feature cache, a sampled hit computes to other features -> RuntimeError
@@ -37,6 +39,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
   --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
+  M-RoPE fallback -> none without M-RoPE, also for int item fields; the strategy's own with it
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
   chat turns' media + partially expanded IDs -> prefix kept, new turn expanded
@@ -66,6 +69,7 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreprocessCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -529,6 +533,50 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                 asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
             loaded.append(load.await_args.args[0])
         self.assertEqual(loaded, [[image], None, [image], [image], [image]])
+
+    def test_item_feature_cache_is_scoped_by_the_strategy_fingerprint(self):
+        """Features that read hf_config change with an override under one model path; the
+        strategy's fingerprint keeps such processors from reading each other's entries."""
+
+        class _ScaledWidthStrategy(_ImageWidthStrategy):
+            def process_image(self, image, processor, preprocess_kwargs, **kwargs):
+                count = image.width * self.hf_config.scale
+                return {
+                    "pixel_values": torch.full((count, 1), float(count)),
+                    "num_image_tokens": [count],
+                }
+
+            def preprocess_fingerprint_payload(self):
+                return {"scale": self.hf_config.scale}
+
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        expanded, loaded = [], []
+        for scale in (1, 2, 2):
+            processor = self._processor(
+                strategy_class=_ScaledWidthStrategy,
+                hf_config=PretrainedConfig(name_or_path="ckpt", scale=scale),
+                item_feature_cache=item_feature_cache,
+            )
+            load = AsyncMock(wraps=processor._load_media_lists)
+            with patch.object(processor, "_load_media_lists", load):
+                output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+            expanded.append(output["input_ids"].shape[-1])
+            loaded.append(load.await_args.args[0])
+        self.assertEqual(expanded, [3, 5, 5])
+        # The last processor reads the second one's entry without loading the image.
+        self.assertEqual(loaded, [[image], [image], None])
+
+        class _DevicePayloadStrategy(_ImageWidthStrategy):
+            def preprocess_fingerprint_payload(self):
+                return {"device": torch.device("cpu")}
+
+        # Not on the first cached request, which a strategy's own tests may never make.
+        with self.assertRaisesRegex(ValueError, "Unsupported value"):
+            self._processor(
+                strategy_class=_DevicePayloadStrategy,
+                hf_config=PretrainedConfig(name_or_path="ckpt"),
+            )
 
     def test_media_sources_must_be_lists(self):
         # A bare source would otherwise be iterated item by item, e.g. a URL per character.
@@ -994,6 +1042,55 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (1, 2)),
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
+
+    def test_mrope_fallback_rebuilds_fields_only_for_a_strategy_with_mrope(self):
+        """A strategy without M-RoPE answers the fallback with none, also for int item fields
+        a rebuild could not concatenate; one with M-RoPE still gets the rebuilt fields."""
+
+        class _WidthGridStrategy(_ImageWidthStrategy):
+            mm_item_fields = {"pixel_values": Modality.IMAGE, "width": Modality.IMAGE}
+
+        class _MropeStrategy(_WidthGridStrategy):
+            def compute_mrope_positions(self, output):
+                return output["width"].tolist(), None
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+
+        def items(width_of):
+            return [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=torch.ones(width, 1),
+                    offsets=[(start, start + width - 1)],
+                    model_specific_data={"width": width_of(width)},
+                )
+                for start, width in ((1, 2), (4, 3))
+            ]
+
+        input_ids = [1, IMAGE, IMAGE, 2, IMAGE, IMAGE, IMAGE]
+        # Int grids as legacy DeepSeek-V4.1 keeps n_vit_h and n_vit_w; tensors for M-RoPE.
+        for strategy_class, width_of, positions in (
+            (_WidthGridStrategy, int, (None, None)),
+            (_MropeStrategy, lambda width: torch.tensor([width]), ([2, 3], None)),
+        ):
+            processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                strategy_class, TokenSpaceServingSpec
+            )(None, server_args, _bare_tokenizer(), None)
+            self.addCleanup(processor.shutdown)
+            with self.subTest(strategy=strategy_class.__name__):
+                self.assertEqual(
+                    processor.compute_mrope_positions(input_ids, items(width_of)),
+                    positions,
+                )
 
 
 class TestStrategyLoaders(unittest.TestCase):

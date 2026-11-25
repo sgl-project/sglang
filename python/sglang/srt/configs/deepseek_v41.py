@@ -44,6 +44,8 @@ class DeepseekV41Config(DeepseekV3Config):
     # V3 accepts the V4.1 compression ratios; the native V4 config rejects 1/2.
     model_type = "deepseek_v41"
     vision_n_layers = 0
+    # The model builds no vision tower when set; ModelConfig sets it for a server.
+    language_model_only = False
     hc_pre_from_prev_sublayer = True
     q_head_norm = False
     kv_source_layer_ids = ()

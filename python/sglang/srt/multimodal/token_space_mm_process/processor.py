@@ -101,7 +101,10 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         self.strategy = strategy_class(
             hf_config, processor, mm_process_config=self.mm_process_config
         )
-        self._strategy_fingerprint = self.strategy.preprocess_fingerprint_payload()
+        # Hashed once, so a payload the key cannot hold fails at construction.
+        # An empty payload adds no key part, so entries written without one stay valid.
+        payload = self.strategy.preprocess_fingerprint_payload()
+        self._strategy_key_parts = (build_cache_key(payload),) if payload else ()
         self._video_preprocessing_device = self.mm_process_config.get(
             "video_preprocessing_device", strategy_class.video_preprocessing_device
         )
@@ -272,7 +275,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                         transformers.__version__,
                         sglang_version,
                         self.hf_config.name_or_path,
-                        self._strategy_fingerprint,
+                        *self._strategy_key_parts,
                         self.mm_process_config,
                         self.image_processor_backend,
                         modality,

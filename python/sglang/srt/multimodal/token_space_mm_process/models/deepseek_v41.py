@@ -7,6 +7,7 @@ pass through unchanged.
 
 from types import MappingProxyType
 
+import msgspec
 import PIL
 import torch
 
@@ -24,6 +25,25 @@ from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
 
 # Per-image token counts the expansion reads; not a model input.
 _NUM_IMAGE_TOKENS = "num_image_tokens"
+
+
+class _VisionSettings(msgspec.Struct, frozen=True):
+    """The config fields patchify_image reads, fixed when the strategy is built."""
+
+    vision_patch_size: int
+    vision_downsample_ratio: int
+    vision_max_n_token: int
+    vision_min_pixels: int
+    vision_max_wh_ratio: int | None
+
+
+def _check_image_device(device, *, source):
+    # Patches are made on the CPU, so another device would be ignored without this.
+    if device is not None and torch.device(device).type != "cpu":
+        raise ValueError(
+            f"DeepSeek-V4.1 patchifies on the CPU, so {source} must be 'cpu' "
+            f"or unset, not {device!r}"
+        )
 
 
 class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
@@ -51,25 +71,57 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 "mm_process_config image_decoder must be 'pil' for DeepSeek-V4.1, "
                 "which patchifies PIL images"
             )
-        # A cache hit moves to the image device, where the CPU patches of a miss would not be.
-        if self.image_config.get("device", "cpu") != "cpu":
-            raise ValueError(
-                "mm_process_config image device must be 'cpu' for DeepSeek-V4.1, "
-                "which patchifies on the CPU"
+        _check_image_device(
+            self.image_config.get("device"),
+            source="mm_process_config['image']['device']",
+        )
+        # A vision tower as the model decides; text-only checkpoints share the architecture name.
+        # Serving never builds this without one; a trainer that does gets text, and an error for an image.
+        has_vision_tower = (
+            hf_config.model_type == "deepseek_v41"
+            and hf_config.vision_n_layers > 0
+            and not hf_config.language_model_only
+        )
+        # Patches and the cache key both come from this snapshot,
+        # whatever happens to hf_config afterwards.
+        self._vision = (
+            _VisionSettings(
+                vision_patch_size=hf_config.vision_patch_size,
+                vision_downsample_ratio=hf_config.vision_downsample_ratio,
+                vision_max_n_token=hf_config.vision_max_n_token,
+                vision_min_pixels=hf_config.vision_min_pixels,
+                vision_max_wh_ratio=hf_config.vision_max_wh_ratio,
             )
-        self.mm_token_expansion_params = {"image_token_id": hf_config.image_token_id}
+            if has_vision_tower
+            else None
+        )
+        self.mm_token_expansion_params = {
+            "image_token_id": hf_config.image_token_id if has_vision_tower else None
+        }
 
     def preprocess_fingerprint_payload(self):
-        # What patchify_image reads; Pillow 13 resizes some images differently
-        # (python-pillow/Pillow#9549).
-        return {
-            "vision_patch_size": self.hf_config.vision_patch_size,
-            "vision_downsample_ratio": self.hf_config.vision_downsample_ratio,
-            "vision_max_n_token": self.hf_config.vision_max_n_token,
-            "vision_min_pixels": self.hf_config.vision_min_pixels,
-            "vision_max_wh_ratio": self.hf_config.vision_max_wh_ratio,
-            "pillow": PIL.__version__,
-        }
+        if self._vision is None:
+            return {}
+        # Pillow 13 resizes some images differently (python-pillow/Pillow#9549).
+        return {**msgspec.structs.asdict(self._vision), "pillow": PIL.__version__}
+
+    def resolve_media_options(self, processor, *, image_device=None, video_device=None):
+        options = super().resolve_media_options(
+            processor, image_device=image_device, video_device=video_device
+        )
+        # A trainer can pass the device per call, past the check in __init__.
+        # Dropping it gives a call naming "cpu" and one naming nothing one cache key.
+        _check_image_device(
+            options[Modality.IMAGE].pop("device", None), source="image_device"
+        )
+        return options
+
+    def load_image(self, source):
+        if self._vision is None:
+            raise ValueError(
+                "This checkpoint has no vision tower, so image input is not supported"
+            )
+        return super().load_image(source)
 
     # Legacy loads images only; reject other media before decoding it.
     def load_video(self, source, *, video_decode_device):
@@ -80,13 +132,17 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
 
     def process_image(self, image, processor, preprocess_kwargs, **kwargs):
         patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = patchify_image(
-            image=image, args=self.hf_config
+            image=image, args=self._vision
         )
         return {
             "pixel_values": patches,
-            "n_vit_h": torch.tensor([n_vit_h]),
-            "n_vit_w": torch.tensor([n_vit_w]),
-            _NUM_IMAGE_TOKENS: [num_image_tokens(n_llm_h=n_llm_h, n_llm_w=n_llm_w)],
+            # On the CPU with the patches, even under a trainer's default device.
+            "n_vit_h": torch.tensor([n_vit_h], device="cpu"),
+            "n_vit_w": torch.tensor([n_vit_w], device="cpu"),
+            # A tensor, not a list, so a sampled cache check compares it.
+            _NUM_IMAGE_TOKENS: torch.tensor(
+                [num_image_tokens(n_llm_h=n_llm_h, n_llm_w=n_llm_w)], device="cpu"
+            ),
         }
 
     def build_processor_output(self, media_features, input_ids, *, processor):
@@ -100,12 +156,11 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     # each placeholder becomes a run of itself, one token per position of the image's span.
     def get_mm_token_expansion_spec(self, media_features, *, encode_expansion_text):
         image_token_id = self.mm_token_expansion_params["image_token_id"]
-        return {
-            image_token_id: [
-                [image_token_id] * count
-                for count in media_features.get(_NUM_IMAGE_TOKENS, [])
-            ]
-        }
+        if image_token_id is None:
+            return {}
+        counts = media_features.get(_NUM_IMAGE_TOKENS)
+        counts = [] if counts is None else counts.tolist()
+        return {image_token_id: [[image_token_id] * count for count in counts]}
 
 
 class DeepseekV41TokenSpaceServingSpec(TokenSpaceServingSpec):
@@ -137,7 +192,8 @@ class DeepseekV41TokenSpaceServingSpec(TokenSpaceServingSpec):
                 split.append(
                     MultimodalDataItem(
                         modality=item.modality,
-                        # Own storage, as legacy: a view would pickle the whole batch.
+                        # Own storage, as legacy: a view would pickle the whole batch,
+                        # and a lone image would share its tensor with the cache.
                         feature=feature.clone(),
                         offsets=[offsets],
                         model_specific_data={"n_vit_h": h, "n_vit_w": w},
