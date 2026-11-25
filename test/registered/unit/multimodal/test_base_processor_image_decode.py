@@ -111,10 +111,12 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
             "sglang.srt.multimodal.multimodal_processor_mixin.load_image",
             side_effect=requests.ConnectionError("connection refused"),
         ):
-            with self.assertRaisesRegex(ValueError, "connection refused"):
+            with self.assertRaisesRegex(ValueError, "ConnectionError") as ctx:
                 _StubProcessor._load_single_item(
-                    "https://127.0.0.1:1/not-an-image.png", Modality.IMAGE
+                    "https://example.com/fixture.png", Modality.IMAGE
                 )
+
+        self.assertNotIn("connection refused", str(ctx.exception))
 
     def test_invalid_image_bytes_are_a_client_error(self):
         with self.assertRaisesRegex(ValueError, "cannot identify image file"):
@@ -125,8 +127,10 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
             "sglang.srt.multimodal.multimodal_processor_mixin.load_image",
             side_effect=TypeError("unexpected loader bug"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
+            with self.assertRaisesRegex(RuntimeError, "TypeError") as ctx:
                 _StubProcessor._load_single_item(b"image", Modality.IMAGE)
+
+        self.assertNotIn("unexpected loader bug", str(ctx.exception))
 
     def test_high_fidelity_gpu_jpeg_decoder_is_selected(self):
         data = _jpeg_bytes()
