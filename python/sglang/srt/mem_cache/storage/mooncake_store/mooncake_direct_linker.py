@@ -24,6 +24,9 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
 )
+from sglang.srt.mem_cache.unified_cache.mamba_storage_retention import (
+    MambaStateRemover,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
@@ -117,6 +120,8 @@ def _storage_sharing(
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    removes_superseded_states = True
+
     def __init__(
         self,
         server_args,
@@ -246,6 +251,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.mamba_remover: MambaStateRemover | None = None
         self.load_io_executor = ThreadPoolExecutor(
             self.load_threads, thread_name_prefix=f"mooncake-load-io-tp{tp_rank}"
         )
@@ -644,7 +650,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
     def offload(
-        self, transfers: list[PoolTransfer], session_id: str | None = None
+        self,
+        transfers: list[PoolTransfer],
+        session_id: str | None = None,
+        superseded_mamba_keys: list[str] | None = None,
     ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
@@ -654,10 +663,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             self.offload_results.put(True)
             return True
+        # Only a stored newer state supersedes the old ones.
+        if not any(t.name == PoolName.MAMBA for t in expanded):
+            superseded_mamba_keys = None
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready = self.record_transfer_ready()
-        self.offload_queue.put((expanded, tokens, ready, session_id))
+        self.offload_queue.put(
+            (expanded, tokens, ready, session_id, superseded_mamba_keys)
+        )
         return True
 
     def offload_thread_func(self) -> None:
@@ -666,7 +680,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready, session_id = task
+                expanded, tokens, ready, session_id, superseded_mamba_keys = task
                 ready.synchronize()
                 extra_info = (
                     HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
@@ -675,6 +689,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 )
                 results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
+                if success and superseded_mamba_keys:
+                    if self.mamba_remover is None:
+                        self.mamba_remover = MambaStateRemover(self.stats)
+                    self.mamba_remover.submit(self.storage, superseded_mamba_keys)
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:

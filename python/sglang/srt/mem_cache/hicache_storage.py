@@ -485,6 +485,15 @@ class HiCacheStorage(ABC):
         """
         raise NotImplementedError()
 
+    def batch_remove_pool_keys(
+        self, pool_name: PoolName, page_keys: List[str]
+    ) -> Optional[List[int]]:
+        """Remove one pool's objects for ``page_keys``, keeping leased ones.
+
+        Returns a status per removed object, or None when unsupported.
+        """
+        return None
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -745,6 +754,11 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
                 for transfer in transfers
             }
         return self._backend.batch_set_v2(transfers, extra_info)
+
+    def batch_remove_pool_keys(
+        self, pool_name: PoolName, page_keys: List[str]
+    ) -> Optional[List[int]]:
+        return self._backend.batch_remove_pool_keys(pool_name, page_keys)
 
     def batch_get_v1(
         self,
