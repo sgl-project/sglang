@@ -305,7 +305,11 @@ class TestNanLogits(CustomTestCase):
 
     def test_sanitize_mode_heals_verify_logits_as_decode(self):
         """A masked token's logprob is -1e30 on both, not -inf on verify."""
-        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
+        with (
+            envs.SGLANG_SANITIZE_NAN_LOGITS.override(True),
+            envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(False),
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
+        ):
             decode = self._decode(self._logits())
             verify = self._verify(self._logits())
         self.assertTrue(torch.equal(verify, decode))
@@ -313,7 +317,12 @@ class TestNanLogits(CustomTestCase):
         self.assertTrue(torch.isfinite(torch.log_softmax(verify, dim=-1)).all())
 
     def test_default_env_leaves_verify_logits_unhealed(self):
-        verify = self._verify(self._logits())
+        # The NaN probe is off, as in the default env (rerun CI turns it on).
+        with (
+            envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(False),
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
+        ):
+            verify = self._verify(self._logits())
         self.assertTrue(verify[0, 0].isnan())
         self.assertEqual(verify[0, 1:3].tolist(), [float("inf"), float("-inf")])
 

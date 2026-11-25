@@ -320,7 +320,12 @@ class TestSynthIDEngine(CustomTestCase):
         verify = engine.bind_verify(
             SynthIDRows.from_candidates([True], "cpu"), full_mask=True
         )
-        with envs.SGLANG_SANITIZE_NAN_LOGITS.override(True):
+        # The NaN probe would raise first when a run enables it (rerun CI does).
+        with (
+            envs.SGLANG_SANITIZE_NAN_LOGITS.override(True),
+            envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(False),
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
+        ):
             verified, _ = verify.apply(
                 logits,
                 sampling_info=_info(1),
