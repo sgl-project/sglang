@@ -3817,7 +3817,10 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.tree_cache_has_linker():
+        if (
+            self.enable_unified_cache_external_linker
+            and self.tree_cache.linker is not None
+        ):
             return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -4352,7 +4355,10 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
-            or self.tree_cache_has_linker()
+            or (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            )
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
@@ -6150,7 +6156,11 @@ class Scheduler(
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
                 or self.deferred_responses.has_pending()
-                or (self.tree_cache_has_linker() and self.tree_cache.linker.prefetches)
+                or (
+                    self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker is not None
+                    and self.tree_cache.linker.prefetches
+                )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -6273,7 +6283,10 @@ class Scheduler(
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
-            if self.tree_cache_has_linker():
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            ):
                 idle &= not self.tree_cache.linker.prefetches
 
         return idle
@@ -6387,13 +6400,6 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
-
-    def tree_cache_has_linker(self) -> bool:
-        # The linker can be detached at runtime, so the launch flag alone is not enough.
-        return (
-            self.enable_unified_cache_external_linker
-            and self.tree_cache.linker is not None
-        )
 
     def update_cache_linker_wrapped(
         self, recv_req: UpdateCacheLinkerReqInput
