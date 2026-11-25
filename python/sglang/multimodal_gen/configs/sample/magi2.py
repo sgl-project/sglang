@@ -4,7 +4,6 @@ from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
-    align_num_frames_for_num_gpus,
 )
 
 # 1088 rather than 1080: the VAE stride forces multiples of 16.
@@ -80,9 +79,20 @@ class Magi2SamplingParams(SamplingParams):
     generate_audio: bool = True
 
     def __post_init__(self) -> None:
+        self.adjust_frames = False  # clip length is fixed by the model
         if self.supported_resolutions is None:
             self.supported_resolutions = list(MAGI2_RESOLUTIONS)
         super().__post_init__()
+
+    def _adjust(self, server_args: Any) -> None:
+        explicit = getattr(self, "_explicit_fields", None) or set()
+        if (
+            not getattr(server_args.pipeline_config, "enable_refiner", True)
+            and not explicit & {"width", "height"}
+        ):
+            self.width = self.preview_width
+            self.height = self.preview_height
+        super()._adjust(server_args)
 
     def _validate(self) -> None:
         super()._validate()
@@ -98,17 +108,10 @@ class Magi2SamplingParams(SamplingParams):
                 f"got {self.preview_width}x{self.preview_height}"
             )
 
-        # The clip length is fixed: both preview and refiner grids derive their
-        # time dimension from MAGI2_BASE_FRAMES, not from this field. The ±5%
-        # window accommodates the per-GPU rounding that _adjust applies
-        # (e.g. 253 at 4/8 GPUs); values outside it are almost certainly wrong.
-        nominal_frames = MAGI2_CLIP_SECONDS * self.fps
-        if abs(self.num_frames - nominal_frames) > 0.05 * nominal_frames:
+        if (self.num_frames, self.fps) != (MAGI2_NUM_FRAMES, MAGI2_REFINER_FPS):
             raise ValueError(
-                f"MAGI-2 only generates {MAGI2_CLIP_SECONDS:g}s clips "
-                f"({round(nominal_frames)} frames at fps={self.fps}); "
-                f"got num_frames={self.num_frames}. The actual clip length is "
-                "always fixed by the model; this field is validated but ignored."
+                f"MAGI-2 only supports {MAGI2_NUM_FRAMES} frames at {MAGI2_REFINER_FPS} fps; "
+                f"got num_frames={self.num_frames}, fps={self.fps}"
             )
 
         if self.num_inference_steps is not None and self.num_inference_steps < 1:
@@ -124,9 +127,6 @@ class Magi2SamplingParams(SamplingParams):
 
     def _validate_with_pipeline_config(self, pipeline_config) -> None:
         super()._validate_with_pipeline_config(pipeline_config)
-        # When the refiner is disabled the server can only deliver 896×512.
-        # Silently downgrading a 1920×1088 request would produce a file whose
-        # size disagrees with the job metadata; reject it explicitly instead.
         if (
             not getattr(pipeline_config, "enable_refiner", True)
             and (self.width, self.height) != (self.preview_width, self.preview_height)
@@ -140,24 +140,12 @@ class Magi2SamplingParams(SamplingParams):
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any
     ) -> None:
-        # The generic default picks the 896x512 preview-only tier, which never
-        # runs the refiner or the 1080p decode.
         if server_args.warmup_resolutions is not None:
             return
         req.width, req.height = self._default_width, self._default_height
         if server_args.warmup_num_frames is not None:
             return
-        # Warmup skips _adjust, so apply the same per-GPU rounding real requests get.
-        req.num_frames = (
-            align_num_frames_for_num_gpus(
-                MAGI2_NUM_FRAMES,
-                num_gpus=server_args.num_gpus,
-                vae_config=server_args.pipeline_config.vae_config,
-                round_down=self.num_frames_round_down,
-            )
-            if self.adjust_frames
-            else MAGI2_NUM_FRAMES
-        )
+        req.num_frames = MAGI2_NUM_FRAMES
 
     @classmethod
     def lower_video_request_kwargs(
