@@ -1304,6 +1304,9 @@ class SchedulingVPPCore:
                     decode
                     and not rank_schedule.inflight_count
                     and not decode_round_active
+                    # Give ready requests an admission turn when this tick
+                    # completes a capacity-blocked queue round.
+                    and not decode_round_active_at_tick_start
                 ):
                     self.disagg_decode_transfer_queue.resolve_deferred_releases()
                     self.disagg_decode_prealloc_queue.publish_pending_destinations()
@@ -1707,6 +1710,7 @@ class SchedulingVPPCore:
 
         while True:
             server_is_idle = True
+            decode_round_active_at_tick_start = decode_round_active
             process_control_messages()
             self._pp_vpp_reap_send_work(activation_send_work)
             self._pp_vpp_flush_control_outbox(

@@ -593,6 +593,48 @@ class TestSchedulingVPPCore(CustomTestCase):
         )
         self.assertEqual(scheduler.idle_ticks, [1])
 
+    def test_decode_round_completion_admits_ready_request_with_pending_prealloc(self):
+        """A capacity-blocked preallocation must not starve a ready decode."""
+
+        def before_tick(scheduler, context):
+            if context["tick"] == 0:
+                self._tick_batches(scheduler, 1)
+                scheduler.running_mbs = []
+                scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+                    publish_pending_destinations=lambda: None
+                )
+                scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+                    resolve_deferred_releases=lambda: None,
+                    publish_pending_metadata=lambda: None,
+                )
+                scheduler._pp_vpp_decode_queues_pending = lambda: True
+                scheduler._pp_vpp_decode_poll = lambda operation, slot: []
+                scheduler._pp_vpp_decode_apply = lambda operation, outcomes: outcomes
+            else:
+                envelope, wire = self._control_message(
+                    scheduler,
+                    PipelineControlKind.DECODE_STATUS,
+                    returned=True,
+                    payload={
+                        "phase": "apply",
+                        "operation": "transfer",
+                        "slot_id": 0,
+                        "outcomes": {},
+                    },
+                )
+                scheduler.controls.append((envelope, wire))
+
+        scheduler, context = self._control_loop(
+            rank=0,
+            core_type=_TickCore,
+            ticks=2,
+            before_tick=before_tick,
+            mode=DisaggregationMode.DECODE,
+        )
+        self.assertEqual(scheduler.actions, [(0, 0)])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(context["rank_schedule"].inflight_count, 1)
+
     def test_decode_queue_vote_waits_for_retained_batch_and_failure_wins(self):
         scheduler, context = self._control_loop()
         scheduler._pp_vpp_decode_poll = lambda operation, slot: {"request": True}
