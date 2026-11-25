@@ -15,6 +15,9 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.prefill_busy_clock import (
+    PrefillBusyClock,
+)
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -234,6 +237,10 @@ class SchedulerMetricsReporter:
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
+    # Runs whether or not metrics are enabled.
+    prefill_busy_clock: PrefillBusyClock = dataclasses.field(
+        default_factory=PrefillBusyClock
+    )
 
     def __post_init__(self) -> None:
         self.enable_metrics = self.metrics_collector_context.enable_metrics
@@ -1346,15 +1353,17 @@ class SchedulerMetricsReporter:
 
     def record_scheduler_active(self, event_ns: int) -> None:
         """End CPU-side idle at event_ns (monotonic nanoseconds)."""
+        self.prefill_busy_clock.mark_busy(event_ns)
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.set_idle(False)
         self._record_scheduler_time(is_idle=False, event_ns=event_ns)
 
     def record_scheduler_idle(self) -> None:
         """Start CPU-side idle at the current monotonic time."""
+        now_ns = self.prefill_busy_clock.mark_idle()
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.set_idle(True)
-        self._record_scheduler_time(is_idle=True, event_ns=time.monotonic_ns())
+        self._record_scheduler_time(is_idle=True, event_ns=now_ns)
 
     def _record_scheduler_time(self, is_idle: bool, event_ns: int) -> None:
         if not (self.enable_metrics or ENABLE_METRICS_DEVICE_TIMER):

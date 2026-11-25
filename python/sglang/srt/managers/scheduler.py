@@ -2951,10 +2951,21 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: (
                 self.total_prefill_uncached_tokens
             ),
-            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_total_prefill_busy_us=lambda: self._get_total_prefill_busy_us(),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
+
+    def _get_total_prefill_busy_us(self) -> int:
+        """Prefill busy time: all non-idle wall time on a PD prefill engine, else step time."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return self.metrics_reporter.prefill_busy_clock.read_us()
+        return self.total_prefill_busy_us
+
+    def _carry_prefill_busy_us(self, busy_us: int) -> None:
+        """Continue the published prefill busy time from busy_us in either role."""
+        self.total_prefill_busy_us = busy_us
+        self.metrics_reporter.prefill_busy_clock.restart(busy_us)
 
     def init_kv_weight_version_tracker(self) -> None:
         self.kv_weight_version_tracker = KvWeightVersionTracker.maybe_create(
@@ -5937,6 +5948,10 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
+        pd_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        if pd_prefill:
+            # Count the step's tokens before a snapshot that carries busy time up to now.
+            self._record_step_counters(batch, result)
         # Extend and idle results always publish; decode steps are throttled
         # to the publish interval. An idle batch exists only to join
         # attention-DP collectives while other ranks have work, and on_idle
@@ -5976,7 +5991,8 @@ class Scheduler(
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
-        self._record_step_counters(batch, result)
+        if not pd_prefill:
+            self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
@@ -5996,6 +6012,10 @@ class Scheduler(
         if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # PD prefill busy time is the metrics reporter's prefill_busy_clock.
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
             return
         start_iter, start_ts = batch.forward_iter, batch.launch_ts
         prev = self._prev_step
@@ -6661,6 +6681,16 @@ class Scheduler(
                 else:
                     req.request_finish(FINISH_ABORT())
 
+    def _start_pause_window(self) -> None:
+        """Stop counting busy time; a repeated pause keeps the first start."""
+        self.pause_state.start_window()
+        self.metrics_reporter.prefill_busy_clock.pause()
+
+    def _resume_pause(self) -> None:
+        """Close the pause window and count busy time again from now."""
+        self.pause_state.resume()
+        self.metrics_reporter.prefill_busy_clock.resume()
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
         self.pause_state.pause()
@@ -6673,12 +6703,12 @@ class Scheduler(
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
-            self.pause_state.start_window()
+            self._start_pause_window()
             return
 
         if get_parallel().pp_size > 1:
             # The PP loops hold this pause until no micro-batch is in flight.
-            self.pause_state.start_window()
+            self._start_pause_window()
             self._pp_retract_microbatches()
             self._publish_paused_state()
             return
@@ -6695,7 +6725,7 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.
-        self.pause_state.start_window()
+        self._start_pause_window()
         self._retract_batches([(self.running_batch, self.last_batch)])
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -6820,7 +6850,7 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
-        self.pause_state.resume()
+        self._resume_pause()
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
