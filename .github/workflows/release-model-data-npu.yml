@@ -9,6 +9,8 @@ name: Release Model Data (NPU)
 
 on:
   pull_request:
+    # Path-filtered to this file, so editing it is also how the collection is
+    # re-triggered for a PR.
     paths:
       - ".github/workflows/release-model-data-npu.yml"
   workflow_dispatch:
