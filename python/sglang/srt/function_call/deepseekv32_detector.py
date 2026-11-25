@@ -75,7 +75,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
     tool_calls_block_name = "function_calls"
     invoke_tag_name = "invoke"
     parameter_tag_name = "parameter"
-    strip_string_param_value: bool = True
 
     def __init__(self):
         super().__init__()
@@ -169,11 +168,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
             last_match_end = match.end()
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters[param_name] = (
-                    param_value.strip()
-                    if self.strip_string_param_value
-                    else param_value
-                )
+                # NOTE: Verbatim, as DeepSeek's encoder writes it and its
+                # reference parser reads it back; a file's trailing newline
+                # is part of the argument.
+                parameters[param_name] = param_value
             else:
                 # Try to parse as JSON for other types
                 try:

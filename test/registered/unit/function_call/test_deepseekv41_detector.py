@@ -258,6 +258,46 @@ class TestDeepSeekV41ParameterGrammar(CustomTestCase):
         )
 
 
+class TestDeepSeekV41StringArgumentRoundTrip(CustomTestCase):
+    """String arguments the encoder renders must parse back unchanged, as
+    deepseek-recipe reads them; stripping rewrote a file's trailing newline."""
+
+    def setUp(self):
+        self.tools = _tools()
+        self.query = "  def f():\n\treturn 1\n"
+        self.output = _render_assistant(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": json.dumps({"query": self.query, "limit": 2}),
+                        },
+                    }
+                ],
+            },
+            thinking=False,
+        ).removesuffix(EOS)
+
+    def test_non_streaming_keeps_whitespace(self):
+        calls = DeepSeekV41Detector().detect_and_parse(self.output, self.tools).calls
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0].parameters), {"query": self.query, "limit": 2}
+        )
+
+    def test_streaming_keeps_whitespace(self):
+        detector = DeepSeekV41Detector()
+        arguments = ""
+        for char in self.output:
+            for call in detector.parse_streaming_increment(char, self.tools).calls:
+                arguments += call.parameters or ""
+        self.assertEqual(json.loads(arguments), {"query": self.query, "limit": 2})
+
+
 if __name__ == "__main__":
     import unittest
 
