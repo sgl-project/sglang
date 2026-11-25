@@ -1181,6 +1181,62 @@ def test_fused_silu_tiny_group():
     torch.testing.assert_close(deq, ref, rtol=0.13, atol=0.0)
 
 
+@pytest.mark.parametrize("rows,hidden", [(1, 256), (17, 256), (1024, 256), (64, 2048)])
+def test_fused_silu_clamp_bitexact(rows, hidden):
+    """Fused silu_and_mul_clamp + FP8 quant matches the two-step path bit-for-bit."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+
+    torch.manual_seed(42 + rows + hidden)
+    x = (
+        torch.randn(rows, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 8.0
+    ).contiguous()
+    mid = torch.empty((rows, hidden), device="cuda", dtype=torch.bfloat16)
+    silu_and_mul_clamp(x, mid, 10.0)
+    q_ref, s_ref = sglang_per_token_group_quant_fp8(mid, G)
+
+    q_opt, s_opt = per_token_group_quant(
+        x, group_size=G, fuse_silu_and_mul=True, swiglu_limit=10.0
+    )
+    assert torch.equal(q_opt.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s_opt, s_ref)
+
+
+def test_fused_silu_clamp_sorted_rows():
+    """Sorted MoE layout with swiglu_limit skips padding rows and matches flat output."""
+    torch.manual_seed(17)
+    num_valid, rows, hidden = 180, 256, 256
+    x = (
+        torch.randn(rows, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 8.0
+    ).contiguous()
+    sorted_ids = torch.arange(rows, dtype=torch.int32, device="cuda")
+    sorted_ids[num_valid:] = num_valid + 3
+    num_post = torch.tensor([200], dtype=torch.int32, device="cuda")
+
+    q_ref, s_ref = per_token_group_quant(
+        x, group_size=G, fuse_silu_and_mul=True, swiglu_limit=10.0
+    )
+    q_sorted = torch.full((rows, hidden), 0x7F, dtype=torch.uint8, device="cuda").view(
+        fp8_dtype
+    )
+    s_sorted = torch.full((rows, hidden // G), float("nan"), device="cuda")
+    per_token_group_quant(
+        x,
+        q_sorted,
+        s_sorted,
+        group_size=G,
+        fuse_silu_and_mul=True,
+        swiglu_limit=10.0,
+        sorted_token_ids=sorted_ids,
+        num_tokens_post_padded=num_post,
+        num_valid_tokens=num_valid,
+    )
+    assert torch.equal(
+        q_sorted[:num_valid].view(torch.uint8), q_ref[:num_valid].view(torch.uint8)
+    )
+    assert torch.equal(s_sorted[:num_valid], s_ref[:num_valid])
+    assert (q_sorted[200:].view(torch.uint8) == 0x7F).all()
+
+
 if __name__ == "__main__":
     import sys
 

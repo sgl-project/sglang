@@ -186,6 +186,7 @@ struct QuantKernelParams {
   detail::ScaleStoreArgs scale;
   uint32_t num_tokens;   // tokens_pad for the masked kernel
   uint32_t hidden_size;  // = num_groups * kGroupSize
+  float swiglu_limit = 0.0f;  // only read when kFuseSiluAndMul && kApplySwigluLimit
 };
 
 struct MaskedQuantKernelParams {
@@ -231,7 +232,8 @@ template <
     bool kRowMajor_,
     bool kAligned_,
     bool kFuseSiluAndMul_,
-    bool kDenseSiluAndMul = false>
+    bool kDenseSiluAndMul = false,
+    bool kApplySwigluLimit = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -249,6 +251,9 @@ struct QuantTrait {
   static_assert(sizeof(InputType) == 2 || sizeof(InputType) == 4, "inputs must be 16-bit (bf16/fp16) or fp32");
   static_assert(sizeof(InputType) == 2 || !kFuseSiluAndMul, "fp32 inputs do not implement the fused silu");
   static_assert(!kDenseSiluAndMul || (kFuseSiluAndMul && kGroupSize == 128 && std::is_same_v<QuantType, fp8_e4m3_t>));
+  static_assert(
+      !kApplySwigluLimit || (kFuseSiluAndMul && std::is_same_v<InputType, bf16_t> && !kDenseSiluAndMul),
+      "swiglu_limit clamp requires bf16 fused silu_and_mul");
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
@@ -301,12 +306,25 @@ struct QuantTrait {
       up.load(token_in + group_offset + params.hidden_size, lane_id);
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        const auto gate = cast<float2>(in[i]);
-        if constexpr (kDenseSiluAndMul) {
+        if constexpr (kApplySwigluLimit) {
+          // Match silu_mul_clamp_kernel bit-for-bit: clamp gate/up in bf16,
+          // compute fp32 silu(gate) * up, then round product to bf16 before quant.
+          const bf16_t pos_lim = cast<bf16_t>(params.swiglu_limit);
+          const bf16_t neg_lim = cast<bf16_t>(-params.swiglu_limit);
+          const bf16x2_t pos_lim2 = {pos_lim, pos_lim};
+          const bf16x2_t neg_lim2 = {neg_lim, neg_lim};
+          const auto g_clamped = __hmin2(in[i], pos_lim2);
+          const auto u_clamped = __hmin2(__hmax2(up[i], neg_lim2), pos_lim2);
+          const auto gate = cast<float2>(g_clamped);
+          const auto up_f32 = cast<float2>(u_clamped);
+          in[i] = cast<T2>(float2{activation::silu(gate.x) * up_f32.x, activation::silu(gate.y) * up_f32.y});
+        } else if constexpr (kDenseSiluAndMul) {
           // Match dense activation.cuh: round the product, not SiLU, to T.
+          const auto gate = cast<float2>(in[i]);
           const auto up_f32 = cast<float2>(up[i]);
           in[i] = cast<T2>(float2{activation::silu(gate.x) * up_f32.x, activation::silu(gate.y) * up_f32.y});
         } else {
+          const auto gate = cast<float2>(in[i]);
           const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
           in[i] = __hmul2(act, up[i]);
         }
@@ -641,7 +659,8 @@ template <
     bool kAligned,
     bool kFuseSiluAndMul,
     bool kUsePDL,
-    bool kDenseSiluAndMul = false>
+    bool kDenseSiluAndMul = false,
+    bool kApplySwigluLimit = false>
 struct PerTokenGroupQuantFlatKernel {
   using Trait = QuantTrait<
       InputType,
@@ -652,10 +671,21 @@ struct PerTokenGroupQuantFlatKernel {
       kRowMajor,
       kAligned,
       kFuseSiluAndMul,
-      kDenseSiluAndMul>;
+      kDenseSiluAndMul,
+      kApplySwigluLimit>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false>(ctx, ctx.params);
+  }
+
+  static void run_clamped(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      double swiglu_limit) {
+    auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    ctx.params.swiglu_limit = static_cast<float>(swiglu_limit);
     launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false>(ctx, ctx.params);
   }
 };
@@ -669,10 +699,20 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kApplySwigluLimit = false>
 struct PerTokenGroupQuantSortedKernel {
-  using Trait =
-      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kPackedScale, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kPackedScale,
+      kRowMajor,
+      kAligned,
+      kFuseSiluAndMul,
+      /*kDenseSiluAndMul=*/false,
+      kApplySwigluLimit>;
 
   /// \brief Flat quantization over the sorted, block-padded MoE layout.
   /// \param sorted_token_ids moe_align_block_size output; entries >= num_valid_tokens are padding.
@@ -685,12 +725,24 @@ struct PerTokenGroupQuantSortedKernel {
       tvm::ffi::TensorView sorted_token_ids,
       tvm::ffi::TensorView num_tokens_post_padded,
       int64_t num_valid_tokens) {
+    run_clamped(input, output_q, output_s, sorted_token_ids, num_tokens_post_padded, num_valid_tokens, 0.0);
+  }
+
+  static void run_clamped(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      tvm::ffi::TensorView sorted_token_ids,
+      tvm::ffi::TensorView num_tokens_post_padded,
+      int64_t num_valid_tokens,
+      double swiglu_limit) {
     using namespace host;
     CHECK_HOST(is_type<int32_t>(sorted_token_ids.dtype())) << "sorted_token_ids must have dtype int32";
     CHECK_HOST(is_type<int32_t>(num_tokens_post_padded.dtype())) << "num_tokens_post_padded must have dtype int32";
     CHECK_HOST(0 <= num_valid_tokens && num_valid_tokens <= std::numeric_limits<int32_t>::max())
         << "num_valid_tokens out of range: " << num_valid_tokens;
-    const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    ctx.params.swiglu_limit = static_cast<float>(swiglu_limit);
     CHECK_HOST(sorted_token_ids.numel() >= ctx.params.num_tokens) << "sorted_token_ids must cover every row";
     const auto params = SortedQuantKernelParams{
         ctx.params,
