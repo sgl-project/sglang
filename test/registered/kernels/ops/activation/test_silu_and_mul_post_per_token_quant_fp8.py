@@ -6,12 +6,19 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_sail
+from sglang.srt.utils import get_device_sm, is_sail
 from sglang.test.ci.ci_register import register_ppu_ci
 
 register_ppu_ci(est_time=30, suite="extra-test-1-gpu-ppu")
 
-pytestmark = pytest.mark.skipif(not is_sail(), reason="SAIL-only kernel")
+pytestmark = [
+    pytest.mark.skipif(not is_sail(), reason="SAIL-only kernel"),
+    # ZW810E (SM<89) only supports INT8 quantization; keep the FP8 path off it.
+    pytest.mark.skipif(
+        get_device_sm() < 89,
+        reason="The SAIL FP8 quantization path is only validated on SM89+ devices",
+    ),
+]
 
 
 def _swiglu_ref(gateup: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:

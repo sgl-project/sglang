@@ -75,6 +75,13 @@ PY
     python3 -m pip wheel --no-deps --no-build-isolation \
         --wheel-dir "$wheel_dir/runtime-deps" \
         git+https://github.com/t-head/sailify.git@f401ecae76d7b4991d44920bde9edaac7e655fd8
+    # The CUDA sgl-kernel wheel vendors triton_kernels from its Triton checkout,
+    # but the SAIL AOT wheel does not; the fp4 MoE tests import
+    # triton_kernels.numerics_details.mxfp. Build the same pinned snapshot
+    # (PyPI publishes a different project under this name).
+    python3 -m pip wheel --no-deps --no-build-isolation \
+        --wheel-dir "$wheel_dir/runtime-deps" \
+        "git+https://github.com/triton-lang/triton.git@c69c3a9544a8d3d4061848fed4e94e43770f9b10#subdirectory=python/triton_kernels"
     python3 -m pip install --no-deps --force-reinstall "$wheel_dir/runtime-deps/"*.whl
     requirements=$(python3 "$checker" requirements)
     mapfile -t eval_requirements <<< "$requirements"

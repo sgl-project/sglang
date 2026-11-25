@@ -102,6 +102,10 @@ class TestSituAndMul(CustomTestCase):
                         atol=0,
                     )
 
+    @unittest.skipIf(
+        get_device_sm() < 89,
+        "The e2m1 conversion PTX instructions require SM89+ devices.",
+    )
     def test_masked_mxfp4_matches_compact_and_independent_dequantization(self):
         """Check BF16 rounding, E8M0 scale bytes, E2M1 packing and the MN-major
         physical layout."""
@@ -219,11 +223,16 @@ class TestSituAndMul(CustomTestCase):
             )
             counts = torch.zeros(experts, device="cuda", dtype=torch.int32)
             self.assertIs(situ_and_mul_masked(x, out, counts, _BETA, None), out)
-            q = torch.empty((experts, tokens, 128), device="cuda", dtype=torch.uint8)
-            scales = torch.empty(
-                (experts, 4, tokens), device="cuda", dtype=torch.uint16
-            )
-            situ_and_mul_masked_post_quant_mxfp4(x, q, scales, counts, _BETA, None)
+            # The mxfp4 launcher shares the SM89+ e2m1 requirement; ZW810E
+            # (SM<89) only supports INT8 quantization.
+            if get_device_sm() >= 89:
+                q = torch.empty(
+                    (experts, tokens, 128), device="cuda", dtype=torch.uint8
+                )
+                scales = torch.empty(
+                    (experts, 4, tokens), device="cuda", dtype=torch.uint16
+                )
+                situ_and_mul_masked_post_quant_mxfp4(x, q, scales, counts, _BETA, None)
         x = torch.empty((1, 2, 512), device="cuda", dtype=torch.bfloat16)
         counts = torch.ones(1, device="cuda", dtype=torch.int32)
         # The contiguous shape is valid, but the vector start address is offset by

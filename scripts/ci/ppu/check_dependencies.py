@@ -18,7 +18,12 @@ PINNED_ADDITIONS = {
     "latex2sympy2-extended": "1.11.0",
     "antlr4-python3-runtime": "4.9.3",
     "editdistance": "0.8.1",
+    # Built from a pinned triton-lang/triton revision in build_and_test.sh;
+    # PyPI publishes a different project under this name.
+    "triton-kernels": "1.0.0",
 }
+# Pinned additions built from git revisions instead of PyPI releases.
+GIT_SOURCED_ADDITIONS = {"sailify", "triton-kernels"}
 SAIL_ALIASES = {
     "deep-gemm-for-sail": "deep-gemm",
     "flash-attention-for-sail": "flash-attn",
@@ -484,7 +489,7 @@ def main():
         return 0
     if args.command == "requirements":
         for name, version in PINNED_ADDITIONS.items():
-            if name != "sailify":
+            if name not in GIT_SOURCED_ADDITIONS:
                 print(f"{name}=={version}")
         return 0
     if args.command == "missing-wheels":
