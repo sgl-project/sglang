@@ -1342,6 +1342,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             index_k_item_size = (
                 index_k_buffer.element_size() if index_k_buffer is not None else 0
             )
+            scale_item_size = (
+                scale_buffer.element_size() if scale_buffer is not None else 0
+            )
             # FP8 DSA packs V into k_buffer; the device v_buffer is empty and
             # never transferred, so the host v mirror holds no valid data and
             # must not be persisted to storage.

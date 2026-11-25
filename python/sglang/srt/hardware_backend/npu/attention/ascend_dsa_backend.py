@@ -345,7 +345,7 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
 
 def _index_k_scale_cache(pool, layer_id: int):
     """FP32/FP16 per-row scales for FP8/INT8, raw E8M0 bytes for MXFP8."""
-    if pool.dsa_kv_cache_store_fp8 or pool.indexer_kv_store_int8:
+    if pool.indexer_quant:
         return pool.get_index_k_scale_buffer(layer_id)
     if pool.indexer_kv_store_mxfp8:
         return pool.get_index_k_scale_buffer(layer_id).view(torch.uint8)
@@ -389,11 +389,11 @@ def _get_topk_npu(
     pool, layer_id = kv.view, kv.view_layer_id
     quant_mode = -1  # unquant BF16
     weights_dtype = torch.bfloat16
-    if pool.dsa_kv_cache_store_fp8:
-        quant_mode = 0  # FP8 per-token-head quant
-    elif pool.indexer_kv_store_int8:
+    if pool.indexer_kv_store_int8:
         quant_mode = 2  # INT8 quant
         weights_dtype = torch.float16
+    elif pool.indexer_quant:
+        quant_mode = 0  # FP8 per-token-head quant
     elif pool.indexer_kv_store_mxfp8:
         quant_mode = 1  # MXFP8 quant
 
