@@ -1491,7 +1491,9 @@ def test_activation_scale_is_shared_across_token_blocks(block_m, tail):
 )
 def test_block_fp8_activation_matches_torch_on_partial_strided_blocks():
     values = torch.linspace(-2, 2, 256 * 129, device="cuda").bfloat16().view(256, 129).T
-    values[0, 0] = 2.03125  # Multiplying by 1/448 and dividing by 448 round differently.
+    values[0, 0] = (
+        2.03125  # Multiplying by 1/448 and dividing by 448 round differently.
+    )
     values[:128, 128:] = 0
     values[-1, 0] = float("nan")
     values[-1, 128] = float("inf")
