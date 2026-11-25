@@ -958,6 +958,19 @@ class TestPrepareServerArgs(CustomTestCase):
                 ServerArgs(model_path="dummy", **fields).resolve_once()
             self.assertEqual(str(raised.exception), message)
 
+    def test_malformed_env_value_stops_startup(self):
+        """A registered environment variable whose value does not parse stops
+        startup, even when only a later code path would read it."""
+        with (
+            envs.SGLANG_EXA_NUM_RESULTS.override("ten"),
+            self.assertRaisesRegex(
+                ValueError,
+                'Invalid value for SGLANG_EXA_NUM_RESULTS: "ten" is not a valid '
+                "integer value",
+            ),
+        ):
+            ServerArgs(model_path="dummy").resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

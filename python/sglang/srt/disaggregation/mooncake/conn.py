@@ -3537,16 +3537,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
+                # Read the status once: the scheduler can clear a Failed room
+                # between two reads.
+                status = self.request_status.get(kv_chunk.room)
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(kv_chunk.room) == KVPoll.Failed
-                    )
+                    status is None
+                    or status == KVPoll.Success
+                    or (kv_chunk.is_last_chunk and status == KVPoll.Failed)
                 ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
+                    self.transfer_infos.pop(kv_chunk.room, None)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
                     if self.enable_staging:
                         # Purge prefetch bookkeeping for the finished room.
