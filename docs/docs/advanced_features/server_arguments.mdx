@@ -224,6 +224,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## HTTP server
+
+<Warning>
+`--host` defaults to `127.0.0.1`. Before binding to `0.0.0.0` or exposing the port beyond a trusted network, set `--api-key`: without it, anyone who can reach the port can send requests. Set `--admin-api-key` only if you need the control endpoints it unlocks (weight updates, LoRA loading, profiling), and keep it separate from `--api-key`.
+</Warning>
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2867,8 +2872,8 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-continuous-decode-steps`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>Deprecated.</strong> Has no effect.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
     <tr>
