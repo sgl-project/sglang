@@ -254,7 +254,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         from sglang.srt.layers.quantization.gguf import GGUFConfig
 
         norm_topk_prob = getattr(config, "norm_topk_prob", True)
-        if isinstance(quant_config, GGUFConfig):
+        if _is_npu and isinstance(quant_config, GGUFConfig):
             norm_topk_prob = False
 
         self.experts = get_moe_impl_class(quant_config)(

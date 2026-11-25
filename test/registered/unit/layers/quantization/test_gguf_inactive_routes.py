@@ -67,6 +67,59 @@ class TestGgufInactiveRoutes(CustomTestCase):
             dense.append(torch.from_numpy(dequantize(qweight, quant_type)).cuda())
         return packed, dense
 
+    def test_loaded_expert_shards_are_materialized(self):
+        """Post-load processing must expose packed expert shards as usable weights."""
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        with torch.device("cuda"):
+            layer = FusedMoE(
+                num_experts=4,
+                top_k=2,
+                hidden_size=256,
+                intermediate_size=256,
+                layer_id=0,
+                quant_config=GGUFConfig(),
+            )
+        packed, _ = self._weights(GGMLQuantizationType.Q4_0)
+        for expert in range(4):
+            for param, weight, shard in (
+                (layer.w13_qweight, packed[0][expert, :256], "w1"),
+                (layer.w13_qweight, packed[0][expert, 256:], "w3"),
+                (layer.w2_qweight, packed[1][expert], "w2"),
+            ):
+                param.weight_loader(param, weight, "qweight", shard, expert)
+        layer.quant_method.process_weights_after_loading(layer)
+        for param, expected in zip((layer.w13_qweight, layer.w2_qweight), packed):
+            torch.testing.assert_close(param, expected, rtol=0, atol=0)
+
+    def test_qwen3_cuda_routing_preserves_normalization(self):
+        """GGUF must honor the model's selected-expert normalization on CUDA."""
+        from transformers import Qwen3MoeConfig
+
+        from sglang.srt.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+
+        hidden = torch.zeros((1, 256), device="cuda", dtype=torch.float16)
+        logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device="cuda")
+        for normalize in (True, False):
+            with self.subTest(norm_topk_prob=normalize), torch.device("cuda"):
+                block = Qwen3MoeSparseMoeBlock(
+                    layer_id=0,
+                    config=Qwen3MoeConfig(
+                        hidden_size=256,
+                        moe_intermediate_size=256,
+                        num_experts=4,
+                        num_experts_per_tok=2,
+                        norm_topk_prob=normalize,
+                    ),
+                    quant_config=GGUFConfig(),
+                )
+                output = block.topk(hidden, logits)
+                expected = logits.softmax(dim=-1)[:, [3, 2]]
+                if normalize:
+                    expected /= expected.sum(dim=-1, keepdim=True)
+                torch.testing.assert_close(output.topk_weights, expected)
+                self.assertEqual(output.topk_ids.tolist(), [[3, 2]])
+
     @staticmethod
     def _method(packed, quant_type, *, global_experts=4):
         method = GGUFMoEMethod(GGUFConfig())
