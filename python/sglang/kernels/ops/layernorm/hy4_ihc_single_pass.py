@@ -18,10 +18,11 @@ runs the gates, combine and RMSNorm over the whole row from L2.
 Large T (2-3 launches): out-norm rsqrt per row, then stage 1 on tensor cores (CTA =
 BT tokens x a KR-wide K range; hc_fn split into two bf16 terms in registers), then
 stage 2 per row. Stage 1 prefetches every load one chunk ahead into registers and
-runs with num_stages=1. Workaround for a Triton 3.8 pipelining race: with bf16 hc_fn
-tiles loaded straight into tl.dot in a tl.range(num_stages=2 or 3) loop, the next
-activation copy overwrote the shared buffer the previous async wgmma still read
-(30/30 runs differed at T=7726). Re-check and drop when upgrading past Triton 3.8.x.
+runs with num_stages=1. Workaround for triton-lang/triton#6691: with num_stages 2 or 3,
+the activation tile (read by tl.dot and by register math) gets one shared buffer too
+few, and the next copy overwrites it while the previous async wgmma still reads it
+(30/30 runs differed at T=7726 on Triton 3.8.0). Drop once triton-lang/triton#12738
+is in a Triton release.
 
 Concurrency: the split-K tickets are one buffer per device. Two small-T calls in
 flight at once on different streams of one device would corrupt each other; SGLang
