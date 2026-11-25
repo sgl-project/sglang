@@ -26,6 +26,7 @@ from fastapi.responses import ORJSONResponse, Response
 import sglang.srt.disaggregation.encoder.server as server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.runtime import (
+    MINIMUM_PNG_PICTURE_BASE64,
     DPDispatcher,
     EncoderRuntime,
     EncoderScheduler,
@@ -36,7 +37,6 @@ from sglang.srt.disaggregation.encoder.runtime import (
     validate_encode_request,
 )
 from sglang.srt.disaggregation.encoder.server import (
-    EncoderProfiler,
     MMEncoder,
     MMError,
 )
@@ -58,14 +58,12 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_logger
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
 HEALTH_CHECK_TIMEOUT = 30
-
-# Minimal 32x32 black PNG for health check dummy encode
-MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 # Minimal WAV: 16kHz mono 16-bit PCM, 160 samples (0.01s) of silence
 MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
@@ -78,10 +76,6 @@ local_runtime: Optional[EncoderRuntime] = None
 # DP mode (--dp-size > 1): the protocol-neutral runtime owns worker processes
 # and ZMQ; HTTP only keeps the dispatcher handle used by route handlers.
 dp_dispatcher: Optional["DPDispatcher"] = None
-
-
-def is_health_check_request(rid: Optional[str]) -> bool:
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 @contextlib.asynccontextmanager
@@ -100,6 +94,8 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled_kwargs())
+# Peers call the data routes without a key, so only the admin levels are enforced here.
+add_api_key_middleware(app, get_keys=lambda: (None, get_serving().admin_api_key))
 
 
 def _register_encoder_url_with_bootstrap():
@@ -661,8 +657,6 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
     req.req_type = ProfileReqType.START_PROFILE
     for socket in send_sockets:
         sock_send(socket, req)
-    if encoder.profiler is None:
-        encoder.profiler = EncoderProfiler(encoder.rank)
     ok, msg = encoder.profiler.start(req)
     if ok:
         detail = (
@@ -685,10 +679,6 @@ async def stop_profile_async():
         return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
-    if encoder.profiler is None:
-        return Response(
-            content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
-        )
     req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
         sock_send(socket, req)

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-deepseek-v32",
+    suite="nightly-accuracy-test-8-gpu-amd-deepseek-v32",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

@@ -40,16 +40,6 @@ class ShortConvolution(nn.Module):
     This class implements a depthwise separable 1D convolution with causal padding,
     designed for efficient sequence processing using Triton.
 
-    Args:
-        hidden_size (int): Number of input/output channels (must be equal for depthwise conv)
-        kernel_size (int): Size of the convolution kernel
-        activation (Optional[str], optional): Activation function ('silu' or 'swish'). Defaults to 'silu'.
-        use_residual (bool, optional): Whether to add residual connection (y = conv(x) + x). Defaults to False.
-        device (Optional[torch.device], optional): Device to place the layer on. Defaults to None.
-        dtype (Optional[torch.dtype], optional): Data type for layer parameters. Defaults to None.
-        param_config (ParameterConfig | None, optional): Parameter configuration for mixed precision. Defaults to None.
-        **kwargs: Additional keyword arguments (deprecated 'use_fast_conv1d' supported for compatibility)
-
     Note:
         - Uses depthwise convolution (groups=hidden_size) for efficiency
         - Applies causal padding (kernel_size-1) to ensure no future information leakage
@@ -381,7 +371,6 @@ class ShortConvolution(nn.Module):
         working-cache update; save the per-position windows (consumed by
         commit_conv_state_after_mtp_verify), exactly as the verify branch of
         ``forward`` does -- on the reduced pre-conv x."""
-        meta = self._conv_state(forward_batch)
         self._save_intermediate_conv_windows(
             forward_batch=forward_batch,
             sconv_cache=self._sconv_cache(),
@@ -395,16 +384,6 @@ class ShortConvolution(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """
-        Args:
-            x (`torch.Tensor`):
-                Tensor of shape `[B, T, D]` or `[B*T, D]`.
-            sequence_info (SequenceInfo):
-                Sequence info for handling batch/sequence dimensions. Required.
-
-        Returns:
-            Output tensor with same shape as input x.
-        """
         del positions
 
         meta = self._conv_state(forward_batch)

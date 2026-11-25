@@ -159,7 +159,9 @@ def sigmoid_gate_topk_renorm(
     `logits` is [tokens, n_routed + n_shared]; the last `n_shared_experts`
     columns are the shared experts. Selection score is sigmoid(routed logit)
     plus `bias` (per routed expert, fp32). Returns
-    (routed_weights[t,k], shared_weights[t,s], topk_indices[t,k] int32).
+    (routed_weights[t,k], topk_indices[t,k] int32, shared_weights[t,s],
+    packed_topk[t,k] int32); `return_packed_topk` fills the last and leaves the
+    first two None, otherwise the last is None.
     ``k`` and ``k + n_shared_experts`` must round up to the same power of two.
     """
     # Only column-stride-1 is required (the kernel reads rows via stride_lm). In

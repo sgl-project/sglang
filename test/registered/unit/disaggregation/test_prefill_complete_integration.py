@@ -12,10 +12,15 @@ import torch
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -40,7 +45,11 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    decode_queue,
+    release_only_retirer,
+)
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -108,6 +117,7 @@ class TestAllocationIntegration(CustomTestCase):
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
@@ -354,6 +364,9 @@ class TestAllocationIntegration(CustomTestCase):
             cache_request_handle=CacheRequestHandle(rid="retry", attempt_id=0),
             prefill_attempt_count=1,
             output_ids=[42],
+            grammar=None,
+            return_logprob=False,
+            return_sampling_mask=False,
             skip_radix_cache_insert=False,
             kv=SimpleNamespace(cache_protected_len=16),
             full_untruncated_fill_ids=list(range(32)),
@@ -435,6 +448,9 @@ class TestAllocationIntegration(CustomTestCase):
         req.multimodal_inputs = Mock()
         req.prefill_attempt_count = 0
         req.output_ids = [42]
+        req.grammar = None
+        req.return_logprob = False
+        req.return_sampling_mask = False
         req.skip_radix_cache_insert = False
         req.kv = SimpleNamespace(cache_protected_len=16)
         req.full_untruncated_fill_ids = list(range(32))
@@ -481,6 +497,8 @@ class TestAllocationIntegration(CustomTestCase):
                             owner_list=None,
                             finished_reason=None,
                             to_finish=None,
+                            prefix_len=0,
+                            extend_end=64,
                             inflight_steps=inflight_steps,
                         )
                         scheduler = _ChunkedSlot(
@@ -520,6 +538,28 @@ class TestAllocationIntegration(CustomTestCase):
                             self.assertEqual(list(launched), [req])
                     finally:
                         override.restore()
+
+    def test_parked_chunk_is_neither_checkpointed_nor_sent(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                # add_chunked_req parked it: extend_end stayed at prefix_len.
+                req = Mock(prefix_len=64, extend_end=64, tmp_end_idx=None)
+                scheduler = SimpleNamespace(
+                    chunked_req=req,
+                    enable_overlap=overlap,
+                    check_bootstrap=Mock(return_value=True),
+                    checkpoint_disagg_prefill=Mock(),
+                    send_kv_chunk=Mock(),
+                )
+                running = SimpleNamespace(batch_is_full=True)
+                SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                    scheduler, None, running
+                )
+                scheduler.checkpoint_disagg_prefill.assert_not_called()
+                scheduler.send_kv_chunk.assert_not_called()
+                self.assertIsNone(req.tmp_end_idx)
+                self.assertIs(scheduler.chunked_req, req)
+                self.assertFalse(running.batch_is_full)
 
     def test_yielded_request_requeues_after_its_chunk_once_bootstrap_completes(self):
         # The yield is decided before its chunk in flight is processed; a bootstrap
@@ -622,6 +662,7 @@ class TestAllocationIntegration(CustomTestCase):
             req.pending_bootstrap = True
             req.disagg_kv_sender = self.sender(room=i + 1)
         scheduler = self.inflight_scheduler(reqs)
+        scheduler.prefill_admission_no_token = False
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
         waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
@@ -643,6 +684,44 @@ class TestAllocationIntegration(CustomTestCase):
 
             scheduler.process_disagg_prefill_transfer_queue()
             scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
+
+    def mm_req(self, rid, *, sent, session=None):
+        req = Req(rid, "", [1], SamplingParams())
+        req.session = session
+        req.multimodal_inputs = Mock()
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        req.time_stats = Mock()
+        req.disagg_kv_sender = FakeKVSender(self.prefill, "fake:0", 0)
+        if sent:
+            req.disagg_kv_sender.send([])
+        return req
+
+    def drain_transfer_queue(self, reqs):
+        scheduler = self.inflight_scheduler(reqs)
+        scheduler.request_retirer = release_only_retirer(scheduler.tree_cache)
+        scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+        scheduler._release_mm_inputs = MethodType(
+            Scheduler._release_mm_inputs, scheduler
+        )
+        return scheduler.process_disagg_prefill_transfer_queue()
+
+    def test_transferred_request_releases_multimodal_features(self):
+        done = self.mm_req("done", sent=True)
+        transferring = self.mm_req("transferring", sent=False)
+        mm_inputs = done.multimodal_inputs
+
+        self.assertEqual(self.drain_transfer_queue([done, transferring]), [done])
+
+        mm_inputs.release_features.assert_called_once_with()
+        self.assertIsNone(done.multimodal_inputs)
+        transferring.multimodal_inputs.release_features.assert_not_called()
+
+    def test_transferred_session_request_keeps_multimodal_features(self):
+        req = self.mm_req("session", sent=True, session=object())
+
+        self.assertEqual(self.drain_transfer_queue([req]), [req])
+
+        req.multimodal_inputs.release_features.assert_not_called()
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()
@@ -911,6 +990,189 @@ class TestAllocationIntegration(CustomTestCase):
         queue.add(req, is_rebootstrap=True)
         self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
+
+    def early_prefill_manager(self, port=1):
+        mgr = self.manager("prefill", port)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        return mgr
+
+    def early_sender(self, mgr, room=1):
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", room)
+        mgr.update_status(room, KVPoll.WaitingForInput)
+        return sender
+
+    def conclude_success(self, mgr, room=1):
+        mgr.conclude_transfer(
+            bootstrap_room=room,
+            status=KVPoll.Success,
+            targets=[("decode", 2)],
+        )
+
+    def test_abort_after_drained_success_keeps_success(self):
+        """An abort after the transfer drained must not turn Success into Failed."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        self.conclude_success(mgr)
+        sender.abort()
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
+        self.assertNotIn(1, mgr.failure_records)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_abort_with_deferred_chunk_outstanding_fails(self):
+        """Success is provisional while an earlier deferred chunk can still fail."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        mgr._staging_outstanding[1] = 2
+        self.conclude_success(mgr)
+        mgr._staging_outstanding[1] -= 1
+        sender.abort()
+        mgr._staging_outstanding[1] -= 1
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_abort_after_deferred_chunk_drains_keeps_success(self):
+        """Success becomes final when a deferred chunk drains after the last chunk."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        mgr._staging_outstanding[1] = 2
+        self.conclude_success(mgr)
+        mgr._staging_outstanding[1] -= 2
+        sender.abort()
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
+
+    def test_abort_while_last_chunk_is_still_counted_keeps_failed(self):
+        """The sender cannot tell the concluding chunk's count from a deferred chunk."""
+        mgr = self.early_prefill_manager()
+        sender = self.early_sender(mgr)
+        mgr._staging_outstanding[1] = 1
+        self.conclude_success(mgr)
+        sender.abort()
+        mgr._staging_outstanding[1] -= 1
+        self.assertEqual(mgr.request_status.get(1), KVPoll.Failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_split_rank_abort_concludes_failed_on_both_ranks(self):
+        """Ranks that disagree on an abort must both clear the room after consensus."""
+        landed, failed = self.early_prefill_manager(1), self.early_prefill_manager(3)
+        landed_sender = self.early_sender(landed)
+        failed_sender = self.early_sender(failed)
+        self.conclude_success(landed)
+        landed_sender.abort()
+        failed_sender.abort()
+        self.assertEqual(landed_sender.poll(), KVPoll.Success)
+        self.assertEqual(failed_sender.poll(), KVPoll.Failed)
+
+        with self.assertRaises(KVTransferError) as landed_error:
+            landed_sender.failure_exception()
+        with self.assertRaises(KVTransferError) as failed_error:
+            failed_sender.failure_exception()
+        self.assertTrue(landed_error.exception.is_from_another_rank)
+        self.assertFalse(failed_error.exception.is_from_another_rank)
+        for mgr in (landed, failed):
+            self.assertNotIn(1, mgr.request_status)
+            self.assertNotIn(1, mgr.failure_records)
+
+    def test_abort_during_deferred_worker_cleanup_fails_the_room(self):
+        """With deferred allocation a zero entry means the worker is still cleaning
+        up: poll reports Transferring and decode has not been told, so an abort lands."""
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        self.prefill._staging_outstanding[1] = 0
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        sender.abort()
+        self.prefill._staging_outstanding.pop(1)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        sender.clear()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+
+    def test_worker_survives_a_room_cleared_between_its_cleanup_status_reads(self):
+        """An abort that lands during worker cleanup lets the scheduler clear the
+        room while the worker is still reading its status."""
+        from sglang.srt.disaggregation.common.conn import KVTransferError
+
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        mgr = self.prefill
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.session_lock = threading.Lock()
+        mgr.failed_sessions = set()
+        mgr.state_layout_rejections = {}
+        mgr.state_strides_validated = set()
+        mgr.enable_deferred_decode_kv_release = True
+        mgr.decode_kv_args_table = {
+            "session": SimpleNamespace(
+                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=None
+            )
+        }
+        mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
+        mgr.send_aux = Mock(return_value=0)
+        mgr.transfer_infos[1] = {
+            "session": SimpleNamespace(
+                is_dummy=False,
+                mooncake_session_id="session",
+                dst_kv_indices=[],
+                dst_device_kv_indices=None,
+                endpoint="decode",
+                dst_port=2,
+                room=1,
+                required_dst_info_num=1,
+            )
+        }
+        steps = []
+
+        def scheduler_clears_once():
+            # The scheduler polls Failed and clears the room after the worker's
+            # next status read.
+            if steps == ["aborted"]:
+                steps.append("cleared")
+                with self.assertRaises(KVTransferError):
+                    sender.failure_exception()
+
+        class Statuses(dict):
+            def get(table, room, default=None):
+                status = dict.get(table, room, default)
+                scheduler_clears_once()
+                return status
+
+        mgr.request_status = Statuses(mgr.request_status)
+        check_status, note_send_finished = mgr.check_status, mgr.note_send_finished
+
+        def check_then_clear(room):
+            status = check_status(room)
+            scheduler_clears_once()
+            return status
+
+        def abort_after_uncount(room, record=None):
+            note_send_finished(room, record)
+            self.assertEqual(mgr._staging_outstanding[room], 0)
+            sender.abort()
+            steps.append("aborted")
+
+        mgr.check_status = check_then_clear
+        mgr.note_send_finished = abort_after_uncount
+        chunk = TransferKVChunk(
+            room=1,
+            index_slice=slice(0, 0),
+            prefill_kv_indices=[],
+            is_last_chunk=True,
+            state_indices=None,
+            prefill_aux_index=0,
+        )
+        mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
+        self.assertEqual(steps, ["aborted", "cleared"])
+        self.assertNotIn(1, mgr._staging_outstanding)
+        self.assertNotIn(1, mgr.request_status)
 
 
 if __name__ == "__main__":
