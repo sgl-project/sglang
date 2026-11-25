@@ -187,6 +187,7 @@ class _StringStopDecoder:
         self.display = display
         self.stops = stops
         self.pending = deque()
+        self.undecoded_ids = []
 
     def push(self, tokens, finished):
         output = []
@@ -203,23 +204,32 @@ class _StringStopDecoder:
 
     def _step(self, ids, finished):
         raw = self.raw.push(ids, finished)
-        shown = raw if self.display is self.raw else self.display.push(ids, finished)
-        if raw or shown:
-            self.pending.append((raw, shown))
+        self.undecoded_ids.extend(ids)
+        if raw or finished:
+            # Byte fallback may need several IDs to produce one raw delta.
+            # Keep them together until we know where the stop begins.
+            self.pending.append((raw, self.undecoded_ids))
+            self.undecoded_ids = []
         buffered = "".join(raw for raw, _ in self.pending)
         limit, matched = _stop_boundary(buffered, self.stops, finished)
         output = []
-        while self.pending:
-            raw, shown = self.pending[0]
-            if len(raw) > limit:
-                # Retain the entire boundary token until the stop resolves. Only
-                # a terminal match can require cutting a token's display text.
-                if matched:
-                    output.append(_display_prefix(raw, shown, limit))
-                break
-            self.pending.popleft()
-            output.append(shown)
+        while self.pending and len(self.pending[0][0]) <= limit:
+            raw, group = self.pending.popleft()
+            output.append(
+                raw if self.display is self.raw else self.display.push(group, False)
+            )
             limit -= len(raw)
+        if matched or finished:
+            if self.display is not self.raw:
+                # A skipped special can leave earlier, fully accepted bytes
+                # buffered in the display decoder after raw has emitted them.
+                output.append(self.display.push([], True))
+            if matched and limit:
+                raw, group = self.pending[0]
+                shown = (
+                    raw if self.display is self.raw else self.display.push(group, True)
+                )
+                output.append(_display_prefix(raw, shown, limit))
         return "".join(output), matched
 
 

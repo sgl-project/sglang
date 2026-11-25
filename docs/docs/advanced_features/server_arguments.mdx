@@ -1206,7 +1206,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-llm-d-prompt-token-ids`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accept <code>kv_transfer_params.prompt_token_ids</code> for single-candidate text chat on the Python HTTP worker. Restrict worker access to the trusted llm-d gateway. The worker renders locally when it needs its multimodal text processing, a parser-specific prompt prefix, or a template selected with <code>--hf-chat-template-name</code>. For named templates, give the llm-d renderer the same Jinja source with <code>--chat-template</code> so its routing tokens match the worker.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accept <code>kv_transfer_params.prompt_token_ids</code> for single-candidate text chat on the Python HTTP worker. Restrict worker access to the trusted llm-d gateway. The worker renders locally when it needs its multimodal text processing, a parser-specific prompt prefix, an encoder selected by a tool parser override, or a template selected with <code>--hf-chat-template-name</code>. Pass the same <code>--tool-call-parser</code> to the llm-d renderer when it selects the worker’s encoder. For named templates, give the llm-d renderer the same Jinja source with <code>--chat-template</code> so its routing tokens match the worker.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flag</td>
     </tr>

@@ -2083,6 +2083,21 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.text, "Hi")
         self.assertIsNone(adapted.input_ids)
 
+    def test_llm_d_preserves_tool_parser_encoder(self):
+        """Forwarded checkpoint tokens must not replace a parser-selected prompt."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.model_config.hf_config.architectures = ["DeepseekV32ForCausalLM"]
+        self.tm.tokenizer.chat_template = "{{ messages[0].content }}"
+        self.tm.model_config.token_id_vocab_size = 100
+        self.chat.tool_call_parser = "deepseekv32"
+        self.chat.chat_encoding_spec = self.chat._resolve_chat_encoding_spec()
+        self.basic_req.kv_transfer_params = {"prompt_token_ids": [20]}
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            result = self.chat._process_messages(self.basic_req, is_multimodal=False)
+        self.assertEqual(result.prompt_ids, [1, 2, 3, 4, 5])
+        self.assertIn("<｜User｜>", self.tm.tokenizer.encode.call_args.args[0])
+
     def test_llm_d_named_template_uses_worker_selection(self):
         """An unlabelled forwarded prompt cannot override the selected HF template."""
         self.template_manager.chat_template_name = None

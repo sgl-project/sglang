@@ -2,8 +2,9 @@
 
 use dynamo_renderer::{kimi_k3_formatter_for, native_formatter_for};
 
-use super::{ChatFormatter, TemplateError, ThinkingTemplates, load_chat_formatter};
-use crate::model_files::{resolve_model_file, resolve_tokenizer_file};
+use super::loader::load_chat_formatter_in_dir;
+use super::{ChatFormatter, TemplateError, ThinkingTemplates};
+use crate::model_files::{model_directory, resolve_model_file, resolve_tokenizer_file};
 
 /// Model and template sources used to select a chat formatter.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -28,11 +29,11 @@ pub fn select_chat_formatter(
     if config.tokenizer_path.is_empty() {
         return (None, None);
     }
-    let tokenizer_config_file = resolve_model_file(
-        &config.tokenizer_path,
-        config.revision.as_deref(),
-        "tokenizer_config.json",
-    );
+    let tokenizer_dir = model_directory(&config.tokenizer_path, config.revision.as_deref());
+    let tokenizer_config = tokenizer_dir
+        .as_ref()
+        .map(|dir| dir.join("tokenizer_config.json"))
+        .filter(|path| path.is_file());
     let model_source = if config.model_path.is_empty() {
         config.tokenizer_path.as_str()
     } else {
@@ -48,17 +49,7 @@ pub fn select_chat_formatter(
     let display_name_lower = model_source.to_ascii_lowercase();
     if config.chat_template.is_none() {
         if identity.is_deepseek_v41() || identity.is_deepseek_v4() {
-            // Prompt ids need the checkpoint tokenizer; without it only text renders.
-            let tokenizer =
-                resolve_tokenizer_file(&config.tokenizer_path, config.revision.as_deref())
-                    .and_then(|file| std::fs::read_to_string(file).ok());
-            return match ChatFormatter::deepseek_v4(
-                identity.is_deepseek_v41(),
-                tokenizer.as_deref(),
-            ) {
-                Ok(formatter) => (Some(formatter), None),
-                Err(error) => (None, Some(error)),
-            };
+            return deepseek_v4_formatter(config, identity.is_deepseek_v41());
         }
         if kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true).is_some() {
             return (Some(ChatFormatter::KimiK3), None);
@@ -75,8 +66,9 @@ pub fn select_chat_formatter(
             );
         }
     }
-    let loaded = load_chat_formatter(
-        tokenizer_config_file.as_deref(),
+    let loaded = load_chat_formatter_in_dir(
+        tokenizer_config.as_deref(),
+        tokenizer_dir.as_deref(),
         (!config.model_path.is_empty()).then_some(config.model_path.as_str()),
         identity.model_type.as_deref(),
         config.chat_template.as_deref(),
@@ -106,7 +98,7 @@ pub fn select_chat_formatter(
                 };
             }
             tracing::info!(
-                config = ?tokenizer_config_file.as_deref().unwrap_or("<built-in / inferred>"),
+                config = ?tokenizer_config,
                 template = ?config.chat_template,
                 "loaded OpenAI chat template"
             );
@@ -116,6 +108,45 @@ pub fn select_chat_formatter(
             None,
             Some(format!("this model has no usable chat template: {error}")),
         ),
+    }
+}
+
+impl ChatFormatterOptions {
+    /// Mirror the worker's tool-parser override when selecting its prompt encoder.
+    pub fn select_for_tool_parser(
+        &self,
+        parser: Option<&str>,
+    ) -> (Option<ChatFormatter>, Option<String>) {
+        let selected = select_chat_formatter(self);
+        // A selected conversation template bypasses the worker's custom encoders.
+        if matches!(selected.0, Some(ChatFormatter::Legacy(_)))
+            || (self.chat_template.is_some() && selected.1.is_some())
+        {
+            return selected;
+        }
+        match parser {
+            Some("deepseekv32") => (Some(ChatFormatter::DeepSeekV32), None),
+            Some("kimi_k3") => (Some(ChatFormatter::KimiK3), None),
+            Some("deepseekv4") if !matches!(selected.0, Some(ChatFormatter::DeepSeekV4(_))) => {
+                deepseek_v4_formatter(self, false)
+            }
+            Some("deepseekv41") if !matches!(selected.0, Some(ChatFormatter::DeepSeekV41(_))) => {
+                deepseek_v4_formatter(self, true)
+            }
+            _ => selected,
+        }
+    }
+}
+
+fn deepseek_v4_formatter(
+    config: &ChatFormatterOptions,
+    v41: bool,
+) -> (Option<ChatFormatter>, Option<String>) {
+    let tokenizer = resolve_tokenizer_file(&config.tokenizer_path, config.revision.as_deref())
+        .and_then(|file| std::fs::read_to_string(file).ok());
+    match ChatFormatter::deepseek_v4(v41, tokenizer.as_deref()) {
+        Ok(formatter) => (Some(formatter), None),
+        Err(error) => (None, Some(error)),
     }
 }
 

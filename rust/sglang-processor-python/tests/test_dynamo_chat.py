@@ -6,7 +6,7 @@ import pytest
 from dynamo.llm.exceptions import InvalidArgument
 from sglang_processor import ChatProcessor
 from sglang_processor.dynamo import DynamoChat, _load
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 
 
 def processor(tmp_path, template, model_type="llama"):
@@ -234,3 +234,102 @@ def test_named_checkpoint_template_precedence(tmp_path):
     (named / "default.jinja").write_text("named default")
     assert render() == "named default"
     assert render(str(named / "rag.jinja")) == "named\nHi"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_reasoning_marker_with_automatic_bos(tmp_path, turn_tokenizer, stream):
+    turn_tokenizer.add_special_tokens(["[BOS]", "</think>"])
+    turn_tokenizer.post_processor = processors.TemplateProcessing(
+        single="[BOS] $A",
+        special_tokens=[("[BOS]", turn_tokenizer.token_to_id("[BOS]"))],
+    )
+    turn_tokenizer.save(str(tmp_path / "tokenizer.json"))
+    chat = ChatProcessor(str(tmp_path))
+    tokens = ["think", "</think>", "answer"]
+    _, choices = run_generation(
+        chat, [], "qwen3", [[chat.token_id(t)] for t in tokens], stream=stream
+    )
+    assert "".join(c["delta"].get("reasoning_content", "") for c in choices) == "think"
+    assert "".join(c["delta"]["content"] for c in choices) == "answer"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("hidden_controls", [False, True])
+def test_kimi_channel_segmentation_and_truncation(
+    tmp_path, turn_tokenizer, stream, hidden_controls
+):
+    if not hidden_controls:
+        # The official K3 tokenizer exposes the XTML controls in decoded text.
+        config = json.loads(turn_tokenizer.to_str())
+        for token in config["added_tokens"]:
+            token["special"] = False
+        turn_tokenizer = Tokenizer.from_str(json.dumps(config))
+    turn_tokenizer.add_tokens(["res", "ponse"])
+    turn_tokenizer.save(str(tmp_path / "tokenizer.json"))
+    chat = ChatProcessor(str(tmp_path))
+    tokens = [
+        "think",
+        "<|close|>",
+        "think",
+        "<|sep|>",
+        "<|open|>",
+        "res",
+        "ponse",
+        "<|sep|>",
+        "answer",
+    ]
+    for tail in (
+        ["<|close|>"],
+        ["<|close|>", "response"],
+        ["<|close|>", "response", "<|sep|>"],
+    ):
+        batches = [[turn_tokenizer.token_to_id(t)] for t in tokens + tail]
+        _, choices = run_generation(chat, [], "kimi_k3", batches, stream=stream)
+        assert (
+            "".join(c["delta"].get("reasoning_content", "") for c in choices) == "think"
+        )
+        assert "".join(c["delta"]["content"] for c in choices) == "answer"
+        assert choices[-1]["finish_reason"] == "length"
+
+
+@pytest.mark.parametrize(
+    ("stop", "expected"), [("[CUT]", "€"), ("€[CUT]", ""), ("[CUT]!", "€")]
+)
+def test_stop_preserves_buffered_utf8(tmp_path, stop, expected):
+    words = ["[UNK]", "prompt", "<0xE2>", "<0x82>", "<0xAC>", "[CUT]", "!"]
+    tokenizer = Tokenizer(
+        models.BPE({s: i for i, s in enumerate(words)}, [], byte_fallback=True)
+    )
+    tokenizer.decoder = decoders.Sequence([decoders.ByteFallback(), decoders.Fuse()])
+    tokenizer.add_special_tokens(["[CUT]"])
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text('{"chat_template": "prompt"}')
+    chat = ChatProcessor(str(tmp_path))
+    batches = [[tokenizer.token_to_id(t)] for t in words[2:]]
+    _, choices = run_generation(chat, [], None, batches, stop=stop)
+    assert "".join(c["delta"]["content"] for c in choices) == expected
+    assert choices[-1]["finish_reason"] == "stop"
+
+
+def test_standalone_template_without_tokenizer_config(tmp_path):
+    processor(tmp_path, "embedded")
+    (tmp_path / "tokenizer_config.json").unlink()
+    (tmp_path / "chat_template.jinja").write_text(
+        "standalone {{ messages[0].content }}"
+    )
+    request = {"model": "m", "messages": [{"role": "user", "content": "Hi"}]}
+    body = json.dumps(request).encode()
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    assert (
+        ChatProcessor(str(tmp_path)).encode_chat(body)
+        == tokenizer.encode("standalone Hi").ids
+    )
+
+
+def test_tool_parser_selects_native_encoder_over_checkpoint_template(tmp_path):
+    processor(tmp_path, "checkpoint")
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    request = {"model": "m", "messages": [{"role": "user", "content": "Hi"}]}
+    native = ChatProcessor(str(tmp_path), tool_call_parser="deepseekv32")
+    ids = native.encode_chat(json.dumps(request).encode())
+    assert "<｜User｜>Hi<｜Assistant｜>" in tokenizer.decode(ids)

@@ -29,7 +29,7 @@ pub fn resolve_tokenizer_file(path: &str, revision: Option<&str>) -> Option<Stri
     discover_tokenizer_in_dir(&directory).map(|path| path.to_string_lossy().into_owned())
 }
 
-fn model_directory(path: &str, revision: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn model_directory(path: &str, revision: Option<&str>) -> Option<PathBuf> {
     let input = Path::new(path);
     if input.is_dir() {
         return Some(input.to_path_buf());

@@ -32,14 +32,23 @@ def _text_message(message):
 
 
 def create_app(
-    model_dir, model_name, chat_template=None, defaults=None, max_body_bytes=8 << 20
+    model_dir,
+    model_name,
+    chat_template=None,
+    defaults=None,
+    max_body_bytes=8 << 20,
+    *,
+    tool_call_parser=None,
 ):
     if defaults is not None and not isinstance(defaults, dict):
         raise ValueError("default chat template kwargs must be an object")
     if defaults and "chat_template" in defaults:
         raise ValueError("select the renderer template with --chat-template")
     processor = ChatProcessor(
-        str(model_dir), chat_template, default_kwargs_json=json.dumps(defaults or {})
+        str(model_dir),
+        chat_template,
+        default_kwargs_json=json.dumps(defaults or {}),
+        tool_call_parser=tool_call_parser,
     )
 
     async def render(request):
@@ -100,6 +109,9 @@ def main():
         "--model-name", required=True, help="Model name sent by the EPP"
     )
     parser.add_argument("--chat-template")
+    parser.add_argument(
+        "--tool-call-parser", help="Match the worker's chat encoder selection"
+    )
     parser.add_argument("--default-chat-template-kwargs", type=json.loads, default={})
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
@@ -118,6 +130,7 @@ def main():
         args.chat_template,
         args.default_chat_template_kwargs,
         args.max_body_bytes,
+        tool_call_parser=args.tool_call_parser,
     )
     web.run_app(app, host=args.host, port=args.port)
 

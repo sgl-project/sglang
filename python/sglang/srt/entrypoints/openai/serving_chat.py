@@ -1797,8 +1797,23 @@ class OpenAIServingChat(OpenAIServingBase):
         parser_frames_prefix = _continues_final_assistant(request) and isinstance(
             self._reasoning_detector, ResponseTemplateReasoningDetector
         )
-        # Forwarded IDs carry no HF template name or response-parser state.
-        if mm_needs_text or parser_frames_prefix or get_serving().hf_chat_template_name:
+        # The forwarded IDs do not identify the encoder used by the renderer.
+        # A worker override can take precedence over the checkpoint's template.
+        parser_overrides_encoder = (
+            self.tool_call_parser
+            and self.chat_encoding_spec is not None
+            and self.chat_encoding_spec
+            != chat_encoding.resolve_chat_encoding_spec(
+                hf_config=self.tokenizer_manager.model_config.hf_config,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
+        )
+        if (
+            mm_needs_text
+            or parser_frames_prefix
+            or parser_overrides_encoder
+            or get_serving().hf_chat_template_name
+        ):
             request.input_ids = None
             return False
         request.input_ids = ids

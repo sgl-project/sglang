@@ -25,6 +25,25 @@ pub fn load_chat_formatter(
     model_type: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
+    let config_path = config_file.map(Path::new);
+    load_chat_formatter_in_dir(
+        config_path,
+        config_path
+            .and_then(Path::parent)
+            .or_else(|| model_path.map(Path::new)),
+        model_path,
+        model_type,
+        chat_template_arg,
+    )
+}
+
+pub(super) fn load_chat_formatter_in_dir(
+    config_path: Option<&Path>,
+    tokenizer_dir: Option<&Path>,
+    model_path: Option<&str>,
+    model_type: Option<&str>,
+    chat_template_arg: Option<&str>,
+) -> Result<ChatFormatter, TemplateError> {
     // Python resolves registry names before looking at the filesystem — and
     // before touching the tokenizer config, so a built-in name works even when
     // `tokenizer_config.json` is absent.
@@ -45,24 +64,23 @@ pub fn load_chat_formatter(
         return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
     }
 
-    // Every remaining source builds the HF renderer around the tokenizer
-    // config (the template itself, or the argument injected into it).
-    let Some(config_file) = config_file else {
-        return Err(TemplateError::MissingConfig);
+    let mut config = match config_path {
+        Some(path) => parse_json(
+            &read_to_string(path, "tokenizer config")?,
+            path,
+            "tokenizer config",
+        )?,
+        None => json!({}),
     };
-
-    let config_path = Path::new(config_file);
-    let config_text = read_to_string(config_path, "tokenizer config")?;
-    let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
-
     let discovered = if chat_template_arg.is_none() {
-        config_path
-            .parent()
-            .and_then(crate::model_files::discover_chat_template_in_dir)
+        tokenizer_dir.and_then(crate::model_files::discover_chat_template_in_dir)
     } else {
         None
     };
     let Some(path) = chat_template_arg.map(Path::new).or(discovered.as_deref()) else {
+        if config_path.is_none() {
+            return Err(TemplateError::MissingConfig);
+        }
         return ChatFormatter::from_tokenizer_config_with_type(&config, model_type);
     };
 
@@ -85,7 +103,7 @@ pub fn load_chat_formatter(
             && (path
                 .file_name()
                 .is_some_and(|name| name == "chat_template.jinja")
-                || path.parent() != config_path.parent());
+                || path.parent() != tokenizer_dir);
         let template = if hf_template {
             template
         } else {

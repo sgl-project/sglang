@@ -112,6 +112,11 @@ impl DynamoTokenizer {
         Ok(tokenizer)
     }
 
+    /// Encode literal output markers without adding sequence-level BOS/EOS.
+    pub fn tokenizer_without_specials(&self) -> &dynamo_tokenizers::Tokenizer {
+        &self.without_specials
+    }
+
     /// The handle that adds the tokenizer's specials, which decoding shares.
     pub fn tokenizer(&self) -> &dynamo_tokenizers::Tokenizer {
         &self.with_specials

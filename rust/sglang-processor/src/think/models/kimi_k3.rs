@@ -167,6 +167,10 @@ impl KimiK3Detector {
 
     /// `finish`.
     pub(crate) fn finish(&mut self) -> (String, String) {
+        if !self.tools_passthrough {
+            self.buffer
+                .truncate(strip_partial_marker_suffix(&self.buffer).len());
+        }
         self.streamed_reasoning.clear();
         if !self.force_nonempty_content {
             return self.base_finish();

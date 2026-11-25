@@ -3,10 +3,9 @@ use std::collections::{HashMap, VecDeque};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde_json::Value;
-use sglang_processor::dynamo_tokenizers::{DecodeStream, EncodeSegment};
+use sglang_processor::dynamo_tokenizers::{DecodeStream, EncodeSegment, Tokenizer};
 use sglang_processor::{
     ChatFormatter, ChatFormatterOptions, DynamoTokenizer, OneOrMany, TemplateArgs, TextTokenizer,
-    select_chat_formatter,
 };
 
 fn invalid(error: impl std::fmt::Display) -> PyErr {
@@ -23,20 +22,22 @@ struct ChatProcessor {
 #[pymethods]
 impl ChatProcessor {
     #[new]
-    #[pyo3(signature = (model_dir, chat_template=None, *, default_kwargs_json=None))]
+    #[pyo3(signature = (model_dir, chat_template=None, *, default_kwargs_json=None, tool_call_parser=None))]
     fn new(
         py: Python<'_>,
         model_dir: String,
         chat_template: Option<String>,
         default_kwargs_json: Option<&str>,
+        tool_call_parser: Option<&str>,
     ) -> PyResult<Self> {
         py.detach(|| {
-            let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
+            let (formatter, error) = ChatFormatterOptions {
                 tokenizer_path: model_dir.clone(),
                 model_path: model_dir.clone(),
                 chat_template,
                 ..Default::default()
-            });
+            }
+            .select_for_tool_parser(tool_call_parser);
             Ok(Self {
                 formatter: formatter.ok_or_else(|| {
                     invalid(error.unwrap_or_else(|| "missing chat template".into()))
@@ -67,7 +68,7 @@ impl ChatProcessor {
     }
 
     fn token_id(&self, token: &str) -> PyResult<Option<u32>> {
-        let tokenizer = self.tokenizer.tokenizer();
+        let tokenizer = self.tokenizer.tokenizer_without_specials();
         if let Ok(id) = tokenizer.token_to_id(token) {
             return Ok(id);
         }
@@ -93,7 +94,7 @@ impl ChatProcessor {
         skip_special_tokens: bool,
         reasoning_parser: Option<&str>,
     ) -> Decoder {
-        let tokenizer = self.tokenizer.tokenizer();
+        let tokenizer = self.tokenizer.tokenizer_without_specials();
         let framing = reasoning_parser
             .filter(|_| skip_special_tokens)
             .into_iter()
@@ -105,8 +106,9 @@ impl ChatProcessor {
                 let ids = encoded.token_ids();
                 let raw = tokenizer.decode(ids, false).ok()?;
                 let filtered = tokenizer.decode(ids, true).ok()?;
+                let first_id = *ids.first()?;
                 (raw.as_str() == marker && filtered.as_str() != marker).then(|| FramingMarker {
-                    ids: ids.to_vec(),
+                    first_id,
                     text: marker,
                     // K3 channel names after a skipped control token are
                     // framing even when generation stops before the separator.
@@ -118,6 +120,7 @@ impl ChatProcessor {
             })
             .collect();
         Decoder {
+            tokenizer: tokenizer.clone(),
             stream: tokenizer.decode_stream(&prompt_tail, skip_special_tokens),
             framing,
             pending: VecDeque::new(),
@@ -287,7 +290,7 @@ impl ReasoningDecoder {
 }
 
 struct FramingMarker {
-    ids: Vec<u32>,
+    first_id: u32,
     text: &'static str,
     discard_partial: bool,
 }
@@ -295,6 +298,7 @@ struct FramingMarker {
 /// One incremental decoder per generation. Token boundaries can split UTF-8.
 #[pyclass(module = "sglang_processor._native")]
 struct Decoder {
+    tokenizer: Tokenizer,
     stream: DecodeStream,
     framing: Vec<FramingMarker>,
     pending: VecDeque<u32>,
@@ -329,24 +333,29 @@ impl Decoder {
     /// tokens. Decode every other token with the caller's normal skip setting.
     fn decode_pending(&mut self, finished: bool, text: &mut String) -> PyResult<()> {
         while let Some(&id) = self.pending.front() {
-            if let Some(marker) = self
-                .framing
-                .iter()
-                .find(|m| self.pending.iter().take(m.ids.len()).eq(&m.ids))
-            {
-                text.extend(self.stream.finish().map_err(invalid)?);
-                text.push_str(marker.text);
-                self.pending.drain(..marker.ids.len());
-                continue;
-            }
-            let pending = self.pending.make_contiguous();
-            if let Some(marker) = self.framing.iter().find(|m| m.ids.starts_with(pending)) {
-                if !finished {
-                    break;
-                }
-                if marker.discard_partial {
-                    self.pending.clear();
-                    break;
+            let mut candidates = self.framing.iter().filter(|m| m.first_id == id).peekable();
+            if candidates.peek().is_some() {
+                // The model can spell a channel name with several different
+                // token sequences after the same opening control token.
+                let raw = self
+                    .tokenizer
+                    .decode(self.pending.make_contiguous(), false)
+                    .map_err(invalid)?;
+                let spelling = raw.as_str();
+                if let Some(marker) = candidates.find(|m| m.text.starts_with(spelling)) {
+                    if marker.text == spelling {
+                        text.extend(self.stream.finish().map_err(invalid)?);
+                        text.push_str(marker.text);
+                        self.pending.clear();
+                        break;
+                    }
+                    if !finished {
+                        break;
+                    }
+                    if marker.discard_partial {
+                        self.pending.clear();
+                        break;
+                    }
                 }
             }
             self.pending.pop_front();
