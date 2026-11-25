@@ -1,5 +1,6 @@
-"""SM90 small-M BF16 GEMV (TileLang) on every M its tables admit: fp64 reference, cuBLAS,
-rows past M, determinism and CUDA graph replay."""
+"""SM90 small-M BF16 GEMV (TileLang): fp64 reference, cuBLAS, rows past M, determinism and
+CUDA graph replay. CI takes the smallest M and both sides of each table row boundary; outside
+CI (or with SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1) every M the tables admit."""
 
 import sys
 
@@ -7,9 +8,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 if SM90:
@@ -40,6 +42,14 @@ def _setup(n, k, mode, seed):
     w = (torch.randn(n, k, generator=gen, device="cuda") * 0.05).bfloat16()
     f32 = mode != "GWC"  # fp32 out takes the weight as [K, N]
     return tab, f32, x, w, w.t().contiguous() if f32 else w
+
+
+def _test_ms(rows):
+    """Row boundaries pick the kernel config: both sides of each, and M = 1."""
+    edges = {1} | {r[0] for r in rows} | {r[0] + 1 for r in rows[:-1]}
+    return get_ci_test_range(
+        full_range=list(range(1, rows[-1][0] + 1)), ci_range=sorted(edges)
+    )
 
 
 def _err(y, ref):  # bf16: outputs not correctly rounded; fp32: squared error
@@ -87,15 +97,15 @@ def test_wide_wgmma_stays_inside_the_build():
 
 
 @pytest.mark.parametrize("n,k,mode", CASES)
-def test_every_m(n, k, mode):
+def test_table_ms(n, k, mode):
     tab, f32, x, w, arg = _setup(n, k, mode, seed=n + k)
-    mmax, dt = x.shape[0], torch.float32 if f32 else torch.bfloat16
+    ms, dt = _test_ms(tab[(n, k)]), torch.float32 if f32 else torch.bfloat16
     xd, wd = x.double(), w.double()
     ref, s = xd @ wd.t(), xd.abs() @ wd.abs().t()
     if f32:
         ref, s = _fold(ref), _fold(s)
     ours = stock = 0.0
-    for m in range(1, mmax + 1):
+    for m in ms:
         xb = torch.full((m + PAD, k), NAN, dtype=torch.bfloat16, device="cuda")
         yb = torch.full((m + PAD, ref.shape[1]), NAN, dtype=dt, device="cuda")
         xb[:m] = x[:m]
@@ -112,20 +122,24 @@ def test_every_m(n, k, mode):
         ours, stock = ours + _err(y, ref[:m]), stock + _err(c, ref[:m])
     # as accurate as cuBLAS (the stock path) against the fp64 reference, up to the
     # summation order (it decides some roundings on long K: 1.27x at K = 40960)
-    slack = 0 if f32 else 1e-5 * n * mmax * mmax
+    slack = 0 if f32 else 2e-5 * n * sum(ms)
     assert ours <= 1.5 * stock + slack, (ours, stock)
 
 
+_GRAPH_CASES = [
+    (2304, 8192, 5, "GWC"),
+    (512, 8192, 100, "GWC"),
+    (8192, 1024, 256, "GWC"),
+    (1024, 40960, 64, "GWC"),
+    (512, 8192, 64, "GWR"),
+    (512, 8192, 256, "GWS"),
+]
+
+
+# CI: a K-split cluster kernel with the fp32 router epilogue
 @pytest.mark.parametrize(
     "n,k,m,mode",
-    [
-        (2304, 8192, 5, "GWC"),
-        (512, 8192, 100, "GWC"),
-        (8192, 1024, 256, "GWC"),
-        (1024, 40960, 64, "GWC"),
-        (512, 8192, 64, "GWR"),
-        (512, 8192, 256, "GWS"),
-    ],
+    get_ci_test_range(full_range=_GRAPH_CASES, ci_range=[(512, 8192, 64, "GWR")]),
 )
 def test_cuda_graph_replay(n, k, m, mode):
     tab, f32, x, _, arg = _setup(n, k, mode, seed=m)
