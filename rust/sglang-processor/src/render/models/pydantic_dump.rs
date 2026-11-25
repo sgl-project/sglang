@@ -33,7 +33,7 @@ pub(crate) fn split_continuation(messages: &mut Vec<Value>, continuing: bool) ->
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
-pub(super) fn engine_message(message: Value) -> Value {
+pub(crate) fn engine_message(message: Value) -> Value {
     let mut message = match message {
         Value::Object(message) => message,
         _ => Map::new(),

@@ -102,6 +102,29 @@ impl ThinkDetector {
     }
 }
 
+/// One choice's streaming parser for the model families ported from Python.
+pub struct ReasoningStream(ThinkDetector);
+
+impl ReasoningStream {
+    pub fn supports(name: &str) -> bool {
+        think_config(name).is_some()
+    }
+
+    pub fn new(name: &str, options: &ReasoningOptions) -> Option<Self> {
+        Some(Self(ThinkDetector::new(think_config(name)?, options)))
+    }
+
+    pub fn push(&mut self, text: &str, finished: bool) -> (String, String) {
+        let (mut reasoning, mut content) = self.0.push(text);
+        if finished {
+            let (r, c) = self.0.finish();
+            reasoning.push_str(&r);
+            content.push_str(&c);
+        }
+        (reasoning, content)
+    }
+}
+
 /// The tokens one `--reasoning-parser` configures the base detector with.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TagConfig {

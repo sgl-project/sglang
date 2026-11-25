@@ -36,6 +36,7 @@ def _validate(request):
     if not messages or any(
         msg.get("role") not in ("system", "user", "assistant")
         or not isinstance(msg.get("content"), str)
+        or msg.get("tools")
         or msg.get("tool_calls")
         for msg in messages
     ):
@@ -64,6 +65,8 @@ def _validate(request):
         "add_generation_prompt",
         "thinking",
         "reasoning_effort",
+        "separate_reasoning",
+        "stream_reasoning",
         "response_format",
         "tool_choice",
         "user",
@@ -209,7 +212,21 @@ class _StringStopDecoder:
 
 
 class DynamoChat:
-    def __init__(self, processor, routed_engine, eos, default_thinking_mode=None):
+    def __init__(
+        self,
+        processor,
+        routed_engine,
+        eos,
+        default_thinking_mode=None,
+        reasoning_parser=None,
+    ):
+        if reasoning_parser and not processor.supports_reasoning_parser(
+            reasoning_parser
+        ):
+            raise ValueError(
+                f"unsupported sglang-rust reasoning parser: {reasoning_parser}"
+            )
+        self.reasoning_parser = reasoning_parser
         self.processor = processor
         self.routed_engine = routed_engine
         self.eos = eos
@@ -232,16 +249,22 @@ class DynamoChat:
         )
         if kwargs:
             request = dict(request, chat_template_kwargs=kwargs)
-        return self.processor.encode_chat(msgspec.json.encode(request))
+        body = msgspec.json.encode(request)
+        if self.reasoning_parser and request.get("separate_reasoning", True):
+            return self.processor.encode_reasoning_chat(body, self.reasoning_parser)
+        return self.processor.encode_chat(body), None
 
     async def generate(self, request, context=None):
         _validate(request)
         try:
-            ids = await asyncio.to_thread(self._encode, request)
+            ids, splitter = await asyncio.to_thread(self._encode, request)
         except ValueError as error:
             raise InvalidArgument(str(error)) from error
         worker = _worker_request(request, ids, self.eos, self.template_stops)
         stops = worker["stop_conditions"]
+        if splitter is not None:
+            # Parser delimiters can be registered as special tokens.
+            worker["output_options"]["skip_special_tokens"] = False
         skip_special = worker["output_options"]["skip_special_tokens"]
         if stops["stop"]:
             decoder = _StringStopDecoder(
@@ -297,9 +320,14 @@ class DynamoChat:
             consumed += int(end is not None and not matched)
             count += consumed
             update_usage_metadata(metadata, frame.get("completion_usage") or {})
-            if not text and reason is None and not first:
+            reasoning = ""
+            if splitter is not None:
+                reasoning, text = splitter.push(text, reason is not None)
+            if not (text or reasoning) and reason is None and not first:
                 continue
             delta = {"content": text}
+            if reasoning:
+                delta["reasoning_content"] = reasoning
             if first:
                 delta["role"] = "assistant"
                 first = False
@@ -358,18 +386,20 @@ def _load(model_dir, template):
 
 def provider(config, options):
     """Dynamo calls the returned factory for each token-input model registration."""
-    if set(options) - {"chat_template"}:
-        raise ValueError("sglang-rust only accepts the chat_template file option")
+    if unknown := set(options) - {"chat_template", "reasoning_parser"}:
+        raise ValueError(f"unsupported sglang-rust options: {sorted(unknown)}")
 
     async def factory(instance_id, mdc, routed_engine):
         processor, eos = await asyncio.to_thread(
             _load, str(mdc.local_dir()), options.get("chat_template")
         )
+        runtime = mdc.runtime_config() or {}
         chat = DynamoChat(
             processor,
             routed_engine,
             eos,
-            runtime_default_thinking_mode(mdc.runtime_config()),
+            runtime_default_thinking_mode(runtime),
+            options.get("reasoning_parser") or runtime.get("reasoning_parser"),
         )
         return PythonAsyncEngine(chat.generate, asyncio.get_running_loop())
 

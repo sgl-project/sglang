@@ -51,7 +51,7 @@ pub use render::{
     requested_effort, requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]
-pub use think::ReasoningOptions;
+pub use think::{ReasoningOptions, ReasoningStream};
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 #[cfg(any(feature = "parser", feature = "openai"))]

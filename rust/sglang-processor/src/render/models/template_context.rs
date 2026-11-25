@@ -20,7 +20,7 @@ pub(crate) fn preserve_messages(config: &mut Value, name: &str) -> String {
     let wrap = |template: &mut Value| {
         if let Some(source) = template.as_str() {
             *template = format!(
-                "{{% if {context} is defined %}}{{% set messages = {context} %}}{{% endif +%}}{source}"
+                "{{% if not messages and {context} is defined %}}{{% set messages = {context} %}}{{% endif +%}}{source}"
             )
             .into();
         }

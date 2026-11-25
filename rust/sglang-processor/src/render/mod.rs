@@ -67,6 +67,8 @@ pub enum ChatFormatter {
         /// The template's own errors for a developer turn, which Dynamo would
         /// render as a system turn instead.
         developer_errors: DeveloperErrors,
+        content_parts: Option<bool>,
+        message_context: String,
     },
     /// A native Dynamo encoder selected by model identity, without a Jinja template.
     Native {
@@ -77,6 +79,8 @@ pub enum ChatFormatter {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
     },
+    /// DeepSeek-V3.2 without a checkpoint template.
+    DeepSeekV32,
     /// DeepSeek-V4 through deepseek-recipe, with the checkpoint tokenizer when known.
     DeepSeekV4(Option<Arc<DeepSeekTokenizer>>),
     /// DeepSeek-V4.1 through deepseek-recipe, with the checkpoint tokenizer when known.
@@ -183,6 +187,13 @@ impl ChatFormatter {
                         message: error.to_string(),
                     })
             }
+            ChatFormatter::DeepSeekV32 => {
+                dynamo_renderer::deepseek::v32::DeepSeekV32Formatter::new_chat()
+                    .render_prompt(request)
+                    .map_err(|error| TemplateError::Renderer {
+                        message: error.to_string(),
+                    })
+            }
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
                 // Typed messages serialize straight to JSON, skipping minijinja.
                 let messages = match request.typed_messages() {
@@ -219,6 +230,9 @@ impl ChatFormatter {
     ) -> Result<(RenderedPrompt, String), TemplateError> {
         let text = |(prompt, prefix)| (RenderedPrompt::text(prompt), prefix);
         match self {
+            ChatFormatter::DeepSeekV32 => {
+                models::render_deepseek_v32(request, default_kwargs).map(text)
+            }
             // recipe renders a continued final message itself, so no prefix follows.
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
                 let v41 = matches!(self, ChatFormatter::DeepSeekV41(_));
@@ -270,10 +284,7 @@ impl ChatFormatter {
             .map(text),
             _ => Err(RenderError::Declined("this formatter's requests".into())),
         }
-        .map_err(|error| match error {
-            RenderError::Declined(message) => TemplateError::NeedsRenderFallback { message },
-            RenderError::Failed(message) => TemplateError::Renderer { message },
-        })
+        .map_err(TemplateError::from)
     }
 
     /// DeepSeek-V4 or V4.1 through deepseek-recipe; `tokenizer_json`, the
@@ -346,6 +357,7 @@ impl ChatFormatter {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::Native { .. }
             | ChatFormatter::KimiK25 { .. }
+            | ChatFormatter::DeepSeekV32
             | ChatFormatter::DeepSeekV4(_)
             | ChatFormatter::DeepSeekV41(_)
             | ChatFormatter::Glm53(_)
@@ -411,7 +423,9 @@ impl ChatFormatter {
             ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
+            ChatFormatter::DeepSeekV32
+            | ChatFormatter::DeepSeekV4(_)
+            | ChatFormatter::DeepSeekV41(_) => {
                 let enabled = deepseek_v4_thinking(
                     &serde_json::json!({ "chat_template_kwargs": args }),
                     &HashMap::new(),
@@ -520,6 +534,15 @@ pub(crate) enum RenderError {
     Declined(String),
     /// An invalid request, or one the template rejects.
     Failed(String),
+}
+
+impl From<RenderError> for TemplateError {
+    fn from(error: RenderError) -> Self {
+        match error {
+            RenderError::Declined(message) => Self::NeedsRenderFallback { message },
+            RenderError::Failed(message) => Self::Renderer { message },
+        }
+    }
 }
 
 impl From<String> for RenderError {

@@ -158,6 +158,8 @@ impl ChatFormatter {
             preserve_messages(&mut render_config, "__sglang_minimax_m3_messages")
         } else if qwen38.is_none() && step3p5 {
             preserve_messages(&mut render_config, "__sglang_step3p5_messages")
+        } else if qwen38.is_none() {
+            preserve_messages(&mut render_config, "__sglang_chat_messages")
         } else {
             String::new()
         };
@@ -209,6 +211,10 @@ impl ChatFormatter {
                 formatter,
                 thinking,
                 developer_errors,
+                content_parts: config["chat_template"]
+                    .as_str()
+                    .and_then(super::content_format::takes_content_parts),
+                message_context,
             }
         })
     }

@@ -1,9 +1,6 @@
 //! Chat formatter selection from a model's template files and identity.
 
-use std::sync::Arc;
-
-use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
-use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
+use dynamo_renderer::{kimi_k3_formatter_for, native_formatter_for};
 
 use super::legacy::infer_legacy_template_from_model_path;
 use super::{ChatFormatter, TemplateError, ThinkingTemplates, load_chat_formatter};
@@ -146,10 +143,7 @@ fn native_fallback(
     display_name_lower: &str,
 ) -> Option<ChatFormatter> {
     if identity.is_deepseek_v32() {
-        return Some(ChatFormatter::Native {
-            formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
-            thinking: ThinkingTemplates::native(false, false),
-        });
+        return Some(ChatFormatter::DeepSeekV32);
     }
     Some(ChatFormatter::Native {
         formatter: native_formatter_for(model_type_lower, display_name_lower)?,

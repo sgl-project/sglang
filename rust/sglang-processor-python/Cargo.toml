@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3.workspace = true
 serde_json.workspace = true
-sglang-processor = { path = "../sglang-processor", default-features = false, features = ["render", "tokenizer"] }
+sglang-processor = { path = "../sglang-processor", default-features = false, features = ["render", "tokenizer", "openai"] }

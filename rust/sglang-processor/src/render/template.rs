@@ -22,6 +22,26 @@ pub struct TemplateArgs {
 }
 
 impl TemplateArgs {
+    fn check_jinja_kwargs(&self) -> Result<(), TemplateError> {
+        if let Some(key) = [
+            "conversation",
+            "tools",
+            "add_generation_prompt",
+            "tokenize",
+            "return_dict",
+        ]
+        .into_iter()
+        .find(|key| self.kwargs.contains_key(*key))
+        {
+            return Err(TemplateError::Renderer {
+                message: format!(
+                    "chat_template_kwargs duplicates apply_chat_template argument {key}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The server `defaults`, under the request effort's thinking toggle, under its own
     /// `chat_template_kwargs`; a default effort wins (`_convert_to_internal_request`).
     pub fn new(body: &Value, defaults: &HashMap<String, Value>) -> Self {
@@ -51,7 +71,102 @@ impl TemplateArgs {
     }
 }
 
+/// Normalize text content before splitting an assistant continuation, as
+/// process_content_for_template_format does on the Python worker.
+pub(super) fn text_messages(
+    body: &Value,
+    content_parts: Option<bool>,
+) -> Result<Vec<Value>, super::RenderError> {
+    if body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(super::RenderError::Declined("chat tools".into()));
+    }
+    let mut messages: Vec<_> = body["messages"]
+        .as_array()
+        .ok_or_else(|| "expected chat messages".to_owned())?
+        .iter()
+        .cloned()
+        .map(super::models::engine_message)
+        .collect();
+    for message in &mut messages {
+        if !matches!(
+            message["role"].as_str(),
+            Some("system" | "assistant" | "user")
+        ) || message.get("tool_calls").is_some()
+            || message.get("tools").is_some()
+        {
+            return Err(super::RenderError::Declined(
+                "expected text chat without tools".into(),
+            ));
+        }
+        if let Some(parts) = message["content"].as_array() {
+            let mut texts = Vec::new();
+            for part in parts {
+                if part["type"] != "text" {
+                    return Err(super::RenderError::Declined("expected text parts".into()));
+                }
+                texts.push(
+                    part["text"]
+                        .as_str()
+                        .ok_or_else(|| "expected text part content".to_owned())?,
+                );
+            }
+            message["content"] =
+                if content_parts.ok_or_else(|| "unknown template content format".to_owned())? {
+                    texts
+                        .into_iter()
+                        .map(|text| json!({"type":"text","text":text}))
+                        .collect()
+                } else {
+                    texts.join(" ").into()
+                };
+        }
+    }
+    Ok(messages)
+}
+
 impl ChatFormatter {
+    /// Render plain text chat with the worker's original message order and
+    /// content shape. Dynamo's role and content rewrites precede template evaluation.
+    pub fn render_text_jinja(
+        &self,
+        body: &Value,
+        defaults: &HashMap<String, Value>,
+    ) -> Result<(RenderedPrompt, String), TemplateError> {
+        let Self::HuggingFace {
+            formatter,
+            content_parts,
+            message_context,
+            ..
+        } = self
+        else {
+            return Err(TemplateError::NeedsRenderFallback {
+                message: "expected a Jinja formatter".into(),
+            });
+        };
+        let mut args = TemplateArgs::new(body, defaults);
+        args.check_jinja_kwargs()?;
+        let mut messages = text_messages(body, *content_parts).map_err(TemplateError::from)?;
+        let continuing = args
+            .continuing
+            .map_err(|message| TemplateError::Renderer { message })?;
+        let prefix = split_continuation(&mut messages, continuing);
+        if messages.is_empty() {
+            return Err(TemplateError::Renderer {
+                message: "no messages to render".into(),
+            });
+        }
+        args.kwargs
+            .insert(message_context.clone(), Value::Array(messages));
+        let request = super::models::PreservedRequest {
+            args: args.kwargs,
+            tools: None,
+        };
+        Ok((super::render_oai(formatter, &request)?, prefix))
+    }
+
     /// Render `request` through the formatter's own template as SGLang's chat
     /// layer does, returning the prompt and the `continue_final_message` text.
     pub fn render_template(
@@ -72,21 +187,8 @@ impl ChatFormatter {
         if matches!(
             self,
             ChatFormatter::HuggingFace { .. } | ChatFormatter::KimiK25 { .. }
-        ) && let Some(key) = [
-            "conversation",
-            "tools",
-            "add_generation_prompt",
-            "tokenize",
-            "return_dict",
-        ]
-        .into_iter()
-        .find(|key| args.kwargs.contains_key(*key))
-        {
-            return Err(TemplateError::Renderer {
-                message: format!(
-                    "chat_template_kwargs duplicates apply_chat_template argument {key}"
-                ),
-            });
+        ) {
+            args.check_jinja_kwargs()?;
         }
         let (messages, continuation) = match self {
             // SGLang's K3 encoder splits a trailing assistant turn off only to continue it.
@@ -98,6 +200,7 @@ impl ChatFormatter {
             self,
             ChatFormatter::HuggingFace { .. }
                 | ChatFormatter::Native { .. }
+                | ChatFormatter::DeepSeekV32
                 | ChatFormatter::Glm53(_)
                 | ChatFormatter::MiniMaxM3 { .. }
                 | ChatFormatter::Qwen38 { .. }
