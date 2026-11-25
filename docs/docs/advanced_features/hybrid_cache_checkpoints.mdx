@@ -32,6 +32,10 @@ These historical measurements from [#49886](https://github.com/sgl-project/sglan
 | Qwen3.8-27B multi-turn sessions with HiCache: continuation hit / states written to host / host write bytes | 0.993 / 304 / 66.7 GB | 0.993 / 87 / 33.4 GB |
 | Qwen3.8-Flash-Next, AgentX trace replay (cookbook TP1 MTP recipe): hit rate / output tok/min/GPU | 0.961 / 59,480 | 0.960 / 60,525 |
 
+## Publishing checkpoints as KV events
+
+A KV-aware router that places requests by cached prefix needs to know where a worker kept its checkpoints, since a hybrid model resumes only there. With `--kv-events-config` set and `"publish_recurrent_checkpoints": true` in that JSON, the cache publishes each checkpoint next to the attention events: a `BlockStored` with `kv_cache_spec_kind: "mamba"`, `group_idx: 1`, no token ids and one block hash, the hash of the page the state is valid at (the same hash the attention `BlockStored` for that page carries), when a state is cached on device, and a matching `BlockRemoved` when the state is evicted while the attention KV stays. These fields mirror vLLM's self-describing KV events, so the Dynamo router consumes both engines alike. The option is off by default because a consumer that ignores `kv_cache_spec_kind` would read these as attention blocks. Dense models publish nothing extra.
+
 ## Related options
 
 - `--mamba-max-states-per-path N` is deprecated. When set, it still sets the soft per-path cap at either level (`-1` means unlimited).

@@ -17,7 +17,7 @@ use crate::unified_lru_list::CostPriority;
 use crate::unified_tree_core::{
     CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
-    PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
+    PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, StorageMedium, UnifiedTreeCore,
 };
 
 /// Mamba component driver; owns the Mamba device/host value slots.
@@ -454,11 +454,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let tokens = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             tree_core.inc_evictable_size(MAMBA, tokens);
             self.cost_mark_used_(tree_core, node_id);
+            tree_core.record_state_store_event_(node_id, StorageMedium::Gpu);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
             tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
+            tree_core.record_state_store_event_(node_id, StorageMedium::Gpu);
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
             self.cost_mark_used_(tree_core, node_id);
@@ -593,6 +595,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .or_default()
                 .push(tree_core.arena.node_mut(node_id).take_device_value(MAMBA));
             tree_core.dec_evictable_size(MAMBA, freed);
+            // The attention pages may stay (a tombstone), so the checkpoint
+            // needs its own removal.
+            tree_core.record_state_remove_event_(node_id, StorageMedium::Gpu);
         }
 
         // Host layer
@@ -955,6 +960,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     // The materialization primitive owns the ledger/LRU moves,
                     // including crediting protected when restored under lock.
                     tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
+                    tree_core.record_state_store_event_(node_id, StorageMedium::Gpu);
                     self.cost_mark_used_(tree_core, node_id);
                     self.cost_forget_gains_(tree_core, node_id);
                 }
