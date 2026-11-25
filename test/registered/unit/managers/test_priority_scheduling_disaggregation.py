@@ -272,6 +272,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             priority=3,
             extra_key=None,
             cache_salt=None,
+            _user_cache_salt=None,
             kv_rotation_base=None,
             last_node=object(),
             swa_branching_seqlen=None,

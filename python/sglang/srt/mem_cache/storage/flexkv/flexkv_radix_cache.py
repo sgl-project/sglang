@@ -219,7 +219,7 @@ class FlexKVRadixCache(RadixCache):
                 key.extra_key,
                 key.is_bigram,
                 cache_salt=key.cache_salt,
-                user_cache_salt=key.user_cache_salt,
+                request_cache_salt=key.request_cache_salt,
             ),
             value_numel=device_len,
         )

@@ -21,6 +21,7 @@ def _req(n):
         full_untruncated_fill_ids=array("q", range(n)),
         extra_key=None,
         cache_salt=None,
+        _user_cache_salt=None,
     )
 
 

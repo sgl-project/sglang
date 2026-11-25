@@ -255,9 +255,17 @@ class KVCacheEvent(
     This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
     such as Dynamo decodes both engines with one code path.
 
-    Dynamo routing consumers prefer ``user_cache_salt`` by field presence:
-    explicit null means unsalted; only an omitted field permits legacy fallback
-    to ``cache_salt``. Do not use ``user_cache_salt or cache_salt``.
+    Consumers must select ``request_cache_salt`` by field presence: explicit null
+    means unsalted; omission falls back to ``cache_salt``. It is omitted when
+    equal to ``cache_salt`` or outside the Dynamo format.
+    Native ``sgl-router`` namespace handling is unchanged.
+
+    ``request_cache_salt`` is the namespace supplied to the engine, which may
+    already be derived by a proxy; ``cache_salt`` is the engine cache namespace.
+
+    The caller namespace does not imply cross-media prefix reuse: the engine
+    scopes the whole request, including leading text, to its media identities.
+    Routers must also honor that scope when estimating reusable prefixes.
 
     ``EventBatch`` stays a positional array ``[ts, events, attn_dp_rank]``.
     """
@@ -292,10 +300,9 @@ class BlockStored(KVCacheEvent):
     # label] runs of multimodal tokens whose item carried a caller routing
     # label. Labels are routing metadata only and never affect hashes or reuse.
     mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
-    # Dynamo format: the original caller salt, before media identities are
-    # mixed into cache_salt. UNSET means unknown; None explicitly means unsalted.
-    # Routing metadata only: cache identity and emitted block hashes are unchanged.
-    user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET
+    # Supplied request namespace; omitted when cache_salt is already sufficient.
+    # Explicit None means unsalted, not a fallback to the engine namespace.
+    request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET
 
 
 class BlockRemoved(KVCacheEvent):

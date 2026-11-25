@@ -30,6 +30,7 @@ class _StubReq:
         self.output_ids = array("q")
         self.extra_key = None
         self.cache_salt = None
+        self._user_cache_salt = None
         self.prefix_len = 0
         self.last_node = None
         self.last_host_node = None

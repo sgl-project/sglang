@@ -32,6 +32,7 @@ from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -2301,7 +2302,6 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
             lora_id=None,
             medium=StorageMedium.GPU,
             lora_name="adapter-a",
-            user_cache_salt=None,
         )
     ]
 
@@ -4419,6 +4419,61 @@ def test_swa_host_only_prefix_matches_with_a_request_window(backend, request_win
     assert matched.host_hit_length == (8 if request_window else 0)
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_new_nodes_keep_the_inserting_caller_metadata(backend, monkeypatch):
+    """Extending a cached path must not inherit its older caller metadata."""
+    monkeypatch.setattr(events, "MM_ROUTING_LABELS", events.MmRoutingLabels())
+    core = _tree_core(
+        backend,
+        page_size=2,
+        enable_kv_cache_events=True,
+        dynamo_kv_event_format=True,
+    )
+    core.take_events()
+    for tokens, salt in (
+        ([1, 2], msgspec.UNSET),
+        ([1, 2, 3, 4], None),
+        ([1, 2, 3, 4, 5, 6], "caller-a"),
+    ):
+        key = RadixKey(
+            array("q", tokens),
+            cache_salt="engine-namespace",
+            request_cache_salt=salt,
+        )
+        _pump_insert(core, InsertParams(key=key, value=torch.arange(len(tokens))))
+        stored = [e for e in core.take_events() if isinstance(e, BlockStored)]
+        assert len(stored) == 1
+        assert stored[0].token_ids == tokens[-2:]
+        assert stored[0].request_cache_salt == salt
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("user_salt", [msgspec.UNSET, None, "caller-a"])
+def test_host_insert_publishes_the_caller_namespace(backend, user_salt, monkeypatch):
+    """Host-only insertion must retain explicit unsalted and tenant metadata."""
+    monkeypatch.setattr(events, "MM_ROUTING_LABELS", events.MmRoutingLabels())
+    core = _tree_core(
+        backend,
+        page_size=2,
+        enable_kv_cache_events=True,
+        dynamo_kv_event_format=True,
+    )
+    core.set_hicache_enabled()
+    core.take_events()
+    key = RadixKey(
+        array("q", [1, 2, 3, 4]),
+        cache_salt="engine-namespace",
+        request_cache_salt=user_salt,
+    )
+    core.insert_host(
+        core.root_node_handle(), key, torch.arange(4), ["a" * 64, "b" * 64]
+    )
+    stored = [e for e in core.take_events() if isinstance(e, BlockStored)]
+    assert stored
+    assert [t for event in stored for t in event.token_ids] == [1, 2, 3, 4]
+    assert all(event.request_cache_salt == user_salt for event in stored)
+
+
 @pytest.mark.parametrize("user_salt", [msgspec.UNSET, None, "caller-a"])
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split(user_salt):
     core = _tree_core()
@@ -4427,7 +4482,7 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split(user_salt):
         array("q", [1, 2]),
         extra_key="adapter-a",
         cache_salt="tenant-a",
-        user_cache_salt=user_salt,
+        request_cache_salt=user_salt,
     )
     inserted = _pump_insert(
         core,
@@ -4444,7 +4499,7 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split(user_salt):
     assert snapshot.key.token_ids == array("q", [1, 2])
     assert snapshot.key.extra_key == "adapter-a"
     assert snapshot.key.cache_salt == "tenant-a"
-    assert snapshot.key.user_cache_salt == user_salt
+    assert snapshot.key.request_cache_salt == key.request_cache_salt
     assert not snapshot.key.is_bigram
     assert snapshot.prefix_keys == []
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is not None

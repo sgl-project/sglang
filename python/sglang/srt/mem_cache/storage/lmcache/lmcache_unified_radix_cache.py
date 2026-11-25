@@ -187,7 +187,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         storage_hit_end: Optional[int] = None,
         *,
         kv_hints: Optional[KvHintsEnvelope] = None,
-        user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
+        request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
     ) -> None:
         del last_hash, prefix_keys, storage_hit_end, kv_hints
         req_id = request.rid
@@ -205,7 +205,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
-            user_cache_salt=user_cache_salt,
+            request_cache_salt=request_cache_salt,
         ).page_aligned(self.page_size)
         if len(key) == 0:
             return

@@ -249,10 +249,13 @@ class TestFeatureIdentity(CustomTestCase):
 
     def test_request_namespace_prevents_partial_media_prefix_reuse(self):
         for backend, page_size, text_len, media_len in itertools.product(
-            ("python", "rust"), (1, 16), (15, 16), (1, 32)
+            ("python", "rust"), (1, 16), (15, 16, 64), (1, 32)
         ):
-            with self.subTest(
-                backend=backend, page=page_size, text=text_len, media=media_len
+            with (
+                self.subTest(
+                    backend=backend, page=page_size, text=text_len, media=media_len
+                ),
+                patch.object(events, "MM_ROUTING_LABELS", events.MmRoutingLabels()),
             ):
                 a, b = _item(torch.zeros(8)), _item(torch.ones(8))
                 a.set_pad_value()
@@ -273,9 +276,7 @@ class TestFeatureIdentity(CustomTestCase):
                     )
                     req.extend_image_inputs(MultimodalInputs(mm_items=[item]))
                     keys.append(
-                        RadixKey(
-                            array("q", req.origin_input_ids), cache_salt=req.cache_salt
-                        )
+                        RadixKey.from_req(req, array("q", req.origin_input_ids))
                     )
                     salt = req.cache_salt
                     req.bind_multimodal_cache_namespace()
@@ -285,7 +286,13 @@ class TestFeatureIdentity(CustomTestCase):
                 self.assertNotEqual(
                     get_storage_hash_str(keys[0]), get_storage_hash_str(keys[1])
                 )
-                core = _tree_core(backend, page_size=page_size)
+                core = _tree_core(
+                    backend,
+                    page_size=page_size,
+                    enable_kv_cache_events=True,
+                    dynamo_kv_event_format=True,
+                )
+                core.take_events()
                 cached_len = len(keys[0]) // page_size * page_size
                 _pump_insert(
                     core, InsertParams(key=keys[0], value=torch.arange(cached_len))
@@ -298,6 +305,11 @@ class TestFeatureIdentity(CustomTestCase):
                     core.match_prefix(MatchPrefixParams(key=keys[2])).device_prefix_len,
                     cached_len,
                 )
+                stored = [e for e in core.take_events() if isinstance(e, BlockStored)]
+                self.assertTrue(stored)
+                for event in stored:
+                    self.assertEqual(event.cache_salt, keys[0].cache_salt)
+                    self.assertEqual(event.request_cache_salt, "tenant")
 
     def test_dynamo_events_preserve_the_original_request_namespace(self):
         """Media-scoped requests must publish the caller namespace and label spans."""
@@ -349,8 +361,8 @@ class TestFeatureIdentity(CustomTestCase):
                 )[1]
                 for event in wire:
                     self.assertEqual(event["cache_salt"], req.cache_salt)
-                    self.assertIn("user_cache_salt", event)
-                    self.assertEqual(event["user_cache_salt"], user_salt)
+                    self.assertIn("request_cache_salt", event)
+                    self.assertEqual(event["request_cache_salt"], user_salt)
                 self.assertEqual(
                     [token for event in wire for token in event["token_ids"]],
                     tokens,

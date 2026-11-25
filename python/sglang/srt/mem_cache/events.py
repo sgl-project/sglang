@@ -313,7 +313,7 @@ class KVCacheEventRecorder:
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
-                    and tail.user_cache_salt == event.user_cache_salt
+                    and tail.request_cache_salt == event.request_cache_salt
                     and tail.session_id == event.session_id
                     and tail.lora_name == event.lora_name
                     and tail.block_hashes
@@ -393,6 +393,11 @@ class KVCacheEventRecorder:
             if self.dynamo_format
             else self.lora_names.get(node.key.extra_key)
         )
+        request_cache_salt = (
+            node.key.request_cache_salt
+            if self.dynamo_format and node.key.request_cache_salt != node.key.cache_salt
+            else msgspec.UNSET
+        )
 
         page_index = 0
         logical_len = len(node.key)
@@ -422,11 +427,7 @@ class KVCacheEventRecorder:
                     lora_id=None,
                     medium=medium,
                     cache_salt=node.key.cache_salt,
-                    user_cache_salt=(
-                        node.key.user_cache_salt
-                        if self.dynamo_format
-                        else msgspec.UNSET
-                    ),
+                    request_cache_salt=request_cache_salt,
                     session_id=session_id,
                     lora_name=lora_name,
                     mm_routing_spans=(

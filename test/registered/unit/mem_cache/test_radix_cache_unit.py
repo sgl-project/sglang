@@ -61,7 +61,7 @@ class TestKVCacheEventQueue(unittest.TestCase):
         for first, second in ((msgspec.UNSET, None), (None, "tenant-a")):
             queue = KVCacheEventRecorder(enabled=True, page_size=2)
             a, b = self._store(1, None), self._store(2, 1)
-            a.user_cache_salt, b.user_cache_salt = first, second
+            a.request_cache_salt, b.request_cache_salt = first, second
             queue.enqueue(a)
             queue.enqueue(b)
             self.assertEqual(len(queue.take()), 2)
@@ -176,13 +176,9 @@ class TestRadixKey(unittest.TestCase):
                     )
                     self.assertEqual(key.match(query), len(key))
                     for view in (key, key[1:], key[:0], key.page_aligned(2)):
-                        self.assertEqual(view.user_cache_salt, salt)
+                        self.assertEqual(view.request_cache_salt, salt)
                         self.assertEqual(view.cache_salt, req.cache_salt)
-                    del req._user_cache_salt
-                    self.assertIs(
-                        RadixKey.from_req(req, key.token_ids).user_cache_salt,
-                        msgspec.UNSET,
-                    )
+                    self.assertEqual(query.request_cache_salt, req.cache_salt)
 
     def test_init_with_extra_key(self):
         """Test initialization with extra_key."""
@@ -382,7 +378,7 @@ class TestRadixCache(CustomTestCase):
                     for event in initial + delayed:
                         self.assertEqual(event.cache_salt, internal_salt)
                         self.assertEqual(
-                            event.user_cache_salt,
+                            event.request_cache_salt,
                             user_salt if dynamo_format else msgspec.UNSET,
                         )
 
@@ -561,6 +557,7 @@ class TestRadixCache(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
+            _user_cache_salt=None,
             priority=0,
             last_node=cache.root_node,
             lock=None,
@@ -613,6 +610,7 @@ class TestRadixCache(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
+            _user_cache_salt=None,
             priority=priority,
             last_node=cache.root_node,
             lock=None,

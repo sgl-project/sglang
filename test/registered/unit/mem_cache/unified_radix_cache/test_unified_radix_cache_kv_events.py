@@ -88,8 +88,8 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
                     self.assertTrue(stored)
                     for event in stored:
                         self.assertIs(
-                            event.user_cache_salt,
-                            None if dynamo_format else msgspec.UNSET,
+                            event.request_cache_salt,
+                            msgspec.UNSET,
                         )
                     spans = [
                         block_spans
@@ -126,7 +126,7 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
             salted_hashes,
         )
 
-    def test_user_cache_salt_survives_host_backup_and_load_back(self):
+    def test_request_cache_salt_survives_host_backup_and_load_back(self):
         for backend in ("python", "rust"):
             for user_salt in (None, "tenant-a"):
                 with self.subTest(backend=backend, user_salt=user_salt):
@@ -145,7 +145,7 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
                         allocator,
                         tokens,
                         cache_salt=internal_salt,
-                        user_cache_salt=user_salt,
+                        request_cache_salt=user_salt,
                     )
                     initial = self._stored_events(cache, StorageMedium.GPU)
                     leaf = cache.match_prefix(
@@ -166,7 +166,7 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
                         )
                         for event in stored:
                             self.assertEqual(event.cache_salt, internal_salt)
-                            self.assertEqual(event.user_cache_salt, user_salt)
+                            self.assertEqual(event.request_cache_salt, user_salt)
 
     def test_session_id_is_attributed_without_changing_block_hash(self):
         cache_a, allocator_a, _ = build_fixture(self.cfg, enable_kv_cache_events=True)

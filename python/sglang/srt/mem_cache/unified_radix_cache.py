@@ -2750,7 +2750,7 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_end: Optional[int] = None,
         *,
         kv_hints: Optional[KvHintsEnvelope] = None,
-        user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
+        request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2801,7 +2801,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
-            user_cache_salt=user_cache_salt,
+            request_cache_salt=request_cache_salt,
         ).page_aligned(self.page_size)
         assume_stored = (
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
@@ -3745,7 +3745,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_key=old_key.extra_key,
                 is_bigram=old_key.is_bigram,
                 cache_salt=old_key.cache_salt,
-                user_cache_salt=old_key.user_cache_salt,
+                request_cache_salt=old_key.request_cache_salt,
             )
         )
         self.ongoing_prefetch[request] = info

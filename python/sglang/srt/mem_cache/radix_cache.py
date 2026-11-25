@@ -65,7 +65,7 @@ class RadixKey:
         "token_ids",
         "extra_key",
         "cache_salt",
-        "user_cache_salt",
+        "request_cache_salt",
         "is_bigram",
         "limit",
     )
@@ -77,20 +77,19 @@ class RadixKey:
         is_bigram: bool = False,
         limit: Optional[int] = None,
         cache_salt: Optional[str] = None,
-        user_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
+        request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
         # Namespaces the tree and storage; KV events see only its LoRA name.
         self.extra_key = extra_key
-        # Namespaces the tree, storage and KV events.
+        # Engine namespace for tree matching, storage and opaque block IDs.
         self.cache_salt = cache_salt or None
-        # Event metadata only; deliberately excluded from matching/storage keys.
-        self.user_cache_salt = (
-            None
-            if user_cache_salt == ""
-            or (user_cache_salt is msgspec.UNSET and self.cache_salt is None)
-            else user_cache_salt
+        # Supplied request namespace: event metadata, not a matching/storage key.
+        self.request_cache_salt = (
+            self.cache_salt
+            if request_cache_salt is msgspec.UNSET
+            else request_cache_salt or None
         )
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
@@ -100,13 +99,18 @@ class RadixKey:
 
     @classmethod
     def from_req(
-        cls, req: Req, token_ids: array[int], *, is_bigram=False, limit=None
+        cls,
+        req: Req,
+        token_ids: array[int],
+        *,
+        is_bigram: bool = False,
+        limit: Optional[int] = None,
     ) -> RadixKey:
         return cls(
             token_ids,
             extra_key=req.extra_key,
             cache_salt=req.cache_salt,
-            user_cache_salt=getattr(req, "_user_cache_salt", msgspec.UNSET),
+            request_cache_salt=req._user_cache_salt,
             is_bigram=is_bigram,
             limit=limit,
         )
@@ -163,13 +167,13 @@ class RadixKey:
                 self.extra_key,
                 is_bigram=True,
                 cache_salt=self.cache_salt,
-                user_cache_salt=self.user_cache_salt,
+                request_cache_salt=self.request_cache_salt,
             )
         return RadixKey(
             self.token_ids[start:stop],
             self.extra_key,
             cache_salt=self.cache_salt,
-            user_cache_salt=self.user_cache_salt,
+            request_cache_salt=self.request_cache_salt,
         )
 
     def __repr__(self) -> str:

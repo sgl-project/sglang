@@ -1117,26 +1117,31 @@ fn cache_salt_is_a_distinct_child_namespace_dimension() -> Result<(), TreeCoreRu
 }
 
 #[test]
-fn user_cache_salt_is_metadata_not_cache_identity() {
+fn request_cache_salt_is_metadata_not_cache_identity() {
     let internal = KeyNamespaceRef::new(None, Some("sglang-mm-v1:internal"));
-    assert_eq!(internal.to_owned().user_cache_salt(), None);
+    assert_eq!(
+        internal.to_owned().request_cache_salt().as_deref(),
+        Some("sglang-mm-v1:internal")
+    );
     for user_salt in [None, Some("tenant-a")] {
-        let labeled = internal.with_user_cache_salt(Some(user_salt));
+        let labeled = internal.with_request_cache_salt(user_salt);
         assert_eq!(labeled, internal);
         let owned = labeled.to_owned();
         assert_eq!(owned, internal.to_owned());
-        assert_eq!(owned.user_cache_salt(), Some(user_salt.map(Arc::from)));
+        assert_eq!(owned.request_cache_salt(), user_salt.map(Arc::from));
         let mut plain_hash = DefaultHasher::new();
         let mut labeled_hash = DefaultHasher::new();
         internal.hash(&mut plain_hash);
         owned.hash(&mut labeled_hash);
         assert_eq!(plain_hash.finish(), labeled_hash.finish());
         assert_eq!(
-            owned.as_ref().to_owned().user_cache_salt(),
-            owned.user_cache_salt()
+            owned.as_ref().to_owned().request_cache_salt(),
+            owned.request_cache_salt()
         );
     }
-    assert_eq!(KeyNamespace::default().user_cache_salt(), Some(None));
+    assert_eq!(KeyNamespace::default().request_cache_salt(), None);
+    assert_eq!(KeyNamespaceRef::default().request_cache_salt(), None);
+    assert_eq!(KeyNamespaceRef::new(None, None).request_cache_salt(), None);
 }
 
 #[test]
@@ -1156,13 +1161,13 @@ fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     let first = KeyNamespaceRef {
         extra_key: Some("adapter-a"),
         cache_salt: Some("tenant-a"),
-        user_cache_salt: None,
+        request_cache_salt: None,
         hash: 7,
     };
     let second = KeyNamespaceRef {
         extra_key: Some("adapter-b"),
         cache_salt: Some("tenant-b"),
-        user_cache_salt: None,
+        request_cache_salt: None,
         hash: 7,
     };
     assert_ne!(first, second);
