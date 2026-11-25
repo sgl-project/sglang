@@ -24,6 +24,20 @@ use crate::unified_tree_core::{
     PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
+fn request_namespace<'a>(
+    extra_key: Option<&'a str>,
+    cache_salt: Option<&'a str>,
+    request_cache_salt: Option<&'a str>,
+    has_request_cache_salt: bool,
+) -> KeyNamespaceRef<'a> {
+    let namespace = KeyNamespaceRef::new(extra_key, cache_salt);
+    if has_request_cache_salt || request_cache_salt.is_some() {
+        namespace.with_request_cache_salt(request_cache_salt)
+    } else {
+        namespace
+    }
+}
+
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
 /// Keep this boundary outside the whole binding call so its MutexGuard unwinds
 /// and poisons the core before the panic is caught. A poisoned core stays unusable.
@@ -524,6 +538,7 @@ pub struct InsertParamsBinding {
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
     pub request_cache_salt: Option<String>,
+    pub has_request_cache_salt: bool,
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub mamba_host_value: Option<Py<PyAny>>,
@@ -539,7 +554,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false, request_cache_salt = None, request_cache_salt_provided = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false, request_cache_salt = None, has_request_cache_salt = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -558,14 +573,8 @@ impl InsertParamsBinding {
         mamba_host_value: Option<Py<PyAny>>,
         allow_missing_mamba: bool,
         request_cache_salt: Option<String>,
-        request_cache_salt_provided: bool,
+        has_request_cache_salt: bool,
     ) -> PyResult<Self> {
-        // The flag distinguishes an explicit None from omitted metadata.
-        let request_cache_salt = if request_cache_salt_provided || request_cache_salt.is_some() {
-            request_cache_salt
-        } else {
-            cache_salt.clone()
-        };
         Ok(InsertParamsBinding {
             rotation_base,
             key: py_array_to_vec_i64(py, key)?,
@@ -573,6 +582,7 @@ impl InsertParamsBinding {
             extra_key,
             cache_salt,
             request_cache_salt,
+            has_request_cache_salt,
             session_id,
             mamba_value,
             mamba_host_value,
@@ -589,8 +599,12 @@ impl InsertParamsBinding {
 
 impl InsertParamsBinding {
     fn namespace(&self) -> KeyNamespaceRef<'_> {
-        KeyNamespaceRef::new(self.extra_key.as_deref(), self.cache_salt.as_deref())
-            .with_request_cache_salt(self.request_cache_salt.as_deref())
+        request_namespace(
+            self.extra_key.as_deref(),
+            self.cache_salt.as_deref(),
+            self.request_cache_salt.as_deref(),
+            self.has_request_cache_salt,
+        )
     }
 }
 
@@ -1699,13 +1713,8 @@ macro_rules! tree_core_methods {
                 hash_value: Vec<String>,
                 cache_salt: Option<String>,
                 request_cache_salt: Option<String>,
-                request_cache_salt_provided: bool,
+                has_request_cache_salt: bool,
             ) -> PyResult<InsertResultBinding> {
-                let request_cache_salt = if request_cache_salt_provided || request_cache_salt.is_some() {
-                    request_cache_salt
-                } else {
-                    cache_salt.clone()
-                };
                 let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
                 let host_value = host_value.0;
                 if host_value.kind() != Kind::Int64 {
@@ -1718,8 +1727,12 @@ macro_rules! tree_core_methods {
                     .detach(move || {
                         self.core().insert_host_in_namespace(
                             node_id,
-                            KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref())
-                                .with_request_cache_salt(request_cache_salt.as_deref()),
+                            request_namespace(
+                                extra_key.as_deref(),
+                                cache_salt.as_deref(),
+                                request_cache_salt.as_deref(),
+                                has_request_cache_salt,
+                            ),
                             key,
                             host_value,
                             hash_value,
@@ -2180,6 +2193,7 @@ macro_rules! tree_core_methods {
                             medium,
                             cache_salt,
                             request_cache_salt,
+                            has_request_cache_salt,
                             session_id,
                             extra_key,
                         } => {
@@ -2194,6 +2208,7 @@ macro_rules! tree_core_methods {
                                 session_id.map(|session_id| session_id.to_string()),
                                 extra_key.map(|extra_key| extra_key.to_string()),
                                 request_cache_salt.map(|salt| salt.to_string()),
+                                has_request_cache_salt,
                             )
                                 .into_py_any(py)?;
                             list.append(item)?;
@@ -3187,7 +3202,7 @@ macro_rules! tree_core_binding {
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
-            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None, request_cache_salt = None, request_cache_salt_provided = false))]
+            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None, request_cache_salt = None, has_request_cache_salt = false))]
             fn insert_host(
                 &self,
                 py: Python<'_>,
@@ -3198,11 +3213,12 @@ macro_rules! tree_core_binding {
                 hash_value: Vec<String>,
                 cache_salt: Option<String>,
                 request_cache_salt: Option<String>,
-                request_cache_salt_provided: bool,
+                has_request_cache_salt: bool,
             ) -> PyResult<InsertResultBinding> {
                 catch_native_panic(|| {
                     self.inner.insert_host(
-                        py, node_id, extra_key, key, host_value, hash_value, cache_salt, request_cache_salt, request_cache_salt_provided,
+                        py, node_id, extra_key, key, host_value, hash_value,
+                        cache_salt, request_cache_salt, has_request_cache_salt,
                     )
                 })
             }

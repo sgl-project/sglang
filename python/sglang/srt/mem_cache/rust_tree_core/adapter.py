@@ -152,7 +152,7 @@ def _kv_event_from_tagged(
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
             request_cache_salt=(
-                event[9] if dynamo_format and event[9] != event[6] else msgspec.UNSET
+                event[9] if dynamo_format and event[10] else msgspec.UNSET
             ),
             session_id=event[7],
             lora_name=lora_name,
@@ -973,14 +973,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # The binding always receives a value tensor; fall back to the
             # token ids materialized on the core's device.
             value = torch.tensor(key_buffer, dtype=torch.int64, device=self.device)
+        has_request_cache_salt = key.request_cache_salt is not key.cache_salt
         step = self._binding.begin_insert(
             self._bindings.InsertParamsBinding(
                 key=key_buffer,
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
-                request_cache_salt=key.request_cache_salt,
-                request_cache_salt_provided=True,
+                request_cache_salt=(
+                    key.request_cache_salt if has_request_cache_salt else None
+                ),
+                has_request_cache_salt=has_request_cache_salt,
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 mamba_host_value=params.mamba_host_value,
@@ -1105,6 +1108,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         host_value: torch.Tensor,
         hash_value: list[str],
     ) -> InsertResult:
+        has_request_cache_salt = key.request_cache_salt is not key.cache_salt
         result = self._binding.insert_host(
             node_id,
             key.extra_key,
@@ -1112,8 +1116,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             host_value,
             list(hash_value),
             key.cache_salt,
-            request_cache_salt=key.request_cache_salt,
-            request_cache_salt_provided=True,
+            request_cache_salt=(
+                key.request_cache_salt if has_request_cache_salt else None
+            ),
+            has_request_cache_salt=has_request_cache_salt,
         )
         return InsertResult(
             prefix_len=result.prefix_len,

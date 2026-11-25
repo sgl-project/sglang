@@ -146,7 +146,7 @@ class _StagedPrefetch(msgspec.Struct):
     aux_xfers: list[PoolTransfer]
     hash_values: list[str]
     operation_id: int
-    request_cache_salt: str | None = None
+    request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET
 
 
 class _OngoingBufferLoadBack(msgspec.Struct):

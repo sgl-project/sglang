@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     EvictParams,
     InsertParams,
@@ -44,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
     zero_match_result,
 )
+from sglang.srt.mem_cache.buffer_mode.pipeline import _StagedPrefetch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.events import KvEventLoraNames, LoRANameTable
@@ -4460,10 +4462,25 @@ def test_host_insert_publishes_the_caller_namespace(backend, user_salt, monkeypa
     )
     core.set_hicache_enabled()
     core.take_events()
-    key = RadixKey(
-        array("q", [1, 2, 3, 4]),
+    staged = _StagedPrefetch(
+        request=CacheRequestHandle("caller-namespace", 0),
+        key_tokens=array("q", [1, 2, 3, 4]),
+        extra_key=None,
         cache_salt="engine-namespace",
-        request_cache_salt=user_salt,
+        matched_len=0,
+        num_tokens=4,
+        occupied_tokens=4,
+        host_indices=torch.arange(4),
+        aux_xfers=[],
+        hash_values=["a" * 64, "b" * 64],
+        operation_id=1,
+    )
+    if user_salt is not msgspec.UNSET:
+        staged.request_cache_salt = user_salt
+    key = RadixKey(
+        staged.key_tokens,
+        cache_salt=staged.cache_salt,
+        request_cache_salt=staged.request_cache_salt,
     )
     core.insert_host(
         core.root_node_handle(), key, torch.arange(4), ["a" * 64, "b" * 64]

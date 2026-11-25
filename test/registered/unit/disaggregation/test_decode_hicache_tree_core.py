@@ -151,6 +151,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
                     origin_input_ids=tokens,
                     extra_key=extra_key,
                     cache_salt=salt,
+                    _user_cache_salt=salt,
                     kv_hints=_HINT,
                 )
                 cache.get_last_hash_value = lambda node: keys[0]
@@ -325,6 +326,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             origin_input_ids=[0, 1, 2, 3, 4, 5],
             extra_key=None,
             cache_salt=None,
+            _user_cache_salt=None,
         )
         prefix_match = DecodePrefixMatch(
             prefix_indices=torch.tensor([10, 11]),

@@ -12,7 +12,10 @@ from sglang.srt.managers.cache_controller import CacheOperation, HiCacheControll
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+from sglang.srt.mem_cache.buffer_mode.pipeline import (
+    BufferModePipeline,
+    _StagedPrefetch,
+)
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -391,7 +394,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         }
         pipeline.release_staged_hold = mock.Mock(return_value=True)
         pipeline.staged_prefetches = {
-            handle: SimpleNamespace(
+            handle: _StagedPrefetch(
                 request=handle,
                 key_tokens=array("q", range(8)),
                 extra_key=None,

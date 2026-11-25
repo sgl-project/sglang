@@ -1139,12 +1139,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let new_node_id = self.arena.alloc_detached(priority);
         // New nodes retain the inserter's metadata; existing nodes keep theirs.
         let parent = self.arena.node(parent_id);
-        let ns = if parent.is_root()
-            || parent.namespace.as_ref().request_cache_salt() != namespace.request_cache_salt()
-        {
+        let ns = if parent.is_root() {
             namespace.to_owned()
         } else {
-            parent.namespace.clone()
+            parent
+                .namespace
+                .with_request_cache_salt(namespace.request_cache_salt())
         };
         let new_node = self.arena.node_mut(new_node_id);
         new_node.key = key;
@@ -3980,6 +3980,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium: tail_medium,
                     cache_salt: tail_cache_salt,
                     request_cache_salt: tail_request_cache_salt,
+                    has_request_cache_salt: tail_has_request_cache_salt,
                     session_id: tail_session_id,
                     extra_key: tail_extra_key,
                     ..
@@ -3992,12 +3993,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt,
                     request_cache_salt,
+                    has_request_cache_salt,
                     session_id,
                     extra_key,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
                 && *tail_cache_salt == cache_salt
+                && *tail_has_request_cache_salt == has_request_cache_salt
                 && *tail_request_cache_salt == request_cache_salt
                 && *tail_session_id == session_id
                 && *tail_extra_key == extra_key
@@ -4081,7 +4084,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        let request_cache_salt = if self.dynamo_kv_event_format {
+        let namespace = self.arena.node(node_id).namespace.as_ref();
+        let has_request_cache_salt =
+            self.dynamo_kv_event_format && namespace.request_cache_salt() != namespace.cache_salt;
+        let request_cache_salt = if has_request_cache_salt {
             self.arena.node(node_id).namespace.request_cache_salt()
         } else {
             None
@@ -4123,6 +4129,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt: cache_salt.clone(),
                     request_cache_salt: request_cache_salt.clone(),
+                    has_request_cache_salt,
                     session_id: session_id.clone(),
                     extra_key: extra_key.clone(),
                 });
@@ -6714,8 +6721,9 @@ pub enum KvCacheEvent<A> {
         block_size: usize,
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
-        /// Supplied request namespace; None means unsalted in the Dynamo format.
+        /// Present-null means unsalted; absent metadata inherits cache_salt.
         request_cache_salt: Option<Arc<str>>,
+        has_request_cache_salt: bool,
         session_id: Option<Arc<str>>,
         /// Not published; Python maps it to the LoRA name that namespaces the hashes.
         extra_key: Option<Arc<str>>,

@@ -150,6 +150,25 @@ impl KeyNamespace {
             .and_then(|namespace| namespace.request_cache_salt.clone())
     }
 
+    pub fn with_request_cache_salt(&self, value: Option<&str>) -> Self {
+        let value = value.filter(|salt| !salt.is_empty());
+        if self.as_ref().request_cache_salt() == value {
+            return self.clone();
+        }
+        let cache_salt = self.cache_salt_arc();
+        let request_cache_salt = if cache_salt.as_deref() == value {
+            cache_salt.clone()
+        } else {
+            value.map(Arc::from)
+        };
+        Self(Some(Arc::new(KeyNamespaceData {
+            extra_key: self.extra_key_arc(),
+            cache_salt,
+            request_cache_salt,
+            hash: self.as_ref().hash,
+        })))
+    }
+
     pub fn extra_key_arc(&self) -> Option<Arc<str>> {
         self.0
             .as_ref()

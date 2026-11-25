@@ -14,6 +14,38 @@ fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
 }
 
+#[test]
+fn child_helpers_preserve_parent_cache_identity_when_request_metadata_changes() {
+    let mut tc = core();
+    let root = tc.arena.root();
+    let namespace = KeyNamespaceRef::new(Some("adapter-a"), Some("engine-a"))
+        .with_request_cache_salt(Some("caller-a"));
+    let parent = tc.add_new_node_in_namespace_(
+        root,
+        vec![1, 2],
+        &Tensor::from_slice(&[1i64, 2]),
+        0,
+        namespace,
+        None,
+    );
+    let child = tc.add_new_node_(parent, vec![3, 4], &Tensor::from_slice(&[3i64, 4]), 0, None);
+    let detached = tc.new_node_(vec![5, 6], parent, 0, 0, None, None);
+    for id in [child, detached] {
+        assert_eq!(tc.arena.node(id).namespace, tc.arena.node(parent).namespace);
+        assert_eq!(tc.arena.node(id).namespace.request_cache_salt(), None);
+        assert!(Arc::ptr_eq(
+            &tc.arena.node(id).namespace.cache_salt_arc().unwrap(),
+            &tc.arena.node(parent).namespace.cache_salt_arc().unwrap(),
+        ));
+    }
+    let matched = tc.match_prefix(&match_params_in_namespace(
+        &vec![1, 2, 3, 4],
+        Some("adapter-a"),
+        Some("engine-a"),
+    ));
+    assert_eq!(matched.device_prefix_len, 4);
+}
+
 fn add_leaf<K: ChildKeyType>(core: &mut UnifiedTreeCore<K>, parent: NodeIdx_, key: K) -> NodeIdx_ {
     let values = Tensor::arange(key.atom_len() as i64, (Kind::Int64, Device::Cpu));
     core.add_new_node_(parent, key, &values, 0, None)
@@ -3355,6 +3387,49 @@ fn events_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
 }
 
 #[test]
+fn store_events_only_carry_request_namespace_overrides_in_dynamo_format() {
+    for dynamo_format in [false, true] {
+        for (cache_salt, request_salt) in [
+            (None, None),
+            (Some("tenant-a"), Some("tenant-a")),
+            (Some("sglang-mm-v1:internal"), None),
+            (Some("sglang-mm-v1:internal"), Some("tenant-a")),
+        ] {
+            let mut tc = events_core(2);
+            tc.dynamo_kv_event_format = dynamo_format;
+            let key = vec![1, 2, 3, 4];
+            let mut params = insert_params_in_namespace(&key, &[10, 11, 12, 13], None, cache_salt);
+            params.namespace = params.namespace.with_request_cache_salt(request_salt);
+            tc.insert(&params);
+            let events = tc.take_events();
+            assert!(!events.is_empty());
+            for event in events {
+                let KvCacheEvent::BlockStored {
+                    cache_salt: engine_salt,
+                    request_cache_salt,
+                    has_request_cache_salt,
+                    ..
+                } = event
+                else {
+                    panic!("expected store event");
+                };
+                let expected_override = dynamo_format && cache_salt != request_salt;
+                assert_eq!(engine_salt.as_deref(), cache_salt);
+                assert_eq!(has_request_cache_salt, expected_override);
+                assert_eq!(
+                    request_cache_salt.as_deref(),
+                    if expected_override {
+                        request_salt
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn request_cache_salt_survives_splits_and_late_host_stores() {
     for user_salt in [None, Some("tenant-a")] {
         let mut tc = events_core(2);
@@ -3389,10 +3464,12 @@ fn request_cache_salt_survives_splits_and_late_host_stores() {
                 KvCacheEvent::BlockStored {
                     cache_salt,
                     request_cache_salt,
+                    has_request_cache_salt,
                     ..
                 } => {
                     assert_eq!(cache_salt.as_deref(), Some("sglang-mm-v1:internal"));
                     assert_eq!(request_cache_salt, user_salt.map(Arc::from));
+                    assert!(has_request_cache_salt);
                 }
                 _ => panic!("expected store event"),
             }
@@ -3425,6 +3502,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -3464,6 +3542,7 @@ fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: Some(Arc::from("session-a")),
             extra_key: None,
         }]
@@ -3542,6 +3621,7 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: Some(Arc::from("lora-a")),
         }]
@@ -3629,12 +3709,13 @@ fn salted_event_hash_walk_is_iterative_and_on_demand() {
 #[test]
 fn event_coalescing_respects_request_cache_salt() {
     for (first, second) in [
-        (None, Some("tenant-a")),
-        (Some("tenant-a"), Some("tenant-b")),
-        (Some("tenant-a"), Some("tenant-a")),
+        ((false, None), (true, None)),
+        ((true, None), (true, Some("tenant-a"))),
+        ((true, Some("tenant-a")), (true, Some("tenant-b"))),
+        ((true, Some("tenant-a")), (true, Some("tenant-a"))),
     ] {
         let mut tc = events_core(2);
-        for (index, salt) in [first, second].into_iter().enumerate() {
+        for (index, (has_salt, salt)) in [first, second].into_iter().enumerate() {
             tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
                 block_hashes: vec![index as i64 + 1],
                 parent_block_hash: (index == 1).then_some(1),
@@ -3643,6 +3724,7 @@ fn event_coalescing_respects_request_cache_salt() {
                 medium: StorageMedium::Gpu,
                 cache_salt: Some(Arc::from("sglang-mm-v1:internal")),
                 request_cache_salt: salt.map(Arc::from),
+                has_request_cache_salt: has_salt,
                 session_id: None,
                 extra_key: None,
             });
@@ -3666,6 +3748,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3679,6 +3762,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3692,6 +3776,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3705,6 +3790,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3754,6 +3840,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3765,6 +3852,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3780,6 +3868,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: None,
     });
@@ -3791,6 +3880,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         request_cache_salt: None,
+        has_request_cache_salt: false,
         session_id: None,
         extra_key: Some(Arc::from("lora-a")),
     });
@@ -3995,6 +4085,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -4025,6 +4116,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -4084,6 +4176,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -4106,6 +4199,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -4199,6 +4293,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -4288,6 +4383,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]
@@ -4621,6 +4717,7 @@ fn insert_host_publishes_a_host_store_event() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             request_cache_salt: None,
+            has_request_cache_salt: false,
             session_id: None,
             extra_key: None,
         }]

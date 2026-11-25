@@ -57,7 +57,7 @@ DEFAULT_PAGE_SIZE = 4
 
 
 class TestKVCacheEventQueue(unittest.TestCase):
-    def test_coalescing_preserves_user_salt_presence(self):
+    def test_coalescing_preserves_request_salt_presence(self):
         for first, second in ((msgspec.UNSET, None), (None, "tenant-a")):
             queue = KVCacheEventRecorder(enabled=True, page_size=2)
             a, b = self._store(1, None), self._store(2, 1)
@@ -159,7 +159,7 @@ class TestLoRANameTable(unittest.TestCase):
 class TestRadixKey(unittest.TestCase):
     """Test cases for RadixKey class."""
 
-    def test_request_user_salt_survives_key_views_without_changing_matching(self):
+    def test_request_salt_survives_key_views_without_changing_matching(self):
         for salt in (None, "tenant-a"):
             for bigram in (False, True):
                 with self.subTest(salt=salt, bigram=bigram):
@@ -339,7 +339,7 @@ class TestTreeNode(unittest.TestCase):
 class TestRadixCache(CustomTestCase):
     """Test cases for RadixCache class."""
 
-    def test_user_salt_survives_split_and_delayed_store_only_in_dynamo_format(self):
+    def test_request_salt_survives_split_and_delayed_store_only_in_dynamo_format(self):
         for dynamo_format in (False, True):
             for user_salt in (None, "tenant-a"):
                 with self.subTest(dynamo_format=dynamo_format, user_salt=user_salt):
