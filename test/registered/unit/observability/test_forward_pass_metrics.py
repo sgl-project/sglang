@@ -1973,6 +1973,56 @@ class TestEstimatedPerfConstants(CustomTestCase):
             self.reporter._kv_cache_bytes_per_token, expected_kv_cache_bytes
         )
 
+    def test_nemotronh_style_dedicated_mlp_layers_are_not_treated_as_moe(self):
+        # Regression for RedHatAI/NVIDIA-Nemotron-Nano-9B-v2-FP8-dynamic:
+        # NemotronHConfig's constructor defaults num_experts_per_tok=2 and
+        # moe_intermediate_size=7688 regardless of whether a given checkpoint
+        # ever sets them -- this checkpoint's own config.json has neither
+        # field, and its real weights (model.safetensors.index.json) carry
+        # plain up_proj/down_proj per "mlp" layer, no expert-routed tensors
+        # anywhere. layers_block_type is the authoritative, per-checkpoint
+        # signal here: it lists "mlp" (dedicated dense FFN) layers but never
+        # "moe", so the MoE-shaped hf_text_config fields (stale class
+        # defaults, not this checkpoint's reality) must not override it.
+        hidden, head_dim, heads, kv_heads = 4480, 128.0, 40, 8
+        layers_block_type = [
+            "mamba", "mlp", "mamba", "mlp", "attention", "mlp", "mamba",
+        ]
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=999,
+                hf_config=types.SimpleNamespace(
+                    architectures=["NemotronHForCausalLM"]
+                ),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "intermediate_size": 15680,
+                    # Stale class-level MoE defaults this checkpoint never set.
+                    "moe_intermediate_size": 7688,
+                    "num_experts_per_tok": 2,
+                    "n_shared_experts": 1,
+                },
+            )
+        )
+        num_attn_layers = 1.0  # one "attention" label
+        num_mlp_layers = 3.0  # three "mlp" labels, zero "moe"
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        # NemotronHForCausalLM is in _NON_GATED_MLP_ARCHITECTURES (relu2,
+        # plain up_proj/down_proj) -- dense non-gated 4x multiplier, not the
+        # MoE path's 6x-gated-and-scaled-by-active-experts formula.
+        dense_mlp_flops = 4.0 * hidden * 15680
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * num_attn_layers + dense_mlp_flops * num_mlp_layers,
+        )
+
     def test_falcon_h1_style_uniform_hybrid_label_counts_every_layer(self):
         # FalconH1Config.layers_block_type is a property that returns
         # ["hybrid"] * num_hidden_layers -- every layer, never "attention",
@@ -2518,6 +2568,8 @@ class TestEstimatedPerfConstants(CustomTestCase):
         # "relu2"), OPTForCausalLM (opt.py: fc1+fc2, hidden_act "relu"), and
         # PhiForCausalLM (phi.py: fc1+fc2, hidden_act "gelu_new"), all of
         # which the old activation-based heuristic classified correctly.
+        # NemotronHForCausalLM (nemotron_h.py: up_proj+down_proj, hidden_act
+        # "relu2") was never covered by either heuristic -- added directly.
         # Each entry here must independently resolve to non-gated.
         for arch in (
             "GPT2LMHeadModel",
@@ -2527,6 +2579,7 @@ class TestEstimatedPerfConstants(CustomTestCase):
             "ArceeForCausalLM",
             "OPTForCausalLM",
             "PhiForCausalLM",
+            "NemotronHForCausalLM",
         ):
             with self.subTest(arch=arch):
                 config = _fake_model_config(
