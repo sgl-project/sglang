@@ -44,6 +44,31 @@ class TestMmProcessConfigValidation(CustomTestCase):
         args = self._validate_config(config)
         self.assertEqual(resolution_result(args, "mm_process_config"), config)
 
+    def test_shared_cache_dir_rejects_a_restricted_media_policy(self):
+        """Other processes fill the cache directory, so a hit would serve media this
+        server's local-file or domain policy rejects."""
+
+        def validate(**policy):
+            handle_multimodal(
+                ServerArgs(
+                    model_path="dummy",
+                    enable_token_space_processor=True,
+                    enable_token_space_preprocess_cache=True,
+                    token_space_preprocess_cache_trust_url=True,
+                    token_space_preprocess_cache_dir="/tmp/item-features",
+                    **policy,
+                )
+            )
+
+        validate()
+        for policy in (
+            {"allow_local_media_files": False},
+            {"allowed_media_domains": ["media.example.com"]},
+        ):
+            with self.subTest(**policy), self.assertRaises(ValueError) as ctx:
+                validate(**policy)
+            self.assertIn("--token-space-preprocess-cache-dir", str(ctx.exception))
+
 
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""

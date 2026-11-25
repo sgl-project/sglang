@@ -172,6 +172,15 @@ def handle_multimodal(server_args: Any):
                 "--enable-token-space-preprocess-cache in memory requires a positive "
                 "--mm-preprocess-cache-size-mb"
             )
+        if cfg.token_space_preprocess_cache_dir is not None and (
+            not cfg.allow_local_media_files or cfg.allowed_media_domains
+        ):
+            # Other processes write the directory, and a hit skips loading, the only
+            # place this server's media policy is checked.
+            raise ValueError(
+                "--token-space-preprocess-cache-dir cannot be combined with "
+                "--no-allow-local-media-files or --allowed-media-domains"
+            )
     elif cfg.token_space_preprocess_cache_dir is not None:
         raise ValueError(
             "--token-space-preprocess-cache-dir requires --enable-token-space-preprocess-cache"
