@@ -69,6 +69,7 @@ pub enum ChatFormatter {
         developer_errors: DeveloperErrors,
         content_parts: Option<bool>,
         message_context: String,
+        effort: reasoning::JinjaEffort,
     },
     /// A native Dynamo encoder selected by model identity, without a Jinja template.
     Native {

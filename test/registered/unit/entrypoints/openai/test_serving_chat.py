@@ -2317,6 +2317,30 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
 
+    def test_llm_d_hunyuan_tokens_require_matching_worker_parser(self):
+        """A Hunyuan prompt uses the worker's actual parser configuration."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.tm.tokenizer.encode.return_value = [1, 2, 3]
+        self.tm.model_config.token_id_vocab_size = 100
+
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            for parser, expected in ((None, [1, 2, 3]), ("hunyuan", [10, 20])):
+                with self.subTest(parser=parser):
+                    self.chat.reasoning_parser = parser
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        reasoning_effort="none",
+                        kv_transfer_params={"prompt_token_ids": [10, 20]},
+                    )
+                    actual = self.chat._process_messages(request, is_multimodal=False)
+                    self.assertEqual(actual.prompt_ids, expected)
+
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
         self.chat = OpenAIServingChat(self.tm, self.template_manager)

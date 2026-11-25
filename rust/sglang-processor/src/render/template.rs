@@ -22,7 +22,7 @@ pub struct TemplateArgs {
 }
 
 impl TemplateArgs {
-    fn check_jinja_kwargs(&self) -> Result<(), TemplateError> {
+    fn check_jinja_kwargs(kwargs: &mut HashMap<String, Value>) -> Result<(), TemplateError> {
         if let Some(key) = [
             "conversation",
             "tools",
@@ -31,13 +31,27 @@ impl TemplateArgs {
             "return_dict",
         ]
         .into_iter()
-        .find(|key| self.kwargs.contains_key(*key))
+        .find(|key| kwargs.contains_key(*key))
         {
             return Err(TemplateError::Renderer {
                 message: format!(
                     "chat_template_kwargs duplicates apply_chat_template argument {key}"
                 ),
             });
+        }
+        // The HuggingFace call always opens a generation prompt and requests
+        // plain text or token IDs without an assistant mask.
+        for key in ["continue_final_message", "return_assistant_tokens_mask"] {
+            if kwargs
+                .remove(key)
+                .is_some_and(|value| minijinja::Value::from_serialize(value).is_true())
+            {
+                return Err(TemplateError::Renderer {
+                    message: format!(
+                        "chat_template_kwargs.{key} is incompatible with chat rendering"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -139,6 +153,7 @@ impl ChatFormatter {
             formatter,
             content_parts,
             message_context,
+            effort,
             ..
         } = self
         else {
@@ -147,7 +162,8 @@ impl ChatFormatter {
             });
         };
         let mut args = TemplateArgs::new(body, defaults);
-        args.check_jinja_kwargs()?;
+        TemplateArgs::check_jinja_kwargs(&mut args.kwargs)?;
+        effort.apply(body, defaults, &mut args.kwargs)?;
         let mut messages = text_messages(body, *content_parts).map_err(TemplateError::from)?;
         let continuing = args
             .continuing
@@ -183,12 +199,13 @@ impl ChatFormatter {
             let prompt = formatter.render_with_continuation(request, continuing)?;
             return Ok((RenderedPrompt::text(prompt), String::new()));
         }
+        let mut kwargs = args.kwargs.clone();
         // _render_and_encode_chat_template supplies these arguments itself.
         if matches!(
             self,
             ChatFormatter::HuggingFace { .. } | ChatFormatter::KimiK25 { .. }
         ) {
-            args.check_jinja_kwargs()?;
+            TemplateArgs::check_jinja_kwargs(&mut kwargs)?;
         }
         let (messages, continuation) = match self {
             // SGLang's K3 encoder splits a trailing assistant turn off only to continue it.
@@ -208,7 +225,7 @@ impl ChatFormatter {
         );
         let request = TemplateArgsRequest {
             request,
-            args: args.kwargs.clone(),
+            args: kwargs,
             messages,
             tools: use_dumped_tools.then(|| args.tools.clone()),
         };
@@ -387,6 +404,69 @@ mod tests {
                 };
                 assert!(error.to_string().contains(key), "{error}");
             }
+        }
+    }
+
+    #[test]
+    fn text_jinja_rejects_incompatible_tokenizer_options() {
+        let formatter = jinja(concat!(
+            "{{ messages[0].content }}",
+            "{% if continue_final_message is defined or return_assistant_tokens_mask is defined %}",
+            "leaked tokenizer option{% endif %}"
+        ));
+        let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        for key in ["continue_final_message", "return_assistant_tokens_mask"] {
+            body["chat_template_kwargs"] = json!({key: true});
+            let Err(error) = formatter.render_text_jinja(&body, &HashMap::new()) else {
+                panic!("accepted {key}");
+            };
+            assert!(error.to_string().contains(key), "{error}");
+            body["chat_template_kwargs"][key] = false.into();
+            let (prompt, _) = formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+            assert_eq!(prompt.as_str(), "Hi");
+        }
+    }
+
+    #[test]
+    fn text_jinja_normalizes_hunyuan_effort() {
+        let formatter = jinja("{% set reasoning_mode_token = 'no_think' %}{{ reasoning_effort }}");
+        let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        let defaults = HashMap::from([("reasoning_effort".into(), json!("none"))]);
+        for (root, nested, expected) in [
+            (Value::Null, json!({}), "no_think"),
+            (Value::Null, json!({"reasoning_effort":"minimal"}), "low"),
+            (json!("none"), json!({"reasoning_effort":"low"}), "no_think"),
+            (json!("xhigh"), json!({"reasoning_effort":"none"}), "high"),
+            (Value::Null, json!({"reasoning_effort":null}), "high"),
+        ] {
+            body["reasoning_effort"] = root;
+            body["chat_template_kwargs"] = nested;
+            let (prompt, _) = formatter.render_text_jinja(&body, &defaults).unwrap();
+            assert_eq!(prompt.as_str(), expected);
+        }
+        body["reasoning_effort"] = json!("ultra");
+        assert!(formatter.render_text_jinja(&body, &defaults).is_err());
+    }
+
+    #[test]
+    fn text_jinja_sets_nemotron_low_effort() {
+        let formatter = jinja(concat!(
+            "{% set truncate_history_thinking = true %}",
+            "{{ 'short' if low_effort|default(false) else 'regular' }}"
+        ));
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning_effort": "low",
+        });
+        let defaults = HashMap::from([("reasoning_effort".into(), json!("high"))]);
+        for (kwargs, expected) in [
+            (json!({}), "short"),
+            (json!({"low_effort":false}), "regular"),
+            (json!({"reasoning_effort":"high"}), "regular"),
+        ] {
+            body["chat_template_kwargs"] = kwargs;
+            let (prompt, _) = formatter.render_text_jinja(&body, &defaults).unwrap();
+            assert_eq!(prompt.as_str(), expected);
         }
     }
 

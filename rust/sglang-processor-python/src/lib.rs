@@ -148,7 +148,10 @@ impl ChatProcessor {
             force_nonempty_content: body["chat_template_kwargs"]["force_nonempty_content"] == true,
         };
         sglang_processor::ReasoningStream::new(name, &options)
-            .map(ReasoningDecoder)
+            .map(|parser| ReasoningDecoder {
+                parser,
+                unary_text: (body["stream"] != true).then(String::new),
+            })
             .ok_or_else(|| invalid(format!("unsupported reasoning parser {name}")))
     }
 
@@ -207,12 +210,23 @@ impl ChatProcessor {
 }
 
 #[pyclass(module = "sglang_processor._native")]
-struct ReasoningDecoder(sglang_processor::ReasoningStream);
+struct ReasoningDecoder {
+    parser: sglang_processor::ReasoningStream,
+    unary_text: Option<String>,
+}
 
 #[pymethods]
 impl ReasoningDecoder {
     fn push(&mut self, text: &str, finished: bool) -> (String, String) {
-        self.0.push(text, finished)
+        let Some(buffer) = &mut self.unary_text else {
+            return self.parser.push(text, finished);
+        };
+        buffer.push_str(text);
+        if finished {
+            self.parser.parse(buffer)
+        } else {
+            Default::default()
+        }
     }
 }
 

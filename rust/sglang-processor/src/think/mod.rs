@@ -143,6 +143,11 @@ impl ReasoningStream {
         }
         (reasoning, content)
     }
+
+    /// Split a complete unary response before emitting either output field.
+    pub fn parse(&mut self, text: &str) -> (String, String) {
+        self.0.parse(text)
+    }
 }
 
 /// The tokens one `--reasoning-parser` configures the base detector with.

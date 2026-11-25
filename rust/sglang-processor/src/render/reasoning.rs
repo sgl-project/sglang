@@ -1,7 +1,81 @@
 //! The effort and thinking toggle SGLang's `ChatCompletionRequest` derives from
 //! `thinking`, `reasoning` and `reasoning_effort` (`protocol.py`), shared with hosts.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
+
+use super::TemplateError;
+
+/// Effort conventions that SGLang applies outside the Jinja template.
+#[derive(Clone, Copy, Default)]
+pub enum JinjaEffort {
+    #[default]
+    None,
+    Hunyuan,
+    Nemotron,
+}
+
+impl JinjaEffort {
+    pub(super) fn detect(template: &str) -> Self {
+        // Mirrors the corresponding rules in parser/template_detection.py.
+        if ["reasoning_effort", "reasoning_mode_token", "no_think"]
+            .iter()
+            .all(|marker| template.contains(marker))
+        {
+            Self::Hunyuan
+        } else if template.contains("low_effort") && template.contains("truncate_history_thinking")
+        {
+            Self::Nemotron
+        } else {
+            Self::None
+        }
+    }
+
+    pub(super) fn apply(
+        self,
+        body: &Value,
+        defaults: &HashMap<String, Value>,
+        kwargs: &mut HashMap<String, Value>,
+    ) -> Result<(), TemplateError> {
+        let own_effort = body["chat_template_kwargs"].get("reasoning_effort");
+        let default_effort = || defaults.get("reasoning_effort");
+        match self {
+            Self::None => {}
+            Self::Hunyuan => {
+                // normalize_hunyuan_reasoning_effort reads the normalized root
+                // effort first, followed by the merged template kwargs.
+                let effort = requested_effort(body)
+                    .or(own_effort)
+                    .or_else(default_effort)
+                    .unwrap_or(&Value::Null);
+                let normalized = match (effort.is_null(), effort.as_str()) {
+                    (true, _) | (_, Some("medium" | "high" | "xhigh" | "max")) => "high",
+                    (_, Some("none" | "no_think")) => "no_think",
+                    (_, Some("minimal" | "low")) => "low",
+                    _ => {
+                        return Err(TemplateError::Renderer {
+                            message: format!("invalid Hunyuan reasoning_effort {effort}"),
+                        });
+                    }
+                };
+                kwargs.insert("reasoning_effort".into(), normalized.into());
+            }
+            Self::Nemotron => {
+                // _apply_jinja_template checks the request effort after
+                // _convert_to_internal_request has read the nested override.
+                let effort = own_effort
+                    .filter(|effort| !effort.is_null())
+                    .or_else(|| requested_effort(body))
+                    .or_else(default_effort);
+                if effort.is_some_and(|effort| effort == "low") {
+                    kwargs.entry("low_effort".into()).or_insert(true.into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// `protocol.ReasoningEffortTier`.
 pub(crate) const EFFORT_TIERS: [&str; 8] = [

@@ -1822,8 +1822,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_minimax_m3:
             _normalize_minimax_m3_request(request)
 
+        reasoning_config = self.template_manager.reasoning_config
         normalize_hunyuan_reasoning_effort(
-            request, self.reasoning_parser, self.template_manager.reasoning_config
+            request, self.reasoning_parser, reasoning_config
         )
 
         # GptOss model needs to keep special tokens for harmony parsing
@@ -1833,15 +1834,24 @@ class OpenAIServingChat(OpenAIServingBase):
         self._patch_reasoning_skip_special_tokens(request)
 
         thinking_mode = self._get_reasoning_from_request(request)
-        if (
-            forwarded
-            and self.template_manager.chat_template_name is not None
-            and self._legacy_adds_think_prefix(request, thinking_mode)
-        ):
-            # The llm-d renderer does not have the worker's reasoning parser.
-            # Render and tokenize the complete prompt, including its prefix.
-            request.input_ids = None
-            forwarded = False
+        if forwarded:
+            template = self.template_manager.chat_template_name
+            legacy_prefix = (
+                template is not None
+                and self._legacy_adds_think_prefix(request, thinking_mode)
+            )
+            hunyuan_parser_mismatch = (
+                template is None
+                and self.chat_encoding_spec is None
+                and reasoning_config is not None
+                and reasoning_config.special_case == "hunyuan_effort"
+                and self.reasoning_parser != "hunyuan"
+            )
+            if legacy_prefix or hunyuan_parser_mismatch:
+                # llm-d assumes the parser implied by a Hunyuan template and
+                # leaves worker-only legacy prefixes to the worker.
+                request.input_ids = None
+                forwarded = False
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
