@@ -524,9 +524,6 @@ class QSAIndexer(MultiPlatformOp):
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
                     topk=self.block_topk,
-                    dispatch_rows=(
-                        chunk_end - chunk_start if total_rows is not None else None
-                    ),
                 )
             selected = block_indices
             if not defer_expansion:

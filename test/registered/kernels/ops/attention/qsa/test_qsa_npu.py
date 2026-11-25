@@ -78,7 +78,7 @@ def test_qwen38_packed_prefill_selection():
     _check_selected(actual, scores, starts.cpu(), ends.cpu(), positions, row_lengths)
 
 
-def test_qsa_tp_topk_keeps_unsharded_order():
+def test_qsa_tp_topk_keeps_unsharded_selection():
     rows, keys = 8192, 2048
     # An unsharded chunk uses hybrid Top-K, while an eighth uses tiled Top-K.
     columns = torch.arange(keys, dtype=torch.int32, device="npu")
@@ -87,10 +87,13 @@ def test_qsa_tp_topk_keeps_unsharded_order():
     ends = (torch.arange(rows, dtype=torch.int32, device="npu") + 1) // 4
     expected = kernel.qsa_fast_topk(scores, starts, ends, 512)
     local = slice(-rows // 8, None)
-    actual = kernel.qsa_fast_topk(
-        scores[local], starts[local], ends[local], 512, dispatch_rows=rows
+    actual = kernel.qsa_fast_topk(scores[local], starts[local], ends[local], 512)
+    torch.testing.assert_close(
+        actual.cpu().sort(dim=-1).values,
+        expected[local].cpu().sort(dim=-1).values,
+        atol=0,
+        rtol=0,
     )
-    torch.testing.assert_close(actual, expected[local], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
