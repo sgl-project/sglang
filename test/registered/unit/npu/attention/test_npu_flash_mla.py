@@ -87,7 +87,9 @@ def make_batch(mode, lengths):
         seq_lens=torch.tensor(lengths, dtype=torch.int64),
         seq_lens_cpu=None,
         spec_algorithm=SimpleNamespace(
-            is_dflash=lambda: False, is_dflash_family=lambda: True
+            is_dflash=lambda: False,
+            is_dflash_family=lambda: True,
+            uses_block_verify=lambda: True,
         ),
         req_pool_indices=torch.arange(len(lengths)),
         spec_info=SimpleNamespace(draft_token_num=8)
@@ -342,6 +344,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         is_dspark=lambda: dspark,
         is_none=lambda: not dspark,
         is_dflash_family=lambda: dspark,
+        uses_block_verify=lambda: dspark,
         get_num_tokens_per_req_for_target_verify=lambda count, **kwargs: count,
     )
     model_config = SimpleNamespace(

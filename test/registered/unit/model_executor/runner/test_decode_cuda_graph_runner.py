@@ -495,7 +495,9 @@ class TestPrePlannedReplayRestage(CustomTestCase):
             pp_proxy_tensors=None,
         )
         runner.model_runner = SimpleNamespace(
-            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+            spec_algorithm=SimpleNamespace(
+                is_dflash_family=lambda: False, uses_block_verify=lambda: False
+            ),
             is_draft_worker=False,
         )
         runner.device_module = SimpleNamespace(current_stream=lambda: stream[0])

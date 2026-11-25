@@ -118,7 +118,9 @@ class TestDSparkResolverStages(unittest.TestCase):
                 server_args=None,
                 model_config=target,
                 spec_algorithm=SimpleNamespace(
-                    is_dflash_family=lambda: True, is_dspark=lambda: True
+                    is_dflash_family=lambda: True,
+                    uses_block_verify=lambda: True,
+                    is_dspark=lambda: True,
                 ),
                 is_draft_worker=False,
             )
