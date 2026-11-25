@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import dcp_packed_gather_capacity
+
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "python/sglang/srt/hardware_backend/npu/attention/dcp_memory.py"
 
@@ -33,6 +35,8 @@ class TestReserve(unittest.TestCase):
         setattr(layer, "w_vc_stream_shard" if streamed else "w_vc_qrep", projection)
         namespace = dict(
             envs=envs,
+            dcp_packed_gather_capacity=dcp_packed_gather_capacity,
+            get_exec=lambda: SimpleNamespace(moe=SimpleNamespace(fuseep_mode=0)),
             get_parallel=lambda: SimpleNamespace(attn_tp_size=16, moe_ep_size=ep),
         )
         tree = ast.parse(SOURCE.read_text())

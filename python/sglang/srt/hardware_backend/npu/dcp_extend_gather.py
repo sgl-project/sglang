@@ -28,7 +28,7 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.dcp.layout import dcp_local_row, get_dcp_lens
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import print_info_once
+from sglang.srt.utils import ceil_align, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -151,6 +151,11 @@ def dcp_extend_gathers_kv(
 # Reusable device buffers for the extend gather, keyed by purpose, dtype, device
 # and row shape. See dcp_extend_gather_buffer.
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
+_DCP_PACKED_BUFFER_BUCKET_ROWS = 131_072
+
+
+def dcp_packed_gather_capacity(rows: int) -> int:
+    return ceil_align(rows, _DCP_PACKED_BUFFER_BUCKET_ROWS)
 
 
 def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
@@ -166,12 +171,19 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
         # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None
-        buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+        # Packed buffers grow through the prefix one chunk at a time.
+        capacity = (
+            dcp_packed_gather_capacity(rows) if name.startswith("packed_") else rows
+        )
+        buf = torch.empty(
+            (capacity, *ref.shape[1:]), dtype=ref.dtype, device=ref.device
+        )
         _dcp_extend_gather_buffers[key] = buf
         logger.info(
-            "DCP extend gather buffer %r reserved: %d rows, %.3f GiB",
+            "DCP extend gather buffer %r reserved: %d rows (alloc %d), %.3f GiB",
             name,
             rows,
+            capacity,
             buf.numel() * buf.element_size() / (1 << 30),
         )
     return buf[:rows]

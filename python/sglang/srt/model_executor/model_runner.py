@@ -1421,6 +1421,29 @@ class ModelRunner:
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)
+        if envs.SGLANG_NPU_EP_SHARED_W4_ROUTED.get() and not self.is_draft_worker:
+            from sglang.srt.hardware_backend.npu.moe.fuseep import (
+                prepare_fuseep_shared_w4,
+            )
+            from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+            if (
+                self.model_config.hf_config.model_type != "glm_moe_dsa"
+                or get_exec().moe.fuseep_mode != 3
+            ):
+                raise ValueError(
+                    "Routed W4 shared experts require GLM and FuseEP mode 3"
+                )
+            count = 0
+            for module in self.model.modules():
+                if isinstance(module, DeepseekV2MoE):
+                    prepare_fuseep_shared_w4(module)
+                    count += 1
+            if not count:
+                raise ValueError("Routed W4 shared experts found no GLM MoE layers")
+            logger.info(
+                "A3 MegaMoE prepared routed W4 shared experts for %d layers", count
+            )
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (

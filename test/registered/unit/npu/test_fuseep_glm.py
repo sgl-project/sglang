@@ -19,6 +19,23 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class TestRoutedSharedExpert(CustomTestCase):
+    def test_remaps_expert_ids_and_adds_local_shared_slot(self):
+        ids = torch.tensor([[1, 2], [-1, -1]], dtype=torch.int32)
+        weights = torch.tensor([[0.25, 0.75], [0, 0]])
+        remapped_ids, remapped_weights = fuseep._route_shared_w4(
+            ids, weights, local_experts=2, ep_size=2, ep_rank=1, shared_scale=0.5
+        )
+        self.assertEqual(remapped_ids.tolist(), [[1, 3, 5], [-1, -1, 5]])
+        self.assertEqual(remapped_weights.tolist(), [[0.25, 0.75, 0.5], [0, 0, 0]])
+
+    def test_dispatch_capacity_includes_one_shared_expert_per_rank(self):
+        layer = SimpleNamespace(num_experts=256, moe_ep_size=16)
+        self.assertEqual(fuseep.fuseep_dispatch_expert_count(layer), 256)
+        layer._fuseep_shared_w4 = {"local_experts": 16, "scale": 1.0}
+        self.assertEqual(fuseep.fuseep_dispatch_expert_count(layer), 272)
+
+
 def make_layer(w4a8=True, bf16=False, intermediate=1024):
     layer = torch.nn.Module()
     kernel_type = (

@@ -1594,7 +1594,11 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if (
+                not sbo_enabled_flag
+                and self.num_fused_shared_experts == 0
+                and getattr(self.experts, "_fuseep_shared_w4", None) is None
+            ):
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1797,6 +1801,8 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if getattr(self.experts, "_fuseep_shared_w4", None) is not None:
+            return None
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is None and _is_hip:
                 # the gfx950 FFN norm launch's fp8 + ue8m0 of these rows
@@ -1978,8 +1984,12 @@ class DeepseekV2MoE(nn.Module):
 
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+        if (
+            self.num_fused_shared_experts == 0
+            and getattr(self.experts, "_fuseep_shared_w4", None) is None
+            and is_non_idle_and_non_empty(
+                state.forward_batch.forward_mode, hidden_states_mlp_input
+            )
         ):
             state.shared_output = self.shared_experts(hidden_states_mlp_input)
         else:

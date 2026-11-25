@@ -34,6 +34,169 @@ logger = logging.getLogger(__name__)
 _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
 
+def _encode_shared_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Per-channel float scales -> the MegaMoE scale-bit uint64 encoding."""
+    return (
+        scale.reshape(-1)
+        .contiguous()
+        .view(torch.int32)
+        .to(torch.int64)
+        .bitwise_and(0xFFFFFFFF)
+        .view(torch.uint64)
+    )
+
+
+def _requantize_shared_w4(weight: torch.Tensor, scale: torch.Tensor):
+    if weight.dtype != torch.int8 or weight.ndim != 2 or weight.shape[1] % 8:
+        raise ValueError(
+            "shared W4 requires INT8 [inputs, channels] with channels divisible by 8"
+        )
+    scale = scale.detach().cpu().to(torch.float32).reshape(-1)
+    if (
+        scale.numel() != weight.shape[1]
+        or not torch.isfinite(scale).all()
+        or (scale < 0).any()
+    ):
+        raise ValueError("shared W4 requires finite nonnegative per-channel scales")
+    values = weight.detach().cpu().to(torch.float32)
+    maximum = values.abs().amax(dim=0).clamp_min(1.0)
+    quantized = (values * (7.0 / maximum)).round().clamp(-7, 7).to(torch.int8)
+    low = quantized[:, 0::2].bitwise_and(15).to(torch.uint8)
+    high = quantized[:, 1::2].bitwise_and(15).to(torch.uint8).bitwise_left_shift(4)
+    packed = low.bitwise_or(high).view(torch.int8).contiguous()
+    scale4 = (scale * maximum / 7.0).contiguous()
+    bias = (8.0 * quantized.to(torch.float32).sum(dim=0) * scale4).contiguous()
+    return packed, scale4, bias
+
+
+def _route_shared_w4(
+    topk_ids, topk_weights, local_experts, ep_size, ep_rank, shared_scale
+):
+    if local_experts <= 0 or ep_size <= 1 or not 0 <= ep_rank < ep_size:
+        raise ValueError("shared W4 routing requires valid EP geometry")
+    if (
+        topk_ids.ndim != 2
+        or topk_ids.shape != topk_weights.shape
+        or topk_ids.shape[1] >= 16
+    ):
+        raise ValueError(
+            "shared W4 routing requires matching top-k tensors with room for one expert"
+        )
+    if (local_experts + 1) * ep_size > 1024 or not 0.0 < shared_scale <= 1.0:
+        raise ValueError(
+            "shared W4 routing exceeds MegaMoE limits or has invalid scale"
+        )
+    remapped = torch.where(
+        topk_ids >= 0,
+        topk_ids + torch.div(topk_ids, local_experts, rounding_mode="floor"),
+        topk_ids,
+    )
+    shared_ids = topk_ids.new_full(
+        (topk_ids.shape[0], 1), ep_rank * (local_experts + 1) + local_experts
+    )
+    shared_weights = topk_weights.new_full((topk_weights.shape[0], 1), shared_scale)
+    shared_weights = torch.where(
+        (topk_ids >= 0).any(dim=1, keepdim=True), shared_weights, 0.0
+    )
+    return torch.cat((remapped, shared_ids), dim=1), torch.cat(
+        (topk_weights, shared_weights), dim=1
+    )
+
+
+def _check_shared_geometry(hidden: int, intermediate: int) -> None:
+    """The native operator's shared-geometry envelope (same as routed)."""
+    if (
+        not 1024 <= intermediate <= 3072
+        or intermediate % 512
+        or not 1024 <= hidden <= 8192
+        or hidden % 512
+    ):
+        raise ValueError(
+            f"shared geometry outside MegaMoE limits "
+            f"(hidden={hidden}, intermediate={intermediate})"
+        )
+
+
+def prepare_fuseep_shared_w4(moe_module):
+    shared = moe_module.shared_experts
+    experts = moe_module.experts
+    if shared is None or getattr(moe_module, "num_fused_shared_experts", 0):
+        raise ValueError("shared W4 requires separate shared experts")
+    if not getattr(experts, "_mega_moe_weights_processed", False):
+        raise ValueError("shared W4 requires processed MegaMoE weights")
+    if getattr(experts, "_fuseep_shared_w4", None) is not None:
+        return
+    local_experts = experts.num_local_experts
+    ep_size = experts.moe_ep_size
+    if experts.moe_tp_size != 1 or experts.num_experts != local_experts * ep_size:
+        raise ValueError("shared W4 requires uniform EP experts and MoE TP=1")
+    _check_shared_geometry(experts.hidden_size, experts.intermediate_size_per_partition)
+    if local_experts >= 128 or (local_experts + 1) * ep_size > 1024:
+        raise ValueError("shared W4 exceeds MegaMoE expert limit")
+    if experts.moe_runner_config.top_k >= 16:
+        raise ValueError("shared W4 requires a free routing slot")
+    output_scale = (
+        1.0
+        if moe_module.routed_scaling_factor_fused_in_topk
+        else 1.0 / float(moe_module.routed_scaling_factor)
+    )
+    if not 0.0 < output_scale <= 1.0:
+        raise ValueError("shared W4 requires a supported routed output scale")
+    prepared = {}
+    for prefix, proj, inputs, channels in (
+        (
+            "w13",
+            shared.gate_up_proj,
+            experts.hidden_size,
+            2 * experts.intermediate_size_per_partition,
+        ),
+        (
+            "w2",
+            shared.down_proj,
+            experts.intermediate_size_per_partition,
+            experts.hidden_size,
+        ),
+    ):
+        weight = proj.weight.data
+        if weight.dtype != torch.int8 or tuple(weight.shape) not in (
+            (inputs, channels),
+            (channels, inputs),
+        ):
+            raise ValueError(
+                f"shared W4 {prefix} has incompatible weight shape or dtype"
+            )
+        if tuple(weight.shape) != (inputs, channels):
+            weight = weight.transpose(0, 1)
+        offset = getattr(proj, "weight_offset", None)
+        if offset is not None and torch.count_nonzero(offset).item():
+            raise ValueError(f"shared W4 {prefix} has nonzero offset")
+        linear_bias = getattr(proj, "bias", None)
+        if linear_bias is not None and torch.count_nonzero(linear_bias).item():
+            raise ValueError(f"shared W4 {prefix} has unsupported linear bias")
+        packed, scale, bias = _requantize_shared_w4(weight, proj.weight_scale)
+        device = weight.device
+        for suffix in ("weight", "weight_scale", "scale_bias"):
+            value = getattr(experts, f"{prefix}_{suffix}")
+            if not isinstance(value, list) or len(value) != local_experts:
+                raise ValueError(
+                    f"shared W4 requires one {prefix}_{suffix} per routed expert"
+                )
+        prepared[f"{prefix}_weight"] = npu_format_cast(packed.to(device)).view(
+            torch.int32
+        )
+        prepared[f"{prefix}_weight_scale"] = _encode_shared_scale(scale.to(device))
+        prepared[f"{prefix}_scale_bias"] = bias.to(device)
+    for name, value in prepared.items():
+        setattr(experts, name, [*getattr(experts, name), value])
+    experts._fuseep_shared_w4 = dict(local_experts=local_experts, scale=output_scale)
+
+
+def fuseep_dispatch_expert_count(layer: FusedMoE) -> int:
+    return layer.num_experts + (
+        layer.moe_ep_size if getattr(layer, "_fuseep_shared_w4", None) else 0
+    )
+
+
 def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
     return DeepEPBuffer.get_deepep_buffer(
@@ -42,7 +205,7 @@ def _get_fuseep_buffer(layer: FusedMoE):
         _PARAMS_BYTES,
         DeepEPMode.LOW_LATENCY,
         envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
-        layer.num_experts,
+        fuseep_dispatch_expert_count(layer),
     )
 
 
@@ -70,17 +233,29 @@ def forward_fuseep(
             )
         if not getattr(layer, "_mega_moe_weights_processed", False):
             raise RuntimeError("FuseEP mode 3 expert weights have not been prepared")
+        topk_ids = topk_output.topk_ids.to(torch.int32)
+        topk_weights = topk_output.topk_weights.to(torch.float32)
+        shared = getattr(layer, "_fuseep_shared_w4", None)
+        if shared is not None:
+            topk_ids, topk_weights = _route_shared_w4(
+                topk_ids,
+                topk_weights,
+                shared["local_experts"],
+                layer.moe_ep_size,
+                layer.moe_ep_rank,
+                shared["scale"],
+            )
         buffer = _get_fuseep_buffer(layer)
         hidden_states, _ = buffer.fused_deep_moe(
             x=hidden_states,
-            topk_idx=topk_output.topk_ids.to(torch.int32),
-            topk_weights=topk_output.topk_weights.to(torch.float32),
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
             gmm1_permuted_weight=layer.w13_weight,
             gmm1_permuted_weight_scale=getattr(layer, "w13_weight_scale", None),
             gmm2_weight=layer.w2_weight,
             gmm2_weight_scale=getattr(layer, "w2_weight_scale", None),
             num_max_dispatch_tokens_per_rank=capacity,
-            num_experts=layer.num_experts,
+            num_experts=fuseep_dispatch_expert_count(layer),
             fuse_mode=3,
             quant_mode=layer._mega_moe_quant_mode,
             **layer._mega_moe_activation_params,
