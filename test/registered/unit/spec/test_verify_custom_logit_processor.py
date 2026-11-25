@@ -147,11 +147,41 @@ def _verify(batch):
     )
 
 
+def _run_chain(verify, accept, *, prefix_lens, host_tree=None, barrier=None):
+    """`verify.run` over a chain verify whose accept returns `accept`; no stage
+    runs unless the route says one edits the logits."""
+    return verify.run(
+        LogitsProcessorOutput(next_token_logits=torch.zeros(1, VOCAB)),
+        host_tree=host_tree,
+        barrier=barrier,
+        draft_tokens=None,
+        prefix_lens=prefix_lens,
+        accept_core=lambda logits, info: accept,
+    )
+
+
+def _one_token_accept(bs):
+    return ChainAccept(
+        correct_len=torch.zeros(bs, dtype=torch.int64),
+        bonus=torch.zeros(bs, dtype=torch.int64),
+        commit_lens=torch.ones(bs, dtype=torch.int32),
+        out_tokens=torch.zeros((bs, 1), dtype=torch.int64),
+    )
+
+
 def _bound_verify(batch, layout, barrier=None):
-    verify = _verify(batch)
-    verify.build_row_inputs(
-        SimpleNamespace(next_token_logits=None),
-        tree=_host_tree(layout, 2),
+    """A verify whose `run` built its row inputs from `layout`."""
+    verify = VerifyStep(
+        batch=batch,
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
+        watermark=None,
+        watermark_full_mask=True,
+    )
+    _run_chain(
+        verify,
+        _one_token_accept(2),
+        prefix_lens=torch.tensor([7, 11]),
+        host_tree=_host_tree(layout, 2),
         barrier=barrier,
     )
     return verify
@@ -221,14 +251,19 @@ class TestRowPrefixes(CustomTestCase):
 
 class TestOneTokenCap(CustomTestCase):
     def _verify(self, first_row_only):
-        verify = VerifyStep(
-            batch=None,
-            route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+        return VerifyStep(
+            batch=SimpleNamespace(
+                sampling_info=SimpleNamespace(step_penalties=None),
+                forward_mode=SimpleNamespace(is_idle=lambda: False),
+                return_logprob=False,
+            ),
+            route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
             watermark=None,
             watermark_full_mask=True,
+            first_row_only_reqs=(
+                None if first_row_only is None else torch.tensor(first_row_only)
+            ),
         )
-        verify.first_row_only_reqs = torch.tensor(first_row_only)
-        return verify
 
     def test_chain_accept_keeps_the_first_token(self):
         """Request 0 accepted draft 1 (commits it), request 1 accepted none
@@ -239,9 +274,7 @@ class TestOneTokenCap(CustomTestCase):
             commit_lens=torch.tensor([3, 1, 3], dtype=torch.int32),
             out_tokens=torch.tensor([[21, 22, 23], [31, 0, 0], [41, 42, 43]]),
         )
-        self._verify([0, 1]).cap_chain_accept(
-            accept, prefix_lens=torch.tensor([10, 20, 30])
-        )
+        _run_chain(self._verify([0, 1]), accept, prefix_lens=torch.tensor([10, 20, 30]))
         self.assertEqual(accept.commit_lens.tolist(), [1, 1, 3])
         self.assertEqual(accept.commit_lens.dtype, torch.int32)
         self.assertEqual(accept.bonus.tolist(), [21, 31, 43])
@@ -249,8 +282,6 @@ class TestOneTokenCap(CustomTestCase):
         self.assertEqual(accept.correct_len.tolist(), [2, 0, 2])
 
     def test_nothing_capped_leaves_the_accept(self):
-        verify = self._verify([])
-        verify.first_row_only_reqs = None
         commit_lens, bonus = torch.tensor([3]), torch.tensor([7])
         accept = ChainAccept(
             correct_len=torch.tensor([2]),
@@ -258,7 +289,7 @@ class TestOneTokenCap(CustomTestCase):
             commit_lens=commit_lens,
             out_tokens=torch.tensor([[5, 6, 7]]),
         )
-        verify.cap_chain_accept(accept, prefix_lens=torch.tensor([10]))
+        _run_chain(self._verify(None), accept, prefix_lens=torch.tensor([10]))
         self.assertIs(accept.commit_lens, commit_lens)
         self.assertIs(accept.bonus, bonus)
         self.assertIsNone(accept.new_seq_lens)

@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
-from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
+from sglang.srt.sampling.verify_accept import ChainAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -1195,54 +1195,45 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
-        target_logits = logits_output.next_token_logits
-        # Without sampling info (a simulated greedy accept drops it), nothing
-        # adjusts the logits: the drop requires a route that adjusts nothing.
-        if sampling_info is not None:
-            # run_compact scatters its rows back to (bs * chain_len), so the rows
-            # line up with the verify ids on both verify paths.
-            target_logits, sampling_info = verify.adjust(
-                target_logits, verify_ids_2d, positions=verify_window.positions_2d
-            )
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
-        region_accept = None
-        if (
-            not folded_accept
-            and can_run_cuda_graph
-            and not run_compact
-            and self._sampling_graph_eligible(
-                route=verify.route,
-                proposal_folded=proposal.folded,
-                sampling_info=sampling_info,
-                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-            )
-        ):
-            if simulate_bonus_sampling_info is not None:
-                epilogue.begin_sim_bonus(
-                    bs, simulate_bonus_sampling_info.temperatures[:bs]
+
+        def accept_core(target_logits, info):
+            # A simulated greedy accept dropped the sampling info; the drop
+            # requires a route that adjusts nothing, so no stage ran.
+            if sampling_info is None:
+                info = None
+            if (
+                not folded_accept
+                and can_run_cuda_graph
+                and not run_compact
+                and self._sampling_graph_eligible(
+                    route=verify.route,
+                    proposal_folded=proposal.folded,
+                    sampling_info=info,
+                    simulate_bonus_sampling_info=simulate_bonus_sampling_info,
                 )
-            region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=target_logits
-            )
-        # The accept and its commits ran in a graph: the verify graph's fold or the
-        # sampling-accept region replayed right after it.
-        graph_accept = folded_accept or region_accept is not None
-        if region_accept is not None:
-            accept = region_accept
-        else:
-            accept = self._verify_executor.accept_and_finalize(
+            ):
+                if simulate_bonus_sampling_info is not None:
+                    epilogue.begin_sim_bonus(
+                        bs, simulate_bonus_sampling_info.temperatures[:bs]
+                    )
+                region_accept = self._sampling_accept_graph.run(
+                    bs=bs, target_logits=target_logits
+                )
+                if region_accept is not None:
+                    return region_accept
+            return self._verify_executor.accept_and_finalize(
                 folded_accept=folded_accept,
                 bs=bs,
                 verify_ids_2d=verify_ids_2d,
                 target_logits=target_logits,
                 draft_block=draft_block,
-                sampling_info=sampling_info,
+                sampling_info=info,
                 route=verify.route,
                 draft_input=draft_input,
                 layout=layout,
@@ -1250,13 +1241,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-            # The graph accepts never run with a custom logit processor: the
-            # processor adjusts the logits.
-            verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
-        verify.commit(
-            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
-            logits_output=logits_output,
+
+        # run_compact scatters its rows back to (bs * chain_len), so the rows
+        # line up with the verify ids on both verify paths.
+        accept = verify.run(
+            logits_output,
+            draft_tokens=verify_ids_2d,
+            positions=verify_window.positions_2d,
+            prefix_lens=prefix_lens,
+            host_tree=host_tree,
+            barrier=grammar_barrier,
+            accept_core=accept_core,
         )
+        graph_accept = accept.in_graph
+        region_ran = graph_accept and not folded_accept
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,
@@ -1267,9 +1265,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._deferred_draft_kv.note_staged(batch.reqs)
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
-        ) or (
-            region_accept is not None and self._sampling_accept_graph.committed_engram
-        )
+        ) or (region_ran and self._sampling_accept_graph.committed_engram)
         # The static verify graph committed the engram history when it folded the accept.
         if not engram_in_graph:
             self.model_runner.ngram_embedding_manager.update_after_verify(

@@ -955,6 +955,7 @@ class DsparkVerifyEpilogue:
             commit_lens=self.commit_lens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
+            in_graph=True,
         )
 
     def read_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:

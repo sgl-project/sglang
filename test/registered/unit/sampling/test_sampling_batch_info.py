@@ -200,7 +200,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 ),
             ),
         ):
-            verify_logits, _ = step.adjust(logits, torch.zeros(1, 2, dtype=torch.long))
+            verify_logits, _ = step._adjust(logits, torch.zeros(1, 2, dtype=torch.long))
 
         self.assertIs(verify_logits, watermarked)
         self.assertEqual(
@@ -300,7 +300,7 @@ class TestNanLogits(CustomTestCase):
             watermark_full_mask=True,
             grammar_mask=SimpleNamespace(apply=self._mask),
         )
-        verify_logits, _ = step.adjust(logits, torch.zeros(1, 1, dtype=torch.long))
+        verify_logits, _ = step._adjust(logits, torch.zeros(1, 1, dtype=torch.long))
         return verify_logits
 
     def test_sanitize_mode_heals_verify_logits_as_decode(self):
@@ -332,8 +332,8 @@ class TestNanLogits(CustomTestCase):
                 detect_nan_logits(self._logits(), "verify")
             with self.assertRaises(RuntimeError):
                 self._verify(self._logits())
-            # Every verify worker probes through build_row_inputs, also without a host
-            # tree: before its early return.
+            # Every verify worker probes through run, also without a host tree,
+            # before its stages.
             verify = VerifyStep(
                 batch=None,
                 route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
@@ -341,10 +341,11 @@ class TestNanLogits(CustomTestCase):
                 watermark_full_mask=True,
             )
             with self.assertRaises(RuntimeError):
-                verify.build_row_inputs(
+                verify.run(
                     SimpleNamespace(next_token_logits=self._logits()),
-                    tree=None,
+                    host_tree=None,
                     barrier=None,
+                    accept_core=None,
                 )
             detect_nan_logits(torch.zeros(1, VOCAB_SIZE), "verify")
 
