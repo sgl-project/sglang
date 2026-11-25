@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.managers.io_struct import LinkerOffloadVerdict
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -247,6 +248,13 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
+    def prepare_pp_lookup(
+        self, groups: list, windows: Sequence[TreeComponent]
+    ) -> Callable[[str, list[str]], list[int]] | None:
+        """Collective over ``groups``: a lookup returning the prefix lengths, in
+        pages, restorable on every pipeline stage, or None if unsupported."""
+        return None
+
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a load into the given device indices.
@@ -372,11 +380,17 @@ class UnifiedCacheLinkerWrapper:
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
+        # Loads this stage could not queue under PP; they fail after the forward.
+        self.rejected_loads: set[str] = set()
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # PP0's offload verdicts ride the request relay; a reset bumps the epoch.
+        self.decided_offloads = 0
+        self.undelivered_offloads: list[bool] = []
+        self.offload_epoch = 0
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
 
@@ -385,6 +399,24 @@ class UnifiedCacheLinkerWrapper:
         self.metrics = cache.metrics_collector
         if self.metrics is not None:
             self.metrics.init_linker_metrics()
+        self.pp_lookup = None
+        if cache.pp_size > 1:
+            groups = [
+                group
+                for group in (
+                    cache.attn_cp_group,
+                    cache.attn_tp_group or cache.tp_group,
+                )
+                if group is not None and torch.distributed.get_world_size(group) > 1
+            ]
+            self.pp_lookup = cache_linker.prepare_pp_lookup(
+                [*groups, cache.pp_group], self._windows
+            )
+            if self.pp_lookup is None:
+                raise ValueError(
+                    "External linker with pipeline parallelism requires a backend "
+                    "that can check every stage's objects in one lookup."
+                )
 
     @property
     def layer_done_counter(self) -> object:
@@ -421,12 +453,23 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
-        self._record_lookup(len(tail_hashes) * page, hit_pages * page)
+        if cache.pp_size > 1:
+            device_pages = device_hit_len // page
+            hit_pages = max(
+                (
+                    pages - device_pages
+                    for pages in req.pp_linker_restorable_pages
+                    if device_pages < pages <= device_pages + len(tail_hashes)
+                ),
+                default=0,
+            )
+        else:
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            self._record_lookup(len(tail_hashes) * page, hit_pages * page)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -451,6 +494,44 @@ class UnifiedCacheLinkerWrapper:
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
+        )
+
+    def lookup_pp_arrival(self, req: Req) -> list[int]:
+        """Collective over PP0's attention ranks; only the leader queries."""
+        page = self.cache.page_size
+        key = RadixKey(
+            req.origin_input_ids,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            limit=req._compute_max_prefix_len(len(req.origin_input_ids)),
+        ).page_aligned(page)
+        if not len(key) or req.positional_embed_overrides is not None:
+            return []
+        hashes = get_storage_hash_str(key[:], None, page_size=page)
+        mask = torch.ones(len(hashes) + 1, dtype=torch.int)
+        if self._is_attn_leader():
+            mask.zero_()
+            try:
+                restorable = self.pp_lookup(req.rid, hashes)
+            except Exception:
+                logger.warning("PP linker lookup failed for %s", req.rid, exc_info=True)
+                if self.metrics is not None:
+                    self.metrics.increment_linker_failures("lookup")
+                restorable = []
+            valid = [pages for pages in restorable if 0 < pages <= len(hashes)]
+            if valid:
+                mask[torch.tensor(valid, dtype=torch.long)] = 1
+            self._record_lookup(len(hashes) * page, max(valid, default=0) * page)
+        mask[0] = 0
+        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        return mask.nonzero().flatten().tolist()
+
+    def _is_attn_leader(self) -> bool:
+        cache = self.cache
+        return all(
+            group is None or torch.distributed.get_rank(group) == 0
+            for group in (cache.attn_cp_group, cache.attn_tp_group or cache.tp_group)
         )
 
     def prefetch(self, req: Req) -> None:
@@ -764,10 +845,13 @@ class UnifiedCacheLinkerWrapper:
             )
             raise
         if not queued:
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
-            )
-            return 0, req.last_node
+            if cache.pp_size == 1:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                )
+                return 0, req.last_node
+            # Other stages queued theirs; keep the shared prefix and fail the row.
+            self.rejected_loads.add(req.rid)
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -923,12 +1007,40 @@ class UnifiedCacheLinkerWrapper:
 
     def num_completed_offloads(self) -> int:
         return min(
-            self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
+            self.cache_linker.num_completed_offloads(),
+            len(self.pending_offloads) - self.decided_offloads,
         )
 
-    def take_completed_offloads(self, finish_count: int) -> list[bool]:
-        assert finish_count <= len(self.pending_offloads)
+    def take_completed_offloads(
+        self, finish_count: int, wait: bool = False
+    ) -> list[bool]:
+        assert finish_count <= len(self.pending_offloads) - self.decided_offloads
+        # A later PP stage commits PP0's count and may still be writing its share.
+        while wait and self.cache_linker.num_completed_offloads() < finish_count:
+            time.sleep(0.001)
         return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
+
+    def queue_offload_verdict(self, successes: Sequence[bool]) -> None:
+        self.decided_offloads += len(successes)
+        self.undelivered_offloads.extend(successes)
+
+    def take_offload_verdict(self) -> Optional[LinkerOffloadVerdict]:
+        if not self.undelivered_offloads:
+            return None
+        verdict = LinkerOffloadVerdict(
+            tuple(self.undelivered_offloads), self.offload_epoch
+        )
+        self.undelivered_offloads.clear()
+        return verdict
+
+    def commit_offload_verdict(self, verdict: LinkerOffloadVerdict) -> None:
+        if verdict.epoch != self.offload_epoch:
+            return
+        if self.cache.pp_rank > 0:
+            self.take_completed_offloads(len(verdict.successes), wait=True)
+        else:
+            self.decided_offloads -= len(verdict.successes)
+        self.commit_completed_offloads(verdict.successes)
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
@@ -964,11 +1076,12 @@ class UnifiedCacheLinkerWrapper:
         if not rids:
             return []
         index, self.inflight_load_index = self.inflight_load_index, -1
+        rejected = self.rejected_loads.intersection(rids)
+        self.rejected_loads.difference_update(rejected)
         start = time.perf_counter()
-        landed = torch.tensor(
-            [int(self.cache_linker.finish_layer_wise_loading(index))],
-            dtype=torch.int,
-        )
+        # Under PP a stage may queue none of the batch's loads.
+        landed_here = index < 0 or self.cache_linker.finish_layer_wise_loading(index)
+        landed = torch.tensor([int(landed_here and not rejected)], dtype=torch.int)
         finish_wait = time.perf_counter() - start
         counter = self.cache_linker.layer_done_counter
         forward_wait = (
@@ -1007,6 +1120,7 @@ class UnifiedCacheLinkerWrapper:
             self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
+        self.rejected_loads.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
         for pending in self.pending_offloads:
@@ -1015,6 +1129,9 @@ class UnifiedCacheLinkerWrapper:
             )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
+        self.decided_offloads = 0
+        self.undelivered_offloads.clear()
+        self.offload_epoch += 1
         if self.metrics is not None:
             self.metrics.set_linker_offloads_in_flight(0)
 
@@ -1024,7 +1141,10 @@ class UnifiedCacheLinkerWrapper:
         self._cancel_prefetch(request, reason="released")
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
-        if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
+        if rid in self.inflight_load_rids and (
+            self.cache_linker.cancel_queued_load(rid) or rid in self.rejected_loads
+        ):
+            self.rejected_loads.discard(rid)
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
 

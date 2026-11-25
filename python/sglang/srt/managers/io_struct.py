@@ -38,6 +38,7 @@ from typing import (
     Iterable,
     List,
     Literal,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -1328,6 +1329,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
+    # Internal: set by PP0; see Req.pp_linker_restorable_pages.
+    pp_linker_restorable_pages: Optional[List[int]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -2540,6 +2543,11 @@ class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
     old_role: str = ""
     new_role: str = ""
     safe_to_restore: bool = False
+
+
+class LinkerOffloadVerdict(NamedTuple):
+    successes: Tuple[bool, ...]
+    epoch: int
 
 
 class AbortReq(BaseReq, kw_only=True):

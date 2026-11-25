@@ -1015,6 +1015,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             recv_requests=lambda local_reqs=None: next(inputs, [])
         )
         scheduler._poll_timeout_aborts = MagicMock(return_value=[])
+        scheduler.enable_unified_cache_external_linker = False
         events = []
 
         def process_input_requests(reqs):

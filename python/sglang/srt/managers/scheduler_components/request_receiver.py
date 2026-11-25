@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    LinkerOffloadVerdict,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -346,6 +347,7 @@ class SchedulerRequestReceiver:
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
                     AbortReq,
+                    LinkerOffloadVerdict,
                 ),
             )
         ]
@@ -360,6 +362,7 @@ class SchedulerRequestReceiver:
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
                     AbortReq,
+                    LinkerOffloadVerdict,
                 ),
             )
         ]
