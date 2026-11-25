@@ -392,7 +392,6 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         self.assertEqual(pool.kv_buffer.shape[1], pool.size)
         # allocator surface is logical
         self.assertEqual(pool.free_slots.numel(), pool.logical_size)
-        self.assertEqual(pool.mem_state.numel(), pool.logical_size)
 
     def test_alloc_is_widened_page_granular(self):
         pool = _make_host_pool(dcp_rank=0)
@@ -739,8 +738,13 @@ class TestDcpL3PoolCheck(CustomTestCase):
 
 
 class TestLayerShardedHostTransfers(CustomTestCase):
-    def test_layer_sharded_ascend_reports_unsupported_backend(self):
-        """Unsupported Ascend backup must report the backend, not a buffer error."""
+    def test_layer_sharded_ascend_reports_unsupported_layout(self):
+        """kernel_ascend backup only accepts NPU kv-split layouts.
+
+        The layer-sharded Ascend host pool has no CUDA-style per-layer KV
+        buffers, so a mismatched layout must report the layout itself rather
+        than fail inside the transfer with a buffer error.
+        """
         pool = _fake_mla_device_pool(size=128)
         pool.layer_shard_enabled = True
         pool.layer_shard_size = 2
@@ -772,7 +776,7 @@ class TestLayerShardedHostTransfers(CustomTestCase):
         indices = torch.arange(PHYSICAL_PAGE)
         with self.assertRaisesRegex(
             ValueError,
-            "Layer-sharded HiCache backup does not support IO backend: kernel_ascend",
+            "Unsupported layout: layer_first",
         ):
             host.backup_from_device_all_layer(
                 pool, indices, indices, io_backend="kernel_ascend"

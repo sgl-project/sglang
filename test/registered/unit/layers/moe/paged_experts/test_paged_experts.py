@@ -3470,5 +3470,17 @@ class TestSaveRecurrentState(CustomTestCase):
                 replay_hooks.save_recurrent_state(pool, torch.tensor([1]))
 
 
+class TestPrecopyGrid(CustomTestCase):
+    def test_half_the_sms_at_most_32(self):
+        """The pre-copy's grid is half the GPU's SMs, capped at the 32 blocks measured on a 70-SM
+        RTX 5070 Ti, so a smaller GPU never gives the side copy a larger share of its SMs."""
+        from sglang.srt.layers.moe.paged_experts.precopy import copy_blocks
+
+        cases = {70: 32, 132: 32, 36: 18, 20: 10, 1: 1, 0: 1}
+        for sms, blocks in cases.items():
+            with self.subTest(sms=sms):
+                self.assertEqual(copy_blocks(sms), blocks)
+
+
 if __name__ == "__main__":
     unittest.main()
