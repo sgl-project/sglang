@@ -1874,6 +1874,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ],
             )
 
+    def test_nemotron_h_modelopt_fp8_keeps_auto_moe_on_xpu(self):
+        hf_config = SimpleNamespace(
+            architectures=["NemotronHForCausalLM"],
+            mlp_hidden_act="relu2",
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt_fp8",
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+        )
+        server_args = SimpleNamespace(
+            quantization=None,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
+            attention_backend=None,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
+            _model_config=model_config,
+        )
+
+        # flashinfer_cutlass is CUDA-only; XPU keeps the auto MoE runner.
+        with override_platform(
+            is_xpu=True,
+            is_cuda=False,
+            is_hip=False,
+            is_sm100=False,
+            is_blackwell=False,
+        ):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "NemotronHForCausalLM",
+                    server_args,
+                    hf_config,
+                ),
+                [("_nemotron_h_overrides", {"quantization": "modelopt_fp8"})],
+            )
+
     def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
