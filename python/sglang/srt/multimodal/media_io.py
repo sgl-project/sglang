@@ -369,12 +369,17 @@ def _open_local_media_file(path: str) -> BinaryIO:
     return f
 
 
+def check_local_media_file(path: str) -> str:
+    """Check the current file against the local media policy."""
+    _open_local_media_file(path).close()
+    return path
+
+
 def local_media_decoder_source(path: str) -> Union[str, bytes]:
     """Give codecs a snapshot of an allowlisted file, or a vetted ordinary path."""
     if _allowed_local_media_paths is not None:
         return read_local_media_file(path)
-    _open_local_media_file(path).close()
-    return path
+    return check_local_media_file(path)
 
 
 def read_local_media_file(path: str) -> bytes:

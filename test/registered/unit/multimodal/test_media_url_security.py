@@ -213,7 +213,7 @@ class TestMediaURLSecurity(unittest.TestCase):
             self.assertEqual(read_local_media_file(file_path), b"sample-image-content")
             self.assertEqual(
                 _normalize_video_input(f"file://{file_path}"),
-                file_path,
+                b"sample-image-content",
             )
 
     def test_allowed_local_media_paths_rejects_unwhitelisted_and_traversal(self):

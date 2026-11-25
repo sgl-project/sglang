@@ -228,7 +228,7 @@ class TestLocalMediaFiles(_PolicyTestCase):
             patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
         ):
             processor = BaseMultimodalProcessor(
-                None, None, None, "cpu", skip_mm_pool=True
+                None, SimpleNamespace(base_gpu_id=0), None, "cpu", skip_mm_pool=True
             )
         self.addCleanup(processor.shutdown)
 
