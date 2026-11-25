@@ -16,6 +16,7 @@ Covers:
 
 import asyncio
 import itertools
+import threading
 import time
 import unittest
 from array import array
@@ -42,6 +43,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
+    ServerStatus,
     TokenizerManager,
     _add_sampling_mask_to_meta_info,
 )
@@ -430,6 +432,75 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 await anext(stream)
         request.is_disconnected.assert_awaited_once()
         self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
+
+
+class TestSchedulerExit(unittest.IsolatedAsyncioTestCase):
+    """A scheduler the subprocess watchdog cannot see (a Ray actor) has exited.
+
+    Before report_scheduler_exit, pending and new requests waited forever for
+    outputs the dead scheduler would never send.
+    """
+
+    async def asyncSetUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.event_loop = asyncio.get_running_loop()
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.tm.gracefully_exit = False
+        self.tm.server_status = ServerStatus.Up
+
+    async def test_pending_request_fails_with_503(self):
+        state = _make_req_state("pending")
+        state.obj.stream = False
+        state.dispatched = True
+        self.tm.rid_to_state[state.obj.rid] = state
+        stream = self.tm._wait_one_response(state.obj)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+
+        self.tm.report_scheduler_exit("SGLang scheduler actor died")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await pending
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+        self.assertFalse(self.tm.is_healthy())
+
+    async def test_report_from_another_thread_cleans_up_on_handle_loop(self):
+        """RayEngine reports from its monitor thread; request state must only be
+        touched on the handle loop."""
+        fail_requests = self.tm._fail_requests_after_scheduler_exit
+        fail_threads = []
+
+        def record_thread_and_fail():
+            fail_threads.append(threading.current_thread())
+            fail_requests()
+
+        self.tm._fail_requests_after_scheduler_exit = record_thread_and_fail
+        await asyncio.to_thread(
+            self.tm.report_scheduler_exit, "SGLang scheduler actor died"
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(fail_threads, [threading.current_thread()])
+        self.assertEqual(self.tm.server_status, ServerStatus.UnHealthy)
+
+    async def test_report_before_handle_loop_only_sets_flag(self):
+        """With no handle loop no request is pending, so only the flag is set."""
+        self.tm.event_loop = None
+        self.tm.report_scheduler_exit("SGLang scheduler actor died")
+        self.assertEqual(self.tm.scheduler_exit_error, "SGLang scheduler actor died")
+        self.assertEqual(self.tm.server_status, ServerStatus.Up)
+        self.assertFalse(self.tm.is_healthy())
+
+    async def test_new_request_is_rejected_with_503(self):
+        self.tm.report_scheduler_exit("SGLang scheduler actor died")
+
+        obj = GenerateReqInput(rid="new", input_ids=[1, 2])
+        with self.assertRaises(HTTPException) as ctx:
+            await anext(self.tm.generate_request(obj))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(self.tm.rid_to_state, {})
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
@@ -1614,6 +1685,60 @@ class TestAbortBeforeDispatch(CustomTestCase):
                 sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
                 self.assertEqual([type(m) for m in sent], [AbortReq])
                 self.assertEqual(sent[0].rid, rid)
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    def test_scheduler_exit_during_preprocessing_fails_with_503(self, _wrap_shm):
+        """A scheduler exit while a request is suspended before dispatch must not
+        drop the state its handler still reads: the request is not dispatched and
+        fails with 503, not a KeyError."""
+        for stage in ("tokenize", "publish"):
+            with self.subTest(stage=stage):
+                tm = self._make_tm(self)
+                rid = f"exit_during_{stage}"
+                obj = GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+                tokenized = MagicMock()
+                tokenized.rid = rid
+                tokenized.mm_inputs = self._mm_inputs()
+                prepared = [Mock()]
+
+                async def drive():
+                    entered, release = asyncio.Event(), asyncio.Event()
+
+                    async def run_stage(name, result):
+                        if name == stage:
+                            entered.set()
+                            await release.wait()
+                        return result
+
+                    tm._tokenize_one_request = lambda _obj: run_stage(
+                        "tokenize", tokenized
+                    )
+                    tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = (
+                        lambda _mm_inputs: run_stage("publish", prepared)
+                    )
+                    task = asyncio.create_task(tm.generate_request(obj).__anext__())
+                    await asyncio.wait_for(entered.wait(), timeout=2)
+                    # generate_request started the handle loop on this loop.
+                    tm.event_loop = asyncio.get_running_loop()
+                    tm.report_scheduler_exit("SGLang scheduler actor died")
+                    await asyncio.sleep(0)
+                    self.assertIn(rid, tm.rid_to_state)
+                    release.set()
+                    return await asyncio.wait_for(task, timeout=2)
+
+                with self.assertRaises(HTTPException) as ctx:
+                    asyncio.run(drive())
+
+                self.assertEqual(ctx.exception.status_code, 503)
+                self.assertIn("scheduler actor died", ctx.exception.detail)
+                self.assertNotIn(rid, tm.rid_to_state)
+                tm._dispatch_to_scheduler.assert_not_called()
+                tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+                    prepared
+                )
 
     @patch(
         "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
