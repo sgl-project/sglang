@@ -361,7 +361,9 @@ Requirements:
   over the peer process. With `kernel.yama.ptrace_scope` 1 (the Ubuntu default),
   run the container with `--cap-add SYS_PTRACE` (or set `ptrace_scope` to 0 on
   the host). Without it, the server stops at startup with an error that says so.
-- Two Xe2 GPUs with at least 32 Xe cores each, `--tp 2`, up to 8 requests a
+- Two Xe2 GPUs with at least 20 Xe cores each, `--tp 2`. The kernels are tuned
+  for 32 Xe cores (Arc Pro B70); a GPU with fewer (Arc Pro B60: 20) runs a
+  functional, untuned variant. Up to 8 requests a
   decode step (set `--max-running-requests` and `--cuda-graph-max-bs-decode` to
   the concurrency you serve). MTP speculative decoding: `--speculative-algorithm
   EAGLE` with `--speculative-eagle-topk 1` and 2, 3, 4, 6 or 8 draft tokens.
