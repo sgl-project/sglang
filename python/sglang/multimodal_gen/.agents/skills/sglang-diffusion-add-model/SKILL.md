@@ -713,6 +713,11 @@ in the cleanup ledger.
 
 Before submitting, verify:
 
+For cloud S1 policies and S2 planners, bring up batching across independent
+sessions alongside the single-robot path. Verify the real model batch, per-row
+action parity, deadlines and retained GPU state. See the [physical AI development
+guide](https://docs.sglang.io/docs/sglang-diffusion/support_new_models#design-cloud-action-policies-for-batching).
+
 **Common (all styles):**
 - [ ] **Pipeline file** exists at `runtime/pipelines/{model_name}.py` with `EntryClass`
 - [ ] **PipelineConfig** at `configs/pipeline_configs/{model_name}.py`
