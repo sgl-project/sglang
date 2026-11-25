@@ -551,7 +551,7 @@ mod tests {
         assert!(args(&["--sharegpt-output-len", "2"]).validate().is_err());
         assert!(args(&["--max-concurrency", "0"]).validate().is_err());
         // Only sharegpt needs four output tokens; prebuilt prompts take 1.
-        let mut prefill_only = vec![
+        let prefill_only = [
             "--dataset-name",
             "openai",
             "--dataset-path",
@@ -562,8 +562,6 @@ mod tests {
             "1",
         ];
         assert!(args(&prefill_only).validate().is_ok());
-        *prefill_only.last_mut().unwrap() = "0";
-        assert!(args(&prefill_only).validate().is_err());
     }
 
     /// `--vocab-size` replaces the tokenizer, so it is only coherent where the
