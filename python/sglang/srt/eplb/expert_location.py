@@ -660,10 +660,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
     num_physical_experts: int,
-    ep_rank: int,
+    ep_rank: int | None,
     seed: int = 42,
 ):
-
+    """Return one rank's static picks, or the full table when ep_rank is None."""
     r = random.Random(seed)
 
     device = logical_to_all_physical_map.device
@@ -709,7 +709,9 @@ def compute_logical_to_rank_dispatch_physical_map(
         )
 
     assert torch.all(result != -1)
-    return result[:, :, ep_rank].contiguous().to(dtype=dtype, device=device)
+    if ep_rank is not None:
+        result = result[:, :, ep_rank]
+    return result.contiguous().to(dtype=dtype, device=device)
 
 
 def _compact_candidates(

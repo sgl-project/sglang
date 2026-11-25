@@ -432,13 +432,15 @@ class _SinglePassGatherer(ABC):
         if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
-        if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
-            # Both Ascend dispatchers report physical IDs at TopK.
-            if get_exec().moe.moe_a2a_backend in ("ascend_ops", "ascend_fuseep"):
-                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            if get_exec().moe.moe_a2a_backend != "none" and (
-                get_exec().moe.deepep_mode == "normal"
+        moe = get_exec().moe
+        if moe.expert_distribution_recorder_mode == "stat_approx":
+            # Async Ascend scores source locality, so count at TopK before
+            # dispatch. DeepEP receive counts no longer identify the source.
+            if moe.moe_a2a_backend in ("ascend_ops", "ascend_fuseep") or (
+                moe.moe_a2a_backend == "deepep" and moe.eplb_async_rebalance
             ):
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+            if moe.moe_a2a_backend != "none" and moe.deepep_mode == "normal":
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError

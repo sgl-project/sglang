@@ -9,6 +9,7 @@ from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -18,7 +19,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
-    compute_logical_to_rank_dispatch_physical_map,
     get_eplb_group,
 )
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
@@ -209,11 +209,9 @@ def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
         if name == "logical_to_all_physical_map":
             destination = destination[..., :width]
         destination.copy_(row)
-    current.physical_to_logical_map_cpu[layer].copy_(
-        planned["physical_to_logical_map"][layer]
-    )
+    current.physical_to_logical_map_cpu[layer].copy_(planned["physical_to_logical_map"])
     current.logical_to_all_physical_map_cpu[layer, :, :width].copy_(
-        planned["logical_to_all_physical_map"][layer]
+        planned["logical_to_all_physical_map"]
     )
 
     for algorithm, (physical, count) in current._mega_gate_maps.items():
@@ -228,6 +226,15 @@ def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
             count[layer].copy_(current.logical_to_all_physical_map_num_valid[layer])
 
 
+class _PlacementRows(NamedTuple):
+    """One row per changed layer, in installation order on this rank."""
+
+    layers: tuple[int, ...]
+    physical_to_logical: torch.Tensor
+    logical_to_physical: torch.Tensor
+    local_dispatch: torch.Tensor | None
+
+
 def _broadcast_placement(
     placement: MigrationPlacement | None,
     error: str | None,
@@ -235,15 +242,16 @@ def _broadcast_placement(
     group: dist.ProcessGroup,
     physical_shape: torch.Size,
     num_logical: int,
-) -> MigrationPlacement | None:
-    """Use a fixed header and one CPU tensor for a successful plan."""
+) -> _PlacementRows | None:
+    """Broadcast changed rows; scatter only the static picks each rank uses."""
     # The first header value is -1 on failure, 0 for an empty plan, or the
     # number of layers to install. The second is the replica table width.
-    header = torch.zeros(2, dtype=torch.int64, device="cpu")
+    header = torch.zeros(3, dtype=torch.int64, device="cpu")
+    rank_tables = None
     if rank == 0:
         if error is None and placement is not None:
             try:
-                changed, physical, logical = placement
+                changed, physical, logical, dispatch = placement
                 width = logical.size(-1)
                 if physical.shape != physical_shape or logical.shape != (
                     physical_shape[0],
@@ -251,14 +259,30 @@ def _broadcast_placement(
                     width,
                 ):
                     raise ValueError("EPLB placement changed the routing geometry")
-                payload = torch.cat(
-                    (
-                        torch.tensor(changed, dtype=torch.int64, device="cpu"),
-                        physical.flatten(),
-                        logical.flatten(),
+                ids = torch.tensor(changed, dtype=torch.int64, device="cpu")
+                fields = [
+                    ids,
+                    physical.index_select(0, ids),
+                    logical.index_select(0, ids),
+                ]
+                if dispatch is not None:
+                    if dispatch.shape != (
+                        physical_shape[0],
+                        num_logical,
+                        dist.get_world_size(group),
+                    ):
+                        raise ValueError(
+                            "EPLB placement changed the static routing geometry"
+                        )
+                    rank_tables = list(
+                        dispatch.index_select(0, ids)
+                        .permute(2, 0, 1)
+                        .long()
+                        .contiguous()
+                        .unbind()
                     )
-                )
-                payload = payload.to(torch.int64)
+                    header[2] = 1
+                payload = torch.cat([field.reshape(-1) for field in fields]).long()
                 header[0] = len(changed)
                 header[1] = width
             except Exception as exc:
@@ -266,25 +290,34 @@ def _broadcast_placement(
         if error is not None:
             header[0] = -1
     dist.broadcast(header, src=0, group=group)
-    count, width = header.tolist()
+    count, width, has_static_dispatch = header.tolist()
     if count < 0:
         message = [error]
         dist.broadcast_object_list(message, src=0, group=group)
         raise RuntimeError(f"EPLB CPU planner failed: {message[0]}")
     if count == 0:
         return None
-    layers, slots = physical_shape
-    physical_end = count + layers * slots
-    logical_shape = (layers, num_logical, width)
+    slots = physical_shape[1]
+    physical_end = count + count * slots
+    logical_end = physical_end + count * num_logical * width
     if rank != 0:
         payload = torch.empty(
-            physical_end + layers * num_logical * width, dtype=torch.int64, device="cpu"
+            logical_end,
+            dtype=torch.int64,
+            device="cpu",
         )
     dist.broadcast(payload, src=0, group=group)
-    return MigrationPlacement(
+    local_dispatch = None
+    if has_static_dispatch:
+        local_dispatch = torch.empty(
+            (count, num_logical), dtype=torch.int64, device="cpu"
+        )
+        dist.scatter(local_dispatch, rank_tables, src=0, group=group)
+    return _PlacementRows(
         tuple(payload[:count].tolist()),
-        payload[count:physical_end].view(physical_shape),
-        payload[physical_end:].view(logical_shape),
+        payload[count:physical_end].view(count, slots),
+        payload[physical_end:logical_end].view(count, num_logical, width),
+        local_dispatch,
     )
 
 
@@ -327,7 +360,7 @@ class _PackedExpertFields:
 class _RoutingPlan:
     """Pinned host tables and views of the reusable one-layer device buffers."""
 
-    host_rows: dict[str, torch.Tensor]
+    host_rows: dict[int, dict[str, torch.Tensor]]
     device_rows: dict[str, torch.Tensor]
     last_layer: int
 
@@ -400,7 +433,7 @@ class NpuEplbRuntime:
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
 
-    def planner(self, counts):
+    def planner(self, counts, sources=None):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
         self._owner_stream = self.device_module.current_stream()
@@ -412,16 +445,21 @@ class NpuEplbRuntime:
             except Exception as error:
                 event_error = str(error)
         else:
-            counts = None
+            counts = sources = None
 
         def compute():
-            nonlocal counts
+            nonlocal counts, sources
             error = event_error
             placement = None
             if self.rank == 0 and error is None:
                 try:
                     host_counts = self._copy_counts_to_host(counts)
-                    counts = None
+                    host_sources = (
+                        self._copy_counts_to_host(sources)
+                        if sources is not None
+                        else None
+                    )
+                    counts = sources = None
                     if host_counts.any().item():
                         placement = plan_migration(
                             host_counts,
@@ -429,6 +467,7 @@ class NpuEplbRuntime:
                             self.spec,
                             self.ranks_per_node,
                             self.layer_ids,
+                            source_totals=host_sources,
                             current_replicas=(
                                 self.metadata.logical_to_all_physical_map_cpu[
                                     :, :, : self._replica_width
@@ -456,10 +495,10 @@ class NpuEplbRuntime:
             self._p2p_stream.wait_event(self._owner_ready)
             return counts.cpu()
 
-    def prepare(self, placement: MigrationPlacement | None) -> tuple[int, ...]:
+    def prepare(self, placement: _PlacementRows | None) -> tuple[int, ...]:
         if placement is None:
             return ()
-        changed, physical, logical = placement
+        changed, physical, logical, dispatch = placement
         width = logical.size(-1)
         # Include the previous populated columns so shrinking the active width
         # overwrites stale replicas. The graph still points to the full table.
@@ -482,17 +521,21 @@ class NpuEplbRuntime:
             "logical_to_all_physical_map_num_valid": (logical != -1).sum(dim=-1),
         }
         if "logical_to_rank_dispatch_physical_map" in device_rows:
-            # Preserve the shared static algorithm's draws in full layer order.
+            # Without replicas the inverse table already gives the static pick.
             host_rows["logical_to_rank_dispatch_physical_map"] = (
-                compute_logical_to_rank_dispatch_physical_map(
-                    logical, self.metadata.ep_size, physical.size(1), self.rank
-                )
+                logical[..., 0] if dispatch is None else dispatch
             )
         # Pageable H2D blocks the worker on the current stream. Keep the plan
         # pinned until the asynchronous routing copies have drained.
         self.device_module.set_device(self.device)
+        pinned = {
+            name: rows.contiguous().pin_memory() for name, rows in host_rows.items()
+        }
         self._routing_plan = _RoutingPlan(
-            host_rows={name: rows.pin_memory() for name, rows in host_rows.items()},
+            host_rows={
+                layer: {name: rows[i] for name, rows in pinned.items()}
+                for i, layer in enumerate(changed)
+            },
             device_rows=device_rows,
             last_layer=changed[-1],
         )
@@ -521,7 +564,7 @@ class NpuEplbRuntime:
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
             for name, row in routing.device_rows.items():
-                row.copy_(routing.host_rows[name][layer], non_blocking=True)
+                row.copy_(routing.host_rows[layer][name], non_blocking=True)
             writeback = self._stage_weights(layer, routing, pending_work)
             if submitted is not None:
                 submitted.set_result(None)
@@ -532,7 +575,7 @@ class NpuEplbRuntime:
 
     def _stage_weights(self, layer, routing, pending_work) -> WeightWriteback:
         old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
-        new_layout = routing.host_rows["physical_to_logical_map"][layer].tolist()
+        new_layout = routing.host_rows[layer]["physical_to_logical_map"].tolist()
         if old_layout == new_layout:
             # A replica-order update only publishes the staged routing rows.
             return lambda: None
@@ -608,7 +651,7 @@ class NpuEplbRuntime:
         get_global_expert_distribution_recorder().before_layer_install(layer)
         writeback()
         _install_routing_layer(
-            self.metadata, routing.host_rows, layer, routing.device_rows
+            self.metadata, routing.host_rows[layer], layer, routing.device_rows
         )
         if layer == routing.last_layer:
             self._routing_plan = None
@@ -646,18 +689,17 @@ def create_npu_async_eplb(model_config, weights, metadata):
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
     physical_count_mode = None
-    if (
-        moe.ep_dispatch_algorithm == "dynamic"
-        and metadata.num_physical_experts > metadata.num_logical_experts
-    ):
-        physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
+    if metadata.num_physical_experts > metadata.num_logical_experts:
+        if moe.ep_dispatch_algorithm == "static":
+            physical_count_mode = "static"
+        else:
+            physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
     spec = PlanningSpec(
         metadata.num_physical_experts,
         metadata.num_local_physical_experts,
         groups,
         parallel.nnodes,
         algorithm,
-        rank_fixed_dispatch=moe.ep_dispatch_algorithm == "static",
         physical_count_mode=physical_count_mode,
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
@@ -706,6 +748,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             else None,
             spec,
             metadata.num_logical_experts,
+            moe.ep_dispatch_algorithm,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
         )
     except Exception as exc:
