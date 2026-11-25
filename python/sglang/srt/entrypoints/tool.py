@@ -277,7 +277,3 @@ class HarmonyPythonTool(Tool):
         async for msg in self.python_tool.process(last_msg):
             tool_output_msgs.append(msg)
         return tool_output_msgs
-
-    @property
-    def tool_config(self) -> Any:
-        return self.python_tool.tool_config
