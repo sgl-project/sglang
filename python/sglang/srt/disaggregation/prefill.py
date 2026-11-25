@@ -419,6 +419,10 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool
             if transfer_draft_cache
             and (not _is_npu or get_parallel().pp_group.is_last_rank)
+            # A draft pool on the target's window ids goes with the window state.
+            and not getattr(
+                self.draft_token_to_kv_pool, "follows_target_swa_ids", False
+            )
             else None
         )
         num_draft_entries = 0

@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.pool_configurator import dflash_pd_window_draft_reach
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
     get_context,
@@ -407,6 +408,13 @@ def build_kv_cache(
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     # The tail a running request keeps of each window, which the prefix tree,
     # PD peers and admission read from the storage alone.
+    window_pool = token_to_kv_pool_allocator.target_window_pool()
+    draft_reach = dflash_pd_window_draft_reach()
+    if draft_reach is not None and window_pool is not None:
+        draft_window_reaches = dict(draft_window_reaches or {})
+        draft_window_reaches[window_pool] = max(
+            draft_window_reaches.get(window_pool, 0), draft_reach
+        )
     kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator).bind_window_retention(
         sliding_window_size, draft_window_reaches
     )
