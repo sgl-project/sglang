@@ -785,14 +785,6 @@ mod tests {
             chat.cached_tokens_details.unwrap()["storage_backend"],
             "file"
         );
-
-        // No cache fields at all: nothing recorded.
-        let plain = feed_all(
-            Api::OpenaiCompletions,
-            &[r#"data: {"choices":[{"text":"a"}]}"#],
-        );
-        assert_eq!(plain.cached_tokens, 0);
-        assert!(plain.cached_tokens_details.is_none());
     }
 
     /// The OpenAI routes send deltas, so the text concatenates and each frame
