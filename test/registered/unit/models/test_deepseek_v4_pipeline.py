@@ -254,6 +254,17 @@ class TestVPPConstruction(CustomTestCase):
                         expected,
                     )
 
+    def test_contiguous_pp_does_not_create_whole_tail_graphs(self):
+        for rank in (0, 1):
+            with (
+                self.subTest(rank=rank),
+                self.construction(rank, 2) as (module, config),
+            ):
+                with patch.object(module.DecoderReplayTail, "maybe_create") as create:
+                    model = module.DeepseekV4Model(config)
+                self.assertIsNone(model.decoder_replay_tail)
+                create.assert_not_called()
+
     def test_incompatible_layout_is_rejected_before_layer_allocation(self):
         from sglang.srt.distributed.vpp_layout import VPPLayout
 
@@ -544,6 +555,77 @@ class TestVPPStageForward(CustomTestCase):
                             wires[j].before_norm, expected.before_norm
                         )
 
+    def test_contiguous_pp_preserves_lagged_mhc_and_shared_state(self):
+        from sglang.srt.distributed.vpp_layout import VPPLayout
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+        from sglang.srt.models import deepseek_v4_vpp_state
+
+        layout = VPPLayout(6, 2, virtual_stages=1)
+        for tokens in (0, 3):
+            with self.subTest(tokens=tokens), self.execution() as (module, parallel, _):
+                calls = []
+                models = [
+                    self.make_model(module, layout, rank, True, calls)
+                    for rank in range(2)
+                ]
+                for model in models:
+                    model.model.config.model_type = "deepseek_v41"
+                    model.model.vpp_layout = None
+                    model.model.vpp_stages = ()
+                ids = torch.arange(tokens)
+                batch = SimpleNamespace(
+                    residual_stream=None,
+                    forward_mode=SimpleNamespace(is_extend=lambda: False),
+                )
+                shared_kv = torch.arange(tokens * 2).reshape(tokens, 2)
+
+                def export(tensors, **kwargs):
+                    tensors["vpp_source_kv"] = shared_kv
+
+                def install(tensors, **kwargs):
+                    torch.testing.assert_close(tensors["vpp_source_kv"], shared_kv)
+
+                with (
+                    patch.object(
+                        module,
+                        "get_attn_backend",
+                        return_value=SimpleNamespace(forward_metadata=object()),
+                    ),
+                    patch.object(module, "get_token_to_kv_pool", return_value=object()),
+                    patch.object(
+                        module,
+                        "get_req_to_token_pool",
+                        return_value=SimpleNamespace(req_to_token=object()),
+                    ),
+                    patch.object(
+                        deepseek_v4_vpp_state, "export_state", side_effect=export
+                    ),
+                    patch.object(
+                        deepseek_v4_vpp_state, "install_state", side_effect=install
+                    ),
+                ):
+                    parallel.pp_rank = 0
+                    wire = models[0].forward(ids, ids, batch)
+                    self.assertIsInstance(wire, PPProxyTensors)
+                    self.assertEqual(
+                        set(wire.tensors),
+                        {
+                            "hidden_states",
+                            "hc_pre",
+                            "vpp_engram_hash_ids",
+                            "vpp_source_kv",
+                        },
+                    )
+                    parallel.pp_rank = 1
+                    result = models[1].forward(ids, ids, batch, pp_proxy_tensors=wire)
+                serial = self.make_model(module, None, 0, True, [])
+                expected = serial.forward(ids, ids, batch)
+                torch.testing.assert_close(result.logits, expected.logits)
+                torch.testing.assert_close(result.before_norm, expected.before_norm)
+                self.assertEqual(calls, list(range(6)))
+                self.assertIsNone(batch.residual_stream)
+                models[0].logits_processor.assert_not_called()
+
     def test_stage_errors_do_not_publish_or_retain_residual_state(self):
         from sglang.srt.distributed.vpp_layout import VPPLayout
         from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -591,7 +673,6 @@ class TestVPPStageForward(CustomTestCase):
                 (model, "capture_aux_hidden_states", True),
                 (model, "vision", object()),
                 (model.model, "dspark_layers_to_capture", [0]),
-                (model.model, "late_layer_start", 3),
                 (model.model, "decoder_replay_tail", object()),
                 (model.model, "_can_run_tbo", Mock(return_value=True)),
             ):
@@ -601,6 +682,72 @@ class TestVPPStageForward(CustomTestCase):
                     self.assertEqual(calls, [])
                     self.assertIsNone(batch.residual_stream)
             model.logits_processor.assert_not_called()
+
+
+class TestContiguousPPValidation(CustomTestCase):
+    def test_eager_text_prefill_only(self):
+        from sglang.srt.arg_groups import deepseek_v4_hook
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        cfg = SimpleNamespace(
+            pp_size=2,
+            pp_virtual_stages=1,
+            disaggregation_mode="prefill",
+            language_model_only=True,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            enable_prefill_cp=False,
+            speculative_algorithm=None,
+            enable_layernorm_sp=False,
+            enable_attn_tp_input_scattered=False,
+            enable_encoder_swa_bounded_replay=False,
+            enable_decoder_swa_bounded_replay=True,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED),
+                decode=SimpleNamespace(backend=Backend.DISABLED),
+            ),
+            enable_return_hidden_states=False,
+            enable_return_aux_hidden_states=False,
+            enable_return_routed_experts=False,
+            enable_torch_compile=False,
+            enable_hisparse=False,
+            enable_two_batch_overlap=False,
+            dsv4_attn_backend="auto",
+        )
+        platform = SimpleNamespace(is_cuda=True)
+        with (
+            patch.object(deepseek_v4_hook, "resolving_view", return_value=cfg),
+            patch.object(
+                deepseek_v4_hook,
+                "model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="deepseek_v41")
+                ),
+            ),
+            patch.object(deepseek_v4_hook, "get_platform", return_value=platform),
+            patch.object(deepseek_v4_hook, "attn_dp_enabled_of", return_value=False),
+            patch(
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+                return_value=False,
+            ),
+        ):
+            deepseek_v4_hook.validate_deepseek_v41_features(object())
+            for target, name, value, feature in (
+                (cfg, "disaggregation_mode", "decode", "outside PD prefill"),
+                (cfg, "language_model_only", False, "vision"),
+                (platform, "is_cuda", False, "non-CUDA"),
+                (cfg, "attn_dp_size", 2, "attention DP"),
+                (cfg, "attn_cp_size", 2, "attention CP"),
+                (cfg, "speculative_algorithm", "DSPARK", "speculative"),
+                (cfg.cuda_graph_config.prefill, "backend", Backend.FULL, "CUDA graphs"),
+                (cfg.cuda_graph_config.decode, "backend", Backend.FULL, "CUDA graphs"),
+            ):
+                with (
+                    self.subTest(feature=feature, field=name),
+                    patch.object(target, name, value),
+                    self.assertRaisesRegex(ValueError, feature),
+                ):
+                    deepseek_v4_hook.validate_deepseek_v41_features(object())
 
 
 class TestPipelineCompletion(unittest.TestCase):

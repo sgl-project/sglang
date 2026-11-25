@@ -210,6 +210,7 @@ class KVArgsRegisterInfo:
     # the field; a PP>1 sender stage without a draft runner cannot derive the
     # host-backed/device-only boundary from its own registration.
     num_draft_entries: Optional[int] = None
+    dst_vpp_layers: Optional[List[int]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -268,6 +269,11 @@ class KVArgsRegisterInfo:
                 if len(msg) > 22 and msg[22] != b""
                 else None
             ),
+            dst_vpp_layers=(
+                list(struct.unpack(f"{len(msg[23]) // 4}I", msg[23]))
+                if len(msg) > 23 and msg[23]
+                else None
+            ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -279,6 +285,7 @@ class PeerBuffers(msgspec.Struct, frozen=True):
 
     remote: MooncakeRemoteBuffers
     keys: BufferKeys
+    vpp_layers: Optional[List[int]] = None
 
 
 class _DcpEntryCopy(msgspec.Struct, frozen=True):
@@ -976,6 +983,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         force_flat: bool = False,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_vpp_layers: Optional[List[int]] = None,
     ) -> Optional[str]:
         """First entry whose decode stride differs from prefill's, else None.
 
@@ -995,13 +1003,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             # The MHA branch splits the entries into K/V and is not covered.
             return None
-        if has_layer_ids:
-            pairs = build_transfer_entry_pairs(
-                src_layer_ids or [],
-                dst_layer_ids or [],
-                num_src_entries,
-                num_dst_entries,
-                allow_positional_fallback=self.pp_size == 1,
+        reverse_vpp = dst_vpp_layers is not None and self.pp_size == 1
+        if has_layer_ids or reverse_vpp:
+            pairs = (
+                self._pp1_to_vpp_entry_pairs(
+                    num_src_entries, num_dst_entries, dst_vpp_layers, state_type
+                )
+                if reverse_vpp
+                else build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    num_src_entries,
+                    num_dst_entries,
+                    allow_positional_fallback=self.pp_size == 1,
+                )
             )
             for i, j in pairs:
                 if j >= len(dst_item_lens):
@@ -1119,7 +1134,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         remote = self.transport.import_registration(
             session_id=mooncake_session_id, bases=bases
         )
-        return PeerBuffers(remote=remote, keys=keys)
+        return PeerBuffers(
+            remote=remote,
+            keys=keys,
+            vpp_layers=getattr(decode_kv_args, "dst_vpp_layers", None),
+        )
 
     def _kv_layout_mismatch(self, info: KVArgsRegisterInfo) -> Optional[str]:
         """Reject a decode peer whose KV page stride differs from ours.
@@ -1163,6 +1182,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     dst_item_lens=info.dst_kv_item_lens,
                     src_layer_ids=self.kv_args.kv_layer_ids,
                     dst_layer_ids=info.dst_kv_layer_ids,
+                    dst_vpp_layers=getattr(info, "dst_vpp_layers", None),
                 )
             else:
                 mismatch = self._mha_kv_stride_mismatch(info)
@@ -1323,6 +1343,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         if i < len(registration_info.dst_state_layer_ids)
                         else []
                     ),
+                    dst_vpp_layers=getattr(registration_info, "dst_vpp_layers", None),
                 )
             except Exception as e:
                 # Pairing can reject a layout on its own; never let that kill
@@ -1375,6 +1396,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             prefill_data_indices, dst_data_indices
         )
         device_prefill_kv_blocks = device_dst_kv_blocks = None
+        dst_vpp_layers = getattr(self._peers[mooncake_session_id], "vpp_layers", None)
         if dst_device_data_indices is not None:
             device_prefill_kv_blocks, device_dst_kv_blocks = (
                 group_concurrent_contiguous(
@@ -1396,6 +1418,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 force_flat=force_flat,
                 src_layer_ids=src_layer_ids,
                 dst_layer_ids=dst_layer_ids,
+                dst_vpp_layers=dst_vpp_layers,
             )
             if mismatch is not None:
                 assert bootstrap_room is not None
@@ -1415,6 +1438,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             force_flat=force_flat,
             src_layer_ids=src_layer_ids,
             dst_layer_ids=dst_layer_ids,
+            dst_vpp_layers=dst_vpp_layers,
         )
         if layers_params is None:
             return -1
@@ -1520,6 +1544,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
+    def _pp1_to_vpp_entry_pairs(self, num_src, num_dst, owned_layers, state_type):
+        from sglang.srt.disaggregation.vpp import slice_pp1_to_vpp_mla_entries
+
+        src, dst = slice_pp1_to_vpp_mla_entries(
+            self.kv_args,
+            owned_layers,
+            list(range(num_src)),
+            list(range(num_dst)),
+            state_type,
+        )
+        return list(zip(src, dst))
+
     def _generic_entry_pairs(
         self,
         *,
@@ -1531,6 +1567,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         force_flat: bool,
         src_layer_ids: Optional[List[int]],
         dst_layer_ids: Optional[List[int]],
+        dst_vpp_layers: Optional[List[int]] = None,
     ) -> Optional[List[Tuple[int, int, int]]]:
         """(src entry, dst entry, item_len) to copy, or None on a layout error."""
         src_entries = list(range(num_src_entries))
@@ -1547,13 +1584,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
-            if has_layer_ids:
-                pairs = build_transfer_entry_pairs(
-                    src_layer_ids,
-                    dst_layer_ids,
-                    num_src_entries,
-                    num_dst_entries,
-                    allow_positional_fallback=self.pp_size == 1,
+            reverse_vpp = dst_vpp_layers is not None and self.pp_size == 1
+            if has_layer_ids or reverse_vpp:
+                pairs = (
+                    self._pp1_to_vpp_entry_pairs(
+                        num_src_entries, num_dst_entries, dst_vpp_layers, state_type
+                    )
+                    if reverse_vpp
+                    else build_transfer_entry_pairs(
+                        src_layer_ids,
+                        dst_layer_ids,
+                        num_src_entries,
+                        num_dst_entries,
+                        allow_positional_fallback=self.pp_size == 1,
+                    )
                 )
                 # An entry elided on either side moves no bytes and has no
                 # registered buffer to write into.
@@ -3980,6 +4024,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
             str(self.kv_args.num_draft_entries).encode("ascii"),
+            (
+                struct.pack(
+                    f"{len(self.kv_args.vpp_layers[self.kv_args.pp_rank])}I",
+                    *self.kv_args.vpp_layers[self.kv_args.pp_rank],
+                )
+                if getattr(self.kv_args, "vpp_layers", None) is not None
+                else b""
+            ),
         ]
 
     def build_receiver_metadata_message(

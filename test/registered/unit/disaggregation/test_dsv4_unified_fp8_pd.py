@@ -1,10 +1,12 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.vpp import (
     check_vpp_transfer_layers,
+    slice_pp1_to_vpp_mla_entries,
     vpp_transfer_layers,
 )
 from sglang.srt.distributed.vpp_layout import VPPLayout
@@ -29,6 +31,130 @@ class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
     # kv_data groups: 2*c4 + c128 bf16, 3*c4 + 2*c128 under the fp8 two-pool
     BF16_KV_LEN = 7
     FP8_KV_LEN = 11
+
+    def test_pp1_to_vpp_writes_only_decode_owned_entries_and_checks_strides(self):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        layout = VPPLayout(40, 2, virtual_stages=2, partition=(10, 10, 9, 11))
+        ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
+        for state, full in (
+            (None, [20, 20, 2, 8, 14, 2, 8, 14]),
+            (StateType.SWA, list(range(40))),
+            (StateType.DSV4_REQUEST_STATE, [2, 8, 14]),
+        ):
+            covered = []
+            for rank in range(2):
+                owned = list(layout.layer_ids_for_rank(rank))
+                expected = [i for i, layer in enumerate(full) if layer in owned]
+                manager = object.__new__(MooncakeKVManager)
+                manager.pp_size = 1
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.kv_args = SimpleNamespace(
+                    prefill_start_layer=0,
+                    prefill_end_layer=40,
+                    mla_compression_ratios=ratios,
+                    mla_kv_source_layers=[2, 8, 14, 20],
+                )
+                src, dst = slice_pp1_to_vpp_mla_entries(
+                    manager.kv_args,
+                    owned,
+                    list(range(len(full))),
+                    list(range(len(expected))),
+                    state,
+                )
+                self.assertEqual(src, expected)
+                self.assertEqual(dst, list(range(len(expected))))
+                covered.extend(src)
+                source_lens = [1000 + i for i in range(len(full))]
+                target_lens = [source_lens[i] for i in expected]
+                kwargs = dict(
+                    num_src_entries=len(full),
+                    num_dst_entries=len(expected),
+                    item_lens=source_lens,
+                    dst_item_lens=target_lens,
+                    state_type=state,
+                    force_flat=False,
+                    src_layer_ids=[],
+                    dst_layer_ids=[],
+                    dst_vpp_layers=owned,
+                )
+                pairs = manager._generic_entry_pairs(**kwargs)
+                self.assertEqual(
+                    pairs,
+                    [(i, j, source_lens[i]) for j, i in enumerate(expected)],
+                )
+                self.assertIsNone(manager._state_stride_mismatch(**kwargs))
+                target_lens[0] += 1
+                self.assertIn(
+                    "item length mismatch", manager._state_stride_mismatch(**kwargs)
+                )
+            self.assertEqual(sorted(covered), list(range(len(full))))
+
+    def test_pp1_to_vpp_bootstrap_counts_every_decode_destination(self):
+        from sglang.srt.disaggregation.common import conn
+
+        ownership = [list(range(20)), list(range(20, 40))]
+        check_vpp_transfer_layers(
+            None,
+            ownership,
+            prefill_tp=4,
+            decode_tp=4,
+            decode_pp_size=2,
+            allow_pp1_prefill=True,
+        )
+        manager = object.__new__(CommonKVManager)
+        manager.pp_size = 2
+        manager.pp_rank = 1
+        manager.attn_tp_size = 4
+        manager.attn_cp_size = 1
+        manager.attn_cp_rank = 0
+        manager.vpp_layers = ownership
+        manager.kv_args = SimpleNamespace(
+            engine_rank=2,
+            mla_compression_ratios=[2, 1],
+        )
+        info = SimpleNamespace(
+            pp_size=1,
+            attn_tp_size=4,
+            attn_cp_size=1,
+            enable_kv_cache_sharding=False,
+        )
+        with patch.object(
+            conn,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_transfer_backend="mooncake"),
+        ):
+            manager._resolve_rank_mapping(info)
+        self.assertEqual(info.target_pp_ranks, [0])
+        self.assertEqual(info.required_dst_info_num, 2)
+        self.assertEqual(info.required_prefill_response_num, 1)
+
+    def test_contiguous_v41_pp_maps_shared_sources_to_pp1(self):
+        ownership = [list(range(20)), list(range(20, 40))]
+        self.assertEqual(
+            vpp_transfer_layers(
+                SimpleNamespace(vpp_layout=None, pp_transfer_layers=ownership)
+            ),
+            ownership,
+        )
+        ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
+        full = [20, 20, 2, 8, 14, 2, 8, 14]
+        strides = [149760, 65536] + [74880] * 3 + [32768] * 3
+        for rank in range(2):
+            mgr = _pp_mgr(rank * 20, (rank + 1) * 20, ratios)
+            mgr.kv_args.vpp_layers = ownership
+            mgr.kv_args.pp_rank = rank
+            mgr.kv_args.mla_kv_source_layers = [2, 8, 14, 20]
+            expected = [i for i, layer in enumerate(full) if layer in ownership[rank]]
+            local_strides = [strides[i] for i in expected]
+            _, selected, count = mgr.get_mla_kv_ptrs_with_pp(local_strides, strides)
+            self.assertEqual(selected, local_strides)
+            self.assertEqual(count, len(expected))
+            _, selected, _ = mgr.get_mla_kv_ptrs_with_pp(
+                [100] * len(expected), list(range(len(full)))
+            )
+            self.assertEqual(selected, expected)
 
     def test_v41_producer_groups_tile_decode_without_exporting_replicas(self):
         ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
