@@ -24,6 +24,7 @@ from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     build_local_partition_assignment,
 )
 from sglang.multimodal_gen.test.server.gpu_cases import (
+    CUDA_STANDALONE_FILES,
     PARAMETRIZED_CASE_GROUPS,
     STANDALONE_FILES,
     TWO_GPU_CASES,
@@ -53,7 +54,7 @@ def _expected_work(suite: str) -> tuple[list[str], list[str]]:
 
 @pytest.mark.parametrize("suite", ["1-gpu", "2-gpu"])
 def test_ci_plan_preserves_registered_standalone_files(tmp_path, suite):
-    """The CI planner must retain standalone tests imported by the suite adapter."""
+    """The CUDA CI planner must schedule every standalone file in its registry."""
     repo_root = Path(__file__).resolve().parents[5]
     result = subprocess.run(
         [
@@ -79,7 +80,7 @@ def test_ci_plan_preserves_registered_standalone_files(tmp_path, suite):
         for partition in plan["partitions"]
         for filename in partition["standalone_files"]
     ]
-    assert sorted(scheduled) == sorted(STANDALONE_FILES[suite])
+    assert sorted(scheduled) == sorted(CUDA_STANDALONE_FILES[suite])
 
 
 def test_assign_partition_covers_every_item_once():

@@ -60,7 +60,6 @@ if TYPE_CHECKING:
         RequestRetirer,
     )
     from sglang.srt.rust_server.server import RustServer
-    from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -75,7 +74,6 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
     request_retirer: RequestRetirer
