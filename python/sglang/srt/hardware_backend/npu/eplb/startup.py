@@ -84,6 +84,7 @@ def _check_startup_agreement(
     """Check the gathered setup before any rank creates the transport groups."""
     peer_settings = []
     narrowed_layers = set()
+    # Report a rank's preparation failure before checking the settings it produced.
     for rank, result in enumerate(peers):
         if isinstance(result, str):
             raise RuntimeError(
@@ -123,7 +124,8 @@ def create_npu_async_eplb(
     world_size = dist.get_world_size()
     cpu_timeout = timedelta(seconds=90)
     control_group = dist.new_group(backend="gloo", timeout=cpu_timeout)
-    error = None
+    local_error = None
+    # Every rank participates in the setup vote, even if a local allocation fails.
     try:
         control = EplbControl(control_group)
         import torch_npu
@@ -161,6 +163,16 @@ def create_npu_async_eplb(
         p2p_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
         p2p_options.hccl_config = {"hccl_buffer_size": p2p_buffer_mib}
         blocking_wait = _hccl_blocking_wait()
+        use_prefill_admission = (
+            serving_mode == "null"
+            and not get_schedule().disable_overlap_schedule
+            and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
+            # With multiple DP ranks, idle ranks also need the synchronized extend flag.
+            and not (
+                parallel.num_dp_ranks > 1
+                and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            )
+        )
         runtime = NpuEplbRuntime(
             weights,
             metadata,
@@ -170,17 +182,7 @@ def create_npu_async_eplb(
             world_size // parallel.nnodes,
             order_submissions=decode_worker,
             pack_small_fields=decode_worker and parallel.nnodes == 1,
-            use_prefill_admission=(
-                serving_mode == "null"
-                and not get_schedule().disable_overlap_schedule
-                and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
-                # With multiple DP ranks the admission vote needs the
-                # synchronized extend flag, including on idle ranks.
-                and not (
-                    parallel.num_dp_ranks > 1
-                    and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
-                )
-            ),
+            use_prefill_admission=use_prefill_admission,
         )
         initial_layout = metadata.physical_to_logical_map_cpu.contiguous()
         if any(t.shape[0] != spec.local_experts for t in runtime.staging):
@@ -210,14 +212,14 @@ def create_npu_async_eplb(
             "initial_layout": hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
             **{f"placement.{key}": value for key, value in asdict(spec).items()},
         }
-        setup = (signature, sorted(runtime.narrowed_replica_layers))
+        local_setup = (signature, sorted(runtime.narrowed_replica_layers))
     except Exception as exc:
-        error = exc
-        setup = f"{type(exc).__name__}: {exc}"
-    peers = [None] * world_size
-    dist.all_gather_object(peers, setup, group=control_group)
+        local_error = exc
+        local_setup = f"{type(exc).__name__}: {exc}"
+    peer_setups = [None] * world_size
+    dist.all_gather_object(peer_setups, local_setup, group=control_group)
     try:
-        narrowed_layers = _check_startup_agreement(peers, error)
+        narrowed_layers = _check_startup_agreement(peer_setups, local_error)
     except (RuntimeError, ValueError):
         dist.destroy_process_group(control_group)
         raise

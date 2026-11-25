@@ -65,10 +65,23 @@ class EplbControl:
         start = time.perf_counter()
         dist.all_reduce(self._vote_flags, op=dist.ReduceOp.MAX, group=self.group)
         self.wait_seconds += time.perf_counter() - start
-        values = self._vote_flags.tolist()
-        if any(values[i] != -values[i + 1] for i in (0, 2, 4)):
+        (
+            max_epoch,
+            neg_min_epoch,
+            max_phase,
+            neg_min_phase,
+            max_layer,
+            neg_min_layer,
+            any_unready,
+            any_error,
+        ) = self._vote_flags.tolist()
+        if (
+            max_epoch != -neg_min_epoch
+            or max_phase != -neg_min_phase
+            or max_layer != -neg_min_layer
+        ):
             raise RuntimeError("EPLB ranks reached different protocol boundaries")
-        return values[6] == 0, bool(values[7])
+        return any_unready == 0, bool(any_error)
 
     def close(self) -> None:
         dist.destroy_process_group(self.group)
@@ -140,7 +153,7 @@ def _make_comm_rank_lookup(old_layout, new_layout, local_experts):
     return lookup
 
 
-def _submit_hccl_batches(p2p_op_infos, expert_order, batch_size, pending_work):
+def _submit_hccl_batches(p2p_op_infos, expert_order, batch_size, work_handles):
     ops_by_expert = dict(p2p_op_infos)
     if not any(ops_by_expert.values()):
         return
@@ -152,7 +165,7 @@ def _submit_hccl_batches(p2p_op_infos, expert_order, batch_size, pending_work):
         ]
         if batch_ops:
             work = dist.batch_isend_irecv(batch_ops)
-            pending_work.extend(work)
+            work_handles.extend(work)
             for request in work:
                 request.wait()
 
@@ -271,35 +284,57 @@ def _install_routing_layer(
 class _PackedExpertFields:
     """Send narrow fields together and expose their original views for writeback."""
 
-    small: tuple[int, ...]
-    direct: tuple[int, ...]
-    send: torch.Tensor
-    receive: list[torch.Tensor]
+    packed_indices: tuple[int, ...]
+    direct_indices: tuple[int, ...]
+    send_buffer: torch.Tensor
+    receive_buffers: list[torch.Tensor]
 
     @classmethod
     def create(cls, staging: list[torch.Tensor]) -> _PackedExpertFields | None:
         # The weight adapter exposes contiguous [expert, bytes] tensors.
-        small = tuple(
+        packed_indices = tuple(
             i
             for i, field in enumerate(staging)
             if 0 < field.size(1) <= _MAX_PACKED_FIELD_BYTES
         )
-        if len(small) < 2:
+        if len(packed_indices) < 2:
             return None
-        direct = tuple(i for i in range(len(staging)) if i not in small)
-        widths = [staging[i].size(1) for i in small]
-        packed = staging[0].new_empty((staging[0].size(0), sum(widths)))
-        for i, view in zip(small, packed.split(widths, dim=1), strict=True):
+        direct_indices = tuple(
+            i for i in range(len(staging)) if i not in packed_indices
+        )
+        widths = [staging[i].size(1) for i in packed_indices]
+        receive_buffer = staging[0].new_empty((staging[0].size(0), sum(widths)))
+        for i, view in zip(
+            packed_indices, receive_buffer.split(widths, dim=1), strict=True
+        ):
             staging[i] = view
         return cls(
-            small,
-            direct,
-            torch.empty_like(packed),
-            [staging[i] for i in direct] + [packed],
+            packed_indices=packed_indices,
+            direct_indices=direct_indices,
+            send_buffer=torch.empty_like(receive_buffer),
+            receive_buffers=[staging[i] for i in direct_indices] + [receive_buffer],
         )
 
     def pack(self, weights: list[torch.Tensor]) -> None:
-        torch.cat([weights[i] for i in self.small], dim=1, out=self.send)
+        torch.cat(
+            [weights[i] for i in self.packed_indices], dim=1, out=self.send_buffer
+        )
+
+    def pack_for_local_copies(
+        self,
+        weights: list[torch.Tensor],
+        old_local_layout: list[int],
+        new_local_layout: list[int],
+    ) -> bool:
+        """Pack early if the updater will copy a resident expert before P2P."""
+        resident_experts = set(old_local_layout)
+        if any(
+            old != new and new in resident_experts
+            for old, new in zip(old_local_layout, new_local_layout, strict=True)
+        ):
+            self.pack(weights)
+            return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -453,43 +488,47 @@ class NpuEplbRuntime:
     def prepare(self, placement: PlacementRows | None) -> tuple[int, ...]:
         if placement is None:
             return ()
-        changed, physical, logical, dispatch = placement
-        incoming_width = logical.size(-1)
+        replica_table = placement.logical_to_physical
+        incoming_width = replica_table.size(-1)
         # Include the previous populated columns so shrinking the active width
         # overwrites stale replicas. The graph still points to the full table.
         install_width = max(self._replica_width, incoming_width)
         self._replica_width = install_width
-        num_logical = logical.size(1)
+        num_logical = replica_table.size(1)
         replica_buffer = self._routing_buffers.logical_to_physical
         device_rows = self._routing_buffers._replace(
             logical_to_physical=replica_buffer.view(-1)[
                 : num_logical * install_width
             ].view(num_logical, install_width)
         )
-        padded_logical = logical
+        host_replica_table = replica_table
         if incoming_width < install_width:
-            padded_logical = torch.nn.functional.pad(
-                logical, (0, install_width - incoming_width), value=-1
+            host_replica_table = torch.nn.functional.pad(
+                replica_table, (0, install_width - incoming_width), value=-1
             )
         static_dispatch = None
         if device_rows.static_dispatch is not None:
             # Without replicas the inverse table already gives the static pick.
-            static_dispatch = logical[..., 0] if dispatch is None else dispatch
+            static_dispatch = placement.local_dispatch
+            if static_dispatch is None:
+                static_dispatch = replica_table[..., 0]
         # Pageable H2D blocks the worker on the current stream. Keep the plan
         # pinned until the asynchronous routing copies have drained.
         self.device_module.set_device(self.device)
         pinned = _RoutingTensors(
-            physical_to_logical=physical,
-            logical_to_physical=padded_logical,
-            replica_counts=(logical != -1).sum(dim=-1),
+            physical_to_logical=placement.physical_to_logical,
+            logical_to_physical=host_replica_table,
+            replica_counts=(replica_table != -1).sum(dim=-1),
             static_dispatch=static_dispatch,
         ).pin_memory()
         self._routing_plan = _RoutingPlan(
-            host_rows={layer: pinned.row_at(i) for i, layer in enumerate(changed)},
+            host_rows={
+                layer: pinned.row_at(i) for i, layer in enumerate(placement.layers)
+            },
             device_rows=device_rows,
-            last_layer=changed[-1],
+            last_layer=placement.layers[-1],
         )
-        return changed
+        return placement.layers
 
     def _check_stream(self):
         if self.device_module.current_stream() != self._owner_stream:
@@ -511,7 +550,8 @@ class NpuEplbRuntime:
         routing = self._routing_plan
         assert routing is not None
         host_rows = routing.host_rows[layer]
-        pending_work = []
+        # Keep the Work handles alive through stream completion.
+        work_handles: list[dist.Work] = []
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
             for destination, source in zip(routing.device_rows, host_rows, strict=True):
@@ -519,7 +559,7 @@ class NpuEplbRuntime:
                     assert source is not None
                     destination.copy_(source, non_blocking=True)
             writeback = self._stage_weights(
-                layer, host_rows.physical_to_logical, pending_work
+                layer, host_rows.physical_to_logical, work_handles
             )
             if submitted is not None:
                 submitted.set_result(None)
@@ -529,7 +569,7 @@ class NpuEplbRuntime:
         return writeback
 
     def _stage_weights(
-        self, layer: int, planned_layout: torch.Tensor, pending_work: list[dist.Work]
+        self, layer: int, planned_layout: torch.Tensor, work_handles: list[dist.Work]
     ) -> WeightWriteback:
         old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
         new_layout = planned_layout.tolist()
@@ -537,7 +577,7 @@ class NpuEplbRuntime:
             # A replica-order update only publishes the staged routing rows.
             return lambda: None
 
-        staged_rows = []
+        writeback_rows = []
         get_comm_ranks = _make_comm_rank_lookup(
             old_layout, new_layout, self.spec.local_experts
         )
@@ -554,27 +594,23 @@ class NpuEplbRuntime:
         expert_order = p2p_expert_order or range(len(old_layout))
 
         weights, staging = self.weights[layer], self.staging
-        sends, receives = weights, staging
+        send_fields, receive_buffers = weights, staging
         packed = self._packed_fields
         packed_for_local_copy = False
         if packed is not None:
             first = self.rank * self.spec.local_experts
-            local = slice(first, first + self.spec.local_experts)
-            resident = old_layout[local]
-            # The updater copies local moves before calling stage_transfers.
-            # Other sources only need packing if an isend was selected.
-            resident_experts = set(resident)
-            packed_for_local_copy = any(
-                old != new and new in resident_experts
-                for old, new in zip(resident, new_layout[local], strict=True)
+            local_slots = slice(first, first + self.spec.local_experts)
+            packed_for_local_copy = packed.pack_for_local_copies(
+                weights, old_layout[local_slots], new_layout[local_slots]
             )
-            if packed_for_local_copy:
-                packed.pack(weights)
-            sends = [weights[i] for i in packed.direct] + [packed.send]
-            receives = packed.receive
+            send_fields = [weights[i] for i in packed.direct_indices] + [
+                packed.send_buffer
+            ]
+            receive_buffers = packed.receive_buffers
 
         def stage_transfers(p2p_op_infos, rows):
-            staged_rows.extend(rows)
+            writeback_rows.extend(rows)
+            # A sender that had no local copies can defer packing until it has an isend.
             if (
                 packed is not None
                 and not packed_for_local_copy
@@ -582,12 +618,12 @@ class NpuEplbRuntime:
             ):
                 packed.pack(weights)
             _submit_hccl_batches(
-                p2p_op_infos, expert_order, self.p2p_batch_size, pending_work
+                p2p_op_infos, expert_order, self.p2p_batch_size, work_handles
             )
 
         update_expert_weights_single_layer(
-            routed_experts_weights=sends,
-            temp_buffers=receives,
+            routed_experts_weights=send_fields,
+            temp_buffers=receive_buffers,
             old_physical_to_logical_map=old_layout,
             new_physical_to_logical_map=new_layout,
             num_local_physical_experts=self.spec.local_experts,
@@ -599,7 +635,7 @@ class NpuEplbRuntime:
             get_comm_ranks=get_comm_ranks,
             stage_transfers=stage_transfers,
         )
-        return _make_weight_writeback(weights, staging, staged_rows)
+        return _make_weight_writeback(weights, staging, writeback_rows)
 
     def install(self, layer: int, writeback: WeightWriteback) -> None:
         self._check_stream()
@@ -631,7 +667,11 @@ class NpuEplbRuntime:
         packed = self._packed_fields
         if packed is None:
             return weight_bytes, routing_bytes, 0
-        return weight_bytes + packed.send.nbytes, routing_bytes, len(packed.small)
+        return (
+            weight_bytes + packed.send_buffer.nbytes,
+            routing_bytes,
+            len(packed.packed_indices),
+        )
 
     def open_transport(
         self, cpu_timeout, hccl_timeout, p2p_options, tp_probe, warmup_buffers
