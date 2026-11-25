@@ -37,7 +37,7 @@ class _AsyncStatAccumulator(_StatAccumulator):
     def __init__(self, metadata, rank):
         super().__init__(metadata, rank)
         self.window_samples = 0
-        self._previous_layouts = {}
+        self._previous_layouts: dict[int, tuple[int, torch.Tensor]] = {}
 
     def append(self, forward_pass_id, gatherer_key, single_pass_data, outputs):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
@@ -164,26 +164,34 @@ class _AsyncStatAccumulator(_StatAccumulator):
         logical = super()._logical_counts(physical_counts)
         if not self._previous_layouts:
             return logical
-        # A manual dump can fall between layer installs. Correct only samples
-        # still in the ring that predate each install, including wraparound.
+        # A manual dump can fall between layer installs. Compute where the
+        # oldest retained sample lives, even when a reset left the cursor nonzero.
         capacity = physical_counts.size(0)
-        cursor = self._global_physical_count_of_buffered_step._curr_index
-        for layer, (at_install, old_row) in self._previous_layouts.items():
-            newer = self.window_samples - at_install
-            retained = min(at_install, capacity - newer)
-            if retained <= 0:
+        retained_samples = min(self.window_samples, capacity)
+        if not retained_samples:
+            return logical
+        next_slot = self._global_physical_count_of_buffered_step._curr_index
+        oldest_slot = (next_slot - retained_samples) % capacity
+        overwritten_samples = self.window_samples - retained_samples
+
+        for layer, (samples_at_install, old_row) in self._previous_layouts.items():
+            retained_before_install = samples_at_install - overwritten_samples
+            if retained_before_install <= 0:
                 continue
-            first = (cursor - newer - retained) % capacity
-            end = first + retained
+            end_slot = oldest_slot + retained_before_install
+            # The prefix recorded under the old layout spans at most two slices.
+            spans = ((oldest_slot, min(end_slot, capacity)), (0, end_slot - capacity))
+            layer_slice = slice(layer, layer + 1)
             old_map = old_row.unsqueeze(0).to(physical_counts.device)
-            for lo, hi in ((first, min(end, capacity)), (0, end - capacity)):
-                if lo < hi:
-                    rows = physical_counts[lo:hi, layer : layer + 1]
-                    logical[lo:hi, layer : layer + 1].copy_(
-                        _convert_global_physical_count_to_logical_count(
-                            rows, 1, logical.size(-1), old_map
-                        )
+            for start, stop in spans:
+                if start >= stop:
+                    continue
+                rows = physical_counts[start:stop, layer_slice]
+                logical[start:stop, layer_slice].copy_(
+                    _convert_global_physical_count_to_logical_count(
+                        rows, 1, logical.size(-1), old_map
                     )
+                )
         return logical
 
 
