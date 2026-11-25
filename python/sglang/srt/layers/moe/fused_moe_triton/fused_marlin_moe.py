@@ -392,7 +392,22 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    # Gate-up is dead; the down GEMM defines inactive rows in the shared output.
+    output = None
+    if not no_combine:
+        output = zero_copy_context.get_moe_output(hidden_states)
+        if output is None:
+            output = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    use_topk_sum = (
+        is_mxfp4_marlin and output is not None and output.is_contiguous() and K % 8 == 0
+    )
+    mask_inactive = (
+        use_topk_sum
+        and expert_map is not None
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+    )
+    # Only the masked sum can consume unwritten down-projection rows.
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
@@ -411,7 +426,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=not no_combine or no_combine_keep_router_weight,
-        zero_inactive_output=True,
+        zero_inactive_output=not mask_inactive,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,
         has_inactive_prefix_count=expert_map is None,
@@ -428,25 +443,18 @@ def fused_marlin_moe(
     if no_combine:
         return intermediate_cache3
 
-    output = zero_copy_context.get_moe_output(hidden_states)
-    if output is None:
-        output = hidden_states if inplace else torch.empty_like(hidden_states)
-
     if is_mxfp4_marlin:
         # Top-k weights (incl. routed scaling) are already applied above via
         # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
         # vectorized pass (~1.5us at decode shapes) beats sgl_kernel's
         # moe_sum_reduce_kernel_general (~5.7us) and the generic at::native
         # reduce_kernel torch.sum dispatches to (~6.7us).
-        if (
-            intermediate_cache3.dtype == torch.bfloat16
-            and intermediate_cache3.is_contiguous()
-            and output.is_contiguous()
-            and intermediate_cache3.shape[-1] % 8 == 0
-        ):
+        if use_topk_sum:
             from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
 
-            moe_topk_sum(intermediate_cache3, output)
+            moe_topk_sum(
+                intermediate_cache3, output, expert_ids=topk_ids if mask_inactive else None
+            )
         else:
             moe_sum_reduce(intermediate_cache3, output, 1.0)
         return output

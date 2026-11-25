@@ -14,6 +14,7 @@
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
 
 #include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/optional.h>
 
 #include <cstdint>
 
@@ -22,12 +23,13 @@ namespace sglang {
 struct TopkSumParams {
   const bf16_t* __restrict__ in;  // [M, topk, K] contiguous
   bf16_t* __restrict__ out;       // [M, K] contiguous
+  const int32_t* __restrict__ ids;  // [M, topk] local expert IDs, or nullptr
   uint32_t K;
   uint32_t topk;
   float scale;
 };
 
-template <int kThreads, bool kUsePDL>
+template <int kThreads, bool kUsePDL, bool kMasked>
 __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
   using namespace device;
 
@@ -51,6 +53,9 @@ __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
   // 4 rows in flight: at decode (topk=10) the dependent vector load was the whole cost.
 #pragma unroll 4
   for (uint32_t j = 0; j < params.topk; ++j) {
+    if constexpr (kMasked) {
+      if (params.ids[static_cast<int64_t>(m) * params.topk + j] < 0) continue;
+    }
     vec_bf16_t x;
     x.load(base + static_cast<int64_t>(j) * params.K, v);
 #pragma unroll
@@ -71,9 +76,11 @@ __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
 
 template <int kThreads, bool kUsePDL>
 struct TopkSumKernel {
-  static constexpr auto kernel = topk_sum_kernel<kThreads, kUsePDL>;
-
-  static void run(const tvm::ffi::TensorView in, const tvm::ffi::TensorView out, float scale) {
+  static void run(
+      const tvm::ffi::TensorView in,
+      const tvm::ffi::TensorView out,
+      float scale,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> ids) {
     using namespace host;
 
     auto M_ = SymbolicSize{"num_tokens"};
@@ -84,6 +91,9 @@ struct TopkSumKernel {
 
     TensorMatcher({M_, T_, K_}).with_dtype<bf16_t>().with_device(device).verify(in);
     TensorMatcher({M_, K_}).with_dtype<bf16_t>().with_device(device).verify(out);
+    if (ids.has_value()) {
+      TensorMatcher({M_, T_}).with_dtype<int32_t>().with_device(device).verify(ids.value());
+    }
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     const auto topk = static_cast<uint32_t>(T_.unwrap());
@@ -95,6 +105,7 @@ struct TopkSumKernel {
     const auto params = TopkSumParams{
         .in = static_cast<const bf16_t*>(in.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .ids = ids.has_value() ? static_cast<const int32_t*>(ids.value().data_ptr()) : nullptr,
         .K = K,
         .topk = topk,
         .scale = scale,
@@ -102,6 +113,7 @@ struct TopkSumKernel {
 
     const uint32_t n_vecs = K / 8;
     dim3 grid((n_vecs + kThreads - 1) / kThreads, M);
+    auto kernel = ids.has_value() ? topk_sum_kernel<kThreads, kUsePDL, true> : topk_sum_kernel<kThreads, kUsePDL, false>;
     LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };

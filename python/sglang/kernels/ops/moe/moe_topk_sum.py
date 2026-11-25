@@ -32,13 +32,19 @@ def _jit_topk_sum_module(threads: int) -> Module:
 
 
 def moe_topk_sum(
-    x: torch.Tensor, out: torch.Tensor, scale: float = 1.0, threads: int = _THREADS
+    x: torch.Tensor,
+    out: torch.Tensor,
+    scale: float = 1.0,
+    threads: int = _THREADS,
+    *,
+    expert_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """out[M, K] = x[M, topk, K].sum(dim=1) * scale for contiguous bf16 tensors.
 
+    Negative local expert IDs mark input rows to skip before loading.
     ``threads`` sets the block width; the grid is ``(ceil(K / 8 / threads), M)``. More CTAs stop
     paying well before the SM count: at decode ([8, 10, 2560], one A100) 16 CTAs (256 threads) take
     3.45 us, 24 (128) 3.14, 40 (64) 3.02 and 80 (32) 3.06, so the Marlin runner keeps 64.
     """
-    _jit_topk_sum_module(threads).run(x, out, scale)
+    _jit_topk_sum_module(threads).run(x, out, scale, expert_ids)
     return out
