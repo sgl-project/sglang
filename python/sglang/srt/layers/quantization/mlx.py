@@ -51,10 +51,6 @@ class MlxQuantizationConfig(QuantizationConfig):
         "reached this error, SGLANG_USE_MLX=1 is likely not set."
     )
 
-    def __init__(self, preset: str):
-        super().__init__()
-        self.preset = preset
-
     @classmethod
     def get_name(cls) -> str:
         return "mlx"

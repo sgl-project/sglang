@@ -22,6 +22,10 @@ ROPE_DIM = 64
 FP8_MAX = 448.0
 TOKENS_PER_PAGE = 64
 
+# Row counts, page-table widths and row offsets change with every batch;
+# specializing on them compiles a new kernel variant while serving.
+_PAGE_TABLE_ARGS = ("pages_stride", "num_pages")
+
 
 @triton.jit
 def _rope_quant_row(x, pos, inv_freq_ptr):
@@ -60,7 +64,8 @@ def _mrope_positions(p0, p1, p2, S1: tl.constexpr, S2: tl.constexpr):
     return tl.where(use_h, p1, tl.where(use_w, p2, p0))
 
 
-@triton.jit
+# With MROPE, pos_stride_a is the batch's token count.
+@triton.jit(do_not_specialize=["pos_stride_a"])
 def _query_kernel(
     query_ptr,  # [R, H, 128] bf16
     pos_ptr,  # [R] int64, or [R, 3] with MROPE
@@ -258,7 +263,7 @@ def _pool_group(
     tl.store(scale_ptr, scale)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=_PAGE_TABLE_ARGS)
 def _decode_update_kernel(
     key_ptr,  # [R, >=128] bf16 raw key projection (before its RMSNorm)
     key_stride,
@@ -446,7 +451,11 @@ def indexpool_pool_write(
     )
 
 
-@triton.jit
+# Extend scores in row chunks that can start at any row.
+@triton.jit(
+    do_not_specialize=_PAGE_TABLE_ARGS,
+    do_not_specialize_on_alignment=["row_batch_ptr", "pos_ptr"],
+)
 def _logits_kernel(
     q_ptr,  # [R, H, 128] fp8
     w_ptr,  # [R, H] fp32
@@ -509,7 +518,10 @@ def _logits_kernel(
     tl.store(out_ptr + r * G + groups, logits, mask=in_range)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[*_PAGE_TABLE_ARGS, "R"],
+    do_not_specialize_on_alignment=["row_batch_ptr", "pos_ptr"],
+)
 def _logits_rows_kernel(
     q_ptr,  # [R, H, 128] fp8
     w_ptr,  # [R, H] fp32
@@ -688,7 +700,7 @@ def indexpool_logits(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[*_PAGE_TABLE_ARGS, "K"])
 def _expand_kernel(
     picked_ptr,  # [R, K] int64/int32 candidate groups (any order)
     value_ptr,  # [R, K] fp32 their logits (-inf: not a candidate)
@@ -776,14 +788,15 @@ def indexpool_expand(
         k,
         RAGGED=ragged,
         RATIO=4,
-        BLOCK_K=triton.next_power_of_2(max(k, 16)),
+        # Sized by topk, not k, so short contexts reuse the same kernel.
+        BLOCK_K=triton.next_power_of_2(topk // 4),
         TOPK=topk,
         num_warps=4,
     )
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=_PAGE_TABLE_ARGS)
 def _window_kernel(
     pos_ptr,
     pages_ptr,
