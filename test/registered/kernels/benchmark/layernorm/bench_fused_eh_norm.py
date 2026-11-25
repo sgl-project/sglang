@@ -7,7 +7,7 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
-    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 register_amd_ci(est_time=6, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
@@ -43,7 +43,7 @@ FN_MAP = {
 @marker.parametrize("dtype", [torch.bfloat16, torch.float16], [torch.bfloat16])
 @marker.parametrize("hidden_size", [6144, 7168], [7168])
 @marker.parametrize("num_tokens", [1, 4, 6, 8, 16, 32, 128, 512], [1, 6])
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark(num_tokens: int, hidden_size: int, dtype: torch.dtype, impl: str):
     x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=dtype)
     prev = torch.randn_like(x)
