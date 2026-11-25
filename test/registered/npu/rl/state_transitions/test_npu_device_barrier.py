@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler_components import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
     begin_weight_update,
@@ -63,12 +64,11 @@ DP_ARGS = SERVER_ARGS + (
 NORM_WEIGHT = "model.norm.weight"
 
 
+_TP_GROUP = SimpleNamespace(cpu_group=object())
+
+
 def _make_manager(events):
-    with patch.object(
-        weight_updater_module,
-        "get_parallel",
-        lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=object())),
-    ):
+    with get_parallel().override(tp_group=_TP_GROUP, tp_rank=0, tp_size=1):
         return SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
             draft_worker=None,
@@ -97,16 +97,21 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 "get_model",
                 lambda: SimpleNamespace(weight_cache_mode="off"),
             ),
-            patch(
-                "torch.distributed.barrier",
-                lambda *args, **kwargs: events.append(("barrier", None)),
+            patch.object(
+                weight_updater_module,
+                "control_request_barrier",
+                lambda: events.append(("barrier", None)),
             ),
             patch(
                 "torch.npu.synchronize",
                 lambda: events.append(("sync", None)),
             ),
             # release_memory_occupation gates on the TP ranks being idle.
-            patch("torch.distributed.all_reduce", lambda *args, **kwargs: None),
+            patch.object(
+                weight_updater_module,
+                "control_request_all_gather_object",
+                lambda obj: [obj],
+            ),
         ):
             manager.release_memory_occupation(SimpleNamespace(tags=["weights"]))
 
@@ -131,9 +136,10 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 "get_model",
                 lambda: SimpleNamespace(weight_cache_mode="off"),
             ),
-            patch(
-                "torch.distributed.barrier",
-                lambda *args, **kwargs: events.append(("barrier", None)),
+            patch.object(
+                weight_updater_module,
+                "control_request_barrier",
+                lambda: events.append(("barrier", None)),
             ),
         ):
             manager.resume_memory_occupation(SimpleNamespace(tags=["weights"]))

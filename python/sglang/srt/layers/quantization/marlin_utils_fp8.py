@@ -208,3 +208,83 @@ def pack_fp8_to_int32(
     # with `.view(torch.int32)`, it become (N, K // 4)
     int32_tensor = fp8_tensor.view(torch.int32)
     return int32_tensor.T.contiguous() if size_k_first else int32_tensor
+
+
+def prepare_moe_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
+    """Repack canonical E4M3 experts and unswizzled group-32 E8M0 scales.
+
+    Gate/up rows remain in [gate; up] order. Unlike ordinary FP8 Marlin,
+    E8M0 scales retain their exponent bytes rather than absorbing an FP8 bias.
+    """
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        _permute_moe_fp4_scales_for_marlin,
+        mxfp4_marlin_process_scales,
+    )
+
+    w13 = layer.w13_weight.data
+    w2 = layer.w2_weight.data
+    num_experts, w13_size_n, hidden_size = w13.shape
+    intermediate_size = w13_size_n // 2
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"MXFP8 Marlin needs float8_e4m3fn experts, got {w13.dtype} and {w2.dtype}"
+        )
+    if w2.shape != (num_experts, hidden_size, intermediate_size):
+        raise ValueError(
+            f"MXFP8 Marlin w2 shape {tuple(w2.shape)} does not match "
+            f"w13 shape {tuple(w13.shape)}"
+        )
+    if hidden_size % 128 or intermediate_size % 64:
+        raise ValueError(
+            "MXFP8 Marlin needs hidden_size % 128 == 0 and intermediate_size % 64 "
+            f"== 0, got {hidden_size} and {intermediate_size}"
+        )
+
+    perm = torch.empty(0, dtype=torch.int32, device=w13.device)
+
+    def repack(weight: torch.Tensor) -> torch.Tensor:
+        _, size_n, size_k = weight.shape
+        output = torch.empty(
+            (num_experts, size_k // 16, size_n * 4),
+            dtype=torch.int32,
+            device=weight.device,
+        )
+        for i, expert in enumerate(weight):
+            output[i] = gptq_marlin_repack(
+                b_q_weight=pack_fp8_to_int32(expert, size_k_first=False).T.contiguous(),
+                perm=perm,
+                size_k=size_k,
+                size_n=size_n,
+                num_bits=8,
+            )
+        return output
+
+    def permute_scales(scales: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
+        if scales.shape != (num_experts, size_n, size_k // 32):
+            raise ValueError(
+                f"MXFP8 Marlin scale shape {tuple(scales.shape)} does not match "
+                f"[{num_experts}, {size_n}, {size_k // 32}]"
+            )
+        if scales.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise ValueError(f"MXFP8 Marlin needs E8M0 scale bytes, got {scales.dtype}")
+        # BF16 represents E8M0 exactly and supports the shared scale permutation.
+        scales = scales.view(torch.float8_e8m0fnu).to(torch.bfloat16)
+        return _permute_moe_fp4_scales_for_marlin(
+            scales,
+            num_experts=num_experts,
+            size_n=size_n,
+            size_k=size_k,
+            group_size=32,
+            process_scales=mxfp4_marlin_process_scales,
+        )
+
+    w13_scale = permute_scales(layer.w13_weight_scale_inv.data, w13_size_n, hidden_size)
+    w2_scale = permute_scales(
+        layer.w2_weight_scale_inv.data, hidden_size, intermediate_size
+    )
+    layer.w13_weight = torch.nn.Parameter(repack(w13), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(repack(w2), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+    del layer.w13_weight_scale_inv
+    del layer.w2_weight_scale_inv
