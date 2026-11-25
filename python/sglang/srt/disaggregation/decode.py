@@ -4479,7 +4479,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        balancer = self.decode_lane_balancer
+        balancer = getattr(self, "decode_lane_balancer", None)
         if balancer is not None:
             rows = self.dp_attn_adapter.rank_rows.rows
             startable = [
