@@ -10,6 +10,9 @@ from sglang.kernels.ops.diffusion.rope.complex_rope_triton import fused_complex_
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
 )
+from sglang.multimodal_gen.test.quality_tier_admission import (
+    assert_error_no_worse_than_reference,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
@@ -35,13 +38,36 @@ def _eager_rmsnorm(x, weight, eps):
     return (x.float() * torch.rsqrt(variance + eps)).to(x.dtype) * weight
 
 
+def _fp64_rope(x, rope):
+    z = torch.view_as_complex(x.double().unflatten(-1, (-1, 2)))
+    return torch.view_as_real(z * rope.to(torch.complex128)[None, :, None]).flatten(-2)
+
+
+def _fp64_rmsnorm(x, weight, eps):
+    x = x.double()
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.double()
+
+
+def _assert_lossless(reference_fp64, baseline, candidate, label):
+    base, cand = assert_error_no_worse_than_reference(
+        reference_fp64=reference_fp64,
+        baseline=baseline,
+        candidate=candidate,
+        label=label,
+    )
+    print(f"{label}: baseline {base} candidate {cand}")
+
+
 @pytest.mark.parametrize("shape", [(1, 2048, 32, 128), (1, 7, 4, 128)])
 def test_complex_rope_matches_eager(shape):
     torch.manual_seed(0)
     x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     rope = _rope(shape[1], shape[-1] // 2)
-    torch.testing.assert_close(
-        fused_complex_rope(x, rope), _eager_rope(x, rope), atol=2e-2, rtol=1e-2
+    _assert_lossless(
+        _fp64_rope(x, rope),
+        _eager_rope(x, rope),
+        fused_complex_rope(x, rope),
+        f"complex_rope {shape}",
     )
 
 
@@ -51,9 +77,11 @@ def test_qknorm_complex_rope_matches_eager(shape):
     x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     weight = torch.rand(128, device="cuda", dtype=torch.bfloat16) + 0.5
     rope = _rope(shape[1], 64)
-    expected = _eager_rope(_eager_rmsnorm(x, weight, 1e-6), rope)
-    torch.testing.assert_close(
-        qknorm_complex_rope(x, weight, rope, 1e-6), expected, atol=3e-2, rtol=2e-2
+    _assert_lossless(
+        _fp64_rope(_fp64_rmsnorm(x, weight, 1e-6), rope),
+        _eager_rope(_eager_rmsnorm(x, weight, 1e-6), rope),
+        qknorm_complex_rope(x, weight, rope, 1e-6),
+        f"qknorm_complex_rope {shape}",
     )
 
 

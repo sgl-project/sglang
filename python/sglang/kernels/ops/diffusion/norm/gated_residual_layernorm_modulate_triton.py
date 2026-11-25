@@ -99,7 +99,35 @@ def can_use_gated_residual_layernorm_modulate(
     )
 
 
+def _check_launch_args(residual, update, gate, scale):
+    per_batch = [t for t in (gate, scale) if t is not None]
+    if not can_use_gated_residual_layernorm_modulate(residual, *per_batch):
+        rows = [(t.dtype, tuple(t.shape), str(t.device), t.stride()) for t in per_batch]
+        raise ValueError(
+            "expected a contiguous non-empty bf16 [B, L, D] GPU tensor with "
+            "D <= 8192 and bf16 [B, 1, D] or [B, D] gate/scale rows on the same "
+            f"device; got residual dtype={residual.dtype} "
+            f"shape={tuple(residual.shape)} device={residual.device} "
+            f"strides={residual.stride()}, per-batch (dtype, shape, device, "
+            f"strides)={rows}"
+        )
+    if (update is None) != (gate is None):
+        raise ValueError("update and gate must be passed together")
+    if update is None:
+        return
+    for attr, got, expected in (
+        ("shape", update.shape, residual.shape),
+        ("dtype", update.dtype, residual.dtype),
+        ("device", update.device, residual.device),
+    ):
+        if got != expected:
+            raise ValueError(f"update {attr} {got} does not match residual {expected}")
+    if not update.is_contiguous():
+        raise ValueError(f"update must be contiguous, got strides {update.stride()}")
+
+
 def _launch(residual, update, gate, scale, eps, residual_out, out):
+    _check_launch_args(residual, update, gate, scale)
     batch, seq_len, hidden = residual.shape
     block = triton.next_power_of_2(hidden)
     has_update = update is not None
@@ -137,8 +165,6 @@ def gated_residual_add(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     """``residual + update * gate``."""
-    if update.shape != residual.shape or not update.is_contiguous():
-        raise RuntimeError("update must be contiguous and match residual")
     residual_out = torch.empty_like(residual)
     _launch(residual, update, gate, None, 0.0, residual_out, None)
     return residual_out
@@ -152,8 +178,6 @@ def gated_residual_layernorm_modulate(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``r = residual + update * gate``; returns ``(r, LayerNorm(r) * (1 + scale))``."""
-    if update.shape != residual.shape or not update.is_contiguous():
-        raise RuntimeError("update must be contiguous and match residual")
     residual_out = torch.empty_like(residual)
     out = torch.empty_like(residual)
     _launch(residual, update, gate, scale, eps, residual_out, out)

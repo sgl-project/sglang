@@ -11,6 +11,9 @@ from sglang.kernels.ops.diffusion.norm.gated_residual_layernorm_modulate_triton 
     gated_residual_layernorm_modulate,
     layernorm_modulate,
 )
+from sglang.multimodal_gen.test.quality_tier_admission import (
+    assert_error_no_worse_than_reference,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -18,13 +21,20 @@ register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd"
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
-SHAPES = [(1, 1, 128), (1, 2048, 4096), (2, 17, 3072)]
+# On (1, 1, 128) a single 1-ulp difference can break the error gate's max ratio.
+LARGE_SHAPES = [(1, 2048, 4096), (2, 17, 3072)]
+SHAPES = [(1, 1, 128), *LARGE_SHAPES]
+ACTIVATIONS = ["randn", "outliers"]
 
 
-def _inputs(shape, per_batch_dim):
+def _inputs(shape, per_batch_dim, activations="randn"):
     torch.manual_seed(0)
     batch, _, hidden = shape
     x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    if activations == "outliers":
+        # DiT-style: a constant offset plus a few large outlier channels.
+        x = x + 4.0
+        x[..., torch.arange(8, device="cuda") * (hidden // 8)] *= 32
     update = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     rows = (batch, 1, hidden) if per_batch_dim else (batch, hidden)
     gate = torch.randn(rows, device="cuda", dtype=torch.bfloat16).tanh()
@@ -40,6 +50,22 @@ def _eager_modulation(x, scale, eps):
     return F.layer_norm(x, (x.shape[-1],), eps=eps) * (1 + _per_batch(scale))
 
 
+def _fp64_modulation(x, scale, eps):
+    return F.layer_norm(x.double(), (x.shape[-1],), eps=eps) * (
+        1 + _per_batch(scale).double()
+    )
+
+
+def _assert_lossless(inp, scale, actual, label):
+    base, cand = assert_error_no_worse_than_reference(
+        reference_fp64=_fp64_modulation(inp, scale, 1e-6),
+        baseline=_eager_modulation(inp, scale, 1e-6),
+        candidate=actual,
+        label=label,
+    )
+    print(f"{label}: baseline {base} candidate {cand}")
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("per_batch_dim", [True, False])
 def test_gated_residual_add_matches_eager_bits(shape, per_batch_dim):
@@ -50,26 +76,33 @@ def test_gated_residual_add_matches_eager_bits(shape, per_batch_dim):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("shape", LARGE_SHAPES)
 @pytest.mark.parametrize("per_batch_dim", [True, False])
-def test_layernorm_modulate_matches_eager(shape, per_batch_dim):
-    x, _, _, scale = _inputs(shape, per_batch_dim)
-    expected = _eager_modulation(x, scale, 1e-6)
+@pytest.mark.parametrize("activations", ACTIVATIONS)
+def test_layernorm_modulate_matches_eager(shape, per_batch_dim, activations):
+    x, _, _, scale = _inputs(shape, per_batch_dim, activations)
     actual = layernorm_modulate(x, scale, 1e-6)
-    # only the mean/variance reduction order differs from the eager chain
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+    _assert_lossless(
+        x, scale, actual, f"layernorm_modulate {shape} {per_batch_dim} {activations}"
+    )
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-def test_gated_residual_layernorm_modulate_matches_eager(shape):
-    x, update, gate, scale = _inputs(shape, per_batch_dim=True)
+@pytest.mark.parametrize("activations", ACTIVATIONS)
+def test_gated_residual_layernorm_modulate_matches_eager(shape, activations):
+    x, update, gate, scale = _inputs(shape, per_batch_dim=True, activations=activations)
     residual = x + update * gate
-    expected = _eager_modulation(residual, scale, 1e-6)
     actual_residual, actual = gated_residual_layernorm_modulate(
         x, update, gate, scale, 1e-6
     )
     assert torch.equal(actual_residual.view(torch.int16), residual.view(torch.int16))
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+    if shape in LARGE_SHAPES:
+        _assert_lossless(
+            residual,
+            scale,
+            actual,
+            f"gated_residual_layernorm_modulate {shape} {activations}",
+        )
 
 
 def test_rejects_unsupported_layouts():
@@ -78,6 +111,33 @@ def test_rejects_unsupported_layouts():
     assert not can_use_gated_residual_layernorm_modulate(x.transpose(1, 2), gate)
     assert not can_use_gated_residual_layernorm_modulate(x, gate[:1])
     assert not can_use_gated_residual_layernorm_modulate(x, scale.expand(2, 17, 128))
+
+
+def test_entry_points_raise_on_unsupported_inputs():
+    x, update, gate, scale = _inputs((2, 17, 128), per_batch_dim=True)
+    bad_inputs = [x.float(), x.transpose(1, 2)]
+    for bad_x in bad_inputs:
+        with pytest.raises(ValueError):
+            layernorm_modulate(bad_x, scale, 1e-6)
+        with pytest.raises(ValueError):
+            gated_residual_add(bad_x, update, gate)
+        with pytest.raises(ValueError):
+            gated_residual_layernorm_modulate(bad_x, update, gate, scale, 1e-6)
+    for bad_row in (scale[:1], scale.expand(2, 17, 128)):
+        with pytest.raises(ValueError):
+            layernorm_modulate(x, bad_row, 1e-6)
+        with pytest.raises(ValueError):
+            gated_residual_layernorm_modulate(x, update, gate, bad_row, 1e-6)
+    for bad_gate in (gate[:1], gate.expand(2, 17, 128)):
+        with pytest.raises(ValueError):
+            gated_residual_add(x, update, bad_gate)
+        with pytest.raises(ValueError):
+            gated_residual_layernorm_modulate(x, update, bad_gate, scale, 1e-6)
+    for bad_update in (update.float(), update.transpose(1, 2), update.cpu()):
+        with pytest.raises(ValueError):
+            gated_residual_add(x, bad_update, gate)
+        with pytest.raises(ValueError):
+            gated_residual_layernorm_modulate(x, bad_update, gate, scale, 1e-6)
 
 
 if __name__ == "__main__":
