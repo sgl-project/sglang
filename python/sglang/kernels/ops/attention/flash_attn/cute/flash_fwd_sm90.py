@@ -85,25 +85,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             assert fp8_kv_dequant and self.tile_hdim == self.tile_hdimv == 512
             # K and V are TMA'd by page; the PV ordering below needs the overlap loop.
             assert intra_wg_overlap and not paged_kv_non_tma
-            # P is scaled before its e4m3 cast so small probabilities keep precision
-            # over long contexts; the inverse joins the final O scale. The residual
-            # term is cast to e5m2 (WGMMA takes e5m2 x e4m3): its range reaches 2^-16,
-            # so probabilities down to ~2^-25 of the row max still reach PV, and both
-            # terms sum into one accumulator.
+            # Q and P are each an e4m3 high term plus an e5m2 residual (WGMMA takes
+            # e5m2 x e4m3). e5m2 reaches 2^-16, so the residual keeps what underflows
+            # e4m3 (Q components down to ~2^-17), and both terms share a scale and
+            # an accumulator.
+            self.fp8_res_dtype = cutlass.Float8E5M2
+            # P is scaled before its cast so small probabilities keep precision over
+            # long contexts (down to ~2^-25 of the row max); the inverse joins the
+            # final O scale.
             self.fp8_p_scale = 256.0
-            self.fp8_p_res_dtype = cutlass.Float8E5M2
-            # Q has no known range, so its high term is cast unscaled; its residual is
-            # at most 2^-4 of the high term and takes the same x16, which keeps small Q
-            # components (down to ~2^-14) and residuals that would be e4m3 subnormals.
-            self.fp8_q_res_scale = 16.0
             # K needs no conversion, so it is TMA'd into one of two sK slots and the
             # next K load overlaps the current QK.
             self.num_k_slots_mma = 2
-            # QK sums the high and residual Q terms into two accumulators, folded with
-            # the residual's inverse scale; one chain makes ptxas serialize the WGMMAs
-            # in causal/local builds (C7511). Every mask uses the split, so a row's
-            # scores do not depend on whether another request in the batch brings an
-            # image mask (deterministic inference).
+            # QK sums its k-steps into two accumulators: one chain makes ptxas
+            # serialize the WGMMAs in causal/local builds (C7511). Every mask uses
+            # the split, so a row's scores do not depend on whether another request
+            # in the batch brings an image mask (deterministic inference).
         if fp8_kv_dequant:
             assert self.dtype == Float16, "FP8-KV dequant computes in fp16"
             # hdim 512: two MMA warpgroups share 64 Q rows and each owns one
@@ -921,7 +918,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # The fp16/bf16 Q bytes are dead once quantized; reuse them for the
             # residual term.
             sQ_res = storage.sQ.get_tensor(
-                sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner, dtype=self.kv_dtype
+                sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner, dtype=self.fp8_res_dtype
             )
         elif const_expr(self.q_dtype != self.dtype):
             sQ_mma = storage.sQ.get_tensor(
@@ -2722,8 +2719,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
     ) -> SimpleNamespace:
         # Trace-time setup (plain Python, called from the jit mma()).
+        tiled_mma_qk_res = sm90_utils_basic.make_trivial_tiled_mma(
+            self.fp8_res_dtype,
+            self.kv_dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            Float32,
+            atom_layout_mnk=(self.tile_m // 64, 2, 1),
+            tiler_mn=(64, self.tile_n),
+        )
         _, tSrQ_res, _ = sm90_utils.partition_fragment_ABC(
-            wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ_res, sK
+            tiled_mma_qk_res.get_slice(wg_thr_layout),
+            (self.tile_m, self.tile_n, self.tile_hdim),
+            sQ_res,
+            sK,
         )
         pv = self._make_pv_scratch(sVt, wg_thr_layout, pv_cols=64)
         # Q: one 256-thread pass reads the fp16/bf16 tile and writes the e4m3 pair.
@@ -2765,8 +2774,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         qk_fn = partial(
             self._gemm_qk_fp8_compensated,
             tiled_mma_qk,
+            tiled_mma_qk_res.op,
             (self.tile_m, self.tile_n),
-            # The residual term goes first, so the V transpose (mid) overlaps it.
+            # The residual term goes first, while the running sum is still small.
             tSrQ_res,
             tSrQ,
             tSrK,
@@ -2775,7 +2785,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qk_fn=qk_fn,
             pv=pv,
             tOrP=tOrP,
-            tOrP_res=cute.make_rmem_tensor(tOrP.layout, self.fp8_p_res_dtype),
+            tOrP_res=cute.make_rmem_tensor(tOrP.layout, self.fp8_res_dtype),
             pipeline_k=pipeline_k,
             pipeline_stage=pipeline_stage,
             warp_group_idx=warp_group_idx,
@@ -2792,7 +2802,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def _quantize_q_fp8(self, m: SimpleNamespace):
-        """Split the TMA'd fp16/bf16 Q tile into e4m3 high and residual terms."""
+        """Split the TMA'd fp16/bf16 Q tile into an e4m3 high term and an e5m2
+        residual."""
         rQ = cute.make_rmem_tensor_like(m.tQsrc)
         rHi = cute.make_rmem_tensor_like(m.tQhi)
         rRes = cute.make_rmem_tensor_like(m.tQres)
@@ -2800,7 +2811,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         q = rQ.load().to(Float32)
         q_hi = q.to(self.kv_dtype)
         rHi.store(q_hi)
-        rRes.store(((q - q_hi.to(Float32)) * Float32(self.fp8_q_res_scale)).to(self.kv_dtype))
+        rRes.store((q - q_hi.to(Float32)).to(self.fp8_res_dtype))
         cute.autovec_copy(rHi, m.tQhi)
         # Every thread holds its Q values in registers before sQ is overwritten.
         cute.arch.barrier(
@@ -2816,6 +2827,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def _gemm_qk_fp8_compensated(
         self,
         tiled_mma: cute.TiledMma,
+        res_op,
         shape,
         tQ_first: cute.Tensor,
         tQ_second: cute.Tensor,
@@ -2830,47 +2842,53 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(split_acc is None):
             # First block: a private second accumulator, waited for and folded here.
             acc2 = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
-            self._gemm_qk_fp8_split(tiled_mma, acc, acc2, tQ_first, tQ_second, rK, None)
+            self._gemm_qk_fp8_split(
+                tiled_mma, res_op, acc, acc2, tQ_first, tQ_second, rK, None
+            )
             warpgroup.wait_group(0)
             self._fold_qk_split(acc, acc2)
         else:
             # The caller waits and folds split_acc before it reuses the scratch.
-            self._gemm_qk_fp8_split(tiled_mma, acc, split_acc, tQ_first, tQ_second, rK, mid)
+            self._gemm_qk_fp8_split(
+                tiled_mma, res_op, acc, split_acc, tQ_first, tQ_second, rK, mid
+            )
         return acc
 
     @cute.jit
     def _gemm_qk_fp8_split(
         self,
         tiled_mma: cute.TiledMma,
+        res_op,
         acc: cute.Tensor,
         acc2: cute.Tensor,
-        tA_first: cute.Tensor,
-        tA_second: cute.Tensor,
+        tA_res: cute.Tensor,
+        tA_hi: cute.Tensor,
         rK: cute.Tensor,
         mid: Optional[Callable],
     ):
-        """One commit group: the first Q term (the scaled residual) sums into acc2,
-        the second (the high term) into acc."""
-        nk = const_expr(cute.size(tA_first.shape[2]))
+        """One commit group, the e5m2 residual Q term then the e4m3 high term: the
+        first half of each term's k-steps sums into acc, the rest into acc2."""
+        nk = const_expr(cute.size(tA_hi.shape[2]))
         warpgroup.fence()
         for t in cutlass.range_constexpr(2):
-            tA = tA_first if const_expr(t == 0) else tA_second
-            tC = acc2 if const_expr(t == 0) else acc
+            tA = tA_res if const_expr(t == 0) else tA_hi
             if const_expr(t == 1 and mid is not None):
                 mid()
                 warpgroup.fence()
-            atom = cute.make_mma_atom(tiled_mma.op)
-            atom.set(warpgroup.Field.ACCUMULATE, False)
             for k in cutlass.range_constexpr(nk):
+                atom = cute.make_mma_atom(res_op if const_expr(t == 0) else tiled_mma.op)
+                # Only the first step into each accumulator starts from zero.
+                atom.set(
+                    warpgroup.Field.ACCUMULATE, not (t == 0 and (k == 0 or k == nk // 2))
+                )
+                tC = acc if const_expr(k < nk // 2) else acc2
                 cute.gemm(atom, tC, tA[None, None, k], rK[None, None, k], tC)
-                atom.set(warpgroup.Field.ACCUMULATE, True)
         warpgroup.commit_group()
 
     @cute.jit
     def _fold_qk_split(self, acc: cute.Tensor, acc2: cute.Tensor):
-        inv_res = Float32(1.0 / self.fp8_q_res_scale)
         for i in cutlass.range_constexpr(cute.size(acc)):
-            acc[i] = acc[i] + acc2[i] * inv_res
+            acc[i] = acc[i] + acc2[i]
 
     def _make_pv_scratch(self, sVt: cute.Tensor, wg_thr_layout, pv_cols: int):
         """PV in pv_cols-wide column chunks: one 64 x pv_cols WGMMA per warpgroup into
@@ -2888,7 +2906,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             a_source=warpgroup.OperandSource.RMEM,
         )
         tiled_mma_res = sm90_utils_basic.make_trivial_tiled_mma(
-            self.fp8_p_res_dtype,
+            self.fp8_res_dtype,
             self.kv_dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
@@ -3047,7 +3065,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         p = tP_acc.load() * Float32(self.fp8_p_scale)
         p_hi = p.to(self.kv_dtype)
-        p_res = (p - p_hi.to(Float32)).to(self.fp8_p_res_dtype)
+        p_res = (p - p_hi.to(Float32)).to(self.fp8_res_dtype)
         m.tOrP.store(p_hi)
         m.tOrP_res.store(p_res)
 

@@ -1844,32 +1844,40 @@ class TestFlashAttention4SM90(CustomTestCase):
                 # newest_v=0: ref = 0.129, the tail's share of the mass.
                 torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.0)
 
-    def test_fp8_kv_cache_small_q(self):
-        """FP8 MMA with every Q component at +-2^-11, below e4m3's range: the
-        high term rounds to 0, so the scores must come from the scaled residual
-        (unscaled, every score is 0 and attention goes uniform)."""
-        for q_len, lengths in ((1, (7, 1103)), (64, (100, 1103))):
-            with self.subTest(q_len=q_len):
-                inputs = _gemma4_fp8_kv_inputs(lengths, q_len, 64, seed=3)
-                q = inputs["q"].sign() * 2.0**-11
-                # Scores of a few units, so attention is far from uniform.
-                softmax_scale = 1024.0
-                out, _ = _flash_attn_fwd(
-                    q,
-                    inputs["k"],
-                    inputs["v"],
-                    cu_seqlens_q=inputs["cu_seqlens_q"],
-                    seqused_k=inputs["cache_seqlens"],
-                    max_seqlen_q=q_len,
-                    page_table=inputs["page_table"],
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    k_descale=inputs["k_descale"],
-                    v_descale=inputs["v_descale"],
-                    num_splits=1,
-                )
-                ref = _fp8_kv_reference(inputs, q_len, q=q * softmax_scale)
-                _assert_fp8_kv_close(out, ref, fp8_mma=True)
+    def test_fp8_kv_cache_q_range(self):
+        """FP8 MMA with Q outside e4m3's range. Small: every component at
+        +-2^-11 rounds to 0 in e4m3, so the scores must come from the e5m2
+        residual (dropped, every score is 0 and attention goes uniform). Large:
+        components of +-480 and +-512 saturate the high term at 448, and the
+        residual must carry the rest exactly."""
+        cases = (
+            # name, |q| values, softmax_scale (scores of a few units)
+            ("small", (2.0**-11,), 1024.0),
+            ("large", (480.0, 512.0), 1.0 / 256),
+        )
+        for name, mags, softmax_scale in cases:
+            for q_len, lengths in ((1, (7, 1103)), (64, (100, 1103))):
+                with self.subTest(q=name, q_len=q_len):
+                    inputs = _gemma4_fp8_kv_inputs(lengths, q_len, 64, seed=3)
+                    q = inputs["q"].sign()
+                    pick = torch.randint(len(mags), q.shape, device="cuda")
+                    q = q * torch.tensor(mags, device="cuda", dtype=q.dtype)[pick]
+                    out, _ = _flash_attn_fwd(
+                        q,
+                        inputs["k"],
+                        inputs["v"],
+                        cu_seqlens_q=inputs["cu_seqlens_q"],
+                        seqused_k=inputs["cache_seqlens"],
+                        max_seqlen_q=q_len,
+                        page_table=inputs["page_table"],
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        k_descale=inputs["k_descale"],
+                        v_descale=inputs["v_descale"],
+                        num_splits=1,
+                    )
+                    ref = _fp8_kv_reference(inputs, q_len, q=q.float() * softmax_scale)
+                    _assert_fp8_kv_close(out, ref, fp8_mma=True)
 
     def test_fp8_kv_cache_mask_paths_bit_identical(self):
         """A text request gets the same bits whether it runs alone (causal) or
