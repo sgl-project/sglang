@@ -61,7 +61,19 @@ async function check({
 
 test('a label added after the event bypasses sibling failures on rerun', async () => {
   assert.deepEqual(await check({ live: ['bypass-fail-fast'] }),
-    { failures: [], labelReads: 1, jobReads: 0 });
+    { failures: [], labelReads: 1, jobReads: 1 });
+});
+
+test('a shard with no failed siblings does not read labels', async () => {
+  for (const live of [[], ['bypass-fail-fast']]) {
+    assert.deepEqual(await check({ live, failedJobNames: [] }),
+      { failures: [], labelReads: 0, jobReads: 1 });
+  }
+});
+
+test('labels are not read when every failure is filtered out', async () => {
+  assert.deepEqual(await check({ failedJobNames: ['pr-test-finish'] }),
+    { failures: [], labelReads: 0, jobReads: 1 });
 });
 
 test('a removed label does not continue bypassing sibling failures', async () => {
@@ -78,7 +90,7 @@ test('bypass never skips a failed lint check', async () => {
 
 test('non-PR events retain associated-PR label lookup', async () => {
   assert.deepEqual(await check({ event: 'workflow_dispatch', live: ['bypass-fail-fast'] }),
-    { failures: [], labelReads: 1, jobReads: 0 });
+    { failures: [], labelReads: 1, jobReads: 1 });
 });
 
 test('scheduled runs remain exempt', async () => {

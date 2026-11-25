@@ -80,17 +80,6 @@ runs:
             return;
           }
 
-          // The lint check above is never bypassed; only sibling failures are.
-          const { resolveCiLabels } = require(
-            `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
-          );
-          const axes = await resolveCiLabels(github, context);
-          core.info(`[health-check] PR labels: [${axes.labels.join(', ')}]`);
-          if (axes.bypassFailFast) {
-            core.info('[health-check] SKIP jobs-failed check: bypass-fail-fast label present');
-            return;
-          }
-
           const jobs = await readWithQuotaReset(() => github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
@@ -169,8 +158,21 @@ runs:
           });
           core.info(`[health-check] Root cause failures (after filtering): ${rootCauseFailures.map(j => j.name).join(', ') || 'none'}`);
 
-          if (rootCauseFailures.length > 0) {
-            core.setFailed(`Fail-fast: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
-          } else {
+          if (rootCauseFailures.length === 0) {
             core.info('[health-check] PASS: no root cause failures detected');
+            return;
+          }
+
+          // Labels only matter for bypassing a sibling failure (the lint check
+          // above is never bypassed), so read them only once there is one.
+          // Every shard runs this check, and the API quota is shared repo-wide.
+          const { resolveCiLabels } = require(
+            `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+          );
+          const axes = await resolveCiLabels(github, context);
+          core.info(`[health-check] PR labels: [${axes.labels.join(', ')}]`);
+          if (axes.bypassFailFast) {
+            core.info('[health-check] SKIP jobs-failed check: bypass-fail-fast label present');
+          } else {
+            core.setFailed(`Fail-fast: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
           }
