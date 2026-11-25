@@ -512,23 +512,17 @@ struct TopKConfig {
     const auto list = reinterpret_cast<uint32_t*>(const_cast<TieValue*>(tie_buffer));
     bool straddle = false;
 
-    // Deterministic mode already cuts exact-score ties by index below. In the
-    // default mode, refine the score first, then the inverse index.
-    constexpr int kTieRounds = kDeterministic ? 4 : 8;
 #pragma unroll
-    for (int round = 0; round < kTieRounds; round++) {
-      const uint32_t shift = 24 - (round % 4) * 8;
+    for (int round = 0; round < 4; round++) {
+      const uint32_t shift = 24 - round * 8;
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
 
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
-        if (active[i]) {
-          const uint32_t digit_key = round < 4 ? key[i] : ~idx[i];
-          atomicAdd(&histogram[(digit_key >> shift) & 0xFFu], 1);
-        }
+        if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
       }
-      if (round < kTieRounds - 1 && tx < kRadixSize) {
+      if (round < 3 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
@@ -559,14 +553,13 @@ struct TopKConfig {
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
         if (!active[i]) continue;
-        const uint32_t digit_key = round < 4 ? key[i] : ~idx[i];
-        const uint32_t bin = (digit_key >> shift) & 0xFFu;
+        const uint32_t bin = (key[i] >> shift) & 0xFFu;
         if (bin > threshold_bin) {
           write_pos[i] = atomicAdd(&smem->counter, 1);
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == kTieRounds - 1 || (!kDeterministic && equal_count == topk_remain)) {
+        } else if (round == 3) {
           const auto slot = atomicAdd(&smem->counter_final, 1);
           if (straddle) {
             list[slot] = idx[i];
@@ -574,11 +567,10 @@ struct TopKConfig {
             write_pos[i] = topk - topk_remain + slot;
           }
         }
-        // Otherwise refine the threshold bucket in the next digit.
+        // bin == threshold_bin before the last round: stays active
       }
 
-      if (round == kTieRounds - 1 || topk_remain == 0 || (!kDeterministic && equal_count == topk_remain))
-        break;
+      if (round == 3 || topk_remain == 0) break;
     }
 
 #pragma unroll
