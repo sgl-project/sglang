@@ -271,6 +271,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         index_slots(cache, cache.tree_components)
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
+        cache.pp_size = 1
         counter = MagicMock(name="layer_done_counter")
         linker = SimpleNamespace(pools=linker_pools, layer_done_counter=counter)
         linker.draft_layer_counter = lambda: UnifiedCacheLinker.draft_layer_counter(

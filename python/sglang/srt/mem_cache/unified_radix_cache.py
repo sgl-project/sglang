@@ -4709,8 +4709,40 @@ class UnifiedRadixCache(BasePrefixCache):
                 + ", ".join(dead)
             )
 
+    def _check_linker_offloads_pp(self) -> None:
+        """Commit finished external offloads at the same scheduler step on every
+        pipeline stage: stage 0 decides how many and whether each landed. A later
+        stage waits for its own writes of those nodes and rewrites one it lost."""
+        linker = self.linker
+        pending = len(linker.pending_offloads)
+        counts = torch.tensor(
+            [linker.num_settled_offloads() if self.pp_rank == 0 else 0, pending],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(counts, torch.distributed.ReduceOp.MIN)
+        offload_count, relayed_pending = counts.tolist()
+        if relayed_pending != pending:
+            raise RuntimeError(
+                f"Pipeline stage {self.pp_rank} has {pending} external offloads "
+                f"pending where stage 0 has {relayed_pending}."
+            )
+        landed = linker.take_completed_offloads(offload_count, wait=self.pp_rank > 0)
+        if landed:
+            successes = torch.tensor(landed, dtype=torch.int, device="cpu")
+            self._all_reduce(successes, torch.distributed.ReduceOp.MIN)
+            verdicts = [bool(success) for success in successes.tolist()]
+            if self.pp_rank > 0:
+                linker.settle_stage_offloads(landed, verdicts)
+            linker.commit_completed_offloads(verdicts)
+        self._bound_async_work()
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None and self.pp_size > 1:
+            self._check_linker_offloads_pp()
+            self.linker.check_prefetch_events()
+            return
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
