@@ -5,8 +5,11 @@ import contextlib
 import dataclasses
 import importlib.util
 import json
+import pickle
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -94,6 +97,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
@@ -774,98 +778,207 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
 
 
 class TestCosmos3DiffusersBackendSamplingParams(unittest.TestCase):
-    """Cosmos3SamplingParams works when --backend diffusers swaps pipeline_config."""
+    """Cosmos3 diffusers backend resolves static variant config and fails fast cleanly."""
 
     @staticmethod
-    def _diffusers_server_args(pipeline_config=None):
-        server_args = _cosmos3_size_server_args(
-            pipeline_config or DiffusersTI2VPipelineConfig()
+    def _write_cosmos3_checkpoint(
+        root: str,
+        name: str,
+        *,
+        edge: bool = False,
+        distilled: bool = False,
+    ) -> str:
+        ckpt = Path(root) / name
+        (ckpt / "transformer").mkdir(parents=True, exist_ok=True)
+        (ckpt / "scheduler").mkdir(parents=True, exist_ok=True)
+        (ckpt / "vae").mkdir(parents=True, exist_ok=True)
+        (ckpt / "model_index.json").write_text(
+            json.dumps(
+                {
+                    "_class_name": "Cosmos3OmniPipeline",
+                    "_diffusers_version": "0.35.0",
+                }
+            )
         )
-        server_args.model_path = "nvidia/Cosmos3-Edge"
-        server_args.backend = "diffusers"
-        return server_args
+        (ckpt / "transformer" / "config.json").write_text(
+            json.dumps(
+                {
+                    "_class_name": "Cosmos3Transformer",
+                    "backbone_type": "edge" if edge else "dit",
+                    "hidden_act": "relu2" if edge else "silu",
+                }
+            )
+        )
+        scheduler_cfg = (
+            {
+                "_class_name": "FlowMatchEulerDiscreteScheduler",
+                "fixed_step_sampler_config": {"t_list": [1.0, 0.5, 0.25]},
+            }
+            if distilled
+            else {"_class_name": "FlowUniPCMultistepScheduler"}
+        )
+        (ckpt / "scheduler" / "scheduler_config.json").write_text(
+            json.dumps(scheduler_cfg)
+        )
+        return str(ckpt)
 
-    def test_diffusers_backend_model_info_and_sampling_params_adjust(self):
+    @staticmethod
+    def _diffusers_cosmos3_config_cls():
+        from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+            DiffusersCosmos3PipelineConfig,
+        )
+
+        return DiffusersCosmos3PipelineConfig
+
+    def test_diffusers_backend_model_info_returns_cosmos3_config(self):
         get_model_info.cache_clear()
         info = get_model_info("nvidia/Cosmos3-Edge", backend="diffusers")
         self.assertIsNotNone(info)
-        self.assertIs(info.pipeline_config_cls, DiffusersTI2VPipelineConfig)
+        self.assertIs(info.pipeline_config_cls, self._diffusers_cosmos3_config_cls())
         self.assertIs(info.sampling_param_cls, Cosmos3SamplingParams)
 
-        server_args = self._diffusers_server_args(info.pipeline_config_cls())
-        params = SamplingParams.from_user_sampling_params_args(
-            model_path="nvidia/Cosmos3-Edge",
-            server_args=server_args,
-            prompt="a red cube on a table",
-            width=256,
-            height=256,
-            num_frames=9,
-            fps=8,
-            num_inference_steps=1,
-            seed=42,
-        )
+    def test_diffusers_backend_resolves_real_checkpoints_through_server_args(self):
+        cosmos3_cfg_cls = self._diffusers_cosmos3_config_cls()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cases = [
+                (
+                    "base",
+                    False,
+                    False,
+                    Cosmos3SamplingParams().supported_resolutions[0],
+                    4.0,
+                    None,
+                    35,
+                ),
+                ("edge", True, False, (832, 480), 5.0, None, 35),
+                (
+                    "distilled",
+                    False,
+                    True,
+                    Cosmos3SamplingParams().supported_resolutions[0],
+                    1.0,
+                    [1.0, 0.5, 0.25],
+                    3,
+                ),
+            ]
+            for (
+                name,
+                edge,
+                distilled,
+                expected_size,
+                expected_guidance,
+                expected_sigmas,
+                expected_steps,
+            ) in cases:
+                with self.subTest(variant=name):
+                    get_model_info.cache_clear()
+                    ckpt = self._write_cosmos3_checkpoint(
+                        tmpdir, name, edge=edge, distilled=distilled
+                    )
+                    server_args = ServerArgs.from_kwargs(
+                        model_path=ckpt, backend="diffusers"
+                    )
+                    self.assertIs(
+                        type(server_args.pipeline_config),
+                        cosmos3_cfg_cls,
+                    )
+                    self.assertIs(server_args.pipeline_config.is_edge, edge)
+                    self.assertEqual(
+                        server_args.pipeline_config.distilled_sigmas, expected_sigmas
+                    )
+                    unpickled = pickle.loads(pickle.dumps(server_args.pipeline_config))
+                    self.assertIs(type(unpickled), cosmos3_cfg_cls)
+                    self.assertIs(unpickled.is_edge, edge)
+                    self.assertEqual(unpickled.distilled_sigmas, expected_sigmas)
 
-        self.assertIsInstance(params, Cosmos3SamplingParams)
-        self.assertEqual((params.width, params.height), (256, 256))
-        self.assertEqual(params.num_frames, 9)
-        self.assertEqual(params.fps, 8)
-        self.assertEqual(params.num_inference_steps, 1)
-        self.assertEqual(params.data_type, DataType.VIDEO)
+                    with mock.patch.object(
+                        openai_utils, "get_global_server_args", return_value=server_args
+                    ):
+                        params = openai_utils.build_sampling_params(
+                            f"req-{name}",
+                            prompt="a red cube on a table",
+                            request_data_type=DataType.VIDEO,
+                            width=None,
+                            height=None,
+                            num_frames=81,
+                            fps=8,
+                            seed=42,
+                        )
 
-    def test_diffusers_backend_build_sampling_params_video_request(self):
-        get_model_info.cache_clear()
-        server_args = self._diffusers_server_args()
-        with mock.patch.object(
-            openai_utils, "get_global_server_args", return_value=server_args
-        ):
-            params = openai_utils.build_sampling_params(
-                "req-diffusers",
-                prompt="a red cube on a table",
-                request_data_type=DataType.VIDEO,
-                width=256,
-                height=256,
-                num_frames=9,
-                fps=8,
-                num_inference_steps=1,
-                seed=42,
-            )
+                    self.assertIsInstance(params, Cosmos3SamplingParams)
+                    self.assertEqual((params.width, params.height), expected_size)
+                    self.assertEqual(params.guidance_scale, expected_guidance)
+                    self.assertEqual(params.num_inference_steps, expected_steps)
+                    self.assertEqual(params.data_type, DataType.VIDEO)
 
-        self.assertIsInstance(params, Cosmos3SamplingParams)
-        self.assertEqual((params.width, params.height), (256, 256))
-        self.assertEqual(params.num_frames, 9)
-        self.assertEqual(params.fps, 8)
-        self.assertEqual(params.num_inference_steps, 1)
-        self.assertEqual(params.data_type, DataType.VIDEO)
+    def test_diffusers_backend_missing_variant_metadata_fails_fast(self):
+        from fastapi import HTTPException
 
-    def test_diffusers_backend_unspecified_size_uses_default_resolution(self):
-        get_model_info.cache_clear()
-        server_args = self._diffusers_server_args()
-        params = SamplingParams.from_user_sampling_params_args(
-            model_path="nvidia/Cosmos3-Edge",
-            server_args=server_args,
-            prompt="a red cube on a table",
-            width=None,
-            height=None,
-            num_frames=9,
-        )
+        cosmos3_cfg_cls = self._diffusers_cosmos3_config_cls()
+        for cfg in (DiffusersTI2VPipelineConfig(), cosmos3_cfg_cls()):
+            with self.subTest(cfg_type=type(cfg).__name__):
+                server_args = _cosmos3_size_server_args(cfg)
+                server_args.model_path = "nvidia/Cosmos3-Edge"
+                server_args.backend = "diffusers"
+                with self.assertRaisesRegex(
+                    ValueError, "missing resolved checkpoint variant metadata"
+                ):
+                    Cosmos3SamplingParams(prompt="t", num_frames=9)._adjust(server_args)
+                with mock.patch.object(
+                    openai_utils, "get_global_server_args", return_value=server_args
+                ):
+                    with self.assertRaises(HTTPException) as exc_ctx:
+                        openai_utils.build_sampling_params(
+                            "req-missing-meta",
+                            prompt="t",
+                            request_data_type=DataType.VIDEO,
+                            num_frames=9,
+                        )
+                self.assertEqual(exc_ctx.exception.status_code, 400)
+                self.assertIn(
+                    "missing resolved checkpoint variant metadata",
+                    str(exc_ctx.exception.detail),
+                )
 
-        self.assertEqual(
-            (params.width, params.height),
-            Cosmos3SamplingParams().supported_resolutions[0],
-        )
+    def test_diffusers_backend_transfer_control_paths_fail_fast(self):
+        from fastapi import HTTPException
 
-    def test_diffusers_backend_transfer_control_paths_without_native_attrs(self):
-        params = Cosmos3SamplingParams(
-            prompt="transfer request",
-            num_frames=9,
-            control_path="ctrl.mp4",
-            control_hint="edge",
-        )
-        params._adjust(self._diffusers_server_args())
-
-        self.assertEqual(params.data_type, DataType.VIDEO)
-        self.assertEqual(params.guidance_scale, 3.0)
-        self.assertEqual(params.control_guidance, 1.5)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cases = [
+                ("distilled", False, True, "distilled checkpoints"),
+                ("edge", True, False, "Edge checkpoints"),
+                ("base", False, False, "diffusers backend adapter"),
+            ]
+            for name, edge, distilled, msg in cases:
+                with self.subTest(variant=name):
+                    get_model_info.cache_clear()
+                    ckpt = self._write_cosmos3_checkpoint(
+                        tmpdir, name, edge=edge, distilled=distilled
+                    )
+                    server_args = ServerArgs.from_kwargs(
+                        model_path=ckpt, backend="diffusers"
+                    )
+                    with self.assertRaisesRegex(ValueError, msg):
+                        Cosmos3SamplingParams(
+                            prompt="transfer request",
+                            num_frames=9,
+                            control_path="ctrl.mp4",
+                            control_hint="edge",
+                        )._adjust(server_args)
+                    with mock.patch.object(
+                        openai_utils, "get_global_server_args", return_value=server_args
+                    ):
+                        with self.assertRaises(HTTPException) as exc_ctx:
+                            openai_utils.build_sampling_params(
+                                f"req-transfer-{name}",
+                                prompt="transfer request",
+                                request_data_type=DataType.VIDEO,
+                                num_frames=9,
+                                control_path="ctrl.mp4",
+                                control_hint="edge",
+                            )
+                    self.assertEqual(exc_ctx.exception.status_code, 400)
+                    self.assertIn(msg, str(exc_ctx.exception.detail))
 
     def test_native_cosmos3_config_preserves_distilled_and_edge_behavior(self):
         edge_config = Cosmos3Config(is_edge=True)
@@ -893,6 +1006,18 @@ class TestCosmos3DiffusersBackendSamplingParams(unittest.TestCase):
                 control_path="ctrl.mp4",
                 control_hint="edge",
             )._adjust(_cosmos3_size_server_args(distilled_config))
+
+        base_config = Cosmos3Config(is_edge=False)
+        base_transfer = Cosmos3SamplingParams(
+            prompt="transfer request",
+            num_frames=9,
+            control_path="ctrl.mp4",
+            control_hint="edge",
+        )
+        base_transfer._adjust(_cosmos3_size_server_args(base_config))
+        self.assertEqual(base_transfer.data_type, DataType.VIDEO)
+        self.assertEqual(base_transfer.guidance_scale, 3.0)
+        self.assertEqual(base_transfer.control_guidance, 1.5)
 
 
 class TestCosmos3ActionEndpoint(unittest.TestCase):

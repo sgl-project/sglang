@@ -557,8 +557,10 @@ def _get_diffusers_model_info(
     """
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
         DIFFUSERS_TASK_TYPE_TO_CONFIG,
+        DiffusersCosmos3PipelineConfig,
         DiffusersGenericPipelineConfig,
     )
+    from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
     from sglang.multimodal_gen.configs.sample.diffusers_generic import (
         DiffusersGenericSamplingParams,
     )
@@ -585,6 +587,11 @@ def _get_diffusers_model_info(
                     "Inherited task_type=%s from native config for diffusers backend",
                     native_task_type.name,
                 )
+
+    if isinstance(sampling_param_cls, type) and issubclass(
+        sampling_param_cls, Cosmos3SamplingParams
+    ):
+        pipeline_config_cls = DiffusersCosmos3PipelineConfig
 
     return ModelInfo(
         pipeline_cls=DiffusersPipeline,
