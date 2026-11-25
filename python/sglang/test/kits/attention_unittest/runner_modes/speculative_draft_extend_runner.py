@@ -433,6 +433,10 @@ class _EagleDraftExtendWorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.model_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.target_worker = SimpleNamespace(model_runner=fixture.runner)
         self.draft_extend_attn_backend = draft_extend_attn_backend
         self.topk = settings.topk
@@ -461,6 +465,10 @@ class _EagleDraftExtendV2WorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.draft_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.target_worker = SimpleNamespace(model_runner=fixture.runner)
         self.draft_extend_attn_backend = draft_extend_attn_backend
         self.topk = settings.topk
