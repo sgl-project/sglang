@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import (
-    inputs_on_cuda,
+    inputs_on_triton_device,
 )
 from sglang.srt.utils import is_npu
 
@@ -24,7 +24,7 @@ class ScheduleVerifyLensTopk:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         # Accelerator inputs take triton(), which sends NPU to its sgl_kernel_npu
         # kernel; CPU inputs take the bit-exact torch reference.
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 

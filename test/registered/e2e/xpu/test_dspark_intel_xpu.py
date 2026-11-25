@@ -1,8 +1,11 @@
 """DSPARK speculative decoding on Intel XPU."""
 
+import importlib.metadata
 import os
 import sys
 import unittest
+
+from packaging.version import Version
 
 from sglang.srt.utils import is_xpu, kill_process_tree
 
@@ -30,13 +33,20 @@ from sglang.test.test_utils import (
 )
 
 register_xpu_ci(
-    est_time=3000,
+    est_time=3300,
     suite="nightly-kernel-main-test-2-gpu-xpu",
     nightly=True,
-    disabled="XPU full decode graph with --tp 2: TP ranks diverge on draft graph "
-    "replay, so DecodeGraph drafts are all rejected (accept_length ~1.0); "
-    "https://github.com/sgl-project/sglang/issues/45034",
 )
+
+
+def _xpu_graph_records_xccl_all_reduce() -> bool:
+    # oneCCL before 2022.1.2 runs an XCCL all-reduce only at XPU graph capture, so TP
+    # ranks diverge on replay (https://github.com/sgl-project/sglang/issues/45034);
+    # torch 2.14.0+xpu pins oneccl==2022.1.1.
+    try:
+        return Version(importlib.metadata.version("oneccl")) >= Version("2022.1.2")
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 
 @unittest.skipUnless(is_xpu(), "Intel XPU required")
@@ -46,7 +56,7 @@ class TestBasicSanityDSparkXpuTriton(_dspark_base._DSparkSanityMixin, CustomTest
     max_running_requests = "2"
     mem_fraction_static = "0.75"
     chunked_prefill_size = "1024"
-    extra_launch_args = ["--tp", "2", "--dtype", "bfloat16", "--base-gpu-id", "1"]
+    extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
 
 
 @unittest.skipUnless(is_xpu(), "Intel XPU required")
@@ -57,7 +67,7 @@ class TestBasicSanityDSparkXpuIntelXpu(_dspark_base._DSparkSanityMixin, CustomTe
     mem_fraction_static = "0.85"
     max_running_requests = "2"
     chunked_prefill_size = "512"
-    extra_launch_args = ["--tp", "2", "--dtype", "bfloat16", "--base-gpu-id", "1"]
+    extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
 
     def test_logprob_decode_match_prefill(self):
         # intel_xpu bf16 matmul is not batch-invariant, so the decode (verify,
@@ -67,7 +77,10 @@ class TestBasicSanityDSparkXpuIntelXpu(_dspark_base._DSparkSanityMixin, CustomTe
         self.skipTest("intel_xpu decode-vs-prefill deep-tail drift is batch-variance")
 
 
-@unittest.skipUnless(is_xpu(), "Intel XPU required")
+@unittest.skipUnless(
+    is_xpu() and _xpu_graph_records_xccl_all_reduce(),
+    "XPU decode graph with --tp 2 needs oneccl>=2022.1.2 (#45034)",
+)
 class TestBasicSanityDSparkXpuIntelXpuDecodeGraph(TestBasicSanityDSparkXpuIntelXpu):
     extra_launch_args = TestBasicSanityDSparkXpuIntelXpu.extra_launch_args + [
         "--cuda-graph-backend-decode",
