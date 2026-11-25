@@ -235,6 +235,8 @@ def handle_sail_backends(server_args: Any):
         envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
     if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
         envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.is_set():
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.set(0)
 
     cfg = resolving_view(server_args)
     # mega_moe_hook validates MegaMoE device and vendor API requirements.

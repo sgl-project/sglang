@@ -26,6 +26,7 @@ class TestSailMxfp4W4a16(CustomTestCase):
         super().setUp()
         stack = ExitStack()
         self.addCleanup(stack.close)
+        stack.enter_context(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.override(2))
         stack.enter_context(envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.override(False))
         stack.enter_context(envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(False))
         stack.enter_context(envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.override(False))

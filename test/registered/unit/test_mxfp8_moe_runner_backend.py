@@ -103,6 +103,7 @@ class TestSailMoeA2aBackend(CustomTestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         # Isolate switches modified by the hook and MegaMoE precision opt-ins.
+        stack.enter_context(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.override(2))
         for var in (
             envs.SGLANG_SAIL_DEEPGEMM_DENSE,
             envs.SGLANG_SAIL_DEEPGEMM_MOE,
@@ -130,6 +131,29 @@ class TestSailMoeA2aBackend(CustomTestCase):
         ):
             handle_sail_backends(args)
         return args
+
+    def test_mega_moe_reserved_sms_default_and_explicit_override(self):
+        """Only SAIL startup supplies an unset reserve; explicit budgets win."""
+        reserved_sms = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS
+        for is_sail in (False, True):
+            for explicit in (None, 0, 8):
+                with (
+                    self.subTest(is_sail=is_sail, explicit=explicit),
+                    override_platform(is_sail=is_sail),
+                    reserved_sms.override(2 if explicit is None else explicit),
+                ):
+                    if explicit is None:
+                        reserved_sms.clear()
+                        self.assertEqual(reserved_sms.get(), 2)
+                    expected = (
+                        explicit if explicit is not None else (0 if is_sail else 2)
+                    )
+                    for _ in range(2):
+                        self._run_hook("megamoe")
+                        self.assertEqual(reserved_sms.get(), expected)
+                        self.assertEqual(
+                            reserved_sms.is_set(), is_sail or explicit is not None
+                        )
 
     def test_sail_preserves_megamoe_with_or_without_waterfill(self):
         with override_platform(is_sail=True):
