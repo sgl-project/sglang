@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
@@ -39,6 +39,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.deepseek_v4_compress_state import offline_compress_state_rows
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -1240,6 +1241,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
+    _npu_kv_row_bytes: Optional[dict[int, int]] = None
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1340,6 +1342,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
+
+        if _is_npu:
+            self._init_npu_row_bytes(cfg.compress_ratios)
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1493,6 +1498,84 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
 
+    def _init_npu_row_bytes(self, model_ratios: Sequence[int]) -> None:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            NPUDSV4KVLayout,
+            resolve_npu_dsv4_kv_layout,
+            validate_npu_dsv4_c128_page_size,
+        )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        arch35 = is_npu_arch35()
+        is_v41 = any(
+            ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS for ratio in model_ratios
+        )
+        self._npu_kv_row_bytes = {}
+        for ratio in (0, *self.stage_owner_layers):
+            layout = resolve_npu_dsv4_kv_layout(
+                is_v41=is_v41, arch35=arch35, compress_ratio=ratio
+            )
+            dim, dtype = layout.kv_info(self.qk_nope_head_dim, self.qk_rope_head_dim)
+            self._npu_kv_row_bytes[ratio] = dim * dtype.itemsize
+        self.kv_bytes = self._npu_kv_row_bytes[0]
+        index_layout = resolve_npu_dsv4_kv_layout(is_v41=False, arch35=arch35)
+        k, scale, k_dtype, scale_dtype = index_layout.indexer_kv_info(
+            self.indexer_head_dim
+        )
+        self.indexer_bytes_per_token = (
+            k * k_dtype.itemsize + scale * scale_dtype.itemsize
+        )
+        self._npu_c128_page_size = validate_npu_dsv4_c128_page_size(
+            get_schedule().c128_page_size
+        )
+
+    def _npu_swa_pool_bytes(self, swa_tokens: int) -> int:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            npu_dsv4_num_pages,
+        )
+
+        swa_rows = npu_dsv4_num_pages(swa_tokens, self.page_size) * self.page_size
+        kv_bytes = swa_rows * self.kv_bytes * self.num_swa_layers
+        if not self.num_layers(4):
+            return kv_bytes
+        ring = self.ring_sizes[4]
+        state_rows = offline_compress_state_rows(
+            swa_tokens // self.page_size * ring, ring, 4, ring
+        )
+        state_row_bytes = 4 * (self.attn_head_dim + self.indexer_head_dim)
+        return (
+            kv_bytes
+            + state_rows * state_row_bytes * torch.float32.itemsize * self.num_layers(4)
+        )
+
+    def _npu_variable_pool_bytes(self, full_tokens: int) -> float:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+            npu_dsv4_num_pages,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
+
+        total = 0
+        if self.swa_cap_tokens is None:
+            total += self._npu_swa_pool_bytes(
+                self._get_swa_tokens(full_tokens, self.page_size)
+            )
+        for ratio, layers in self.stage_owner_layers.items():
+            size = full_tokens // ratio
+            page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
+            rows = npu_dsv4_num_pages(size, page) * page
+            layer_bytes = rows * self._npu_kv_row_bytes[ratio]
+            if ratio == 4:
+                layer_bytes += rows * self.indexer_bytes_per_token
+            elif ratio in (1, 2):
+                index_size = (full_tokens + self.page_size) // ratio
+                index_rows = (
+                    npu_dsv4_num_pages(index_size, DSV41_INDEX_PAGE_SIZE)
+                    * DSV41_INDEX_PAGE_SIZE
+                )
+                layer_bytes += index_rows * self.low_ratio_index_bytes
+            total += layer_bytes * len(layers)
+        return total * self._spec_infl
+
     def num_layers(self, ratio: int) -> int:
         """Layers of this stage owning ratio's compressed storage."""
         return len(self.stage_owner_layers.get(ratio, ()))
@@ -1560,9 +1643,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
-        # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
-        # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+        if self._npu_kv_row_bytes is not None:
+            return self._npu_kv_row_bytes[compress_ratio]
+        # Unified rings and the trtllm uniform-FP8 pool have no page-internal pad.
+        if self._unified or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1660,11 +1744,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes of the encoder-replay request window plus the cap-mode pool."""
-        paged_bytes = (
-            0
-            if self.swa_cap_tokens is None
-            else self.swa_cap_tokens * self.bytes_per_swa_token
-        )
+        paged_bytes = 0
+        if self.swa_cap_tokens is not None:
+            if self._npu_kv_row_bytes is not None:
+                paged_bytes = (
+                    self._npu_swa_pool_bytes(self.swa_cap_tokens) * self._spec_infl
+                )
+            else:
+                paged_bytes = self.swa_cap_tokens * self.bytes_per_swa_token
         return self.request_window_bytes + paged_bytes
 
     def _get_swa_tokens(self, full_token: int, page_size: int) -> int:
@@ -1734,8 +1821,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_last_dim = 3 * self.attn_head_dim
         else:
             state_pool_size = num_req_slots * ring_size
-            state_rows = state_pool_size + ring_size + 1
-            state_rows = ceil_div(state_rows, 128) * 128
+            state_rows = offline_compress_state_rows(
+                state_pool_size, ring_size, 128, ring_size if _is_npu else 1
+            )
             state_last_dim = 2 * self.attn_head_dim
 
         return state_rows * state_last_dim * c128_state_dtype_size * num_layers
@@ -1749,9 +1837,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
-        state_rows = num_req_slots * ring_size + ring_size + 1
-        state_rows = ceil_div(state_rows, 2) * 2
+        state_rows = offline_compress_state_rows(
+            num_req_slots * ring_size, ring_size, 2, ring_size if _is_npu else 1
+        )
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 
@@ -1880,14 +1968,30 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
         full_token = full_token // page_size * page_size
-        # The coefficient excludes reserved pages. Remove the few full pages
-        # needed to cover them, including indexer rounding at this capacity.
-        while full_token > 0 and (
-            full_token * self.bytes_per_full_token
-            + self._get_low_ratio_kv_padding_bytes(full_token)
-            > available_bytes_for_tokens
-        ):
-            full_token -= page_size
+        if self._npu_kv_row_bytes is not None:
+            # The linear estimate seeds the search. Actual PA_ND buffers grow in
+            # physical pages, so a candidate can land on either side of it.
+            if self._npu_variable_pool_bytes(full_token) > available_bytes_for_tokens:
+                while (
+                    full_token > 0
+                    and self._npu_variable_pool_bytes(full_token)
+                    > available_bytes_for_tokens
+                ):
+                    full_token -= page_size
+            else:
+                while (
+                    self._npu_variable_pool_bytes(full_token + page_size)
+                    <= available_bytes_for_tokens
+                ):
+                    full_token += page_size
+        else:
+            # Account for reserved low-ratio KV and indexer pages.
+            while full_token > 0 and (
+                full_token * self.bytes_per_full_token
+                + self._get_low_ratio_kv_padding_bytes(full_token)
+                > available_bytes_for_tokens
+            ):
+                full_token -= page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "

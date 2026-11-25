@@ -20,6 +20,13 @@ def _lcm(a: int, b: int) -> int:
     return a // gcd(a, b) * b
 
 
+def offline_compress_state_rows(
+    size: int, ring_size: int, ratio: int, state_cache_page_size: int = 1
+) -> int:
+    pad_to = _lcm(ratio, state_cache_page_size)
+    return (size + ring_size + pad_to) // pad_to * pad_to
+
+
 @dataclasses.dataclass
 class KVAndScore:
     kv_score: torch.Tensor
@@ -120,14 +127,9 @@ class CompressStatePool:
             self._size = self._logical_size * (1 + self.online_mtp_max_draft_tokens)
             last_dim = 3 * head_dim
         else:
-            self._size = size + self.ring_size + 1
-            # The common GPU pool is flat by default. A backend that also needs
-            # a physical 3-D cache view can request its second-axis page size;
-            # allocation and ring ownership still stay in this shared class.
-            pad_to = ratio
-            if state_cache_page_size > 1:
-                pad_to = _lcm(pad_to, state_cache_page_size)
-            self._size = (self._size + pad_to - 1) // pad_to * pad_to
+            self._size = offline_compress_state_rows(
+                size, ring_size, ratio, state_cache_page_size
+            )
             self._logical_size = self._size
             last_dim = 2 * (1 + overlap) * head_dim
 

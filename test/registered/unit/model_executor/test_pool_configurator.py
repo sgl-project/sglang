@@ -2216,6 +2216,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         mr.server_args = get_server_args()
         mr.kv_cache_dtype_str = "fp8_e4m3"
         mr.model_config.qk_nope_head_dim = 448
+        mr.model_config.qk_rope_head_dim = 64
         mr.model_config.index_head_dim = 128
         mr.model_config.compress_ratios = ratios
         mr.model_config.window_size = 128
@@ -2327,6 +2328,59 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             self.assertEqual(
                 planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
             )
+
+    def test_npu_v4_budget_covers_bf16_kv_and_physical_pages(self):
+        configurator = "sglang.srt.model_executor.pool_configurator"
+        npu_utils = "sglang.srt.hardware_backend.npu.utils"
+        with (
+            patch(f"{configurator}._is_npu", True),
+            patch(f"{npu_utils}.is_npu_arch35", return_value=False),
+            self._planner("v4", None, 128, 128, [4, 128], []) as planner,
+        ):
+            planner.swa_cap_tokens = 1280
+            planner.bytes_per_full_token = planner._get_bytes_per_full_token()
+            # 11 SWA pages per layer, 101 C4 pages, 7 C128 pages, and the
+            # FP32 state buffers (96 C4 rows and 640 request-scoped C128 rows).
+            budget = (
+                1408 * 1024 * 2
+                + 3232 * (1024 + 130)
+                + 112 * 1024
+                + 96 * (512 + 128) * 4 * 4
+                + 640 * 512 * 2 * 4
+            )
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget, 128).max_total_num_tokens, 12800
+            )
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget - 1, 128).max_total_num_tokens,
+                12672,
+            )
+            planner.ring_sizes[128] = 256
+            self.assertEqual(planner._get_c128_state_fixed_bytes(2), 1280 * 512 * 2 * 4)
+
+    def test_npu_v41_budget_uses_distinct_swa_and_compressed_rows(self):
+        configurator = "sglang.srt.model_executor.pool_configurator"
+        npu_utils = "sglang.srt.hardware_backend.npu.utils"
+        with (
+            patch(f"{configurator}._is_npu", True),
+            patch(f"{npu_utils}.is_npu_arch35", return_value=True),
+            self._planner("v41", None, 128, 128, [1, 2, 2], [0, 1]) as planner,
+        ):
+            planner.swa_cap_tokens = 384
+            planner.bytes_per_full_token = planner._get_bytes_per_full_token()
+            # All three layers own SWA; only the two sources own compressed
+            # rows. Indexer storage includes the reserved FULL and index pages.
+            budget = (
+                512 * 544 * 3 + (640 + 320) * 320 + (768 + 384) * 68 + 10 * 512 * 2 * 4
+            )
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget, 128).max_total_num_tokens, 512
+            )
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget - 1, 128).max_total_num_tokens, 384
+            )
+            planner.ring_sizes[2] = 8
+            self.assertEqual(planner._get_c2_state_fixed_bytes(2), 40 * 512 * 2 * 4)
 
     def test_no_low_ratio_owners_add_no_padding(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
