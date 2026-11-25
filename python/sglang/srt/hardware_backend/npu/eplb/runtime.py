@@ -20,6 +20,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_eplb_group,
+    get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
 from sglang.srt.hardware_backend.npu.eplb.coordinator import (
@@ -723,7 +724,7 @@ def _make_planning_spec(model_config, metadata, moe, nodes, *, decode_worker):
     )
 
 
-def create_npu_async_eplb(model_config, weights, metadata):
+def create_npu_async_eplb(model_config, model, *, startup_weight_load):
     from sglang.srt.runtime_context import (
         get_disagg,
         get_exec,
@@ -740,10 +741,17 @@ def create_npu_async_eplb(model_config, weights, metadata):
         import torch_npu
 
         _validate_migration_topology(world_size)
+        if startup_weight_load is not None:
+            raise ValueError(
+                "Async EPLB requires completed weight loading before migration setup"
+            )
         parallel = get_parallel()
         moe = get_exec().moe
         serving_mode = get_disagg().disaggregation_mode
         decode_worker = serving_mode == "decode"
+        # Resolving the model's lazy weight table can fail independently on each rank.
+        weights = model.routed_experts_weights_of_layer
+        metadata = get_global_expert_location_metadata()
         spec = _make_planning_spec(
             model_config, metadata, moe, parallel.nnodes, decode_worker=decode_worker
         )
@@ -765,6 +773,12 @@ def create_npu_async_eplb(model_config, weights, metadata):
                 serving_mode == "null"
                 and not get_schedule().disable_overlap_schedule
                 and not envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
+                # With multiple DP ranks the admission vote needs the
+                # synchronized extend flag, including on idle ranks.
+                and not (
+                    parallel.num_dp_ranks > 1
+                    and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+                )
             ),
         )
         initial_layout = metadata.physical_to_logical_map_cpu.contiguous()

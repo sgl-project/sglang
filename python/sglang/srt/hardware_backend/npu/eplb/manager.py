@@ -12,7 +12,6 @@ from sglang.srt.eplb.expert_distribution import (
     _StatAccumulator,
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     ControlPoint,
     Phase,
@@ -48,7 +47,19 @@ class _AsyncStatAccumulator(_StatAccumulator):
         self.window_samples = 0
         self._previous_layouts.clear()
 
-    def snapshot_counts(self, spec):
+    def take_rebalance_snapshot(
+        self, spec, rebalance_needed
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None] | None:
+        """Consume the window on all ranks. None skips the plan on all ranks.
+
+        A participating non-root rank returns (None, None) and joins the
+        planner broadcast. Only rank 0 keeps counts after reset.
+        """
+        utilization = self._get_global_average_utilization_rate()
+        if not rebalance_needed(utilization):
+            self.reset()
+            return None
+
         # A completed migration resets the window before the next epoch.
         assert not self._previous_layouts
         counts = self._global_physical_count_of_buffered_step.get_all()
@@ -64,14 +75,18 @@ class _AsyncStatAccumulator(_StatAccumulator):
             )
             torch.sum(counts, dim=0, out=sources[source])
             dist.reduce(sources, dst=0, group=group)
-        # The caller resets the recorder immediately after this snapshot. Reduce
-        # its buffer in place and give only the planner an independent copy.
+        # The window is consumed here. Give the planner an independent copy.
         dist.all_reduce(counts, group=group)
-        if rank != 0:
-            return None, None
-        snapshot = (
-            counts.clone() if spec.physical_count_mode else self._logical_counts(counts)
-        )
+        snapshot = None
+        if rank == 0:
+            snapshot = (
+                counts.clone()
+                if spec.physical_count_mode
+                else self._logical_counts(counts)
+            )
+        else:
+            sources = None
+        self.reset()
         return snapshot, sources
 
     def _logical_counts(self, physical_counts):
@@ -120,15 +135,9 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
 
     def snapshot_for_rebalance(self, spec, rebalance_needed):
         with record_function("npu_eplb.snapshot"):
-            utilization = self._accumulator._get_global_average_utilization_rate()
-            # Every rank gets the same decision before entering the count reductions.
-            snapshot = (
-                self._accumulator.snapshot_counts(spec)
-                if rebalance_needed(utilization)
-                else None
-            )
-            self._reset()
-            return snapshot
+            # Per-pass gatherers reset at the next forward. The accumulator
+            # owns the recorder window and clears it after taking a snapshot.
+            return self._accumulator.take_rebalance_snapshot(spec, rebalance_needed)
 
 
 def make_prefill_release_policy(scheduler):
@@ -163,15 +172,9 @@ class NpuAsyncEPLBManager(EPLBManager):
         super().__init__(**kwargs)
 
     def init_after_model_load(self, startup_weight_load):
-        if startup_weight_load is not None:
-            raise ValueError(
-                "Async EPLB requires completed weight loading before migration setup"
-            )
         model = self._get_model()
         self._async_coordinator = create_npu_async_eplb(
-            self._model_config,
-            model.routed_experts_weights_of_layer,
-            get_global_expert_location_metadata(),
+            self._model_config, model, startup_weight_load=startup_weight_load
         )
         get_global_expert_distribution_recorder().mark_statistics_group_warmed()
         if getattr(model, "_derived_weight_cache_error", None) is None:
