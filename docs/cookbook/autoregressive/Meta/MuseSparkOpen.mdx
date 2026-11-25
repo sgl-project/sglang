@@ -1184,3 +1184,22 @@ python -m sglang.launch_server \
 </Accordion>
 
 Pair this worker with a compatible prefill worker using the same target checkpoint, TP4, `--kv-cache-dtype fp8_e4m3`, `--page-size 128`, and `--served-model-name external`, with bootstrap port `8998`. Use the [Playground](#playground) PD router command with `--model-id external` and the decode URL pointing to this worker on port `30002`; send client requests to the router on port `8000`.
+
+### 3.7 Expert TP
+
+Expert TP (`--ep-size 1`) shards every expert across all TP ranks instead of assigning whole experts to each rank: each GPU holds all 256 experts and 1/TP of each expert's intermediate dimension, which avoids the expert-load imbalance of EP at low concurrency. With **DFlash V2 at concurrency 1**, TP8/EP1 is roughly **3% faster** than TP8/EP8 on 8×B300.
+
+<Accordion title="Expert TP server (8×B300)">
+
+```bash Command
+sglang serve \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --reasoning-parser muse \
+  --tool-call-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2
+```
+
+</Accordion>

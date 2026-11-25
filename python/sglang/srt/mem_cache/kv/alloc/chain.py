@@ -1178,12 +1178,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         chunk_align: int | None = None,
     ) -> int | None:
         """The most new tokens, at most ``max_new_tokens``, a lone request of
-        ``input_tokens`` can be admitted with in an empty pool, within
-        ``token_capacity``; None when even the prompt cannot. Priced as
-        `DemandPurpose.CEILING`: all of its decode, a fresh request's state
-        slots and request row, window retirement (`demand.window_retirement`),
-        and the smallest chunk admission may cut its prompt to
-        (`smallest_admissible_chunk`)."""
+        ``input_tokens`` can be admitted with in an empty pool; None when even
+        the prompt cannot. Priced as `DemandPurpose.CEILING`: all of its
+        decode, a fresh request's state slots and request row, window
+        retirement (`demand.window_retirement`), and the smallest chunk
+        admission may cut its prompt to (`smallest_admissible_chunk`).
+
+        ``token_capacity`` is not read: the bands share one memory, so the
+        sizing's nominal full-band share does not bound one request."""
         windows = self._ceiling_windows(sliding_window_size)
         state_slots = (
             0 if self.mamba_allocator is None else self.fresh_request_state_slots
@@ -1193,7 +1195,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         key = (
             input_tokens,
             max_new_tokens,
-            token_capacity,
             tuple(windows.items()),
             state_slots,
             bool(self.request_allocators),
@@ -1210,10 +1211,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if len(memo) >= _MAX_NEW_TOKENS_MEMO_SIZE:
             memo.clear()
         page = self.page_size
-        paged_input = -(-input_tokens // page) * page
-        max_new_tokens = min(
-            max_new_tokens, max(0, token_capacity - paged_input - page - 1)
-        )
         # Below the grid no shorter chunk is admissible: admission runs the
         # request at the configured chunk or not at all.
         chunk = smallest_admissible_chunk(chunk_size, page, chunk_align) or chunk_size
