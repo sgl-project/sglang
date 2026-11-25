@@ -5,8 +5,9 @@
 //! itself, but it does not reproduce the Python script's selection: the two
 //! use different random number generators, so the same `--seed` draws
 //! different prompts. Totals and distributions match; individual prompts do
-//! not. `token-ids` reads prompts that were tokenized ahead of time and has no
-//! Python counterpart.
+//! not. `token-ids` reads prompts that were tokenized ahead of time; it has no
+//! Python-client counterpart, so `serving.py` admits it only with
+//! `--rust-client`.
 
 use std::io::BufRead;
 use std::path::Path;
