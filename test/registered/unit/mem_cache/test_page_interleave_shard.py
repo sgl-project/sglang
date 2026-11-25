@@ -2417,6 +2417,14 @@ class TestShardedStorageAttach(CustomTestCase):
     def test_attach_rejects_unsupported_storage_before_creating_a_backend(self):
         for backend, mode, layout, key_scheme, error, message in (
             (
+                "dynamic",
+                "cache",
+                "layer_first",
+                "rank-suffix",
+                ValueError,
+                "dynamic",
+            ),
+            (
                 "fast_file",
                 "cache",
                 "page_unified",

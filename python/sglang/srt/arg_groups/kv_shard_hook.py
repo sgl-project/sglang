@@ -45,9 +45,8 @@ def register_kv_shard_transfer_backend(name: str) -> None:
     _KV_SHARD_TRANSFER_BACKENDS.add(name)
 
 
-# HiCache storage backends whose reads and writes cover only each shard rank's
-# own pages. None upstream.
-_KV_SHARD_STORAGE_BACKENDS: set = set()
+# Out-of-tree HiCache backends that handle page ownership themselves.
+_KV_SHARD_STORAGE_BACKENDS: set[str] = set()
 
 
 def register_kv_shard_storage_backend(name: str) -> None:
@@ -56,6 +55,7 @@ def register_kv_shard_storage_backend(name: str) -> None:
 
 
 def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
+    """Return whether the backend registered its own sharded I/O path."""
     return name in _KV_SHARD_STORAGE_BACKENDS
 
 
@@ -127,13 +127,15 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
-def check_kv_shard_storage(
+def resolve_kv_shard_file_storage(
     *,
     storage_backend: str,
     host_memory_mode: str,
     key_scheme: str,
-) -> None:
-    """Validate File storage at launch and at runtime attach."""
+) -> bool:
+    """Validate sharded storage and select the built-in File I/O path."""
+    if kv_shard_storage_backend_supported(storage_backend):
+        return False
     if storage_backend != "file":
         raise ValueError(
             "--enable-kv-cache-sharding supports only the file built-in HiCache "
@@ -149,6 +151,7 @@ def check_kv_shard_storage(
             "--enable-kv-cache-sharding requires --hicache-storage-key-scheme "
             "unified with File storage."
         )
+    return True
 
 
 def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) -> None:
@@ -245,13 +248,9 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "--enable-kv-cache-sharding and --cp-kv-layout cannot be combined: "
             "each sets the KV cache layout across the prefill CP ranks."
         )
-    use_builtin_storage = (
-        cfg.enable_hierarchical_cache
-        and cfg.hicache_storage_backend is not None
-        and not kv_shard_storage_backend_supported(cfg.hicache_storage_backend)
-    )
-    if use_builtin_storage:
-        check_kv_shard_storage(
+    sharded_file = False
+    if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
+        sharded_file = resolve_kv_shard_file_storage(
             storage_backend=cfg.hicache_storage_backend,
             host_memory_mode=cfg.hicache_host_memory_mode,
             key_scheme=cfg.hicache_storage_key_scheme,
@@ -259,7 +258,7 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
     if cfg.enable_hierarchical_cache and is_deepseek_dsa(
         model_config_of(server_args).hf_config
     ):
-        if use_builtin_storage:
+        if sharded_file:
             raise ValueError(
                 "--enable-kv-cache-sharding does not support "
                 "--hicache-storage-backend for DSA models: sharded storage "

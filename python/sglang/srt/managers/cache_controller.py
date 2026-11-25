@@ -39,10 +39,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
-from sglang.srt.arg_groups.kv_shard_hook import (
-    check_kv_shard_storage,
-    kv_shard_storage_backend_supported,
-)
+from sglang.srt.arg_groups.kv_shard_hook import resolve_kv_shard_file_storage
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -759,16 +756,13 @@ class HiCacheController:
                 "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
             ) from e
 
-        # Registered out-of-tree backends read and write only owned pages themselves.
         sharded_file = isinstance(
             self.storage_host_pool, PageInterleaveHostPool
-        ) and not kv_shard_storage_backend_supported(storage_backend)
-        if sharded_file:
-            check_kv_shard_storage(
-                storage_backend=storage_backend,
-                host_memory_mode=self.host_memory_mode,
-                key_scheme=key_scheme,
-            )
+        ) and resolve_kv_shard_file_storage(
+            storage_backend=storage_backend,
+            host_memory_mode=self.host_memory_mode,
+            key_scheme=key_scheme,
+        )
 
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
