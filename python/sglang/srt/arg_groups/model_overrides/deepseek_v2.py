@@ -25,10 +25,14 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         raise ValueError("DSA DCP supports HiCache only on ROCm.")
     # Preserve main's NPU support and ROCm standalone HiCache behavior.
     # The additional ROCm PD path requires DCP1 prefill and no HiCache.
-    if cfg.disaggregation_mode != "null" and not platform.is_npu and not (
-        cfg.disaggregation_mode == "decode"
-        and platform.is_hip
-        and not cfg.enable_hierarchical_cache
+    if (
+        cfg.disaggregation_mode != "null"
+        and not platform.is_npu
+        and not (
+            cfg.disaggregation_mode == "decode"
+            and platform.is_hip
+            and not cfg.enable_hierarchical_cache
+        )
     ):
         raise ValueError(
             "DSA DCP with PD disaggregation is supported only as a DCP1 prefill "
