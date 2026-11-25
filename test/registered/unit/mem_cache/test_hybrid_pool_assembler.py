@@ -5,7 +5,7 @@ import unittest
 from functools import partial
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import msgspec
 import torch
@@ -15,6 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _split_hicache_size_with_mamba,
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
@@ -62,12 +64,17 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
+from sglang.srt.mem_cache.pool_host import mamba as pool_host_mamba
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -1625,6 +1632,355 @@ class TestHostPoolPreflight(CustomTestCase):
                 transfer_layer_id_max=2,
                 transfer_page_size=64,
             )
+
+
+class TestHicacheMambaSize(CustomTestCase):
+    @staticmethod
+    def _pool(nbytes):
+        return SimpleNamespace(
+            host_capacity_bytes=None, get_kv_size_bytes=lambda: nbytes
+        )
+
+    @staticmethod
+    def _hicache_args(*, hicache_size=192, mamba_size):
+        return get_context().override_server_args(
+            enable_hierarchical_cache=True,
+            hicache_size=hicache_size,
+            hicache_mamba_size=mamba_size,
+        )
+
+    def _split(self, *, hicache_size, mamba_size, kv_pools, mamba_pools):
+        with self._hicache_args(hicache_size=hicache_size, mamba_size=mamba_size):
+            return _split_hicache_size_with_mamba(
+                kv_pools=kv_pools, mamba_pools=mamba_pools
+            )
+
+    def test_pinned_mamba_share_ignores_device_kv_growth(self):
+        mamba = self._pool(6 << 30)
+        for kv_bytes in (8 << 30, 12 << 30):
+            self.assertEqual(
+                self._split(
+                    hicache_size=192,
+                    mamba_size=70,
+                    kv_pools=(self._pool(kv_bytes),),
+                    mamba_pools=(mamba,),
+                ),
+                (122, 70),
+            )
+
+    def test_pinned_split_of_a_stage_without_kv_bytes_gives_kv_nothing(self):
+        """A PP stage with no KV layers has no KV bytes to weigh; the pin must not divide by them."""
+        self.assertEqual(
+            self._split(
+                hicache_size=192,
+                mamba_size=70,
+                kv_pools=(self._pool(0),),
+                mamba_pools=(self._pool(6 << 30),),
+            ),
+            (0.0, 70),
+        )
+
+    def test_unset_keeps_proportional_split(self):
+        self.assertEqual(
+            self._split(
+                hicache_size=192,
+                mamba_size=0,
+                kv_pools=(self._pool(10 << 30),),
+                mamba_pools=(self._pool(6 << 30),),
+            ),
+            (120.0, 72.0),
+        )
+
+    def test_unset_gives_every_packed_mamba_pool_its_device_share(self):
+        """Draft Mamba pools are packed into the one Mamba host pool,
+        so their device bytes join its share instead of dropping out of the split."""
+        self.assertEqual(
+            self._split(
+                hicache_size=192,
+                mamba_size=0,
+                kv_pools=(self._pool(10 << 30),),
+                mamba_pools=(self._pool(4 << 30), self._pool(2 << 30)),
+            ),
+            (120.0, 72.0),
+        )
+
+    def test_mamba_swa_stack_gives_the_pin_to_mamba_and_the_rest_by_kv_bytes(self):
+        """The full and SWA host pools split the remainder by device bytes;
+        the Mamba host pool gets exactly the pin."""
+        params = SimpleNamespace(
+            page_size=1,
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=None),
+        )
+        with (
+            self._hicache_args(mamba_size=70),
+            patch.object(hybrid_pool_assembler, "_mamba_info"),
+            patch.object(
+                hybrid_pool_assembler, "_mamba_layer_mapping", return_value={2: 0}
+            ),
+            patch.object(hybrid_pool_assembler, "_mtp_full_device_pools"),
+            patch.object(hybrid_pool_assembler, "_mtp_swa_device_pools"),
+            patch.object(hybrid_pool_assembler, "build_hybrid_swa_group") as swa_group,
+            patch.object(hybrid_pool_assembler, "_mamba_entry") as mamba_entry,
+            patch.object(hybrid_pool_assembler, "_build_cache_controller"),
+        ):
+            hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                params=params,
+                full_kv_pool=self._pool(8 << 30),
+                swa_kv_pool=self._pool(4 << 30),
+                mamba_pool=self._pool(6 << 30),
+                full_layer_mapping={0: 0},
+                swa_layer_mapping={1: 0},
+                start_layer=0,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        kv_sizes = swa_group.call_args.kwargs
+        self.assertAlmostEqual(kv_sizes["kv_host_size"], 122 * 2 / 3)
+        self.assertAlmostEqual(kv_sizes["swa_host_size"], 122 / 3)
+        self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
+
+    def test_both_stacks_build_the_pinned_mamba_host_pool_at_its_pin(self):
+        """Both builders hand the pin to a real Mamba host pool, which holds floor(pin / slot bytes) + 1 slots,
+        and give the KV host pool the rest of --hicache-size."""
+        mamba_pool = MambaPool(
+            size=4,
+            spec_state_size=4,
+            cache_params=InklingConvCacheParams(
+                shape=InklingConvStateShape(conv=[(2, 2)], temporal=(128, 128, 8)),
+                layers=[0, 1],
+                dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+            ),
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+        )
+        kv = MHATokenToKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            page_size=1,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                swa_attn_allocator=allocator, state_slots=allocator
+            ),
+            tp_cache_group=None,
+            pp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+        )
+
+        def meta_alloc(dims, *, dtype, **_):
+            return torch.empty(dims, dtype=dtype, device="meta")
+
+        for swa in (False, True):
+            with (
+                self.subTest(swa=swa),
+                self._hicache_args(hicache_size=192, mamba_size=70),
+                host_memory_budget_scope(1 << 40),
+                patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "MambaPoolHost",
+                    partial(MambaPoolHost, pin_memory=False),
+                ),
+                patch.object(hybrid_pool_assembler, "HybridCacheController"),
+                patch.object(
+                    hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_kv_host_pool",
+                    return_value=SimpleNamespace(
+                        layer_num=1,
+                        layout="page_first_direct",
+                        page_size=1,
+                        device="cpu",
+                        size=17,
+                        logical_size=17,
+                        can_use_write_back_jit=False,
+                    ),
+                ) as build_kv_host_pool,
+            ):
+                common = dict(
+                    params=params,
+                    mamba_pool=mamba_pool,
+                    full_layer_mapping={0: 0},
+                    start_layer=0,
+                    load_cache_event=None,
+                    storage_backend=None,
+                )
+                if swa:
+                    group, _ = hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                        **common,
+                        full_kv_pool=kv,
+                        swa_kv_pool=kv,
+                        swa_layer_mapping={1: 0},
+                    )
+                    kv_shares = sum(
+                        call.kwargs["host_size"]
+                        for call in build_kv_host_pool.call_args_list
+                    )
+                else:
+                    group, _, _ = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                        **common, kv_pool=kv
+                    )
+                    kv_shares = build_kv_host_pool.call_args.kwargs["host_size"]
+                host = group.entry_map[PoolName.MAMBA].host_pool
+                self.addCleanup(host.destroy)
+                self.assertEqual(host.size, int(70 * 1e9 // host.size_per_token) + 1)
+                self.assertAlmostEqual(kv_shares, 122)
+
+    def test_pin_below_one_mamba_slot_is_rejected(self):
+        """Host sizing pads by one slot,
+        so a pin smaller than one state slot would silently build a one-slot pool."""
+        # Six layers of 256 MiB temporal state per slot: about 1.6 GB, so a 1 GB pin holds none.
+        buffer_info = MambaStateBufferInfo(
+            temporal=torch.empty((6, 2, 512, 512, 256), device="meta"),
+            conv=(torch.empty((6, 2, 2, 2), device="meta"),),
+        )
+
+        alloc = Mock(side_effect=AssertionError("a rejected pin must not allocate"))
+
+        with (
+            self._hicache_args(mamba_size=1),
+            host_memory_budget_scope(1 << 40),
+            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
+            self.assertRaisesRegex(ValueError, "one Mamba state slot"),
+        ):
+            MambaPoolHost(
+                buffer_info=buffer_info,
+                host_to_device_ratio=2,
+                host_size=1,
+                device_capacity=2,
+                pin_memory=False,
+                layout="page_first",
+            )
+
+    def test_pin_on_a_stage_without_mamba_layers_sizes_like_the_ratio_path(self):
+        """A PP stage that owns no Mamba layers has zero bytes per slot,
+        so a pin must neither divide by zero nor cap the other stages' capacity."""
+        buffer_info = MambaStateBufferInfo(
+            temporal=torch.empty((0, 2, 2, 2, 2), device="meta"),
+            conv=(torch.empty((0, 2, 2, 2), device="meta"),),
+        )
+
+        def meta_alloc(dims, *, dtype, **_):
+            return torch.empty(dims, dtype=dtype, device="meta")
+
+        with (
+            self._hicache_args(mamba_size=1),
+            host_memory_budget_scope(1 << 40),
+            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+            patch.object(
+                pool_host_mamba, "sync_fixed_hicache_size", wraps=lambda size, _: size
+            ) as sync,
+        ):
+            host = MambaPoolHost(
+                buffer_info=buffer_info,
+                host_to_device_ratio=2,
+                host_size=1,
+                device_capacity=4,
+                pin_memory=False,
+                layout="page_first",
+            )
+        self.assertEqual(host.size_per_token, 0)
+        self.assertEqual(sync.call_args.args[0], torch.iinfo(torch.int64).max)
+        # Ratio-path size (4 * 2) plus the padding slot.
+        self.assertEqual(host.size, 9)
+
+    def test_pin_holds_the_packed_mtp_draft_layers(self):
+        """Each pinned host slot also carries every packed MTP draft Mamba layer,
+        so a pin buys fewer slots with a draft than without."""
+
+        def make_pool(layer_ids):
+            return MambaPool(
+                size=4,
+                spec_state_size=4,
+                cache_params=InklingConvCacheParams(
+                    shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                    layers=list(layer_ids),
+                    dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+                ),
+                mamba_layer_ids=list(layer_ids),
+                device="cpu",
+            )
+
+        def info(pool):
+            return pool.get_device_pool_infos()[0].buffer_info
+
+        # Conv (2 x 2) plus temporal (2 x 2 x 2) fp32 values per layer and slot.
+        layer_bytes = (2 * 2 + 2 * 2 * 2) * 4
+        target, draft = make_pool([0, 1]), make_pool([2])
+
+        def meta_alloc(dims, *, dtype, **_):
+            return torch.empty(dims, dtype=dtype, device="meta")
+
+        for drafts, layers in (((), 2), ((draft,), 3)):
+            with (
+                self.subTest(draft_layers=len(drafts)),
+                host_memory_budget_scope(2 << 30),
+                patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+                self._hicache_args(hicache_size=2, mamba_size=1),
+            ):
+                host = MambaPoolHost(
+                    buffer_info=info(target),
+                    host_to_device_ratio=2,
+                    host_size=1,
+                    device_capacity=target.size,
+                    pin_memory=False,
+                    layout="page_first",
+                    mtp_draft_buffer_infos=[info(pool) for pool in drafts],
+                )
+                self.assertEqual(host.size_per_token, layers * layer_bytes)
+                # One padding slot on top of what 1 GB holds.
+                self.assertEqual(host.size, int(1e9 // (layers * layer_bytes)) + 1)
+
+    def test_pin_warns_when_no_mamba_host_pool_was_built(self):
+        """Every HiCache build checks the pin against the host pools that exist,
+        so FlexKV, LMCache and non-hybrid models warn too."""
+        logger = kv_cache_builder.logger
+        with_mamba = Mock(
+            spec=UnifiedRadixCache,
+            host_pool_group=SimpleNamespace(entry_map={PoolName.MAMBA: object()}),
+        )
+        without_mamba = Mock(
+            spec=UnifiedRadixCache,
+            host_pool_group=SimpleNamespace(entry_map={PoolName.KV: object()}),
+        )
+        no_group = Mock(spec=UnifiedRadixCache, host_pool_group=None)
+        with self._hicache_args(mamba_size=0):
+            with (
+                self.subTest(tree_cache="no pin"),
+                self.assertNoLogs(logger, "WARNING"),
+            ):
+                kv_cache_builder._warn_unused_hicache_mamba_size(
+                    tree_cache=without_mamba
+                )
+        with self._hicache_args(mamba_size=70):
+            with self.subTest(tree_cache="mamba host pool"):
+                with self.assertNoLogs(logger, "WARNING"):
+                    kv_cache_builder._warn_unused_hicache_mamba_size(
+                        tree_cache=with_mamba
+                    )
+            for name, tree_cache in (
+                ("kv host pool only", without_mamba),
+                ("no host pool group", no_group),
+                ("plain radix cache", object()),
+            ):
+                with self.subTest(tree_cache=name):
+                    with self.assertLogs(logger, "WARNING") as logs:
+                        kv_cache_builder._warn_unused_hicache_mamba_size(
+                            tree_cache=tree_cache
+                        )
+                    self.assertIn("--hicache-mamba-size has no effect", logs.output[0])
 
 
 class TestDeclaredPoolVerification(CustomTestCase):

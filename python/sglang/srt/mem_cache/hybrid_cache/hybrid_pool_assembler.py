@@ -232,10 +232,31 @@ def _split_hicache_size(
             sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
         )
     total_device_pool_size = sum(device_pool_sizes)
+    if total_device_pool_size == 0:
+        # A PP stage with no KV layers has nothing to split.
+        return (0.0,) * len(device_pool_sizes)
     return tuple(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _split_hicache_size_with_mamba(
+    *, kv_pools: tuple[Any, ...], mamba_pools: tuple[Any, ...]
+) -> tuple[float, ...]:
+    # One share per KV pool, then one Mamba share for all of mamba_pools;
+    # the Mamba host pool packs every one of them into each slot.
+    hicache_size = get_memory().hicache_size
+    mamba_size = get_memory().hicache_mamba_size
+    if mamba_size == 0:
+        sizes = _split_hicache_size(
+            hicache_size=hicache_size, kv_pools=(*kv_pools, *mamba_pools)
+        )
+        return (*sizes[: len(kv_pools)], sum(sizes[len(kv_pools) :]))
+    kv_sizes = _split_hicache_size(
+        hicache_size=hicache_size - mamba_size, kv_pools=kv_pools
+    )
+    return (*kv_sizes, mamba_size)
 
 
 def build_pool_entry(
@@ -1221,8 +1242,8 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+        kv_host_size, mamba_host_size = _split_hicache_size_with_mamba(
+            kv_pools=(kv_pool,), mamba_pools=(mamba_pool,)
         )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
@@ -1294,8 +1315,8 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size_with_mamba(
+            kv_pools=(full_kv_pool, swa_kv_pool), mamba_pools=(mamba_pool,)
         )
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,

@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -186,9 +187,26 @@ class MambaPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
+            # A PP stage without Mamba layers holds no bytes per slot;
+            # it must not cap the group minimum, and uses the ratio path if no stage does.
+            no_mamba_layers = self.size_per_token == 0
             self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+                (
+                    torch.iinfo(torch.int64).max
+                    if no_mamba_layers
+                    else int(host_size * 1e9 // self.size_per_token)
+                ),
+                host_size,
             )
+            if self.size == torch.iinfo(torch.int64).max:
+                self.size = int(device_capacity * host_to_device_ratio)
+            # The padding slot below would otherwise turn a sub-slot pin into a one-slot pool.
+            elif self.size < 1 and get_memory().hicache_mamba_size > 0:
+                raise ValueError(
+                    f"--hicache-mamba-size {host_size:g} cannot hold one Mamba state slot, "
+                    f"which takes {self.size_per_token / 1e9:.3f} GB across the target "
+                    "and MTP draft Mamba layers."
+                )
         else:
             self.size = int(device_capacity * host_to_device_ratio)
 
@@ -197,9 +215,10 @@ class MambaPoolHost(HostKVCache):
 
         if self.size <= device_capacity:
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
-                "L2 cache effectiveness is reduced."
-                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                "HiCache host Mamba pool (%d state slots) is smaller than the device "
+                "pool (%d state slots); L2 cache effectiveness is reduced. Consider "
+                "increasing --hicache-mamba-size when it is set, else --hicache-ratio "
+                "(or --hicache-size), for a higher L2 cache hit rate.",
                 self.size,
                 device_capacity,
             )
