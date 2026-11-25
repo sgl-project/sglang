@@ -541,7 +541,11 @@ async fn text_generation_keeps_forwarding_guards() {
             .config
             .model
             .disable_input_ids_forwarding = disable_ids;
-        let expected_ids = ctx.tokenizers.encode_prompt("tiny", "hello world").unwrap();
+        let expected_ids = ctx
+            .preprocessor
+            .tokenizers()
+            .encode_prompt("tiny", "hello world")
+            .unwrap();
         let mut client = serve_grpc(ctx).await;
         let mut body = json!({"text": "hello world", "return_text_in_logprobs": text_logprobs});
         if media {

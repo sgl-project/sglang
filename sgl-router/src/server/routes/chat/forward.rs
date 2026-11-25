@@ -234,7 +234,7 @@ async fn dispatch<T: Transport>(
         disagg_prefill_dp_rank: None,
     };
     let body = request.outgoing_body(
-        ctx,
+        &ctx.metrics,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;

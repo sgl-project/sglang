@@ -7,6 +7,7 @@ mod preparation;
 mod reorg;
 
 pub(super) use preparation::enforce_minimax_m31_thinking;
+pub use preparation::Preprocessor;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
@@ -33,6 +34,7 @@ use preparation::{
     COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
 use sglang_api_types::api::v1::{token_ids_or_list, GenerateRequest, TokenIds, TokenIdsOrList};
+use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
@@ -203,7 +205,7 @@ pub async fn route_generate(
         let model = ModelId(ctx.config.model.id.clone());
         let routing = ModelRouting::lookup(ctx, &model)?;
         let view = RoutingView::try_from(&request)?;
-        let prepared = PreparedRequest::typed(ctx, model, &view)?;
+        let prepared = ctx.preprocessor.typed(model, &view)?;
         if view.text.is_some()
             && !ctx.config.model.disable_input_ids_forwarding
             && request.return_text_in_logprobs != Some(true)
@@ -273,22 +275,31 @@ fn prepare_now<'a>(
             let sent =
                 ModelId(sent.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (_, body) = canonicalize_model_alias(ctx, sent, body)?;
-            let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_tokens =
+                routing.needs_request_tokens(ctx) || ctx.bucket_selector.is_enabled();
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
                 COMPLETIONS_PATH
             };
-            PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
+            ctx.preprocessor.openai(
+                model_openai_settings(ctx, &model).as_deref(),
+                path,
+                model,
+                fields,
+                headers,
+                body,
+                needs_tokens,
+            )?
         }
-        Endpoint::Generate => PreparedRequest::generate(ctx, model, body)?,
+        Endpoint::Generate => ctx.preprocessor.generate(model, body)?,
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
             let (sent, mut value) = parse_embedding_request(&body)?;
             let (sent, body) = canonicalize_model_alias(ctx, sent, body)?;
             value["model"] = sent.0.into();
             require_plain_workers(ctx, &model, path)?;
-            PreparedRequest::embeddings(ctx, path, model, body, value)?
+            ctx.preprocessor.embeddings(path, model, body, value)?
         }
         Endpoint::Rerank => {
             require_plain_workers(ctx, &model, RERANK_PATH)?;
@@ -791,6 +802,19 @@ fn parse_optional_positive_f64_header(
     Ok(Some(parsed))
 }
 
+/// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
+fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
+    let workers = ctx.registry.workers_for(model);
+    let first = Arc::clone(workers.first()?.openai_settings()?);
+    let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !agree && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(model = %model.0, "workers report different OpenAI server args; \
+            serving OpenAI requests through the engines' own routes");
+    }
+    agree.then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,7 +953,11 @@ mod tests {
         ctx.config.model.tokenizer_path = Some(dir.join("tokenizer.json").to_str().unwrap().into());
         // A token-aware route, so `prepare` renders and tokenizes the chat.
         ctx.config.model.dp_aware = true;
-        ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        ctx.preprocessor = Preprocessor::new(
+            &ctx.config.model,
+            Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap()),
+            Arc::clone(&ctx.metrics),
+        );
         ctx.policies.insert(
             ModelId("stub-model".into()),
             Arc::new(crate::policies::round_robin::RoundRobinPolicy::new()),
@@ -944,7 +972,13 @@ mod tests {
         let dir = slow_template_dir();
         let ctx = Arc::new(slow_render_ctx(dir.path()));
         let body = slow_chat_body(
-            |b| assert!(ctx.tokenizers.encode_chat("stub-model", b).is_some()),
+            |b| {
+                assert!(ctx
+                    .preprocessor
+                    .tokenizers()
+                    .encode_chat("stub-model", b)
+                    .is_some())
+            },
             Duration::from_millis(400),
         );
         let body = Bytes::from(body.to_string());
