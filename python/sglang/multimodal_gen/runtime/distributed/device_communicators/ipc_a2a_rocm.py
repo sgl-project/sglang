@@ -42,6 +42,20 @@ _POOL_HEADROOM = 1.25
 # copies start before the rest is packed; "kernel": the collective path's
 # one-pass pack kernel
 _GROUP_PACK = os.environ.get("SGLANG_DIFFUSION_ROCM_CE_PACK", "kernel") == "group"
+# with a caller's fill: "group" launches it once per head group so the first
+# group's copies start while the rest fills; "all": one launch for every group
+_FILL_SPLIT = os.environ.get("SGLANG_DIFFUSION_ROCM_CE_FILL_SPLIT", "all") == "group"
+# "first": group 0 in one launch, the other groups in a second
+_FILL_FIRST = os.environ.get("SGLANG_DIFFUSION_ROCM_CE_FILL_SPLIT", "all") == "first"
+# "merged": peers write each output block straight into this rank's merged
+# [rows, heads, head_dim] buffer (pitched copies), so no merge pass follows
+_OUT_MERGED = os.environ.get("SGLANG_DIFFUSION_ROCM_CE_OUT", "blocks") == "merged"
+# with a fill: merge each group's output blocks on the caller's stream as soon
+# as they arrive (it idles while the groups attend), not in one pass at the end
+_GROUP_MERGE = os.environ.get("SGLANG_DIFFUSION_ROCM_CE_MERGE", "end") == "group"
+# with a fill: at most this many group attentions in flight (0: no limit);
+# group g starts after group g - N has attended
+_MAX_CONC = int(os.environ.get("SGLANG_DIFFUSION_ROCM_CE_MAX_CONC", "0"))
 
 
 class _Unsupported(RuntimeError):
@@ -59,10 +73,11 @@ class _Hip:
         lib = ctypes.CDLL(path or "libamdhip64.so")
         vp, sz, u32 = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32
         lib.hipMemcpyAsync.argtypes = [vp, vp, sz, ctypes.c_int, vp]
+        lib.hipMemcpy2DAsync.argtypes = [vp, sz, vp, sz, sz, sz, ctypes.c_int, vp]
         lib.hipStreamWaitValue32.argtypes = [vp, vp, u32, ctypes.c_uint, u32]
         lib.hipGetErrorString.argtypes = [ctypes.c_int]
         lib.hipGetErrorString.restype = ctypes.c_char_p
-        for fn in (lib.hipMemcpyAsync, lib.hipStreamWaitValue32):
+        for fn in (lib.hipMemcpyAsync, lib.hipMemcpy2DAsync, lib.hipStreamWaitValue32):
             fn.restype = ctypes.c_int
         self.lib = lib
 
@@ -76,6 +91,14 @@ class _Hip:
         self._check(
             self.lib.hipMemcpyAsync(dst, src, nbytes, _NOCU, stream.cuda_stream),
             "hipMemcpyAsync(DeviceToDeviceNoCU)",
+        )
+
+    def copy2d(self, stream, dst, dpitch, src, spitch, width, height) -> None:
+        self._check(
+            self.lib.hipMemcpy2DAsync(
+                dst, dpitch, src, spitch, width, height, _NOCU, stream.cuda_stream
+            ),
+            "hipMemcpy2DAsync(DeviceToDeviceNoCU)",
         )
 
     def wait(self, stream, addr: int, value: int) -> None:
@@ -127,6 +150,10 @@ class _Pool:
         self.fout = _share(zeros(max_groups * w), g, r, w)
         self.inb_ptr = [t.data_ptr() for t in self.inb]
         self.outb_ptr = [t.data_ptr() for t in self.outb]
+        # merged outputs: outb and outb2 alternate per call, so a returned
+        # output is rewritten only two calls later
+        self.outb2 = None
+        self.out_numel = out_numel
         self.fin_ptr = [t.data_ptr() for t in self.fin]
         self.fout_ptr = [t.data_ptr() for t in self.fout]
         self.groups_sent = 0
@@ -215,12 +242,16 @@ class IpcA2ARocmState:
         pool.groups_sent = 0
         pool.calls = 0
 
-    def pipelined_attention(self, q, k, v, attend, groups: int, pack):
+    def pipelined_attention(self, q, k, v, attend, groups: int, pack=None, fill=None):
         """``ulysses_head_group_pipelined_attention`` on the copy engines.
 
         q/k/v: ``[rows, heads, head_size]`` row shards; ``pack(q, k, v, n)``
         returns the destination-major ``[n, rows, heads / n, 3 * head_size]``
         pack the collective path exchanges. Same result bytes as that path.
+        ``fill(send, own, first_group, n_groups)``, when given, writes those
+        groups' blocks itself (from q/k/v it was built over): the peers' into
+        ``send`` ``[world, groups, rows, gh, 3 * head_size]`` and this rank's
+        into its receive slots ``own`` ``[groups, world, rows, gh, 3 * head_size]``.
         """
         world, r = self.world, self.rank
         rows, heads, hd = q.shape
@@ -243,7 +274,26 @@ class IpcA2ARocmState:
         call = pool.calls
         chunk_in = rows * gh * 3 * hd * esz
         chunk_out = rows * gh * hd * esz
-        if _GROUP_PACK:
+        if fill is not None:
+            if pool.send is None or pool.send.numel() < groups * g_in:
+                pool.send = torch.empty(groups * g_in, dtype=q.dtype, device=q.device)
+            packed = pool.send[: groups * g_in].view(world, groups, rows, gh, 3 * hd)
+            if _FILL_SPLIT:
+                ready = []
+                for g in range(groups):
+                    fill(packed, recv, g, 1)
+                    ready.append(main.record_event())
+            elif _FILL_FIRST and groups > 1:
+                # group 0 alone, so its copies start while the rest fills
+                fill(packed, recv, 0, 1)
+                first = main.record_event()
+                fill(packed, recv, 1, groups - 1)
+                ready = [first] + [main.record_event()] * (groups - 1)
+            else:
+                fill(packed, recv, 0, groups)
+                ready = [main.record_event()] * groups
+            own = ready
+        elif _GROUP_PACK:
             # group by group, so group 0 is on the copy engines while the
             # later groups pack; this rank's blocks go straight into its slots.
             # Each block is its heads' q|k|v per head, as the pack kernel lays it
@@ -279,18 +329,63 @@ class IpcA2ARocmState:
                     chunk_in,
                 )
                 hip.copy(st, pool.fin_ptr[p] + 4 * r, seq[base + g + 1].data_ptr(), 4)
-        done = []
+        # the merged output rides with the fill only, so the plain path keeps
+        # the collective layout
+        out_merged = _OUT_MERGED and fill is not None
+        if out_merged:
+            if pool.outb2 is None:
+                # a group collective; every rank's call sequence is the same
+                pool.outb2 = _share(
+                    torch.zeros(pool.out_numel, dtype=q.dtype, device=q.device),
+                    self.group,
+                    r,
+                    world,
+                )
+                pool.outb2_ptr = [t.data_ptr() for t in pool.outb2]
+            mbuf, mptr = (
+                (pool.outb, pool.outb_ptr) if call % 2 else (pool.outb2, pool.outb2_ptr)
+            )
+            merged = mbuf[r][: rows * heads * hd].view(rows, heads, hd)
+            row_pitch = heads * hd * esz
+            width = gh * hd * esz
+        max_conc = _MAX_CONC if fill is not None else 0
+        done, attended = [], []
         for g in range(groups):
             st = self.group_streams[g]
             st.wait_event(own[g])
+            if max_conc and g >= max_conc:
+                st.wait_event(attended[g - max_conc])
             with torch.cuda.stream(st):
                 for p in self.peers:
                     hip.wait(st, pool.fin_ptr[r] + 4 * p, base + g + 1)
                 qkv = recv[g].view(world * rows, gh, 3 * hd)
                 out = attend(*qkv.split(hd, dim=-1))
+                attended.append(st.record_event())
                 if not out.is_contiguous():
                     out = out.contiguous()
                 optr = out.data_ptr()
+                if out_merged:
+                    # my heads of group g: block (r * groups + g) of every row
+                    col = (r * groups + g) * gh
+                    for p in self.peers:
+                        hip.copy2d(
+                            st,
+                            mptr[p] + col * hd * esz,
+                            row_pitch,
+                            optr + p * chunk_out,
+                            width,
+                            width,
+                            rows,
+                        )
+                        hip.copy(
+                            st,
+                            pool.fout_ptr[p] + 4 * (g * world + r),
+                            seq[call].data_ptr(),
+                            4,
+                        )
+                    merged[:, col : col + gh].copy_(out[r * rows : (r + 1) * rows])
+                    done.append(st.record_event())
+                    continue
                 for p in self.peers:
                     hip.copy(
                         st,
@@ -310,13 +405,22 @@ class IpcA2ARocmState:
         # queued: HIP multiplexes streams onto GPU_MAX_HW_QUEUES hardware
         # queues, and a wait queued on a group stream could hold back the next
         # group's attention sharing its queue
+        group_merge = _GROUP_MERGE and fill is not None and not out_merged
+        if group_merge:
+            merged = torch.empty(rows, heads, hd, dtype=q.dtype, device=q.device)
+            merged_groups = merged.view(rows, world, groups, gh, hd)
         for g in range(groups):
             main.wait_event(done[g])
             for p in self.peers:
                 hip.wait(main, pool.fout_ptr[r] + 4 * (g * world + p), call)
+            if group_merge:
+                # [rank, row, head, dim] -> [row, rank, head, dim] of group g
+                merged_groups[:, :, g].copy_(outb[g].permute(1, 0, 2, 3))
         # the next call's pack rewrites `packed`, read by the copy streams
         for st in self.copy_streams:
             main.wait_stream(st)
+        if out_merged or group_merge:
+            return merged
         # [group, rank, row, head, dim] -> [row, rank, group, head, dim]
         return outb.permute(2, 1, 0, 3, 4).reshape(rows, heads, hd)
 
