@@ -747,6 +747,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "http_graceful_shutdown_timeout must be None or a non-negative "
                 "integer in seconds"
             )
+        # Publishes the media URL policy to this process, so invalid media
+        # flags fail at parse time, as in the LLM server.
+        configure_media_url_policy(self)
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -3331,9 +3334,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "--media-url-timeout",
             type=float,
             default=ServerArgs.media_url_timeout,
-            help="Seconds to download one client-supplied media URL, redirects and "
-            "body included, for every media type. When unset, REQUEST_TIMEOUT "
-            "applies, else each loader's default.",
+            help="Time budget in seconds of one client-supplied media URL "
+            "download, redirects included, for every media type. When unset, "
+            "REQUEST_TIMEOUT applies, else each loader's default.",
         )
 
         # LoRA

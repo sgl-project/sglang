@@ -222,8 +222,8 @@ def download_video_to_stream(video: str, output: BinaryIO) -> None:
     """Fetch a remote video into a caller-owned stream under the media URL policy.
 
     ``open_remote_media`` checks every redirect hop, pins each connection to
-    the checked address, and bounds the body by the configured size cap and
-    one deadline; the body is streamed instead of buffered in memory.
+    the checked address, and bounds the body by the configured size cap; the
+    body is streamed instead of buffered in memory.
     """
     with open_remote_media(video, media_url_timeout(_VIDEO_DOWNLOAD_TIMEOUT_S)) as (
         _,
@@ -296,30 +296,36 @@ def load_video(
     """
     if max_frames is not None and max_frames <= 0:
         raise ValueError(f"max_frames must be positive, got {max_frames}.")
-    pil_images = call_with_sanitized_media_errors(_read_video_source, video, max_frames)
+    pil_images = _read_video_source(video, max_frames)
     return convert_method(pil_images) if convert_method is not None else pil_images
 
 
+@contextmanager
+def local_video_path(video: str) -> Iterator[str]:
+    """A local file for a client-supplied video: an http(s) URL is downloaded to
+    a temp file that lives for the ``with`` body; anything else is yielded as is."""
+    if not video.lower().startswith(("http://", "https://")):
+        yield video
+        return
+    parsed_url = call_with_sanitized_media_errors(
+        urlparse, video, invalid_input="Invalid video URL."
+    )
+    file_name = os.path.basename(unquote(parsed_url.path))
+    # FFmpeg probes the content; a client-chosen suffix such as .m3u8
+    # would let it read the file as a playlist of further URLs.
+    suffix = ".gif" if file_name.lower().endswith(".gif") else ".mp4"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        video_path = os.path.join(temp_dir, f"video{suffix}")
+        with open(video_path, "wb") as output:
+            call_with_sanitized_media_errors(download_video_to_stream, video, output)
+        yield video_path
+
+
 def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Image]:
-    is_url = video.startswith("http://") or video.startswith("https://")
-    if not is_url and not os.path.isfile(video):
-        raise ValueError("Expected an existing video file or an HTTP(S) URL.")
-
-    if is_url:
-        parsed_url = call_with_sanitized_media_errors(
-            urlparse, video, invalid_input="Invalid video URL."
-        )
-        file_name = os.path.basename(unquote(parsed_url.path))
-
-        # FFmpeg probes the content; a client-chosen suffix such as .m3u8
-        # would let it read the file as a playlist of further URLs.
-        suffix = ".gif" if file_name.lower().endswith(".gif") else ".mp4"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path = os.path.join(temp_dir, f"video{suffix}")
-            with open(video_path, "wb") as output:
-                download_video_to_stream(video, output)
-            return _read_video_frames(video_path, max_frames)
-    return _read_video_frames(video, max_frames)
+    with local_video_path(video) as video_path:
+        if not os.path.isfile(video_path):
+            raise ValueError("Expected an existing video file or an HTTP(S) URL.")
+        return _read_video_frames(video_path, max_frames)
 
 
 def _read_video_frames(

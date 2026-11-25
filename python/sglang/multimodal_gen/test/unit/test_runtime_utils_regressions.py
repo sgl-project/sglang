@@ -26,6 +26,7 @@ def _gif_bytes() -> bytes:
     "loader, dependency, category",
     [
         (vision.load_image, "srt_get_image_bytes", requests.HTTPError),
+        (vision.load_video, "get", requests.HTTPError),
         (vision.load_video, "get", requests.Timeout),
         (vision.load_video, "get", requests.TooManyRedirects),
     ],

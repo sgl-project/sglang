@@ -112,8 +112,9 @@ class TestEntrypointMediaValidation:
             "file:/etc/passwd",
             "concat:clip1.mp4|clip2.mp4",
             "ftp://93.184.216.34/clip.mp4",
-            # An FFmpeg protocol string with no URL scheme.
+            # FFmpeg protocol strings with no URL scheme.
             "subfile,,start,0,end,99,,:http:169.254.169.254/latest",
+            "subfile,//:http:169.254.169.254/latest",
         ],
     )
     def test_non_http_scheme_is_rejected(self, value):
@@ -214,6 +215,20 @@ class TestLoadVideoDownload:
         ):
             assert vision.load_video(PUBLIC_VIDEO_URL) == ["frame"]
         read_frames.assert_called_once()
+
+    def test_url_is_staged_with_a_fixed_suffix(self):
+        url = "https://93.184.216.34/playlist.m3u8"
+        with mock.patch.object(
+            vision,
+            "download_video_to_stream",
+            side_effect=lambda _, output: output.write(b"video-bytes"),
+        ) as download:
+            with vision.local_video_path(url) as local:
+                assert local.endswith(".mp4")
+                with open(local, "rb") as f:
+                    assert f.read() == b"video-bytes"
+        download.assert_called_once()
+        assert download.call_args.args[0] == url
 
 
 class TestAvOpenGuard:

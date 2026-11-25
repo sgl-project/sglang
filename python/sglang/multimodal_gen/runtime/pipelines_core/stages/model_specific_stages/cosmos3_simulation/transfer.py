@@ -14,9 +14,7 @@ paired control/RGB window with pinned sink frames.
 import json
 import math
 import os
-import tempfile
-from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 import imageio.v3 as iio
 import msgspec
@@ -84,11 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import (
-    call_with_sanitized_media_errors,
-    download_video_to_stream,
-    load_video,
-)
+from sglang.multimodal_gen.runtime.utils.vision import load_video, local_video_path
 
 logger = init_logger(__name__)
 
@@ -201,26 +195,6 @@ def read_video_fps(path: str) -> float | None:
     except (OSError, ValueError, RuntimeError, KeyError):
         return None
     return float(fps) if fps else None
-
-
-@contextmanager
-def local_control_path(path: str) -> Iterator[str]:
-    """A local file for the control clip; an http(s) URL is downloaded once, under
-    the media URL policy, to a temp file that lives for the ``with`` body."""
-    if not path.lower().startswith(("http://", "https://")):
-        yield path
-        return
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # FFmpeg probes the content; a fixed suffix keeps the client from steering it.
-        local_path = os.path.join(temp_dir, "control.mp4")
-        with open(local_path, "wb") as output:
-            call_with_sanitized_media_errors(
-                download_video_to_stream,
-                path,
-                output,
-                invalid_input="Invalid control video URL.",
-            )
-        yield local_path
 
 
 def load_control_frames(path: str, *, max_frames: int) -> torch.Tensor:
@@ -459,13 +433,13 @@ class CosmosDreamsControlVideoStage(PipelineStage):
         result.add_check("num_frames", batch.num_frames, V.positive_int)
         return result
 
-    def _resolve_fps(self, batch: Req, local_path: str, control_path: str) -> float:
+    def _resolve_fps(self, batch: Req, local_path: str) -> float:
         if batch.sampling_params.is_explicit("fps"):
             return float(batch.fps)
         fps = read_video_fps(local_path)
         if fps is None:
             raise ValueError(
-                f"Could not read the frame rate of {control_path!r}; pass fps explicitly."
+                "Could not read the frame rate of the control video; pass fps explicitly."
             )
         return fps
 
@@ -490,11 +464,11 @@ class CosmosDreamsControlVideoStage(PipelineStage):
             raise ValueError(
                 f"Checkpoint {manifest.checkpoint_id} accepts control hints {list(allowed_hints)}, got {hint!r}."
             )
-        with local_control_path(control_path) as local_path:
+        with local_video_path(control_path) as local_path:
             frames = load_control_frames(
                 local_path, max_frames=int(sampling_params.max_frames)
             )
-            fps = self._resolve_fps(batch, local_path, control_path)
+            fps = self._resolve_fps(batch, local_path)
         return frames, hint, fps, control_path
 
     def _fit_control(

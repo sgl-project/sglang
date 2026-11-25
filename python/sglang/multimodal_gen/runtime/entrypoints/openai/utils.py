@@ -284,14 +284,17 @@ def _validate_remote_media_value(field_name: str, value: str) -> None:
     payloads have no scheme and are allowed. Any other scheme-like prefix
     (``file:``, ``concat:``, ``ftp:``, ...) is rejected: loaders such as
     PyAV/FFmpeg would interpret it as a fetch protocol. So is a value whose
-    text before the first ``/`` holds ``:`` other than a one-letter drive:
-    ``subfile,,start,0,end,9,,:http:h/x`` is an FFmpeg protocol string with
-    no URL scheme. No DNS lookup here (this runs on the event loop); a
-    hostname's addresses are checked when the loader connects.
+    text before the first ``/`` holds ``:`` other than a one-letter drive, and
+    one that starts with ``subfile,``: FFmpeg reads both
+    ``subfile,,start,0,end,9,,:http:h/x`` and ``subfile,//:http:h/x`` as
+    protocol strings with no URL scheme. No DNS lookup here (this runs on the
+    event loop); a hostname's addresses are checked when the loader connects.
     """
     head = value.split("/", 1)[0]
     colon = head.find(":")
-    names_protocol = colon >= 0 and not (colon == 1 and head[0].isalpha())
+    names_protocol = value.lower().startswith("subfile,") or (
+        colon >= 0 and not (colon == 1 and head[0].isalpha())
+    )
     try:
         scheme = urlparse(value).scheme.lower()
         if scheme in ("http", "https"):
@@ -537,7 +540,6 @@ _IMAGE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 async def _download_capped_to_temp_file(
     response: httpx.Response, directory: str
 ) -> str:
-    # --media-url-max-file-size-mb; 0 disables the cap.
     max_bytes = media_url_max_file_size_bytes()
     too_large = f"Image exceeds the {max_bytes} byte download limit"
     declared = response.headers.get("content-length")
@@ -619,16 +621,14 @@ async def _save_url_image_to_path(
     backoff_seconds = 0.2
     timeout = media_url_timeout(_IMAGE_DOWNLOAD_TIMEOUT_S)
 
-    try:
-        async with (
-            asyncio.timeout(timeout),
-            httpx.AsyncClient(
-                follow_redirects=False,
-                trust_env=False,
-                verify=httpx.create_ssl_context(),
-                limits=httpx.Limits(max_keepalive_connections=0),
-            ) as client,
-        ):
+    async def download() -> str:
+        nonlocal target_path
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            verify=httpx.create_ssl_context(),
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
             for attempt in range(1, max_attempts + 1):
                 part_path = None
                 try:
@@ -725,6 +725,9 @@ async def _save_url_image_to_path(
                     if part_path is not None:
                         with suppress(FileNotFoundError):
                             os.remove(part_path)
+
+    try:
+        return await asyncio.wait_for(download(), timeout)
     except Exception as e:
         # The message reaches the client; the URL and the cause stay in the log.
         logger.warning("Image download failed for %s: %s", image_url, e)
