@@ -14,7 +14,11 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
-from sglang.test.ascend.test_ascend_utils import resolve_local_ip
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    resolve_local_ip,
+    write_memfabric_tent_conf,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -66,13 +70,22 @@ DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
     "SGLANG_RAGGED_VERIFY_MODE": "static",
 }
 
-# L3 store client. Unlike the A3 cases this one cannot use the memfabric
-# transports: the a5 (Ascend 950) board has no usable device path (device_sdma
-# is A3-only and its fabric host allocator asserts 910C, device_urma is missing
-# from memfabric's URMA topo table) and the host RDMA path fails to start HCOM
-# on this board, so the store runs over TCP. Everything is local to this node,
-# and the cached KV pages already live in host memory, so the loopback TCP
-# staging still exercises the full L3 write/restore path.
+# L3 store client: MemFabric TENT transport over the host-side RDMA path. The
+# store endpoint travels in the extra-config JSON and MC_TENT_CONF, both built
+# in setUpClass.
+# The a5 (Ascend 950) board has no usable memfabric device path: device_sdma is
+# A3-only (its fabric host allocator asserts 910C, which fails the store's
+# client buffer allocation with error code -1) and device_urma is missing from
+# memfabric's URMA topo table on this board. Both the store staging buffer and
+# any transfer engine therefore run over host RDMA.
+DEEPSEEK_V4_FLASH_FP8_4P_L3_ENVS = {
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "host_rdma",
+    "MF_STORE_PROTOCOL": "host_rdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "SGLANG_HICACHE_MOONCAKE_REUSE_TE": "0",
+}
+
 DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "--page-size",
     128,
@@ -184,12 +197,13 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
         # This is a single-node case, so the base class starts the Mooncake
         # master locally (from --hicache-storage-backend) and exports
         # MOONCAKE_MASTER. The store client still gets an explicit extra-config
-        # JSON, because the env-only defaults resolve to protocol=rdma.
+        # JSON: without it the env defaults resolve to protocol=rdma, while the
+        # NPU store client needs the ascend path.
         l3_config = json.dumps(
             {
                 "master_server_address": get_mooncake_master_server_address(),
                 "metadata_server": "P2PHANDSHAKE",
-                "protocol": "tcp",
+                "protocol": "ascend",
                 "global_segment_size": "8gb",
                 "local_hostname": resolve_local_ip(),
                 "extra_backend_tag": "dsv4-flash-fp8-4p-a5",
@@ -200,6 +214,12 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
             "--hicache-storage-backend-extra-config",
             l3_config,
         ]
+        cls.envs = {
+            **DEEPSEEK_V4_FLASH_FP8_4P_ENVS,
+            **DEEPSEEK_V4_FLASH_FP8_4P_L3_ENVS,
+            "MC_TENT_CONF": write_memfabric_tent_conf(),
+            "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
+        }
         super().setUpClass()
 
     def test_npu_deepseek_v4_flash_fp8_4p_gpqa(self):
