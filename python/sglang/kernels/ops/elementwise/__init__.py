@@ -29,6 +29,17 @@ for _fn in ("hc_combine_gate", "hc_combine_apply", "hc_combine_apply_norm"):
     )
 del _fn
 
+for _fn in ("hc_combine_logits", "hc_combine_logits_norm"):
+    register_kernel(
+        KernelSpec(
+            op=f"elementwise.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.elementwise.hc_combine:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(

@@ -23,7 +23,7 @@ def _qwen4_ngram_hash_kernel(
     NGRAM_HEADS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    output_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    output_idx = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = output_idx < num_outputs
     token_idx = output_idx // NGRAM_HEADS
     head_idx = output_idx % NGRAM_HEADS

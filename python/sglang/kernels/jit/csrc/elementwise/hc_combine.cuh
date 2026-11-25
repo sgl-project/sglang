@@ -372,9 +372,299 @@ struct HcCombineSplitKernel {
     };
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
     LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
         .enable_pdl(kUsePDL)(gate_kernel, params);
     LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
+  }
+};
+
+struct HcCombineLogitsParams {
+  const void* block_output;  // [M, H]
+  const void* residual;      // [M, HC * H]
+  const void* gate_logits;   // [M, HC] with row stride gate_stride
+  int64_t gate_stride;
+  const void* norm_weight;   // [HC * H] or nullptr
+  void* combined;            // [M, HC * H]
+  void* normalized;          // [M, HC * H] or nullptr
+  float eps;
+};
+
+namespace hc_combine_logits_detail {
+
+template <int64_t kHiddenSize>
+constexpr bool use_32b_vec() {
+  return (device::kMaxVecBytes >= 32) && (kHiddenSize % 16 == 0) &&
+         ((kHiddenSize / 16) % 32 == 0) && ((kHiddenSize / 16) <= 256);
+}
+
+template <int64_t kHiddenSize>
+constexpr uint32_t select_vec_len() {
+  return use_32b_vec<kHiddenSize>() ? 16u : 8u;
+}
+
+template <int64_t kHiddenSize>
+constexpr uint32_t select_num_threads() {
+  constexpr uint32_t vecs = static_cast<uint32_t>(kHiddenSize / select_vec_len<kHiddenSize>());
+  if constexpr (use_32b_vec<kHiddenSize>()) {
+    return vecs;
+  } else if constexpr (vecs <= 256u && (vecs % 32u == 0u)) {
+    return vecs;
+  } else {
+    return 256u;
+  }
+}
+
+}  // namespace hc_combine_logits_detail
+
+/**
+ * \brief Fused HyperConnection combine (with optional GroupedGemmaRMSNorm epilogue)
+ *        consuming precomputed TensorCore gate logits [M, HC].
+ *
+ * Grid is (M,): one CTA per token. block_output [M, H] is loaded once into
+ * registers and reused across all kHcCount branches, avoiding redundant HBM
+ * reads while keeping each branch's RMSNorm reduction within one CTA.
+ */
+template <int64_t kHcCount, int64_t kHiddenSize, bool kFuseNorm, bool kUsePDL, typename Float>
+__global__ __launch_bounds__(hc_combine_logits_detail::select_num_threads<kHiddenSize>()) void hc_combine_logits_kernel(
+    const HcCombineLogitsParams __grid_constant__ params) {
+  using namespace device;
+  using Float2 = packed_t<Float>;
+  constexpr uint32_t kVecLen = hc_combine_logits_detail::select_vec_len<kHiddenSize>();
+  constexpr uint32_t kPairsPerVec = kVecLen / 2;
+  using Storage = AlignedVector<Float2, kPairsPerVec>;
+  constexpr uint32_t kNumThreads = hc_combine_logits_detail::select_num_threads<kHiddenSize>();
+  constexpr uint32_t kVecsPerBranch = static_cast<uint32_t>(kHiddenSize / kVecLen);
+  constexpr uint32_t kIters = (kVecsPerBranch + kNumThreads - 1) / kNumThreads;
+  constexpr uint32_t kNumWarps = kNumThreads / kWarpThreads;
+  static_assert(kNumWarps <= kWarpThreads, "kNumThreads must not exceed 1024");
+
+  const uint32_t row = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+
+  const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(row) * kHiddenSize);
+  const auto logits_ptr = static_cast<const Float*>(params.gate_logits);
+  const int64_t row_base = static_cast<int64_t>(row) * kHcCount * kHiddenSize;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  // Load block_output once into registers and reuse across all kHcCount branches.
+  Storage y_reg[kIters];
+#pragma unroll
+  for (uint32_t j = 0; j < kIters; ++j) {
+    const uint32_t vec_idx = tid + j * kNumThreads;
+    if (kVecsPerBranch % kNumThreads == 0 || vec_idx < kVecsPerBranch) {
+      y_reg[j].load(y_ptr, vec_idx);
+    }
+  }
+
+  float gates[kHcCount];
+  const int64_t logit_row_offset = static_cast<int64_t>(row) * params.gate_stride;
+#pragma unroll
+  for (uint32_t b = 0; b < static_cast<uint32_t>(kHcCount); ++b) {
+    const float logit = cast<float>(logits_ptr[logit_row_offset + b]);
+    gates[b] = 2.0f / (1.0f + math::exp(-logit / static_cast<float>(kHcCount)));
+  }
+
+  __shared__ float warp_sums[kNumWarps];
+  __shared__ float inv_rms_shared;
+  const uint32_t warp_id = tid / kWarpThreads;
+  const uint32_t lane = tid % kWarpThreads;
+
+#pragma unroll
+  for (uint32_t branch = 0; branch < static_cast<uint32_t>(kHcCount); ++branch) {
+    const int64_t branch_offset = row_base + static_cast<int64_t>(branch) * kHiddenSize;
+    const auto r_ptr = pointer::offset<Float>(params.residual, branch_offset);
+    const auto out_ptr = pointer::offset<Float>(params.combined, branch_offset);
+    const float gate = gates[branch];
+
+    if constexpr (!kFuseNorm) {
+#pragma unroll
+      for (uint32_t j = 0; j < kIters; ++j) {
+        const uint32_t vec_idx = tid + j * kNumThreads;
+        if (kVecsPerBranch % kNumThreads == 0 || vec_idx < kVecsPerBranch) {
+          Storage r_vec, c_vec;
+          r_vec.load(r_ptr, vec_idx);
+#pragma unroll
+          for (uint32_t i = 0; i < kPairsPerVec; ++i) {
+            const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
+            const auto [yx, yy] = cast<fp32x2_t>(y_reg[j][i]);
+            c_vec[i] = cast<Float2>(fp32x2_t{rx + gate * yx, ry + gate * yy});
+          }
+          c_vec.store(out_ptr, vec_idx);
+        }
+      }
+    } else {
+      const auto w_ptr = pointer::offset<Float>(params.norm_weight, static_cast<int64_t>(branch) * kHiddenSize);
+      const auto norm_ptr = pointer::offset<Float>(params.normalized, branch_offset);
+      Storage combined_reg[kIters];
+      float sum = 0.0f;
+#pragma unroll
+      for (uint32_t j = 0; j < kIters; ++j) {
+        const uint32_t vec_idx = tid + j * kNumThreads;
+        if (kVecsPerBranch % kNumThreads == 0 || vec_idx < kVecsPerBranch) {
+          Storage r_vec, c_vec;
+          r_vec.load(r_ptr, vec_idx);
+#pragma unroll
+          for (uint32_t i = 0; i < kPairsPerVec; ++i) {
+            const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
+            const auto [yx, yy] = cast<fp32x2_t>(y_reg[j][i]);
+            // Match the BF16/FP16 store rounding before RMSNorm accumulation.
+            c_vec[i] = cast<Float2>(fp32x2_t{rx + gate * yx, ry + gate * yy});
+            const auto [cx, cy] = cast<fp32x2_t>(c_vec[i]);
+            sum += cx * cx + cy * cy;
+          }
+          c_vec.store(out_ptr, vec_idx);
+          combined_reg[j] = c_vec;
+        }
+      }
+
+      sum = warp::reduce_sum(sum);
+      if (lane == 0) {
+        warp_sums[warp_id] = sum;
+      }
+      __syncthreads();
+      if (warp_id == 0) {
+        const float local_sum = lane < kNumWarps ? warp_sums[lane] : 0.0f;
+        const float total = warp::reduce_sum(local_sum);
+        if (lane == 0) {
+          inv_rms_shared = math::rsqrt(total / static_cast<float>(kHiddenSize) + params.eps);
+        }
+      }
+      __syncthreads();
+      const float inv_rms = inv_rms_shared;
+
+#pragma unroll
+      for (uint32_t j = 0; j < kIters; ++j) {
+        const uint32_t vec_idx = tid + j * kNumThreads;
+        if (kVecsPerBranch % kNumThreads == 0 || vec_idx < kVecsPerBranch) {
+          Storage w_vec, n_vec;
+          w_vec.load(w_ptr, vec_idx);
+#pragma unroll
+          for (uint32_t i = 0; i < kPairsPerVec; ++i) {
+            const auto [cx, cy] = cast<fp32x2_t>(combined_reg[j][i]);
+            const auto [wx, wy] = cast<fp32x2_t>(w_vec[i]);
+            n_vec[i] = cast<Float2>(fp32x2_t{cx * inv_rms * (1.0f + wx), cy * inv_rms * (1.0f + wy)});
+          }
+          n_vec.store(norm_ptr, vec_idx);
+        }
+      }
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType>
+struct HcCombineLogitsKernel {
+  static_assert(sizeof(DType) == 2, "HcCombineLogits only supports 2-byte dtypes");
+  static_assert(kHcCount > 0, "kHcCount must be positive");
+  static_assert(kHiddenSize > 0 && kHiddenSize % 8 == 0, "kHiddenSize must be a multiple of 8");
+  static constexpr uint32_t kNumThreads = hc_combine_logits_detail::select_num_threads<kHiddenSize>();
+  static constexpr size_t kVecBytes = hc_combine_logits_detail::select_vec_len<kHiddenSize>() * sizeof(DType);
+
+  static void
+  run(const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView gate_logits,
+      const tvm::ffi::TensorView combined) {
+    using namespace host;
+    auto M = SymbolicSize{"num_tokens"};
+    auto gate_stride = SymbolicSize{"gate_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(residual)
+        .verify(combined);
+    TensorMatcher({M, kHcCount})
+        .with_strides({gate_stride, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(gate_logits);
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
+
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(block_output.data_ptr()) % kVecBytes == 0 &&
+            reinterpret_cast<uintptr_t>(residual.data_ptr()) % kVecBytes == 0 &&
+            reinterpret_cast<uintptr_t>(combined.data_ptr()) % kVecBytes == 0,
+        "HcCombineLogits tensors must be ",
+        kVecBytes,
+        "-byte aligned");
+
+    const auto params = HcCombineLogitsParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .gate_logits = gate_logits.data_ptr(),
+        .gate_stride = gate_stride.unwrap(),
+        .norm_weight = nullptr,
+        .combined = combined.data_ptr(),
+        .normalized = nullptr,
+        .eps = 0.0f,
+    };
+    LaunchKernel(dim3(num_tokens, 1, 1), kNumThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(hc_combine_logits_kernel<kHcCount, kHiddenSize, false, kUsePDL, DType>, params);
+  }
+
+  static void
+  run_norm(
+      const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView gate_logits,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView combined,
+      const tvm::ffi::TensorView normalized,
+      float eps) {
+    using namespace host;
+    auto M = SymbolicSize{"num_tokens"};
+    auto gate_stride = SymbolicSize{"gate_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(residual)
+        .verify(combined)
+        .verify(normalized);
+    TensorMatcher({kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(norm_weight);
+    TensorMatcher({M, kHcCount})
+        .with_strides({gate_stride, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(gate_logits);
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
+
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(block_output.data_ptr()) % kVecBytes == 0 &&
+            reinterpret_cast<uintptr_t>(residual.data_ptr()) % kVecBytes == 0 &&
+            reinterpret_cast<uintptr_t>(norm_weight.data_ptr()) % kVecBytes == 0 &&
+            reinterpret_cast<uintptr_t>(combined.data_ptr()) % kVecBytes == 0 &&
+            reinterpret_cast<uintptr_t>(normalized.data_ptr()) % kVecBytes == 0,
+        "HcCombineLogitsNorm tensors must be ",
+        kVecBytes,
+        "-byte aligned");
+
+    const auto params = HcCombineLogitsParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .gate_logits = gate_logits.data_ptr(),
+        .gate_stride = gate_stride.unwrap(),
+        .norm_weight = norm_weight.data_ptr(),
+        .combined = combined.data_ptr(),
+        .normalized = normalized.data_ptr(),
+        .eps = eps,
+    };
+    LaunchKernel(dim3(num_tokens, 1, 1), kNumThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(hc_combine_logits_kernel<kHcCount, kHiddenSize, true, kUsePDL, DType>, params);
   }
 };
 

@@ -1182,9 +1182,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
 
-    def _can_reuse_text_only_prompt_ids(
-        self, processed_messages: MessageProcessingResult, is_multimodal: bool
-    ) -> bool:
+    def _can_reuse_text_only_prompt_ids_static(self, is_multimodal: bool) -> bool:
         # Moss-VL invokes its processor for text-only requests, and that processor
         # requires the rendered text rather than pre-tokenized ids.
         is_moss_vl = (
@@ -1198,6 +1196,13 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
             and not self._tokenizer_auto_adds_specials
+        )
+
+    def _can_reuse_text_only_prompt_ids(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> bool:
+        return (
+            self._can_reuse_text_only_prompt_ids_static(is_multimodal)
             and isinstance(processed_messages.prompt_ids, list)
             and bool(processed_messages.prompt_ids)
             and not processed_messages.image_data
@@ -2144,13 +2149,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
+            has_media = bool(image_data or video_data or audio_data or modalities)
+            needs_multimodal_prompt = is_multimodal and (
+                has_media
+                or not self._can_reuse_text_only_prompt_ids_static(is_multimodal)
+            )
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
                     openai_compatible_messages,
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
-                    use_cache=is_multimodal,
+                    use_cache=needs_multimodal_prompt,
                     add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
@@ -2167,7 +2177,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
-                        use_cache=is_multimodal,
+                        use_cache=needs_multimodal_prompt,
                         add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
@@ -2184,7 +2194,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
 
-            if is_multimodal:
+            if needs_multimodal_prompt or (is_multimodal and not prompt_ids):
                 prompt = (
                     decoded_prompt
                     if decoded_prompt is not None

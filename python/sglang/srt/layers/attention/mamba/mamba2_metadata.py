@@ -44,6 +44,12 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     # int64 copy of query_start_loc for extend kernels that need it; None otherwise.
     query_start_loc_i64: Optional[torch.Tensor] = None
+    # Precomputed extend_prefix_lens > 0 reused across all linear-attention layers.
+    extend_has_initial_state: Optional[torch.Tensor] = None
+    # Host upper bound on extend sequence length for FlashInfer CP launch grids.
+    max_extend_seq_len: Optional[int] = None
+    # True when every extend row owns a unique positive state-pool slot (no padding).
+    can_use_direct_state_indices: bool = False
     mamba_cache_indices: torch.Tensor
     conv_block_table: Optional[torch.Tensor] = None
     logical_num_tokens: Optional[int] = None

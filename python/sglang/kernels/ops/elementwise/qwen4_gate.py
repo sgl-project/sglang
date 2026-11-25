@@ -20,7 +20,7 @@ def _qwen4_gate_value_kernel(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_group = tl.program_id(0)
+    token_group = tl.program_id(0).to(tl.int64)
     token = token_group // HC_COUNT
     hidden = tl.arange(0, BLOCK_SIZE)
     mask = (token < num_tokens) & (hidden < HIDDEN_SIZE)
@@ -91,7 +91,7 @@ def _qwen4_gate_reduce_kernel(
     HC_COUNT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    group = tl.program_id(0)
+    group = tl.program_id(0).to(tl.int64)
     hidden = tl.arange(0, BLOCK_SIZE)
     mask = hidden < HIDDEN_SIZE
     key = tl.load(key_ptr + group * HIDDEN_SIZE + hidden, mask, other=0).to(tl.float32)

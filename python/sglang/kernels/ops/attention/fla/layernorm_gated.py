@@ -107,7 +107,7 @@ def rms_norm_ref(
     return out.to(dtype)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _layer_norm_fwd_1pass_kernel(
     X,  # pointer to the input
     Y,  # pointer to the output
@@ -137,17 +137,18 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    SAVE_STATS: tl.constexpr = True,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
     # Map the program id to the starting row of X and Y it should compute.
-    row_start = tl.program_id(0) * ROWS_PER_BLOCK
-    group = tl.program_id(1)
+    row_start = tl.program_id(0).to(tl.int64) * ROWS_PER_BLOCK
+    group = tl.program_id(1).to(tl.int64)
 
     # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
-    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
-    cols = tl.arange(0, BLOCK_N)
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK).to(tl.int64)
+    cols = tl.arange(0, BLOCK_N).to(tl.int64)
 
     # Compute offsets for 2D tile
     row_offsets = rows[:, None] * stride_x_row
@@ -182,10 +183,11 @@ def _layer_norm_fwd_1pass_kernel(
     # Compute mean and variance per row (reduce along axis 1)
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
-        # Store mean for each row
-        mean_offsets = group * M + rows
-        mean_mask = rows < M
-        tl.store(Mean + mean_offsets, mean, mask=mean_mask)
+        if SAVE_STATS:
+            # Store mean for each row
+            mean_offsets = group * M + rows
+            mean_mask = rows < M
+            tl.store(Mean + mean_offsets, mean, mask=mean_mask)
         # Broadcast mean back to 2D for subtraction
         xbar = tl.where(mask, x - mean[:, None], 0.0)
         var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
@@ -196,10 +198,11 @@ def _layer_norm_fwd_1pass_kernel(
 
     rstd = tl.rsqrt(var + eps)  # Shape: [ROWS_PER_BLOCK]
 
-    # Store rstd for each row
-    rstd_offsets = group * M + rows
-    rstd_mask = rows < M
-    tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
+    if SAVE_STATS:
+        # Store rstd for each row
+        rstd_offsets = group * M + rows
+        rstd_mask = rows < M
+        tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
 
     # Load weights and biases (broadcast across rows)
     w_offsets = cols + group * N
@@ -279,6 +282,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    save_stats: bool = True,
 ):
     M, N = x.shape
     if group_size is None:
@@ -307,10 +311,14 @@ def _layer_norm_fwd(
     assert out.stride(-1) == 1
     mean = (
         torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
+        if (save_stats and not is_rms_norm)
         else None
     )
-    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+    rstd = (
+        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+        if save_stats
+        else None
+    )
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
@@ -320,6 +328,15 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    if (
+        not quant_heads
+        and BLOCK_N <= 256
+        and M >= 4096
+        and not is_batch_invariant_mode_enabled()
+        and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+    ):
+        rows_per_block = 16
+        num_warps = 4
     quant = {}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
@@ -378,6 +395,7 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            SAVE_STATS=save_stats,
             **pdl_kwargs,
             **quant,
         )
@@ -482,6 +500,7 @@ def rms_norm_gated(
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
         activation=activation,
+        **({} if _is_npu else {"save_stats": False}),
     )
     return y.reshape(x_shape_og)
 

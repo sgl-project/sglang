@@ -2,7 +2,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+from sglang.kernels.ops.elementwise.hc_combine import (
+    hc_combine,
+    hc_combine_logits,
+    hc_combine_logits_norm,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -134,6 +138,66 @@ def test_hc_combine_3d_input():
 
     assert out.shape == residual.shape
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [0, 1, 7, 128, 8243])
+@pytest.mark.parametrize("strided_logits", [False, True])
+def test_hc_combine_logits_and_norm_correctness(dtype, num_tokens, strided_logits):
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        max(num_tokens, 1), dtype
+    )
+    norm_weight = torch.randn(HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1
+    if num_tokens == 0:
+        block_output = block_output[:0]
+        residual = residual[:0]
+        normed_residual = normed_residual[:0]
+    gate_logits_contig = F.linear(normed_residual, inject_weight)
+    if strided_logits:
+        wide = torch.randn(num_tokens, 80, dtype=dtype, device="cuda")
+        wide[:, 64 : 64 + HC_COUNT] = gate_logits_contig
+        gate_logits = wide[:, 64 : 64 + HC_COUNT]
+    else:
+        gate_logits = gate_logits_contig
+
+    out = hc_combine_logits(
+        block_output, residual, gate_logits, HC_COUNT, HIDDEN_SIZE
+    )
+    combined, normalized = hc_combine_logits_norm(
+        block_output,
+        residual,
+        gate_logits,
+        norm_weight,
+        1e-6,
+        HC_COUNT,
+        HIDDEN_SIZE,
+    )
+    assert out.shape == residual.shape
+    assert combined.shape == residual.shape
+    assert normalized.shape == residual.shape
+    if num_tokens == 0:
+        return
+
+    gates = 2.0 * torch.sigmoid(gate_logits_contig.float() / HC_COUNT)
+    ref_combined = (
+        residual.float().unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
+        + block_output.float().unsqueeze(-2) * gates.unsqueeze(-1)
+    ).flatten(-2).to(dtype)
+    # Match BF16/FP16 combined rounding before per-branch GemmaRMSNorm.
+    c_f32 = ref_combined.float().unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
+    inv_rms = torch.rsqrt(c_f32.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    ref_norm = (
+        (c_f32 * inv_rms).flatten(-2) * (1.0 + norm_weight.float())
+    ).to(dtype)
+
+    torch.testing.assert_close(out, ref_combined, **_TOLERANCES[dtype])
+    torch.testing.assert_close(combined, ref_combined, **_TOLERANCES[dtype])
+    norm_tol = (
+        {"atol": 2e-3, "rtol": 2e-3}
+        if dtype == torch.float16
+        else _TOLERANCES[dtype]
+    )
+    torch.testing.assert_close(normalized, ref_norm, **norm_tol)
 
 
 if __name__ == "__main__":

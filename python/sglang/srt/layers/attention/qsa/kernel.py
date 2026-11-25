@@ -234,13 +234,27 @@ def triton_expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
     rows, block_topk = block_indices.shape
     final_topk = token_topk + compress_ratio - 1
-    output = torch.empty(
-        (rows, final_topk), dtype=torch.int32, device=block_indices.device
-    )
+    if out is not None:
+        if (
+            out.shape != (rows, final_topk)
+            or out.dtype != torch.int32
+            or out.device != block_indices.device
+            or out.stride(1) != 1
+        ):
+            raise ValueError(
+                f"invalid expand_qsa_block_indices out buffer: "
+                f"shape={tuple(out.shape)} dtype={out.dtype} stride={out.stride()}"
+            )
+        output = out
+    else:
+        output = torch.empty(
+            (rows, final_topk), dtype=torch.int32, device=block_indices.device
+        )
     if rows == 0:
         return output
     _expand_qsa_block_indices_kernel[(rows,)](
@@ -260,7 +274,7 @@ def triton_expand_qsa_block_indices(
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["table_stride", "total_blocks"])
 def _gather_qsa_compressed_keys_kernel(
     compressed,
     output,
@@ -337,6 +351,7 @@ def expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Expand compressed blocks with platform kernels or the Torch fallback."""
 
@@ -354,13 +369,17 @@ def expand_qsa_block_indices(
 
         # The package wrapper owns the model contract and its internal dispatch.
         # Unsupported metadata must not silently enter the generic reference.
-        return expand_blocks(
+        result = expand_blocks(
             block_indices,
             query_positions,
             sequence_lengths,
             compress_ratio,
             token_topk,
         )
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     if block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
@@ -370,14 +389,19 @@ def expand_qsa_block_indices(
             sequence_lengths.to(device=block_indices.device).contiguous(),
             compress_ratio,
             token_topk,
+            out=out,
         )
-    return torch_expand_qsa_block_indices(
+    result = torch_expand_qsa_block_indices(
         block_indices,
         query_positions,
         sequence_lengths,
         compress_ratio,
         token_topk,
     )
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def qsa_sparse_attention(
