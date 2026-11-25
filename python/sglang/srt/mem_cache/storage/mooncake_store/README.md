@@ -427,7 +427,7 @@ A node that only reads from the pool (a consumer) contributes no segment. Set `g
 ```
 
 * `enable_egm_store_pool`, `MOONCAKE_ENABLE_EGM_STORE_POOL`: Back the segment with EGM host memory. Default `false`. Requires `protocol` set to `"nvlink"` and cannot be combined with `standalone_storage`.
-* `egm_numa_nodes`, `MOONCAKE_EGM_NUMA_NODES`: Host NUMA nodes the segment is allocated on, as `"auto"` or a comma-separated list such as `"0,1"`. When unset, each rank uses the host NUMA node of its own GPU, so the segment stays on that GPU's socket. `"auto"` lets Mooncake split the segment across the nodes of every GPU the process can see.
+* `egm_numa_nodes`, `MOONCAKE_EGM_NUMA_NODES`: Host NUMA nodes the segment is allocated on, as `"auto"` or a comma-separated list such as `"0,1"`. When unset, each rank uses the host NUMA node of its own GPU, so the segment stays on that GPU's socket; if that node cannot be read (no `cuda-python`, or a driver without the attribute), the rank logs a warning and uses `"auto"`. `"auto"` lets Mooncake split the segment across the nodes of every GPU the process can see.
 
 Requirements:
 
