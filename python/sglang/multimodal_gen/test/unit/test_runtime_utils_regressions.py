@@ -140,3 +140,14 @@ def test_bool_env_var_warning_is_deduplicated_per_variable(monkeypatch):
         common.get_bool_env_var("SGLANG_TEST_FLAG_B")
 
     assert warning.call_count == 2
+
+
+def test_video_frame_prefix_respects_decoded_byte_limit(tmp_path, monkeypatch):
+    from sglang.srt.multimodal.media_budget import MediaBudgetExceeded
+
+    path = tmp_path / "ordinary.gif"
+    path.write_bytes(_gif_bytes())
+    monkeypatch.setattr(vision, "MAX_DECODED_BYTES", 16)
+    assert len(vision._read_video_frames(str(path), max_frames=1)) == 1
+    with pytest.raises(MediaBudgetExceeded):
+        vision._read_video_frames(str(path))

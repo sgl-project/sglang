@@ -20,7 +20,12 @@ from packaging import version
 
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
-from sglang.srt.multimodal.media_budget import charge_media_bytes
+from sglang.srt.multimodal.media_budget import (
+    MAX_DECODED_BYTES,
+    ByteBudget,
+    charge_media_bytes,
+    check_decoded_bytes,
+)
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 from sglang.srt.multimodal.media_io import (
     get_mm_http_session,
@@ -331,14 +336,18 @@ def _read_video_frames(
     video: str, max_frames: int | None = None
 ) -> list[PIL.Image.Image]:
     pil_images = []
+    decoded = ByteBudget(MAX_DECODED_BYTES)
     if video.endswith(".gif"):
         gif = PIL.Image.open(video)
         try:
             while max_frames is None or len(pil_images) < max_frames:
+                decoded.charge(gif.width * gif.height * len(gif.getbands()))
                 pil_images.append(gif.copy())
                 gif.seek(gif.tell() + 1)
         except EOFError:
             pass
+        finally:
+            gif.close()
 
     else:
         try:
@@ -349,9 +358,13 @@ def _read_video_frames(
             ) from None
 
         with imageio.get_reader(video) as reader:
+            size = reader.get_meta_data().get("size")
+            if size:
+                check_decoded_bytes(size[0] * size[1] * 3)
             # Closing the reader early stops the ffmpeg subprocess, so a prefix
             # costs only the frames it needs.
             for frame in reader:
+                decoded.charge(frame.nbytes)
                 pil_images.append(PIL.Image.fromarray(frame))
                 if max_frames is not None and len(pil_images) >= max_frames:
                     break

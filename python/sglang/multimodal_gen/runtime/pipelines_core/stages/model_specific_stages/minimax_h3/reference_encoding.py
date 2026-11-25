@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_scoped_encode_rng,
 )
 from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
+from sglang.srt.multimodal.media_budget import MAX_DECODED_BYTES, check_decoded_bytes
 
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
@@ -356,10 +357,12 @@ def _load_waveform(
         "-ac",
         str(MINIMAX_H3_AUDIO_CHANNELS),
     ]
-    if material_chain != "audio":
-        command += ["-ar", str(source_rate)]
-    if max_duration_seconds is not None:
-        command += ["-t", f"{max_duration_seconds:.9g}"]
+    frame_bytes = MINIMAX_H3_AUDIO_CHANNELS * torch.float32.itemsize
+    # Decode one extra frame so an over-budget reference is rejected, not shortened.
+    duration_limit = (MAX_DECODED_BYTES // frame_bytes + 1) / source_rate
+    duration = min(max_duration_seconds or duration_limit, duration_limit)
+    command += ["-ar", str(source_rate)]
+    command += ["-t", str(duration)]
     command += ["-f", "f32le", "pipe:1"]
     decoded = subprocess.run(
         command, env=local_media_subprocess_env(), check=True, capture_output=True
@@ -367,7 +370,7 @@ def _load_waveform(
     payload = decoded.stdout
     if not isinstance(payload, bytes):
         raise TypeError("ffmpeg float PCM output must be bytes")
-    frame_bytes = MINIMAX_H3_AUDIO_CHANNELS * torch.float32.itemsize
+    check_decoded_bytes(len(payload))
     if len(payload) % frame_bytes:
         raise ValueError(
             "ffmpeg returned a partial reference-audio sample frame: "
@@ -517,6 +520,7 @@ def minimax_h3_decode_reference_video_frames(
         "rgb24",
     ]
     frame_bytes = target_width * target_height * 3
+    check_decoded_bytes(frame_bytes * target_frame_count)
     if share_across_replicas:
         payload, payload_size = _decode_reference_video_shared(command)
     else:

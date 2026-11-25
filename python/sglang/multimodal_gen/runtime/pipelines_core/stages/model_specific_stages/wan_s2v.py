@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import tempfile
 from urllib.parse import urlparse
@@ -11,7 +12,11 @@ import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torchvision import transforms
 
-from sglang.srt.multimodal.media_budget import charge_media_bytes
+from sglang.srt.multimodal.media_budget import (
+    MediaBudgetExceeded,
+    charge_media_bytes,
+    check_decoded_bytes,
+)
 from sglang.srt.multimodal.media_io import (
     media_url_timeout,
     open_remote_media,
@@ -291,6 +296,7 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             if idx >= total_frames:
                 break
             sampled_indices.append(idx)
+        check_decoded_bytes(len(sampled_indices) * math.prod(vr[0].shape))
         pose_seq = vr.get_batch(sampled_indices).asnumpy()
         resize = transforms.Resize(min(height, width))
         crop = transforms.CenterCrop((height, width))
@@ -316,9 +322,11 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         if sf is None:
             return None, None
         try:
-            audio_np, sample_rate = sf.read(
-                audio_path, dtype="float32", always_2d=False
-            )
+            with sf.SoundFile(audio_path) as stream:
+                check_decoded_bytes(stream.frames * stream.channels * 4)
+                audio_np, sample_rate = stream.read(dtype="float32"), stream.samplerate
+        except MediaBudgetExceeded:
+            raise
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to load source audio for output muxing: %s", exc)
             return None, None

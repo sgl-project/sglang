@@ -100,7 +100,11 @@ class WanS2VAudioEncoder(AudioEncoder):
     def _load_audio(self, audio_path: str) -> tuple[np.ndarray, int]:
         if sf is None:
             raise ImportError("soundfile is required to load Wan S2V audio")
-        audio_input, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+        from sglang.srt.multimodal.media_budget import check_decoded_bytes
+
+        with sf.SoundFile(audio_path) as stream:
+            check_decoded_bytes(stream.frames * stream.channels * 4)
+            audio_input, sample_rate = stream.read(dtype="float32"), stream.samplerate
         if isinstance(audio_input, np.ndarray) and audio_input.ndim > 1:
             audio_input = audio_input.mean(axis=-1)
         if sample_rate != self.sample_rate:
@@ -109,6 +113,7 @@ class WanS2VAudioEncoder(AudioEncoder):
             target_len = max(
                 1, int(round(waveform.shape[-1] * self.sample_rate / sample_rate))
             )
+            check_decoded_bytes(target_len * 4)
             waveform = F.interpolate(
                 waveform,
                 size=target_len,

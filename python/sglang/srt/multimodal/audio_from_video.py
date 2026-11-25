@@ -18,6 +18,12 @@ import logging
 
 import numpy as np
 
+from sglang.srt.multimodal.media_budget import (
+    MAX_DECODED_BYTES,
+    ByteBudget,
+    MediaBudgetExceeded,
+)
+
 logger = logging.getLogger(__name__)
 
 _INVALID_AUDIO_CONTAINER_MESSAGE = (
@@ -48,10 +54,12 @@ def is_audio_container(data: bytes) -> bool:
 def _append_resampled_frames(
     chunks: list[np.ndarray],
     frames,
+    budget: ByteBudget,
     *,
     mono: bool,
 ) -> None:
     for frame in frames:
+        budget.charge(frame.samples * len(frame.layout.channels) * 4)
         array = frame.to_ndarray()
         chunks.append(array.reshape(-1) if mono else array.T)
 
@@ -86,6 +94,7 @@ def decode_audio_container(
                     format="fltp", rate=target_sr
                 )
 
+            budget = ByteBudget(MAX_DECODED_BYTES)
             chunks: list[np.ndarray] = []
             skipped_packets = 0
             first_decode_error = None
@@ -95,6 +104,7 @@ def decode_audio_container(
                         _append_resampled_frames(
                             chunks,
                             resampler.resample(frame),
+                            budget,
                             mono=mono,
                         )
                 except av.error.FFmpegError as error:
@@ -105,6 +115,7 @@ def decode_audio_container(
             _append_resampled_frames(
                 chunks,
                 resampler.resample(None),
+                budget,
                 mono=mono,
             )
             if skipped_packets:
@@ -115,7 +126,7 @@ def decode_audio_container(
                     len(chunks),
                     first_decode_error,
                 )
-    except _AudioContainerDecodeError:
+    except (_AudioContainerDecodeError, MediaBudgetExceeded):
         raise
     except Exception as error:
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from error
@@ -143,6 +154,8 @@ def extract_audio_from_video_bytes(
             target_sr=target_sr,
             mono=True,
         )
+    except MediaBudgetExceeded:
+        raise
     except Exception:
         logger.warning("Error extracting audio from video", exc_info=True)
         return None
