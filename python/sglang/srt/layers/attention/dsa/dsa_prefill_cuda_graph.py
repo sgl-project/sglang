@@ -110,7 +110,6 @@ def pcg_dsa_indexer_prefill_split(
             num_tokens=extend_num_tokens,
         )
         indexer._get_topk_ragged(
-            False,
             forward_batch,
             layer_id,
             q_fp8,
@@ -135,7 +134,6 @@ def pcg_dsa_indexer_prefill_split(
             enable_dual_stream=False,
         )
         indexer._get_topk_ragged(
-            False,
             forward_batch,
             layer_id,
             q_fp8,
@@ -154,7 +152,11 @@ def pcg_dsa_indexer_prefill_split(
     )
     from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 
-    if (
+    if indexer.fp4_index_k:
+        from sglang.srt.layers.attention.dsa import dsa_indexer_hip
+
+        q_fp8, weights = dsa_indexer_hip.fp4_prefill_q(indexer, query, x)
+    elif (
         _is_cuda
         and indexer.bf16_head_gate
         and indexer.skip_rope
@@ -198,7 +200,6 @@ def pcg_dsa_indexer_prefill_split(
     if not return_indices:
         return
     indexer._get_topk_ragged(
-        False,
         forward_batch,
         layer_id,
         q_fp8 if in_cp else q_fp8[:extend_num_tokens],
