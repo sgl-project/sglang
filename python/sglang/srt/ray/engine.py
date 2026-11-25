@@ -275,10 +275,9 @@ class RayEngine(Engine):
         """
         if self._scheduler_exit_error is not None:
             raise self._scheduler_exit_error
-        tokenizer_manager = self.tokenizer_manager
         rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
         sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-        if tokenizer_manager.is_generation:
+        if self.tokenizer_manager.is_generation:
             probe = GenerateReqInput(
                 rid=rid,
                 input_ids=[0],
@@ -299,7 +298,7 @@ class RayEngine(Engine):
         deadline = time.monotonic() + timeout_s
 
         async def send_probe():
-            async for _ in tokenizer_manager.generate_request(probe):
+            async for _ in self.tokenizer_manager.generate_request(probe):
                 break
 
         task = asyncio.create_task(send_probe())
@@ -310,7 +309,7 @@ class RayEngine(Engine):
                 if self._scheduler_exit_error is not None:
                     raise self._scheduler_exit_error
                 # Compared against real_time(), which is time.time().
-                if tokenizer_manager.last_receive_tstamp > sent_at:
+                if self.tokenizer_manager.last_receive_tstamp > sent_at:
                     return
                 if task.done() and task.exception() is not None:
                     raise task.exception()
@@ -321,7 +320,7 @@ class RayEngine(Engine):
                 await asyncio.sleep(_HEALTH_PROBE_POLL_S)
         finally:
             task.cancel()
-            tokenizer_manager.rid_to_state.pop(probe.rid, None)
+            self.tokenizer_manager.rid_to_state.pop(probe.rid, None)
 
     def _monitor_schedulers(self) -> None:
         """Report the first scheduler event loop to end, unless shutdown() ended it."""

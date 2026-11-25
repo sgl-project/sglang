@@ -4012,12 +4012,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # and then checks this flag, so a request either sees the flag and gets
         # 503, or has started the loop and is failed below.
         self.scheduler_exit_error = message
-        loop = self.event_loop
-        if loop is None:
+        if self.event_loop is None:
             # No request has started the handle loop, so none is pending.
             return
         # Request state belongs to the handle loop and is not thread-safe.
-        loop.call_soon_threadsafe(self._fail_requests_after_scheduler_exit)
+        self.event_loop.call_soon_threadsafe(self._fail_requests_after_scheduler_exit)
 
     def _fail_requests_after_scheduler_exit(self) -> None:
         """Runs on the handle loop after report_scheduler_exit set the flag."""
