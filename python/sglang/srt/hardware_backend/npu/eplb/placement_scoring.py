@@ -16,28 +16,22 @@ def window_p95_index(active_steps: int) -> int:
     return math.ceil(0.95 * active_steps) - 1
 
 
-def estimate_migration_gain(
-    logical_counts, current_rank_experts, candidate_rank_experts, before_peak=None
-):
-    """Screen a layout by splitting each expert's load evenly across replicas."""
-    num_experts = logical_counts.shape[-1]
-
-    def peak_tokens(layer_load, rank_experts):
-        replicas = np.bincount(rank_experts.ravel(), minlength=num_experts)
-        # Keep each float64 gather near 512 KiB even for long recorder windows.
-        steps = max(1, (64 * 1024) // rank_experts.size)
-        peak = np.empty(len(layer_load))
-        for start in range(0, len(peak), steps):
-            block = slice(start, start + steps)
-            per_replica = layer_load[block] / replicas
-            peak[block] = per_replica[:, rank_experts].sum(axis=-1).max(axis=1)
-        return peak
-
-    if before_peak is None:
-        before_peak = peak_tokens(logical_counts, current_rank_experts)
-    after_peak = peak_tokens(logical_counts, candidate_rank_experts)
+def estimate_migration_gain(logical_counts, candidate_rank_experts, *, before_peak):
+    """Compare the recorded rank peak with an even split across candidate replicas."""
+    replicas = np.bincount(
+        candidate_rank_experts.ravel(), minlength=logical_counts.shape[-1]
+    )
+    # Keep each float64 gather near 512 KiB even for long recorder windows.
+    steps = max(1, (64 * 1024) // candidate_rank_experts.size)
+    after_peak = np.empty(len(logical_counts))
+    for start in range(0, len(after_peak), steps):
+        block = slice(start, start + steps)
+        per_replica = logical_counts[block] / replicas
+        after_peak[block] = (
+            per_replica[:, candidate_rank_experts].sum(axis=-1).max(axis=1)
+        )
     return _peak_gain(
-        before_peak, after_peak, logical_counts.sum(axis=1), len(current_rank_experts)
+        before_peak, after_peak, logical_counts.sum(axis=1), len(candidate_rank_experts)
     )
 
 

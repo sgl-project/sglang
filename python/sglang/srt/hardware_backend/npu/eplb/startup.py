@@ -122,9 +122,10 @@ def create_npu_async_eplb(
 
     world_size = dist.get_world_size()
     cpu_timeout = timedelta(seconds=90)
-    control = EplbControl(dist.new_group(backend="gloo", timeout=cpu_timeout))
+    control_group = dist.new_group(backend="gloo", timeout=cpu_timeout)
     error = None
     try:
+        control = EplbControl(control_group)
         import torch_npu
 
         _validate_migration_topology(world_size)
@@ -214,11 +215,11 @@ def create_npu_async_eplb(
         error = exc
         setup = f"{type(exc).__name__}: {exc}"
     peers = [None] * world_size
-    dist.all_gather_object(peers, setup, group=control.group)
+    dist.all_gather_object(peers, setup, group=control_group)
     try:
         narrowed_layers = _check_startup_agreement(peers, error)
     except (RuntimeError, ValueError):
-        control.close()
+        dist.destroy_process_group(control_group)
         raise
     runtime.narrowed_replica_layers.update(narrowed_layers)
     runtime.open_transport(

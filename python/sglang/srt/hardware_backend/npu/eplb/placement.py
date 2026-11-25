@@ -206,7 +206,13 @@ def plan_migration(
     static_dispatch = None
     if refine_on_one_node and not replicated:
         physical, logical, known_gains = _prefer_fewer_moves(
-            current, physical, logical, counts, spec.local_experts, eligible_rows
+            current,
+            physical,
+            logical,
+            counts,
+            spec.local_experts,
+            eligible_rows,
+            observed_peaks=observed_peaks,
         )
     moved = (physical != current).any(dim=1).tolist()
     candidates = tuple(
@@ -228,7 +234,13 @@ def plan_migration(
         )
         candidates = tuple(known_gains)
     layers_to_move = _select_layers_for_migration(
-        candidates, current, physical, counts, spec.local_experts, known_gains
+        candidates,
+        current,
+        physical,
+        counts,
+        spec.local_experts,
+        known_gains,
+        observed_peaks=observed_peaks,
     )
     if not layers_to_move:
         return None
@@ -441,7 +453,7 @@ def _balance_recorded_steps(
     current,
     layer_ids,
     *,
-    observed_peaks=None,
+    observed_peaks,
 ):
     """Refine replica placement, spending extra searches on layers with headroom."""
     layers, capacity = physical.shape
@@ -507,12 +519,15 @@ def _balance_recorded_steps(
             improvement = 1 - (candidate_score / baseline[layer]).mean()
             live = current[layer].numpy().reshape(slots.shape)
             target = ids[layer, candidate]
-            observed = None if observed_peaks is None else observed_peaks[:, layer]
-            if not estimate_migration_gain(samples[:, layer], live, target, observed):
+            before_peak = observed_peaks[:, layer]
+            layer_counts = samples[:, layer]
+            if not estimate_migration_gain(
+                layer_counts, target, before_peak=before_peak
+            ):
                 continue
             primary = ids[layer, order[layer]]
             primary_gain = estimate_migration_gain(
-                samples[:, layer], live, primary, observed
+                layer_counts, primary, before_peak=before_peak
             )
             if primary_gain and improvement <= 1e-12:
                 continue
@@ -539,7 +554,9 @@ def _balance_recorded_steps(
     return _reindex_placement(physical, logical, order)
 
 
-def _prefer_fewer_moves(old, physical, logical, counts, local_experts, layer_ids):
+def _prefer_fewer_moves(
+    old, physical, logical, counts, local_experts, layer_ids, *, observed_peaks
+):
     """Save remote rows within 2% of the reference peak on the recorded load."""
     layers, capacity = old.shape
     live = old.numpy().reshape(layers, -1, local_experts)
@@ -580,7 +597,9 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts, layer_ids
             np.count_nonzero(reference != source)
         ):
             # Keep the aligned plan unless the cheaper move also passes admission.
-            gain = estimate_migration_gain(samples[:, layer], source, candidate)
+            gain = estimate_migration_gain(
+                samples[:, layer], candidate, before_peak=observed_peaks[:, layer]
+            )
             if gain:
                 result[layer] = candidate
                 cheaper_gains[layer] = gain
@@ -679,7 +698,7 @@ def _admit_dispatch_layers(
 
 
 def _select_layers_for_migration(
-    changed, old, physical, counts, local_experts, known_gains
+    changed, old, physical, counts, local_experts, known_gains, *, observed_peaks
 ):
     """Skip marginal improvements and stage the most useful layers first."""
     load = counts.numpy()
@@ -691,7 +710,9 @@ def _select_layers_for_migration(
         target = after[layer].reshape(live.shape)
         gain = known_gains.get(layer)
         if gain is None:
-            gain = estimate_migration_gain(load[:, layer], live, target)
+            gain = estimate_migration_gain(
+                load[:, layer], target, before_peak=observed_peaks[:, layer]
+            )
         if not gain:
             continue
         receives = max(

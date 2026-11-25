@@ -44,20 +44,28 @@ class EplbControl:
     def __init__(self, group: dist.ProcessGroup):
         self.group = group
         self.wait_seconds = 0.0
+        # The forward thread owns votes and waits for each reduction to finish.
+        self._vote_values = np.empty(8, dtype=np.int64)
+        self._vote_flags = torch.from_numpy(self._vote_values)
 
     def vote(
         self, epoch: int, phase: int, layer: int, ready: bool, error: bool
     ) -> tuple[bool, bool]:
         # MAX(x), MAX(-x) detects mismatched protocol positions on every rank.
-        flags = torch.tensor(
-            [epoch, -epoch, phase, -phase, layer, -layer, int(not ready), int(error)],
-            dtype=torch.int64,
-            device="cpu",
+        self._vote_values[:] = (
+            epoch,
+            -epoch,
+            phase,
+            -phase,
+            layer,
+            -layer,
+            int(not ready),
+            int(error),
         )
         start = time.perf_counter()
-        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=self.group)
+        dist.all_reduce(self._vote_flags, op=dist.ReduceOp.MAX, group=self.group)
         self.wait_seconds += time.perf_counter() - start
-        values = flags.tolist()
+        values = self._vote_flags.tolist()
         if any(values[i] != -values[i + 1] for i in (0, 2, 4)):
             raise RuntimeError("EPLB ranks reached different protocol boundaries")
         return values[6] == 0, bool(values[7])
