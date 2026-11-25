@@ -224,6 +224,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## HTTP server
+
+<Warning>
+`--host` defaults to `127.0.0.1`. Before binding to `0.0.0.0` or exposing the port beyond a trusted network, set `--api-key`: without it, anyone who can reach the port can send requests. Set `--admin-api-key` only if you need the control endpoints it unlocks (weight updates, LoRA loading, profiling), and keep it separate from `--api-key`.
+</Warning>
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
