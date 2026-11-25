@@ -123,7 +123,7 @@ class TestDiskPreprocessCache(unittest.TestCase):
         """The temporary file is the claim: the second of two concurrent writers does nothing."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        key = build_cache_key("image.png")
+        key = structured_digest("image.png").hex()
         cache = DiskPreprocessCache(directory.name)
         release = threading.Event()
         real_save = torch.save
@@ -150,7 +150,7 @@ class TestDiskPreprocessCache(unittest.TestCase):
             [path.name for path in Path(directory.name).rglob("*.tmp")], []
         )
 
-        failing_key = build_cache_key("video.mp4")
+        failing_key = structured_digest("video.mp4").hex()
         with patch("torch.save", side_effect=OSError(errno.ENOSPC, "No space left")):
             with self.assertRaises(OSError):
                 cache[failing_key] = torch.zeros(8)
@@ -164,7 +164,7 @@ class TestDiskPreprocessCache(unittest.TestCase):
         """Removing a live writer's claim lets its rename publish another writer's partial file."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        key = build_cache_key("image.png")
+        key = structured_digest("image.png").hex()
         path = DiskPreprocessCache(directory.name)._path(key)
         path.parent.mkdir(parents=True)
         claim = path.with_name(path.name + ".tmp")
