@@ -1516,7 +1516,13 @@ mod tests {
                 rid: rid.into(),
                 text: r#"[{"name":"search","parameters":{"q": "[other()]"},"arguments":null}]"#
                     .into(),
-                finish_reason: Some(super::FinishKind::Length { length: Some(24) }.into()),
+                finish_reason: Some(
+                    super::FinishKind::Length {
+                        length: Some(24),
+                        ignored_stop: None,
+                    }
+                    .into(),
+                ),
                 completion_tokens: 24,
                 ..Default::default()
             })
