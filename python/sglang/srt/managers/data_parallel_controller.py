@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    is_control_broadcast_local,
     publish,
 )
 from sglang.srt.server_args import (
@@ -248,8 +249,9 @@ class DataParallelController:
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
-            self.control_message_step = 1 if local_ctrl else get_parallel().tp_size
+            self.control_message_step = (
+                1 if is_control_broadcast_local() else get_parallel().tp_size
+            )
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
@@ -978,9 +980,7 @@ def run_data_parallel_controller_process(
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )

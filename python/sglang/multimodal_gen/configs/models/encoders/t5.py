@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import argparse
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
@@ -28,6 +27,9 @@ class T5ArchConfig(TextEncoderArchConfig):
     relative_attention_max_distance: int = 128
     dropout_rate: float = 0.1
     layer_norm_epsilon: float = 1e-6
+    # Plain-PyTorch T5 LayerNorm (the HF / Wan reference math: fp32 statistics, cast
+    # to the weight dtype, then scale) instead of sglang's RMSNorm kernel.
+    reference_layer_norm: bool = False
     initializer_factor: float = 1.0
     feed_forward_proj: str = "relu"
     dense_act_fn: str = ""
@@ -78,9 +80,3 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
-
-    @staticmethod
-    def add_cli_args(
-        parser: argparse.ArgumentParser, prefix: str = "t5-config"
-    ) -> argparse.ArgumentParser:
-        return parser

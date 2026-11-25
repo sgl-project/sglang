@@ -27,8 +27,6 @@ MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla", "aiter"]
 # ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
 # forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
 # handlers keep returning the generic method; the platform swap happens here.
-# MHA_CHUNKED_KV deliberately stays generic on ROCm. Its shared implementation
-# selects the ROCm prepare/fetch helpers and the portable merge_state wrapper.
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
@@ -262,10 +260,10 @@ AttentionBackendRegistry.register("fa3", handle_attention_fa3)
 AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
 AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
+# CuteDSL shares TRT-LLM's prefill implementation. Cached prefill must use
+# expanded MHA heads, not the default handler's absorbed-MLA dimensions.
+AttentionBackendRegistry.register("cutedsl_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("dsa", handle_attention_dsa)
-AttentionBackendRegistry.register(
-    "nsa", handle_attention_dsa
-)  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)

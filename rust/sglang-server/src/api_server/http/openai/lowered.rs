@@ -14,14 +14,14 @@ use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Reply, TokenPieces,
-    lower_chat,
+    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, ROUTING_KEY_HEADER,
+    Reply, TokenPieces, lower_chat,
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
-use super::super::dp_relay::HintRoute;
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
+use super::pd_routing::HintRoute;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
 use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};
@@ -161,7 +161,7 @@ pub(super) async fn chat(
 ) -> Option<Response> {
     state.openai_chat.as_ref()?;
     let header = |name: &str| headers.get(name)?.to_str().ok().map(str::to_owned);
-    let routing_key = header("x-smg-routing-key");
+    let routing_key = header(ROUTING_KEY_HEADER);
     let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
@@ -487,7 +487,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let vocab = json!({"[UNK]": 0, "!": 1, "#": 2, "Ã©": 3});
             let model = json!({"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"});
-            let config = json!({"model": model, "pre_tokenizer": {"type": "Whitespace"}});
+            let config = json!({"model": model, "pre_tokenizer": {"type": "Whitespace"},
+                "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}});
             let path = dir.join("tokenizer.json");
             std::fs::write(&path, config.to_string()).unwrap();
             path.to_string_lossy().into_owned()

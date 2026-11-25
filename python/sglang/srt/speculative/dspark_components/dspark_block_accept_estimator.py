@@ -38,7 +38,7 @@ def block_accept_skip_reason(
 ) -> Optional[str]:
     if not logits_adjustments_are_noop:
         return (
-            "non-noop logits adjustments (penalizer/logit_bias/grammar) "
+            "non-noop logits adjustments (penalties/logit_bias/grammar) "
             "in batch; cross-step conditioning of the gathered target "
             "probabilities would be state-dependent"
         )
