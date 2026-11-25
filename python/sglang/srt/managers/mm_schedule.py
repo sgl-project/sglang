@@ -11,7 +11,7 @@ from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 
@@ -486,6 +486,15 @@ def _batch_encode_per_image_misses(
     return hash_to_embedding
 
 
+def _full_path_encoder_free_bytes(device: torch.device) -> Optional[int]:
+    if device.type != "cuda":
+        return None
+    # Ranks cannot independently choose different encoder calls.
+    if get_parallel().tp_size != 1:
+        return 0
+    return torch.cuda.mem_get_info(device)[0]
+
+
 def _batch_encode_full_path_misses(
     data_embedding_func: DataEmbeddingFunc,
     full_path_requests: List[PerImageRequestInfo],
@@ -505,11 +514,15 @@ def _batch_encode_full_path_misses(
         seen.add(key)
     if len(misses) < 2:
         return {}
+    sizes = [sum(end - start + 1 for start, end in req.items_offset) for req in misses]
+    free_bytes = _full_path_encoder_free_bytes(device)
+    # Budget vision activations by output tokens and leave headroom for preprocessing.
+    if free_bytes is not None and free_bytes < (2 << 30) + sum(sizes) * (256 << 10):
+        return {}
     items = [item for req in misses for item in req.items]
     _move_items_to_device(items, device, data_embedding_func)
     embedding = _flatten_embedding_result(data_embedding_func(items))
     embedding = embedding.reshape(-1, embedding.shape[-1])
-    sizes = [sum(end - start + 1 for start, end in req.items_offset) for req in misses]
     if embedding.shape[0] != sum(sizes):
         return {}
     return {req.req_idx: emb for req, emb in zip(misses, embedding.split(sizes))}

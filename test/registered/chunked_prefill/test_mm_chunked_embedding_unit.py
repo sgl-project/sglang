@@ -364,11 +364,17 @@ def _multi_span_encoder(items):
     )
 
 
-@pytest.mark.parametrize("case", ["cuda", "duplicate", "hip", "evs"])
+@pytest.mark.parametrize("case", ["cuda", "duplicate", "hip", "evs", "low_memory"])
 def test_cross_request_multi_span_batching(monkeypatch, case):
-    """Multi-span items (e.g. timestamped videos) of all requests share one encoder
-    call and a repeated item is encoded once; HIP and EVS keep per-request calls."""
+    """Batch multi-span items unless the backend or free memory rules it out."""
     monkeypatch.setattr(mm_schedule, "_is_hip", case == "hip")
+    if case == "low_memory":
+        monkeypatch.setattr(
+            mm_schedule,
+            "_full_path_encoder_free_bytes",
+            lambda _: 1 << 30,
+            raising=False,
+        )
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = [
         MultimodalDataItem(
@@ -385,6 +391,8 @@ def test_cross_request_multi_span_batching(monkeypatch, case):
         evs_enabled = case == "evs"
 
         def get_video_feature(self, batch):
+            if case == "low_memory" and len(batch) > 1:
+                raise torch.cuda.OutOfMemoryError("test encoder cannot batch")
             calls.append(batch)
             return _multi_span_encoder(batch)
 
