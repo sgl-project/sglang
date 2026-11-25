@@ -24,6 +24,13 @@ from sglang.srt.utils import is_gfx95_supported
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
 
+# gfx950: a bank of more than 4 rows is walked in 2-row tiles. An 8-row tile needs
+# 8 warps, which leaves one CTA per CU where 4 warps run two. Measured on MI355X,
+# H=7168, against one 8-row tile: a launch at nvb 5..8 takes 0.61-0.79x at
+# 560..16384 tokens. Fixed per nvb so that a row's bits do not depend on its batch.
+_SINGLE_TILE_ROWS: int = 4
+_TILE_ROWS: int = 2
+
 
 @cache
 def supports_attn_res_hip(hidden_size: int, nvb: int) -> bool:
@@ -34,6 +41,36 @@ def supports_attn_res_hip(hidden_size: int, nvb: int) -> bool:
 
 def _tile_size(hidden_size: int, nvb: int) -> int:
     return triton.next_power_of_2(max(nvb, 1)) * triton.next_power_of_2(hidden_size)
+
+
+def _tile_rows(nvb: int) -> int:
+    if is_gfx95_supported() and nvb > _SINGLE_TILE_ROWS:
+        return _TILE_ROWS
+    return triton.next_power_of_2(nvb)
+
+
+@triton.jit
+def _score_tile(
+    bank_ptr,  # this token's bank rows
+    cw,
+    offs_r,  # bank rows of the tile
+    offs,
+    mask,
+    stride_bb,
+    score_eps,
+    H: tl.constexpr,
+    NVB: tl.constexpr,
+):
+    mask_r = offs_r < NVB
+    tile = tl.load(
+        bank_ptr + offs_r[:, None] * stride_bb + offs[None, :],
+        mask=mask_r[:, None] & mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    score = tl.sum(tile * cw[None, :], axis=1) / tl.sqrt(
+        tl.sum(tile * tile, axis=1) / H + score_eps
+    )
+    return tile, score, mask_r
 
 
 @triton.jit
@@ -56,7 +93,7 @@ def _agg_kernel(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NVB: tl.constexpr,
-    R_PAD: tl.constexpr,
+    R_TILE: tl.constexpr,
     HAS_ADD: tl.constexpr,
     WRITE_BANK: tl.constexpr,
     APPLY_OUT_NORM: tl.constexpr,
@@ -70,20 +107,23 @@ def _agg_kernel(
     one's online softmax reads each row once but chains one block-wide reduction
     per row; here each link in that chain costs a full HBM round-trip —
     measured 1.1us/row, dead linear in NVB, because there is no TMA pipeline to
-    hide it behind. Scoring the rows as one [R_PAD, BLOCK_H] tile instead puts
+    hide it behind. Scoring the rows as one [R_TILE, BLOCK_H] tile instead puts
     every row's load in flight at once, and keeping that tile in registers lets
     the mix reuse it rather than re-reading the bank, which at one active CU is
     the difference between ~9us and ~12.5us at NVB=8.
 
     Holding the tile is why NVB is a constexpr and why MAX_REGISTER_TILE caps
-    the shape: the register budget is what this trades away.
+    the shape: the register budget is what this trades away. A bank of more
+    than R_TILE rows is walked tile by tile, the softmax taken online across
+    the tiles (see _tile_rows).
 
     The prefix row streams through anyway, so the pending residual add and the
     bank snapshot ride along for free — no other program reads bank row NVB, so
     those stores need no synchronization.
 
-    Taking the global max before exponentiating makes this bit-comparable to
-    the 2-kernel pipeline rather than to the SM100 kernel.
+    A bank that is one tile takes the global max before exponentiating, which
+    makes it bit-comparable to the 2-kernel pipeline rather than to the SM100
+    kernel.
     """
     t = tl.program_id(0).to(tl.int64)  # t * stride_bm overflows int32
     offs = tl.arange(0, BLOCK_H)
@@ -108,25 +148,37 @@ def _agg_kernel(
     cw = tl.load(cw_ptr + offs, mask=mask, other=0.0)
     p_score = tl.sum(pv * cw) / tl.sqrt(tl.sum(pv * pv) / H + score_eps)
 
-    # The whole bank, in registers: every row's load is in flight at once, and
-    # the mix below reuses it instead of going back to HBM.
-    offs_r = tl.arange(0, R_PAD)
-    mask_r = offs_r < NVB
-    tile = tl.load(
-        bank_ptr + t * stride_bm + offs_r[:, None] * stride_bb + offs[None, :],
-        mask=mask_r[:, None] & mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    b_score = tl.sum(tile * cw[None, :], axis=1) / tl.sqrt(
-        tl.sum(tile * tile, axis=1) / H + score_eps
-    )
+    bank_t = bank_ptr + t * stride_bm
+    offs_r = tl.arange(0, R_TILE)
+    if NVB <= R_TILE:
+        # The whole bank, in registers: every row's load is in flight at once,
+        # and the mix below reuses it instead of going back to HBM.
+        tile, b_score, mask_r = _score_tile(
+            bank_t, cw, offs_r, offs, mask, stride_bb, score_eps, H, NVB
+        )
+        m = tl.maximum(tl.max(tl.where(mask_r, b_score, -float("inf"))), p_score)
+        b_w = tl.where(mask_r, tl.exp(b_score - m), 0.0)
+        p_w = tl.exp(p_score - m)
+        inv = 1.0 / (tl.sum(b_w) + p_w)
 
-    m = tl.maximum(tl.max(tl.where(mask_r, b_score, -float("inf"))), p_score)
-    b_w = tl.where(mask_r, tl.exp(b_score - m), 0.0)
-    p_w = tl.exp(p_score - m)
-    inv = 1.0 / (tl.sum(b_w) + p_w)
-
-    acc = pv * (p_w * inv) + tl.sum(b_w[:, None] * inv * tile, axis=0)
+        acc = pv * (p_w * inv) + tl.sum(b_w[:, None] * inv * tile, axis=0)
+    else:
+        # acc and z are the mix and its weight sum in units of exp(m), m the
+        # largest score so far: each tile rescales them to its own maximum.
+        m = p_score
+        z = 1.0
+        acc = pv
+        for r0 in tl.static_range(0, NVB, R_TILE):
+            tile, b_score, mask_r = _score_tile(
+                bank_t, cw, r0 + offs_r, offs, mask, stride_bb, score_eps, H, NVB
+            )
+            m_tile = tl.maximum(tl.max(tl.where(mask_r, b_score, -float("inf"))), m)
+            decay = tl.exp(m - m_tile)
+            b_w = tl.where(mask_r, tl.exp(b_score - m_tile), 0.0)
+            acc = acc * decay + tl.sum(b_w[:, None] * tile, axis=0)
+            z = z * decay + tl.sum(b_w)
+            m = m_tile
+        acc = acc * (1.0 / z)
 
     if APPLY_OUT_NORM:
         scale = 1.0 / tl.sqrt(tl.sum(acc * acc) / H + out_eps)
@@ -206,10 +258,9 @@ def attn_res_hip(
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
         NVB=nvb,
-        R_PAD=triton.next_power_of_2(nvb),
+        R_TILE=_tile_rows(nvb),
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        # an 8-row bank tile spills at 4 warps (measured on MI350X, H=7168)
-        num_warps=8 if is_gfx95_supported() and triton.next_power_of_2(nvb) >= 8 else 4,
+        num_warps=4,
     )
