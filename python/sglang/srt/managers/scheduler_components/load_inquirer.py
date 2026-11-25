@@ -241,6 +241,7 @@ class SchedulerLoadInquirer:
         decode_moments = list(totals) if totals[0] > 0 else None
 
         storage_hit_tokens = storage_unfulfilled_tokens = None
+        backuped_tokens = backup_dropped_tokens = None
         storage = (
             self.get_storage_metrics_collector()
             if self.get_storage_metrics_collector is not None
@@ -251,6 +252,8 @@ class SchedulerLoadInquirer:
             storage_unfulfilled_tokens = dict(
                 storage.total_storage_prefetch_unfulfilled_tokens
             )
+            backuped_tokens = storage.total_backuped_tokens
+            backup_dropped_tokens = storage.total_backup_dropped_tokens
 
         return LoadSnapshot(
             dp_rank=int(get_parallel().dp_rank)
@@ -279,5 +282,7 @@ class SchedulerLoadInquirer:
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
             total_storage_prefetch_hit_tokens=storage_hit_tokens,
             total_storage_prefetch_unfulfilled_tokens=storage_unfulfilled_tokens,
+            total_backuped_tokens=backuped_tokens,
+            total_backup_dropped_tokens=backup_dropped_tokens,
             decode_moments=decode_moments,
         )
