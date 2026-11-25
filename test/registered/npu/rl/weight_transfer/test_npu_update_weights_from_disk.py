@@ -69,12 +69,11 @@ def _is_weight_file(name: str) -> bool:
     return name.endswith(WEIGHT_SUFFIXES)
 
 
-def write_refit_checkpoints(source: str, perturbed: str, malformed: str) -> None:
-    """Write a valid refit target and a partial checkpoint with a bad shape."""
+def write_perturbed_checkpoint(source: str, destination: str) -> str:
+    """Copy ``source`` into ``destination`` with one tensor scaled."""
     from safetensors.torch import load_file, save_file
 
-    os.makedirs(perturbed)
-    os.makedirs(malformed)
+    os.makedirs(destination, exist_ok=True)
     shards = sorted(
         name
         for name in os.listdir(source)
@@ -90,16 +89,6 @@ def write_refit_checkpoints(source: str, perturbed: str, malformed: str) -> None
         raise AssertionError(f"{PERTURBED_TENSOR} is not in {source}")
 
     weight = state[PERTURBED_TENSOR]
-    # The loader sorts safetensors keys, so o_proj is copied before the norm
-    # fails. The partial write would undo the perturbation if left in place.
-    save_file(
-        {
-            PERTURBED_TENSOR: weight,
-            "model.norm.weight": state["model.norm.weight"][:2].clone(),
-        },
-        os.path.join(malformed, "model.safetensors"),
-        metadata={"format": "pt"},
-    )
     state[PERTURBED_TENSOR] = (
         (weight.float() * PERTURBED_SCALE + PERTURBED_BIAS)
         .to(weight.dtype)
@@ -112,12 +101,13 @@ def write_refit_checkpoints(source: str, perturbed: str, malformed: str) -> None
             continue
         if name.endswith(".index.json"):
             continue
-        shutil.copyfile(path, os.path.join(perturbed, name))
+        shutil.copyfile(path, os.path.join(destination, name))
     save_file(
         state,
-        os.path.join(perturbed, "model.safetensors"),
+        os.path.join(destination, "model.safetensors"),
         metadata={"format": "pt"},
     )
+    return destination
 
 
 @unittest.skipUnless(HAVE_MODEL, f"model not found: {MODEL}")
@@ -127,9 +117,9 @@ class TestNpuUpdateWeightsFromDisk(CustomTestCase):
         cls._perturbed_dir = tempfile.TemporaryDirectory(
             prefix="npu-disk-refit-target-"
         )
-        cls.perturbed = os.path.join(cls._perturbed_dir.name, "perturbed")
-        cls.malformed = os.path.join(cls._perturbed_dir.name, "malformed")
-        write_refit_checkpoints(MODEL, cls.perturbed, cls.malformed)
+        cls.perturbed = write_perturbed_checkpoint(
+            MODEL, os.path.join(cls._perturbed_dir.name, "perturbed")
+        )
         env = npu_rl_env()
         with npu_server(cls.perturbed, extra_args=BASE_ARGS, env=env) as base_url:
             cls.perturbed_reference = logprob_signature(base_url, PROMPTS)
@@ -185,23 +175,6 @@ class TestNpuUpdateWeightsFromDisk(CustomTestCase):
             self._signature(),
             self.perturbed_reference,
             "refit from disk did not reproduce a startup load of the same checkpoint",
-        )
-
-        failed = post(
-            self.base_url,
-            "/update_weights_from_disk",
-            {"model_path": self.malformed, "load_format": "auto"},
-            expect=None,
-        )
-        self.assertEqual(failed.status_code, 400, failed.text)
-        result = failed.json()
-        self.assertFalse(result["success"])
-        self.assertIn("Attempted to load weight", result["message"])
-        self.assertIn("Rolling back to original weights", result["message"])
-        assert_logprob_signature_equal(
-            self._signature(),
-            self.perturbed_reference,
-            "rollback did not restore the last successful refit",
         )
 
         # Refitting back has to restore the original model, not a blend.

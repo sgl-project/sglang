@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import logging
-from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -213,16 +212,14 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        # Keep the last successful checkpoint available until the refit commits.
-        candidate_config = copy(self.model_config)
-        candidate_config.model_path = model_path
+        self.model_config.model_path = model_path
         # PP stages handle disk updates sequentially, unlike cold startup.
         load_config = LoadConfig(
             load_format=load_format, load_group=get_pp_stage_load_group()
         )
 
         # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, candidate_config)
+        loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
             return False, message
@@ -249,7 +246,7 @@ class WeightUpdater:
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(candidate_config)
+                iter = get_weight_iter(self.model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
@@ -265,7 +262,6 @@ class WeightUpdater:
                 model_load_weights(self.get_model(), iter)
                 return False, message
 
-        self.model_config.model_path = model_path
         self.update_model_fields(
             model,
             model_path=model_path,
