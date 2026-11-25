@@ -49,10 +49,13 @@ when too few CUDA devices are visible. Run directly with:
 import ctypes
 import functools
 import gc
+import json
 import math
 import os
+import tempfile
 import unittest
 import unittest.mock
+from collections import Counter
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -865,7 +868,7 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
 
 def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
-    """Names of the GPU kernels and copies one sharded batch's gathers issue."""
+    """GPU activity names and memcpy records for one batch's gathers."""
     torch.cuda.synchronize()
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
@@ -876,26 +879,49 @@ def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
         for layer_id in range(_GATHER_LAYER_NUM):
             pool.get_key_buffer(layer_id)
         torch.cuda.synchronize()
-    return [
+    activity = [
         event.name
         for event in prof.events()
         if event.device_type == torch.autograd.DeviceType.CUDA
     ]
+    with tempfile.TemporaryDirectory() as directory:
+        trace_path = os.path.join(directory, "gather.json")
+        prof.export_chrome_trace(trace_path)
+        with open(trace_path) as f:
+            copies = [
+                event
+                for event in json.load(f)["traceEvents"]
+                if event.get("cat") == "gpu_memcpy"
+            ]
+    return activity, copies
 
 
 def _run_multicast_mla(rank, world, port):
     pool, req_to_token, prefix_len, seq_len = _run_mla(
         rank, world, port, multicast=True
     )
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    activity, copies = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
     assert not nccl_kernels, f"gather ran NCCL kernels: {nccl_kernels}"
-    # The multicast chunk copies are peer copies; the plan's own host syncs
-    # are device-to-host copies.
+    # Multicast copies can be DtoD on the local rank and PtoP on peers.
+    # Match chunk sizes to exclude the planner's ordinary DtoD copies.
     block_bytes = pool._send_rows.numel() * pool._slots[0].tensors["kv"][0].nbytes
-    chunks = math.ceil(block_bytes / pool._multicast_gather.chunk_bytes)
-    copies = activity.count("Memcpy PtoP (Device -> Device)")
-    assert chunks > 1 and copies == _GATHER_LAYER_NUM * chunks, (copies, chunks)
+    chunk_bytes = pool._multicast_gather.chunk_bytes
+    chunks = math.ceil(block_bytes / chunk_bytes)
+    full_chunks, tail_bytes = divmod(block_bytes, chunk_bytes)
+    expected = Counter({chunk_bytes: _GATHER_LAYER_NUM * full_chunks})
+    if tail_bytes:
+        expected[tail_bytes] += _GATHER_LAYER_NUM
+    copy_names = (
+        "Memcpy PtoP (Device -> Device)",
+        "Memcpy DtoD (Device -> Device)",
+    )
+    observed = Counter(
+        event["args"]["bytes"]
+        for event in copies
+        if event["name"] in copy_names and event["args"]["bytes"] in expected
+    )
+    assert chunks > 1 and observed == expected, (dict(observed), dict(expected))
     torch.distributed.barrier()
 
 
@@ -907,7 +933,7 @@ def _run_cross_node_mla(rank, world, port):
         pool, req_to_token, prefix_len, seq_len = _run_mla(
             rank, world, port, multicast=False
         )
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    activity, _ = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     assert any("nccl" in name.lower() for name in activity), activity
 
 
@@ -951,7 +977,7 @@ def _run_unmapped_rank_mla(rank, world, port, unmapped_call):
         ),
     )
     assert len(calls) == 2, [tensor.nbytes for tensor in calls]
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    activity, _ = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     assert any("nccl" in name.lower() for name in activity), activity
 
 
