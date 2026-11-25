@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     decode_state_free_radix_of,
     mamba_extra_buffer_of,
+    mamba_strategy_is_auto,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -988,7 +989,10 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
     if not view.uses_mamba_radix_cache:
         # auto is arch-gated, so only an explicit strategy reaches a non-mamba
         # arch here, where it would arm the mamba paths and crash at prefill.
-        if mamba_extra_buffer_of(view):
+        # `auto_high_throughput` is still unresolved at this point and reads as
+        # an extra buffer, so it is excluded by name rather than by value: an
+        # auto token asked the engine to decide, and deciding is not an error.
+        if mamba_extra_buffer_of(view) and not mamba_strategy_is_auto(view):
             raise ValueError(
                 f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy} "
                 f"needs mamba state, got {hf_config.architectures[0]}."

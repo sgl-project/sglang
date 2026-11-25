@@ -215,6 +215,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "uses_mamba_radix_cache",
                     "decode_state_free_radix_default",
                     "mamba_radix_cache_strategy",
+                    "mamba_high_throughput_capacity",
                     "mamba_full_memory_ratio",
                     "ple_offload_embedding",
                     "speculative_moe_runner_backend",

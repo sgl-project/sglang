@@ -4,6 +4,7 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    mamba_strategy_is_auto,
     resolving_view,
 )
 
@@ -22,7 +23,7 @@ def _glm5_next_overrides(server_args: Any, hf_config: Any) -> dict:
     # Replaces the extra_buffer pick "auto" would make, where the lazy variant
     # is supported; the mamba radix-cache pass then leaves it alone.
     if (
-        cfg.mamba_radix_cache_strategy == "auto"
+        mamba_strategy_is_auto(cfg)
         and supports_mamba_cache_extra_buffer(cfg, hf_config)
         and cfg.disaggregation_mode == "null"
         and not cfg.disable_overlap_schedule

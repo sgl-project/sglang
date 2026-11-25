@@ -492,17 +492,153 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
-    if view.mamba_radix_cache_strategy == "auto":
+    if view.mamba_radix_cache_strategy in ("auto", "auto_high_throughput"):
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):
-            declared["mamba_radix_cache_strategy"] = "extra_buffer"
+            # `auto_high_throughput` keeps its name here and is resolved to a
+            # concrete strategy by `_mamba_high_throughput_capacity`, which runs
+            # after the last pass that may disable the overlap schedule. Until
+            # then it reads as a non-lazy extra buffer, the choice plain `auto`
+            # makes, so every reader in between sees a legal configuration.
+            if view.mamba_radix_cache_strategy == "auto":
+                declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
             declared["mamba_radix_cache_strategy"] = "no_buffer"
             declared["disable_overlap_schedule"] = True
     return declared
+
+
+def mamba_high_throughput_eligible(view: Any) -> Tuple[bool, Optional[str]]:
+    """Whether `auto_high_throughput` may take the lazy buffer and the decode-lock
+    skip here, and the reason it may not.
+
+    This gates on capability and compatibility, not on whether anyone has
+    benchmarked the exact deployment.
+
+    Most of a deployment's identity is in fact readable here: `tp_size` and the
+    dtypes are resolved fields, and neighbouring passes already call
+    `torch.cuda.get_device_capability()`. What is missing is only the GPU model
+    itself -- H20 and H100 share SM90, and no resolution pass asks for a device
+    name. But knowability is not the argument. An allowlist of benchmarked
+    (architecture, size, parallel layout, dtype, GPU) tuples fails closed for
+    every deployment nobody has measured yet, including each new GPU and each
+    new model size, and has to be edited on every new measurement. For an
+    explicit opt-in whose safety rests on the capability and compatibility
+    gates below, that buys nothing: the operator asked for this behaviour. So
+    the architecture question stays the capability question it already was
+    (`supports_mamba_cache_extra_buffer`), and the measured scope is documented
+    on the flag instead of enforced by a name list.
+
+    Reads the final overlap decision, so it is only meaningful once every pass
+    that writes ``disable_overlap_schedule`` has run.
+    """
+    if view.mamba_radix_cache_strategy != "auto_high_throughput":
+        return False, "strategy is not auto_high_throughput"
+    if not view.uses_mamba_radix_cache:
+        return False, "model does not route through the hybrid-mamba radix cache"
+    if view.disable_radix_cache:
+        return False, "radix cache is disabled, so one slot per request already"
+    hf_config = model_config_of(view).hf_config
+    arch = hf_config.architectures[0]
+    if not supports_mamba_cache_extra_buffer(view, hf_config):
+        return False, f"{arch} has no extra-buffer support on this backend"
+    # The lazy buffer needs the overlap schedule, and the pool it sizes for is
+    # not wired on a PD decode worker.
+    if view.disable_overlap_schedule:
+        return False, "overlap schedule is off, which the lazy buffer requires"
+    if view.disaggregation_mode == "decode":
+        return False, "a PD decode worker has no lazy tracking slots"
+    # Deliberately conservative rather than incompatible: the lazy buffer is
+    # wired for the speculative verify paths, but the capacity policy has no
+    # measurement with a draft model in the pool.
+    if view.speculative_algorithm is not None:
+        return False, "speculative decoding is outside the measured scope"
+    return True, None
+
+
+def mamba_high_throughput_slots(skip_decode_lock: bool) -> int:
+    """State slots a running request reserves once the policy has acted.
+
+    Mirrors `_calculate_mamba_ratio` for the lazy strategy so the startup log
+    can state the number the pool will actually be sized with, instead of the
+    number the policy hoped for.
+    """
+    from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP,
+        MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO,
+    )
+
+    base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
+        MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
+    )
+    return base + get_mamba_tracking_slots(extra_buffer=True, overlap=True, lazy=True)
+
+
+@register_post_process
+def _mamba_high_throughput_capacity(view: Any) -> dict:
+    """Resolve `auto_high_throughput` once the configuration is final.
+
+    `_mamba_radix_cache_resolution` runs before the passes that may disable the
+    overlap schedule (pipeline parallelism, the sparse-head embedding path,
+    diffusion LLM), and the lazy buffer requires it. Deciding there would hand
+    those deployments a configuration the pool sizing then rejects, so the
+    choice is made here instead, at the end of resolution.
+    """
+    if view.mamba_radix_cache_strategy != "auto_high_throughput":
+        return {}
+    eligible, reason = mamba_high_throughput_eligible(view)
+    if not eligible:
+        # Fall back to the token plain `auto` would have ended on, which is not
+        # always `extra_buffer`: where the model does not route through the
+        # hybrid-mamba radix cache, or the radix cache is off,
+        # `_mamba_radix_cache_resolution` declares nothing and `auto` survives
+        # unresolved. Rewriting those to `extra_buffer` would hand a deployment
+        # an extra-buffer strategy plain `auto` never selects.
+        declines = not view.uses_mamba_radix_cache or view.disable_radix_cache
+        fallback = "auto" if declines else "extra_buffer"
+        logger.info("auto_high_throughput: falling back to %s (%s).", fallback, reason)
+        return {
+            "mamba_radix_cache_strategy": fallback,
+            "mamba_high_throughput_capacity": False,
+        }
+    # The policy selecting the strategy does not settle the decode-lock skip: an
+    # explicitly set environment variable still wins, and with the skip off the
+    # lazy strategy reserves four slots, not three. Log what the pool will be
+    # sized with.
+    env = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK
+    if env.is_set():
+        skip = bool(env.get())
+        source = f"{env.name}={'1' if skip else '0'}"
+    else:
+        skip = True
+        source = "policy"
+    logger.info(
+        "auto_high_throughput: extra_buffer_lazy, decode-lock skip %s (%s); "
+        "a running request reserves %d mamba state slots.",
+        "on" if skip else "off",
+        source,
+        mamba_high_throughput_slots(skip),
+    )
+    return {
+        "mamba_radix_cache_strategy": "extra_buffer_lazy",
+        "mamba_high_throughput_capacity": True,
+    }
+
+
+def mamba_skip_decode_lock_of(cfg: Any) -> bool:
+    """Whether decode leaves the matched-prefix mamba state evictable.
+
+    Pool sizing (`_calculate_mamba_ratio`) and the decode-time lock
+    (`UnifiedRadixCache`) have to agree: sizing for the skip while still holding
+    the lock would oversubscribe the state pool. Both read this.
+    """
+    if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.is_set():
+        return envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+    return bool(getattr(cfg, "mamba_high_throughput_capacity", False))
 
 
 @register_post_process

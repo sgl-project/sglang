@@ -131,6 +131,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_model,
     get_observability,
@@ -1813,11 +1814,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # admission-locked last_node (recorded only if still present, locked before
         # the next alloc) -- not this evictable node. A scheduler that matched a
         # whole batch before locking would break that. Off = original full lock.
+        # The flag and the pool sizing read one answer
+        # (`overrides.mamba_skip_decode_lock_of`): sizing for the skip while
+        # still holding the lock would oversubscribe the state pool.
         req.lock = self.lock(
             new_last_node,
             skip_lock_components=(
                 (self.slot_id(TREE_STATE),)
-                if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+                if get_exec().mamba.mamba_skip_decode_lock
                 and self.slot_id(TREE_STATE) is not None
                 else ()
             ),

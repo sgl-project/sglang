@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    mamba_strategy_is_auto,
     model_config_of,
     resolving_view,
 )
@@ -81,7 +82,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # `collect_model_override_declarations` -- for an architecture whose
     # linear-attention spec sets `uses_mamba_radix_cache`. Inkling has no such
     # spec today, but giving it one would silently stop this pin from firing.
-    if cfg.mamba_radix_cache_strategy == "auto":
+    if mamba_strategy_is_auto(cfg):
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
     # The generic resolution never sets the arch-derived leaf for Inkling, and
     # handle_mamba_radix_cache rejects extra_buffer on a model without it.
