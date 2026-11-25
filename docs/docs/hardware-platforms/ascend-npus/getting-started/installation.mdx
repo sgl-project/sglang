@@ -328,6 +328,57 @@ pip install -e python[all_npu]
 
 ### Method 2: Using Docker Image
 
+#### Install Ascend Docker Runtime
+
+The container commands in this documentation rely on
+[Ascend Docker Runtime](https://www.hiascend.com/document/detail/en/mindcluster/latest/clustersched/schedulingug/docs/en/scheduling/01_introduction/01_component_description.md#ascend-docker-runtime) on the host.
+It is a container runtime plugin (an OCI prestart hook) that reads the `ASCEND_VISIBLE_DEVICES` environment variable
+passed to `docker run`: it binds the selected NPU device nodes (including `/dev/davinci_manager` and `/dev/hisi_hdc`)
+into the container and mounts the host driver dependencies the NPU stack needs. Without the runtime,
+`ASCEND_VISIBLE_DEVICES` is ignored and none of this is mounted automatically.
+
+Install it once per host as `root` (skip this step if the host already has it). Download the `.run` package
+from the [MindCluster releases page](https://gitcode.com/Ascend/mind-cluster/releases), then:
+
+```bash Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <version>: Ascend Docker Runtime package version you downloaded
+#   <arch>: host architecture, e.g. aarch64 or x86_64
+# ============================================================
+
+chmod u+x Ascend-docker-runtime_<version>_linux-<arch>.run
+./Ascend-docker-runtime_<version>_linux-<arch>.run --install
+systemctl daemon-reload && systemctl restart docker
+```
+
+Verify that the runtime is registered as Docker's default runtime:
+
+```bash Command
+docker info --format 'default={{.DefaultRuntime}}'
+```
+
+The output must be `default=ascend`. If it prints `default=runc`:
+
+1. If the `Runtimes:` line of `docker info` lists `ascend`, either pass `--runtime ascend` to every `docker run`,
+or set `"default-runtime": "ascend"` in `/etc/docker/daemon.json` and restart Docker.
+2. If `ascend` is missing from `Runtimes:`, rerun the installation above and restart Docker.
+
+**What the runtime handles and what stays in the command:**
+
+| Handled automatically by the runtime | Still set by the `docker run` command |
+|---|---|
+| NPU device nodes (`/dev/davinci*`, `/dev/davinci_manager`, `/dev/hisi_hdc`) for the ids in `ASCEND_VISIBLE_DEVICES` | The image tag |
+| Driver libraries (`/usr/local/Ascend/driver/lib64`, `/usr/local/Ascend/driver/include`) | The device ids in `ASCEND_VISIBLE_DEVICES`: `0-15` for a full A3 Series node (ids are DIE-level, see the [glossary](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware)), `0-7` for a full 950PR/DT Series node |
+| `/usr/local/dcmi`, `/usr/local/bin/npu-smi`, `/var/queue_schedule` | Extra mounts such as `/usr/local/Ascend/driver`, `/usr/local/Ascend/firmware`, `/etc/ascend_install.info`, `/usr/local/sbin`, model weights, and the HF cache |
+
+`ASCEND_VISIBLE_DEVICES` accepts a single id (`0`), a comma-separated list (`0,1`), an inclusive range (`0-15`),
+a mixed form (`0-3,7`), and `void` for a container without any NPU.
+
+If the runtime cannot be installed on the host (for example, no `root` access), containers can still be started
+with explicit `--device` and `--volume` flags — see
+[Running containers without Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/faq#9-running-containers-without-ascend-docker-runtime) in the FAQ.
+
 #### Obtain Image
 
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
@@ -382,6 +433,9 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 
 **Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
+The `drun` aliases below require [Ascend Docker Runtime](#install-ascend-docker-runtime) on the host and select
+all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
+
 Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
 weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
@@ -390,16 +444,13 @@ weights path — see [How do I provide model weights?](#how-do-i-provide-model-w
 
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
+# ASCEND_VISIBLE_DEVICES=0-15 selects all 16 DIE devices of a full A3 Series node
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
-    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
-    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --env ASCEND_VISIBLE_DEVICES=0-15 \
     --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+    --volume ~/.cache/:/root/.cache/'
 
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
@@ -412,17 +463,15 @@ drun --env "HF_TOKEN=<secret>" \
 
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
-# The 950PR/DT Series exposes 8 devices: /dev/davinci0 through /dev/davinci7
+# ASCEND_VISIBLE_DEVICES=0-7 selects all 8 devices of a full 950PR/DT Series node
 # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --env ASCEND_USE_FIA=1 \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
-    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --env ASCEND_VISIBLE_DEVICES=0-7 \
     --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+    --volume ~/.cache/:/root/.cache/'
 
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
