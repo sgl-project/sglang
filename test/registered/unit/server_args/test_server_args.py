@@ -56,6 +56,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
 )
 from sglang.srt.arg_groups.kv_shard_hook import (
     handle_kv_cache_sharding,
+    register_kv_shard_storage_backend,
     validate_kv_shard_attention_backend,
 )
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
@@ -4974,10 +4975,11 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with (
             patch(
                 "sglang.srt.arg_groups.kv_shard_hook._KV_SHARD_STORAGE_BACKENDS",
-                {"dynamic"},
+                set(),
             ),
             envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
         ):
+            register_kv_shard_storage_backend("dynamic")
             for backend in (None, "file", "dynamic"):
                 with self.subTest(backend=backend):
                     args = self._rounding_args(
@@ -5003,8 +5005,14 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             hicache_storage_backend="file",
             hicache_storage_key_scheme="rank-suffix",
         )
-        with self.assertRaisesRegex(ValueError, "requires .*key-scheme unified"):
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_shard_hook.kv_shard_storage_backend_supported"
+            ) as registered,
+            self.assertRaisesRegex(ValueError, "requires .*key-scheme unified"),
+        ):
             handle_kv_cache_sharding(args)
+        registered.assert_not_called()
 
     def test_hicache_file_storage_rejects_dsa(self):
         args = self._args(

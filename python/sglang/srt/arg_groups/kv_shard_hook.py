@@ -134,9 +134,9 @@ def resolve_kv_shard_file_storage(
     key_scheme: str,
 ) -> bool:
     """Validate sharded storage and select the built-in File I/O path."""
-    if kv_shard_storage_backend_supported(storage_backend):
-        return False
     if storage_backend != "file":
+        if kv_shard_storage_backend_supported(storage_backend):
+            return False
         raise ValueError(
             "--enable-kv-cache-sharding supports only the file built-in HiCache "
             f"storage backend, got {storage_backend!r}."
