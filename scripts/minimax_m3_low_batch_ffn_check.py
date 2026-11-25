@@ -16,8 +16,16 @@ It checks the low-batch boundary output against the stock one (per-row
 relative L2), every rank bit for bit, the unfused fallback (``finish``-style
 ``moe_finalize_fuse_shared`` + NCCL all-reduce) against the fused boundary,
 and the same in a CUDA graph (captured once, replayed on new rows), which is
-where FC2's early PDL trigger meets the boundary kernel. ``--bench`` adds
-CUDA-graph replay timings (cold L2) of the routed chains and the boundary.
+where FC2's early PDL trigger meets the boundary kernel.
+
+Each check runs twice: on the full handoff (routed + shared + residual), and
+routed-only, with the boundary given no shared output and a zero residual, so
+``residual_out`` is the all-reduced routed term alone and ``normed`` its
+RMSNorm. The routed-only pass is what sees a zeroed, mis-permuted or
+wrong-expert routed output, or FC2's PDL trigger racing the boundary (whose
+kernel then directly follows FC2); in the full pass the shared output and
+residual carry part of every row. ``--bench`` adds CUDA-graph replay timings
+(cold L2) of the routed chains and the boundary.
 
     torchrun --nproc-per-node 4 scripts/minimax_m3_low_batch_ffn_check.py
     torchrun --nproc-per-node 4 scripts/minimax_m3_low_batch_ffn_check.py --bench
@@ -81,7 +89,7 @@ def _log(coord, *args):
         print(*args, flush=True)
 
 
-def _probe(coord, routed, shared, stock_deferred):
+def _probe(coord, routed, shared, stock_deferred, clamp_fraction):
     """Step 0: what this check (and the served path) assumes about the image."""
     import cutlass
     import flashinfer
@@ -104,6 +112,13 @@ def _probe(coord, routed, shared, stock_deferred):
             f"[probe] experts.{name}: {tuple(tensor.shape)} {tensor.dtype} "
             f"contiguous={tensor.is_contiguous()}",
         )
+    spread = [float(a.max() / a.min()) for a in (routed.g1_alphas, routed.g2_alphas)]
+    _log(
+        coord,
+        f"[probe] routed FC1 pre-activations past the SwiGLU limit: "
+        f"{clamp_fraction:.3f} (expect about 0.16); g1_alphas / g2_alphas "
+        f"max/min {spread[0]:.2f} / {spread[1]:.2f} (expect above 3)",
+    )
     _log(
         coord,
         f"[probe] shared gate_up swizzled scale: "
@@ -139,7 +154,9 @@ def _fake_moe(routed, shared, bias, gate):
     )
 
 
-def _boundary(handoff, residual, gamma, world_size):
+def _boundary(handoff, residual, gamma, world_size, routed_only=False):
+    """The fused finalize + all-reduce + residual + RMSNorm on ``handoff``;
+    ``routed_only`` leaves the shared output out."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
     return all_reduce_fusion.moe_finalize_all_reduce_residual_norm(
@@ -147,7 +164,7 @@ def _boundary(handoff, residual, gamma, world_size):
         handoff.permuted_indices.reshape(-1),
         handoff.expert_weights,
         handoff.expert_weights.shape[1],
-        handoff.gated_shared_output,
+        None if routed_only else handoff.gated_shared_output,
         residual,
         gamma,
         EPS,
@@ -200,6 +217,39 @@ def _same_on_all_ranks(coord, label, rows, tensor):
     return same
 
 
+def _low_batch_boundary(coord, ffn, moe, x, residual, gamma, graph, routed_only):
+    """The low-batch handoff on ``x`` through the boundary, eager or in a CUDA
+    graph captured on zero rows and replayed on other rows before ``x``.
+    Returns ``(handoff, normed, residual_out, graph)``; keep the graph alive
+    while its outputs are read."""
+    if not graph:
+        handoff = ffn._run(moe, x)
+        normed, residual_out = _boundary(
+            handoff, residual, gamma, coord.world_size, routed_only
+        )
+        return handoff, normed, residual_out, None
+    static_x = torch.zeros_like(x)
+    static_residual = torch.zeros_like(residual)
+    ffn._run(moe, static_x)
+    torch.cuda.synchronize()
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cuda_graph):
+        handoff = ffn._run(moe, static_x)
+        normed, residual_out = _boundary(
+            handoff, static_residual, gamma, coord.world_size, routed_only
+        )
+    # Replay on other rows first, so stale state from it would show.
+    for step_x, step_residual in ((x.roll(1, 0), residual.roll(1, 0)), (x, residual)):
+        static_x.copy_(step_x)
+        static_residual.copy_(step_residual)
+        cuda_graph.replay()
+    return handoff, normed, residual_out, cuda_graph
+
+
+def _rms(tensor):
+    return float(tensor.float().pow(2).mean().sqrt())
+
+
 def _check_rows(coord, ffn, moe, routed, shared, rows, generator, graph):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         finalize_flashinfer_trtllm_deferred_output,
@@ -216,79 +266,77 @@ def _check_rows(coord, ffn, moe, routed, shared, rows, generator, graph):
         x[1] = 0
 
     stock, _, logits = _stock_handoff(x, moe, routed, shared)
-    stock_normed, stock_residual = _boundary(stock, residual, gamma, coord.world_size)
     ties = ref.near_tie_rows(logits, moe.e_score_correction_bias)
-
-    if not graph:
-        handoff = ffn._run(moe, x)
-        normed, residual_out = _boundary(handoff, residual, gamma, coord.world_size)
-    else:
-        static_x = torch.zeros_like(x)
-        static_residual = torch.zeros_like(residual)
-        ffn._run(moe, static_x)
-        torch.cuda.synchronize()
-        cuda_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(cuda_graph):
-            handoff = ffn._run(moe, static_x)
-            normed, residual_out = _boundary(
-                handoff, static_residual, gamma, coord.world_size
-            )
-        # Replay on other rows first, so stale state from it would show.
-        static_x.copy_(x.roll(1, 0))
-        static_residual.copy_(residual.roll(1, 0))
-        cuda_graph.replay()
-        static_x.copy_(x)
-        static_residual.copy_(residual)
-        cuda_graph.replay()
-    torch.cuda.synchronize()
-
-    mode = "graph" if graph else "eager"
-    ok = _compare(
-        coord, f"{mode} normed vs stock", rows, normed, stock_normed, ties
-    ) & _compare(
-        coord,
-        f"{mode} residual vs stock",
-        rows,
-        residual_out,
-        stock_residual,
-        ties,
-    )
-    ok &= _same_on_all_ranks(coord, f"{mode} normed", rows, normed)
-
-    # The unfused fallback (MoeDeferredFinalize.finish) on the same handoff.
-    deferred = SimpleNamespace(
-        gemm2_out=handoff.routed_output,
-        expanded_idx_to_permuted_idx=handoff.permuted_indices.reshape(-1),
-        expert_weights=handoff.expert_weights,
-        top_k=handoff.expert_weights.shape[1],
-    )
-    partial = finalize_flashinfer_trtllm_deferred_output(
-        deferred, handoff.gated_shared_output
-    ).float()
-    dist.all_reduce(partial, group=coord.device_group)
-    unfused_residual = partial + residual.float()
-    unfused_normed = (
-        unfused_residual
-        * torch.rsqrt(unfused_residual.pow(2).mean(-1, keepdim=True) + EPS)
-        * gamma.float()
-    )
     no_skip = torch.zeros_like(ties)
-    ok &= _compare(
-        coord,
-        f"{mode} residual vs unfused finish + NCCL",
-        rows,
-        residual_out,
-        unfused_residual,
-        no_skip,
-    )
-    ok &= _compare(
-        coord,
-        f"{mode} normed vs unfused finish + NCCL",
-        rows,
-        normed,
-        unfused_normed,
-        no_skip,
-    )
+    mode = "graph" if graph else "eager"
+    ok = True
+    for routed_only in (False, True):
+        label = f"{mode} {'routed-only' if routed_only else 'full'}"
+        residual_in = torch.zeros_like(residual) if routed_only else residual
+        stock_normed, stock_residual = _boundary(
+            stock, residual_in, gamma, coord.world_size, routed_only
+        )
+        handoff, normed, residual_out, _graph = _low_batch_boundary(
+            coord, ffn, moe, x, residual_in, gamma, graph, routed_only
+        )
+        torch.cuda.synchronize()
+        if routed_only and not graph:
+            # The all-reduced routed and shared terms, for scale.
+            shared_sum = handoff.gated_shared_output.float()
+            dist.all_reduce(shared_sum, group=coord.device_group)
+            _log(
+                coord,
+                f"  rows {rows:2d} {label}: RMS routed {_rms(residual_out):.3g}, "
+                f"shared {_rms(shared_sum):.3g}, residual {_rms(residual):.3g}",
+            )
+
+        ok &= _compare(
+            coord, f"{label} normed vs stock", rows, normed, stock_normed, ties
+        )
+        ok &= _compare(
+            coord,
+            f"{label} residual vs stock",
+            rows,
+            residual_out,
+            stock_residual,
+            ties,
+        )
+        ok &= _same_on_all_ranks(coord, f"{label} normed", rows, normed)
+
+        # The unfused fallback (MoeDeferredFinalize.finish) on the same handoff.
+        deferred = SimpleNamespace(
+            gemm2_out=handoff.routed_output,
+            expanded_idx_to_permuted_idx=handoff.permuted_indices.reshape(-1),
+            expert_weights=handoff.expert_weights,
+            top_k=handoff.expert_weights.shape[1],
+        )
+        partial = finalize_flashinfer_trtllm_deferred_output(
+            deferred, None if routed_only else handoff.gated_shared_output
+        ).float()
+        dist.all_reduce(partial, group=coord.device_group)
+        unfused_residual = partial + residual_in.float()
+        unfused_normed = (
+            unfused_residual
+            * torch.rsqrt(unfused_residual.pow(2).mean(-1, keepdim=True) + EPS)
+            * gamma.float()
+        )
+        ok &= _compare(
+            coord,
+            f"{label} residual vs unfused finish + NCCL",
+            rows,
+            residual_out,
+            unfused_residual,
+            no_skip,
+        )
+        ok &= _compare(
+            coord,
+            f"{label} normed vs unfused finish + NCCL",
+            rows,
+            normed,
+            unfused_normed,
+            no_skip,
+        )
+        del _graph
     return ok
 
 
@@ -381,8 +429,14 @@ def main():
     bias = torch.rand(128, generator=common, device="cuda") * 2
     moe = _fake_moe(routed, shared, bias, gate)
 
-    probe_x = torch.randn(8, hidden, device="cuda").bfloat16()
-    _probe(coord, routed, shared, _stock_handoff(probe_x, moe, routed, shared)[1])
+    probe_x = (torch.randn(8, hidden, device="cuda") * 2).bfloat16()
+    _probe(
+        coord,
+        routed,
+        shared,
+        _stock_handoff(probe_x, moe, routed, shared)[1],
+        ref.fc1_clamp_fraction(probe_x, routed),
+    )
 
     ffn = LowBatchFfn(moe)  # compiles and warms up, outside any capture
     _log(coord, f"[check] TP{coord.world_size}, {columns} columns per rank")

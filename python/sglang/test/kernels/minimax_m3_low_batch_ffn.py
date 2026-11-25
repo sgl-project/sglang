@@ -1,11 +1,25 @@
 """Oracles for the MiniMax-M3.1 low-batch FFN tests: one TP rank's MoE layer in
-SGLang's processed layout (random weights at checkpoint magnitudes), the
-stock routed call it replaces (``moe_fused_gate`` top-k, then the TRT-LLM-gen
-routed experts with ``do_finalize=False``), and an MXFP8 shared-expert
-reference in torch."""
+SGLang's processed layout, the stock routed call it replaces
+(``moe_fused_gate`` top-k, then the TRT-LLM-gen routed experts with
+``do_finalize=False``), and an MXFP8 shared-expert reference in torch.
+
+The random weights are sized so the tests can see what they check. Each
+routed expert has its own NVFP4 global scale (5e3-2.5e4, gate and up equal),
+so the per-expert ``g1_alphas`` / ``g2_alphas`` (and the stock per-expert
+clamp limit and beta, ``clamp / g1`` and ``beta / g1``) differ by up to 5x and
+a kernel that reads another expert's scale moves the row. The block scales
+follow the global scale, so every expert's effective weights have RMS
+``WEIGHT_RMS``: on ``x = randn * 2`` rows the routed FC1 pre-activations have
+a standard deviation of about 5, and about a sixth of them pass the SwiGLU-OAI
+limit of 7 (``fc1_clamp_fraction``). The routed and shared outputs then have
+comparable sizes (RMS about 10 per rank), so a boundary check on their sum
+sees the routed half.
+"""
 
 from __future__ import annotations
 
+import dataclasses
+import math
 from types import SimpleNamespace
 from unittest import mock
 
@@ -38,29 +52,67 @@ def _random_bytes(shape, generator, low: int, high: int, dtype=torch.uint8):
     )
 
 
+# The 16 E2M1 values by code (bit 3 the sign) and their RMS over uniform codes.
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_RMS = math.sqrt(sum(v * v for v in _E2M1) / len(_E2M1))
+# RMS of the per-block spread 2**u, u uniform in [-0.5, 0.5].
+_SPREAD_RMS = math.sqrt(1.5 / math.log(4))
+# Effective (dequantized) RMS of every routed expert's FC1 and FC2 weights.
+WEIGHT_RMS = 0.032
+# Per-expert NVFP4 global scales are drawn uniformly from this range.
+GLOBAL_SCALE_RANGE = (5e3, 2.5e4)
+
+
+def _nvfp4_experts(n: int, k: int, generator: torch.Generator):
+    """Random NVFP4 weights for every expert, [EXPERTS, n, k]: packed E2M1
+    codes, E4M3 block scales (one per 16 values along k) and a per-expert
+    FP32 global scale. Dequantized as ``e2m1 * block_scale / global``, every
+    expert's weights have RMS about ``WEIGHT_RMS``; the block scales stay
+    below 448."""
+    low, high = GLOBAL_SCALE_RANGE
+    packed = _random_bytes((EXPERTS, n, k // 2), generator, 0, 256)
+    global_scale = low + (high - low) * torch.rand(
+        EXPERTS, generator=generator, device="cuda"
+    )
+    base = WEIGHT_RMS * global_scale / (_E2M1_RMS * _SPREAD_RMS)
+    spread = torch.exp2(
+        torch.rand((EXPERTS, n, k // 16), generator=generator, device="cuda") - 0.5
+    )
+    block_scale = (base.view(-1, 1, 1) * spread).clamp(max=448)
+    return packed, block_scale.to(torch.float8_e4m3fn), global_scale
+
+
+def _dequant_nvfp4(
+    packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    """FP32 [n, k] from one expert's packed E2M1 [n, k / 2] (low nibble
+    first), E4M3 block scales [n, k / 16] and scalar global scale."""
+    table = torch.tensor(_E2M1, device=packed.device)
+    table = torch.cat([table, -table])
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).flatten(-2).long()
+    scale = block_scale.float().repeat_interleave(16, dim=-1)
+    return table[codes] * scale / global_scale
+
+
 def build_routed_layer(columns: int, generator: torch.Generator) -> torch.nn.Module:
     """One rank's NVFP4 experts (``columns`` intermediate columns), processed by
     ``MiniMaxM3Nvfp4MoE._process_trtllm_weights`` exactly as at load time.
-    ``layer.quant_info`` is the payload the scheme hands the stock runner."""
+    ``layer.quant_info`` is the payload the scheme hands the stock runner;
+    ``layer.reference_fc1`` is expert 0's dequantized FC1 weight [2 * columns,
+    HIDDEN] (rows ``[gate; up]``), for ``fc1_clamp_fraction``."""
     layer = torch.nn.Module()
-    e4m3 = torch.float8_e4m3fn
+    w13, w13_scale, w13_global = _nvfp4_experts(2 * columns, HIDDEN, generator)
+    w2, w2_scale, w2_global = _nvfp4_experts(HIDDEN, columns, generator)
+    reference_fc1 = _dequant_nvfp4(w13[0], w13_scale[0], w13_global[0])
     params = dict(
-        w13_weight_packed=_random_bytes(
-            (EXPERTS, 2 * columns, HIDDEN // 2), generator, 0, 256
-        ),
-        # E4M3 block scales between 0.5 and 4.
-        w13_weight_scale=_random_bytes(
-            (EXPERTS, 2 * columns, HIDDEN // 16), generator, 0x30, 0x48, e4m3
-        ),
-        w13_weight_global_scale=torch.full((EXPERTS, 2), 1.5e4, device="cuda"),
+        w13_weight_packed=w13,
+        w13_weight_scale=w13_scale,
+        # Gate and up share each expert's global scale, as the loader requires.
+        w13_weight_global_scale=w13_global.unsqueeze(1).repeat(1, 2),
         w13_input_global_scale=torch.ones((EXPERTS, 2), device="cuda"),
-        w2_weight_packed=_random_bytes(
-            (EXPERTS, HIDDEN, columns // 2), generator, 0, 256
-        ),
-        w2_weight_scale=_random_bytes(
-            (EXPERTS, HIDDEN, columns // 16), generator, 0x30, 0x48, e4m3
-        ),
-        w2_weight_global_scale=torch.full((EXPERTS,), 1.5e4, device="cuda"),
+        w2_weight_packed=w2,
+        w2_weight_scale=w2_scale,
+        w2_weight_global_scale=w2_global,
         w2_input_global_scale=torch.ones((EXPERTS,), device="cuda"),
     )
     for name, tensor in params.items():
@@ -98,7 +150,27 @@ def build_routed_layer(columns: int, generator: torch.Generator) -> torch.nn.Mod
     scheme.apply_weights(layer, None)
     layer.quant_info = captured["q"]
     layer.scheme = scheme
+    layer.reference_fc1 = reference_fc1
     return layer
+
+
+def fc1_clamp_fraction(x: torch.Tensor, layer: torch.nn.Module) -> float:
+    """Fraction of expert 0's routed FC1 pre-activations on the nonzero rows
+    of ``x`` (BF16 in torch, no input quantization) whose magnitude passes the
+    SwiGLU-OAI limit: the share of the FC1 epilogue the clamp decides. Every
+    expert's weights have the same RMS, so expert 0 stands for all."""
+    x = x[x.ne(0).any(-1)].float()
+    if x.numel() == 0:
+        return 0.0
+    pre = x @ layer.reference_fc1.t()
+    return float((pre.abs() > SWIGLU_LIMIT).float().mean())
+
+
+def without_fc1_clamp(layer: torch.nn.Module):
+    """``layer.quant_info`` with the stock routed FC1 clamp lifted far past any
+    pre-activation, to show the clamp changes the oracle's outputs."""
+    info = layer.quant_info
+    return dataclasses.replace(info, gemm1_clamp_limit=info.gemm1_clamp_limit * 1e4)
 
 
 def build_shared(columns: int, generator: torch.Generator) -> SimpleNamespace:
@@ -149,9 +221,11 @@ def stock_routed_deferred(
     weights: torch.Tensor,
     ids: torch.Tensor,
     layer: torch.nn.Module,
+    quant_info=None,
 ):
     """The stock routed call on ``x`` stopped after GEMM2: a
-    ``FlashInferTrtllmDeferredFinalizeOutput``."""
+    ``FlashInferTrtllmDeferredFinalizeOutput``. ``quant_info`` defaults to
+    ``layer.quant_info``."""
     dispatch = StandardDispatchOutput(
         hidden_states=x,
         hidden_states_scale=None,
@@ -164,7 +238,10 @@ def stock_routed_deferred(
         mock.patch.object(flashinfer_trtllm, "is_allocation_symmetric", lambda: False),
     ):
         return flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp4(
-            dispatch, layer.quant_info, layer.moe_runner_config, use_routed_topk=True
+            dispatch,
+            layer.quant_info if quant_info is None else quant_info,
+            layer.moe_runner_config,
+            use_routed_topk=True,
         ).hidden_states
 
 

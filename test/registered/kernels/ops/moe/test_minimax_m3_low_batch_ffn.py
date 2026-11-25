@@ -6,7 +6,11 @@ TRT-LLM-gen routed experts stopped after GEMM2, on weights SGLang's own NVFP4
 loader processed; the shared side with an MXFP8 torch reference. Both chains
 round through NVFP4 / MXFP8 and accumulate in different orders, so a row may
 move by about a percent when a rounding flips; a wrong expert, scale, clamp,
-weight or row moves it by far more.
+weight or row moves it by far more. The oracle gives every expert its own
+global scale and sizes the weights so the FC1 clamp decides part of the
+epilogue; ``test_oracle_reaches_clamp_and_expert_scales`` checks both, and
+``test_wrong_expert_scale_is_caught`` that the comparison fails a kernel
+reading another expert's ``alpha``.
 """
 
 import sys
@@ -100,6 +104,23 @@ def _run(x, logits, bias, routed, shared, records):
     return out, weights, permuted, shared_out
 
 
+def _stock_rows(x, logits, bias, routed, quant_info=None):
+    """The stock routed rows (FP32 weighted sum over the top-k), the stock
+    routing weights, and the rows whose top-k set is not a near tie."""
+    from sglang.test.kernels import minimax_m3_low_batch_ffn as ref
+
+    rows = x.shape[0]
+    stock_weights, stock_ids = ref.stock_topk(logits, bias, ROUTED_SCALING_FACTOR)
+    stock = ref.stock_routed_deferred(x, stock_weights, stock_ids, routed, quant_info)
+    want = ref.weighted_rows(
+        stock.gemm2_out,
+        stock.expert_weights,
+        stock.expanded_idx_to_permuted_idx,
+        rows,
+    )
+    return want, stock_weights, ~ref.near_tie_rows(logits, bias)
+
+
 def _check(result, x, logits, bias, routed, shared):
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import (
         moe_finalize_fuse_shared,
@@ -115,10 +136,7 @@ def _check(result, x, logits, bias, routed, shared):
     assert bool(((permuted >= 0) & (permuted < out.shape[0])).all())
     assert bool((permuted.sort(-1).values.diff(dim=-1) > 0).all())
 
-    stock_weights, stock_ids = ref.stock_topk(logits, bias, ROUTED_SCALING_FACTOR)
-    stock = ref.stock_routed_deferred(x, stock_weights, stock_ids, routed)
-    ties = ref.near_tie_rows(logits, bias)
-    exact = ~ties
+    want, stock_weights, exact = _stock_rows(x, logits, bias, routed)
     torch.testing.assert_close(
         weights.sort(-1).values[exact],
         stock_weights.float().reshape(-1, 4)[:rows].sort(-1).values[exact],
@@ -127,12 +145,6 @@ def _check(result, x, logits, bias, routed, shared):
     )
 
     mine = ref.weighted_rows(out, weights, permuted, rows)
-    want = ref.weighted_rows(
-        stock.gemm2_out,
-        stock.expert_weights,
-        stock.expanded_idx_to_permuted_idx,
-        rows,
-    )
     routed_error = ref.relative_errors(mine, want)
     shared_error = ref.relative_errors(shared_out, ref.shared_reference(x, shared))
     for row in range(rows):
@@ -183,6 +195,65 @@ def test_low_batch_ffn_matches_stock(layer, rows, kind, graph):
         cuda_graph.replay()
         torch.cuda.synchronize()
         _check(result, step_x, step_logits, bias, routed, shared)
+
+
+def test_oracle_reaches_clamp_and_expert_scales(layer):
+    """The comparisons above can see the per-expert scales and the FC1 clamp:
+    the experts' alphas differ, part of the FC1 pre-activations pass the
+    SwiGLU-OAI limit, and lifting the stock clamp moves the stock rows far
+    past ``TOLERANCE``."""
+    from sglang.test.kernels import minimax_m3_low_batch_ffn as ref
+
+    routed, _, _ = layer
+    for name in ("g1_alphas", "g2_alphas"):
+        alphas = getattr(routed, name).float()
+        assert float(alphas.max() / alphas.min()) > 3, (name, alphas)
+
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    x, logits, bias = _inputs("random", 32, generator)
+    fraction = ref.fc1_clamp_fraction(x, routed)
+    assert 0.02 < fraction < 0.5, fraction
+
+    want, _, exact = _stock_rows(x, logits, bias, routed)
+    unclamped, _, _ = _stock_rows(
+        x, logits, bias, routed, quant_info=ref.without_fc1_clamp(routed)
+    )
+    keep = exact & x.ne(0).any(-1)
+    moved = ref.relative_errors(unclamped, want)[keep]
+    assert float((moved > 5 * TOLERANCE).float().mean()) > 0.9, moved
+
+
+@pytest.mark.parametrize("wrong", ["alpha1", "alpha2"])
+def test_wrong_expert_scale_is_caught(layer, wrong):
+    """Mutation check of the comparison: the low-batch routed chain fed the
+    previous expert's FC1 or FC2 alpha misses the stock rows by more than
+    ``TOLERANCE`` on (nearly) every row."""
+    from sglang.kernels.ops.moe.minimax_m3_low_batch import ffn
+    from sglang.test.kernels import minimax_m3_low_batch_ffn as ref
+
+    routed, _, _ = layer
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    x, logits, bias = _inputs("random", 16, generator)
+    alphas = dict(alpha1=routed.g1_alphas, alpha2=routed.g2_alphas)
+    alphas[wrong] = alphas[wrong].roll(1).contiguous()
+    out, weights, permuted = ffn.low_batch_routed_ffn(
+        x,
+        logits,
+        bias=bias,
+        routed_scaling_factor=ROUTED_SCALING_FACTOR,
+        w13=routed.w13_weight,
+        w13_scale=routed.w13_weight_scale,
+        w2=routed.w2_weight,
+        w2_scale=routed.w2_weight_scale,
+        columns=routed.intermediate_size_per_partition,
+        **alphas,
+    )
+    torch.cuda.synchronize()
+    want, _, exact = _stock_rows(x, logits, bias, routed)
+    mine = ref.weighted_rows(out, weights, permuted, x.shape[0])
+    keep = exact & x.ne(0).any(-1)
+    errors = ref.relative_errors(mine, want)[keep]
+    assert float((errors > TOLERANCE).float().mean()) > 0.9, errors
 
 
 def test_bf16_weights_variant(layer):
