@@ -41,7 +41,6 @@ from sglang.srt.configs.hy_v4_flash import (
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -1307,15 +1306,10 @@ class HYV4FlashModel(nn.Module):
             **get_embedding_tp_kwargs(),
         )
         self.alt_stream = None
-        device = torch.device("cuda", torch.cuda.current_device())
-        ihc_single_pass = (
-            envs.SGLANG_OPT_HY4_FLASH_IHC_SINGLE_PASS.get()
-            and hy4_ihc_single_pass_supported(
-                hc_mult=config.hc_mult,
-                hidden_size=config.hidden_size,
-                dtype=self.embed_tokens.weight.dtype,
-                device=device,
-            )
+        ihc_single_pass = hy4_ihc_single_pass_supported(
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            dtype=self.embed_tokens.weight.dtype,
         )
         self.rope_store = (
             _MRopePositionStore(config.mrope_section)
@@ -1338,7 +1332,7 @@ class HYV4FlashModel(nn.Module):
             out_norms = [layer.self_attn.out_norm for layer in self.layers]
             out_norms += [layer.mlp.out_norm for layer in self.layers]
             prepare_hy4_ihc_single_pass(
-                device=device,
+                device=torch.device("cuda", torch.cuda.current_device()),
                 out_norm_variants=tuple({n is not None for n in out_norms}),
             )
         self.engram_hasher = None

@@ -18,10 +18,10 @@ runs the gates, combine and RMSNorm over the whole row from L2.
 Large T (2-3 launches): out-norm rsqrt per row, then stage 1 on tensor cores (CTA =
 BT tokens x a KR-wide K range; hc_fn split into two bf16 terms in registers), then
 stage 2 per row. Stage 1 prefetches every load one chunk ahead into registers and
-runs with num_stages=1. Do not feed tl.dot straight from loads in a pipelined loop
-here: with bf16 hc_fn tiles loaded in a tl.range(num_stages=2 or 3) loop, Triton 3.8
-let the next activation copy overwrite the shared buffer the previous async wgmma
-still read (30/30 runs differed at T=7726).
+runs with num_stages=1. Workaround for a Triton 3.8 pipelining race: with bf16 hc_fn
+tiles loaded straight into tl.dot in a tl.range(num_stages=2 or 3) loop, the next
+activation copy overwrote the shared buffer the previous async wgmma still read
+(30/30 runs differed at T=7726). Re-check and drop when upgrading past Triton 3.8.x.
 
 Concurrency: the split-K tickets are one buffer per device. Two small-T calls in
 flight at once on different streams of one device would corrupt each other; SGLang
@@ -35,6 +35,8 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.arch import current_arch
 
 HC_MULT = 4
 HIDDEN_SIZE = 3072
@@ -468,30 +470,33 @@ def _ihc_stage2_kernel(
 
 
 def hy4_ihc_single_pass_supported(
-    *, hc_mult: int, hidden_size: int, dtype: torch.dtype, device: torch.device
+    *, hc_mult: int, hidden_size: int, dtype: torch.dtype
 ) -> bool:
-    """Coverage: SM90, hc_mult 4, hidden 3072, bf16 activations. The tile tables
-    were measured on H200 only; every other case takes the generic kernels."""
+    """Coverage: NVIDIA SM90 (the local GPU), hc_mult 4, hidden 3072, bf16
+    activations. The tile tables were measured on H200 only; every other case
+    takes the generic kernels."""
     return (
-        device.type == "cuda"
-        and torch.cuda.get_device_capability(device) == (9, 0)
-        and hc_mult == HC_MULT
+        hc_mult == HC_MULT
         and hidden_size == HIDDEN_SIZE
         and dtype == torch.bfloat16
+        and current_arch().is_sm(9, 0)
     )
 
 
 def _tickets(device: torch.device) -> torch.Tensor:
-    key = (device.type, device.index)
+    index = torch.cuda.current_device() if device.index is None else device.index
+    key = (device.type, index)
     tickets = _tickets_by_device.get(key)
     if tickets is None:
-        # Allocated inside a capture, the buffer would be zeroed at capture time
-        # only, not before each replay.
+        # A zeroing during capture is only recorded into the graph, not executed:
+        # eager calls and other graphs would read uninitialized tickets.
         assert not torch.cuda.is_current_stream_capturing(), (
             "hy4_ihc_single_pass: allocate the ticket buffer outside CUDA-graph "
             "capture (call prepare_hy4_ihc_single_pass at model init)"
         )
-        tickets = torch.zeros(_TICKET_SLOTS, dtype=torch.int32, device=device)
+        tickets = torch.zeros(
+            _TICKET_SLOTS, dtype=torch.int32, device=torch.device(device.type, index)
+        )
         _tickets_by_device[key] = tickets
     return tickets
 
@@ -604,6 +609,7 @@ def _tiled(
             RB=4,
             BLOCK_H=block_h,
             num_warps=8,
+            enable_fp_fusion=False,
         )
     else:
         inv_o = hc_scale
@@ -676,35 +682,39 @@ def hy4_ihc_single_pass(
     is accepted at every T. Only for inputs `hy4_ihc_single_pass_supported`
     accepts. Returns (new residual, y, next post); without `output` the
     residual is returned as the new residual."""
+    if out_norm_weight is not None and output is None:
+        raise ValueError("the output RMSNorm needs the block output")
     residual = residual.contiguous()
     hc_fn = hc_fn.contiguous()
     T, hc, hidden = residual.shape
     assert hc == HC_MULT and hidden == HIDDEN_SIZE, residual.shape
+    assert residual.dtype == torch.bfloat16, residual.dtype
     assert hc_fn.dtype == torch.float32 and hc_fn.shape == (2 * hc, hc * hidden)
     if output is not None:
+        assert output.dtype == torch.bfloat16, output.dtype
         output = output.contiguous()
         post = post.contiguous()
     if T == 0:
         return _outputs(output, residual)
-    args = (
-        output,
-        residual,
-        post,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        magnitude,
-        norm_eps,
-        hc_eps,
-        rms_weight,
-        rms_eps,
-        out_norm_weight,
-        out_norm_eps,
+    kwargs = dict(
+        output=output,
+        residual=residual,
+        post=post,
+        hc_fn=hc_fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        magnitude=magnitude,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        out_norm_weight=out_norm_weight,
+        out_norm_eps=out_norm_eps,
     )
     splitk_max_t = _SPLITK_MAX_T_NOOUT if output is None else _SPLITK_MAX_T_OUT
     if T <= splitk_max_t:
-        return _splitk(*args)
-    return _tiled(*args, cfg=_tiled_cfg(T, output is not None))
+        return _splitk(**kwargs)
+    return _tiled(**kwargs, cfg=_tiled_cfg(T, output is not None))
 
 
 def prepare_hy4_ihc_single_pass(

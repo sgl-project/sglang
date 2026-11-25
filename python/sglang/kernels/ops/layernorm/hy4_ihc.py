@@ -775,19 +775,19 @@ def hy4_ihc_post_pre_norm(
         # H200-tuned, hidden 3072 only (one launch at decode sizes); the kernels
         # below serve every other architecture and shape.
         return hy4_ihc_single_pass(
-            output,
-            residual,
-            post,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            magnitude,
-            norm_eps,
-            hc_eps,
-            rms_weight,
-            rms_eps,
-            out_norm_weight,
-            out_norm_eps,
+            output=output,
+            residual=residual,
+            post=post,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            magnitude=magnitude,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
         )
     residual = residual.contiguous()
     hc_fn = hc_fn.contiguous()

@@ -1,5 +1,7 @@
 """SM90 single-pass Hy4-Flash iHC post + pre + RMSNorm against an fp32 reference."""
 
+import sys
+
 import pytest
 import torch
 
@@ -144,7 +146,9 @@ def test_without_output_matches_reference(T):
     _assert_close(_call(x), _reference(x), has_out=False)
 
 
-@pytest.mark.parametrize("T,has_out", [(1, True), (64, True), (48, False), (78, True)])
+@pytest.mark.parametrize(
+    "T,has_out", [(1, True), (64, True), (32, False), (48, False), (78, True)]
+)
 def test_graph_replays_match_eager(T, has_out):
     """The split-K tickets reset themselves: every replay of a captured call, and
     every eager call after it, finishes each token exactly once."""
@@ -185,25 +189,34 @@ def test_no_compile_after_prepare():
 
 
 def test_ticket_buffer_not_allocated_in_capture():
-    """A buffer first allocated inside a capture would be zeroed only at capture
-    time, not before each replay."""
+    """A zeroing during capture is only recorded into the graph, not executed, so
+    a ticket buffer first allocated there would be uninitialized for eager calls
+    and other graphs."""
     sp._tickets_by_device.clear()
     x = _inputs(1, has_out=True)
     graph = torch.cuda.CUDAGraph()
     with pytest.raises(AssertionError, match="outside CUDA-graph capture"):
         with torch.cuda.graph(graph):
             _call(x)
+    # Allocated eagerly through the index-less device, as model init does.
     sp._tickets(torch.device("cuda"))
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        _call(x)
 
 
 def test_supported_shapes_only():
-    dev = torch.device("cuda")
-    ok = dict(hc_mult=HC, hidden_size=HIDDEN, dtype=torch.bfloat16, device=dev)
+    ok = dict(hc_mult=HC, hidden_size=HIDDEN, dtype=torch.bfloat16)
     assert sp.hy4_ihc_single_pass_supported(**ok)
-    for change in (
-        dict(hidden_size=4096),
-        dict(hc_mult=3),
-        dict(dtype=torch.float16),
-        dict(device=torch.device("cpu")),
-    ):
+    for change in (dict(hidden_size=4096), dict(hc_mult=3), dict(dtype=torch.float16)):
         assert not sp.hy4_ihc_single_pass_supported(**{**ok, **change})
+
+
+def test_out_norm_without_output_is_rejected():
+    x = _inputs(1, has_out=False)
+    x["out_norm_weight"] = x["rms_weight"]
+    with pytest.raises(ValueError, match="output RMSNorm"):
+        _call(x)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
