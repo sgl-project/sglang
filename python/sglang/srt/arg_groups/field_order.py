@@ -588,5 +588,6 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "token_space_preprocess_cache_trust_url",
 )
 # fmt: on

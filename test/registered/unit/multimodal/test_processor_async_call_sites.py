@@ -155,6 +155,7 @@ def test_expansion_and_packaging_share_one_worker_task():
 
     processor = object.__new__(TokenSpaceProcessor)
     processor.strategy = TokenSpaceProcessStrategy(None, None)
+    processor._item_feature_cache = None
     processor._load_media_lists = AsyncMock(return_value=([object()], [], []))
     processor._run_mm_processor = AsyncMock(return_value="result")
     package_output = object()
