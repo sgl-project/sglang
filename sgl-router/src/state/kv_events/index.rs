@@ -175,16 +175,6 @@ struct WorkerEntry {
     dp_ranks: Vec<u32>,
 }
 
-/// Ranks whose socket port is representable for a publisher range. This is
-/// shared by lifecycle bookkeeping and the subscriber registry contract so an
-/// expected load rank always has a corresponding SUB socket.
-fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
-    let port_base = u32::from(port_base);
-    (0..dp_size)
-        .filter(|rank| port_base.saturating_add(*rank) <= u32::from(u16::MAX))
-        .collect()
-}
-
 /// The read-only handles the `/metrics` scrape pulls the KV storage-tier
 /// series from. Narrower than an [`KvEventIndex`] handle on purpose: a route
 /// has no business calling `add_worker` / `remove_worker` / `shutdown`.
@@ -562,13 +552,21 @@ impl KvEventIndex {
         // hash KV blocks over token bigrams, so the policy must use the bigram
         // hasher for its query hashes to match the worker's stored hashes.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
-        let kv_dp_ranks = if self.maintain_tree {
-            subscribable_ranks(cfg.port_base, cfg.dp_size)
+        let resolved = cfg.resolved_publishers();
+        let kv_dp_ranks: Vec<u32> = if self.maintain_tree {
+            resolved
+                .iter()
+                .filter(|r| r.endpoint.is_some())
+                .map(|r| r.dp_rank)
+                .collect()
         } else {
             Vec::new()
         };
-        let load_descriptor_complete = cfg.load_port_base.is_some() && cfg.load_topic.is_some();
-        if cfg.load_port_base.is_some() != cfg.load_topic.is_some() {
+        let has_load_endpoints = resolved.iter().any(|r| r.load_endpoint.is_some());
+        let has_load_config =
+            has_load_endpoints || (cfg.publishers.is_empty() && cfg.load_port_base.is_some());
+        let load_descriptor_complete = has_load_endpoints && cfg.load_topic.is_some();
+        if has_load_config != cfg.load_topic.is_some() {
             warn!(
                 worker_url = %worker_url,
                 load_port_base = ?cfg.load_port_base,
@@ -576,11 +574,15 @@ impl KvEventIndex {
                 "kv-events: incomplete load descriptor; refusing load subscription"
             );
         }
-        let load_dp_ranks = cfg
-            .load_port_base
-            .filter(|_| load_descriptor_complete)
-            .map(|port_base| subscribable_ranks(port_base, cfg.dp_size))
-            .unwrap_or_default();
+        let load_dp_ranks: Vec<u32> = if load_descriptor_complete {
+            resolved
+                .iter()
+                .filter(|r| r.load_endpoint.is_some())
+                .map(|r| r.dp_rank)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut dp_ranks = kv_dp_ranks.clone();
         dp_ranks.extend(load_dp_ranks.iter().copied());
         dp_ranks.sort_unstable();
@@ -590,6 +592,7 @@ impl KvEventIndex {
                 worker_url = %worker_url,
                 port_base = cfg.port_base,
                 dp_size = cfg.dp_size,
+                publisher_count = cfg.publishers.len(),
                 "kv-events: no usable KV or load publisher ranks; skipping worker",
             );
             return;
@@ -600,6 +603,7 @@ impl KvEventIndex {
                 dp_size = cfg.dp_size,
                 port_base = cfg.port_base,
                 load_port_base = ?cfg.load_port_base,
+                publisher_count = cfg.publishers.len(),
                 block_size = cfg.block_size,
                 is_bigram = cfg.is_bigram,
                 "kv-events: subscribing",
@@ -609,6 +613,7 @@ impl KvEventIndex {
                 worker_url = %worker_url,
                 dp_size = cfg.dp_size,
                 load_port_base = ?cfg.load_port_base,
+                publisher_count = cfg.publishers.len(),
                 block_size = cfg.block_size,
                 is_bigram = cfg.is_bigram,
                 "kv-events: external Indexer configured; subscribing only to engine load",

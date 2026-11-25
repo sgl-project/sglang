@@ -45,6 +45,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         load_topic: None,
         replay_port_base: None,
         is_bigram: false,
+        publishers: Vec::new(),
     };
 
     // 2. Two independent router-process surrogates, each with its own
@@ -181,6 +182,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         load_topic: None,
         replay_port_base: None,
         is_bigram: false,
+        publishers: Vec::new(),
     };
     let cfg_y = EventConfig {
         host: "127.0.0.1".into(),
@@ -192,6 +194,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         load_topic: None,
         replay_port_base: None,
         is_bigram: false,
+        publishers: Vec::new(),
     };
 
     // Both routers subscribe to BOTH workers — the production fan-out.

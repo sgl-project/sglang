@@ -30,9 +30,11 @@
 //! # Endpoint construction
 //!
 //! Each call to [`KvEventSubscriberRegistry::add_worker`] takes an
-//! [`EventConfig`] describing where the worker publishes:
-//! `tcp://{cfg.host}:{cfg.port_base + dp_rank}` per rank in
-//! `0..cfg.dp_size`. The host comes from the worker's `/server_info`
+//! [`EventConfig`] describing where the worker publishes, resolved via
+//! [`EventConfig::resolved_publishers`]: either explicit per-rank endpoints
+//! from `/server_info["kv_events"]["publishers"]` (multi-node attention-DP)
+//! or the legacy single-host `tcp://{cfg.host}:{cfg.port_base + dp_rank}`
+//! per rank in `0..cfg.dp_size`. The host comes from `/server_info`
 //! introspection in production (so wildcard bind hosts resolve to the
 //! address the router can reach) or from the worker URL as a fallback.
 //!
@@ -210,10 +212,13 @@ impl KvEventSubscriberRegistry {
         self
     }
 
-    /// Open one SUB connection per `dp_rank` in `0..cfg.dp_size`,
-    /// connecting to `tcp://{cfg.host}:{cfg.port_base + dp_rank}`. Spawns
-    /// background tasks. Idempotent: a second `add_worker` for the same
-    /// `(worker_url, dp_rank)` pair is a no-op.
+    /// Open one SUB connection per resolved rank in [`EventConfig::resolved_publishers`].
+    ///
+    /// When `cfg.publishers` is non-empty, each rank connects to its own
+    /// advertised KV / replay / load endpoint URL. When `cfg.publishers` is
+    /// empty, falls back to `tcp://{cfg.host}:{port_base + dp_rank}` per rank
+    /// in `0..cfg.dp_size`. Spawns background tasks. Idempotent: a second
+    /// `add_worker` for the same `(worker_url, dp_rank)` pair is a no-op.
     ///
     /// `worker_url` is the HTTP URL the router uses for routing (e.g.,
     /// `"http://10.0.0.1:30000"`). It serves as the keying identity in the
@@ -223,18 +228,19 @@ impl KvEventSubscriberRegistry {
     ///
     /// # Errors
     ///
-    /// If `cfg.port_base + dp_rank` overflows `u16`, that rank is skipped
-    /// with a `warn!` log and the remaining ranks proceed.
+    /// In legacy single-host mode, if `port_base + dp_rank` overflows `u16`,
+    /// that rank is skipped with a `warn!` log and the remaining ranks proceed.
     pub async fn add_worker(&self, worker_url: &str, cfg: &EventConfig) {
-        // (port_base, topic) depend on this registry's kind. KV uses the cache
-        // socket + configured topic; Load uses its own advertised socket +
-        // topic. Refuse an incomplete load descriptor rather than subscribe-all:
-        // the load wire is a distinct contract and a future mixed-use socket
-        // must not feed unrelated payloads into the load decoder.
-        let (port_base, topic) = match self.kind {
-            SubKind::Kv => (cfg.port_base, cfg.topic.clone()),
-            SubKind::Load => match (&cfg.load_port_base, &cfg.load_topic) {
-                (Some(port), Some(topic)) => (*port, topic.clone()),
+        let resolved = cfg.resolved_publishers();
+        // Topic and endpoint selection depend on this registry's kind. KV uses
+        // the cache socket + configured topic; Load uses its own advertised
+        // socket + topic. Refuse an incomplete load descriptor rather than
+        // subscribe-all: the load wire is a distinct contract and a future
+        // mixed-use socket must not feed unrelated payloads into the load decoder.
+        let topic = match self.kind {
+            SubKind::Kv => cfg.topic.clone(),
+            SubKind::Load => match &cfg.load_topic {
+                Some(topic) if resolved.iter().any(|r| r.load_endpoint.is_some()) => topic.clone(),
                 _ => {
                     debug!(
                         worker_url = %worker_url,
@@ -245,7 +251,8 @@ impl KvEventSubscriberRegistry {
             },
         };
         let mut handles = self.inner.handles.lock().await;
-        for dp_rank in 0..cfg.dp_size {
+        for rank in resolved {
+            let dp_rank = rank.dp_rank;
             let id = KvWorkerId {
                 url: worker_url.to_string(),
                 dp_rank,
@@ -258,25 +265,36 @@ impl KvEventSubscriberRegistry {
                 );
                 continue;
             }
-            let port = match u16::try_from(port_base as u32 + dp_rank) {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!(
-                        worker_url = %worker_url,
-                        dp_rank,
-                        port_base,
-                        kind = ?self.kind,
-                        "ZMQ event port overflows u16; skipping this rank"
-                    );
-                    continue;
-                }
+            let (endpoint, replay) = match self.kind {
+                SubKind::Kv => match rank.endpoint {
+                    Some(ep) => (ep, rank.replay_endpoint),
+                    None => {
+                        warn!(
+                            worker_url = %worker_url,
+                            dp_rank,
+                            port_base = cfg.port_base,
+                            kind = ?self.kind,
+                            "ZMQ event port overflows u16; skipping this rank"
+                        );
+                        continue;
+                    }
+                },
+                SubKind::Load => match rank.load_endpoint {
+                    Some(ep) => (ep, None),
+                    None => {
+                        if cfg.publishers.is_empty() && cfg.load_port_base.is_some() {
+                            warn!(
+                                worker_url = %worker_url,
+                                dp_rank,
+                                port_base = ?cfg.load_port_base,
+                                kind = ?self.kind,
+                                "ZMQ event port overflows u16; skipping this rank"
+                            );
+                        }
+                        continue;
+                    }
+                },
             };
-            let endpoint = format!("tcp://{}:{}", cfg.host, port);
-            let replay = cfg
-                .replay_port_base
-                .filter(|_| self.kind == SubKind::Kv)
-                .and_then(|base| u16::try_from(base as u32 + dp_rank).ok())
-                .map(|port| format!("tcp://{}:{}", cfg.host, port));
             let cancel = CancellationToken::new();
             let join = spawn_subscriber_task(
                 id.clone(),
@@ -885,6 +903,7 @@ mod tests {
                 block_size: 64,
                 dp_size,
                 is_bigram: false,
+                publishers: Vec::new(),
             }
         }
 
@@ -1893,5 +1912,321 @@ mod tests {
         }
         assert_eq!(kinds, [5, 9, -1, 2, 0]);
         assert_eq!(tally.replays(ReplayOutcome::Failed), 0);
+    }
+
+    /// Multi-node `publishers` integration test on `KvEventSubscriberRegistry`:
+    /// binds 2 distinct KV PUB sockets, 2 replay ROUTER sockets, and 2 load PUB
+    /// sockets on non-contiguous OS-assigned ports, registers a single worker
+    /// with bogus legacy `port_base` values so only per-rank `publishers`
+    /// endpoints can work, and asserts KV events, gap replay, and load snapshots
+    /// flow cleanly for both ranks.
+    #[tokio::test]
+    async fn multinode_publishers_route_kv_replay_and_load_per_rank() {
+        use super::super::discovery::PublisherEndpointConfig;
+        use zeromq::RouterSocket;
+
+        let (mut pub0, port0) = helpers::make_pub_bound().await;
+        let (mut load0, load_port0) = helpers::make_pub_bound().await;
+        let (mut pub1, port1) = helpers::make_pub_bound().await;
+        let (mut load1, load_port1) = helpers::make_pub_bound().await;
+
+        let mut replay1 = RouterSocket::new();
+        let replay_ep1 = replay1.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+        let replay_server = tokio::spawn(async move {
+            let request = replay1.recv().await.unwrap();
+            let peer = request.get(0).unwrap().clone();
+            assert_eq!(request.get(2).unwrap().as_ref(), 2i64.to_be_bytes());
+            for (seq, payload) in [
+                (2, helpers::encode_all_blocks_cleared_batch(1.2, Some(1))),
+                (3, helpers::encode_all_blocks_cleared_batch(1.3, Some(1))),
+                (-1, Vec::new()),
+            ] {
+                let mut reply = ZmqMessage::from(peer.clone());
+                reply.push_back(Bytes::new());
+                reply.push_back(Bytes::copy_from_slice(&i64::to_be_bytes(seq)));
+                reply.push_back(Bytes::from(payload));
+                replay1.send(reply).await.unwrap();
+            }
+        });
+
+        let worker_url = "http://10.0.0.1:30000";
+        let cfg = EventConfig {
+            host: "10.0.0.1".into(),
+            // Deliberately invalid/unused legacy ports to prove `publishers` is used.
+            port_base: 1,
+            topic: String::new(),
+            load_port_base: Some(1),
+            load_topic: Some("load".into()),
+            replay_port_base: Some(1),
+            block_size: 64,
+            dp_size: 2,
+            is_bigram: false,
+            publishers: vec![
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: format!("tcp://127.0.0.1:{port0}"),
+                    replay_endpoint: None,
+                    load_endpoint: Some(format!("tcp://127.0.0.1:{load_port0}")),
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 1,
+                    endpoint: format!("tcp://127.0.0.1:{port1}"),
+                    replay_endpoint: Some(replay_ep1),
+                    load_endpoint: Some(format!("tcp://127.0.0.1:{load_port1}")),
+                },
+            ],
+        };
+
+        let (kv_tx, mut kv_rx) = mpsc::channel::<WorkerEvent>(16);
+        let tally = Arc::new(EventTally::new());
+        let kv_registry = KvEventSubscriberRegistry::new(kv_tx).with_tally(Arc::clone(&tally));
+        let (load_tx, mut load_rx) = mpsc::channel::<WorkerEvent>(16);
+        let load_registry = KvEventSubscriberRegistry::with_kind(load_tx, SubKind::Load);
+
+        kv_registry.add_worker(worker_url, &cfg).await;
+        load_registry.add_worker(worker_url, &cfg).await;
+        helpers::settle().await;
+
+        // Publish rank 0 seq 1 and rank 1 seqs 1, 4 (triggering gap replay 2..4 on rank 1).
+        pub0.send(helpers::build_multipart(
+            1,
+            helpers::encode_all_blocks_cleared_batch(0.1, Some(0)),
+        ))
+        .await
+        .unwrap();
+        for seq in [1, 4] {
+            pub1.send(helpers::build_multipart(
+                seq,
+                helpers::encode_all_blocks_cleared_batch(1.0 + seq as f64, Some(1)),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Publish load snapshots from both ranks.
+        load0
+            .send(helpers::build_multipart_with_topic(
+                b"load",
+                1,
+                helpers::encode_load_stat(3, 1, 128, 1024, 0),
+            ))
+            .await
+            .unwrap();
+        load1
+            .send(helpers::build_multipart_with_topic(
+                b"load",
+                1,
+                helpers::encode_load_stat(7, 2, 256, 1024, 1),
+            ))
+            .await
+            .unwrap();
+
+        let mut rank0_seqs = Vec::new();
+        let mut rank1_seqs = Vec::new();
+        for _ in 0..5 {
+            let ev = timeout(Duration::from_secs(2), kv_rx.recv())
+                .await
+                .expect("timed out waiting for KV batch")
+                .expect("kv channel closed");
+            let (worker, seq, _) = helpers::expect_batch(ev);
+            assert_eq!(worker.url, worker_url);
+            match worker.dp_rank {
+                0 => rank0_seqs.push(seq),
+                1 => rank1_seqs.push(seq),
+                other => panic!("unexpected dp_rank {other}"),
+            }
+        }
+        assert_eq!(rank0_seqs, [1]);
+        assert_eq!(rank1_seqs, [1, 2, 3, 4]);
+        assert_eq!(tally.replays(ReplayOutcome::Repaired), 1);
+        replay_server.await.unwrap();
+
+        let mut loads = HashMap::new();
+        for _ in 0..2 {
+            let ev = timeout(Duration::from_secs(2), load_rx.recv())
+                .await
+                .expect("timed out waiting for load event")
+                .expect("load channel closed");
+            match ev {
+                WorkerEvent::Load { worker, load } => {
+                    assert_eq!(worker.url, worker_url);
+                    loads.insert(worker.dp_rank, load.num_running_reqs);
+                }
+                other => panic!("expected Load event, got {other:?}"),
+            }
+        }
+        assert_eq!(loads.get(&0), Some(&3));
+        assert_eq!(loads.get(&1), Some(&7));
+
+        kv_registry.remove_worker(worker_url).await;
+        load_registry.remove_worker(worker_url).await;
+        kv_registry.shutdown().await;
+        load_registry.shutdown().await;
+    }
+
+    /// End-to-end integration test through `KvEventIndex`: binds 2 distinct
+    /// ZMQ PUB endpoints (and 2 load PUB endpoints) simulating 2 separate nodes
+    /// (`dp_rank=0` and `dp_rank=1` on non-contiguous ports), registers the
+    /// worker via `EventConfig` with `publishers`, publishes `BlockStored` and
+    /// `LoadStat` events from both ranks, and asserts both ranks are indexed in
+    /// `KvEventIndex` and cleanly removed on `remove_worker`.
+    #[tokio::test]
+    async fn multinode_publishers_events_indexed_in_kv_event_index() {
+        use super::super::discovery::PublisherEndpointConfig;
+        use super::super::hash::compute_block_hashes;
+        use super::super::index::KvEventIndex;
+        use rmp::encode as mp;
+
+        fn encode_block_stored_batch(
+            ts: f64,
+            block_hashes: &[i64],
+            token_ids: &[u32],
+            block_size: u32,
+            attn_dp_rank: u32,
+        ) -> Vec<u8> {
+            let mut buf = Vec::new();
+            // Outer batch array: [ts, [event], dp_rank]
+            mp::write_array_len(&mut buf, 3).unwrap();
+            mp::write_f64(&mut buf, ts).unwrap();
+            mp::write_array_len(&mut buf, 1).unwrap();
+            // Tagged map: BlockStored
+            mp::write_map_len(&mut buf, 7).unwrap();
+            mp::write_str(&mut buf, "type").unwrap();
+            mp::write_str(&mut buf, "BlockStored").unwrap();
+            mp::write_str(&mut buf, "block_hashes").unwrap();
+            mp::write_array_len(&mut buf, block_hashes.len() as u32).unwrap();
+            for &h in block_hashes {
+                mp::write_sint(&mut buf, h).unwrap();
+            }
+            mp::write_str(&mut buf, "parent_block_hash").unwrap();
+            mp::write_nil(&mut buf).unwrap();
+            mp::write_str(&mut buf, "token_ids").unwrap();
+            mp::write_array_len(&mut buf, token_ids.len() as u32).unwrap();
+            for &t in token_ids {
+                mp::write_uint(&mut buf, u64::from(t)).unwrap();
+            }
+            mp::write_str(&mut buf, "block_size").unwrap();
+            mp::write_uint(&mut buf, u64::from(block_size)).unwrap();
+            mp::write_str(&mut buf, "lora_id").unwrap();
+            mp::write_nil(&mut buf).unwrap();
+            mp::write_str(&mut buf, "medium").unwrap();
+            mp::write_str(&mut buf, "GPU").unwrap();
+            mp::write_uint(&mut buf, u64::from(attn_dp_rank)).unwrap();
+            buf
+        }
+
+        let (mut pub0, port0) = helpers::make_pub_bound().await;
+        // Allocate a spacer socket so rank 0 and rank 1 KV ports are guaranteed
+        // non-contiguous even if the OS assigns ports sequentially.
+        let (_spacer, _) = helpers::make_pub_bound().await;
+        let (mut pub1, port1) = helpers::make_pub_bound().await;
+        let (mut load0, load_port0) = helpers::make_pub_bound().await;
+        let (mut load1, load_port1) = helpers::make_pub_bound().await;
+        assert_ne!(port1, port0.wrapping_add(1));
+
+        let worker_url = "http://10.0.0.1:30000";
+        let block_size = 4u32;
+        let cfg = EventConfig {
+            host: "10.0.0.1".into(),
+            port_base: 1,
+            topic: String::new(),
+            load_port_base: None,
+            load_topic: Some("load".into()),
+            replay_port_base: None,
+            block_size,
+            dp_size: 2,
+            is_bigram: false,
+            publishers: vec![
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: format!("tcp://127.0.0.1:{port0}"),
+                    replay_endpoint: None,
+                    load_endpoint: Some(format!("tcp://127.0.0.1:{load_port0}")),
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 1,
+                    endpoint: format!("tcp://127.0.0.1:{port1}"),
+                    replay_endpoint: None,
+                    load_endpoint: Some(format!("tcp://127.0.0.1:{load_port1}")),
+                },
+            ],
+        };
+
+        let index = KvEventIndex::new();
+        index.add_worker(worker_url, Some(cfg)).await;
+        helpers::settle().await;
+
+        let tokens_rank0: Vec<u32> = (100..108).collect();
+        let tokens_rank1: Vec<u32> = (200..208).collect();
+        let hashes_rank0 = compute_block_hashes(&tokens_rank0, block_size as usize);
+        let hashes_rank1 = compute_block_hashes(&tokens_rank1, block_size as usize);
+
+        pub0.send(helpers::build_multipart(
+            1,
+            encode_block_stored_batch(1.0, &hashes_rank0, &tokens_rank0, block_size, 0),
+        ))
+        .await
+        .unwrap();
+        pub1.send(helpers::build_multipart(
+            1,
+            encode_block_stored_batch(2.0, &hashes_rank1, &tokens_rank1, block_size, 1),
+        ))
+        .await
+        .unwrap();
+        load0
+            .send(helpers::build_multipart_with_topic(
+                b"load",
+                1,
+                helpers::encode_load_stat(4, 0, 100, 1000, 0),
+            ))
+            .await
+            .unwrap();
+        load1
+            .send(helpers::build_multipart_with_topic(
+                b"load",
+                1,
+                helpers::encode_load_stat(6, 1, 200, 1000, 1),
+            ))
+            .await
+            .unwrap();
+
+        let id0 = KvWorkerId::new(worker_url.to_string(), 0);
+        let id1 = KvWorkerId::new(worker_url.to_string(), 1);
+        let tree = index.tree();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let m0 = tree.match_prefix(None, &hashes_rank0);
+            let m1 = tree.match_prefix(None, &hashes_rank1);
+            let load_ready = index
+                .engine_reported_load()
+                .capture_snapshot(std::time::Instant::now())
+                .fresh_load_for_url(worker_url)
+                .is_some();
+            if m0.holds(&id0) && m1.holds(&id1) && load_ready {
+                assert!(!m0.holds(&id1), "rank 1 must not hold rank 0 blocks");
+                assert!(!m1.holds(&id0), "rank 0 must not hold rank 1 blocks");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for both multi-node ranks to be indexed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let snap = index
+            .engine_reported_load()
+            .capture_snapshot(std::time::Instant::now());
+        let worker_load = snap
+            .fresh_load_for_url(worker_url)
+            .expect("both ranks reported fresh load");
+        assert_eq!(worker_load.num_running_reqs, 10);
+        assert_eq!(worker_load.num_waiting_reqs, 1);
+
+        index.remove_worker(worker_url).await;
+        assert!(!tree.match_prefix(None, &hashes_rank0).holds(&id0));
+        assert!(!tree.match_prefix(None, &hashes_rank1).holds(&id1));
+        assert_eq!(index.engine_reported_load().expected_count(), 0);
+        index.shutdown().await;
     }
 }

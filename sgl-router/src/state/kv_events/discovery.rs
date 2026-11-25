@@ -19,6 +19,7 @@
 //!   the error and skips subscription, but the worker remains in the
 //!   broader router registry. Future re-discovery may retry.
 
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -69,6 +70,254 @@ pub struct EventConfig {
     /// match the worker's stored hashes — otherwise cache-aware routing
     /// silently never matches and degrades to min-load.
     pub is_bigram: bool,
+    /// Optional per-rank ZMQ endpoints advertised in
+    /// `/server_info["kv_events"]["publishers"]`.
+    ///
+    /// When non-empty, [`EventConfig::resolved_publishers`] uses these
+    /// per-rank endpoints (supporting multi-node DP deployments where ranks
+    /// live on distinct hosts or non-contiguous ports). When empty (older
+    /// SGLang servers), it falls back identically to `host` + `port_base + dp_rank`.
+    pub publishers: Vec<PublisherEndpointConfig>,
+}
+
+/// Per-rank ZMQ publisher endpoints advertised in `/server_info["kv_events"]["publishers"]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PublisherEndpointConfig {
+    /// Attention-DP rank that owns these ZMQ sockets.
+    pub dp_rank: u32,
+    /// Reachable ZMQ KV-event PUB endpoint (e.g. `"tcp://10.0.0.2:5557"`).
+    pub endpoint: String,
+    /// Optional reachable ZMQ replay ROUTER endpoint for gap recovery.
+    #[serde(default)]
+    pub replay_endpoint: Option<String>,
+    /// Optional reachable ZMQ load-snapshot PUB endpoint.
+    #[serde(default)]
+    pub load_endpoint: Option<String>,
+}
+
+/// Resolved per-rank ZMQ endpoints ready for subscription.
+///
+/// Returned by [`EventConfig::resolved_publishers`], giving both
+/// [`super::index::KvEventIndex`] and [`super::subscriber::KvEventSubscriberRegistry`]
+/// a single unified iteration path across multi-node `publishers` configs and
+/// legacy single-host `host + port_base + dp_rank` configs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRankEndpoints {
+    /// Attention-DP rank.
+    pub dp_rank: u32,
+    /// Reachable ZMQ KV-event PUB endpoint for this rank, if representable
+    /// (`None` in legacy mode when `port_base + dp_rank` overflows `u16`).
+    pub endpoint: Option<String>,
+    /// Optional reachable ZMQ replay ROUTER endpoint for gap recovery.
+    pub replay_endpoint: Option<String>,
+    /// Optional reachable ZMQ load-snapshot PUB endpoint.
+    pub load_endpoint: Option<String>,
+}
+
+impl EventConfig {
+    /// Resolve the effective per-rank ZMQ endpoints for this worker.
+    ///
+    /// - When [`Self::publishers`] is non-empty, returns those per-rank
+    ///   endpoints normalized, sorted by `dp_rank`, and deduplicated (first
+    ///   entry per rank wins). Each rank's optional `replay_endpoint` and
+    ///   `load_endpoint` come strictly from that rank's entry rather than
+    ///   falling back to `self.host + *_port_base` (which belongs to a single
+    ///   host and would misroute other nodes).
+    /// - When [`Self::publishers`] is empty, falls back identically to the
+    ///   legacy single-host calculation: `tcp://{host}:{port_base + dp_rank}`
+    ///   for `dp_rank in 0..self.dp_size`.
+    pub fn resolved_publishers(&self) -> Vec<ResolvedRankEndpoints> {
+        if !self.publishers.is_empty() {
+            let fallback_host = (!self.host.is_empty() && !is_wildcard_host(&self.host))
+                .then_some(self.host.as_str());
+            let mut out = Vec::with_capacity(self.publishers.len());
+            for entry in &self.publishers {
+                let Some(endpoint) = normalize_tcp_endpoint(&entry.endpoint, fallback_host) else {
+                    continue;
+                };
+                let replay_endpoint = entry
+                    .replay_endpoint
+                    .as_deref()
+                    .and_then(|ep| normalize_tcp_endpoint(ep, fallback_host));
+                let load_endpoint = entry
+                    .load_endpoint
+                    .as_deref()
+                    .and_then(|ep| normalize_tcp_endpoint(ep, fallback_host));
+                out.push(ResolvedRankEndpoints {
+                    dp_rank: entry.dp_rank,
+                    endpoint: Some(endpoint),
+                    replay_endpoint,
+                    load_endpoint,
+                });
+            }
+            out.sort_by_key(|r| r.dp_rank);
+            out.dedup_by_key(|r| r.dp_rank);
+            return out;
+        }
+
+        (0..self.dp_size)
+            .map(|dp_rank| {
+                let endpoint = u16::try_from(u32::from(self.port_base) + dp_rank)
+                    .ok()
+                    .map(|port| format_tcp_endpoint(&self.host, port));
+                let replay_endpoint = self
+                    .replay_port_base
+                    .and_then(|base| u16::try_from(u32::from(base) + dp_rank).ok())
+                    .map(|port| format_tcp_endpoint(&self.host, port));
+                let load_endpoint = self
+                    .load_port_base
+                    .and_then(|base| u16::try_from(u32::from(base) + dp_rank).ok())
+                    .map(|port| format_tcp_endpoint(&self.host, port));
+                ResolvedRankEndpoints {
+                    dp_rank,
+                    endpoint,
+                    replay_endpoint,
+                    load_endpoint,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether `host` is a wildcard/unspecified bind address (`*`, `0.0.0.0`, `::`, `[::]`).
+pub(crate) fn is_wildcard_host(host: &str) -> bool {
+    if host == "*" {
+        return true;
+    }
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    unbracketed
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// Format a ZMQ TCP endpoint, bracketing unbracketed IPv6 literals automatically.
+pub(crate) fn format_tcp_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("tcp://[{host}]:{port}")
+    } else {
+        format!("tcp://{host}:{port}")
+    }
+}
+
+/// Parse a `tcp://<host>:<port>` ZMQ endpoint into `(host, port)`, rejecting
+/// empty, non-TCP, missing/zero-port, or malformed host strings.
+fn parse_tcp_endpoint(raw: &str) -> Option<(&str, u16)> {
+    let rest = raw.trim().strip_prefix("tcp://")?;
+    if let Some(bracketed) = rest.strip_prefix('[') {
+        let close = bracketed.find(']')?;
+        let inner = &bracketed[..close];
+        if inner.is_empty() || inner.parse::<Ipv6Addr>().is_err() {
+            return None;
+        }
+        let port_str = bracketed[close + 1..].strip_prefix(':')?;
+        let port: u16 = port_str.parse().ok()?;
+        if port == 0 {
+            return None;
+        }
+        Some((&rest[..=close + 1], port))
+    } else {
+        let (host, port_str) = rest.rsplit_once(':')?;
+        if host.is_empty()
+            || host
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '/' | '[' | ']'))
+        {
+            return None;
+        }
+        if host.contains(':') && host.parse::<Ipv6Addr>().is_err() {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        if port == 0 {
+            return None;
+        }
+        Some((host, port))
+    }
+}
+
+/// Normalize a ZMQ TCP endpoint string, substituting wildcard hosts with
+/// `worker_host` when available. Returns `None` if `raw` is empty or malformed.
+pub(crate) fn normalize_tcp_endpoint(raw: &str, worker_host: Option<&str>) -> Option<String> {
+    let (host, port) = parse_tcp_endpoint(raw)?;
+    if is_wildcard_host(host) {
+        let resolved_host = worker_host.unwrap_or(host);
+        Some(format_tcp_endpoint(resolved_host, port))
+    } else {
+        Some(format_tcp_endpoint(host, port))
+    }
+}
+
+/// Normalize, validate, sort, and deduplicate per-rank publisher entries from
+/// `/server_info["kv_events"]["publishers"]`.
+pub(crate) fn resolve_publishers(
+    raw: Vec<PublisherEndpointConfig>,
+    worker_host: Option<&str>,
+    worker_url: &str,
+) -> Vec<PublisherEndpointConfig> {
+    let mut resolved = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let dp_rank = entry.dp_rank;
+        let Some(endpoint) = normalize_tcp_endpoint(&entry.endpoint, worker_host) else {
+            warn!(
+                worker_url = %worker_url,
+                dp_rank,
+                endpoint = %entry.endpoint,
+                "kv-events: skipping publisher entry with empty or malformed endpoint"
+            );
+            continue;
+        };
+        let replay_endpoint = entry.replay_endpoint.and_then(|ep| {
+            let normalized = normalize_tcp_endpoint(&ep, worker_host);
+            if normalized.is_none() {
+                warn!(
+                    worker_url = %worker_url,
+                    dp_rank,
+                    replay_endpoint = %ep,
+                    "kv-events: ignoring malformed publisher replay_endpoint"
+                );
+            }
+            normalized
+        });
+        let load_endpoint = entry.load_endpoint.and_then(|ep| {
+            let normalized = normalize_tcp_endpoint(&ep, worker_host);
+            if normalized.is_none() {
+                warn!(
+                    worker_url = %worker_url,
+                    dp_rank,
+                    load_endpoint = %ep,
+                    "kv-events: ignoring malformed publisher load_endpoint"
+                );
+            }
+            normalized
+        });
+        resolved.push(PublisherEndpointConfig {
+            dp_rank,
+            endpoint,
+            replay_endpoint,
+            load_endpoint,
+        });
+    }
+    resolved.sort_by_key(|p| p.dp_rank);
+    let mut deduped: Vec<PublisherEndpointConfig> = Vec::with_capacity(resolved.len());
+    for entry in resolved {
+        if deduped
+            .last()
+            .is_some_and(|prev| prev.dp_rank == entry.dp_rank)
+        {
+            warn!(
+                worker_url = %worker_url,
+                dp_rank = entry.dp_rank,
+                endpoint = %entry.endpoint,
+                "kv-events: duplicate publisher entry for dp_rank; keeping first"
+            );
+            continue;
+        }
+        deduped.push(entry);
+    }
+    deduped
 }
 
 /// Default timeout for the `/server_info` introspection request. The
@@ -305,6 +554,7 @@ mod tests {
                 block_size: 64,
                 dp_size: 2,
                 is_bigram: false,
+                publishers: Vec::new(),
             })
         );
     }
@@ -471,5 +721,289 @@ mod tests {
             last_rank > u32::from(u16::MAX),
             "test fixture must put the last rank's port past u16::MAX so subscriber-level overflow handling is exercised by its own tests",
         );
+    }
+
+    /// Multi-node `publishers` with distinct IPv4 and IPv6 hosts and
+    /// non-contiguous ports: parsed, normalized, sorted by `dp_rank`, and
+    /// exposed verbatim by `resolved_publishers()`.
+    #[tokio::test]
+    async fn fetch_parses_multinode_publishers_ipv4_and_ipv6_sorted() {
+        let body = Arc::new(json!({
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "10.0.0.1",
+                "endpoint_port_base": 5557,
+                "replay_endpoint_port_base": 5558,
+                "load_endpoint_port_base": 5559,
+                "topic": "kv",
+                "load_topic": "load",
+                "block_size": 64,
+                "dp_size": 2,
+                "publishers": [
+                    {
+                        "dp_rank": 1,
+                        "endpoint": "tcp://[2001:db8::2]:7100",
+                        "replay_endpoint": "tcp://[2001:db8::2]:7101",
+                        "load_endpoint": "tcp://[2001:db8::2]:7102"
+                    },
+                    {
+                        "dp_rank": 0,
+                        "endpoint": "tcp://10.0.0.1:5557",
+                        "replay_endpoint": "tcp://10.0.0.1:5558",
+                        "load_endpoint": "tcp://10.0.0.1:5559"
+                    }
+                ]
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(
+            got.publishers,
+            vec![
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: "tcp://10.0.0.1:5557".into(),
+                    replay_endpoint: Some("tcp://10.0.0.1:5558".into()),
+                    load_endpoint: Some("tcp://10.0.0.1:5559".into()),
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 1,
+                    endpoint: "tcp://[2001:db8::2]:7100".into(),
+                    replay_endpoint: Some("tcp://[2001:db8::2]:7101".into()),
+                    load_endpoint: Some("tcp://[2001:db8::2]:7102".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            got.resolved_publishers(),
+            vec![
+                ResolvedRankEndpoints {
+                    dp_rank: 0,
+                    endpoint: Some("tcp://10.0.0.1:5557".into()),
+                    replay_endpoint: Some("tcp://10.0.0.1:5558".into()),
+                    load_endpoint: Some("tcp://10.0.0.1:5559".into()),
+                },
+                ResolvedRankEndpoints {
+                    dp_rank: 1,
+                    endpoint: Some("tcp://[2001:db8::2]:7100".into()),
+                    replay_endpoint: Some("tcp://[2001:db8::2]:7101".into()),
+                    load_endpoint: Some("tcp://[2001:db8::2]:7102".into()),
+                },
+            ]
+        );
+    }
+
+    /// Optional `replay_endpoint` and `load_endpoint` may be omitted or `null`,
+    /// and `resolved_publishers()` must keep them `None` instead of leaking
+    /// single-host legacy `*_port_base` values onto another node's rank.
+    #[tokio::test]
+    async fn fetch_publishers_optional_replay_and_load_omitted_or_null() {
+        let body = Arc::new(json!({
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "10.0.0.1",
+                "endpoint_port_base": 5557,
+                "replay_endpoint_port_base": 5558,
+                "load_endpoint_port_base": 5559,
+                "topic": "kv",
+                "load_topic": "load",
+                "block_size": 64,
+                "dp_size": 2,
+                "publishers": [
+                    {
+                        "dp_rank": 0,
+                        "endpoint": "tcp://10.0.0.1:6100"
+                    },
+                    {
+                        "dp_rank": 1,
+                        "endpoint": "tcp://10.0.0.2:6200",
+                        "replay_endpoint": null,
+                        "load_endpoint": null
+                    }
+                ]
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(
+            got.resolved_publishers(),
+            vec![
+                ResolvedRankEndpoints {
+                    dp_rank: 0,
+                    endpoint: Some("tcp://10.0.0.1:6100".into()),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+                ResolvedRankEndpoints {
+                    dp_rank: 1,
+                    endpoint: Some("tcp://10.0.0.2:6200".into()),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+            ]
+        );
+    }
+
+    /// Wildcard hosts (`*`, `0.0.0.0`, `[::]`, `::`) inside `publishers` are
+    /// substituted with the worker URL's host (IPv4 and IPv6).
+    #[tokio::test]
+    async fn fetch_publishers_substitutes_wildcard_hosts() {
+        let body = Arc::new(json!({
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "load_topic": "load",
+                "block_size": 64,
+                "dp_size": 3,
+                "publishers": [
+                    {
+                        "dp_rank": 0,
+                        "endpoint": "tcp://*:5557",
+                        "replay_endpoint": "tcp://0.0.0.0:5558",
+                        "load_endpoint": "tcp://[::]:5559"
+                    },
+                    {
+                        "dp_rank": 1,
+                        "endpoint": "tcp://0.0.0.0:5560",
+                        "replay_endpoint": "tcp://:::5561",
+                        "load_endpoint": "tcp://10.0.0.9:5562"
+                    },
+                    {
+                        "dp_rank": 2,
+                        "endpoint": "tcp://[::]:5563"
+                    }
+                ]
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(
+            got.resolved_publishers(),
+            vec![
+                ResolvedRankEndpoints {
+                    dp_rank: 0,
+                    endpoint: Some("tcp://127.0.0.1:5557".into()),
+                    replay_endpoint: Some("tcp://127.0.0.1:5558".into()),
+                    load_endpoint: Some("tcp://127.0.0.1:5559".into()),
+                },
+                ResolvedRankEndpoints {
+                    dp_rank: 1,
+                    endpoint: Some("tcp://127.0.0.1:5560".into()),
+                    replay_endpoint: Some("tcp://127.0.0.1:5561".into()),
+                    load_endpoint: Some("tcp://10.0.0.9:5562".into()),
+                },
+                ResolvedRankEndpoints {
+                    dp_rank: 2,
+                    endpoint: Some("tcp://127.0.0.1:5563".into()),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+            ]
+        );
+    }
+
+    /// Wildcard substitution with an IPv6 worker URL produces a properly
+    /// bracketed IPv6 ZMQ TCP endpoint.
+    #[test]
+    fn resolve_publishers_ipv6_worker_url_and_malformed_filtering() {
+        let resolved = resolve_publishers(
+            vec![
+                PublisherEndpointConfig {
+                    dp_rank: 1,
+                    endpoint: "tcp://[::]:7001".into(),
+                    replay_endpoint: Some("".into()),
+                    load_endpoint: Some("not-a-zmq-url".into()),
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: "tcp://*:7000".into(),
+                    replay_endpoint: Some("tcp://0.0.0.0:7010".into()),
+                    load_endpoint: None,
+                },
+                // Duplicate dp_rank 0: ignored, first wins.
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: "tcp://10.9.9.9:9999".into(),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+                // Empty / malformed endpoints: skipped cleanly.
+                PublisherEndpointConfig {
+                    dp_rank: 2,
+                    endpoint: "   ".into(),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 3,
+                    endpoint: "tcp://10.0.0.3:0".into(),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+            ],
+            Some("[2001:db8::1]"),
+            "http://[2001:db8::1]:30000",
+        );
+        assert_eq!(
+            resolved,
+            vec![
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: "tcp://[2001:db8::1]:7000".into(),
+                    replay_endpoint: Some("tcp://[2001:db8::1]:7010".into()),
+                    load_endpoint: None,
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 1,
+                    endpoint: "tcp://[2001:db8::1]:7001".into(),
+                    replay_endpoint: None,
+                    load_endpoint: None,
+                },
+            ]
+        );
+    }
+
+    /// Legacy server payload (omitted, `null`, or empty `publishers`) falls
+    /// back 100% identically to `host` + `port_base + dp_rank`.
+    #[tokio::test]
+    async fn legacy_payload_without_publishers_falls_back_identically() {
+        for publishers_field in [None, Some(json!(null)), Some(json!([]))] {
+            let mut kv = json!({
+                "publisher": "zmq",
+                "endpoint_host": "10.2.3.4",
+                "endpoint_port_base": 5557,
+                "replay_endpoint_port_base": 5567,
+                "load_endpoint_port_base": 5577,
+                "topic": "kv",
+                "load_topic": "load",
+                "block_size": 64,
+                "dp_size": 2,
+            });
+            if let Some(p) = publishers_field {
+                kv["publishers"] = p;
+            }
+            let (url, _shutdown) = spawn_fake_worker(Arc::new(json!({ "kv_events": kv }))).await;
+            let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+            assert!(got.publishers.is_empty());
+            assert_eq!(
+                got.resolved_publishers(),
+                vec![
+                    ResolvedRankEndpoints {
+                        dp_rank: 0,
+                        endpoint: Some("tcp://10.2.3.4:5557".into()),
+                        replay_endpoint: Some("tcp://10.2.3.4:5567".into()),
+                        load_endpoint: Some("tcp://10.2.3.4:5577".into()),
+                    },
+                    ResolvedRankEndpoints {
+                        dp_rank: 1,
+                        endpoint: Some("tcp://10.2.3.4:5558".into()),
+                        replay_endpoint: Some("tcp://10.2.3.4:5568".into()),
+                        load_endpoint: Some("tcp://10.2.3.4:5578".into()),
+                    },
+                ]
+            );
+        }
     }
 }

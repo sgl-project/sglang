@@ -744,6 +744,7 @@ async fn add_worker_rejects_block_size_mismatch() {
         block_size: 128,
         dp_size: 1,
         is_bigram: false,
+        publishers: Vec::new(),
     };
     index
         .add_worker("http://127.0.0.1:30100", Some(bad_cfg))
@@ -776,6 +777,7 @@ async fn add_worker_seeds_oracle_with_first_block_size() {
         block_size: 64,
         dp_size: 0,
         is_bigram: false,
+        publishers: Vec::new(),
     };
     index.add_worker("http://127.0.0.1:30200", Some(cfg)).await;
     assert_eq!(index.block_size_oracle().get(), Some(64));
@@ -800,6 +802,7 @@ async fn add_worker_seeds_bigram_flag_from_event_config() {
         block_size: 64,
         dp_size: 0,
         is_bigram: true,
+        publishers: Vec::new(),
     };
     index.add_worker("http://127.0.0.1:30300", Some(cfg)).await;
     assert!(
@@ -826,6 +829,7 @@ async fn metadata_only_mode_keeps_the_load_subscriber() {
         block_size: 64,
         dp_size: 2,
         is_bigram: true,
+        publishers: Vec::new(),
     };
 
     index.add_worker("http://127.0.0.1:30400", Some(cfg)).await;
@@ -855,6 +859,7 @@ async fn remove_worker_clears_engine_load() {
         block_size: 64,
         dp_size: 1,
         is_bigram: false,
+        publishers: Vec::new(),
     };
     index.add_worker(url, Some(cfg)).await;
     assert_eq!(index.engine_reported_load().expected_count(), 1);
@@ -907,6 +912,7 @@ async fn remove_worker_clears_every_rank_before_returning() {
         block_size: 64,
         dp_size: 2,
         is_bigram: false,
+        publishers: Vec::new(),
     };
     index.add_worker(url, Some(cfg)).await;
 

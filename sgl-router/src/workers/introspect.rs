@@ -33,7 +33,8 @@ use sglang_processor::openai::OpenAiSettings;
 use tracing::warn;
 use url::Url;
 
-use crate::state::kv_events::EventConfig;
+use crate::state::kv_events::discovery::{is_wildcard_host, resolve_publishers};
+use crate::state::kv_events::{EventConfig, PublisherEndpointConfig};
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
@@ -347,15 +348,12 @@ pub(crate) fn resolve_event_config(
     worker_url: &str,
     is_bigram: bool,
 ) -> EventConfig {
-    let host = if matches!(
-        block.endpoint_host.as_str(),
-        "*" | "0.0.0.0" | "::" | "[::]"
-    ) {
-        match Url::parse(worker_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|s| s.to_owned()))
-        {
-            Some(h) => h,
+    let worker_host = Url::parse(worker_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_owned()));
+    let host = if is_wildcard_host(&block.endpoint_host) {
+        match worker_host.as_ref() {
+            Some(h) => h.clone(),
             None => {
                 warn!(
                     worker_url = %worker_url,
@@ -367,6 +365,11 @@ pub(crate) fn resolve_event_config(
     } else {
         block.endpoint_host
     };
+    let publishers = resolve_publishers(
+        block.publishers.unwrap_or_default(),
+        worker_host.as_deref(),
+        worker_url,
+    );
     EventConfig {
         host,
         port_base: block.endpoint_port_base,
@@ -377,6 +380,7 @@ pub(crate) fn resolve_event_config(
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
+        publishers,
     }
 }
 
@@ -470,6 +474,10 @@ pub(crate) struct KvEventsBlock {
     pub replay_endpoint_port_base: Option<u16>,
     pub block_size: u32,
     pub dp_size: u32,
+    /// Optional per-rank ZMQ publisher endpoints for multi-node attention-DP.
+    /// Absent or empty on older single-host SGLang servers.
+    #[serde(default)]
+    pub publishers: Option<Vec<PublisherEndpointConfig>>,
 }
 
 #[cfg(test)]
@@ -978,5 +986,57 @@ mod tests {
         .await;
         let got = fast_introspector().fetch(&url).await;
         assert!(got.disaggregation_role.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_resolves_multinode_publishers_with_wildcard_fallback() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "load_topic": "load",
+                "block_size": 64,
+                "dp_size": 2,
+                "publishers": [
+                    {
+                        "dp_rank": 1,
+                        "endpoint": "tcp://10.0.0.2:7001",
+                        "replay_endpoint": "tcp://10.0.0.2:7002",
+                        "load_endpoint": "tcp://10.0.0.2:7003"
+                    },
+                    {
+                        "dp_rank": 0,
+                        "endpoint": "tcp://0.0.0.0:5557",
+                        "replay_endpoint": "tcp://*:5558"
+                    }
+                ]
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        assert_eq!(
+            cfg.publishers,
+            vec![
+                PublisherEndpointConfig {
+                    dp_rank: 0,
+                    endpoint: "tcp://127.0.0.1:5557".into(),
+                    replay_endpoint: Some("tcp://127.0.0.1:5558".into()),
+                    load_endpoint: None,
+                },
+                PublisherEndpointConfig {
+                    dp_rank: 1,
+                    endpoint: "tcp://10.0.0.2:7001".into(),
+                    replay_endpoint: Some("tcp://10.0.0.2:7002".into()),
+                    load_endpoint: Some("tcp://10.0.0.2:7003".into()),
+                },
+            ]
+        );
     }
 }
