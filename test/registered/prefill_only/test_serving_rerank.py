@@ -13,6 +13,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 try:
     from sglang.srt.entrypoints.openai.serving_rerank import (
         OpenAIServingRerank,
+        _get_compiled_jinja_template,
         _is_qwen3_reranker_template,
         _qwen3_rerank_score,
         _render_jinja_chat_template,
@@ -304,6 +305,62 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
 
         self.assertEqual(res[1].document, "doc2")
         self.assertAlmostEqual(res[1].score, 0.3)  # 0.3 / (0.3+0.7) = 0.3
+
+    def test_compiled_jinja_template_cached(self):
+        try:
+            import jinja2  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("jinja2 is not installed")
+
+        _get_compiled_jinja_template.cache_clear()
+        tpl = "{{ messages[0]['content'] }}:{{ messages[1]['content'] }}"
+        for i in range(5):
+            out = _render_jinja_chat_template(
+                tpl, query="q", document=f"d{i}", instruct=None
+            )
+            self.assertEqual(out, f"q:d{i}")
+        info = _get_compiled_jinja_template.cache_info()
+        self.assertEqual(info.misses, 1)
+        self.assertEqual(info.hits, 4)
+
+    def test_extract_score_from_logprobs_handles_none_entry(self):
+        self.assertEqual(
+            self.handler._extract_score_from_logprobs(
+                {"meta_info": {"output_top_logprobs": [None]}}
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            self.handler._extract_score_from_logprobs(
+                {"meta_info": {"output_top_logprobs": None}}
+            ),
+            0.0,
+        )
+
+    def test_validate_request_multimodal_whitespace_and_empty_parts(self):
+        bad_query = V1RerankReqInput(
+            query=[{"type": "text", "text": "   "}],
+            documents=["valid doc"],
+        )
+        self.assertEqual(
+            self.handler._validate_request(bad_query),
+            "Query cannot be empty or whitespace only",
+        )
+
+        bad_doc = V1RerankReqInput(
+            query="valid query",
+            documents=[[{"type": "text", "text": " \n\t "}]],
+        )
+        self.assertEqual(
+            self.handler._validate_request(bad_doc),
+            "Each document cannot be empty or whitespace only",
+        )
+
+        valid_mm = V1RerankReqInput(
+            query=[{"type": "image_url", "image_url": {"url": "http://host/q.png"}}],
+            documents=[[{"type": "text", "text": "doc text"}]],
+        )
+        self.assertIsNone(self.handler._validate_request(valid_mm))
 
 
 if __name__ == "__main__":
