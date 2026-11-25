@@ -188,8 +188,7 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
 
 3.  **Start the monitoring stack, choosing a Grafana admin password:**
     ```bash Command
-    echo "GRAFANA_ADMIN_PASSWORD='<a strong password>'" > .env
-    chmod 600 .env
+    (umask 077; echo "GRAFANA_ADMIN_PASSWORD='<a strong password>'" > .env)
     docker compose up -d
     ```
     This starts Prometheus and Grafana in the background. Docker Compose reads the password from `.env` (excluded by the repository's `.gitignore`) for every later command too, such as `docker compose ps` or `docker compose down`; exporting `GRAFANA_ADMIN_PASSWORD` in your shell works as well. Every `docker compose` command for this stack fails while the variable is unset.

@@ -24,8 +24,7 @@ By default, the metrics server will run on `127.0.0.1:30000`.
 
 ```bash
 cd examples/monitoring
-echo "GRAFANA_ADMIN_PASSWORD='<a strong password>'" > .env
-chmod 600 .env
+(umask 077; echo "GRAFANA_ADMIN_PASSWORD='<a strong password>'" > .env)
 docker compose up
 ```
 
