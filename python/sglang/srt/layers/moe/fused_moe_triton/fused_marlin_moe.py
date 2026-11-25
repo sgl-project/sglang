@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
@@ -101,6 +102,13 @@ def get_scalar_type(
         and (scales.dtype == torch.float8_e8m0fnu or global_scale is not None)
     ):
         return scalar_types.float4_e2m1f
+    if (
+        not has_zp
+        and num_bits == 8
+        and scales is not None
+        and scales.dtype == torch.float8_e8m0fnu
+    ):
+        return scalar_types.float8_e4m3fn
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
@@ -135,18 +143,6 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
-def swiglu_gpt_oss_sigmoid_alpha_contiguous(
-    output: torch.Tensor,
-    input: torch.Tensor,  # first half is gate, second half is up
-    gemm1_alpha: float,
-    gemm1_limit: float,
-) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d].clamp(max=gemm1_limit)
-    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
-    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
-
-
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -179,6 +175,7 @@ def fused_marlin_moe(
     activation: str = "silu",
     is_gated: bool = True,
     no_combine: bool = False,
+    no_combine_keep_router_weight: bool = True,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -205,6 +202,8 @@ def fused_marlin_moe(
     - num_bits (int): The number of bits in expert weights quantization.
     - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
         ``[num_tokens, topk, hidden]``, instead of their top-k sum.
+    - no_combine_keep_router_weight (bool): With no_combine, False returns the
+        rows without router weights.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -234,9 +233,16 @@ def fused_marlin_moe(
         and w1_global_scale is not None
         and w2_global_scale is not None
     )
-    if is_mxfp4_marlin:
+    is_mxfp8_marlin = (
+        num_bits == 8
+        and w1_zeros is None
+        and w2_zeros is None
+        and w1_scale.dtype == torch.float8_e8m0fnu
+        and w2_scale.dtype == torch.float8_e8m0fnu
+    )
+    if is_mxfp4_marlin or is_mxfp8_marlin:
         assert hidden_states.dtype == torch.bfloat16, (
-            "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 "
+            "MXFP4/MXFP8 Marlin with E8M0 scales is only instantiated for bfloat16 "
             f"activations, got {hidden_states.dtype}"
         )
     elif not is_nvfp4_marlin:
@@ -275,11 +281,14 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
+            topk_ids, block_size_m, return_inactive_prefix_count=True
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            return_inactive_prefix_count=expert_map is None,
         )
 
     if workspace is None:
@@ -318,7 +327,7 @@ def fused_marlin_moe(
     use_atomic_add = (
         hidden_states.dtype == torch.half
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    ) and (not is_mxfp4_marlin)
+    ) and not (is_mxfp4_marlin or is_mxfp8_marlin)
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
@@ -339,6 +348,8 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -352,11 +363,12 @@ def fused_marlin_moe(
     if activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:
             raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
+        swiglu_oai_split(
             intermediate_cache1.view(-1, gemm1_n),
             gemm1_alpha,
+            1.0,
             clamp_limit,
+            out=intermediate_cache2,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
@@ -380,9 +392,7 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    # Gate-up is dead after activation, so its storage can hold the down output.
-    # Skipped down routes must start at zero before the top-k reduction.
-    intermediate_cache3.zero_()
+    # Gate-up is dead; the down GEMM defines inactive rows in the shared output.
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
@@ -400,8 +410,11 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=1,
-        mul_topk_weights=True,
+        mul_topk_weights=not no_combine or no_combine_keep_router_weight,
+        zero_inactive_output=True,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,

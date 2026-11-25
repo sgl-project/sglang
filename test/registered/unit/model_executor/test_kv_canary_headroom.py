@@ -15,7 +15,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=11, stage="base-a", runner_config="cpu")
 
 _GIB = 1 << 30
 
@@ -106,6 +106,23 @@ class TestCanaryHeadroom(CustomTestCase):
         args, kwargs = runner.kv_cache_configurator.config_from_budget.call_args
         self.assertEqual(kwargs, {"cap_tokens": 1_000_000})
         return args[0]
+
+    def test_distinct_routed_drafts_share_one_backing_charge(self):
+        from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
+
+        arena = SimpleNamespace(backed_after_capture=True, backed_bytes=2 * _GIB)
+        pools = []
+        for _ in range(3):
+            pool = RoutedKVCache.__new__(RoutedKVCache)
+            pool._arena = arena
+            pool.dtype = "bfloat16"
+            pool.size = 1024
+            pool.finalize_backing = Mock()
+            pools.append(pool)
+        budget = self._resize(None, (None, None), pool=pools[0], draft_pools=pools[1:])
+        self.assertEqual(budget, 15 * _GIB)
+        for draft in pools[1:]:
+            draft.finalize_backing.assert_not_called()
 
     def test_canary_off_preserves_every_budget_byte(self):
         for graph_borrow, eager_gap, headroom in (

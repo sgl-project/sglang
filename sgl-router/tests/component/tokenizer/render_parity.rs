@@ -10,8 +10,11 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::ModelId;
-use sgl_router::policies::request_tokens_for;
-use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter, TokenizerRegistry};
+use sgl_router::tokenizer::chat_formatter::{ChatFormatter, ChatTemplateKwargs};
+use sgl_router::tokenizer::prompt::request_tokens_for;
+use sgl_router::tokenizer::{adapter, TokenizerRegistry};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Deserialize)]
@@ -85,13 +88,22 @@ fn starts_with_iso_date(text: &str) -> bool {
         && b[8..10].iter().all(u8::is_ascii_digit)
 }
 
-fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
-    let hf_home = std::env::var("HF_HOME")
+/// The HF hub cache: `HF_HUB_CACHE`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`.
+fn hub_cache() -> Option<PathBuf> {
+    std::env::var("HF_HUB_CACHE")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cache/huggingface")))?;
-    let snapshots = hf_home
-        .join("hub")
+        .or_else(|| {
+            std::env::var("HF_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".cache/huggingface")))
+                .map(|home| home.join("hub"))
+        })
+}
+
+fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
+    let snapshots = hub_cache()?
         .join(format!("models--{}", model_id.replace('/', "--")))
         .join("snapshots");
     std::fs::read_dir(snapshots)
@@ -102,6 +114,14 @@ fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
 }
 
 fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
+    registry_with_defaults(model_id, tokenizer_path, Default::default())
+}
+
+fn registry_with_defaults(
+    model_id: &str,
+    tokenizer_path: PathBuf,
+    default_chat_template_kwargs: ChatTemplateKwargs,
+) -> TokenizerRegistry {
     let cfg = Config {
         server: ServerConfig {
             host: "0".into(),
@@ -110,6 +130,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            aliases: Vec::new(),
             id: model_id.into(),
             tokenizer_path: Some(tokenizer_path.to_str().unwrap().into()),
             disable_input_ids_forwarding: false,
@@ -118,6 +139,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            decode_dp_rank_policy: None,
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),
@@ -128,7 +150,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
-            default_chat_template_kwargs: Default::default(),
+            default_chat_template_kwargs,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -191,4 +213,140 @@ fn chat_render_parity_matrix() {
         "no cached model snapshots; parity was not checked"
     );
     eprintln!("chat render parity: {checked} cases checked");
+}
+
+/// Whether SGLang refused the case only because a text-only server got image parts.
+fn refuses_images_as_text_only(case: &serde_json::Value) -> bool {
+    case["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("only supports text input"))
+        && image_parts(&case["request"]) > 0
+}
+
+fn image_parts(request: &serde_json::Value) -> usize {
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .count()
+}
+
+/// A chat with images that SGLang's text-only server refuses, on a model whose
+/// image chats the router renders for prefix routing. Each image renders as one
+/// placeholder token where its part was, so the prompt reads as the same chat
+/// with each image part a text part spelling the placeholder, which the text
+/// path renders as plain text (the fixtures check that spelling against SGLang).
+fn check_image_chat(
+    reg: &TokenizerRegistry,
+    model: &str,
+    name: &str,
+    request: &serde_json::Value,
+    ids: Option<Vec<u32>>,
+) {
+    let ids = ids.unwrap_or_else(|| panic!("{name}: image chat not rendered"));
+    let placeholders = reg.media_token_ids();
+    let images: Vec<u32> = ids
+        .iter()
+        .copied()
+        .filter(|id| placeholders.contains(id))
+        .collect();
+    assert_eq!(
+        images.len(),
+        image_parts(request),
+        "{name}: image placeholders"
+    );
+    let tokenizer = reg.get(model).unwrap();
+    let decode = |ids: &[u32]| adapter::decode_complete(&tokenizer, ids, false).unwrap();
+    let mut spelled = request.clone();
+    for message in spelled["messages"].as_array_mut().unwrap() {
+        for part in message["content"].as_array_mut().into_iter().flatten() {
+            if part["type"] == "image_url" {
+                *part = serde_json::json!({"type": "text", "text": decode(&images[..1])});
+            }
+        }
+    }
+    let spelled = reg
+        .encode_chat(model, &spelled)
+        .unwrap_or_else(|| panic!("{name}: placeholder spelled as text not rendered"));
+    assert!(
+        !spelled.iter().any(|id| placeholders.contains(id)),
+        "{name}: placeholder text parsed as the image token"
+    );
+    assert_eq!(
+        decode(&ids),
+        decode(&spelled),
+        "{name}: image chat vs the placeholder spelled as text"
+    );
+}
+
+/// The router's own render and tokenization (`encode_chat`, continuation prefixes
+/// included) reproduce `rust/sglang-processor`'s parity fixtures, which SGLang's
+/// Python serving path wrote: the ids of every case it renders, and no ids where it
+/// fails. The exception is a chat with images on a model whose image chats the
+/// router renders, which SGLang's text-only server refuses (see
+/// [`check_image_chat`]). Checks only the fixtures whose pinned snapshot is cached.
+#[test]
+fn processor_fixture_parity() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../rust/sglang-processor/tests/fixtures/parity");
+    for entry in std::fs::read_dir(&root).unwrap().flatten() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+        let model = fixture["model"].as_str().unwrap();
+        let snapshot = hub_cache().map(|hub| {
+            hub.join(format!("models--{}", model.replace('/', "--")))
+                .join("snapshots")
+                .join(fixture["revision"].as_str().unwrap())
+        });
+        let Some(tokenizer_path) = ["tokenizer.json", "tiktoken.model"]
+            .iter()
+            .filter_map(|file| Some(snapshot.as_ref()?.join(file)))
+            .find(|path| path.is_file())
+        else {
+            eprintln!("skip {model}: pinned snapshot not cached");
+            continue;
+        };
+        // One registry per server `--default-chat-template-kwargs`.
+        let mut registries: HashMap<String, TokenizerRegistry> = HashMap::new();
+        for case in fixture["cases"].as_array().unwrap() {
+            // A server-side template override is the processor's to check.
+            if case.get("chat_template").is_some() {
+                continue;
+            }
+            let defaults = case["default_chat_template_kwargs"].clone();
+            let reg = registries.entry(defaults.to_string()).or_insert_with(|| {
+                let defaults = defaults
+                    .as_object()
+                    .map(|d| d.clone().into_iter().collect())
+                    .unwrap_or_default();
+                registry_with_defaults(model, tokenizer_path.clone(), defaults)
+            });
+            let name = format!("{model} {}", case["name"]);
+            let ids = reg.encode_chat(model, &case["request"]);
+            if !case["error"].is_null() {
+                if refuses_images_as_text_only(case) && !reg.media_token_ids().is_empty() {
+                    check_image_chat(reg, model, &name, &case["request"], ids);
+                } else {
+                    assert!(ids.is_none(), "{name}: SGLang rejects this request");
+                }
+                continue;
+            }
+            if case.get("known_gap").is_some() {
+                continue;
+            }
+            let ids = ids.unwrap_or_else(|| panic!("{name}: not rendered"));
+            let digest = ids.iter().fold(Sha256::new(), |hash, id| {
+                hash.chain_update(id.to_le_bytes())
+            });
+            assert_eq!(ids.len() as u64, case["token_count"], "{name}");
+            assert_eq!(
+                format!("{:x}", digest.finalize()),
+                case["token_sha256"],
+                "{name}"
+            );
+        }
+    }
 }

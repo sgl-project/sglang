@@ -25,7 +25,7 @@ DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=1865, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=1844, stage="extra-b", runner_config="4-gpu-h100")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
@@ -67,7 +67,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             args += ["--pp-size", str(cls.pp_size)]
         args += [
             "--attention-backend",
-            "compressed",
+            "dsv4",
             "--page-size",
             "256",
             "--chunked-prefill-size",
@@ -148,7 +148,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--tp-size",
                 "4",
                 "--attention-backend",
-                "compressed",
+                "dsv4",
                 "--page-size",
                 "256",
                 "--chunked-prefill-size",
@@ -215,7 +215,7 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                 "--tp-size",
                 "4",
                 "--attention-backend",
-                "compressed",
+                "dsv4",
                 "--page-size",
                 str(cls.page_size),
                 "--chunked-prefill-size",
@@ -356,7 +356,7 @@ class TestUnifiedDeepSeekV4FlashDSparkHiCacheL3(
                 "--tp-size",
                 "4",
                 "--attention-backend",
-                "compressed",
+                "dsv4",
                 "--page-size",
                 str(cls.page_size),
                 "--chunked-prefill-size",

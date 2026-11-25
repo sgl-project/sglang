@@ -30,10 +30,12 @@ import json
 import os
 import re
 import runpy
+import shutil
 import subprocess
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.sdist import sdist
 
 try:
     from setuptools_rust import Binding, RustExtension, build_rust
@@ -214,6 +216,29 @@ def _declared_rust_extensions():
     return _pyproject_rust_extensions(_discovered_rust_extensions())
 
 
+class Sdist(sdist):
+    """Materialize shared GGUF headers in the standalone source distribution."""
+
+    def make_release_tree(self, base_dir, files):
+        super().make_release_tree(base_dir, files)
+        relative = Path("sglang/kernels/jit/include/sgl_kernel/quantization/gguf")
+        canonical = (
+            _PYTHON_DIR / "sglang/kernels/aot/include/sgl_kernel/quantization/gguf"
+        )
+        included = {Path(name) for name in files}
+        for header in sorted((_PYTHON_DIR / relative).glob("*")):
+            name = header.relative_to(_PYTHON_DIR)
+            if name not in included or not header.is_symlink():
+                continue
+            target = header.resolve(strict=True)
+            if target.parent != canonical.resolve():
+                raise ValueError(f"Shared GGUF header escapes its owner: {header}")
+            destination = Path(base_dir) / name
+            # make_release_tree may hard-link the source symlink itself.
+            destination.unlink()
+            shutil.copyfile(target, destination)
+
+
 if build_rust is not None:
 
     class BuildRust(build_rust):
@@ -241,8 +266,8 @@ if build_rust is not None:
             super().run()
 
     setup(
-        cmdclass={"build_rust": BuildRust},
+        cmdclass={"build_rust": BuildRust, "sdist": Sdist},
         rust_extensions=_declared_rust_extensions(),
     )
 else:
-    setup()
+    setup(cmdclass={"sdist": Sdist})

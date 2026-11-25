@@ -14,6 +14,7 @@ def softcap_inplace_logits_kernel(
     output_ptr=None,
     output_row_stride=0,
     CAST_TO_FP32: tl.constexpr = False,
+    APPLY_SOFTCAP: tl.constexpr = True,
 ):
     row = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0).to(tl.int64)
@@ -27,9 +28,10 @@ def softcap_inplace_logits_kernel(
     if CAST_TO_FP32:
         x = x.to(tl.float32)
 
-    x = x / softcapping_value
-    x = libdevice.tanh(x)
-    x = x * softcapping_value
+    if APPLY_SOFTCAP:
+        x = x / softcapping_value
+        x = libdevice.tanh(x)
+        x = x * softcapping_value
 
     # Store result
     if CAST_TO_FP32:
@@ -70,6 +72,7 @@ def _softcap_logits(full_logits, final_logit_softcapping, output=None):
         if output is not None
         else 0,
         CAST_TO_FP32=output is not None,
+        APPLY_SOFTCAP=final_logit_softcapping is not None,
     )
     return full_logits if output is None else output
 
@@ -83,6 +86,11 @@ def softcap_to_float32_logits(logits, final_logit_softcapping, output):
     return _softcap_logits(logits, final_logit_softcapping, output)
 
 
+def cast_to_float32_logits(logits, output):
+    """Write FP32 logits to an equally shaped, row-contiguous output."""
+    return _softcap_logits(logits, None, output)
+
+
 @triton.jit
 def _gathered_softcap_logits_kernel(
     gathered_ptr,
@@ -93,6 +101,7 @@ def _gathered_softcap_logits_kernel(
     output_row_stride,
     softcapping_value,
     BLOCK_SIZE: tl.constexpr,
+    APPLY_SOFTCAP: tl.constexpr = True,
 ):
     row = tl.program_id(1).to(tl.int64)
     cols = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -104,16 +113,18 @@ def _gathered_softcap_logits_kernel(
         + cols
         - shard * shard_width,
         mask=mask,
-    )
-    x = x / softcapping_value
-    x = libdevice.tanh(x)
-    x = x * softcapping_value
+    ).to(tl.float32)
+    if APPLY_SOFTCAP:
+        x = x / softcapping_value
+        x = libdevice.tanh(x)
+        x = x * softcapping_value
     tl.store(output_ptr + row * output_row_stride + cols, x, mask=mask)
 
 
 def gathered_softcap_logits(gathered, final_logit_softcapping, output):
     """Softcap rank-major all-gathered logits ``[world, tokens, shard]`` into
-    vocab-major ``output[tokens, :vocab]`` in one pass."""
+    vocab-major FP32 ``output[tokens, :vocab]`` in one pass; with
+    ``final_logit_softcapping`` None it only casts."""
     world, num_tokens, shard_width = gathered.shape
     vocab_size = output.shape[1]
     assert gathered.is_contiguous() and output.stride(1) == 1
@@ -129,5 +140,6 @@ def gathered_softcap_logits(gathered, final_logit_softcapping, output):
         output.stride(0),
         final_logit_softcapping,
         BLOCK_SIZE=BLOCK_SIZE,
+        APPLY_SOFTCAP=final_logit_softcapping is not None,
     )
     return output

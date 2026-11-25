@@ -32,7 +32,6 @@ from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
-    get_disagg,
     get_exec,
     get_parallel,
     get_serving,
@@ -41,10 +40,12 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_gfx95_supported,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import register_sgl_tp_rank
 
@@ -110,6 +111,8 @@ def init_parallel_runtime(
             "through here."
         )
     _PARALLEL_INITIALISED = True
+    # Foundry binds this rank's allocation region before any communicator.
+    get_foundry_adapter().before_parallel_init(device)
 
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
@@ -140,6 +143,10 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
+    if current_platform.is_rocm() and is_gfx95_supported():
+        from sglang.srt.distributed.bootstrap_rocm import reserve_runtime_memory
+
+        reserve_runtime_memory(device=device, gpu_id=get_device().gpu_id)
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()
@@ -174,18 +181,27 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    # EPLB uses the default process group, not the TP/EP coordinators.
-    # Limit warmup to static, single-node full-EP layouts for now.
+    # CUDA EPLB uses the default process group, not the TP/EP coordinators.
+    # Limit warmup to static full-EP layouts for now.
     if (
         device == "cuda"
         and backend == "nccl"
         and get_exec().moe.enable_eplb
         and get_exec().moe.elastic_ep_backend is None
-        and parallel.nnodes == 1
         and parallel.pp_size == 1
         and parallel.moe_ep_size == parallel.tp_size > 1
     ):
         _prewarm_eplb_p2p()
+
+    # Account for NPU EPLB's TP transports before sizing the KV cache.
+    if (
+        device == "npu"
+        and get_exec().moe.enable_eplb
+        and get_exec().moe.elastic_ep_backend is None
+    ):
+        from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication
+
+        prewarm_eplb_communication()
 
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 
@@ -231,7 +247,7 @@ def _resolve_backend(*, device: str) -> str:
 
 
 def _resolve_dist_init_method(*, dist_port: int) -> str:
-    # Allow external orchestrators (e.g. trainpi) to override the distributed
+    # Allow external orchestrators to override the distributed
     # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
     # env-vars and an externally-created TCPStore, completely avoiding port
     # conflicts with intra-host collocation.
@@ -331,7 +347,6 @@ def _init_parallel_groups(
         max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
-        duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
         # groups are fixed groups local to its launch cohort.
@@ -391,12 +406,14 @@ def _prewarm_eplb_p2p() -> None:
         )
     for work in dist.batch_isend_irecv(ops):
         work.wait()
+    # The rebalance also all-reduces the recorded expert counts on this group.
+    dist.all_reduce(send.view(torch.int32))
     current_platform.synchronize()
     del ops, send, recv
     current_platform.empty_cache()
     free_after, _ = torch.cuda.mem_get_info()
     logger.info(
-        "EPLB default-group P2P warmup completed in %.3fs "
+        "EPLB default-group P2P and all-reduce warmup completed in %.3fs "
         "(world_size=%d, free memory delta=%.2f MiB)",
         time.perf_counter() - warmup_start,
         world_size,
@@ -408,8 +425,8 @@ def _prewarm_tp_lm_head_all_to_all() -> None:
     """Materialize PyNCCL P2P resources before model-memory accounting."""
     warmup_start = time.perf_counter()
     tp_group = get_tp_group()
-    pynccl_comm = tp_group.pynccl_comm
-    if pynccl_comm is None or not pynccl_comm.available:
+    pynccl_comm = tp_group.get_available_pynccl_comm()
+    if pynccl_comm is None:
         raise RuntimeError(
             "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
             "communicator for CUDA graph capture."

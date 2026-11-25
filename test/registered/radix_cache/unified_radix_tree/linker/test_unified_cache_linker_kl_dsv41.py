@@ -70,7 +70,7 @@ class _DSV41FlashLinkerServer:
                 "64",
                 "--enable-cache-report",
                 "--enable-unified-cache-external-linker",
-                "--hicache-storage-backend-extra-config",
+                "--unified-cache-external-linker-config",
                 json.dumps({"enable_group_semantics": True}),
                 *cls.extra_args,
             ],
@@ -89,7 +89,7 @@ class _DSV41FlashLinkerServer:
             f"{label}: expected cached_tokens >= {minimum}, got {cached_tokens}",
         )
         details = meta_info.get("cached_tokens_details") or {}
-        remote_tokens = int(details.get("host", 0))
+        remote_tokens = int(details.get("storage", 0))
         self._direct_remote_tokens += remote_tokens
         if remote_tokens:
             print(f"{label}: Direct load-back confirmed for {remote_tokens} tokens")

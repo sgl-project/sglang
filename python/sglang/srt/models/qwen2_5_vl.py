@@ -59,24 +59,22 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
@@ -245,7 +243,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            head_size=head_size,
+            head_dim=head_size,
             projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
@@ -546,10 +544,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        # one full-attention segment per temporal step (h * w tokens), as in HF
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
                 .cumsum(dim=0)
                 .to(device=x.device, dtype=torch.int32),
             ]
@@ -642,20 +641,23 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        # one full-attention segment per temporal step (h * w tokens), as in HF
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
                 .cumsum(dim=0)
                 .to(device=x.device, dtype=torch.int32),
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        # graph key: must match the cu_seqlens boundaries above
         full_layout = [0, 0]
         total_tokens = 0
         for temporal, height, width in grid_thw.tolist():
-            total_tokens += temporal * height * width
-            full_layout.append(total_tokens)
+            for _ in range(temporal):
+                total_tokens += height * width
+                full_layout.append(total_tokens)
 
         return self.cuda_graph_runner.run(
             x=x,

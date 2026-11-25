@@ -16,10 +16,15 @@ from sglang.srt.speculative.dspark_components import (
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 STRIDE = 6
 GAMMA = STRIDE - 1
@@ -37,11 +42,11 @@ def _sampling_info(**overrides):
         is_all_greedy=False,
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
         has_custom_logit_processor=False,
-        acc_linear_penalties=None,
-        penalizer_orchestrator=None,
-        grammar_mask=None,
+        step_penalties=None,
         logit_bias=None,
+        watermark=None,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -71,10 +76,14 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, _sampling_info(is_any_greedy=True))
     assert not _eligible(worker, _sampling_info(need_top_k_sampling=True))
     assert not _eligible(worker, _sampling_info(need_top_p_sampling=True))
+    assert not _eligible(worker, _sampling_info(need_min_p_sampling=True))
+    assert not _eligible(worker, _sampling_info(watermark=object()))
     assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
     assert not _eligible(worker, _sampling_info(), folded=False)
     assert not _eligible(worker, _sampling_info(), grammar=True)
     assert not _eligible(worker, _sampling_info(), sim_bonus=_sampling_info())
+    info = _sampling_info()
+    assert _eligible(worker, info, sim_bonus=info)
     assert not _eligible(_worker(enabled=False), _sampling_info())
     assert not _eligible(_worker(mode="compact"), _sampling_info())
 
@@ -161,7 +170,6 @@ def _graph(epi, sampler, monkeypatch, rejection_noise=None):
         epilogue=epi,
         resolve_draft_sampler=lambda: sampler,
         tp_sync=_tp_sync(),
-        fused_argmax=False,
         block_verification=False,
         device="cuda",
         rejection_noise=rejection_noise,
@@ -233,21 +241,23 @@ def test_replay_acceptance_distribution_matches_eager(monkeypatch):
     assert (p_graph - p_eager).abs().max().item() < 0.042, (p_graph, p_eager)
 
 
-def test_region_stages_the_deferred_commit_from_the_joined_projection():
-    """The verify graph replayed this step already joined the deferred commit's
+def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
+    """The verify graph replayed this step already joined the deferred store's
     projection (its host flag is spent), so the region must stage from it instead of
     joining again, which would find nothing and fall back to an unprojected inject."""
     calls = []
-    commit = SimpleNamespace(
+    deferred_draft_kv = SimpleNamespace(
         join_projection=lambda: calls.append("join") or False,
         stage=lambda **k: calls.append(("stage", int(k["commit_lens"].sum()))),
     )
     epi = dspark_verify.DsparkVerifyEpilogue.__new__(dspark_verify.DsparkVerifyEpilogue)
+    epi._draft_folds_static_commit_cache = False
+    epi._folds_static_commit_cache = None
     epi.stride = STRIDE
     epi.verify_lens_buf = torch.full((2,), STRIDE, dtype=torch.int64)
     epi.commit_lens_buf = torch.tensor([3, 4], dtype=torch.int32)
     epi._post_fold = False
-    epi.deferred_commit = commit
+    epi.deferred_draft_kv = deferred_draft_kv
     epi.commit_ctx = SimpleNamespace(
         resolve_engram_hasher=None,
         resolve_pool=lambda: SimpleNamespace(
@@ -268,6 +278,44 @@ def test_region_stages_the_deferred_commit_from_the_joined_projection():
     gate = torch.ones(1, dtype=torch.int32)
     epi.run_static(io, accept=accept, gate=gate, kv_projected=True)
     assert calls == [("stage", 7)]
+
+
+def test_draft_folds_static_commit_needs_the_targets_unremapped_slots():
+    """The worker turns the static epilogue on for a non-V4.1 target from this
+    check, so a draft that opts in but cannot store at the target's cache
+    locations must not count as folding."""
+
+    def injector(target_space, draft_space):
+        def runner(space):
+            return SimpleNamespace(runner_ids=SimpleNamespace(space=lambda kind: space))
+
+        return SimpleNamespace(
+            model_runner=runner(target_space), draft_model_runner=runner(draft_space)
+        )
+
+    shared = SimpleNamespace(key="full", write=None)
+    folding = SimpleNamespace(folds_static_verify_commit=True)
+    cases = {
+        "shared": (folding, injector(shared, shared), True),
+        "opted_out": (SimpleNamespace(), injector(shared, shared), False),
+        "no_injector": (folding, None, False),
+        "other_space": (
+            folding,
+            injector(shared, SimpleNamespace(key="draft", write=None)),
+            False,
+        ),
+        "remapped_write": (
+            folding,
+            injector(SimpleNamespace(key="full", write=object()), shared),
+            False,
+        ),
+        "no_full_space": (folding, injector(None, shared), False),
+    }
+    for name, (draft_model, kv_injector, folds) in cases.items():
+        got = dspark_verify.draft_folds_static_commit(
+            draft_model=draft_model, kv_injector=kv_injector
+        )
+        assert got is folds, name
 
 
 if __name__ == "__main__":

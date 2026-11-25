@@ -15,7 +15,7 @@ from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 G = 128
@@ -41,14 +41,14 @@ def _aot_v2(x, x_q, x_s):
 
 
 def _jit_v2(x, x_q, x_s):
-    per_token_group_quant_8bit_v2(x, x_q, x_s, G, 1e-10, float(fp8_min), float(fp8_max))
+    per_token_group_quant_8bit_v2(x, x_q, x_s, G)
 
 
 FN = {"aot_v2": _aot_v2, "jit_v2": _jit_v2}
 
 
 @marker.parametrize("num_tokens", [1, 8, 64, 512, 4096], ci_vals=[1, 512])
-@marker.benchmark("impl", ["aot_v2", "jit_v2"])
+@marker.benchmark("impl", ["aot_v2", "jit_v2"], gate=["jit_v2"])
 def benchmark(num_tokens: int, impl: str):
     x = create_random(num_tokens, HIDDEN)
     x_q = torch.empty(num_tokens, HIDDEN, device="cuda", dtype=fp8_dtype)

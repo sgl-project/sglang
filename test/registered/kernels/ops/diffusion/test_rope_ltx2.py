@@ -342,6 +342,55 @@ def test_ltx2_qknorm_split_rope_matches_torch_exactly(
     torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
 
 
+@pytest.mark.parametrize(
+    "batch,q_seq,k_seq,num_heads,head_dim",
+    [
+        (1, 7, 5, 32, 128),
+        (2, 4, 9, 32, 64),
+    ],
+)
+def test_ltx2_qknorm_split_rope_vectorized_matches_scalar(
+    batch: int, q_seq: int, k_seq: int, num_heads: int, head_dim: int
+) -> None:
+    _require_b200()
+    torch.cuda.manual_seed(20261023)
+    hidden = num_heads * head_dim
+    q = torch.randn(batch, q_seq, hidden, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, k_seq, hidden, device="cuda", dtype=torch.bfloat16)
+    q_cos, q_sin = _ltx2_make_cos_sin(batch, q_seq, num_heads, head_dim)
+    k_cos, k_sin = _ltx2_make_cos_sin(batch, k_seq, num_heads, head_dim)
+    q_weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+
+    def misaligned(table: torch.Tensor) -> torch.Tensor:
+        # same values off a 16-byte boundary, which keeps the scalar loop
+        storage = torch.empty(table.numel() + 1, device="cuda", dtype=table.dtype)
+        copy = storage[1:].view(table.contiguous().shape)
+        copy.copy_(table)
+        return copy
+
+    def run(tables):
+        return ltx2_qknorm_split_rope_cuda(
+            q,
+            tables[0],
+            tables[1],
+            q_weight,
+            k,
+            tables[2],
+            tables[3],
+            k_weight,
+            eps=1e-6,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
+    tables = (q_cos, q_sin, k_cos, k_sin)
+    vectorized = run(tables)
+    scalar = run(tuple(misaligned(t) for t in tables))
+    for actual, expected in zip(vectorized, scalar):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
 def test_ltx2_qknorm_split_rope_rejects_unsupported_inputs() -> None:
     _require_b200()
     torch.cuda.manual_seed(20260630)

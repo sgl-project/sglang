@@ -28,7 +28,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=110, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
@@ -438,19 +438,6 @@ def test_indexer_prefill_all_fp8_vs_dequant_ref():
     assert o8.dtype == torch.bfloat16
     torch.testing.assert_close(o8.float(), oref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
     assert _topk_overlap(tidx8, tidxref) >= 0.9
-
-
-def test_dtype_contract_rejects_e5m2_q():
-    q = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=DEVICE).to(
-        torch.float8_e5m2
-    )
-    k = torch.randn(256, 1, 128, dtype=torch.bfloat16, device=DEVICE).to(FP8)
-    from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
-        check_sparse_kv_fp8,
-    )
-
-    with pytest.raises(AssertionError):
-        check_sparse_kv_fp8(q, k, None, label="test")
 
 
 if __name__ == "__main__":

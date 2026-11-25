@@ -10,17 +10,16 @@ from torch import nn
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -434,6 +433,10 @@ class _EagleDraftExtendWorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.model_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.target_worker = SimpleNamespace(model_runner=fixture.runner)
         self.draft_extend_attn_backend = draft_extend_attn_backend
         self.topk = settings.topk
@@ -444,6 +447,7 @@ class _EagleDraftExtendWorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.model_runner.model = model_forward
 
     @property
@@ -461,6 +465,10 @@ class _EagleDraftExtendV2WorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.draft_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.target_worker = SimpleNamespace(model_runner=fixture.runner)
         self.draft_extend_attn_backend = draft_extend_attn_backend
         self.topk = settings.topk
@@ -471,6 +479,7 @@ class _EagleDraftExtendV2WorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.draft_runner.model = model_forward
         EagleDraftWorker._init_dsa_index_share_state(self)
 

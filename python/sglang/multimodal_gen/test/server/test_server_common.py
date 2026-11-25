@@ -85,6 +85,7 @@ from sglang.multimodal_gen.test.test_utils import (
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
+from sglang.test.test_utils import admin_post
 
 logger = init_logger(__name__)
 
@@ -1223,7 +1224,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 1: unmerge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing unmerge_lora_weights for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
         )
         assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
@@ -1237,7 +1238,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 2: merge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing merge_lora_weights for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/merge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
         )
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
@@ -1252,7 +1253,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing set_lora for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1318,7 +1319,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         logger.info(
             "[LoRA Switch E2E] Switching to second LoRA adapter for %s", case.id
         )
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "lora2", "lora_path": second_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1338,7 +1339,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 3: Switch back to original LoRA and generate
         logger.info("[LoRA Switch E2E] Switching back to original LoRA for %s", case.id)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1383,7 +1384,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             "[Dynamic LoRA] Loading LoRA dynamically via set_lora API for %s", case.id
         )
         logger.info("[Dynamic LoRA] LoRA path: %s", dynamic_lora_path)
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1407,7 +1408,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         client = self._client(ctx)
 
         # Test 1: Basic multi-LoRA with list format
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
@@ -1426,7 +1427,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert rid is not None
 
         # Test 2: Different strengths
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
@@ -1444,18 +1445,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
         assert rid is not None
 
-        # Test 3: Different targets
-        requests.post(
+        # Test 3: Select the Z-Image transformer for both cached adapters
+        admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
-                "lora_path": [first_lora_path, second_lora_path],
-                "target": ["transformer", "transformer_2"],
+                "lora_path": [None, None],
+                "target": ["transformer", "transformer"],
                 "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1469,7 +1470,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert rid is not None
 
         # Test 4: Switch back to single LoRA
-        resp = requests.post(
+        resp = admin_post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default"},
             timeout=_CONTROL_API_TIMEOUT_SECS,
@@ -1540,14 +1541,14 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_effect_check:
             base_url = f"http://localhost:{ctx.port}/v1"
             # unmerge turns the adapter off in every merge mode; merge restores it
-            resp = requests.post(
+            resp = admin_post(
                 f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
             )
             assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
             try:
                 without_lora = self._generate_key_frames(ctx, case)
             finally:
-                resp = requests.post(
+                resp = admin_post(
                     f"{base_url}/merge_lora_weights",
                     timeout=_CONTROL_API_TIMEOUT_SECS,
                 )
@@ -1569,7 +1570,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
     ) -> None:
         """
         Test /v1/models endpoint returns OpenAI-compatible response.
-        This endpoint is required for sgl-model-gateway router compatibility.
         """
         base_url = f"http://localhost:{ctx.port}"
 
@@ -1725,6 +1725,21 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
+        failures = []
+        if case.lead_sampling_params is not None:
+            label = "lead request"
+            _print_case_log_separator(case.id, f"BEGIN {label}")
+            try:
+                self._test_lead_request(case, diffusion_server)
+            except pytest.skip.Exception as exc:
+                failures.append(f"[{label}] Required request skipped: {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            except (Exception, pytest.fail.Exception) as exc:
+                failures.append(f"[{label}] {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            else:
+                _print_case_log_separator(case.id, f"PASSED {label}")
+
         for warmup_index in range(case.perf_warmup_requests):
             label = f"request warmup {warmup_index + 1}/{case.perf_warmup_requests}"
             _print_case_log_separator(case.id, f"BEGIN {label}")
@@ -1747,7 +1762,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             )
             _print_case_log_separator(case.id, f"END {label}")
 
-        failures = []
         for request_index in range(1, case.perf_repeat_requests + 1):
             label = f"request {request_index}/{case.perf_repeat_requests}"
             _print_case_log_separator(case.id, f"BEGIN {label}")
@@ -1777,6 +1791,26 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         if failures:
             pytest.fail("\n\n".join(failures), pytrace=False)
+
+    def _test_lead_request(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ) -> None:
+        """Send the lead request; check it against its own golden."""
+        lead = case.lead_case()
+        generate_fn = get_generate_fn(
+            model_path=lead.server_args.model_path,
+            modality=lead.server_args.modality,
+            sampling_params=lead.sampling_params,
+        )
+        _, content = self.run_and_collect(
+            diffusion_server, lead.id, generate_fn, collect_perf=False
+        )
+        if os.environ.get("SGLANG_GEN_GT", "0") == "1":
+            self._save_gt_output(lead, content)
+        elif lead.run_consistency_check:
+            self._validate_consistency(lead, content)
 
     def _test_diffusion_request(
         self,

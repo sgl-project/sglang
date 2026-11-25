@@ -11,10 +11,6 @@ class DispatchPolicy(abc.ABC):
             raise ValueError(f"num_instances must be >= 1, got {num_instances}")
         self._num_instances = num_instances
 
-    @property
-    def num_instances(self) -> int:
-        return self._num_instances
-
     @abc.abstractmethod
     def select_with_capacity(self, free_slots: list[int]) -> int | None:
         """Select an instance that has free capacity, or None if all full."""
@@ -83,9 +79,6 @@ class PoolDispatcher:
 
     def select_denoiser_with_capacity(self, free_slots: list[int]) -> int | None:
         return self.denoiser_policy.select_with_capacity(free_slots)
-
-    def select_decoder_with_capacity(self, free_slots: list[int]) -> int | None:
-        return self.decoder_policy.select_with_capacity(free_slots)
 
 
 def create_dispatch_policy(name: str, num_instances: int) -> DispatchPolicy:

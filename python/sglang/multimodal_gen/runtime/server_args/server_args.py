@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Optional
 
 import addict
 import yaml
@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -67,6 +68,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    parse_request_time_limits,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -82,7 +86,6 @@ from sglang.multimodal_gen.runtime.utils.argparse import (
 )
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
-    is_valid_ipv6_address,
     normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -94,6 +97,9 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
+from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
 
@@ -106,7 +112,7 @@ LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
-RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -200,8 +206,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
+        "efficient-large-model/sana-video_2.0_5b_720p",
         "sana1.5_1.6b_1024px_diffusers",
         "sana-video_2b_480p_diffusers",
+        "sana-video_2.0_5b_720p",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "flux.1-dev",
@@ -217,12 +225,16 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
+        "lightricks/ltx-2.5-diffusers",
         "meituan-longcat/longcat-image",
         "meituan-longcat/longcat-image-edit-turbo",
         "ltx-2",
         "ltx-2.3",
+        "ltx-2.5-diffusers",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
+        "minimaxai/minimax-h3-image",
         "inclusionai/ming-image-0.1-design",
         "inclusionai/ming-image-0.1-design-layer",
         "ming-image-0.1-design",
@@ -258,12 +270,14 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
+        "SanaVideo2PipelineConfig",
         "ZImagePipelineConfig",
         "Flux2KleinPipelineConfig",
     }
@@ -368,7 +382,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
-    # number of gpu in a dp group
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
@@ -424,16 +437,15 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
-    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
-    minimax_h3_adaln_online: bool = False
-    # Widest timestep plan the rebuild slab is sized for; see
-    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
-    minimax_h3_adaln_plan_width: int = 4
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
     # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
     # evicted from the GPU slab swap back in from here instead of re-reading
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
-    minimax_h3_adaln_host_cache_gb: float = 8.0
+    minimax_h3_adaln_host_cache_gb: float | None = None
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -500,21 +512,21 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_torch_compile: bool = False
     regional_compile: bool = False
 
-    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
-    # segments split at attention modules (SP all-to-all / dynamic attention
-    # stay eager). Mutually exclusive with --enable-torch-compile and
-    # Cache-DiT; BCG takes priority when more than one is requested.
-    #
     # PyTorch's two approximate numerics defaults, set explicitly per worker
     # (see runtime/utils/numerics_policy.py). They are process-global, so they
     # cannot follow a request's quality level; the defaults keep PyTorch's own
     # values so the exact tier's speed is unchanged.
     allow_cudnn_tf32: bool = True
     allow_bf16_reduced_precision_reduction: bool = True
-    # BCG graphs are resolution-specific, so --warmup-resolutions is required
-    # when BCG is enabled: every requested resolution is captured at warmup so
-    # serving never triggers a fresh capture.
-    enable_breakable_cuda_graph: bool = False
+    # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
+    # segments split at attention modules (SP all-to-all / dynamic attention
+    # stay eager). Mutually exclusive with --enable-torch-compile and
+    # Cache-DiT; BCG takes priority when more than one is requested.
+    #
+    # BCG graphs are resolution-specific: every warmup resolution is captured at
+    # warmup so serving never triggers a fresh capture. None resolves in
+    # _adjust_breakable_cuda_graph_support (on for opted-in pipelines).
+    enable_breakable_cuda_graph: bool | None = None
     # Text/prompt sequence-length padding budget for BCG. Prompt-conditioning
     # inputs are padded up to the smallest bucket that fits, so prompts of
     # different lengths reuse one captured graph. Warmup captures one graph per
@@ -561,7 +573,14 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    http_graceful_shutdown_timeout: int | None = None
+    # Request watchdog (runtime/managers/request_watchdog.py): SECONDS or TASK=SECONDS
+    # entries; a request executing longer turns /health unhealthy. Unset: off.
+    request_time_limit: list[str] | None = None
     enable_metrics: bool = False
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -576,6 +595,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_config: str | None = None
     enable_batching_metrics: bool = False
     async_output_save: bool = False
+    sleep_on_idle: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -606,16 +626,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600
-    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
-    disagg_instance_id: int = 0
-    disagg_max_slots_per_instance: int = 8
-    disagg_transfer_redundancy: float = 1.25
-    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
-    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
@@ -651,7 +664,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
-    srt_encoder_connect_timeout: int = 3.05
+    srt_encoder_connect_timeout: float = 3.05
     srt_encoder_timeout: int = 100
 
     # SGLang server for PE model inference
@@ -661,6 +674,20 @@ class ServerArgs(DisaggServerArgsMixin):
     @property
     def broker_port(self) -> int:
         return self.port + 1
+
+    @property
+    def cancel_endpoint(self) -> str | None:
+        # the HTTP server publishes cancelled request ids here to every replica driver
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-cancel-{self.port}"
+
+    @property
+    def progress_endpoint(self) -> str | None:
+        # replica drivers send video progress here; ipc only reaches this node
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-progress-{self.port}"
 
     def _adjust_path(self):
         expand_path_fields(self)
@@ -680,9 +707,13 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
+            auto_tuner.maybe_plan_extra_dit_residency()
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -698,7 +729,16 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
+        timeout = self.http_graceful_shutdown_timeout
+        if timeout is not None and (
+            not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 0
+        ):
+            raise ValueError(
+                "http_graceful_shutdown_timeout must be None or a non-negative "
+                "integer in seconds"
+            )
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -710,6 +750,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        parse_request_time_limits(self.request_time_limit)
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
@@ -743,7 +784,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         Falls back to :data:`DEFAULT_BCG_TEXT_BUCKETS` when ``--bcg-text-buckets``
         is unset, so both prompt padding and warmup capture share one source of
-        truth instead of the legacy ``SGLANG_BCG_TEXT_BUCKETS`` env var.
+        truth.
         """
         raw = self.bcg_text_buckets
         if not raw:
@@ -753,6 +794,34 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_breakable_cuda_graph(self):
         if not self.enable_breakable_cuda_graph:
+            return
+        dit_residency = self.residency_mode("transformer")
+        if dit_residency != RESIDENT:
+            # BCG captures the DiT forward; every offload flavor rebinds or
+            # frees its weight storage between forwards, and a captured graph
+            # replays the addresses recorded at capture. Other components
+            # never enter the captured graph and stay free to offload.
+            if self.explicit_residency_mode(
+                "transformer"
+            ) is not None or self.is_explicit_layerwise_offload_component(
+                "transformer"
+            ):
+                raise ValueError(
+                    "--enable-breakable-cuda-graph requires a resident DiT: "
+                    f"the selected {dit_residency!r} placement rebinds weight "
+                    "storage between forwards, while a captured graph replays "
+                    "the addresses recorded at capture. Remove the DiT "
+                    "offload selection or drop --enable-breakable-cuda-graph."
+                )
+            logger.warning(
+                "[Diffusion BCG] the %s DiT placement was selected "
+                "automatically for this configuration; disabling "
+                "--enable-breakable-cuda-graph because a captured graph would "
+                "replay weight addresses the offload rebinds. The DiT runs "
+                "eager.",
+                dit_residency,
+            )
+            self.enable_breakable_cuda_graph = False
             return
         # BCG graphs are captured per resolution and only replay for that exact
         # latent shape, so the user must declare the resolutions up front. We
@@ -809,6 +878,8 @@ class ServerArgs(DisaggServerArgsMixin):
             return None
 
     def _adjust_breakable_cuda_graph_support(self):
+        if self.enable_breakable_cuda_graph is None:
+            self.enable_breakable_cuda_graph = self._breakable_cuda_graph_default()
         if not self.enable_breakable_cuda_graph:
             return
 
@@ -833,7 +904,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
                 "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
                 "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, SANA-Video 2.0, "
                 "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
                 pipeline_config_name,
                 self.model_path,
@@ -842,6 +913,52 @@ class ServerArgs(DisaggServerArgsMixin):
         # cannot build; the ComfyUI step stage captures on its first real step.
         if not self.warmup_resolutions and not self.comfyui_mode:
             self._default_bcg_warmup_resolution()
+
+    def _breakable_cuda_graph_default(self) -> bool:
+        """Whether unset BCG turns on: an opted-in pipeline on a validated checkpoint,
+        captured by the startup warmup over DiT weights that never move."""
+        deployment_config = self.pipeline_config.get_model_deployment_config()
+        if (
+            self.pipeline_class_name
+            not in deployment_config.bcg_default_pipeline_class_names
+        ):
+            return False
+        enabled = (
+            self.performance_mode in ("auto", "speed")
+            and current_platform.is_cuda()
+            and not current_platform.device_shares_host_memory()
+            # offline runs have no startup warmup; capturing would add a generation
+            and self.warmup_mode == "server"
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.comfyui_mode
+            and self._is_breakable_cuda_graph_supported_model()
+            and not self.enable_torch_compile
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and self.batching_max_size == 1
+            and self.lora_path is None
+            # measured with both stage DiTs resident on >=130 GiB cards; capture
+            # holds ~7 GB more on Hopper, past an 80 GB card's speed-mode headroom
+            and current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+            and (
+                self.ltx2_two_stage_device_mode == "resident"
+                or not self._is_ltx23_two_stage_pipeline()
+            )
+            # graphs replay fixed weight addresses
+            and not self.dit_layerwise_offload
+            and not self.use_fsdp_inference
+            and all(
+                self.residency_mode(name) == RESIDENT
+                for name in ("transformer", "transformer_2")
+            )
+        )
+        if enabled:
+            logger.info(
+                "[Diffusion BCG] enabled by default for %s; pass "
+                "--enable-breakable-cuda-graph false to run eager.",
+                self.pipeline_class_name,
+            )
+        return enabled
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)
@@ -922,6 +1039,9 @@ class ServerArgs(DisaggServerArgsMixin):
             and not self.disagg_mode
             and replica_size > 1
         )
+
+        if self.pipeline_config.task_type == ModelTaskType.S2V:
+            return
 
         if fold_replica:
             mode = "replica"
@@ -1039,7 +1159,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _adjust_ltx2_two_stage_device_mode(self):
-        if not self._is_ltx23_two_stage_pipeline():
+        if not self._is_ltx2_distilled_lora_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
@@ -1096,10 +1216,7 @@ class ServerArgs(DisaggServerArgsMixin):
         device_total_memory_gb = (
             current_platform.get_device_total_memory() / BYTES_PER_GB
         )
-        if (
-            "H200" in device_name
-            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
-        ):
+        if device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB:
             logger.info(
                 "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
                 device_name,
@@ -1113,6 +1230,13 @@ class ServerArgs(DisaggServerArgsMixin):
             device_total_memory_gb,
         )
         return "original"
+
+    def _is_ltx2_distilled_lora_two_stage_pipeline(self) -> bool:
+        # LTX-2 and LTX-2.3 refine with a distilled LoRA; LTX-2.5 ships a distilled DiT
+        return (
+            is_ltx2_two_stage_pipeline_name(self.pipeline_class_name)
+            and not self.pipeline_config.default_sigmas
+        )
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
@@ -1204,15 +1328,16 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and self.attention_backend in ("laser_attn", "ascend_sparse_attn")
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
-            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            # Laser and Ascend sparse attention target the H3 transformer. Keep the
+            # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
+                "encoder; %s applies to the transformer",
+                self.attention_backend,
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
@@ -1680,6 +1805,18 @@ class ServerArgs(DisaggServerArgsMixin):
                     "Automatically set kv_gather_degree=sp_degree=2; set "
                     "--ulysses-degree explicitly to keep the Ulysses exchange"
                 )
+            elif self._dit_num_attention_heads() % self.sp_degree:
+                # Ulysses splits attention heads across the SP ranks and fails
+                # at the first all-to-all; K/V gather keeps every head local
+                self.kv_gather_degree = self.sp_degree
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=%d: the DiT's "
+                    "%d attention heads do not divide across %d Ulysses ranks",
+                    self.sp_degree,
+                    self._dit_num_attention_heads(),
+                    self.sp_degree,
+                )
             else:
                 self.ulysses_degree = self.sp_degree
                 logger.info(
@@ -1715,11 +1852,18 @@ class ServerArgs(DisaggServerArgsMixin):
             # composes with Ulysses).
             self.ulysses_degree = self.kv_gather_degree
 
+    def _dit_num_attention_heads(self) -> int:
+        """Head count from the DiT arch config, or 0 when the config does not set it."""
+        dit_config = getattr(self.pipeline_config, "dit_config", None)
+        arch_config = getattr(dit_config, "arch_config", None)
+        return getattr(arch_config, "num_attention_heads", 0) or 0
+
     def _model_default_uses_cfg(self) -> bool:
         """
         Check whether the model uses classifier-free guidance by default.
 
         CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        A ``guidance_scale`` of None (resolved per request, e.g. FLUX.3) does not count.
         """
         from sglang.multimodal_gen.registry import get_model_info
 
@@ -1727,10 +1871,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if model_info is None:
             return False
         default_params = model_info.sampling_param_cls()
+        guidance_scale = getattr(default_params, "guidance_scale", None)
 
         return (
             getattr(default_params, "negative_prompt", None) is not None
-            and getattr(default_params, "guidance_scale", 0) > 1.0
+            and guidance_scale is not None
+            and guidance_scale > 1.0
         )
 
     @staticmethod
@@ -1897,6 +2043,15 @@ class ServerArgs(DisaggServerArgsMixin):
         self, component_name: str, *, supported: bool
     ) -> None:
         self._component_layerwise_capabilities[component_name] = supported
+
+    @property
+    def node_local_gpu_worker_count(self) -> int:
+        """GPU worker processes sharing this node's host memory.
+
+        Per-process host budgets divide by it, because each worker reads the
+        same host-wide free-memory number.
+        """
+        return max(1, self.num_gpus // max(1, self.nnodes))
 
     def has_layerwise_offload_components(self) -> bool:
         return bool(
@@ -2193,7 +2348,10 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Semantic checkpoint variant to serve. Models with partitioned "
                 "checkpoints use this value to select the compatible weights "
-                "without exposing repository subfolder layout."
+                "without exposing repository subfolder layout. MiniMax H3: "
+                "fl2va, ref2va, or fl2va+ref2va (both transformers in one "
+                "server, each request on its task's; the automatic memory "
+                "policy keeps both resident when they fit)."
             ),
         )
         parser.add_argument(
@@ -2228,7 +2386,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "from the GPU slab swaps back in over PCIe instead of "
                 "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
-                "(ref2va) GB; the default 8 holds several. Groups are evicted "
+                "(ref2va) GB. Auto uses 8 GB, or 0 for image releases whose "
+                "fixed timestep plans all fit on the GPU. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
             ),
         )
@@ -2301,6 +2460,16 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+        parser.add_argument(
+            "--enable-attention-backend-autotune",
+            action=StoreBoolean,
+            default=ServerArgs.enable_attention_backend_autotune,
+            help=(
+                "For native pipelines, time the compatible attention backends on "
+                "each layer's first large enough input and keep one only when it "
+                "is numerically compatible and faster. Validated on SM90 and SM12x."
+            ),
         )
         parser.add_argument(
             "--component-attention-backends",
@@ -2460,8 +2629,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "instead of Ulysses all-to-all. Non-causal attention only; "
                 "does not compose with --ulysses-degree/--ring-degree yet. "
                 "When no SP degree is set explicitly, sp_degree=2 defaults to "
-                "kv_gather_degree=2 (its measured-win zone) and higher "
-                "degrees default to Ulysses."
+                "kv_gather_degree=2 (its measured-win zone); higher degrees "
+                "default to Ulysses when the DiT's attention heads divide by "
+                "sp_degree, and to K/V gather otherwise."
             ),
         )
         parser.add_argument(
@@ -2532,11 +2702,6 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
         parser.add_argument(
-            "--mask-strategy-file-path",
-            type=str,
-            help="Path to mask strategy JSON file for STA",
-        )
-        parser.add_argument(
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
@@ -2586,7 +2751,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "(split at attention; SP all-to-all / dynamic attention stay "
             "eager) to cut per-kernel launch overhead. Mutually exclusive "
             "with --enable-torch-compile and Cache-DiT (BCG takes priority). "
-            "Requires --warmup-resolutions; all of them are captured at warmup.",
+            "Graphs are captured at warmup for --warmup-resolutions (default: "
+            "the model default shape). Unset, it is on for LTX-2/LTX-2.3 "
+            "LTX2TwoStagePipeline serving with resident DiTs on >=130 GiB GPUs.",
         )
         parser.add_argument(
             "--bcg-text-buckets",
@@ -2851,8 +3018,10 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
-            help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+            help="Pin CPU-offloaded weights for faster host-to-device transfers, "
+            "subject to the host memory budget. Pinned memory cannot be reclaimed; "
+            "use --pin-cpu-memory false to reduce host/cgroup memory pressure "
+            'or work around CUDA pinning errors such as "invalid argument".',
         )
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
@@ -2860,10 +3029,11 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
-                "LTX-2.3 two-stage device residency mode: "
+                "LTX-2 / LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'resident' keeps both transformers resident on GPU. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+                "'resident' keeps both transformers resident on GPU and runs stage 2 "
+                "on the one with the distilled LoRA merged in. "
+                "Default is auto: resident on CUDA GPUs with at least 130 GiB, otherwise original."
             ),
         )
         parser.add_argument(
@@ -2950,7 +3120,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
-                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(
@@ -3018,6 +3188,14 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            default=ServerArgs.sleep_on_idle,
+            help="Reduce idle CPU usage by waiting for requests instead of busy polling. "
+            "Disabled by default to minimize wake-up latency. Applies only to "
+            "single-rank monolithic replicas; TP/SP/CFG multi-rank replicas keep polling.",
+        )
+        parser.add_argument(
             "--async-output-save",
             action="store_true",
             default=ServerArgs.async_output_save,
@@ -3042,10 +3220,45 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--http-graceful-shutdown-timeout",
+            type=int,
+            default=ServerArgs.http_graceful_shutdown_timeout,
+            help="Seconds to wait for HTTP connections and tasks to finish on shutdown "
+            "before cancelling them. Unset waits indefinitely; 0 cancels immediately. "
+            "Does not bound GPU worker teardown or preserve asynchronous video jobs.",
+        )
+        parser.add_argument(
+            "--request-time-limit",
+            type=str,
+            nargs="+",
+            default=ServerArgs.request_time_limit,
+            help="Execution time limit per request: SECONDS for every request, or "
+            "TASK=SECONDS for one task of a model that names its request tasks "
+            "(MiniMax-H3: t2va, fl2va, ref2va); 0 or off removes a limit. A "
+            "request executing longer (queueing excluded) is logged with every "
+            "worker's Python stacks and turns /health unhealthy; restart the "
+            "server then. Unset: off. Not available with disaggregated roles.",
+        )
+        parser.add_argument(
             "--enable-metrics",
             action=StoreBoolean,
             default=ServerArgs.enable_metrics,
             help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
         )
         parser.add_argument(
             "--strict-ports",
@@ -3234,7 +3447,8 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         parser.add_argument(
             "--srt-encoder-connection-timeout",
-            type=int,
+            dest="srt_encoder_connect_timeout",
+            type=float,
             default=ServerArgs.srt_encoder_connect_timeout,
             help="Timeout (in seconds) for establishing the initial TCP connection to the SGLang encoder server. "
             "Default value is 3.05.",
@@ -3261,6 +3475,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
         )
 
+        # use argparse's destinations so new aliases need no second registry
+        parser.set_defaults(
+            _sglang_cli_destinations={
+                option[2:].replace("-", "_"): action.dest
+                for action in parser._actions
+                for option in action.option_strings
+                if option.startswith("--")
+            }
+        )
         return parser
 
     def url(self):
@@ -3579,6 +3802,8 @@ class ServerArgs(DisaggServerArgsMixin):
         args: argparse.Namespace,
         unknown_args: list[str] | None = None,
         default_args: dict[str, Any] | None = None,
+        *,
+        argv: list[str] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -3604,7 +3829,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
-        provided_args = cls.get_provided_args(args, unknown_args)
+        provided_args = cls.get_provided_args(args, unknown_args, argv=argv)
         explicit_arg_names = set(provided_args)
 
         # Handle config file
@@ -3727,13 +3952,6 @@ class ServerArgs(DisaggServerArgsMixin):
             with open(config_file, "r") as f:
                 return json.load(f)
         elif config_file.endswith((".yaml", ".yml")):
-            try:
-                import yaml
-            except ImportError:
-                raise ImportError(
-                    "Please install PyYAML to use YAML config files. "
-                    "`pip install pyyaml`"
-                )
             with open(config_file, "r") as f:
                 return yaml.safe_load(f)
         else:
@@ -3762,32 +3980,36 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def get_provided_args(
-        args: argparse.Namespace, unknown_args: list[str]
+        args: argparse.Namespace,
+        unknown_args: list[str],
+        *,
+        argv: list[str] | None = None,
     ) -> dict[str, Any]:
         """Get the arguments provided by the user."""
         provided_args = {}
         # We need to check against the raw command-line arguments to see what was
         # explicitly provided by the user, vs. what's a default value from argparse.
-        raw_argv = sys.argv + unknown_args
+        raw_argv = (sys.argv[1:] if argv is None else argv) + unknown_args
 
         # Create a set of argument names that were present on the command line.
         # This handles both styles: '--arg=value' and '--arg value'.
-        provided_arg_names = set(getattr(args, "_sglang_explicit_arg_names", ()))
+        provided_arg_names = set(vars(args).get("_sglang_explicit_arg_names", ()))
+        destinations = vars(args).get("_sglang_cli_destinations", {})
         for arg in raw_argv:
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
-                provided_arg_names.add(arg_name)
-        cli_aliases = {
-            "cfg_parallel_size": "cfg_parallel_degree",
-            "data_parallel_size": "dp_size",
-            "dp": "dp_size",
-            "layerwise_offload_modules": "layerwise_offload_components",
-            "mode": "performance_mode",
-        }
-        for alias_name, dest_name in cli_aliases.items():
-            if alias_name in provided_arg_names:
-                provided_arg_names.add(dest_name)
+                if arg_name not in destinations and arg_name not in vars(args):
+                    # argparse also accepts an unambiguous prefix of a flag; a
+                    # flag spelled in full (also one registered later) wins.
+                    abbreviated = {
+                        dest
+                        for name, dest in destinations.items()
+                        if name.startswith(arg_name)
+                    }
+                    if len(abbreviated) == 1:
+                        arg_name = abbreviated.pop()
+                provided_arg_names.add(destinations.get(arg_name, arg_name))
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -4078,15 +4300,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
 
-        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
-            has_sp = self.sp_degree > 1
-            has_tp = self.tp_size > 1
-            if has_sp and has_tp:
-                logger.warning(
-                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
-                    "Proceeding anyway (SGLang integration may support this mode)."
-                )
-
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:
             return
@@ -4122,45 +4335,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
 @dataclasses.dataclass
 class PortArgs:
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
-    scheduler_input_ipc_name: str
-
-    # The port for nccl initialization (torch.dist)
-    nccl_port: int
-
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
-
-    # The ipc filename for Scheduler to send metrics
-    metrics_ipc_name: str
-
     # Master port for distributed inference
     master_port: int | None = None
 
     @staticmethod
-    def from_server_args(
-        server_args: ServerArgs, dp_rank: Optional[int] = None
-    ) -> "PortArgs":
-        if server_args.nccl_port is None:
-            nccl_port = server_args.scheduler_port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
-        else:
-            nccl_port = server_args.nccl_port
-
-        # Normal case, use IPC within a single node
-        return PortArgs(
-            scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            nccl_port=nccl_port,
-            rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            master_port=server_args.master_port,
-        )
+    def from_server_args(server_args: ServerArgs) -> "PortArgs":
+        return PortArgs(master_port=server_args.master_port)
 
 
 _global_server_args = None
@@ -4173,7 +4353,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args, unknown_args = parser.parse_known_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args, argv=argv)
     return server_args
 
 
@@ -4187,9 +4367,5 @@ def set_global_server_args(server_args: ServerArgs):
 
 def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args

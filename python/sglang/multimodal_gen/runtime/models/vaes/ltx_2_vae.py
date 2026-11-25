@@ -17,6 +17,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
 )
@@ -63,7 +64,7 @@ class PerChannelRMSNorm(nn.Module):
     def __init__(self, channel_dim: int = 1, eps: float = 1e-8) -> None:
         """
         Args:
-            dim: Dimension along which to compute the RMS (typically channels).
+            channel_dim: Dimension along which to compute the RMS (typically channels).
             eps: Small constant added for numerical stability.
         """
         super().__init__()
@@ -76,9 +77,11 @@ class PerChannelRMSNorm(nn.Module):
         """
         Apply RMS normalization along the configured dimension.
         """
-        channel_dim = channel_dim or self.channel_dim
-        # Compute mean of squared values along `dim`, keep dimensions for broadcasting.
-        mean_sq = torch.mean(x**2, dim=self.channel_dim, keepdim=True)
+        if channel_dim is None:
+            channel_dim = self.channel_dim
+        # Compute mean of squared values along `channel_dim`, keep dimensions for
+        # broadcasting. The override has to reach the reduction, not just the local.
+        mean_sq = torch.mean(x**2, dim=channel_dim, keepdim=True)
         # Normalize by the root-mean-square (RMS).
         rms = torch.sqrt(mean_sq + self.eps)
         return x / rms
@@ -635,8 +638,6 @@ class LTX2VideoDownBlock3D(nn.Module):
             Whether this layer behaves causally (future frames depend only on past frames) or not.
     """
 
-    _supports_gradient_checkpointing = True
-
     def __init__(
         self,
         in_channels: int,
@@ -709,8 +710,6 @@ class LTX2VideoDownBlock3D(nn.Module):
                     )
                 )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -721,12 +720,7 @@ class LTX2VideoDownBlock3D(nn.Module):
         r"""Forward method of the `LTXDownBlock3D` class."""
 
         for i, resnet in enumerate(self.resnets):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, generator, causal
-                )
-            else:
-                hidden_states = resnet(hidden_states, temb, generator, causal=causal)
+            hidden_states = resnet(hidden_states, temb, generator, causal=causal)
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
@@ -755,8 +749,6 @@ class LTX2VideoMidBlock3d(nn.Module):
         is_causal (`bool`, defaults to `True`):
             Whether this layer behaves causally (future frames depend only on past frames) or not.
     """
-
-    _supports_gradient_checkpointing = True
 
     def __init__(
         self,
@@ -793,8 +785,6 @@ class LTX2VideoMidBlock3d(nn.Module):
             )
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -817,19 +807,14 @@ class LTX2VideoMidBlock3d(nn.Module):
             temb = temb.view(hidden_states.size(0), -1, 1, 1, 1)
 
         for i, resnet in enumerate(self.resnets):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, generator, causal
-                )
-            else:
-                hidden_states = resnet(
-                    hidden_states,
-                    temb,
-                    generator,
-                    causal=causal,
-                    conv_cache=conv_cache,
-                    cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
-                )
+            hidden_states = resnet(
+                hidden_states,
+                temb,
+                generator,
+                causal=causal,
+                conv_cache=conv_cache,
+                cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
+            )
 
         return hidden_states
 
@@ -926,8 +911,6 @@ class LTX2VideoUpBlock3d(nn.Module):
             Whether this layer behaves causally (future frames depend only on past frames) or not.
     """
 
-    _supports_gradient_checkpointing = True
-
     def __init__(
         self,
         in_channels: int,
@@ -997,8 +980,6 @@ class LTX2VideoUpBlock3d(nn.Module):
             )
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1040,19 +1021,14 @@ class LTX2VideoUpBlock3d(nn.Module):
                 )
 
         for i, resnet in enumerate(self.resnets):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, generator, causal
-                )
-            else:
-                hidden_states = resnet(
-                    hidden_states,
-                    temb,
-                    generator,
-                    causal=causal,
-                    conv_cache=conv_cache,
-                    cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
-                )
+            hidden_states = resnet(
+                hidden_states,
+                temb,
+                generator,
+                causal=causal,
+                conv_cache=conv_cache,
+                cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
+            )
 
         return hidden_states
 
@@ -1173,8 +1149,6 @@ class LTX2VideoEncoder3d(nn.Module):
             spatial_padding_mode=spatial_padding_mode,
         )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self, hidden_states: torch.Tensor, causal: Optional[bool] = None
     ) -> torch.Tensor:
@@ -1203,20 +1177,10 @@ class LTX2VideoEncoder3d(nn.Module):
         hidden_states = hidden_states.permute(0, 1, 3, 7, 5, 2, 4, 6).flatten(1, 4)
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for down_block in self.down_blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    down_block, hidden_states, None, None, causal
-                )
+        for down_block in self.down_blocks:
+            hidden_states = down_block(hidden_states, causal=causal)
 
-            hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states, None, None, causal
-            )
-        else:
-            for down_block in self.down_blocks:
-                hidden_states = down_block(hidden_states, causal=causal)
-
-            hidden_states = self.mid_block(hidden_states, causal=causal)
+        hidden_states = self.mid_block(hidden_states, causal=causal)
 
         hidden_states = self.norm_out(hidden_states)
         hidden_states = self.conv_act(hidden_states)
@@ -1362,8 +1326,6 @@ class LTX2VideoDecoder3d(nn.Module):
                 torch.randn(2, output_channel) / output_channel**0.5
             )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1384,32 +1346,22 @@ class LTX2VideoDecoder3d(nn.Module):
         if self.timestep_scale_multiplier is not None:
             temb = temb * self.timestep_scale_multiplier
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states, temb, None, causal
-            )
+        hidden_states = self.mid_block(
+            hidden_states,
+            temb,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=_ck("mid_block"),
+        )
 
-            for up_block in self.up_blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    up_block, hidden_states, temb, None, causal
-                )
-        else:
-            hidden_states = self.mid_block(
+        for i, up_block in enumerate(self.up_blocks):
+            hidden_states = up_block(
                 hidden_states,
                 temb,
                 causal=causal,
                 conv_cache=conv_cache,
-                cache_key=_ck("mid_block"),
+                cache_key=_ck(f"up_blocks.{i}"),
             )
-
-            for i, up_block in enumerate(self.up_blocks):
-                hidden_states = up_block(
-                    hidden_states,
-                    temb,
-                    causal=causal,
-                    conv_cache=conv_cache,
-                    cache_key=_ck(f"up_blocks.{i}"),
-                )
 
         hidden_states = self.norm_out(hidden_states)
 
@@ -1645,7 +1597,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
     for all models (such as downloading or saving).
     """
 
-    _supports_gradient_checkpointing = False
     supports_decode_on_frames = True
 
     def __init__(self, config: LTXVideoVAEConfig):
@@ -1866,7 +1817,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         batch_size, num_channels, num_frames, height, width = x.shape
 
-        if self.use_framewise_decoding and num_frames > self.tile_sample_min_num_frames:
+        if self.use_framewise_encoding and num_frames > self.tile_sample_min_num_frames:
             return self._temporal_tiled_encode(x, causal=causal)
 
         if self.use_tiling and (
@@ -2140,24 +2091,44 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
-        rows = []
-        for i in range(0, height, tile_latent_stride_height):
-            row = []
-            for j in range(0, width, tile_latent_stride_width):
-                time = self.decoder(
-                    z[
-                        :,
-                        :,
-                        :,
-                        i : i + tile_latent_min_height,
-                        j : j + tile_latent_min_width,
-                    ],
-                    temb,
-                    causal=causal,
-                )
-
-                row.append(time)
-            rows.append(row)
+        row_starts = range(0, height, tile_latent_stride_height)
+        col_starts = range(0, width, tile_latent_stride_width)
+        starts = [(i, j) for i in row_starts for j in col_starts]
+        rank, world_size = self._tile_shard(len(starts))
+        # rank r decodes tiles r, r + world_size, ...; each tile is decoded alone,
+        # so the gathered set equals the one a single rank would decode
+        tiles = [
+            self.decoder(
+                z[
+                    :,
+                    :,
+                    :,
+                    i : i + tile_latent_min_height,
+                    j : j + tile_latent_min_width,
+                ],
+                temb,
+                causal=causal,
+            )
+            for i, j in starts[rank::world_size]
+        ]
+        if world_size > 1:
+            tiles = self._gather_tiles(
+                tiles,
+                [
+                    (
+                        min(tile_latent_min_height, height - i)
+                        * self.spatial_compression_ratio,
+                        min(tile_latent_min_width, width - j)
+                        * self.spatial_compression_ratio,
+                    )
+                    for i, j in starts
+                ],
+                world_size,
+            )
+        rows = [
+            tiles[r * len(col_starts) : (r + 1) * len(col_starts)]
+            for r in range(len(row_starts))
+        ]
 
         dec = self._merge_spatial_tiles(
             rows,
@@ -2171,6 +2142,42 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             return (dec,)
 
         return DecoderOutput(sample=dec)
+
+    def _tile_shard(self, num_tiles: int) -> tuple[int, int]:
+        """`(rank, world_size)` the spatial tiles are split over, or `(0, 1)`.
+
+        Every decode-parallel rank runs the decode once spatial parallel decode
+        is installed, so without the split each of them decodes every tile.
+        """
+        if not self._spatial_parallel_decode_enabled:
+            return 0, 1
+        world_size = get_decode_parallel_world_size()
+        if num_tiles < world_size:
+            return 0, 1
+        return get_decode_parallel_rank(), world_size
+
+    @staticmethod
+    def _gather_tiles(
+        local: list[torch.Tensor],
+        sizes: list[tuple[int, int]],
+        world_size: int,
+    ) -> list[torch.Tensor]:
+        """All-gather the round-robin tile shards back into tile order.
+
+        `sizes` holds every tile's (height, width); shards are padded to the
+        largest so one all-gather moves them, then cropped back.
+        """
+        per_rank = -(-len(sizes) // world_size)
+        height = max(h for h, _ in sizes)
+        width = max(w for _, w in sizes)
+        send = local[0].new_zeros((per_rank, *local[0].shape[:3], height, width))
+        for k, tile in enumerate(local):
+            send[k, ..., : tile.shape[-2], : tile.shape[-1]] = tile
+        recv = get_decode_parallel_group_coordinator().all_gather(send, dim=0)
+        return [
+            recv[(idx % world_size) * per_rank + idx // world_size][..., :h, :w]
+            for idx, (h, w) in enumerate(sizes)
+        ]
 
     def _temporal_tiled_encode(
         self, x: torch.Tensor, causal: Optional[bool] = None
