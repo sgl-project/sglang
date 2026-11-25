@@ -8,7 +8,7 @@ on:
         type: string
         required: true
       pr_number:
-        description: "PR number to build from (e.g. 12345)"
+        description: "PR number to check out in the build job (e.g. 12345); the release job always uses the dispatched ref"
         type: string
         required: false
 
@@ -118,9 +118,11 @@ jobs:
     needs: build-xpu
     runs-on: ubuntu-latest
     steps:
+      # This job holds GH_PAT_FOR_WHL_RELEASE (write to sgl-project/whl), so it runs the
+      # index script from the dispatched ref only, never from pr_number's PR head.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
+          persist-credentials: false
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
