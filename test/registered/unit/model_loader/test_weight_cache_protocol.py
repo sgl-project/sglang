@@ -5,7 +5,7 @@ These cover the pure-Python logic that the GPU end-to-end test
 (test_weight_cache_daemon.py) cannot exercise cheaply:
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
-  - WeightCacheConfig compatibility matching / (de)serialization
+  - CacheConfig compatibility matching / (de)serialization
   - LoadSpec construction, shard identity and schema validation
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
@@ -18,6 +18,8 @@ process, so they run in the fast CPU suite and would catch a regression
 in any of these branches before it reaches the expensive GPU path.
 """
 
+import hashlib
+import json
 import os
 import socket
 import struct
@@ -31,9 +33,9 @@ from transformers import PretrainedConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.weight_cache import protocol
 from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.protocol import (
+    CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -88,17 +90,27 @@ def _cache_config_fields(**overrides):
     return base
 
 
-def _make_cache_config(**overrides) -> WeightCacheConfig:
-    return WeightCacheConfig(**_cache_config_fields(**overrides))
+def _make_cache_config(**overrides) -> CacheConfig:
+    return CacheConfig(**_cache_config_fields(**overrides))
 
 
-def _make_load_spec(*, tp_size=2, hf_config=None, model_path="m", draft_model_idx=None):
+def _make_load_spec(
+    *,
+    tp_size=2,
+    hf_config=None,
+    model_path="m",
+    revision=None,
+    checkpoint_id="rev1",
+    draft_model_idx=None,
+    quantization=None,
+    dtype=torch.float32,
+):
     model_config = SimpleNamespace(
         hf_config=PretrainedConfig() if hf_config is None else hf_config,
         model_path=model_path,
-        revision=None,
-        quantization=None,
-        dtype=torch.float32,
+        revision=revision,
+        quantization=quantization,
+        dtype=dtype,
     )
     with (
         get_context().override_server_args(tp_size=tp_size),
@@ -111,7 +123,7 @@ def _make_load_spec(*, tp_size=2, hf_config=None, model_path="m", draft_model_id
         ),
     ):
         return build_load_spec(
-            checkpoint_id="rev1",
+            checkpoint_id=checkpoint_id,
             model_config=model_config,
             load_config=LoadConfig(draft_model_idx=draft_model_idx),
             target_device=torch.device("cpu"),
@@ -199,7 +211,7 @@ class TestTransportBackend(CustomTestCase):
             b.close()
 
 
-class TestWeightCacheConfig(CustomTestCase):
+class TestCacheConfig(CustomTestCase):
     def test_identical_configs_match(self):
         self.assertTrue(_make_cache_config().matches(_make_cache_config()))
 
@@ -214,6 +226,7 @@ class TestWeightCacheConfig(CustomTestCase):
             ("moe_a2a_backend", "mooncake"),
             ("dtype", "torch.bfloat16"),
             ("quant_method", "fp8"),
+            ("quant_config_hash", "changed"),
             ("model_path", "/models/other"),
             ("revision", "v2"),
             ("device_capability", "9.0"),
@@ -225,49 +238,124 @@ class TestWeightCacheConfig(CustomTestCase):
             )
 
     def test_legacy_protocol_round_trip(self):
-        self.assertIs(protocol.CacheConfig, WeightCacheConfig)
-        self.assertTrue(issubclass(LoadSpec, WeightCacheConfig))
         wire = _cache_config_fields(quant_method="fp8", quant_config_hash="abc123")
-        restored = protocol.CacheConfig.from_dict(wire)
-        self.assertEqual(list(restored.to_dict().items()), list(wire.items()))
+        positional = CacheConfig(*wire.values())
+        self.assertEqual(list(positional.to_dict().items()), list(wire.items()))
+        self.assertTrue(positional.matches(CacheConfig.from_dict(wire)))
 
 
 class TestLoadSpec(CustomTestCase):
-    def test_load_spec_separates_shard_identity_from_shared_settings(self):
+    def test_wire_schema_separates_model_and_runtime(self):
         spec = _make_load_spec()
+        self.assertIsInstance(spec.model, WeightCacheConfig)
         self.assertEqual(
             msgspec.json.decode(msgspec.json.encode(spec), type=LoadSpec), spec
         )
-        unknown_field = {**msgspec.to_builtins(spec), "future_layout": "new"}
-        with self.assertRaisesRegex(msgspec.ValidationError, "future_layout"):
-            msgspec.json.decode(msgspec.json.encode(unknown_field), type=LoadSpec)
+        wire = msgspec.to_builtins(spec)
+        self.assertEqual(
+            set(wire["model"]),
+            {
+                "checkpoint_id",
+                "hf_config_hash",
+                "model_arch",
+                "dtype",
+                "quant_method",
+                "quant_config_hash",
+                "draft_model_idx",
+            },
+        )
+        self.assertTrue(wire.keys().isdisjoint(wire["model"]))
+        self.assertTrue(wire.keys().isdisjoint({"model_path", "revision"}))
+        for field, invalid in (
+            ("checkpoint_id", {**wire, "checkpoint_id": "misplaced"}),
+            ("tp_size", {**wire, "model": {**wire["model"], "tp_size": 2}}),
+        ):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(msgspec.ValidationError, field),
+            ):
+                msgspec.json.decode(msgspec.json.encode(invalid), type=LoadSpec)
+        with self.assertRaises(AttributeError):
+            spec.model.dtype = "torch.float16"
+
+    def test_shard_rank_only_changes_lookup_digest(self):
+        spec = _make_load_spec()
         for field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
             with self.subTest(field=field):
                 peer = msgspec.structs.replace(spec, **{field: 1})
+                self.assertEqual(spec.model, peer.model)
                 self.assertNotEqual(spec.digest(), peer.digest())
                 self.assertEqual(
                     spec.digest(include_rank=False), peer.digest(include_rank=False)
                 )
-        staged = _make_load_spec(
-            hf_config=PretrainedConfig(name_or_path="/tmp/staging"),
-            model_path="/tmp/staging",
-        )
-        self.assertEqual(spec.digest(), staged.digest())
-        self.assertEqual(
-            spec.digest(include_rank=False), staged.digest(include_rank=False)
-        )
+
+    def test_runtime_settings_change_shared_digest_and_preserve_model_identity(self):
+        spec = _make_load_spec()
         for other in (
             _make_load_spec(tp_size=4),
-            _make_load_spec(draft_model_idx=1),
-            _make_load_spec(hf_config=PretrainedConfig(hidden_size=128)),
-            msgspec.structs.replace(spec, checkpoint_id="rev2"),
             msgspec.structs.replace(spec, flashinfer_cutedsl_swap_ab=True),
             msgspec.structs.replace(spec, fp4_gemm_runner_backend="flashinfer_trtllm"),
         ):
+            self.assertEqual(spec.model, other.model)
             self.assertNotEqual(spec.digest(), other.digest())
             self.assertNotEqual(
                 spec.digest(include_rank=False), other.digest(include_rank=False)
             )
+
+    def test_every_model_identity_field_changes_both_digests(self):
+        spec = _make_load_spec()
+        quant_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+        other = _make_load_spec(
+            checkpoint_id="rev2",
+            hf_config=PretrainedConfig(
+                architectures=["OtherModel"], quantization_config=quant_config
+            ),
+            dtype=torch.bfloat16,
+            quantization="fp8",
+            draft_model_idx=1,
+        )
+        self.assertEqual(other.model.checkpoint_id, "rev2")
+        self.assertEqual(other.model.model_arch, "OtherModel")
+        self.assertEqual(other.model.dtype, "torch.bfloat16")
+        self.assertEqual(other.model.quant_method, "fp8")
+        self.assertEqual(other.model.quant_config_hash, hash_quant_config(quant_config))
+        self.assertEqual(other.model.draft_model_idx, 1)
+        # Change each model field in isolation. Several inputs change the HF hash too.
+        for field, value in msgspec.to_builtins(other.model).items():
+            with self.subTest(field=field):
+                self.assertNotEqual(getattr(spec.model, field), value)
+                changed_model = msgspec.structs.replace(spec.model, **{field: value})
+                changed = msgspec.structs.replace(spec, model=changed_model)
+                self.assertNotEqual(spec.digest(), changed.digest())
+                self.assertNotEqual(
+                    spec.digest(include_rank=False), changed.digest(include_rank=False)
+                )
+
+    def test_staged_checkpoint_uses_the_same_identity(self):
+        spec = _make_load_spec()
+        staged = _make_load_spec(
+            hf_config=PretrainedConfig(name_or_path="/tmp/staging"),
+            model_path="/tmp/staging",
+            revision="release-alias",
+        )
+        self.assertEqual(spec, staged)
+        self.assertEqual(spec.digest(), staged.digest())
+        overridden = _make_load_spec(hf_config=PretrainedConfig(hidden_size=128))
+        self.assertNotEqual(spec.model.hf_config_hash, overridden.model.hf_config_hash)
+        self.assertNotEqual(spec.digest(), overridden.digest())
+
+    def test_digests_match_the_previous_flat_keys(self):
+        spec = _make_load_spec()
+        fields = msgspec.to_builtins(spec)
+        fields.update(fields.pop("model"))
+        encoded = json.dumps(fields, sort_keys=True).encode()
+        self.assertEqual(spec.digest(), hashlib.sha256(encoded).hexdigest())
+        for rank_field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+            del fields[rank_field]
+        encoded = json.dumps(fields, sort_keys=True).encode()
+        self.assertEqual(
+            spec.digest(include_rank=False), hashlib.sha256(encoded).hexdigest()
+        )
 
 
 class TestQuantConfigHashing(CustomTestCase):

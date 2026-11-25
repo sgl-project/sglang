@@ -8,7 +8,7 @@ Each GPU runs one daemon process for its TP rank. The daemon:
    (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
    allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
-4. Validates WeightCacheConfig compatibility before serving
+4. Validates CacheConfig compatibility before serving
 
 Usage:
     # Single-node: launch all TP rank daemons with a single command:
@@ -63,6 +63,7 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
+    CacheConfig,
     build_cache_config,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -74,7 +75,6 @@ from .protocol import (
     resolve_cache_quantization,
     send_msg,
 )
-from .schema import WeightCacheConfig
 from .transport import (
     TORCH_IPC_BACKEND,
     VMM_FD_BACKEND,
@@ -189,7 +189,7 @@ class WeightCacheDaemon:
         self.ready_path = get_ready_path(device_uuid)
 
         self.model = None
-        self.config: Optional[WeightCacheConfig] = None
+        self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
@@ -594,7 +594,7 @@ class WeightCacheDaemon:
 
         elif req.get("type") == "fetch_state":
             # Client requests full state with IPC handles
-            engine_config = WeightCacheConfig.from_dict(req["config"])
+            engine_config = CacheConfig.from_dict(req["config"])
             if not self.config.matches(engine_config):
                 # Log detailed mismatch info for debugging
                 daemon_dict = self.config.to_dict()

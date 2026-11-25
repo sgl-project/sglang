@@ -102,7 +102,7 @@ class WeightCacheModelLoader(BaseModelLoader):
 
     - socket file missing            -> fall back to disk load
     - connection refused             -> raise (daemon crashed after binding)
-    - WeightCacheConfig mismatch     -> raise (do NOT disk-load on a shared GPU
+    - CacheConfig mismatch           -> raise (do NOT disk-load on a shared GPU
                                         holding a different config's weights;
                                         also surfaces fingerprint drift bugs)
     - any protocol / transfer error  -> raise

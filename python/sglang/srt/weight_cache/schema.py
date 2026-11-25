@@ -9,16 +9,42 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Optional, Self
+from typing import Any, Optional
 
 import msgspec
 
 
-class WeightCacheConfig(msgspec.Struct):
-    """Fingerprint of one rank's weights, shared by the daemon and snapshot loaders."""
+class WeightCacheConfig(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
+    """Identity and format of the model weights, shared across ranks.
 
-    model_path: str
+    The checkpoint ID follows the contents across staging paths and revision aliases.
+    """
+
+    checkpoint_id: str  # pinned Hub commit or local checkpoint content digest
     model_arch: str
+    hf_config_hash: str  # effective HF config after model overrides
+    dtype: str
+    quant_method: str
+    quant_config_hash: str
+    draft_model_idx: Optional[int]  # layer selected from a multi-layer draft checkpoint
+
+    def __post_init__(self):
+        if not self.checkpoint_id:
+            raise ValueError("A snapshot requires an immutable checkpoint identifier")
+
+
+class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """A model and the conditions that determine its loaded weights on this rank.
+
+    Shard lookup uses the whole spec. Ranks vote on the model and shared load
+    settings while excluding their logical rank coordinates.
+    """
+
+    model: WeightCacheConfig
+
+    # Parallel layout and logical shard coordinates.
     tp_size: int
     tp_rank: int
     pp_size: int
@@ -29,62 +55,30 @@ class WeightCacheConfig(msgspec.Struct):
     moe_dp_rank: int
     moe_ep_rank: int
     attn_dp_size: int
-    enable_dp_lm_head: bool
     attn_cp_size: int
     moe_dense_tp_size: Optional[int]
+    moe_cp_size: int
+
+    # Runtime and kernel choices that affect the representation of the weights.
+    device_capability: str
+    torch_version: str
     moe_a2a_backend: str
-    quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
-    quant_config_hash: str  # SHA-256 hash of quantization config
-    dtype: str  # e.g. "torch.float16"
-    revision: str  # model revision the weights were loaded from ("" if unset)
-    # Environment stamp: a daemon and a client that ran different post-processing
-    # branches (different GPU compute capability or torch/kernel version) can
-    # produce incompatible weights that would map cleanly yet serve garbage.
-    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
-    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
-    torch_version: str  # torch.__version__ of the process that built the weights
-
-    def matches(self, other: WeightCacheConfig) -> bool:
-        """Compare all fields for an IPC weight-cache request."""
-        return self == other
-
-    def to_dict(self) -> dict[str, Any]:
-        return msgspec.structs.asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Self:
-        return cls(**d)
-
-
-class LoadSpec(
-    WeightCacheConfig, frozen=True, kw_only=True, forbid_unknown_fields=True
-):
-    """Inputs to the snapshot lookup key. Sources index snapshots by digest()."""
-
-    checkpoint_id: str
-    hf_config_hash: str
-    draft_model_idx: Optional[int]
     moe_runner_backend: str
     fp4_gemm_runner_backend: str
     fp8_gemm_runner_backend: str
     bf16_gemm_backend: str
-    moe_cp_size: int
+    enable_dp_lm_head: bool
     enable_fp32_lm_head: bool
     ep_num_redundant_experts: int
     enable_eplb: bool
     init_expert_location: Optional[str]
     flashinfer_cutedsl_swap_ab: Optional[bool]
 
-    def __post_init__(self):
-        if not self.checkpoint_id:
-            raise ValueError("A snapshot requires an immutable checkpoint identifier")
-
     def digest(self, *, include_rank: bool = True) -> str:
         """Identify this shard for lookup, or its shared configuration for a vote."""
         fields = msgspec.to_builtins(self)
-        # A remote checkpoint can be staged in a different directory on each rank.
-        # checkpoint_id already identifies the contents across paths and revision aliases.
-        del fields["model_path"], fields["revision"]
+        # Keep the flat key encoding while exposing model settings as a nested struct.
+        fields.update(fields.pop("model"))
         if not include_rank:
             for name in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
                 del fields[name]

@@ -12,19 +12,58 @@ import signal
 import struct
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.serialization import safe_pickle_loads
 
-from .schema import WeightCacheConfig
-
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
-# Earlier daemon clients import this name from the protocol module.
-CacheConfig = WeightCacheConfig
-
 logger = logging.getLogger(__name__)
+
+
+class CacheConfig(msgspec.Struct):
+    """Flat fingerprint exchanged by the weight-cache daemon and its IPC clients."""
+
+    model_path: str
+    model_arch: str
+    tp_size: int
+    tp_rank: int
+    pp_size: int
+    pp_rank: int
+    dp_size: int
+    ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    attn_dp_size: int
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
+    quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
+    quant_config_hash: str  # SHA-256 hash of quantization config
+    dtype: str  # e.g. "torch.float16"
+    revision: str  # model revision the weights were loaded from ("" if unset)
+    # Environment stamp: a daemon and a client that ran different post-processing
+    # branches (different GPU compute capability or torch/kernel version) can
+    # produce incompatible weights that would map cleanly yet serve garbage.
+    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
+    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
+    torch_version: str  # torch.__version__ of the process that built the weights
+
+    def matches(self, other: CacheConfig) -> bool:
+        """Check if two configs are compatible for weight sharing."""
+        return self == other
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {f: getattr(self, f) for f in self.__struct_fields__}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> CacheConfig:
+        return cls(**d)
 
 
 def hash_quant_config(quant_config: Any) -> str:
@@ -87,21 +126,23 @@ def resolve_cache_quantization(
     return method or get_quant_method_name(config), config
 
 
-def build_cache_config(
-    model_config: ModelConfig,
-    *,
-    quant_method: str,
-    quant_config: Any,
-    model_path: str,
-    revision: Optional[str],
-    ep_size: int,
-) -> WeightCacheConfig:
-    """Build the fingerprint before loading can mutate the quantization config."""
-    parallel = get_parallel()
+def model_weight_fields(
+    model_config: ModelConfig, *, quant_method: str, quant_config: Any
+) -> dict[str, str]:
+    """Collect the resolved model fields common to IPC and snapshot keys."""
     architectures = model_config.hf_config.architectures
-    return WeightCacheConfig(
-        model_path=model_path,
+    return dict(
         model_arch=architectures[0] if architectures else "",
+        dtype=str(model_config.dtype),
+        quant_method=quant_method,
+        quant_config_hash=hash_quant_config(quant_config),
+    )
+
+
+def parallel_weight_fields(ep_size: int) -> dict[str, int | bool | str | None]:
+    """Collect the configured parallel widths, shard coordinates, and layout settings."""
+    parallel = get_parallel()
+    return dict(
         tp_size=parallel.tp_size,
         tp_rank=parallel.tp_rank,
         pp_size=parallel.pp_size,
@@ -118,10 +159,26 @@ def build_cache_config(
         attn_cp_size=parallel.attn_cp_size,
         moe_dense_tp_size=parallel.moe_dense_tp_size,
         moe_a2a_backend=get_exec().moe.moe_a2a_backend,
-        quant_method=quant_method,
-        quant_config_hash=hash_quant_config(quant_config),
-        dtype=str(model_config.dtype),
+    )
+
+
+def build_cache_config(
+    model_config: ModelConfig,
+    *,
+    quant_method: str,
+    quant_config: Any,
+    model_path: str,
+    revision: Optional[str],
+    ep_size: int,
+) -> CacheConfig:
+    """Build the fingerprint before loading can mutate the quantization config."""
+    return CacheConfig(
+        model_path=model_path,
         revision=revision or "",
+        **model_weight_fields(
+            model_config, quant_method=quant_method, quant_config=quant_config
+        ),
+        **parallel_weight_fields(ep_size),
         **compute_env_stamp(),
     )
 
@@ -253,7 +310,7 @@ def compute_env_stamp() -> Dict[str, str]:
     Returns the device compute capability and torch version of the current
     process. A daemon and a connecting client that differ on either may have run
     different post-processing / kernel-selection branches, producing weights that
-    map cleanly over IPC yet serve garbage; stamping these into WeightCacheConfig turns
+    map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
     that into a clean mismatch. Imported lazily so protocol.py stays cheap to
     import and usable on CPU-only hosts (both fields degrade to "").
     """

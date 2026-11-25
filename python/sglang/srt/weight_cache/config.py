@@ -16,8 +16,13 @@ from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.runtime_context import get_exec, get_parallel
 
-from .protocol import build_cache_config, resolve_cache_quantization
-from .schema import LoadSpec
+from .protocol import (
+    compute_env_stamp,
+    model_weight_fields,
+    parallel_weight_fields,
+    resolve_cache_quantization,
+)
+from .schema import LoadSpec, WeightCacheConfig
 
 if TYPE_CHECKING:
     import torch
@@ -54,13 +59,13 @@ def build_load_spec(
     a local checkpoint digest). Two checkpoints can have identical model configs.
     """
     quant_method, quant_config = resolve_cache_quantization(model_config)
-    cache_config = build_cache_config(
-        model_config,
-        quant_method=quant_method,
-        quant_config=quant_config,
-        model_path=model_config.model_path,
-        revision=model_config.revision,
-        ep_size=get_parallel().moe_ep_size,
+    model = WeightCacheConfig(
+        checkpoint_id=checkpoint_id,
+        hf_config_hash=_hf_config_hash(model_config.hf_config),
+        draft_model_idx=load_config.draft_model_idx,
+        **model_weight_fields(
+            model_config, quant_method=quant_method, quant_config=quant_config
+        ),
     )
     execution = get_exec()
     moe_runner = get_moe_runner_backend()
@@ -72,10 +77,9 @@ def build_load_spec(
         swap_ab = use_cutedsl_moe_swap_ab(target_device)
 
     return LoadSpec(
-        **cache_config.to_dict(),
-        checkpoint_id=checkpoint_id,
-        hf_config_hash=_hf_config_hash(model_config.hf_config),
-        draft_model_idx=load_config.draft_model_idx,
+        model=model,
+        **parallel_weight_fields(ep_size=get_parallel().moe_ep_size),
+        **compute_env_stamp(),
         moe_runner_backend=moe_runner.value,
         fp4_gemm_runner_backend=get_fp4_gemm_runner_backend().value,
         fp8_gemm_runner_backend=get_fp8_gemm_runner_backend().value,

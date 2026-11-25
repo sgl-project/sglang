@@ -20,8 +20,7 @@ import socket
 import sys
 import time
 
-from sglang.srt.weight_cache.protocol import recv_msg, send_msg
-from sglang.srt.weight_cache.schema import WeightCacheConfig
+from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
 
 
 def find_free_port():
@@ -120,7 +119,7 @@ def run_single_daemon(
                             conn, {"status": "ok", "config": daemon.config.to_dict()}
                         )
                     elif req.get("type") == "fetch_state":
-                        engine_config = WeightCacheConfig.from_dict(req["config"])
+                        engine_config = CacheConfig.from_dict(req["config"])
                         if daemon.config.matches(engine_config):
                             send_msg(
                                 conn,
