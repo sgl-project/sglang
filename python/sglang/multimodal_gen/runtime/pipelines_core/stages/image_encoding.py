@@ -19,6 +19,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -464,7 +465,6 @@ class ImageEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify image encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check("image_embeds", batch.image_embeds, V.list_of_tensors_dims(3))
         return result
 
 
@@ -976,17 +976,20 @@ class ImageVAEEncodingStage(PipelineStage):
                 with autocast_context(vae_dtype, server_args.disable_autocast):
                     if server_args.pipeline_config.vae_tiling:
                         self.vae.enable_tiling()
-                    # if server_args.vae_sp:
-                    #     self.vae.enable_parallel()
                     should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
                     video_condition = server_args.pipeline_config.preprocess_vae_encode(
                         video_condition, self.vae
                     )
-                    with temporary_module_dtype(
-                        self.vae, vae_dtype, enabled=should_cast_vae
-                    ) as vae:
+                    with (
+                        temporary_module_dtype(
+                            self.vae, vae_dtype, enabled=should_cast_vae
+                        ) as vae,
+                        use_gpu_conditioning_hash(
+                            enabled=num_frames == 1 and len(images) > 1
+                        ),
+                    ):
                         latent_dist: DiagonalGaussianDistribution = vae.encode(
                             video_condition
                         )
@@ -1137,7 +1140,4 @@ class ImageVAEEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage outputs."""
         result = VerificationResult()
-        # result.add_check(
-        #     "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
-        # )
         return result

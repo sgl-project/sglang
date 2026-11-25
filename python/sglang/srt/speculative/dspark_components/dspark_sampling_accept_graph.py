@@ -54,13 +54,14 @@ logger = logging.getLogger(__name__)
 
 class GraphSamplingInfo(msgspec.Struct, frozen=True):
     """The SamplingBatchInfo fields the sampling accept reads, for an all-sampled
-    batch without top-k / top-p."""
+    batch without top-k / top-p / min-p."""
 
     temperatures: torch.Tensor
     is_all_greedy: bool = False
     is_any_greedy: bool = False
     need_top_k_sampling: bool = False
     need_top_p_sampling: bool = False
+    need_min_p_sampling: bool = False
 
 
 def sampling_accept_commit_lens(

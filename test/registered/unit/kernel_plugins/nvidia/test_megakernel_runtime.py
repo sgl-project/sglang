@@ -1,5 +1,6 @@
 """CPU checks of the megakernel install, dispatch and capture check."""
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -10,14 +11,25 @@ import torch
 from msgspec.structs import replace
 
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
-from sglang.srt.kernel_plugins.nvidia import binding
+from sglang.srt.kernel_plugins.nvidia import binding, kimi_k31_dflash_binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ANY_TP, ARCH, DRAFT, ISA, SPEC, Lm, batch, server_args  # noqa: E402
+import _fakes  # noqa: E402
+from _fakes import (  # noqa: E402
+    ANY_TP,
+    ARCH,
+    DRAFT,
+    ISA,
+    SPEC,
+    FakeDFlashRuntime,
+    Lm,
+    batch,
+    server_args,
+)
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -115,6 +127,53 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = install(archs=["Draft"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
+
+    def test_a_draft_spec_this_server_does_not_meet_declines_on_every_rank(self):
+        """A draft spec is checked only at install, after the target's megakernel is
+        built; an unmet requirement or too few SMs for its grids must leave the draft
+        on its own forward, not refuse the server."""
+        registry.register(architecture="Draft", path="_fakes:DRAFT")
+        unmet = {
+            "tp_size 4 is not one of [8]": {"tp_sizes": frozenset({8})},
+            "config.num_hidden_layers None is not 3": {
+                "hf_config": {"num_hidden_layers": 3}
+            },
+            # the fake GPU has 160 SMs
+            "160 SMs, the persistent grids need 161": {"resident_blocks": 161},
+        }
+        for reason, requires in unmet.items():
+            spec = replace(DRAFT, requires=replace(DRAFT.requires, **requires))
+            with (
+                get_parallel().override(tp_rank=0),
+                self.assertLogs(binding.logger, "INFO") as logs,
+            ):
+                lm = self._install_spec(spec, archs=["Draft"], is_draft=True)
+            self.assertIsNone(binding.built_megakernel(lm))
+            self.assertNotIn("forward", lm.__dict__)
+            self.assertRegex(
+                "".join(logs.output),
+                rf"fake does not serve this setup \([^;]*{re.escape(reason)}\); the draft keeps "
+                "its own forward",
+            )
+
+        def unmet_on_rank_1(value, group=None):
+            return (
+                [value, ["rank-1 reason"]] if isinstance(value, list) else [value] * 2
+            )
+
+        # a reason on any rank declines every rank; only TP rank 0 logs it
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(binding.logger, "INFO"),
+        ):
+            lm = self._install_spec(
+                DRAFT, archs=["Draft"], is_draft=True, gathered=unmet_on_rank_1
+            )
+        self.assertIsNone(binding.built_megakernel(lm))
+        # the target still refuses on too few SMs
+        small_gpu = replace(SPEC, requires=replace(SPEC.requires, resident_blocks=161))
+        with self.assertRaisesRegex(ValueError, "persistent grids need 161"):
+            self._install_spec(small_gpu)
 
     def test_each_architecture_gets_its_registered_binding(self):
         with patch.dict(binding._BINDINGS, {ARCH: OtherBinding}):
@@ -237,3 +296,138 @@ class TestMegakernelRuntime(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _DFlashWorker:
+    """The DFLASH worker's guarded fields; like DFlashWorkerV2, an unknown name falls
+    back to its target worker."""
+
+    block_size = 8
+    _selector_sampling_enabled = True
+
+    def __getattr__(self, name):
+        return f"target worker's {name}"
+
+
+class TestDFlashBinding(CustomTestCase):
+    """bind_dflash_runtime: the runtime a target build names, checked by the guard."""
+
+    def setUp(self):
+        publish(server_args(enable_nvidia_megakernel=True), role="test")
+        self.addCleanup(reset_context)
+        rank = get_parallel().override(tp_rank=0)
+        rank.__enter__()
+        self.addCleanup(rank.__exit__, None, None, None)
+
+    def _bind(self, built, *, runtime=FakeDFlashRuntime, ranks=1, **attrs):
+        worker = _DFlashWorker()
+        worker.__dict__.update(attrs)
+        gathered = lambda value, group=None: [value] * ranks  # noqa: E731
+        with (
+            patch.object(
+                kimi_k31_dflash_binding, "built_megakernel", return_value=built
+            ),
+            patch.object(binding, "_gather_tp", side_effect=gathered),
+            patch.object(_fakes, "FakeDFlashRuntime", runtime),
+        ):
+            return kimi_k31_dflash_binding.bind_dflash_runtime(worker, Lm())
+
+    def test_only_a_build_naming_a_runtime_binds_one(self):
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+        with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
+            self.assertIsNone(self._bind(SimpleNamespace()))
+        self.assertIn("offers no DFlash runtime", "".join(logs.output))
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
+        ):
+            self.assertIsNone(self._bind(SimpleNamespace()))
+        with self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"):
+            self.assertIsNone(self._bind(None))
+            self.assertIsNone(self._bind(SimpleNamespace(dflash_runtime="")))
+        runtime = self._bind(names, _mask_token_id=3)
+        self.assertIsInstance(runtime, FakeDFlashRuntime)
+        self.assertIs(runtime.built, names)
+        self.assertEqual(runtime.binding.pull("mask_token_id"), 3)
+        with self.assertRaisesRegex(KeyError, "without declaring it"):
+            runtime.binding.pull("draft_model")
+        # an unset binding must fail, not fall back to the target worker
+        runtime = self._bind(names)
+        with self.assertRaises(AttributeError):
+            runtime.binding.pull("mask_token_id")
+        publish(server_args(enable_nvidia_megakernel=False), role="test")
+        self.assertIsNone(self._bind(names))
+
+    def test_a_setup_the_runtime_does_not_serve_runs_stock(self):
+        """A guard value mismatch declines the runtime on every rank: SGLang's round
+        runs, and TP rank 0 names each key once."""
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+        wrong_tp = type(
+            "Runtime",
+            (FakeDFlashRuntime,),
+            {"guards": {"tp_size": 16, "block_size": 8}},
+        )
+        with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
+            self.assertIsNone(self._bind(names, runtime=wrong_tp, block_size=5))
+        (warning,) = logs.output
+        self.assertRegex(warning, r"does not serve this DFLASH setup \(block_size is 5")
+        self.assertRegex(warning, r"tp_size is 4, expected 16\)")
+        self.assertIn("DFlash phases run stock", warning)
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
+        ):
+            self.assertIsNone(self._bind(names, _selector_sampling_enabled=False))
+
+    def test_names_sglang_lacks_and_disagreeing_ranks_raise(self):
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+
+        def runtime(**attrs):
+            return type("Runtime", (FakeDFlashRuntime,), attrs)
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"binding has no name \['draft_kv'\]"
+        ):
+            self._bind(names, runtime=runtime(bindings=frozenset({"draft_kv"})))
+        unknown_key = runtime(guards={"draft_kv": 1})
+        with self.assertRaisesRegex(RuntimeError, r"guard has no key \['draft_kv'\]"):
+            self._bind(names, runtime=unknown_key)
+
+        def guard_differs_on_rank_1(value, group=None):
+            return [value, "other"] if isinstance(value, list) else [value, value]
+
+        with (
+            patch.object(
+                kimi_k31_dflash_binding, "built_megakernel", return_value=names
+            ),
+            patch.object(binding, "_gather_tp", side_effect=guard_differs_on_rank_1),
+            self.assertRaisesRegex(RuntimeError, "guard values differ"),
+        ):
+            kimi_k31_dflash_binding.bind_dflash_runtime(_DFlashWorker(), Lm())
+
+    def test_every_binding_names_a_member_the_worker_defines(self):
+        """A runtime pulls each name from the worker without its target-worker
+        fallback, so a member the worker lost would fail only at a GPU startup."""
+        import ast
+
+        from sglang.srt.speculative import dflash_worker_v2
+
+        tree = ast.parse(Path(dflash_worker_v2.__file__).read_text())
+        (worker,) = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DFlashWorkerV2"
+        ]
+        # what __init__ and the rest assign on the instance; the class has the others
+        assigned = {
+            node.attr
+            for node in ast.walk(worker)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+        }
+        missing = {
+            name: member.attr
+            for name, member in kimi_k31_dflash_binding.BINDINGS.items()
+            if member.attr not in assigned
+            and not hasattr(dflash_worker_v2.DFlashWorkerV2, member.attr)
+        }
+        self.assertEqual(missing, {})

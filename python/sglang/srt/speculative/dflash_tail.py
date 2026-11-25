@@ -58,16 +58,14 @@ def needs_target_only_tail(worker, batch):
 
 
 def forward_target_only_tail(worker, batch, *, on_publish=None, grammar_barrier=None):
-    from sglang.srt.layers.logprob_processor import compute_spec_logprobs
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+    from sglang.srt.sampling.verify_accept import VerifyAccept
     from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-    from sglang.srt.speculative.dflash_utils import (
-        apply_dflash_verify_logits_adjustments,
-    )
     from sglang.srt.speculative.dflash_worker_v2 import _chain_accept_indices
     from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
-    from sglang.srt.speculative.spec_utils import GrammarTree, build_grammar_vocab_mask
+    from sglang.srt.speculative.spec_utils import GrammarTree
+    from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 
     idle = batch.forward_mode.is_idle()
     device = worker.device
@@ -144,29 +142,40 @@ def forward_target_only_tail(worker, batch, *, on_publish=None, grammar_barrier=
             logits.next_token_logits = processor.finish_deferred_gather(
                 logits.next_token_logits
             )
-        if processor is not None and processor.is_deferred_shard(
+        deferred = processor is not None and processor.is_deferred_shard(
             logits.next_token_logits
-        ):
+        )
+        if deferred:
             bonus = processor.deferred_argmax(logits.next_token_logits)
             logits.next_token_logits = None
-        else:
+        target_verify = TargetVerify.prepare(
+            batch,
+            logits_output=logits,
+            grammar_tree=GrammarTree.from_linear_chain(tokens)
+            if batch.has_grammar
+            else None,
+            grammar_barrier=grammar_barrier,
+            watermark_engine=None,
+            watermark_full_mask=False,
+        )
+        if not deferred:
             if batch.sampling_info is not None:
-                apply_dflash_verify_logits_adjustments(
-                    next_token_logits=logits.next_token_logits,
+                adjust_verify_logits(
+                    logits.next_token_logits,
                     sampling_info=batch.sampling_info,
-                    draft_token_num=1,
+                    grammar_mask=target_verify.grammar_mask,
+                    draft_tokens=tokens,
+                    has_custom_logit_processor=batch.sampling_info.has_custom_logit_processor,
                 )
-            if batch.has_grammar:
-                mask = build_grammar_vocab_mask(
-                    reqs=batch.reqs,
-                    tree=GrammarTree.from_linear_chain(tokens),
-                    sampling_info=batch.sampling_info,
-                    device=logits.next_token_logits.device,
-                    barrier=grammar_barrier,
-                )
-                mask.apply(logits.next_token_logits)
+            elif target_verify.grammar_mask is not None:
+                target_verify.grammar_mask.apply(logits.next_token_logits)
             bonus = logits.next_token_logits.argmax(dim=-1)
         worker._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, bonus)
+        target_verify.commit(
+            batch,
+            logits_output=logits,
+            accept=VerifyAccept(tokens=bonus.reshape(count, 1), accept_lens=commits),
+        )
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.commit_spec_accept_tokens(
                 batch, _chain_accept_indices(commits, 1)
@@ -189,8 +198,6 @@ def forward_target_only_tail(worker, batch, *, on_publish=None, grammar_barrier=
             positions=positions,
             extend_lens=commits,
         )
-    if count and batch.return_logprob:
-        compute_spec_logprobs(batch, logits, bonus, chain_stride=1)
     if logits is not None:
         logits.hidden_states = None
     new_lengths = prefix + 1 if count else prefix

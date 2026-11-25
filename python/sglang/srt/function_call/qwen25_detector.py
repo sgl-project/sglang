@@ -112,6 +112,11 @@ class Qwen25Detector(BaseFormatDetector):
 
         return result
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # The stream is over, so a held-back prefix of the end token is plain text.
+        normal_text, self._normal_text_buffer = self._normal_text_buffer, ""
+        return StreamingParseResult(normal_text=normal_text)
+
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='<tool_call>\n{"name":"' + name + '", "arguments":',
