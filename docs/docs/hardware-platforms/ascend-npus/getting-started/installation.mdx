@@ -216,6 +216,10 @@ If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid.
 ```bash Command
 # The index serves both aarch64 and x86_64 wheels
 pip install memfabric-hybrid==1.5.0.dev20261119 --extra-index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/
+
+# Install the device-specific MemFabric kernels.
+# --soc-version is A5 on the 950PR/DT Series, A3 on the A3 Series.
+mfcli kernel install --soc-version <A5|A3>
 ```
 
 #### PyTorch and PyTorch Framework Adapter on Ascend
@@ -385,17 +389,28 @@ docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/s
 
 2. Build an image based on Dockerfile
 
+The Dockerfile clones SGLang from GitHub during the build and does not use the local checkout, which only provides
+`npu.Dockerfile`. Pass `SGLANG_TAG` to build a specific branch or tag.
+
 ```bash Command
-# Clone the SGLang repository
+# Clone the SGLang repository to obtain the Dockerfile
 git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-# Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
-# Optional build arguments:
-#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
+# Required arguments:
+#   TARGETARCH: target architecture, e.g., amd64, arm64
+#   DEVICE_TYPE: target hardware, a3 or 950. The Dockerfile defaults to 950, so A3 Series builds must set a3.
+# Optional arguments:
+#   SGLANG_TAG: SGLang branch or tag to clone, e.g., main (default)
+#   CANN_VERSION: CANN version, e.g., 9.2.0 (default)
+#   SGLANG_KERNEL_NPU_TAG: sgl-kernel-npu release tag (default 2026.11.0.post14)
 # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
-docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
+docker build \
+    --build-arg TARGETARCH=<arch_tag> \
+    --build-arg DEVICE_TYPE=<a3|950> \
+    --build-arg SGLANG_TAG=<branch_or_tag> \
+    -t <image_name> -f npu.Dockerfile .
 ```
 
 #### Create Docker Container
