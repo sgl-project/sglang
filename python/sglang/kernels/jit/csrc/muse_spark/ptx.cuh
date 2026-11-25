@@ -37,6 +37,8 @@ DEVI void advance(T& s, u32& ph) {
     ph ^= 1;
   }
 }
+// sgl_kernel/ptx/barrier.cuh has to_shared / cluster_ctarank / mapa_shared, but NVRTC opens no standard header
+// and it needs sgl_kernel/utils.cuh (<bit>, tvm-ffi) and C++20 concepts; hence smem_u32 / cl_rank / mapa here.
 DEVI u32 smem_u32(const void* p) {
   return static_cast<u32>(__cvta_generic_to_shared(p));
 }
