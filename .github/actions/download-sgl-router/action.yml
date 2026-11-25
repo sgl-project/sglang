@@ -9,6 +9,14 @@ inputs:
     description: "sgl-router-build's artifact in this run; empty uses only the cache."
     required: false
     default: ''
+  from_source:
+    description: >
+      'true' takes neither the artifact nor the cache and leaves the build to
+      source, for a job that holds a secret besides GITHUB_TOKEN: a
+      pull_request_target run (PR code) can write into the default branch's
+      cache, and a same-run artifact may have come from that cache.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -17,7 +25,7 @@ runs:
     # to the cache below.
     - name: Download prebuilt sgl-router
       id: artifact
-      if: inputs.artifact_name != ''
+      if: inputs.artifact_name != '' && inputs.from_source != 'true'
       continue-on-error: true
       uses: actions/download-artifact@v4
       with:
@@ -25,13 +33,13 @@ runs:
         path: sgl-router-bin
 
     - name: Ensure zstd so the cache entry is readable
-      if: steps.artifact.outcome != 'success'
+      if: steps.artifact.outcome != 'success' && inputs.from_source != 'true'
       shell: bash
       run: bash scripts/ci/utils/ensure_zstd.sh
 
     - name: Restore prebuilt sgl-router from cache
       id: cache
-      if: steps.artifact.outcome != 'success'
+      if: steps.artifact.outcome != 'success' && inputs.from_source != 'true'
       uses: actions/cache/restore@v4
       with:
         path: sgl-router-bin/sgl-router
