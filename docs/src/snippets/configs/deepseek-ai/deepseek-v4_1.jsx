@@ -17,11 +17,11 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtx6000"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtxpro6000"],
 
   // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared catalog.
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
   ],
 
   variants: [
@@ -63,7 +63,7 @@ export const config = {
     gb300: "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111",
     // First nightly with #45261, which SM120 needs to start this model.
-    rtx6000: "lmsysorg/sglang:nightly-dev-20261119-6b374a55",
+    rtxpro6000: "lmsysorg/sglang:nightly-dev-20261119-6b374a55",
   },
 
   github: {
@@ -649,7 +649,7 @@ export const config = {
     // ---------- RTX PRO 6000: 8x RTX PRO 6000 Blackwell Server Edition (SM120,
     // 96 GB, PCIe only), TP8 + EP8. Verified on the 1017 checkpoint only.
     {
-      match: { hw: "rtx6000", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
       verified: true,
       env: [

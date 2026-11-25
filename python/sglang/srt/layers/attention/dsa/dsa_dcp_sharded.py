@@ -178,6 +178,7 @@ def init_dcp_candidate_all_gather(max_rows: int, topk: int) -> None:
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
 # of a row's global top-2048 keys under DCP8, so 384 needs no fallback there.
 _DCP_MERGE_CAND_K = 384
+_DCP_MERGE_CAND_K_BY_WORLD = {2: 1280, 4: 640}
 
 
 class DcpTopKMerge:
@@ -186,8 +187,11 @@ class DcpTopKMerge:
     stream, never concurrently, with the same rows in the same order on every
     rank."""
 
-    def __init__(self, group, max_rows: int, topk: int, buffer: torch.Tensor, handle):
+    def __init__(
+        self, group, max_rows: int, topk: int, buffer: torch.Tensor, handle, cand_k: int
+    ):
         device = group.device
+        self.cand_k = cand_k
         self.dcp_rank = group.rank_in_group
         self.max_rows = max_rows
         self.buffer = buffer
@@ -217,12 +221,12 @@ class DcpTopKMerge:
             print_info_once("DSA DCP top-k merge off: it needs NVLink multicast")
             return None
         world = group.world_size
-        worlds = (8, 16) if megakernel_enabled() else (8,)
+        worlds = (8, 16) if megakernel_enabled() else (2, 4, 8)
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
                 if 16 in worlds
-                else "DSA DCP top-k merge off: it needs 8 ranks and top-k 2048"
+                else "DSA DCP top-k merge off: it needs 2, 4 or 8 ranks and top-k 2048"
             )
             return None
         if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
@@ -230,8 +234,9 @@ class DcpTopKMerge:
         ):
             print_info_once("DSA DCP top-k merge off: ranks span NVLink domains")
             return None
+        cand_k = _DCP_MERGE_CAND_K_BY_WORLD.get(world, _DCP_MERGE_CAND_K)
         buffer = symm_mem.empty(
-            dcp_topk_merge_buffer_numel(world, max_rows, topk, _DCP_MERGE_CAND_K),
+            dcp_topk_merge_buffer_numel(world, max_rows, topk, cand_k),
             dtype=torch.int64,
             device=group.device,
         )
@@ -243,7 +248,7 @@ class DcpTopKMerge:
         if handle.multicast_ptr == 0:
             print_info_once("DSA DCP top-k merge off: no multicast")
             return None
-        return cls(group, max_rows, topk, buffer, handle)
+        return cls(group, max_rows, topk, buffer, handle, cand_k)
 
     def usable(self, rows: int) -> bool:
         return rows <= self.max_rows
@@ -269,7 +274,7 @@ class DcpTopKMerge:
             out_fallback=self.fallback[: out_slots.shape[0]],
             dcp_rank=self.dcp_rank,
             span=span,
-            cand_k=_DCP_MERGE_CAND_K,
+            cand_k=self.cand_k,
         )
 
 
