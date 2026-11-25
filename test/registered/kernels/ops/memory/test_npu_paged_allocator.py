@@ -10,7 +10,7 @@ from sgl_kernel_npu.mem_cache.npu_allocator import alloc_extend_kernel
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=90, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=90, suite="extra-b-test-1-npu-a3")
 
 
 class TestNpuPagedAllocator(CustomTestCase):
