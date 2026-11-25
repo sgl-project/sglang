@@ -43,10 +43,7 @@ from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcesso
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
-from sglang.srt.tokenizer.tiktoken_tokenizer import (
-    DEFAULT_SPECIAL_TOKENS,
-    TiktokenTokenizer,
-)
+from sglang.srt.tokenizer.tiktoken_tokenizer import EOS, PAD, SEP, TiktokenTokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -262,7 +259,7 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
                     ],
                     "special_tokens": [
                         {"bytes": list(text.encode()), "token": 256 + index}
-                        for index, text in enumerate(DEFAULT_SPECIAL_TOKENS)
+                        for index, text in enumerate([PAD, SEP, EOS])
                     ],
                     "word_split": "V1",
                 }
