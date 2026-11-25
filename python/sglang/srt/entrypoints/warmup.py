@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, List
 
@@ -9,6 +8,7 @@ import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -196,14 +196,11 @@ _DSV4_TP_WARMUP_TAILS = (
 )
 
 
-def _env_on(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 def default_warmups() -> List[str]:
     """Warm-ups that run without --warmups (token-parallel prefill's, when it is on)."""
-    if _env_on("SGLANG_DSV4_TOKEN_PARALLEL_PREFILL", "0") and _env_on(
-        "SGLANG_DSV4_TOKEN_PARALLEL_WARMUP", "1"
+    if (
+        envs.SGLANG_DSV4_TOKEN_PARALLEL_PREFILL.get()
+        and envs.SGLANG_DSV4_TOKEN_PARALLEL_WARMUP.get()
     ):
         return ["dsv4_token_parallel"]
     return []
@@ -213,9 +210,9 @@ def default_warmups() -> List[str]:
 async def dsv4_token_parallel(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
-    chunk = getattr(tokenizer_manager.server_args, "chunked_prefill_size", None) or 0
-    min_rows = int(os.environ.get("SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS", "2048"))
-    context_len = getattr(tokenizer_manager, "context_len", None) or (1 << 30)
+    chunk = tokenizer_manager.server_args.chunked_prefill_size or 0
+    min_rows = envs.SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS.get()
+    context_len = tokenizer_manager.context_len
     if chunk <= 0:
         logger.info("dsv4 token-parallel warm-up skipped: chunked prefill is off")
         return
