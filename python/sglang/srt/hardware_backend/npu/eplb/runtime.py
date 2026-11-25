@@ -250,24 +250,24 @@ def _pack_placement(
     num_ranks: int | None,
 ) -> tuple[torch.Tensor, int, list[torch.Tensor] | None]:
     changed, physical, logical, dispatch = placement
-    if physical.shape != physical_shape or logical.shape[:-1] != (
-        physical_shape[0],
-        num_logical,
+    num_layers, num_slots = physical_shape
+    count = len(changed)
+    if (
+        physical.shape != (count, num_slots)
+        or logical.shape[:-1] != (count, num_logical)
+        or any(layer < 0 or layer >= num_layers for layer in changed)
     ):
         raise ValueError("EPLB placement changed the routing geometry")
 
     ids = torch.tensor(changed, dtype=torch.int64, device="cpu")
-    logical_rows = logical.index_select(0, ids)
-    width = _populated_replica_width(logical_rows)
-    fields = (ids, physical.index_select(0, ids), logical_rows[..., :width])
+    width = _populated_replica_width(logical)
+    fields = (ids, physical, logical[..., :width])
     payload = torch.cat([field.reshape(-1) for field in fields]).long()
     rank_tables = None
     if dispatch is not None:
-        if dispatch.shape != (physical_shape[0], num_logical, num_ranks):
+        if dispatch.shape != (count, num_logical, num_ranks):
             raise ValueError("EPLB placement changed the static routing geometry")
-        rank_tables = list(
-            dispatch.index_select(0, ids).permute(2, 0, 1).long().contiguous().unbind()
-        )
+        rank_tables = list(dispatch.permute(2, 0, 1).long().contiguous().unbind())
     return payload, width, rank_tables
 
 

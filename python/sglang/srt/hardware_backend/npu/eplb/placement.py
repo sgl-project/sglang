@@ -22,8 +22,8 @@ _MAX_WINDOW_TAIL_REGRESSION_RISK = 0.05
 class MigrationPlacement(NamedTuple):
     """Ordered layers to migrate and CPU routing tables.
 
-    The first table is indexed by layer and physical slot. The inverse is
-    indexed by layer, logical expert and replica, with -1 padding.
+    Each table has one row per entry in layers, in installation order.
+    The inverse lists physical slots per logical expert, with -1 padding.
     """
 
     layers: tuple[int, ...]
@@ -104,18 +104,38 @@ def plan_migration(
     """Refine the solver layout, admit layers against the recorded window, then order moves.
 
     `physical` maps slots to experts; `logical` lists the slots for each expert.
-    Layer IDs index both tables even when only a subset is eligible to move.
+    Inputs use model layer IDs. The result contains only the rows to install.
     """
     from sglang.srt.eplb.expert_distribution import (
         _convert_global_physical_count_to_logical_count,
     )
 
-    physical_counts = slot_counts.numpy()
     observed_peaks, eligible_layers = _rank_peaks_and_eligible_layers(
-        physical_counts, spec, layer_ids
+        slot_counts.numpy(), spec, layer_ids
     )
     if not eligible_layers:
         return None
+
+    uses_static_dispatch = spec.dispatch_mode == "static"
+    model_layers = tuple(range(current.size(0)))
+    # Copying a nearly full window can cost more than solving it directly.
+    # Static picks also need the full layer order for the seeded draw sequence.
+    if not uses_static_dispatch and len(eligible_layers) * 4 <= len(model_layers) * 3:
+        model_layers = tuple(sorted(eligible_layers))
+        compact_index = {layer: i for i, layer in enumerate(model_layers)}
+        layer_index = torch.tensor(model_layers, dtype=torch.long, device="cpu")
+        slot_counts = slot_counts.index_select(1, layer_index)
+        current = current.index_select(0, layer_index)
+        observed_peaks = observed_peaks[:, model_layers]
+        if source_totals is not None:
+            source_totals = source_totals.index_select(1, layer_index)
+        if active_sources is not None:
+            active_sources = active_sources.index_select(1, layer_index)
+        narrowed_layers = {
+            compact_index[layer] for layer in narrowed_layers if layer in compact_index
+        }
+        eligible_layers = tuple(compact_index[layer] for layer in eligible_layers)
+
     if spec.dispatch_mode == "unique":
         logical_to_slot = current.argsort(dim=-1)
         counts = slot_counts.gather(
@@ -131,7 +151,6 @@ def plan_migration(
     replicated = physical.size(1) > logical.size(1)
     # Aggregate counts cannot predict the load on replicas pinned to source
     # ranks. Keep the base planner's rank assignments for static dispatch.
-    uses_static_dispatch = spec.dispatch_mode == "static"
     refine_on_one_node = spec.nodes == 1 and not uses_static_dispatch
     fallbacks = {}
     if refine_on_one_node and replicated:
@@ -180,6 +199,7 @@ def plan_migration(
             logical, spec.source_groups, spec.physical_experts, ep_rank=None
         )
     if spec.dispatch_mode != "unique" or spec.nodes > 1:
+        physical_counts = slot_counts.numpy()
         logical_counts = counts.numpy()
         current_layout = current.numpy()
         dispatch_by_rank = (
@@ -225,10 +245,16 @@ def plan_migration(
     layers_to_move = _select_layers_for_migration(
         candidates, current, physical, counts, spec.local_experts, known_gains
     )
-    return (
-        MigrationPlacement(layers_to_move, physical, logical, static_dispatch)
-        if layers_to_move
-        else None
+    if not layers_to_move:
+        return None
+    install_order = torch.tensor(layers_to_move, dtype=torch.long, device="cpu")
+    return MigrationPlacement(
+        tuple(model_layers[i] for i in layers_to_move),
+        physical.index_select(0, install_order),
+        logical.index_select(0, install_order),
+        static_dispatch.index_select(0, install_order)
+        if static_dispatch is not None
+        else None,
     )
 
 

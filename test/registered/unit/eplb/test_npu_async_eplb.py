@@ -82,20 +82,27 @@ class TestAsyncEplbPlanning(unittest.TestCase):
             )
         compute.assert_not_called()
 
-    def test_low_migration_search_receives_only_eligible_layers(self):
+    def test_sparse_window_keeps_only_eligible_layers_in_the_solver(self):
         current = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
         spec = PlanningSpec(4, 2, None, 1, EplbAlgorithm.deepseek)
         counts = torch.tensor([[[2, 2, 2, 2], [30, 10, 1, 1]]]).repeat(16, 1, 1)
-        with patch.object(
-            placement, "_prefer_fewer_moves", wraps=placement._prefer_fewer_moves
-        ) as search:
+        with (
+            patch.object(
+                PlanningSpec, "compute", autospec=True, side_effect=PlanningSpec.compute
+            ) as solve,
+            patch.object(
+                placement, "_prefer_fewer_moves", wraps=placement._prefer_fewer_moves
+            ) as search,
+        ):
             plan = plan_migration(
                 counts, current, spec, 2, (0, 1), num_logical_experts=4
             )
 
         self.assertIsNotNone(plan)
         self.assertEqual(plan.layers, (1,))
-        self.assertEqual(search.call_args.args[-1], (1,))
+        self.assertEqual(plan.physical_to_logical.shape, (1, 4))
+        self.assertEqual(solve.call_args.args[1].size(1), 1)
+        self.assertEqual(search.call_args.args[-1], (0,))
 
 
 class TestAsyncEplbSnapshot(unittest.TestCase):
@@ -141,7 +148,7 @@ class TestAsyncEplbSnapshot(unittest.TestCase):
         logical = torch.tensor(
             [[[0, -1, -1, 2], [1, 3, -1, -1]], [[0, -1, 2, -1], [1, 3, -1, -1]]]
         )
-        plan = placement.MigrationPlacement((1,), physical, logical)
+        plan = placement.MigrationPlacement((1,), physical[1:], logical[1:])
         with patch.object(runtime.dist, "broadcast") as broadcast:
             rows = runtime._broadcast_placement(plan, None, 0, None, physical.shape, 2)
         self.assertEqual(broadcast.call_args_list[0].args[0].tolist(), [1, 3, 0])
