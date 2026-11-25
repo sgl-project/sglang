@@ -21,13 +21,8 @@ from packaging import version
 
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
-from sglang.srt.multimodal.media_io import (
-    download_remote_media,
-)
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
-from sglang.srt.multimodal.media_io import (
-    media_url_timeout,
-)
+from sglang.srt.multimodal.media_io import media_url_timeout, open_remote_media
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -162,9 +157,11 @@ def call_with_sanitized_media_errors(
                 )
                 if isinstance(exc, cls)
             ),
-            requests.exceptions.InvalidURL
-            if isinstance(exc, ValueError)
-            else requests.RequestException,
+            (
+                requests.exceptions.InvalidURL
+                if isinstance(exc, ValueError)
+                else requests.RequestException
+            ),
         )
         status = exc.response.status_code if exc.response is not None else None
         detail = f" (HTTP {status})" if type(status) is int else ""
@@ -221,9 +218,19 @@ def load_image(
 _VIDEO_DOWNLOAD_TIMEOUT_S = 60
 
 
-def download_video(url: str) -> bytes:
-    """Download a client-supplied video URL under the media URL policy."""
-    return download_remote_media(url, media_url_timeout(_VIDEO_DOWNLOAD_TIMEOUT_S))
+def download_video_to_stream(video: str, output: BinaryIO) -> None:
+    """Fetch a remote video into a caller-owned stream under the media URL policy.
+
+    ``open_remote_media`` checks every redirect hop, pins each connection to
+    the checked address, and bounds the body by the configured size cap and
+    one deadline; the body is streamed instead of buffered in memory.
+    """
+    with open_remote_media(video, media_url_timeout(_VIDEO_DOWNLOAD_TIMEOUT_S)) as (
+        _,
+        chunks,
+    ):
+        for chunk in chunks:
+            output.write(chunk)
 
 
 @contextmanager
@@ -233,13 +240,19 @@ def open_video_source(video: str) -> Iterator[BinaryIO]:
     FFmpeg never sees the client string, so it cannot pick a protocol
     (``file:``, ``concat:``, ...) from it. Open the stream with
     ``options={"protocol_whitelist": "data"}`` so a demuxer cannot fetch the
-    URLs a playlist names.
+    URLs a playlist names. Remote clips are fully staged under the download cap.
     """
     with ExitStack() as files:
         try:
             scheme = urlparse(video).scheme.lower()
             if scheme in ("http", "https"):
-                stream = BytesIO(download_video(video))
+                # An explicitly configured scratch volume must not fall back to another disk.
+                root = os.environ.get("TMPDIR") or None
+                if root is not None and not os.path.isabs(root):
+                    raise ValueError("TMPDIR must be absolute")
+                stream = files.enter_context(tempfile.TemporaryFile(dir=root))
+                download_video_to_stream(video, stream)
+                stream.seek(0)
             elif scheme == "data":
                 # DataHandler only reads inline bytes; it does not dispatch URLs.
                 stream = files.enter_context(DataHandler().data_open(Request(video)))
@@ -304,7 +317,7 @@ def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Ima
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
             with open(video_path, "wb") as output:
-                output.write(download_video(video))
+                download_video_to_stream(video, output)
             return _read_video_frames(video_path, max_frames)
     return _read_video_frames(video, max_frames)
 

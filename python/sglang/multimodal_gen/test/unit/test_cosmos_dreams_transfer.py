@@ -361,13 +361,15 @@ class TestTransferFramesAndHistory(unittest.TestCase):
         url = "https://example.com/control.mp4"
         with mock.patch(
             "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-            "cosmos3_simulation.transfer.download_video",
-            return_value=b"video-bytes",
+            "cosmos3_simulation.transfer.download_video_to_stream",
+            side_effect=lambda _, output: output.write(b"video-bytes"),
         ) as download:
             with local_control_path(url) as local:
-                self.assertTrue(os.path.isfile(local))
                 self.assertTrue(local.endswith("control.mp4"))
-        download.assert_called_once_with(url)
+                with open(local, "rb") as f:
+                    self.assertEqual(f.read(), b"video-bytes")
+        download.assert_called_once()
+        self.assertEqual(download.call_args.args[0], url)
 
     def test_synthetic_control_matches_warmup_request(self):
         frames = synthetic_control_frames(num_frames=17, height=480, width=832)

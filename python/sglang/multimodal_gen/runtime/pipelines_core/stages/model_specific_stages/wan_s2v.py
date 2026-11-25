@@ -10,6 +10,12 @@ import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torchvision import transforms
 
+from sglang.srt.multimodal.media_io import (
+    media_url_timeout,
+    open_remote_media,
+    validate_remote_media_url,
+)
+
 try:
     import soundfile as sf
 except ImportError:  # pragma: no cover
@@ -39,7 +45,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
     resolve_component_precision_override,
 )
-from sglang.srt.multimodal.media_io import download_remote_media, media_url_timeout
 
 logger = init_logger(__name__)
 V = StageValidators
@@ -99,8 +104,9 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         return value
 
     def _download_remote_input(self, url: str, field_name: str) -> str:
+        url = validate_remote_media_url(url)
         # Loaders probe the content; a client-chosen suffix must not steer them.
-        ext = ".wav" if field_name == "audio_path" else ".jpg"
+        ext = {"audio_path": ".wav", "pose_video_path": ".mp4"}.get(field_name, ".jpg")
         cache_dir = os.path.join(tempfile.gettempdir(), "sglang_wan_s2v_remote_inputs")
         os.makedirs(cache_dir, exist_ok=True)
         target_path = os.path.join(
@@ -111,11 +117,19 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             return target_path
         # Renamed in only when complete, so a failed download never leaves a truncated
         # file for the cache check above to return.
-        partial_path = f"{target_path}.partial"
-        content = download_remote_media(url, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S))
-        with open(partial_path, "wb") as fout:
-            fout.write(content)
-        os.replace(partial_path, target_path)
+        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as fout:
+            partial_path = fout.name
+            try:
+                with open_remote_media(
+                    url, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S)
+                ) as (_, chunks):
+                    for chunk in chunks:
+                        fout.write(chunk)
+                fout.close()
+                os.replace(partial_path, target_path)
+            finally:
+                if os.path.exists(partial_path):
+                    os.unlink(partial_path)
         return target_path
 
     def _generate_seed_and_generator(self, batch: Req) -> None:

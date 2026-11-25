@@ -1767,11 +1767,12 @@ def test_reference_video_url_uses_native_media_loading(tmp_path):
     expected = read_reference_video_frames(str(path), 8)
     assert expected.shape == (2, 32, 64, 3)
     with patch(
-        "sglang.multimodal_gen.runtime.utils.vision.download_video",
-        return_value=path.read_bytes(),
+        "sglang.multimodal_gen.runtime.utils.vision.download_video_to_stream",
+        side_effect=lambda _, output: output.write(path.read_bytes()),
     ) as download:
         actual = read_reference_video_frames("https://example.com/reference.mp4", 8)
-    download.assert_called_once_with("https://example.com/reference.mp4")
+    download.assert_called_once()
+    assert download.call_args.args[0] == "https://example.com/reference.mp4"
     np.testing.assert_array_equal(actual, expected)
 
 

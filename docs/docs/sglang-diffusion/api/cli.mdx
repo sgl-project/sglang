@@ -568,9 +568,9 @@ The server downloads them under the same policy and flags as the LLM server
   (videos), larger than the LLM server's `64`; `0` disables the limit.
 - `--media-url-timeout` bounds one download, redirects and body included.
 
-Behind an HTTP(S) proxy the server still resolves the media host itself and
-rejects it when that fails, so a deployment whose only DNS is the proxy's must
-allowlist its media hosts or pass `--allow-private-media-hosts`.
+Media downloads connect directly to the checked origin address, never through
+a proxy: when the server environment sets an HTTP(S) proxy, include trusted
+media origins in `NO_PROXY`, or their downloads fail.
 
 The request-level check covers `image_path`, `video_path`, `video_url`,
 `input_reference`, `reference_url`, and `control_path`: other schemes such as

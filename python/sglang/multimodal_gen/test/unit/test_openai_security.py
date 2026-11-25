@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import errno
 import io
+import ipaddress
 import os
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AsyncExitStack, contextmanager
@@ -14,7 +17,6 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-import requests
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -148,8 +150,18 @@ def image_source(request, monkeypatch):
     if request.param == "base64":
         return "data:image/png;base64,aW1hZ2U=", ".png"
 
-    monkeypatch.setattr(utils, "download_remote_media", lambda url, timeout: b"image")
-    return "https://example.invalid/image.png", ".png"
+    client_cls = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200, headers={"content-type": "image/png"}, content=b"image"
+        )
+    )
+    monkeypatch.setattr(
+        utils.httpx,
+        "AsyncClient",
+        lambda **kwargs: client_cls(transport=transport, **kwargs),
+    )
+    return "https://93.184.216.34/image.png", ".png"
 
 
 def test_save_image_sources_within_uploads_root(tmp_path, image_source):
@@ -160,6 +172,11 @@ def test_save_image_sources_within_uploads_root(tmp_path, image_source):
     )
     assert Path(saved) == root / f"input{suffix}"
     assert Path(saved).read_bytes() == b"image"
+
+
+def _reason(error: BaseException) -> str:
+    """The cause of a failed image save; a URL download raises a generic error from it."""
+    return str(error.__cause__ if error.__cause__ is not None else error)
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -188,12 +205,13 @@ def test_failed_image_write_preserves_destination(
         fault.setattr(utils, "open", partial(failing_write, open), raising=False)
         fault.setattr(image_io, "open", partial(failing_write, open), raising=False)
         fault.setattr(os, "fdopen", partial(failing_write, os.fdopen))
-        with pytest.raises(Exception, match="No space left on device"):
+        with pytest.raises(Exception) as caught:
             asyncio.run(
                 utils.save_image_to_path(
                     source, str(tmp_path / "input"), uploads_root=str(tmp_path)
                 )
             )
+        assert "No space left on device" in _reason(caught.value)
     assert set(tmp_path.iterdir()) == ({target} if existing else set())
     if existing:
         assert target.read_bytes() == b"previous image"
@@ -225,30 +243,52 @@ def test_final_upload_path_cannot_follow_symlink_outside_root(tmp_path, image_so
     outside = tmp_path / "outside"
     outside.write_bytes(b"unchanged")
     (root / f"input{suffix}").symlink_to(outside)
-    with pytest.raises(Exception, match="escapes"):
+    with pytest.raises(Exception) as caught:
         asyncio.run(
             utils.save_image_to_path(
                 source, str(root / "input"), uploads_root=str(root)
             )
         )
+    assert "escapes" in _reason(caught.value)
     assert outside.read_bytes() == b"unchanged"
 
 
-@pytest.mark.parametrize(
-    "source", ["https://example.invalid/image.png", "data:image/png;base64,aW1hZ2U="]
-)
-def test_prefer_remote_source_still_avoids_disk_io(tmp_path, source):
-    root = tmp_path / "uploads"
-    saved = asyncio.run(
-        utils.save_image_to_path(
-            source,
-            str(root / "input"),
-            uploads_root=str(root),
-            prefer_remote_source=True,
-        )
+@pytest.mark.parametrize("persistent", [True, False])
+@pytest.mark.parametrize("as_url", [True, False])
+def test_input_storage_modes_admit_identical_bytes(
+    tmp_path, monkeypatch, persistent, as_url
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "navy").save(buffer, format="PNG")
+    data = buffer.getvalue()
+    _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda _: httpx.Response(
+            200, content=data, headers={"content-type": "image/png"}
+        ),
     )
-    assert saved == source
-    assert not root.exists()
+    source = (
+        "https://x.test/image.png"
+        if as_url
+        else "data:image/png;base64," + base64.b64encode(data).decode()
+    )
+    with utils.temp_dir_if_disabled(
+        str(tmp_path / "uploads") if persistent else None
+    ) as root:
+        path = Path(
+            asyncio.run(
+                utils.save_image_to_path(
+                    source, str(Path(root) / "input"), uploads_root=root
+                )
+            )
+        )
+        assert path.read_bytes() == data
+        with Image.open(path) as decoded:
+            assert decoded.getpixel((0, 0)) == (0, 0, 128)
+    assert path.exists() is persistent
 
 
 def test_video_upload_sanitizes_filename_and_preserves_metadata(tmp_path):
@@ -566,15 +606,175 @@ def test_undeliverable_response_format_is_rejected_before_generation(
     assert detail in response.json()["detail"]
 
 
+def _patch_download(monkeypatch, tmp_path, handler):
+    """Route the download through handler; return the dir holding partial files."""
+    # Only the synthetic origin is allowed; neither DNS nor HTTP needs a network.
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._allowed_media_domains", frozenset({"x.test"})
+    )
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._resolve_host_ips",
+        lambda _: [ipaddress.ip_address("127.0.0.1")],
+    )
+    monkeypatch.setenv("no_proxy", "*")
+    part_dir = tmp_path / "parts"
+    part_dir.mkdir()
+    monkeypatch.setattr(utils.tempfile, "tempdir", str(part_dir))
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        utils.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    return part_dir
+
+
+def _chunked_png(request):
+    async def body():
+        for _ in range(8):
+            yield b"x" * 512
+
+    return httpx.Response(200, content=body(), headers={"content-type": "image/png"})
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        lambda request: httpx.Response(
+            200, content=b"x" * 4096, headers={"content-type": "image/png"}
+        ),
+        _chunked_png,
+    ],
+    ids=["content-length", "chunked-no-length"],
+)
+def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handler):
+    """An oversized remote image must be aborted, not buffered and written."""
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._media_url_max_file_size_bytes", 1024
+    )
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception) as caught:
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert "exceeds" in _reason(caught.value)
+    # The message reaches the client as a 400; neither the URL nor the cause is in it.
+    assert str(caught.value) == "Failed to download image from URL"
+    assert not target.exists()
+    assert not any(part_dir.iterdir())
+    assert not list(target.parent.iterdir())
+
+
+def test_image_download_has_one_deadline(monkeypatch, tmp_path):
+    """A slow drip is cut at --media-url-timeout, not after every chunk's own timeout."""
+    monkeypatch.setattr("sglang.srt.multimodal.media_io._media_url_timeout", 0.3)
+
+    async def drip():
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            yield b"x"
+
+    part_dir = _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda request: httpx.Response(
+            200, content=drip(), headers={"content-type": "image/png"}
+        ),
+    )
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception) as caught:
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert not target.exists()
+    assert not any(part_dir.iterdir())
+
+
+def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._media_url_max_file_size_bytes", 1024
+    )
+    part_dir = _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda request: httpx.Response(
+            200, content=b"x" * 512, headers={"content-type": "image/png"}
+        ),
+    )
+    target = tmp_path / "in" / "img.png"
+    saved = asyncio.run(
+        utils._save_url_image_to_path("https://x.test/a.png", str(target))
+    )
+    assert Path(saved).read_bytes() == b"x" * 512
+    assert not any(part_dir.iterdir())
+    assert list(target.parent.iterdir()) == [target]
+
+
+def test_cancelled_image_download_leaves_no_partial_file(monkeypatch, tmp_path):
+    """Executor congestion must not orphan a fully downloaded temporary file."""
+    target = tmp_path / "in" / "image.png"
+    finish = threading.Event()
+    payload = b"image bytes"
+
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        occupied = asyncio.Event()
+        worker = None
+
+        def occupy_executor():
+            loop.call_soon_threadsafe(occupied.set)
+            assert finish.wait(5)
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield payload
+
+            async def aclose(self):
+                nonlocal worker
+                worker = loop.run_in_executor(None, occupy_executor)
+                await occupied.wait()
+
+        part_dir = _patch_download(
+            monkeypatch,
+            tmp_path,
+            lambda _: httpx.Response(200, stream=Stream()),
+        )
+        task = asyncio.create_task(
+            utils._save_url_image_to_path("https://x.test/image.png", str(target))
+        )
+        try:
+            await asyncio.wait_for(occupied.wait(), 5)
+            await asyncio.sleep(0)
+            if not task.done():
+                task.cancel()
+            try:
+                saved = await task
+            except asyncio.CancelledError:
+                assert not target.exists()
+            else:
+                assert Path(saved).read_bytes() == payload
+        finally:
+            finish.set()
+            if worker is not None:
+                await worker
+        assert not list(part_dir.iterdir())
+        assert list(target.parent.iterdir()) == ([target] if target.exists() else [])
+
+    asyncio.run(run_test())
+
+
 def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
     """A path collision must not return a directory or hide an upload inside it."""
-    monkeypatch.setattr(utils, "download_remote_media", lambda url, timeout: b"image")
+    part_dir = _patch_download(
+        monkeypatch, tmp_path, lambda _: httpx.Response(200, content=b"image")
+    )
     target = tmp_path / "image.png"
     target.mkdir()
-    with pytest.raises(Exception, match="directory"):
+    with pytest.raises(Exception) as caught:
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert "directory" in _reason(caught.value)
     assert not list(target.iterdir())
-    assert set(tmp_path.iterdir()) == {target}
+    assert not list(part_dir.iterdir())
+    assert set(tmp_path.iterdir()) == {target, part_dir}
 
 
 @pytest.mark.parametrize("recover", [False, True])
@@ -584,25 +784,32 @@ def test_image_download_retry_keeps_only_complete_output(
     """Failed attempts must leave neither partial files nor a truncated destination."""
     attempts = 0
 
-    def download(url, timeout):
+    async def broken_body():
+        yield b"partial image"
+        raise httpx.ReadError("incomplete response")
+
+    def handler(request):
         nonlocal attempts
         attempts += 1
-        if recover and attempts == 3:
-            return b"complete image"
-        raise requests.ConnectionError("incomplete response")
+        return httpx.Response(
+            200,
+            content=b"complete image" if recover and attempts == 3 else broken_body(),
+        )
 
-    monkeypatch.setattr(utils, "download_remote_media", download)
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
     target = tmp_path / "image.png"
     target.write_bytes(b"existing image")
     request = utils._save_url_image_to_path("https://x.test/a.png", str(target))
     if recover:
         assert asyncio.run(request) == str(target)
     else:
-        with pytest.raises(requests.ConnectionError):
+        with pytest.raises(Exception) as caught:
             asyncio.run(request)
+        assert "incomplete response" in _reason(caught.value)
     assert attempts == 3
     assert target.read_bytes() == (b"complete image" if recover else b"existing image")
-    assert set(tmp_path.iterdir()) == {target}
+    assert not list(part_dir.iterdir())
+    assert set(tmp_path.iterdir()) == {target, part_dir}
 
 
 _CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))

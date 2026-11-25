@@ -9,6 +9,7 @@ from PIL import Image, UnidentifiedImageError
 
 from sglang.multimodal_gen.runtime.utils import common, vision
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
+from sglang.srt.multimodal.media_io import get_mm_http_session
 
 # A public literal avoids DNS; the tests mock the HTTP transfer.
 _GIF_URL = "https://93.184.216.34/fixture.gif"
@@ -25,8 +26,8 @@ def _gif_bytes() -> bytes:
     "loader, dependency, category",
     [
         (vision.load_image, "srt_get_image_bytes", requests.HTTPError),
-        (vision.load_video, "download_remote_media", requests.Timeout),
-        (vision.load_video, "download_remote_media", requests.TooManyRedirects),
+        (vision.load_video, "get", requests.Timeout),
+        (vision.load_video, "get", requests.TooManyRedirects),
     ],
 )
 def test_media_download_errors_keep_category_not_request(loader, dependency, category):
@@ -39,7 +40,11 @@ def test_media_download_errors_keep_category_not_request(loader, dependency, cat
         response.status_code = 403
     original = category(url, request=request, response=response)
     original.__cause__ = OSError(marker)
-    with patch(f"{vision.__name__}.{dependency}", side_effect=original):
+    with patch.object(
+        vision if dependency != "get" else get_mm_http_session(),
+        dependency,
+        side_effect=original,
+    ):
         with pytest.raises(category) as caught:
             loader(url)
     error = caught.value
@@ -64,16 +69,43 @@ def test_invalid_media_source_does_not_echo_user_input():
 
 
 @pytest.mark.parametrize(
-    "payload, error",
+    "status_code, payload, error",
     [
-        (_gif_bytes(), None),
-        (b"not a gif", UnidentifiedImageError),
+        (200, _gif_bytes(), None),
+        (200, b"not a gif", UnidentifiedImageError),
+        (404, b"", requests.HTTPError),
     ],
 )
-def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload, error):
+def test_load_video_removes_downloaded_temp_file(
+    monkeypatch, tmp_path, status_code, payload, error
+):
     """A downloaded URL video must not outlive load_video, on success or failure."""
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
-    monkeypatch.setattr(vision, "download_remote_media", lambda url, timeout: payload)
+    closed = []
+
+    class Response:
+        headers = {}
+        url = _GIF_URL
+
+        def __init__(self):
+            self.status_code = status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            closed.append(True)
+
+        def raise_for_status(self):
+            if status_code >= 400:
+                raise requests.HTTPError(f"{status_code}", response=None)
+
+        def iter_content(self, chunk_size):
+            return iter([payload])
+
+    monkeypatch.setattr(
+        get_mm_http_session(), "get", lambda *args, **kwargs: Response()
+    )
 
     if error is None:
         frames = vision.load_video(_GIF_URL)
@@ -86,6 +118,7 @@ def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload,
             vision.load_video(_GIF_URL)
 
     assert list(tmp_path.iterdir()) == []
+    assert closed == [True]
 
 
 def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):

@@ -24,12 +24,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
-from sglang.srt.multimodal.media_io import download_remote_media, media_url_timeout
+from sglang.srt.multimodal.media_io import media_url_timeout, open_remote_media
 
 MINIMAX_H3_MATERIAL_CACHE_EXTRA_KEY = "minimax_h3_material_localization"
 MINIMAX_H3_MATERIAL_PROBE_EXTRA_KEY = "minimax_h3_material_probe_facts"
 MINIMAX_H3_TEMP_DIRS_EXTRA_KEY = "minimax_h3_request_temp_dirs"
-MINIMAX_H3_TAR_READ_CHUNK_BYTES = 1024 * 1024
+MINIMAX_H3_HTTP_READ_CHUNK_BYTES = 1024 * 1024
 MINIMAX_H3_BASE64_DECODE_CHUNK_CHARS = 1024 * 1024
 MINIMAX_H3_BASE64_HEADER_MAX_CHARS = 4 * 1024
 MINIMAX_H3_TAR_HEADER_MAX_ENCODED_CHARS = 64 * 1024
@@ -730,7 +730,7 @@ def _stream_tar_member_material(
         with source_path.open("rb") as source, partial_path.open("wb") as output:
             source.seek(offset)
             while remaining:
-                chunk = source.read(min(MINIMAX_H3_TAR_READ_CHUNK_BYTES, remaining))
+                chunk = source.read(min(MINIMAX_H3_HTTP_READ_CHUNK_BYTES, remaining))
                 if not chunk:
                     raise ValueError(
                         f"tar material payload is truncated with {remaining} bytes left"
@@ -755,22 +755,31 @@ def _stream_http_material(
     condition_index: int,
     timeout_s: float,
 ) -> str:
-    content = download_remote_media(uri, media_url_timeout(timeout_s))
-    if not content:
-        raise ValueError(f"HTTP material body is empty: {uri}")
-    output_path, partial_path = _material_output_paths(
-        batch,
-        condition_type=condition_type,
-        condition_index=condition_index,
-        source_name=uri,
-    )
-    try:
-        partial_path.write_bytes(content)
-        partial_path.replace(output_path)
-    except Exception:
-        partial_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-        raise
+    with open_remote_media(uri, media_url_timeout(timeout_s)) as (headers, chunks):
+        media_type = headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        suffix = (
+            _safe_suffix(uri)
+            or _SUFFIX_BY_MEDIA_TYPE.get(str(media_type or "").lower())
+            or _DEFAULT_SUFFIX_BY_TYPE.get(condition_type, ".bin")
+        )
+        output_path = (
+            Path(_material_workdir(batch))
+            / f"condition_{int(condition_index):04d}{suffix}"
+        )
+        partial_path = output_path.with_name(output_path.name + ".partial")
+        total = 0
+        try:
+            with partial_path.open("wb") as output:
+                for chunk in chunks:
+                    total += len(chunk)
+                    output.write(chunk)
+            if total == 0:
+                raise ValueError(f"HTTP material body is empty: {uri}")
+            partial_path.replace(output_path)
+        except Exception:
+            partial_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+            raise
     return str(output_path)
 
 

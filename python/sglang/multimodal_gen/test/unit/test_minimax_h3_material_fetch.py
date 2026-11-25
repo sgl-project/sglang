@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax H3 pre-queue probes fetch a request's remote materials concurrently.
 
-No network and no ffmpeg: an in-process origin stands in for the media
-download, and the audio and video files hold the ffprobe report they are
-probed for.
+No network and no ffmpeg: an in-process origin stands in for urlopen, and the
+audio and video files hold the ffprobe report they are probed for.
 """
 
 from __future__ import annotations
@@ -14,12 +13,13 @@ import json
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import requests
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
@@ -77,7 +77,7 @@ def media(tmp_path_factory) -> dict[str, Path]:
 
 
 class _Origin:
-    """Stands in for the download: serves the media and counts requests in flight."""
+    """Stands in for urlopen: serves the media and counts requests in flight."""
 
     def __init__(self, media: dict[str, Path]) -> None:
         self.files = {name: path.read_bytes() for name, path in media.items()}
@@ -94,7 +94,7 @@ class _Origin:
         self.in_flight = 0
         self.max_in_flight = 0
 
-    def download(self, uri: str, timeout: float) -> bytes:
+    def urlopen(self, uri: str, timeout: float) -> io.BytesIO:
         with self.lock:
             self.hits[uri] = self.hits.get(uri, 0) + 1
             self.in_flight += 1
@@ -109,8 +109,8 @@ class _Origin:
             time.sleep(self.linger_s)
             body = self.files.get(Path(urllib.parse.urlsplit(uri).path).name)
             if body is None:
-                raise requests.HTTPError("404 Client Error: Not Found")
-            return body
+                raise urllib.error.HTTPError(uri, 404, "Not Found", None, None)
+            return io.BytesIO(body)
         finally:
             with self.lock:
                 self.in_flight -= 1
@@ -119,7 +119,14 @@ class _Origin:
 @pytest.fixture
 def origin(monkeypatch, media) -> _Origin:
     origin = _Origin(media)
-    monkeypatch.setattr(material_io, "download_remote_media", origin.download)
+    from contextlib import contextmanager
+
+    @contextmanager
+    def open_material(uri, timeout):
+        with origin.urlopen(uri, timeout) as response:
+            yield {}, iter(lambda: response.read(65536), b"")
+
+    monkeypatch.setattr(material_io, "open_remote_media", open_material)
     monkeypatch.setattr(
         material_io, "_ffprobe_media", lambda path: json.loads(Path(path).read_bytes())
     )
@@ -332,8 +339,8 @@ def test_mixed_materials_match_the_sequential_probes(
                 ("video", "missing.mp4", "b"),
                 ("image", "garbage.png", "c"),
             ],
-            requests.HTTPError,
-            "404 Client Error: Not Found",
+            urllib.error.HTTPError,
+            "HTTP Error 404: Not Found",
         ),
         (
             [("audio", "empty.wav", "a"), ("video", "missing.mp4", "b")],

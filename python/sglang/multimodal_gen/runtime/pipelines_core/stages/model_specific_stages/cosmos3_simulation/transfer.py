@@ -86,7 +86,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import (
     call_with_sanitized_media_errors,
-    download_video,
+    download_video_to_stream,
     load_video,
 )
 
@@ -210,14 +210,16 @@ def local_control_path(path: str) -> Iterator[str]:
     if not path.lower().startswith(("http://", "https://")):
         yield path
         return
-    data = call_with_sanitized_media_errors(
-        download_video, path, invalid_input="Invalid control video URL."
-    )
     with tempfile.TemporaryDirectory() as temp_dir:
         # FFmpeg probes the content; a fixed suffix keeps the client from steering it.
         local_path = os.path.join(temp_dir, "control.mp4")
         with open(local_path, "wb") as output:
-            output.write(data)
+            call_with_sanitized_media_errors(
+                download_video_to_stream,
+                path,
+                output,
+                invalid_input="Invalid control video URL.",
+            )
         yield local_path
 
 

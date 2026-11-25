@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-import requests
 import torch
 from transformers import BatchEncoding
 
@@ -183,23 +182,37 @@ def test_stage_saves_at_the_checkpoint_rate_not_the_requested_one(tmp_path):
     assert batch.fps == 16
 
 
+class _Response:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return {}, iter([self.read()])
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
 def test_retry_after_failed_download_gets_the_whole_file(tmp_path):
     """The download cache returns any file already at its path, so a download that times out
     mid-body must not leave one there for the retry to pick up."""
     stage = object.__new__(stage_module.WanS2VBeforeDenoisingStage)
-    downloads = iter([requests.Timeout("read timed out"), b"RIFF-complete"])
-
-    def download(url, timeout):
-        result = next(downloads)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
+    responses = iter(
+        [_Response(TimeoutError("read timed out")), _Response(b"RIFF-complete")]
+    )
     with (
         patch.object(stage_module.tempfile, "gettempdir", return_value=str(tmp_path)),
-        patch.object(stage_module, "download_remote_media", download),
+        patch.object(stage_module, "validate_remote_media_url", lambda url: url),
+        patch.object(
+            stage_module, "open_remote_media", lambda *a, **kw: next(responses)
+        ),
     ):
-        with pytest.raises(requests.Timeout):
+        with pytest.raises(TimeoutError):
             stage._download_remote_input("https://example.com/talk.wav", "audio_path")
         path = stage._download_remote_input(
             "https://example.com/talk.wav", "audio_path"
