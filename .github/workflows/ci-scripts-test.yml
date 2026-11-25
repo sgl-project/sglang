@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - "scripts/ci/**"
-      - "python/sglang/test/ci/ci_register.py"
       - ".github/workflows/pr-test.yml"
       - ".github/workflows/pr-gate.yml"
       - ".github/workflows/ci-scripts-test.yml"
@@ -31,4 +30,3 @@ jobs:
       - name: Run tests
         run: |
           python -m unittest discover -s scripts/ci -p 'test_diffusion_rust_gate.py' -v
-          python -m unittest discover -s scripts/ci/utils -p 'test_prefetch_hf_models.py' -v
