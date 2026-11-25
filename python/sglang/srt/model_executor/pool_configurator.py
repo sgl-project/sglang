@@ -338,10 +338,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
 
-        # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
-        # which holds for EAGLE/MTP drafts that reuse the target's attention config.
+        # EAGLE/STANDALONE/PARD2: assumes the draft shares the target's per-layer KV
+        # size, which holds for EAGLE/MTP drafts that reuse the target's attention
+        # config and for the Qwen3 PARD-2 drafts of Qwen3 targets.
         if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+            kvc.spec_algorithm.is_eagle()
+            or kvc.spec_algorithm.is_standalone()
+            or kvc.spec_algorithm.is_pard2()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
             fused_full_entry = kvc.fused_entry_bytes("full")
@@ -403,6 +406,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         draft_cell_size * draft_num_layers / int(num_layers)
                     )
                     self._cell_size += draft_kv_size * draft_loc_space_scale * dcp_size
+
+        # PARD2 target-dependent: one projected target feature per KV slot.
+        if kvc.spec_algorithm.is_pard2() and not kvc.is_draft_worker:
+            self._cell_size += kvc.spec_aux_config.pard2_feature_bytes_per_token or 0
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.

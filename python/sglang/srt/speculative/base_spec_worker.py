@@ -215,7 +215,7 @@ class BaseSpecWorker(ABC):
             or spec_algorithm.is_frozen_kv_mtp()
         ):
             return ()
-        if spec_algorithm.is_dflash_family():
+        if spec_algorithm.is_dflash_family() or spec_algorithm.is_pard2():
             return (draft_worker.model_runner,)
         return tuple(draft_worker.draft_runners)
 
