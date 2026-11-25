@@ -94,7 +94,7 @@ def fused_experts_fp8_sgl(
                 use_flashinfer_bi_mxfp8_quantizer,
             )
 
-            if use_flashinfer_bi_mxfp8_quantizer(hidden_states):
+            if use_flashinfer_bi_mxfp8_quantizer(hidden_states, 32):
                 a_q, a_sf = mxfp8_quantize(
                     hidden_states, False, backend="auto", batch_invariant=True
                 )

@@ -378,7 +378,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
         from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
-        if use_flashinfer_bi_mxfp8_quantizer(hidden_states):
+        if use_flashinfer_bi_mxfp8_quantizer(hidden_states, hidden_size):
             x_quant, x_scale = flashinfer_mxfp8_quantize(
                 hidden_states, False, alignment=hidden_size, batch_invariant=True
             )

@@ -93,7 +93,7 @@ def _prepare_flashinfer_mxfp8_activations(
         prepared = route_quant_handoff.take(x)
 
     # The deterministic mode runs FlashInfer's batch-invariant kernel (fp32 too).
-    batch_invariant = use_flashinfer_bi_mxfp8_quantizer(x)
+    batch_invariant = use_flashinfer_bi_mxfp8_quantizer(x, hidden_size)
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)

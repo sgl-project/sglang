@@ -227,7 +227,7 @@ class TestMLAParallelGroups(CustomTestCase):
         for variant in (False, True):
             with self.subTest(fuse_wqa_wkv=variant):
                 attention = build_mla("deepseek_v4", variant, quant_config=GGUFConfig())
-                self.assertFalse(hasattr(attention.wo_b, "weight"))
+                self.assertNotIn("weight", dict(attention.wo_b.named_parameters()))
                 self.assertFalse(attention.use_flashinfer_mxfp8_wo_b)
                 # A fresh module: the property is cached per instance.
                 attention = build_mla("deepseek_v4", variant, quant_config=GGUFConfig())

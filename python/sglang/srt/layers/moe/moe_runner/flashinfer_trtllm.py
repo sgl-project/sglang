@@ -1219,7 +1219,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     flashinfer_mxfp8_quantize,
                 )
 
-                if use_flashinfer_bi_mxfp8_quantizer(hidden_states):
+                if use_flashinfer_bi_mxfp8_quantizer(hidden_states, 32):
                     a_q, a_sf = flashinfer_mxfp8_quantize(
                         hidden_states, False, batch_invariant=True
                     )

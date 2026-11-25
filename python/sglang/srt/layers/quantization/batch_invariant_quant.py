@@ -22,9 +22,12 @@ from sglang.srt.utils.device import is_flashinfer_available
 
 # Compute capabilities of FlashInfer's batch-invariant quantizer and GEMM kernels.
 _FLASHINFER_BI_QUANT_ARCHS = ((10, 0), (10, 3), (10, 7))
-# The longest input row FlashInfer's batch-invariant MXFP8 quantizer accepts;
-# the GEMM keeps the same bound on K (bf16 rows), so a longer row keeps both
-# previous kernels.
+# The longest padded input row FlashInfer's batch-invariant MXFP8 quantizer
+# accepts (K <= 65536 for bf16 / fp16, 32768 for fp32); it raises above it, so
+# `mxfp8_quantizer_takes_rows` mirrors its check. The GEMM rule bounds K at the
+# bf16 figure for every activation dtype, so an fp32 activation with K above the
+# quantizer's fp32 limit and a bf16 / fp16 output keeps the previous quantizer
+# and takes the batch-invariant GEMM; each kernel is invariant on its own.
 MXFP8_QUANT_MAX_ROW_BYTES = 128 * 1024
 MXFP8_GEMM_MAX_K = MXFP8_QUANT_MAX_ROW_BYTES // 2
 
@@ -64,12 +67,18 @@ def use_flashinfer_bi_quantizers(device: torch.device) -> bool:
     return batch_invariant_or_deterministic() and flashinfer_bi_quant_device_ok(device)
 
 
-def use_flashinfer_bi_mxfp8_quantizer(x: torch.Tensor) -> bool:
-    """`use_flashinfer_bi_quantizers` for an MXFP8 activation ``x``: its rows
-    must fit the kernel; longer rows keep the previous quantizer."""
-    return x.shape[
-        -1
-    ] * x.element_size() <= MXFP8_QUANT_MAX_ROW_BYTES and use_flashinfer_bi_quantizers(
+def mxfp8_quantizer_takes_rows(x: torch.Tensor, alignment: int) -> bool:
+    """Whether FlashInfer's batch-invariant MXFP8 quantizer takes the rows of
+    ``x`` quantized with ``alignment``: it pads K to a multiple of ``alignment``
+    and bounds the padded row bytes."""
+    padded_k = -(-x.shape[-1] // alignment) * alignment
+    return padded_k * x.element_size() <= MXFP8_QUANT_MAX_ROW_BYTES
+
+
+def use_flashinfer_bi_mxfp8_quantizer(x: torch.Tensor, alignment: int) -> bool:
+    """`use_flashinfer_bi_quantizers` for an MXFP8 activation ``x`` quantized
+    with the call site's ``alignment``; longer rows keep the previous quantizer."""
+    return mxfp8_quantizer_takes_rows(x, alignment) and use_flashinfer_bi_quantizers(
         x.device
     )
 

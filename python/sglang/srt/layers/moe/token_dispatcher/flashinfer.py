@@ -409,7 +409,7 @@ class FlashinferDispatcher(BaseDispatcher):
                     use_flashinfer_bi_mxfp8_quantizer,
                 )
 
-                if use_flashinfer_bi_mxfp8_quantizer(x):
+                if use_flashinfer_bi_mxfp8_quantizer(x, 32):
                     x, x_sf = mxfp8_quantize(
                         x, False, backend="auto", batch_invariant=True
                     )

@@ -1219,16 +1219,23 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+    # Cached per instance, as `accepts_mxfp8_swizzled_input` caches: the mode
+    # and its opt-out are read at the first forward and frozen after.
     @functools.cached_property
     def use_flashinfer_mxfp8_wo_b(self) -> bool:
         """Whether wo_b consumes FlashInfer-swizzled MXFP8, so wo_a can fuse the
         quantization into its epilogue. Not known until wo_b's weights load."""
-        quant_method = getattr(self.wo_b, "quant_method", None)
-        ok = getattr(
-            quant_method, "mxfp8_dense_backend", None
-        ) == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL and (
-            getattr(quant_method, "use_mxfp8", False)
-            or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
+        quant_method = self.wo_b.quant_method
+        # Fp8LinearMethod sets `block_fp8_mxfp8_ready` on the layer while its
+        # weights load, only under the method's `block_fp8_as_mxfp8` gate.
+        ok = (
+            isinstance(quant_method, Fp8LinearMethod)
+            and quant_method.mxfp8_dense_backend
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                quant_method.use_mxfp8
+                or (quant_method.block_fp8_as_mxfp8 and self.wo_b.block_fp8_mxfp8_ready)
+            )
         )
         # The deterministic mode quantizes in wo_b (FlashInfer's batch-invariant
         # kernel), not in wo_a's epilogue. Only a FlashInfer MXFP8 wo_b has

@@ -24,6 +24,20 @@ with set_batch_invariant_mode(True):
     pass
 
 
+def _cuda_kernel_names(fn):
+    """The CUDA kernel names one call of ``fn`` launches (torch.profiler)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        fn()
+        torch.cuda.synchronize()
+    return [
+        e.name for e in p.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+
+
 class TestBatchInvariantOps(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -136,8 +150,10 @@ class TestBatchInvariantOps(CustomTestCase):
     def test_flashinfer_mxfp8_batch_invariance(self):
         """On SM100-family parts the deterministic mode quantizes MXFP8
         activations and runs the dense MXFP8 GEMM through FlashInfer's
-        batch-invariant kernels: the wrapper gives their bytes, and a row's bits
-        do not depend on the batch it is in."""
+        batch-invariant kernels: the wrapper gives their bytes, a row's bits do
+        not depend on the batch it is in, and the dense linear launches exactly
+        those two kernels (the bits alone cannot tell the routes apart on parts
+        where the previous kernels are invariant too)."""
         from sglang.srt.layers.quantization import fp8_utils
         from sglang.srt.layers.quantization.batch_invariant_quant import (
             flashinfer_bi_quant_supported,
@@ -206,6 +222,15 @@ class TestBatchInvariantOps(CustomTestCase):
             }
             for m in (64, 257):
                 torch.testing.assert_close(outs[m][:1], outs[1], rtol=0, atol=0)
+            for m in (1, 64, 257):
+                names = _cuda_kernel_names(
+                    lambda: fp8_utils.flashinfer_mxfp8_blockscaled_linear(
+                        x[:m], w_q, w_sf, backend="cute-dsl"
+                    )
+                )
+                bi_kernels = [k for k in names if "batch_invariant" in k]
+                self.assertEqual(len(bi_kernels), 2, names)
+                self.assertEqual(len(set(bi_kernels)), 2, names)
             x_q, x_sf = mxfp8_quantize(
                 x, is_sf_swizzled_layout=True, backend="auto", batch_invariant=True
             )
@@ -225,8 +250,6 @@ class TestBatchInvariantOps(CustomTestCase):
         (rows over 128 KiB) and the env opt-out run the previous kernels: the
         output is the pinned path's bit for bit and no batch-invariant kernel is
         launched (CUPTI kernel names)."""
-        from torch.profiler import ProfilerActivity, profile
-
         from sglang.srt.environ import envs
         from sglang.srt.layers.quantization import fp8_utils
         from sglang.srt.layers.quantization.batch_invariant_quant import (
@@ -237,18 +260,7 @@ class TestBatchInvariantOps(CustomTestCase):
             self.skipTest("FlashInfer batch-invariant MXFP8 kernels are unavailable")
         from flashinfer import mxfp8_quantize
 
-        def kernels(fn):
-            fn()
-            torch.cuda.synchronize()
-            with profile(activities=[ProfilerActivity.CUDA]) as p:
-                fn()
-                torch.cuda.synchronize()
-            return [
-                e.name
-                for e in p.events()
-                if e.device_type == torch.autograd.DeviceType.CUDA
-            ]
-
+        kernels = _cuda_kernel_names
         generator = torch.Generator(device=device_type).manual_seed(0)
         lin = fp8_utils.flashinfer_mxfp8_blockscaled_linear
         cases = {

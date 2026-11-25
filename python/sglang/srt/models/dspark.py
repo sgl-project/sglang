@@ -93,7 +93,7 @@ def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Ten
     # The deterministic mode runs the quantizer and the GEMM on FlashInfer's
     # batch-invariant kernels; otherwise the calls are unchanged.
     if use_flashinfer_bi_mxfp8_quantizer(
-        hidden_bf16
+        hidden_bf16, 32
     ) and mm_mxfp8_batch_invariant_shape_ok(cache[0], torch.bfloat16):
         h_q, h_sf = mxfp8_quantize(
             hidden_bf16,
