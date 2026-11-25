@@ -2307,6 +2307,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "host allocation, transfer, or cache insertion.",
             labelnames=labels.keys(),
         )
+        # Plain copies of the two storage-prefetch token counters for the load
+        # report (/v1/loads), which routers difference.
+        self.total_storage_prefetch_hit_tokens = 0
+        self.total_storage_prefetch_unfulfilled_tokens: Dict[str, int] = {}
 
         self.storage_prefetch_unfulfilled_tokens_total = Counter(
             name="sglang:storage_prefetch_unfulfilled_tokens_total",
@@ -2479,6 +2483,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:
             self.storage_prefetch_hit_tokens_total.labels(**self.labels).inc(num_tokens)
+            self.total_storage_prefetch_hit_tokens += num_tokens
 
     def log_storage_prefetch_unfulfilled_tokens(
         self, num_tokens: int, reason: str
@@ -2487,6 +2492,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.storage_prefetch_unfulfilled_tokens_total.labels(
                 **self.labels, reason=reason
             ).inc(num_tokens)
+            unfulfilled = self.total_storage_prefetch_unfulfilled_tokens
+            unfulfilled[reason] = unfulfilled.get(reason, 0) + num_tokens
 
     def log_storage_prefetch_deferred_tokens(
         self, num_tokens: int, reason: str
