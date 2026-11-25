@@ -8,7 +8,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import OpusPackedQ
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import (
@@ -116,6 +121,35 @@ def wq_b_unroped(attn, q) -> torch.Tensor:
     return q.view(-1, attn.n_local_heads, attn.head_dim)
 
 
+def wq_b_packed_for_opus(attn, q, forward_batch, attn_backend) -> Optional[OpusPackedQ]:
+    """wq_b_unroped as the fp8 OPUS prefill kernel's query pair, written by wq_b's GEMM
+    itself, where this layer's attention runs that kernel; None elsewhere."""
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
+
+    rows = q.x if isinstance(q, Fp8GridActivation) else q
+    rows = rows.q if isinstance(rows, Mxfp8Activation) else rows
+    rows = rows[0] if isinstance(rows, tuple) else rows
+    if (
+        not isinstance(attn_backend, DeepseekV4HipRadixBackend)
+        or attn.use_mega_attention
+        or is_in_breakable_cuda_graph()
+        or not attn_backend.opus_fp8_takes_packed_q(
+            num_tokens=rows.shape[0],
+            num_heads=attn.n_local_heads,
+            layer_id=attn.layer_id,
+            forward_batch=forward_batch,
+            compress_ratio=attn.compress_ratio,
+        )
+    ):
+        return None
+    from sglang.srt.layers.quantization.fp8_hip import apply_dense_packed_q
+
+    packed = apply_dense_packed_q(method=attn.wq_b.quant_method, layer=attn.wq_b, x=q)
+    return None if packed is None else OpusPackedQ(*packed)
+
+
 def compute_q_b(
     attn,
     q_lora: torch.Tensor,
@@ -124,15 +158,27 @@ def compute_q_b(
     q_out: Optional[torch.Tensor],
     unified: bool,
     use_cp: bool,
+    forward_batch=None,
+    attn_backend=None,
 ):
     """attn._compute_q_b(q_for_wqb, positions, q_out) as (q, the q_lora the indexer reads,
     whether the K norm-rope-store launch ropes q). The indexer takes the fused operand:
-    its wq_b would re-round onto the same grid."""
+    its wq_b would re-round onto the same grid. With forward_batch / attn_backend, q is an
+    OpusPackedQ where the layer's attention takes one (wq_b_packed_for_opus)."""
     fuse_q_rope = _is_gfx95_supported and fuses_q_rope_into_k_store(
         attn, q_out, unified=unified, use_cp=use_cp
     )
     if fuse_q_rope:
-        q = wq_b_unroped(attn, q_for_wqb)
+        q = None
+        if forward_batch is not None:
+            q = wq_b_packed_for_opus(
+                attn=attn,
+                q=q_for_wqb,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
+        if q is None:
+            q = wq_b_unroped(attn, q_for_wqb)
     else:
         q = attn._compute_q_b(q_for_wqb, positions, q_out)
     return q, q_for_wqb, fuse_q_rope
