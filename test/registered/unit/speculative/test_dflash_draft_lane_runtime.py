@@ -24,6 +24,50 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class DraftRuntimeTests(CustomTestCase):
+    def test_typed_regions_share_registration_and_release_with_target(self):
+        from sglang.srt.disaggregation.mooncake.buffers import BufferKeys
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+        from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport
+
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[100],
+            kv_data_lens=[64],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            state_data_ptrs=[],
+            state_data_lens=[],
+            gpu_id=0,
+            draft_lane_regions=((100, 64), (200, 128), (300, 0)),
+        )
+        manager._local_keys = BufferKeys.for_buffers([100], [], [])
+        engine = MagicMock()
+        manager.transport = MooncakeTransport(engine=engine)
+        manager.register_buffer_to_engine()
+        engine.batch_register.assert_called_once_with([100, 200], [64, 128])
+        manager.deregister_buffer_to_engine()
+        engine.batch_deregister.assert_called_once()
+        self.assertCountEqual(engine.batch_deregister.call_args.args[0], [100, 200])
+
+    def test_transfer_uses_public_engine_api_and_preserves_status(self):
+        from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+            TransferIntent,
+        )
+
+        lane = object.__new__(DraftPDLane)
+        transfer = MagicMock(return_value=-1)
+        lane.manager = SimpleNamespace(
+            engine=SimpleNamespace(batch_transfer_sync=transfer)
+        )
+        self.assertEqual(lane._transfer_data("peer", []), 0)
+        transfer.assert_not_called()
+        self.assertEqual(
+            lane._transfer_data("peer", [(100, 200, 16), (116, 216, 32)]), -1
+        )
+        transfer.assert_called_once_with(
+            "peer", [100, 116], [200, 216], [16, 32], TransferIntent.FOREGROUND
+        )
+
     def setUp(self):
         # The protocol fixture copies real CPU tensor bytes. GPU stream drains
         # are exercised separately by actual RDMA and full serving regressions.
@@ -145,7 +189,7 @@ class DraftRuntimeTests(CustomTestCase):
                     ctypes.memmove(dst, src, size)
                 return 0
 
-            source.manager._transfer_data = transfer
+            source._transfer_data = transfer
 
         class Receiver:
             bootstrap_room = 9
@@ -310,12 +354,12 @@ class DraftRuntimeTests(CustomTestCase):
         self.pump(lanes)
         self.assertTrue(d0.ready(9))
         self.assertEqual(d1.worker._cohort.committed[1], (2, "next-health", 4))
-        p0.manager._transfer_data = MagicMock()
+        p0._transfer_data = MagicMock()
         fake_batch = SimpleNamespace(
             reqs=[SimpleNamespace(bootstrap_host=FAKE_BOOTSTRAP_HOST)], extend_lens=[4]
         )
         p0.send_context_chunk(fake_batch, torch.arange(4), torch.arange(64, 68))
-        p0.manager._transfer_data.assert_not_called()
+        p0._transfer_data.assert_not_called()
 
     def test_malformed_typed_envelope_does_not_consume_the_target_channel(self):
         lanes, receiver, req = self.fixture()
@@ -345,7 +389,7 @@ class DraftRuntimeTests(CustomTestCase):
         d0.begin_lease(req, receiver, 20)
         receiver.send_metadata(kv_indices=[1])
         self.pump(lanes)
-        p0.manager._transfer_data = lambda session, blocks: -1
+        p0._transfer_data = lambda session, blocks: -1
         with self.assertRaisesRegex(RuntimeError, "Unsettled"):
             self.send_chunk(p0, receiver, 0, 8)
         d0.release_owner_slot(1)
@@ -421,14 +465,14 @@ class DraftRuntimeTests(CustomTestCase):
         d0.begin_lease(req, receiver, 4)
         receiver.send_metadata(kv_indices=[1])
         self.pump(lanes)
-        original = p0.manager._transfer_data
+        original = p0._transfer_data
 
         def transfer(session, blocks):
             return (
                 -1 if session == d1.peer.engine_session else original(session, blocks)
             )
 
-        p0.manager._transfer_data = transfer
+        p0._transfer_data = transfer
         with self.assertRaisesRegex(RuntimeError, "Unsettled"):
             self.send_chunk(p0, receiver, 0, 4, distinct_heads=True)
         self.pump(lanes)

@@ -128,6 +128,18 @@ class DraftPDLane:
     def registerable_regions(self):
         return tuple((r.base, r.registered_bytes) for r in self.regions)
 
+    def _transfer_data(self, session, blocks):
+        from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+            TransferIntent,
+        )
+
+        if not blocks:
+            return 0
+        src, dst, lengths = zip(*blocks)
+        return self.manager.engine.batch_transfer_sync(
+            session, list(src), list(dst), list(lengths), TransferIntent.FOREGROUND
+        )
+
     def bind_engine(self, manager):
         self.manager = manager
         from sglang.srt.utils.network import NetworkAddress
@@ -659,7 +671,7 @@ class DraftPDLane:
                 # Bound each descriptor batch: TP2 -> TP4 has strided source rows.
                 # Source reuse and DONE remain gated on every synchronous batch.
                 for block_offset in range(0, len(blocks), 4096):
-                    code = self.manager._transfer_data(
+                    code = self._transfer_data(
                         peer.engine_session, blocks[block_offset : block_offset + 4096]
                     )
                     if code != 0:
