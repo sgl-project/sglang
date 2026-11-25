@@ -11,7 +11,6 @@ import inspect
 import logging
 import os
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -554,11 +553,6 @@ def _muse_verify_attention(
     return False
 
 
-class WrapperDispatch(Enum):
-    SLIDING_WINDOW = auto()
-    CROSS_ATTENTION = auto()
-
-
 @dataclass
 class MlaPrefillPsMetadata:
     qo_indptr: torch.Tensor
@@ -577,12 +571,13 @@ class MlaPrefillPsMetadata:
 
 
 def _kv_cache_is_vectorized_5d(pool) -> bool:
-    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool with a
-    window sub-pool answers with its full view's layout, or its window view's
-    when it routes no full layers (a draft fused into the window sub-pool)."""
+    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool answers
+    with its full view's layout, or its window view's when it routes no full
+    layers (a draft fused into the window sub-pool). A composite that wraps a
+    full view (hybrid linear attention) has no layout of its own."""
     router = pool.layer_router
-    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-        has_full = router.sub_pool(IdSpaceKind.FULL) is not None
+    has_full = router.sub_pool(IdSpaceKind.FULL) is not None
+    if has_full or router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
     return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
@@ -1588,7 +1583,7 @@ class AiterAttnBackend(AttentionBackend):
             else nhead_override
         )
 
-        meta = get_mla_metadata_v1(
+        get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
@@ -3146,8 +3141,6 @@ class AiterAttnBackend(AttentionBackend):
                         )
                 else:
                     max_q_len = 1
-                    page_size = self.page_size
-                    max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
                     kv_indices = torch.zeros(
                         bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
@@ -3490,7 +3483,6 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr,
                     kv_indices,
                     qo_indptr,
-                    # self.mla_indices_updater_prefill.kv_last_page_len,
                     self.kv_last_page_len[:bs],
                     draft_num,
                     None,
@@ -3595,10 +3587,6 @@ class AiterAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
-                extend_no_prefix = False
-            else:
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             if self.use_mla:
                 self.mla_indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
@@ -4931,7 +4919,6 @@ class AiterAttnBackend(AttentionBackend):
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
                 ):
-                    token_to_kv_pool = self.token_to_kv_pool
                     k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                     slot_mapping_swa = self.swa_kv_pool.full_to_swa_index_mapping
 
@@ -6179,30 +6166,16 @@ class AiterAttnBackend(AttentionBackend):
 
 class AiterIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        # Parse Constants
-        self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
-        )
-        self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
-        self.q_data_type = model_runner.dtype
-        self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
-        self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.runner_ids = model_runner.runner_ids
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
-        self.max_q_len = 0
-        self.max_kv_len = 0
 
     def update(
         self,
@@ -6302,7 +6275,6 @@ class AiterMlaIndicesUpdaterPrefill:
         self.kv_indptr = None
         self.kv_indices = None
         self.qo_indptr = None
-        self.kv_last_page_len = None
         self.max_q_len = 0
         self.max_kv_len = 0
 
@@ -6379,7 +6351,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
 class AiterMultiStepDraftBackend:
     """
-    Wrap multiple triton attention backends as one for multiple consecutive
+    Wrap multiple aiter attention backends as one for multiple consecutive
     draft decoding steps.
     """
 

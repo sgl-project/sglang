@@ -51,11 +51,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_gfx115_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -79,7 +79,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx115 = _is_hip and is_gfx115_supported()
 # AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
@@ -104,6 +104,15 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+    from sglang.srt.layers.quantization.unquant_hip import (
+        a16w16_into,
+        prefer_hipblaslt,
+    )
+
+_use_tlx_gemm = _is_gfx95 and envs.SGLANG_USE_TLX_GEMM.get()
+if _use_tlx_gemm:
+    from sglang.kernels.ops.gemm import tlx as tlx_gemm
 
 if _rowmajor_ok:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
@@ -1011,6 +1020,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # _skip_aiter_unquant marks deterministic mode; the TLX plan also varies with M.
+        if (
+            _use_tlx_gemm
+            and bias is None
+            and not _skip_aiter_unquant
+            and type(layer.weight.data) is torch.Tensor
+            and tlx_gemm.mm_supported(x, layer.weight)
+        ):
+            return tlx_gemm.linear(x, layer.weight)
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
@@ -1036,9 +1054,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             _use_aiter
+            and x.is_cuda
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
+            # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
+            and x.is_cuda
         ):
+            if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
+                return F.linear(x, layer.weight, bias)
             if (
                 _rowmajor_ok
                 and _is_gfx1250
@@ -1160,6 +1183,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 f"linear output has shape {output.shape}, expected "
                 f"{(x.shape[0], layer.weight.shape[0])}"
             )
+        if _use_aiter and bias is None and a16w16_into(x, layer.weight, output):
+            return output
         torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)
@@ -1621,6 +1646,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
+        # aiter's only gfx1250 MoE kernel takes MXFP4 weights with gate/up interleaved.
+        if is_gfx1250_supported():
+            return "aiter has no bf16 fused-MoE kernel on gfx1250"
+
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
         if layer.intermediate_size_per_partition % 128 != 0:
