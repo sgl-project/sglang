@@ -129,33 +129,35 @@ def plan_migration(
     )
 
     assert window.slot_counts is not None
-    observed_peaks, eligible_rows = _rank_peaks_and_eligible_layers(
+    observed_peaks, eligible_layers = _rank_peaks_and_eligible_layers(
         window.slot_counts.numpy(), spec, layer_ids
     )
-    if not eligible_rows:
+    if not eligible_layers:
         return None
 
     uses_static_dispatch = spec.dispatch_mode == "static"
     num_layers = current.size(0)
-    model_layer_ids = tuple(range(num_layers))
+    # The planner uses row indices. A compact row can have a different model layer ID.
+    layer_for_row = tuple(range(num_layers))
+    eligible_rows = eligible_layers
     narrowed_rows = narrowed_layers
     # Copying a nearly full window can cost more than solving it directly.
     # Static picks also need the full layer order for the seeded draw sequence.
     if (
         not uses_static_dispatch
-        and num_layers - len(eligible_rows)
+        and num_layers - len(eligible_layers)
         >= num_layers * _MIN_COMPACTION_SKIP_FRACTION
     ):
-        model_layer_ids = tuple(sorted(eligible_rows))
-        row_for_layer = {layer: row for row, layer in enumerate(model_layer_ids)}
-        layer_index = torch.tensor(model_layer_ids, dtype=torch.long, device="cpu")
+        layer_for_row = tuple(sorted(eligible_layers))
+        row_for_layer = {layer: row for row, layer in enumerate(layer_for_row)}
+        layer_index = torch.tensor(layer_for_row, dtype=torch.long, device="cpu")
         window = window.select_layers(layer_index)
         current = current.index_select(0, layer_index)
-        observed_peaks = observed_peaks[:, model_layer_ids]
+        observed_peaks = observed_peaks[:, layer_for_row]
         narrowed_rows = {
             row_for_layer[layer] for layer in narrowed_layers if layer in row_for_layer
         }
-        eligible_rows = tuple(row_for_layer[layer] for layer in eligible_rows)
+        eligible_rows = tuple(row_for_layer[layer] for layer in eligible_layers)
 
     slot_counts = window.slot_counts
     assert slot_counts is not None
@@ -246,10 +248,10 @@ def plan_migration(
         return None
     install_order = torch.tensor(layers_to_move, dtype=torch.long, device="cpu")
     return MigrationPlacement(
-        tuple(model_layer_ids[i] for i in layers_to_move),
-        physical.index_select(0, install_order),
-        logical.index_select(0, install_order),
-        static_dispatch.index_select(0, install_order)
+        layers=tuple(layer_for_row[row] for row in layers_to_move),
+        physical_to_logical=physical.index_select(0, install_order),
+        logical_to_physical=logical.index_select(0, install_order),
+        static_dispatch=static_dispatch.index_select(0, install_order)
         if static_dispatch is not None
         else None,
     )

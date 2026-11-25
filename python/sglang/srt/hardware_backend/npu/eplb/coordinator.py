@@ -153,24 +153,23 @@ class AsyncEplbCoordinator:
         return all_ready
 
     def poll(self) -> bool:
-        """Advance one phase after all ranks agree at a forward boundary."""
+        """Advance at a forward boundary. Return True when the coordinator is idle."""
         if not self.active:
             return self.phase == Phase.IDLE
-        layer = (
-            self._layers[self.layers_installed]
-            if self.phase == Phase.STAGING
-            else ControlPoint.NO_LAYER
+        planning = self.phase == Phase.PLANNING
+        vote_layer = (
+            ControlPoint.NO_LAYER if planning else self._layers[self.layers_installed]
         )
-        if not self._all_ranks_ready(layer):
+        if not self._all_ranks_ready(vote_layer):
             return False
 
         future = self._future
         assert future is not None
-        if self.phase == Phase.PLANNING:
+        if planning:
             self._layers = future.result()
         else:
             try:
-                self.runtime.install(layer, future.result())
+                self.runtime.install(vote_layer, future.result())
                 self.layers_installed += 1
             except Exception as error:
                 self._fatal("EPLB install failed; layout integrity unknown", error)
@@ -180,6 +179,7 @@ class AsyncEplbCoordinator:
             self.phase = Phase.IDLE
             return True
 
+        # Stage only the next layer. The runtime reuses the same device buffers.
         self._start_stage(self._layers[self.layers_installed])
         return False
 

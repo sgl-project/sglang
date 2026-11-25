@@ -54,20 +54,22 @@ class _AsyncStatAccumulator(_StatAccumulator):
         self.window_samples = 0
         self._previous_layouts.clear()
 
-    def _finish_snapshot(self, vote: SnapshotVote, failed: bool) -> bool:
+    def _finish_snapshot(self, vote: SnapshotVote, *, snapshot_failed: bool) -> bool:
         """Clear the window everywhere and report whether planning can start."""
-        cleared = True
+        local_cleared = True
         try:
             self.reset()
         except Exception:
             logger.exception("Async EPLB could not reset its recorder window")
-            cleared = False
-        cleared, failed = vote(ControlPoint.SNAPSHOT_COMPLETE, cleared, failed)
-        if not cleared:
+            local_cleared = False
+        all_cleared, any_failed = vote(
+            ControlPoint.SNAPSHOT_COMPLETE, local_cleared, snapshot_failed
+        )
+        if not all_cleared:
             raise UnsafeRebalanceFailure(
                 "Async EPLB could not clear the recorder on all ranks"
             )
-        return not failed
+        return not any_failed
 
     def _vote_on_utilization(
         self, rebalance_needed: Callable[[float], bool], vote: SnapshotVote
@@ -114,14 +116,15 @@ class _AsyncStatAccumulator(_StatAccumulator):
         vote: SnapshotVote,
     ) -> RecordedWindow | None:
         """Return a consumed window on all ranks, or None to skip the plan."""
-        needed, failed = self._vote_on_utilization(rebalance_needed, vote)
-        if failed or not needed:
-            self._finish_snapshot(vote, failed)
+        needed, admission_failed = self._vote_on_utilization(rebalance_needed, vote)
+        if admission_failed or not needed:
+            self._finish_snapshot(vote, snapshot_failed=admission_failed)
             return None
 
         group = self._communication_group
         rank = dist.get_rank(group)
         window = None
+        prepare_failed = False
         try:
             # A completed migration resets the window before the next epoch.
             assert not self._previous_layouts
@@ -129,10 +132,12 @@ class _AsyncStatAccumulator(_StatAccumulator):
             window = self._prepare_snapshot(counts, spec, rank)
         except Exception:
             logger.exception("Async EPLB could not prepare a recorder snapshot")
-            failed = True
-        _, failed = vote(ControlPoint.SNAPSHOT_PREPARE, not failed, failed)
-        if failed:
-            self._finish_snapshot(vote, failed)
+            prepare_failed = True
+        _, any_prepare_failed = vote(
+            ControlPoint.SNAPSHOT_PREPARE, not prepare_failed, prepare_failed
+        )
+        if any_prepare_failed:
+            self._finish_snapshot(vote, snapshot_failed=True)
             return None
 
         assert window is not None
@@ -143,14 +148,15 @@ class _AsyncStatAccumulator(_StatAccumulator):
             dist.reduce(window.active_sources, dst=0, group=group)
         dist.all_reduce(counts, group=group)
 
+        copy_failed = False
         try:
             if window.slot_counts is not None:
                 window.slot_counts.copy_(counts)
         except Exception:
             logger.exception("Async EPLB could not copy the reduced recorder window")
-            failed = True
+            copy_failed = True
         # Counts now contain the group total. No rank may reuse this window.
-        if not self._finish_snapshot(vote, failed):
+        if not self._finish_snapshot(vote, snapshot_failed=copy_failed):
             return None
         return window if rank == 0 else RecordedWindow()
 

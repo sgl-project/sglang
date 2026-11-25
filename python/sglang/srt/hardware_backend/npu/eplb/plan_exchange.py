@@ -32,26 +32,31 @@ def _pack_placement(
     num_logical: int,
     num_ranks: int | None,
 ) -> tuple[torch.Tensor, int, list[torch.Tensor] | None]:
-    changed, physical, logical, dispatch = placement
+    layers = placement.layers
+    physical = placement.physical_to_logical
+    logical = placement.logical_to_physical
+    static_dispatch = placement.static_dispatch
     num_layers, num_slots = physical_shape
-    count = len(changed)
+    count = len(layers)
     if (
         physical.shape != (count, num_slots)
         or logical.shape[:-1] != (count, num_logical)
-        or any(layer < 0 or layer >= num_layers for layer in changed)
+        or any(layer < 0 or layer >= num_layers for layer in layers)
     ):
         raise ValueError("EPLB placement changed the routing geometry")
 
-    ids = torch.tensor(changed, dtype=torch.int64, device="cpu")
+    ids = torch.tensor(layers, dtype=torch.int64, device="cpu")
     width = populated_replica_width(logical)
     fields = (ids, physical, logical[..., :width])
     payload = torch.cat([field.reshape(-1) for field in fields]).long()
-    rank_tables = None
-    if dispatch is not None:
-        if dispatch.shape != (count, num_logical, num_ranks):
+    static_rows_by_rank = None
+    if static_dispatch is not None:
+        if static_dispatch.shape != (count, num_logical, num_ranks):
             raise ValueError("EPLB placement changed the static routing geometry")
-        rank_tables = list(dispatch.permute(2, 0, 1).long().contiguous().unbind())
-    return payload, width, rank_tables
+        static_rows_by_rank = list(
+            static_dispatch.permute(2, 0, 1).long().contiguous().unbind()
+        )
+    return payload, width, static_rows_by_rank
 
 
 def allocate_plan_header() -> torch.Tensor:
@@ -71,7 +76,7 @@ def broadcast_placement(
 ) -> PlacementRows | None:
     """Broadcast changed rows; scatter only the static picks each rank uses."""
     # Header: [changed layers (-1 on failure), replica width, static dispatch flag].
-    rank_tables = None
+    static_rows_by_rank = None
     if rank == 0:
         header.zero_()
         if error is None and placement is not None:
@@ -81,26 +86,31 @@ def broadcast_placement(
                     if placement.static_dispatch is not None
                     else None
                 )
-                payload, width, rank_tables = _pack_placement(
+                payload, width, static_rows_by_rank = _pack_placement(
                     placement, physical_shape, num_logical, num_ranks
                 )
                 header[0] = len(placement.layers)
                 header[1] = width
-                header[2] = int(rank_tables is not None)
+                header[2] = int(static_rows_by_rank is not None)
             except Exception as exc:
                 error = str(exc)
         if error is not None:
             header[0] = -1
     dist.broadcast(header, src=0, group=group)
-    count, width, has_static_dispatch = header.tolist()
-    if count < 0:
+    layer_count, replica_width, has_static_dispatch = header.tolist()
+    if layer_count < 0:
         message = [error]
         dist.broadcast_object_list(message, src=0, group=group)
         raise RuntimeError(f"EPLB CPU planner failed: {message[0]}")
-    if count == 0:
+    if layer_count == 0:
         return None
-    slots = physical_shape[1]
-    field_sizes = (count, count * slots, count * num_logical * width)
+
+    num_slots = physical_shape[1]
+    field_sizes = (
+        layer_count,
+        layer_count * num_slots,
+        layer_count * num_logical * replica_width,
+    )
     local_dispatch = None
     receive_error = None
     try:
@@ -108,7 +118,7 @@ def broadcast_placement(
             payload = torch.empty(sum(field_sizes), dtype=torch.int64, device="cpu")
         if has_static_dispatch:
             local_dispatch = torch.empty(
-                (count, num_logical), dtype=torch.int64, device="cpu"
+                (layer_count, num_logical), dtype=torch.int64, device="cpu"
             )
     except Exception as exc:
         receive_error = exc
@@ -127,11 +137,11 @@ def broadcast_placement(
     dist.broadcast(payload, src=0, group=group)
     if has_static_dispatch:
         assert local_dispatch is not None
-        dist.scatter(local_dispatch, rank_tables, src=0, group=group)
+        dist.scatter(local_dispatch, static_rows_by_rank, src=0, group=group)
     layer_ids, physical, logical = payload.split(field_sizes)
     return PlacementRows(
-        tuple(layer_ids.tolist()),
-        physical.view(count, slots),
-        logical.view(count, num_logical, width),
-        local_dispatch,
+        layers=tuple(layer_ids.tolist()),
+        physical_to_logical=physical.view(layer_count, num_slots),
+        logical_to_physical=logical.view(layer_count, num_logical, replica_width),
+        local_dispatch=local_dispatch,
     )
