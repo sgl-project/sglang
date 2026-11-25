@@ -27,7 +27,7 @@ class TestDsaPdDcpConfig(unittest.TestCase):
     def test_rocm_decode_uses_merged_triton_defaults(self):
         with patch(
             "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
-            return_value=SimpleNamespace(is_hip=True),
+            return_value=SimpleNamespace(is_hip=True, is_npu=False),
         ):
             self.assertEqual(
                 _dsa_dcp_overrides(
@@ -39,7 +39,7 @@ class TestDsaPdDcpConfig(unittest.TestCase):
     def test_rocm_decode_preserves_a2a_q_replication_default(self):
         with patch(
             "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
-            return_value=SimpleNamespace(is_hip=True),
+            return_value=SimpleNamespace(is_hip=True, is_npu=False),
         ):
             self.assertEqual(
                 _dsa_dcp_overrides(
@@ -55,7 +55,7 @@ class TestDsaPdDcpConfig(unittest.TestCase):
                     self.subTest(hip=hip, mode=mode),
                     patch(
                         "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
-                        return_value=SimpleNamespace(is_hip=hip),
+                        return_value=SimpleNamespace(is_hip=hip, is_npu=False),
                     ),
                 ):
                     cfg = config(disaggregation_mode=mode)
@@ -70,10 +70,35 @@ class TestDsaPdDcpConfig(unittest.TestCase):
             _dsa_dcp_overrides(config(dcp_size=1, disaggregation_mode="prefill")), {}
         )
 
+    def test_existing_npu_pd_support_is_preserved(self):
+        with patch(
+            "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
+            return_value=SimpleNamespace(is_hip=False, is_npu=True),
+        ):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    self.assertEqual(
+                        _dsa_dcp_overrides(config(disaggregation_mode=mode)), {}
+                    )
+
+    def test_existing_rocm_standalone_hicache_support_is_preserved(self):
+        with patch(
+            "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
+            return_value=SimpleNamespace(is_hip=True, is_npu=False),
+        ):
+            self.assertEqual(
+                _dsa_dcp_overrides(
+                    config(disaggregation_mode="null", enable_hierarchical_cache=True)
+                ),
+                {},
+            )
+            with self.assertRaisesRegex(ValueError, "without HiCache"):
+                _dsa_dcp_overrides(config(enable_hierarchical_cache=True))
+
     def test_other_dcp_constraints_are_preserved(self):
         with patch(
             "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
-            return_value=SimpleNamespace(is_hip=True),
+            return_value=SimpleNamespace(is_hip=True, is_npu=False),
         ):
             for kwargs in (
                 {"enable_hisparse": True},
