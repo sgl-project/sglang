@@ -1090,6 +1090,14 @@ def run_dsa_sparse_attention_case(
         index_pattern=index_pattern,
         loc_layout=loc_layout,
     )
+    if case.forward_mode.is_decode() and fixture.backend.use_fused_topk:
+        # The eager fixture bypasses the indexer. Fused decode consumes the
+        # physical slots that the indexer would have emitted on these pages.
+        logical = fixture.topk_indices
+        req_ids = fixture.forward_batch.req_pool_indices.long().unsqueeze(1)
+        locations = fixture.runner.req_to_token_pool.req_to_token
+        slots = locations[req_ids, logical.long().clamp_min(0)]
+        fixture.topk_indices = slots.masked_fill(logical < 0, -1).to(logical.dtype)
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)
     atol = DSA_SPARSE_FP8_ATOL if fp8_kv_cache else DSA_SPARSE_ATOL
@@ -1249,16 +1257,13 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
     "aiter",
 )
 
-# Impls that accept an FP8-stored K cache. The flashmla *sparse* and FA3
-# kernels require BF16 K (`kv must have dtype torch::kBFloat16`), so they
-# fall back to the inline-quantize-of-bf16 path that production *doesn't*
-# take in FP8 deployments. AITER decode, the `flashmla_kv` decode kernel,
-# and both flashmla prefill kernels are the production-relevant FP8 paths.
+# Backends that consume an FP8-stored K cache directly or dequantize it for
+# the attention kernel.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
     {"aiter", "flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
-    {"aiter", "flashmla_kv", "flashmla_auto"}
+    {"aiter", "flashmla_sparse", "flashmla_kv", "flashmla_auto"}
 )
 
 
@@ -1421,11 +1426,7 @@ def run_dsa_sparse_fp8_decode_case(
     *,
     dsa_decode_backend: str = "flashmla_kv",
 ) -> None:
-    """FP8-KV-cache decode. AITER and `flashmla_kv` (including
-    `flashmla_auto`, which resolves to it for FP8) accept an FP8-stored K
-    cache; `flashmla_sparse` and `fa3` decode kernels assert BF16 K and
-    would fall back to the inline-quantize-of-bf16 path that production
-    doesn't take in FP8 deployments."""
+    """Exercise decode from a packed FP8 cache, including the BF16 sparse gather."""
     supported, reason = dsa_impl_capability(dsa_decode_backend)
     if not supported:
         testcase.skipTest(
@@ -1433,9 +1434,7 @@ def run_dsa_sparse_fp8_decode_case(
         )
     if dsa_decode_backend not in DSA_FP8_COMPATIBLE_DECODE_IMPLS:
         testcase.skipTest(
-            f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV "
-            f"cache (only `aiter`, `flashmla_kv`, and `flashmla_auto` read "
-            f"FP8 K directly)."
+            f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV cache."
         )
     if not case.forward_mode.is_decode():
         raise ValueError("run_dsa_sparse_fp8_decode_case expects a DECODE case.")

@@ -160,6 +160,20 @@ def _dequantize_k_cache_fast_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
+def gather_sparse_decode_kv(
+    quant_k_cache: torch.Tensor, physical_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather packed KV into the BF16 rows and token indices FlashMLA sparse reads."""
+    # The paged dequantizer expects valid token slots, including for the entries
+    # that sparse attention will mask. Keep the compact shape fixed for graphs.
+    slots = physical_indices.clamp_min(0).contiguous().view(-1)
+    selected = dequantize_k_cache_paged_dsa(quant_k_cache, slots)
+    compact = torch.arange(
+        slots.numel(), dtype=torch.int32, device=slots.device
+    ).view_as(physical_indices)
+    return selected, compact.masked_fill_(physical_indices < 0, -1)
+
+
 def dequantize_k_cache_paged_dsa(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,

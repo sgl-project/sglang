@@ -385,7 +385,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 run_dsa_eagle_draft_cuda_graph_runner_case(self, case)
 
     # CG decode replay with FP8 KV cache. Captures and replays through
-    # `flashmla_kv` (the only FP8-compatible decode kernel). The
+    # `flashmla_kv`. The
     # `_clone_dsa_sparse_cache` hook is reused as-is — it snapshots the
     # raw uint8 K buffer bytes, which round-trip correctly across
     # capture/replay regardless of bf16 vs FP8 packing.
