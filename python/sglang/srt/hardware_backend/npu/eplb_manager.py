@@ -49,11 +49,17 @@ class _AsyncStatAccumulator(_StatAccumulator):
         self.window_samples = 0
         self._previous_layouts.clear()
 
-    def snapshot_physical_counts(self, source_groups):
+    def snapshot_counts(self, spec):
         # A completed migration resets the window before the next epoch.
         assert not self._previous_layouts
-        counts = self._global_physical_count_of_buffered_step.get_all().clone()
+        buffered = self._global_physical_count_of_buffered_step.get_all()
+        counts = (
+            buffered.clone()
+            if spec.physical_count_mode
+            else self._logical_counts(buffered)
+        )
         sources = None
+        source_groups = spec.source_groups
         if source_groups:
             group = self._communication_group
             ranks_per_group = dist.get_world_size(group) // source_groups
@@ -64,7 +70,7 @@ class _AsyncStatAccumulator(_StatAccumulator):
             torch.sum(counts, dim=0, out=sources[source])
             dist.reduce(sources, dst=0, group=group)
         dist.all_reduce(counts, group=self._communication_group)
-        return counts, sources, self._get_global_average_utilization_rate()
+        return counts, sources
 
     def _logical_counts(self, physical_counts):
         logical = super()._logical_counts(physical_counts)
@@ -110,20 +116,17 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         # NPU startup already warmed TP and emptied the allocator cache.
         self._accumulator._first_dump = False
 
-    def snapshot_for_rebalance(self, spec):
+    def snapshot_for_rebalance(self, spec, rebalance_needed):
         with record_function("npu_eplb.snapshot"):
-            if spec.physical_count_mode is not None:
-                snapshot = self._accumulator.snapshot_physical_counts(
-                    spec.source_groups
-                )
-                self._reset()
-                return snapshot
-            snapshot = self.dump_record(output_mode="object")
-            return (
-                snapshot["logical_count"],
-                None,
-                snapshot["average_utilization_rate_over_window"],
+            utilization = self._accumulator._get_global_average_utilization_rate()
+            # Every rank gets the same decision before entering the count reductions.
+            snapshot = (
+                self._accumulator.snapshot_counts(spec)
+                if rebalance_needed(utilization)
+                else None
             )
+            self._reset()
+            return snapshot
 
 
 def make_prefill_release_policy(scheduler):
@@ -236,15 +239,15 @@ class NpuAsyncEPLBManager(EPLBManager):
         if not ready:
             return
         start = time.perf_counter()
-        counts, sources, utilization = recorder.snapshot_for_rebalance(
-            coordinator.runtime.spec
+        snapshot = recorder.snapshot_for_rebalance(
+            coordinator.runtime.spec, self._check_rebalance_needed
         )
         snapshot_seconds = time.perf_counter() - start
-        if not self._check_rebalance_needed(utilization):
+        if snapshot is None:
             return
         coordinator.control.wait_seconds = 0.0
-        coordinator.start(coordinator.runtime.planner(counts, sources))
-        del counts, sources
+        coordinator.start(coordinator.runtime.planner(*snapshot))
+        del snapshot
         try:
             while True:
                 yield

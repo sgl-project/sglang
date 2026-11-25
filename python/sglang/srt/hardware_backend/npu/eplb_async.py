@@ -694,6 +694,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
             physical_count_mode = "static"
         else:
             physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
+    elif parallel.nnodes > 1 and moe.moe_a2a_backend != "none":
+        physical_count_mode = "unique"
     spec = PlanningSpec(
         metadata.num_physical_experts,
         metadata.num_local_physical_experts,
