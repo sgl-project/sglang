@@ -7,8 +7,8 @@ on:
       - main
     paths:
       - '.github/workflows/nightly-test-npu.yml'
-      - 'test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py'
-      - 'test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1080p_30_out256_50ms.py'
+      - 'test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms.py'
+      - 'test/registered/npu/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py'
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
   workflow_dispatch:
@@ -197,7 +197,7 @@ jobs:
   # The nightly-test-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring extra-b-test-4-npu-a3 in the PR pipeline.
   nightly-test-4-npu-a3:
     name: nightly-test-4-npu-a3
-    # TEMP(nightly rerun): rerun only the shard that failed in run 45212673268.
+    if: false  # TEMP: only the 397b perf case and the qwen3_6_27b gpqa case run in this pass
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -213,9 +213,6 @@ jobs:
       # TEMP(nightly rerun): the retained case does not use sgl-router, so the
       # router build dependency is dropped for this targeted rerun.
       sgl_router: false
-      # TEMP(nightly rerun): only the file that failed in run 45212673268.
-      only_tests: |
-        test/registered/npu/basic_function/dp_attn/test_npu_dp_attention.py
     secrets: inherit
 
   nightly-test-8-npu-a3:
@@ -252,7 +249,7 @@ jobs:
 
   nightly-perf-test-2-npu-a3:
     name: nightly-perf-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-2-npu-a3,')) }}
+    if: false  # TEMP: only the 397b perf case and the qwen3_6_27b gpqa case run in this pass
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -266,9 +263,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      # TEMP(nightly rerun): only the file that failed in run 45212673268 (exit 137 / OOM).
-      only_tests: |
-        test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1080p_30_out256_50ms.py
 
   nightly-perf-test-4-npu-a3:
     name: nightly-perf-test-4-npu-a3
@@ -289,7 +283,6 @@ jobs:
 
   nightly-perf-test-16-npu-a3:
     name: nightly-perf-test-16-npu-a3
-    if: false  # TEMP(PR 52431 verification): only jobs covering changed cases run
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -304,11 +297,14 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       test_timeout_minutes: '180'
+      # TEMP: only the 397b w4a8 perf case (ZBAL envs commented out) runs in this suite.
+      only_tests: |
+        test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms.py
 
-  # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
+  # The acc-2 suite normally splits across 4 parallel partition jobs; this
+  # targeted pass keeps a single partition for the single retained case.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
-    if: false  # TEMP(PR 52431 verification): only jobs covering the two changed cases run
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -317,16 +313,19 @@ jobs:
       test_type: 'accuracy'
       test_suite: nightly-acc-test-2-npu-a3
       is_nightly_pipeline_job: true
-      partitions: '{"size":4,"arr":[0,1,2,3]}'
+      partitions: '{"size":1,"arr":[0]}'
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      # TEMP: only the qwen3_6_27b w8a8 3k5/1k5 gpqa case runs in this suite.
+      only_tests: |
+        test/registered/npu/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py
 
   nightly-acc-test-16-npu-a3:
     name: nightly-acc-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-16-npu-a3,')) }}
+    if: false  # TEMP: only the 397b perf case and the qwen3_6_27b gpqa case run in this pass
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -340,9 +339,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      # TEMP(nightly rerun): only the file that failed in run 45212673268 (host-mem OOM in pin_memory).
-      only_tests: |
-        test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
 
   nightly-acc-test-4-npu-a5:
      name: nightly-acc-test-4-npu-a5
