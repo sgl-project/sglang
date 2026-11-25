@@ -237,6 +237,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                     spec_algorithm = SimpleNamespace(
                         is_eagle=lambda: False,
                         is_dflash_family=lambda: False,
+                        uses_block_verify=lambda: False,
                     )
                     dtype = torch.float16
                     pp_group = SimpleNamespace(is_first_rank=True)
