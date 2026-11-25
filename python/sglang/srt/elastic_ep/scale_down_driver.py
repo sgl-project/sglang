@@ -103,7 +103,9 @@ def advance_scale_down(
     fail_scale: Callable[[str, int], None],
 ) -> Optional[ScaleDownStateMachine]:
     """Step the shrink one tick; returns the machine to keep, or None once terminal."""
-    if time.monotonic() - pending_since > scale_timeout:
+    # Past the NIXL arrival, abandoning would drop cleanup and finalize after the flip.
+    overdue = time.monotonic() - pending_since > scale_timeout
+    if overdue and (sm is None or sm.can_abandon()):
         fail_scale(
             f"Timed out waiting for cohort at retire barrier (target={pending_size})",
             effective_size,

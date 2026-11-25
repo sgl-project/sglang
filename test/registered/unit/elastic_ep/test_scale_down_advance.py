@@ -11,7 +11,10 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from sglang.srt.elastic_ep.scale_down_driver import ScaleDownDriver, advance_scale_down
-from sglang.srt.elastic_ep.scale_down_state import ScaleDownState
+from sglang.srt.elastic_ep.scale_down_state import (
+    ScaleDownState,
+    ScaleDownStateMachine,
+)
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -67,6 +70,51 @@ class TestAdvanceScaleDown(CustomTestCase):
         self.assertIn("retire barrier", failures[0])
         # Abandoned, not leaked: the epoch this rank posted is reset.
         self.assertEqual(len(driver.consumed), 1)
+
+    def test_an_overdue_shrink_past_its_nixl_arrival_still_runs_to_the_end(self):
+        """Peers may flip the mask on this rank's NIXL arrival, so the deadline must
+        not drop the retiree's cleanup or the survivor's finalize."""
+        for rank, state, handle, tail in (
+            (SURVIVOR_RANK, ScaleDownState.RECONFIG, None, ["on_reconfig"]),
+            (RETIREE_RANK, ScaleDownState.LOCAL_CLEANUP, None, ["on_local_cleanup"]),
+            (SURVIVOR_RANK, ScaleDownState.NIXL_RETIRE, "nixl-posted", ["on_reconfig"]),
+            (RETIREE_RANK, ScaleDownState.NIXL_RETIRE, "nixl-posted", ["on_exit"]),
+        ):
+            with self.subTest(rank=rank, state=state.name):
+                driver, failures = RecordingDriver(), []
+                sm = ScaleDownStateMachine(
+                    is_retiree=rank == RETIREE_RANK,
+                    target_size=PENDING_SIZE,
+                    effective_size=EFFECTIVE_SIZE,
+                    ranks_to_retire=[RETIREE_RANK],
+                    my_global_rank=rank,
+                    state=state,
+                    _nixl_barrier_handle=handle,
+                )
+                for _ in range(5):
+                    if advance(sm, driver, failures, timed_out=True) is None:
+                        break
+                self.assertEqual(failures, [])
+                self.assertTrue(sm.is_terminal())
+                self.assertFalse(sm.is_failed())
+                for call in tail:
+                    self.assertIn(call, driver.calls)
+                # The posted arrival is consumed by the fold, never released twice.
+                self.assertEqual(driver.consumed, [handle] if handle else [])
+
+    def test_an_overdue_nixl_retire_that_never_posted_is_still_failed(self):
+        driver, failures = RecordingDriver(), []
+        sm = ScaleDownStateMachine(
+            is_retiree=False,
+            target_size=PENDING_SIZE,
+            effective_size=EFFECTIVE_SIZE,
+            ranks_to_retire=[RETIREE_RANK],
+            my_global_rank=SURVIVOR_RANK,
+            state=ScaleDownState.NIXL_RETIRE,
+        )
+        self.assertIsNone(advance(sm, driver, failures, timed_out=True))
+        self.assertEqual(len(failures), 1)
+        self.assertNotIn("on_flip_mask", driver.calls)
 
     def test_a_failure_before_any_machine_exists_still_fails_the_scale(self):
         """A timeout, or a driver exception: FAILED is terminal, so dropped at once."""

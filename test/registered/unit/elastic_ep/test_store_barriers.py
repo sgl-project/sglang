@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import threading
+import time
 import unittest
 from datetime import timedelta
 from unittest import mock
@@ -152,12 +153,39 @@ class TestCohortVote(StoreBackedTestCase):
         """A late voter must not read a finished round the timed-out rank gave up on."""
         with self.assertRaisesRegex(RuntimeError, "aborted"):
             cohort_vote_via_store(True, 2, tag="late", timeout_s=0.2)
-        with self.assertRaisesRegex(RuntimeError, "aborted"):
-            cohort_vote_via_store(True, 2, tag="late", timeout_s=30.0)
-        # The late voter spent the aborted round's last slot, so the next one is clean.
+        # The abort bumped the epoch, so the late voter and the retry meet afresh.
         self.assertEqual(
             self._vote_concurrently([True, True], tag="late"), [True, True]
         )
+
+    def test_voters_retrying_an_aborted_round_meet_the_late_voter(self):
+        """N-1 voters abort, catch and retry before the Nth enters, as the grow admit
+        does; a retry spending the aborted round's leftover slot splits the cohort."""
+        results, errors = [None] * 3, []
+        retried = threading.Barrier(3)
+
+        def early(index):
+            try:
+                with self.assertRaisesRegex(RuntimeError, "aborted"):
+                    cohort_vote_via_store(True, 3, tag="retry", timeout_s=0.2)
+                retried.wait(timeout=30)
+                results[index] = cohort_vote_via_store(
+                    True, 3, tag="retry", timeout_s=30.0
+                )
+            except Exception as exc:  # surface instead of hanging the assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=early, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        # The Nth voter enters only once both early voters are into their retry.
+        retried.wait(timeout=30)
+        time.sleep(0.5)
+        results[2] = cohort_vote_via_store(True, 3, tag="retry", timeout_s=30.0)
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [], f"vote raised: {errors}")
+        self.assertEqual(results, [True, True, True])
 
     def test_an_abort_after_the_last_vote_keeps_the_verdict(self):
         key = "unit_close"
@@ -167,8 +195,12 @@ class TestCohortVote(StoreBackedTestCase):
                 self._store, key, int(self._store.add(f"{key}_cast", 1)), 2
             )
         late = int(self._store.add(f"{key}_cast", eep._VOTE_ABORT_MARK))
-        _close_vote_round(self._store, key, late, 2, abort=True)
+        _close_vote_round(
+            self._store, key, late, 2, abort=True, epoch_key=f"{key}_epoch"
+        )
         self.assertEqual(self._store.get(f"{key}_verdict"), b"yes")
+        # The round closed, so its voters stay in the epoch they agreed in.
+        self.assertEqual(int(self._store.add(f"{key}_epoch", 0)), 0)
 
     def test_reshuffle_reads_a_vote_timeout_as_a_cohort_wide_no(self):
         from sglang.srt.eplb.eplb_manager import EPLBManager

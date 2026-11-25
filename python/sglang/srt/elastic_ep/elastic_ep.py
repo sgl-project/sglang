@@ -1134,13 +1134,16 @@ def cohort_vote_via_store(
     ok: bool, cohort_size: int, *, tag: str, timeout_s: float = 60.0
 ) -> bool:
     """Unanimous go/no-go over the store; a device all_reduce(MIN) would read a departed
-    slot as a "no". Keyed per width, else consecutive shrinks split a round."""
+    slot as a "no". Keyed per width, else consecutive shrinks split a round. An abort
+    bumps the epoch, so a retry cannot land in the aborted round's leftover slots."""
     if cohort_size <= 1:
         return ok
     store = _store_or_none(f"[Elastic EP][vote] {tag}")
     if store is None:
         return ok
-    ns = f"sglang_cohort_vote_{tag}_n{cohort_size}"
+    base = f"sglang_cohort_vote_{tag}_n{cohort_size}"
+    epoch_key = f"{base}_epoch"
+    ns = f"{base}_e{int(store.add(epoch_key, 0))}"
     rnd = (int(store.add(f"{ns}_seq", 1)) - 1) // cohort_size
     key = f"{ns}_r{rnd}"
     # Tally before casting, else the last caster may read a tally missing a peer.
@@ -1154,7 +1157,9 @@ def cohort_vote_via_store(
         if aborted_at is None and now >= deadline:
             aborted_at = now
             cast = int(store.add(f"{key}_cast", _VOTE_ABORT_MARK))
-            _close_vote_round(store, key, cast, cohort_size, abort=True)
+            _close_vote_round(
+                store, key, cast, cohort_size, abort=True, epoch_key=epoch_key
+            )
         elif aborted_at is not None and now - aborted_at > _VOTE_VERDICT_GRACE_S:
             raise RuntimeError(f"[Elastic EP][vote] {tag} r{rnd} never closed")
         time.sleep(_BARRIER_STORE_POLL_S)
@@ -1175,7 +1180,13 @@ _VOTE_VERDICT_GRACE_S = 10.0
 
 
 def _close_vote_round(
-    store, key: str, cast: int, cohort_size: int, *, abort: bool = False
+    store,
+    key: str,
+    cast: int,
+    cohort_size: int,
+    *,
+    abort: bool = False,
+    epoch_key: Optional[str] = None,
 ) -> None:
     """Publish the verdict if ``cast`` (this rank's add result) closed the round: the
     last vote before any abort mark, or the first abort mark before the last vote.
@@ -1184,6 +1195,9 @@ def _close_vote_round(
     if abort:
         if aborts != 1 or votes >= cohort_size:
             return
+        # Before the verdict: a rank that reads "abort" must retry in the new epoch.
+        if epoch_key is not None:
+            store.add(epoch_key, 1)
         verdict = "abort"
     else:
         if aborts or votes != cohort_size:

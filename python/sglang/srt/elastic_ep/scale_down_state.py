@@ -71,6 +71,14 @@ class ScaleDownStateMachine:
     def is_failed(self) -> bool:
         return self.state is ScaleDownState.FAILED
 
+    def can_abandon(self) -> bool:
+        """Before this rank's NIXL retire arrival, which peers may flip the mask on.
+        Past it the barrier's own timeout bounds the wait; a flip is seen through."""
+        S = ScaleDownState
+        if self.state is S.NIXL_RETIRE:
+            return self._nixl_barrier_handle is None
+        return self.state in (S.PREPARE, S.DRAIN)
+
     def tick(self, driver: Any) -> None:
         """Advance by one stage per call. Side effects live in driver callbacks."""
         if self.is_terminal():
