@@ -49,34 +49,20 @@ class TestRayEngineSchedulerExit(CustomTestCase):
     def tearDownClass(cls):
         ray.shutdown()
 
-    def _start(
-        self, *, num_actors: int = 2, fail: bool = False, handle_loop: bool = True
-    ):
+    def _start(self, *, num_actors: int = 2, fail: bool = False):
         # max_concurrency lets stop() run while run_event_loop blocks.
         actors = [
             _FakeSchedulerActor.options(max_concurrency=2).remote()
             for _ in range(num_actors)
         ]
         refs = [actor.run_event_loop.remote(fail=fail) for actor in actors]
-        # Each message records whether handle_scheduler_exit ran on the handle loop.
+        # Messages the engine passes to report_scheduler_exit.
         messages: queue.Queue = queue.Queue()
-        loop = loop_thread = None
-        if handle_loop:
-            loop = asyncio.new_event_loop()
-            loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
-            loop_thread.start()
-            self.addCleanup(loop.call_soon_threadsafe, loop.stop)
         engine = RayEngine.__new__(RayEngine)
         engine._scheduler_monitor_stopped = threading.Event()
         engine._scheduler_exit_error = None
         engine._scheduler_init_result = SimpleNamespace(event_loop_refs=refs)
-        engine.tokenizer_manager = SimpleNamespace(
-            event_loop=loop,
-            scheduler_exit_error=None,
-            handle_scheduler_exit=lambda message: messages.put(
-                (threading.current_thread() is loop_thread, message)
-            ),
-        )
+        engine.tokenizer_manager = SimpleNamespace(report_scheduler_exit=messages.put)
         monitor = threading.Thread(target=engine._monitor_schedulers, daemon=True)
         monitor.start()
         self.addCleanup(engine._scheduler_monitor_stopped.set)
@@ -85,10 +71,7 @@ class TestRayEngineSchedulerExit(CustomTestCase):
         return actors, engine, monitor, messages
 
     def _assert_reported(self, engine, messages, expected: str):
-        on_handle_loop, message = messages.get(timeout=_EXIT_TIMEOUT_S)
-        self.assertTrue(on_handle_loop)
-        self.assertIn(expected, message)
-        self.assertIn(expected, engine.tokenizer_manager.scheduler_exit_error)
+        self.assertIn(expected, messages.get(timeout=_EXIT_TIMEOUT_S))
         with self.assertRaisesRegex(RuntimeError, expected):
             asyncio.run(engine.check_health())
 
@@ -108,20 +91,6 @@ class TestRayEngineSchedulerExit(CustomTestCase):
         ray.get(actors[0].stop.remote())
         self._assert_reported(engine, messages, "event loop exited")
 
-    def test_exit_before_any_request_sets_flag_without_handle_loop(self):
-        """No request has started the handle loop, so there is nothing to fail;
-        the flag alone makes the first request get 503."""
-        actors, engine, monitor, messages = self._start(num_actors=1, handle_loop=False)
-        ray.kill(actors[0])
-        monitor.join(timeout=_EXIT_TIMEOUT_S)
-        self.assertFalse(monitor.is_alive())
-        self.assertTrue(messages.empty())
-        self.assertIn(
-            "scheduler actor died", engine.tokenizer_manager.scheduler_exit_error
-        )
-        with self.assertRaisesRegex(RuntimeError, "scheduler actor died"):
-            asyncio.run(engine.check_health())
-
     def test_exit_after_shutdown_is_not_reported(self):
         """shutdown() kills the actors; that must not count as a crash."""
         actors, engine, monitor, messages = self._start(num_actors=1)
@@ -131,7 +100,6 @@ class TestRayEngineSchedulerExit(CustomTestCase):
         self.assertFalse(monitor.is_alive())
         self.assertTrue(messages.empty())
         self.assertIsNone(engine._scheduler_exit_error)
-        self.assertIsNone(engine.tokenizer_manager.scheduler_exit_error)
 
 
 class _ProbeTokenizerManager:

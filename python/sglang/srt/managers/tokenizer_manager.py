@@ -575,9 +575,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
-    # Set when a scheduler the subprocess watchdog cannot see has exited (see
-    # handle_scheduler_exit); requests are then rejected with 503. Engines may
-    # set it from another thread before scheduling handle_scheduler_exit.
+    # Set by report_scheduler_exit, possibly from another thread, when a scheduler
+    # the subprocess watchdog cannot see has exited; requests then get 503.
     scheduler_exit_error: Optional[str] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
@@ -3878,17 +3877,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Put some custom force exit logic here."""
         pass
 
-    def handle_scheduler_exit(self, message: str) -> None:
+    def report_scheduler_exit(self, message: str) -> None:
         """Fail every pending request with 503 and reject new ones.
 
         For engines whose schedulers are not child processes of this one, so the
-        subprocess watchdog cannot see them exit. Must run on the handle loop.
+        subprocess watchdog cannot see them exit. Safe to call from any thread.
         """
+        # Set before reading event_loop. generate_request starts the handle loop
+        # and then checks this flag, so a request either sees the flag and gets
+        # 503, or has started the loop and is failed below.
         self.scheduler_exit_error = message
+        loop = self.event_loop
+        if loop is None:
+            # No request has started the handle loop, so none is pending.
+            return
+        # Request state belongs to the handle loop and is not thread-safe.
+        loop.call_soon_threadsafe(self._fail_requests_after_scheduler_exit)
+
+    def _fail_requests_after_scheduler_exit(self) -> None:
+        """Runs on the handle loop after report_scheduler_exit set the flag."""
         self.server_status = ServerStatus.UnHealthy
         finished_reason = {
             "type": "abort",
-            "message": message,
+            "message": self.scheduler_exit_error,
             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
         }
         for rid, state in list(self.rid_to_state.items()):

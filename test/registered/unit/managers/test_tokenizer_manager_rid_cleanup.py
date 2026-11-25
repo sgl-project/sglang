@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+import threading
 import time
 import unittest
 from array import array
@@ -429,7 +430,7 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
 class TestSchedulerExit(unittest.IsolatedAsyncioTestCase):
     """A scheduler the subprocess watchdog cannot see (a Ray actor) has exited.
 
-    Before handle_scheduler_exit, pending and new requests waited forever for
+    Before report_scheduler_exit, pending and new requests waited forever for
     outputs the dead scheduler would never send.
     """
 
@@ -451,7 +452,7 @@ class TestSchedulerExit(unittest.IsolatedAsyncioTestCase):
         pending = asyncio.create_task(anext(stream))
         await asyncio.sleep(0)
 
-        self.tm.handle_scheduler_exit("SGLang scheduler actor died")
+        self.tm.report_scheduler_exit("SGLang scheduler actor died")
 
         with self.assertRaises(HTTPException) as ctx:
             await pending
@@ -459,15 +460,34 @@ class TestSchedulerExit(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
         self.assertFalse(self.tm.is_healthy())
 
-    async def test_flag_set_off_loop_makes_server_unhealthy(self):
-        """An engine sets the flag from its monitor thread before the handle loop
-        runs handle_scheduler_exit, or instead of it when no loop exists yet."""
-        self.tm.scheduler_exit_error = "SGLang scheduler actor died"
+    async def test_report_from_another_thread_cleans_up_on_handle_loop(self):
+        """RayEngine reports from its monitor thread; request state must only be
+        touched on the handle loop."""
+        fail_requests = self.tm._fail_requests_after_scheduler_exit
+        fail_threads = []
+
+        def record_thread_and_fail():
+            fail_threads.append(threading.current_thread())
+            fail_requests()
+
+        self.tm._fail_requests_after_scheduler_exit = record_thread_and_fail
+        await asyncio.to_thread(
+            self.tm.report_scheduler_exit, "SGLang scheduler actor died"
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(fail_threads, [threading.current_thread()])
+        self.assertEqual(self.tm.server_status, ServerStatus.UnHealthy)
+
+    async def test_report_before_handle_loop_only_sets_flag(self):
+        """With no handle loop no request is pending, so only the flag is set."""
+        self.tm.event_loop = None
+        self.tm.report_scheduler_exit("SGLang scheduler actor died")
+        self.assertEqual(self.tm.scheduler_exit_error, "SGLang scheduler actor died")
         self.assertEqual(self.tm.server_status, ServerStatus.Up)
         self.assertFalse(self.tm.is_healthy())
 
     async def test_new_request_is_rejected_with_503(self):
-        self.tm.handle_scheduler_exit("SGLang scheduler actor died")
+        self.tm.report_scheduler_exit("SGLang scheduler actor died")
 
         obj = GenerateReqInput(rid="new", input_ids=[1, 2])
         with self.assertRaises(HTTPException) as ctx:
@@ -1653,7 +1673,10 @@ class TestAbortBeforeDispatch(CustomTestCase):
                     )
                     task = asyncio.create_task(tm.generate_request(obj).__anext__())
                     await asyncio.wait_for(entered.wait(), timeout=2)
-                    tm.handle_scheduler_exit("SGLang scheduler actor died")
+                    # generate_request started the handle loop on this loop.
+                    tm.event_loop = asyncio.get_running_loop()
+                    tm.report_scheduler_exit("SGLang scheduler actor died")
+                    await asyncio.sleep(0)
                     self.assertIn(rid, tm.rid_to_state)
                     release.set()
                     return await asyncio.wait_for(task, timeout=2)

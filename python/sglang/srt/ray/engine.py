@@ -65,14 +65,6 @@ class RaySchedulerInitResult(SchedulerInitResult):
     event_loop_refs: list = dataclasses.field(default_factory=list)
 
 
-def _scheduler_exit_error(event_loop_ref: ray.ObjectRef) -> RuntimeError:
-    try:
-        ray.get(event_loop_ref)
-    except Exception as e:
-        return RuntimeError(f"SGLang scheduler actor died: {e}")
-    return RuntimeError("SGLang scheduler event loop exited")
-
-
 def _find_engine_bundle(
     placement_group: PlacementGroup, nnodes: int
 ) -> tuple[int, str]:
@@ -340,23 +332,18 @@ class RayEngine(Engine):
             if not ray.is_initialized():
                 return
             done, _ = ray.wait(refs, num_returns=1, timeout=_SCHEDULER_MONITOR_POLL_S)
-        if done and not self._scheduler_monitor_stopped.is_set():
-            self._handle_scheduler_exit(_scheduler_exit_error(done[0]))
+        if not done or self._scheduler_monitor_stopped.is_set():
+            return
 
-    def _handle_scheduler_exit(self, error: RuntimeError) -> None:
+        try:
+            ray.get(done[0])
+        except Exception as e:
+            error = RuntimeError(f"SGLang scheduler actor died: {e}")
+        else:
+            error = RuntimeError("SGLang scheduler event loop exited")
         logger.error(f"{error}; failing pending and new requests")
         self._scheduler_exit_error = error
-        tokenizer_manager = self.tokenizer_manager
-        # Set before reading event_loop. generate_request starts the handle loop
-        # and then checks this flag, so a request either sees the flag and gets
-        # 503, or has started the loop and is failed by handle_scheduler_exit.
-        tokenizer_manager.scheduler_exit_error = str(error)
-        loop = tokenizer_manager.event_loop
-        if loop is None:
-            # No request has started the handle loop, so none is pending.
-            return
-        # Request state belongs to the handle loop and is not thread-safe.
-        loop.call_soon_threadsafe(tokenizer_manager.handle_scheduler_exit, str(error))
+        self.tokenizer_manager.report_scheduler_exit(str(error))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
