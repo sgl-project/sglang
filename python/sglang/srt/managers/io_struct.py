@@ -644,6 +644,8 @@ class GenerateReqInput:
             self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+        elif not isinstance(self.rid, str):
+            raise ValueError("rid should be a string for a single request.")
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -1324,6 +1326,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
     # See GenerateReqInput.token_ids_logprob_rows.
     token_ids_logprob_rows: Optional[List[List[int]]] = None
+    # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
+    filler_seed: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -1519,6 +1523,8 @@ class EmbeddingReqInput:
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            elif not isinstance(self.rid, str):
+                raise ValueError("rid should be a string for a single request.")
             if self.sampling_params is None:
                 self.sampling_params = {}
             else:
