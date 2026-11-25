@@ -794,13 +794,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
-        shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+        if self.shared_expert is not None:
+            shared_input = (
+                hidden_states.clone()
+                if getattr(
+                    getattr(self.experts, "moe_runner_config", None), "inplace", True
+                )
+                else hidden_states
             )
-            if self.shared_expert is not None
-            else None
-        )
+            shared_output = self._forward_shared_experts(
+                shared_input, apply_gate=not use_fused_gate
+            )
+        else:
+            shared_output = None
 
         # ===== TO BE REFACTORED ====
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
