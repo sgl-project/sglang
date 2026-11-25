@@ -10,8 +10,8 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::ModelId;
-use sgl_router::policies::request_tokens_for;
 use sgl_router::tokenizer::chat_formatter::{ChatFormatter, ChatTemplateKwargs};
+use sgl_router::tokenizer::prompt::request_tokens_for;
 use sgl_router::tokenizer::{adapter, TokenizerRegistry};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
