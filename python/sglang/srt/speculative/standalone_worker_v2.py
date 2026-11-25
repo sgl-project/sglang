@@ -1,8 +1,6 @@
 import logging
 from typing import Optional
 
-import torch
-
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -21,6 +19,7 @@ from sglang.srt.speculative.base_spec_worker import (
 )
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
+from sglang.srt.speculative.eagle_worker_common import check_draft_branch_tail_copy
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -47,7 +46,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self.target_worker = target_worker
 
         # Args for easy access
@@ -101,6 +99,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.dsa_seed_topk_width = None
         self.seed_dsa_topk_from_draft_extend = False
         self.dsa_extend_topk_buf = None
+        # _draft_extend_for_prefill reads this; the KV-only split is for NextN drafts.
+        self.can_split_prefill_draft_extend = False
 
     def alloc_memory_pool(
         self,
@@ -115,6 +115,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
         self.init_token_map()
         self.init_lm_head()
@@ -161,12 +164,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             target_vocab_size=target_worker.model_runner.model_config.vocab_size,
             target_tokenizer=target_worker.tokenizer,
         )
-
-        # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 

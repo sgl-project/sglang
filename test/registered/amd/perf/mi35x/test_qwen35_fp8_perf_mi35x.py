@@ -3,7 +3,7 @@
 Tests Qwen3.5-397B-A17B-FP8 (MoE, Hybrid Attention with Gated Delta Networks)
 on 8 GPUs with triton attention backend.
 
-Registry: nightly-perf-8-gpu-mi35x-qwen35-fp8 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-qwen35-fp8 suite
 """
 
 import os
@@ -16,7 +16,7 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
-    est_time=5400, suite="nightly-perf-8-gpu-mi35x-qwen35-fp8", nightly=True
+    est_time=5400, suite="nightly-perf-test-8-gpu-amd-mi35x-qwen35-fp8", nightly=True
 )
 
 

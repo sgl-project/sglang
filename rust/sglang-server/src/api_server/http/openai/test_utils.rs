@@ -47,7 +47,7 @@ pub(super) fn checkpoint_formatter(
     formatter.unwrap_or_else(|| panic!("{error:?}"))
 }
 
-pub(super) fn core_handle() -> CoreHandle {
+pub(crate) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
         flume::unbounded().0,
@@ -183,7 +183,7 @@ pub(super) fn frontend_closed() -> CoreHandle {
 
 /// App state whose core intake answers every generation with one finished
 /// `ok` chunk, with the ChatML template so chat can render.
-fn answering_app_state() -> Arc<super::AppState> {
+pub(in crate::api_server::http) fn answering_app_state() -> Arc<super::AppState> {
     let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
     answering_app_state_with(server_args(), formatter.unwrap(), None, "ok")
 }
@@ -274,6 +274,11 @@ fn answering_app_state_built(
         chat_formatter: Some(formatter),
         generate_hook: None,
     })
+}
+
+/// The built-in chatml template, for tests that render a chat prompt.
+pub(crate) fn chatml_formatter() -> super::ChatFormatter {
+    sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap()
 }
 
 /// Serve one request through the full router (extractors, auth, routing).

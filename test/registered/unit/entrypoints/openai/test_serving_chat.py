@@ -853,12 +853,12 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.server_args.tool_call_parser = "auto"
         self.tm.server_args.reasoning_parser = "auto"
         self.tm._config_overrides.update(
-            {"tool_call_parser": "qwen25", "reasoning_parser": None}
+            {"tool_call_parser": "qwen", "reasoning_parser": None}
         )
 
         chat = OpenAIServingChat(self.tm, self.template_manager)
 
-        self.assertEqual(chat.tool_call_parser, "qwen25")
+        self.assertEqual(chat.tool_call_parser, "qwen")
         self.assertIsNone(chat.reasoning_parser)
         self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
 
@@ -968,6 +968,27 @@ class ServingChatTestCase(CustomTestCase):
                 return_value=Mock(allow_auto_truncate=True),
             ):
                 self.assertIsNone(self.chat._validate_request(above_limit))
+
+    def test_request_stop_joins_non_list_template_stop_str(self):
+        """A request's stop joins the template's stop strings when the template
+        declares stop_str as a string or a tuple, not only as a list."""
+        cases = {
+            "phi-4-mm": ["<|end|>"],
+            "minicpmv": ["<|im_end|>", "<|endoftext|>"],
+        }
+        for template_name, template_stop in cases.items():
+            for request_stop in ("x", ["x", "y"]):
+                with self.subTest(template=template_name, stop=request_stop):
+                    self.template_manager.chat_template_name = template_name
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        stop=request_stop,
+                    )
+                    result = self.chat._apply_conversation_template(
+                        request, is_multimodal=False
+                    )
+                    self.assertEqual(result.stop, template_stop + list(request_stop))
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
@@ -1925,6 +1946,53 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(adapted.top_logprobs_num, 2)
                 self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
                 self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
+
+    def test_validate_request_rejects_flat_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_flat_raw_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_sampling_mask requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_flat_sampling_mask_default_to_b64(self):
+        self.tm.tokenizer = None
+        # (request flags, expected flat mask, expected b64)
+        cases = (
+            ({"return_flat_raw_sampling_mask": True}, True, True),
+            (
+                {
+                    "return_flat_raw_sampling_mask": True,
+                    "return_flat_raw_sampling_mask_b64": False,
+                },
+                True,
+                False,
+            ),
+            ({}, False, False),
+        )
+        for flags, flat, b64 in cases:
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                return_sampling_mask=True,
+                return_meta_info=True,
+                **flags,
+            )
+            with self.subTest(flags=flags):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                # The b64 default must not trip GenerateReqInput validation.
+                adapted.normalize_batch_and_arguments()
+
+                self.assertTrue(adapted.return_sampling_mask)
+                self.assertEqual(adapted.return_flat_raw_sampling_mask, flat)
+                self.assertEqual(adapted.return_flat_raw_sampling_mask_b64, b64)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -3851,7 +3919,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a
         non-array payload degrades instead of raising an opaque TypeError."""
-        self.chat.tool_call_parser = "glm45"
+        self.chat.tool_call_parser = "glm"
         tools = [
             {
                 "type": "function",

@@ -13,8 +13,10 @@ register_cpu_ci(1.0, "base-a-test-cpu")
 class _Vocab:
     def __init__(self, tokens):
         self._vocab = {token: i for i, token in enumerate(tokens)}
+        self.get_vocab_calls = 0
 
     def get_vocab(self):
+        self.get_vocab_calls += 1
         return self._vocab
 
 
@@ -103,13 +105,14 @@ class TestMistralDetector(CustomTestCase):
 
     # ==================== Compact Format Tests ====================
 
-    def test_compact_format_single_tool_call(self):
-        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Beijing"}'
+    def test_compact_format_multiple_tool_calls(self):
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Beijing"}[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
         result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        args = json.loads(result.calls[0].parameters)
-        self.assertEqual(args["city"], "Beijing")
+        self.assertEqual(
+            [json.loads(call.parameters)["city"] for call in result.calls],
+            ["Beijing", "Tokyo"],
+        )
+        self.assertEqual(result.normal_text, "")
 
     def test_compact_format_with_leading_text(self):
         text = 'Let me help. [TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
@@ -169,34 +172,27 @@ class TestMistralDetector(CustomTestCase):
     # ==================== structure_info Tests ====================
 
     def test_structure_info(self):
-        # No tokenizer, or one without [ARGS] (pre-v11): JSON array.
-        for detector in (self.detector, MistralDetector(_Vocab({"[TOOL_CALLS]"}))):
+        for detector, compact in (
+            (self.detector, False),
+            (MistralDetector(_Vocab({"[TOOL_CALLS]"})), False),
+            (MistralDetector(_Vocab({"[TOOL_CALLS]", "[ARGS]"})), True),
+        ):
             info = detector.structure_info()("get_weather")
-            self.assertIn("get_weather", info.begin)
             self.assertEqual(info.trigger, "[TOOL_CALLS]")
-            self.assertEqual(info.end, "}]")
+            if compact:
+                self.assertEqual(info.begin, "[TOOL_CALLS]get_weather[ARGS]")
+                self.assertEqual(info.end, "")
+            else:
+                self.assertIn("get_weather", info.begin)
+                self.assertEqual(info.end, "}]")
 
-    def test_structure_info_compact(self):
-        detector = MistralDetector(_Vocab({"[TOOL_CALLS]", "[ARGS]"}))
-        info = detector.structure_info()("get_weather")
-        self.assertEqual(info.begin, "[TOOL_CALLS]get_weather[ARGS]")
-        self.assertEqual(info.trigger, "[TOOL_CALLS]")
-        self.assertEqual(info.end, "")
-
-    def test_constrained_output_parses_every_call(self):
-        info_func = MistralDetector(_Vocab({"[ARGS]"})).structure_info()
-        text = "".join(
-            info_func(name).begin + json.dumps(args) + info_func(name).end
-            for name, args in (
-                ("get_weather", {"city": "Paris"}),
-                ("get_weather", {"city": "Tokyo"}),
-            )
-        )
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(
-            [json.loads(c.parameters)["city"] for c in result.calls], ["Paris", "Tokyo"]
-        )
-        self.assertEqual(result.normal_text, "")
+    def test_vocab_read_once_per_tokenizer(self):
+        """Parsers are built per request; read the full vocab once per tokenizer."""
+        compact, legacy = _Vocab({"[ARGS]"}), _Vocab({"[TOOL_CALLS]"})
+        for _ in range(2):
+            self.assertTrue(MistralDetector(compact)._compact_format)
+            self.assertFalse(MistralDetector(legacy)._compact_format)
+        self.assertEqual((compact.get_vocab_calls, legacy.get_vocab_calls), (1, 1))
 
     # ==================== Streaming Tests ====================
 

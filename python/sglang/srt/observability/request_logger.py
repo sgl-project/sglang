@@ -21,7 +21,7 @@ from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.runtime_context import get_context, get_exec
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.redaction import (
     WATERMARK_CONTAINER_FIELD_NAMES,
     WATERMARK_SECRET_FIELD_NAMES,
     redact_watermark_secrets,
@@ -170,6 +170,10 @@ class RequestLogger:
 
         self.metadata = self._compute_metadata()
         self.targets = self._setup_targets()
+
+    def logs_field_on_finish(self, name: str) -> bool:
+        _, skip_names, _ = self.metadata
+        return self.log_requests and name not in (skip_names or ())
 
     def log_received_request(
         self,

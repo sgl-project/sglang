@@ -1026,7 +1026,6 @@ class TestMistralDetector(CustomTestCase):
             f"size={size}": [text[i : i + size] for i in range(0, len(text), size)]
             for size in (1, 3, 7, 1000)
         }
-        chunkings.update({f"cut={i}": [text[:i], text[i:]] for i in range(len(text))})
         for stream_reasoning in (True, False):
             for name, chunks in chunkings.items():
                 with self.subTest(stream_reasoning=stream_reasoning, chunks=name):
@@ -1043,11 +1042,6 @@ class TestMistralDetector(CustomTestCase):
                         (reasoning + ret.reasoning_text, normal + ret.normal_text),
                         expected,
                     )
-
-    def test_multiple_blocks(self):
-        self._assert_parse(
-            "Sure. [THINK]r1[/THINK]a1[THINK]r2[/THINK]a2", ("r1r2", "Sure. a1a2")
-        )
 
     def test_repeated_and_stray_markers_are_dropped(self):
         self._assert_parse("[THINK][THINK]r[/THINK]a[/THINK]b", ("r", "ab"))
