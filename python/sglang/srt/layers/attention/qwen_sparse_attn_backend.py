@@ -355,7 +355,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
         req_pool = getattr(runner, "req_to_token_pool", None)
-        # Table width: the compressed table is sized from it.
         self.max_context_len = int(getattr(req_pool, "max_context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
