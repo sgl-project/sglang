@@ -106,6 +106,10 @@ Use an Ascend runtime with operator packages and DeepEP exposing
 l1_bias=..., l2_bias=...)`. The MegaMoE JIT extension requires `ninja`.
 The runtime checks the operator loaded by DeepEP and reports its accepted
 arguments and package paths. Use a runtime that exposes those interfaces.
+When the container has multiple toolkits, source the intended toolkit's
+`set_env.sh` before launching SGLang so Python and the native loader use the
+same toolkit. If startup reports an unexpected `activation_params` keyword,
+check the loaded `cann_ops_transformer` path in that error.
 
 In the serving environment, check the DeepEP interface and inspect the loaded
 operator package:

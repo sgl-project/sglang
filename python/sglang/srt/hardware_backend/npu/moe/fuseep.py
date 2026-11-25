@@ -243,7 +243,15 @@ def _check_mega_moe_support():
         get_symm_buffer_for_mega_moe, compatible_operator = (
             fused_strategy.MegaMoeStrategy._load_mega_moe_ops()
         )
-        keywords = _check_mega_moe_operator(compatible_operator)
+        try:
+            keywords = _check_mega_moe_operator(compatible_operator)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}. Loaded cann_ops_transformer from "
+                f"{cann_ops_transformer.__file__}. If the container has multiple "
+                "toolkits, source the intended toolkit's set_env.sh before "
+                "starting the server."
+            ) from exc
         diagnostic = {
             "deep_ep": {
                 "path": deep_ep.__file__,
