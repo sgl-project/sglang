@@ -5,7 +5,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -44,6 +44,9 @@ def _default_on_in_ci() -> bool:
 
 class EnvField:
     _allow_set_name = True
+    # An empty value reads as unset for a type where "" cannot parse; a string
+    # or list field keeps "" as its value.
+    _empty_is_unset = True
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
@@ -72,21 +75,17 @@ class EnvField:
             assert value == str(None)
             return None
 
-        # Not set, return default
-        if value is None:
+        if not self.is_set():
             return self._resolve_default()
 
         try:
             return self.parse(value)
         except ValueError as e:
-            default = self._resolve_default()
-            warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{default}"'
-            )
-            return default
+            raise ValueError(f"Invalid value for {self.name}: {e}") from None
 
     def is_set(self):
-        return self.name in os.environ
+        value = os.environ.get(self.name)
+        return value is not None and not (value == "" and self._empty_is_unset)
 
     def set(self, value: Any):
         self._set_to_none = value is None
@@ -123,31 +122,38 @@ class EnvField:
 
 
 class EnvTuple(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> tuple[str, ...]:
         return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
 class EnvStr(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> str:
         return value
 
 
 class EnvJSON(EnvField):
-    def parse(self, value: str | None) -> list | dict | None:
-        if not value:
-            return None
-        if os.path.exists(value):
-            with open(value) as f:
-                return json.load(f)
-        return json.loads(value)
+    def parse(self, value: str) -> list | dict:
+        try:
+            if os.path.exists(value):
+                with open(value) as f:
+                    return json.load(f)
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f'"{value}" is not valid JSON, inline or in the file it names ({e})'
+            )
 
 
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
         value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
+        if value in ["true", "1", "yes", "y", "on"]:
             return True
-        if value in ["false", "0", "no", "n"]:
+        if value in ["false", "0", "no", "n", "off"]:
             return False
         raise ValueError(f'"{value}" is not a valid boolean value')
 
@@ -173,7 +179,7 @@ class _DeprecatedEnvFallback:
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
-        if os.getenv(self.name) is None:
+        if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
                 warnings.warn(
@@ -1012,6 +1018,8 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    MOONCAKE_ENABLE_EGM_STORE_POOL = EnvBool(False)
+    MOONCAKE_EGM_NUMA_NODES = EnvStr(None)
 
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
@@ -2646,6 +2654,7 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES = EnvInt(2)
 
     # ===================================================================
     # Plugin system
@@ -2709,15 +2718,24 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+def _registered_fields() -> Iterator[EnvField]:
+    return (value for value in vars(Envs).values() if isinstance(value, EnvField))
+
+
 def exportable_env_vars() -> dict[str, str]:
     return {
         field.name: _exportable_value(os.environ[field.name])
-        for field in sorted(
-            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
-            key=lambda field: field.name,
-        )
+        for field in sorted(_registered_fields(), key=lambda field: field.name)
         if not field.secret and field.name in os.environ
     }
+
+
+def validate_env_values() -> None:
+    """Parse every registered variable that is set, so a malformed value stops
+    startup instead of failing at its first read, which may be mid-serving."""
+    for field in _registered_fields():
+        if field.is_set():
+            field.get()
 
 
 def _exportable_value(value: str) -> str:
