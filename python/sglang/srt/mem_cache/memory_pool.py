@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MHABufferInfo
+    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 
 
 logger = logging.getLogger(__name__)
@@ -425,6 +426,14 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @cached_property
+    def sampling_params_table(self) -> SamplingParamsTable:
+        """Each slot's sampling state, allocated on first use: by a graph capture
+        that reads it, or by the scheduler's pool that writes it."""
+        from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
+
+        return SamplingParamsTable(self.req_to_token.shape[0], self.device)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values

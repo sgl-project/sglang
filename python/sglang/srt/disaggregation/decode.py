@@ -239,6 +239,7 @@ class DecodeReqToTokenPool:
     mamba_pool = None
     mamba_allocator = None
     mamba_ckpt_pool = None
+    sampling_params_table = ReqToTokenPool.sampling_params_table
 
     def __init__(
         self,

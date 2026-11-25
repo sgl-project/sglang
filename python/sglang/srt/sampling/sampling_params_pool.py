@@ -87,32 +87,50 @@ class SamplingRows(NamedTuple):
         )
 
 
-class SamplingParamsPool:
-    # Fields of `table`, one row each, floats as fp32 bits and int64 values as
-    # (low, high) int32 halves: one int32 gather reads them all, top_k exact.
+class SamplingParamsTable:
+    """Each request slot's sampling state on the device, one column per slot,
+    addressed by its `req_pool_idx`. The request table owns it, so it exists
+    before any graph capture: a graph reads its rows by slot index, and
+    `SamplingParamsPool` writes them at admission."""
+
+    # One row per field, floats as fp32 bits and int64 values as (low, high)
+    # int32 halves: one int32 gather reads them all, top_k exact.
     TEMPERATURE, TOP_P, TOP_K, MIN_P, PENALTY_INDEX, SEED_LO, SEED_HI = range(7)
     # The first of the watermark algorithm's fields, which end the table.
     WATERMARK = 7
 
-    def __init__(
-        self,
-        num_rows: int,
-        device,
-        penalty_status_pool: Optional[PenaltyStatusPool] = None,
-    ):
-        # The pool the penalty indices point into; None where no request takes one.
-        self.penalty_status_pool = penalty_status_pool
+    def __init__(self, num_rows: int, device):
         self.num_watermark_fields = num_watermark_fields()
-        self.table = torch.zeros(
+        self.values = torch.zeros(
             (self.WATERMARK + self.num_watermark_fields, num_rows),
             dtype=torch.int32,
             device=device,
         )
-        floats = self.table.view(torch.float32)
+        floats = self.values.view(torch.float32)
         floats[self.TEMPERATURE] = 1.0
         floats[self.TOP_P] = 1.0
-        self.table[self.TOP_K] = TOP_K_ALL
-        self.table[self.PENALTY_INDEX] = -1
+        self.values[self.TOP_K] = TOP_K_ALL
+        self.values[self.PENALTY_INDEX] = -1
+
+    def temperatures(self, slots: torch.Tensor) -> torch.Tensor:
+        """[n] fp32, capturable."""
+        return self.values[self.TEMPERATURE].view(torch.float32)[slots]
+
+    def top_ks(self, slots: torch.Tensor) -> torch.Tensor:
+        """[n] int32, capturable."""
+        return self.values[self.TOP_K][slots]
+
+
+class SamplingParamsPool:
+    def __init__(
+        self,
+        table: SamplingParamsTable,
+        penalty_status_pool: Optional[PenaltyStatusPool] = None,
+    ):
+        self.table = table
+        # The pool the penalty indices point into; None where no request takes one.
+        self.penalty_status_pool = penalty_status_pool
+        num_rows = table.values.shape[1]
         self.top_ks_host = np.full(num_rows, TOP_K_ALL, dtype=np.int64)
         self.uses_top_p_host = np.zeros(num_rows, dtype=bool)
         self.uses_min_p_host = np.zeros(num_rows, dtype=bool)
@@ -138,25 +156,29 @@ class SamplingParamsPool:
         self.penalty_indices_host[slots] = penalty_indices
 
         # The table's fields, then the slots in a last row: one copy writes them.
-        host_values = np.empty((self.table.shape[0] + 1, len(reqs)), dtype=np.int32)
+        host_values = np.empty(
+            (self.table.values.shape[0] + 1, len(reqs)), dtype=np.int32
+        )
         host_values[-1] = slots
         host_floats = host_values.view(np.float32)
-        host_floats[self.TEMPERATURE] = [p.temperature for p in params]
-        host_floats[self.TOP_P] = [p.top_p for p in params]
-        host_values[self.TOP_K] = top_ks
-        host_floats[self.MIN_P] = [p.min_p for p in params]
-        host_values[self.PENALTY_INDEX] = penalty_indices
+        host_floats[self.table.TEMPERATURE] = [p.temperature for p in params]
+        host_floats[self.table.TOP_P] = [p.top_p for p in params]
+        host_values[self.table.TOP_K] = top_ks
+        host_floats[self.table.MIN_P] = [p.min_p for p in params]
+        host_values[self.table.PENALTY_INDEX] = penalty_indices
         deterministic = _deterministic()
         seeds = np.array([_seed(r, deterministic) for r in reqs], dtype=np.int64)
-        host_values[self.SEED_LO : self.SEED_HI + 1] = (
+        host_values[self.table.SEED_LO : self.table.SEED_HI + 1] = (
             seeds.view(np.int32).reshape(-1, 2).T
         )
-        if self.num_watermark_fields:
+        if self.table.num_watermark_fields:
             candidates, values = zip(*(watermark_pool_values(r) for r in reqs))
             self.watermark_candidates_host[slots] = candidates
-            host_values[self.WATERMARK : -1] = np.array(values, dtype=np.int32).T
-        values = async_h2d_tensor(torch.from_numpy(host_values), self.table.device)
-        self.table.index_copy_(1, values[-1].long(), values[:-1])
+            host_values[self.table.WATERMARK : -1] = np.array(values, dtype=np.int32).T
+        values = async_h2d_tensor(
+            torch.from_numpy(host_values), self.table.values.device
+        )
+        self.table.values.index_copy_(1, values[-1].long(), values[:-1])
         self._last_gather = None
 
     def gather(
@@ -164,7 +186,7 @@ class SamplingParamsPool:
     ) -> SamplingRows:
         slots = req_pool_indices_cpu.numpy()
         if slots.size == 0:
-            return SamplingRows.empty(self.table.device)
+            return SamplingRows.empty(self.table.values.device)
         key = slots.tobytes()
         if self._last_gather is None or self._last_gather[0] != key:
             self._last_gather = (key, *self._gather_rows(req_pool_indices, slots))
@@ -186,20 +208,22 @@ class SamplingParamsPool:
         top_ks = self.top_ks_host[slots]
         lo, hi = int(top_ks.min()), int(top_ks.max())
         # Each row of the [rows, bs] result is a contiguous [bs] tensor.
-        values = self.table.index_select(1, req_pool_indices)
+        values = self.table.values.index_select(1, req_pool_indices)
         floats = values.view(torch.float32)
         seeds = None
         if _deterministic() or _any_row_with_seed(self.has_seed_host[slots], top_ks):
             seeds = (
-                torch.stack((values[self.SEED_LO], values[self.SEED_HI]), dim=1)
+                torch.stack(
+                    (values[self.table.SEED_LO], values[self.table.SEED_HI]), dim=1
+                )
                 .view(torch.int64)
                 .view(-1)
             )
         rows = SamplingRows(
-            temperatures=floats[self.TEMPERATURE].view(-1, 1),
-            top_ps=floats[self.TOP_P],
-            top_ks=values[self.TOP_K],
-            min_ps=floats[self.MIN_P],
+            temperatures=floats[self.table.TEMPERATURE].view(-1, 1),
+            top_ps=floats[self.table.TOP_P],
+            top_ks=values[self.table.TOP_K],
+            min_ps=floats[self.table.MIN_P],
             is_all_greedy=hi <= 1,
             is_any_greedy=lo <= 1,
             need_top_p_sampling=bool(self.uses_top_p_host[slots].any()),
@@ -210,10 +234,10 @@ class SamplingParamsPool:
             sampling_seed=seeds,
             step_penalties=None,
             watermark=build_watermark_rows(
-                values[self.WATERMARK :], self.watermark_candidates_host[slots]
+                values[self.table.WATERMARK :], self.watermark_candidates_host[slots]
             ),
         )
-        return rows, values[self.PENALTY_INDEX]
+        return rows, values[self.table.PENALTY_INDEX]
 
 
 def _deterministic() -> bool:

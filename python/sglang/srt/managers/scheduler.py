@@ -1401,8 +1401,7 @@ class Scheduler(
 
     def init_sampling_params_pool(self) -> None:
         self.sampling_params_pool = SamplingParamsPool(
-            num_rows=self.req_to_token_pool.req_to_token.shape[0],
-            device=self.req_to_token_pool.device,
+            self.req_to_token_pool.sampling_params_table,
             penalty_status_pool=self.penalty_status_pool,
         )
 

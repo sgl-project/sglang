@@ -511,8 +511,7 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     sampling_params_pool = SamplingParamsPool(
-        num_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
-        device=model_runner.req_to_token_pool.device,
+        model_runner.req_to_token_pool.sampling_params_table
     )
     sampling_params_pool.write(reqs)
     batch.sampling_info.set_rows(

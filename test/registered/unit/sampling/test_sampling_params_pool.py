@@ -8,7 +8,11 @@ import torch
 from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool, SamplingRows
+from sglang.srt.sampling.sampling_params_pool import (
+    SamplingParamsPool,
+    SamplingParamsTable,
+    SamplingRows,
+)
 from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
 from sglang.srt.sampling.watermarking.synthid import adapter as synthid_adapter
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -85,7 +89,7 @@ class _PoolTestCase(CustomTestCase):
 
 class TestSamplerParams(_PoolTestCase):
     def test_gather_reads_each_slot_in_batch_order(self):
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write(
             [
                 _req(5, temperature=0.7, top_p=0.9, top_k=20, min_p=0.05),
@@ -113,7 +117,7 @@ class TestSamplerParams(_PoolTestCase):
     def test_rewritten_slot_reads_the_new_request(self):
         """A freed slot that a later admission reuses holds the new request's
         params, host flags included."""
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(3, temperature=0.5, top_p=0.8, top_k=1, min_p=0.2)])
         pool.write([_req(3, temperature=1.1)])
 
@@ -138,7 +142,7 @@ class TestSamplerParams(_PoolTestCase):
         )
         for top_ks, all_greedy, any_greedy, need_top_k, npu, max_top_k in cases:
             with self.subTest(top_ks=top_ks):
-                pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+                pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
                 slots = list(range(1, len(top_ks) + 1))
                 pool.write([_req(s, top_k=k) for s, k in zip(slots, top_ks)])
 
@@ -158,7 +162,7 @@ class TestSamplerParams(_PoolTestCase):
     def test_flags_drop_when_the_last_row_using_them_leaves(self):
         """Each gather derives need_top_p_sampling and need_min_p_sampling from
         its own rows, so they go off once the last top-p or min-p row leaves."""
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, top_p=0.9, min_p=0.1, top_k=1), _req(2, top_k=20)])
 
         both = _gather(pool, [1, 2])
@@ -183,7 +187,7 @@ class TestSeeds(_PoolTestCase):
     def test_deterministic_mode_seeds_every_row(self):
         """An explicit seed is kept and a missing one defaults to 42."""
         self.exec_ns = _exec(deterministic=True)
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, seed=123), _req(2)])
 
         self.assertEqual(_gather(pool, [1, 2]).sampling_seed.tolist(), [123, 42])
@@ -193,7 +197,7 @@ class TestSeeds(_PoolTestCase):
     def test_seed_without_deterministic_inference(self):
         """A non-greedy request's seed applies; a greedy seed, or speculative
         decoding, leaves the batch unseeded."""
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, seed=123, top_k=50), _req(2, seed=123, top_k=1)])
 
         self.assertEqual(_gather(pool, [1]).sampling_seed.tolist(), [123])
@@ -202,14 +206,14 @@ class TestSeeds(_PoolTestCase):
         # The algorithm is fixed per server; a new pool, so no cached gather
         # outlives the change.
         self.spec_ns.speculative_algorithm = "EAGLE"
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, seed=123, top_k=50)])
         self.assertIsNone(_gather(pool, [1]).sampling_seed)
 
     def test_unseeded_row_samples_with_its_filler_seed(self):
         """An unseeded request samples with its own filler seed in every seeded
         step, wherever its row is, and unseeded once no seeded row is left."""
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write(
             [
                 _req(1, seed=123, top_k=50),
@@ -227,7 +231,7 @@ class TestSeeds(_PoolTestCase):
     def test_every_int64_seed_reads_back_exactly(self):
         """Seeds are kept as two int32 halves; the gather rebuilds the int64."""
         seeds = [-(2**63), -1, 0, 2**31, 2**63 - 1]
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(i, seed=seed, top_k=50) for i, seed in enumerate(seeds)])
 
         rows = _gather(pool, list(range(len(seeds))))
@@ -242,7 +246,7 @@ class TestPenaltyIndices(_PoolTestCase):
         their indices, from the gathered field alone."""
         penalty_pool = SimpleNamespace(kinds=[1, 0, 0, 4])
         pool = SamplingParamsPool(
-            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
+            SamplingParamsTable(NUM_ROWS, DEVICE), penalty_status_pool=penalty_pool
         )
         pool.write(
             [_req(1), _req(2, penalty_index=3), _req(4), _req(5, penalty_index=0)]
@@ -266,7 +270,7 @@ class TestPenaltyIndices(_PoolTestCase):
         req.sampling_params.min_new_tokens = 0
         penalty_pool.alloc([req])
         pool = SamplingParamsPool(
-            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
+            SamplingParamsTable(NUM_ROWS, DEVICE), penalty_status_pool=penalty_pool
         )
         pool.write([req, _req(3)])
         info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
@@ -277,7 +281,7 @@ class TestPenaltyIndices(_PoolTestCase):
         self.assertEqual(info.step_penalties.penalty_indices.tolist(), [0])
 
     def test_unchanged_batch_reuses_its_params_until_a_write(self):
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, temperature=0.7), _req(4, top_k=1)])
 
         first = _gather(pool, [1, 4])
@@ -307,7 +311,7 @@ class TestPenaltyIndices(_PoolTestCase):
         penalty_pool.alloc([req])
         penalty_pool.reset_history([req])
         pool = SamplingParamsPool(
-            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
+            SamplingParamsTable(NUM_ROWS, DEVICE), penalty_status_pool=penalty_pool
         )
         pool.write([_req(3), req])
 
@@ -360,18 +364,18 @@ class TestSlotLifecycle(_PoolTestCase):
         self.assertIsNone(rows.step_penalties)
         self.assertIsNone(rows.sampling_seed)
         self.assertIsNone(rows.watermark)
-        self.assertEqual(pool.table[pool.PENALTY_INDEX, 3].item(), -1)
-        self.assertEqual(pool.table[pool.WATERMARK, 3].item(), 0)
+        self.assertEqual(pool.table.values[pool.table.PENALTY_INDEX, 3].item(), -1)
+        self.assertEqual(pool.table.values[pool.table.WATERMARK, 3].item(), 0)
 
 
 class TestWatermarkFields(_PoolTestCase):
     def test_without_watermarking_the_pool_keeps_no_fields(self):
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, top_k=50)])
 
         rows = _gather(pool, [1])
 
-        self.assertEqual(pool.table.shape[0], SamplingParamsPool.WATERMARK)
+        self.assertEqual(pool.table.values.shape[0], SamplingParamsTable.WATERMARK)
         self.assertIsNone(rows.watermark)
 
     def test_gumbel_rows_read_back_each_request_value(self):
@@ -380,7 +384,7 @@ class TestWatermarkFields(_PoolTestCase):
         self.exec_ns = _exec(watermark_algorithm="gumbel")
         disabled = SimpleNamespace(enabled=False, key=None, context_window=None)
         own_key = SimpleNamespace(enabled=True, key="0x1234", context_window=2)
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write(
             [
                 _req(1, top_k=50),
@@ -406,7 +410,7 @@ class TestWatermarkFields(_PoolTestCase):
 
     def test_synthid_rows_index_the_candidates(self):
         self.exec_ns = _exec(watermark_algorithm="synthid")
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(SamplingParamsTable(NUM_ROWS, DEVICE))
         pool.write([_req(1, top_k=50), _req(2, top_k=1), _req(3, top_k=50)])
 
         rows = _gather(pool, [2, 1, 3]).watermark
