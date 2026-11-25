@@ -255,7 +255,7 @@ In a PD deployment the decode nodes often have spare host memory while the prefi
 
 4. **Set `protocol` explicitly.** When the store config omits `protocol`, the backend falls back to `MOONCAKE_PROTOCOL`. PD deployments that move KV over NVLink set `MOONCAKE_PROTOCOL=nvlink` for the KV transfer, and the store would inherit it.
 5. **Multi-plane RoCE.** On fabrics where a NIC only reaches the same-named NIC on the peer node, set `MC_ENABLE_DEST_DEVICE_AFFINITY=1` on the prefill server and the store services. Otherwise reads that pick a peer NIC on another plane time out, and the backend's warmup read fails at startup.
-6. **Check it serves.** Every prefill rank logs `Mooncake store setup successfully` and `Mooncake store warmup successfully`; during traffic the master's `Master Admin Metrics` lines show `Mem Storage` and `Keys` growing, and the prefill server's `sglang:cached_tokens{cache_source="storage"}` metric grows.
+6. **Check it serves.** Every prefill rank logs `Mooncake store setup successfully` and `Mooncake store warmup successfully`; during traffic the master's `Master Admin Metrics` lines show `Mem Storage` and `Keys` growing, and the prefill server's `sglang:cached_tokens_total{cache_source="storage"}` counter grows (exported on `/metrics` with `--enable-metrics`).
 
 
 ## Custom Storage Backend Integration

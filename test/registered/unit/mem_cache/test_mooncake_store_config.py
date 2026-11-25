@@ -66,6 +66,18 @@ class TestMooncakeStoreConfigProtocol(CustomTestCase):
                 cfg = self._load_from_extra_config({"protocol": "rdma"})
         self.assertEqual(cfg.protocol, "rdma")
 
+    def test_env_only_nvlink_protocol_points_to_store_config(self):
+        with temp_set_env(
+            MOONCAKE_MASTER="127.0.0.1:50051", MOONCAKE_PROTOCOL="nvlink"
+        ):
+            with self.assertLogs(level="WARNING") as logs:
+                cfg = MooncakeStoreConfig.load_from_env()
+        self.assertEqual(cfg.protocol, "nvlink")
+        out = "\n".join(logs.output)
+        self.assertIn("environment variables", out)
+        self.assertIn("--hicache-storage-backend-extra-config", out)
+        self.assertNotIn("config omits 'protocol'", out)
+
 
 class TestMooncakeStoreWarmup(CustomTestCase):
     """A failed warmup read must raise a descriptive error, not an AssertionError."""

@@ -96,7 +96,7 @@ def _parse_global_segment_size(value) -> int:
     return int(value)
 
 
-def _resolve_store_protocol(config: Mapping[str, Any]) -> str:
+def _resolve_store_protocol(config: Mapping[str, Any], from_env: bool = False) -> str:
     # Fall back to MOONCAKE_PROTOCOL (not its default) so an image or deployment
     # that sets it, e.g. MOONCAKE_PROTOCOL=efa, is honored when "protocol" is omitted.
     if "protocol" in config:
@@ -105,12 +105,24 @@ def _resolve_store_protocol(config: Mapping[str, Any]) -> str:
     if protocol == "nvlink":
         # PD disaggregation commonly sets MOONCAKE_PROTOCOL=nvlink for its KV
         # transfer, which moves GPU memory; the store moves host pool pages.
-        logger.warning(
-            "Mooncake store config omits 'protocol', so it inherits "
-            "MOONCAKE_PROTOCOL=nvlink, which is usually set for the PD KV "
-            "transfer. Host KV pool pages are not GPU memory; set 'protocol' "
-            "(e.g. 'rdma') explicitly in the store config."
-        )
+        if from_env:
+            # Env-only setup has no store config: the store and the PD KV
+            # transfer engine both read MOONCAKE_PROTOCOL.
+            logger.warning(
+                "Mooncake store is configured from environment variables, so it "
+                "uses MOONCAKE_PROTOCOL=nvlink, which the PD KV transfer also "
+                "reads. Host KV pool pages are not GPU memory; to give the store "
+                "its own protocol (e.g. 'rdma'), set 'protocol' in "
+                "--hicache-storage-backend-extra-config or in the "
+                "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH file."
+            )
+        else:
+            logger.warning(
+                "Mooncake store config omits 'protocol', so it inherits "
+                "MOONCAKE_PROTOCOL=nvlink, which is usually set for the PD KV "
+                "transfer. Host KV pool pages are not GPU memory; set 'protocol' "
+                "(e.g. 'rdma') explicitly in the store config."
+            )
     return protocol
 
 
@@ -244,7 +256,7 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
             ),
-            protocol=_resolve_store_protocol({}),
+            protocol=_resolve_store_protocol({}, from_env=True),
             device_name=envs.MOONCAKE_DEVICE.get(),
             master_server_address=envs.MOONCAKE_MASTER.get(),
             master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.get(),
