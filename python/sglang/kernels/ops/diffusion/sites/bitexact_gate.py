@@ -139,9 +139,9 @@ class BitExactFusionGate:
 
         The caller has already checked that the fast path applies. An
         unverified ``sig`` is verified on this call unless it is inside compile
-        tracing or CUDA graph capture, where ``reference()`` runs instead. A
-        launch failure (other than ``reraise``) or a mismatch disables the
-        gate and returns ``reference()``.
+        tracing or CUDA graph capture, where ``reference()`` runs instead. An
+        exception from ``fused`` (other than ``reraise``) or a mismatch disables
+        the gate and returns ``reference()``.
         """
         if self.disabled:
             return reference()
