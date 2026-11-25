@@ -1027,6 +1027,14 @@ def _static_state_entries(
                 ):
                     if isinstance(pool, MHATokenToKVPoolMXFP8):
                         add(state_type, *pool.get_kv_scale_buf_infos())
+                # A DFLASH draft pool on the target's sliding-window ids shares the
+                # window pages, so it is a second window entry behind the target's.
+                if getattr(draft_token_to_kv_pool, "follows_target_swa_ids", False):
+                    add(
+                        StateType.SWA,
+                        *draft_token_to_kv_pool.get_contiguous_buf_infos(),
+                        kv_layout=swa_kv_layout,
+                    )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(

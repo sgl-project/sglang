@@ -877,11 +877,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None:
+        # A draft pool on the target's window ids arrives with the window state.
+        draft_kv_pool = (
+            None
+            if getattr(self.draft_token_to_kv_pool, "follows_target_swa_ids", False)
+            else self.draft_token_to_kv_pool
+        )
+        if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                draft_kv_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
@@ -894,12 +900,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
         kv_args.draft_rows_dcp_collapsed = (
-            self.draft_token_to_kv_pool is not None
-            and self.draft_token_to_kv_pool.rows_are_dcp_collapsed
+            draft_kv_pool is not None and draft_kv_pool.rows_are_dcp_collapsed
         )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
-            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
             storage=storage,
@@ -1099,7 +1104,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_layer_ids=kv_args.kv_layer_ids,
                     num_draft_entries=num_draft_entries,
                     kv_pool=kv_pool,
-                    draft_kv_pool=self.draft_token_to_kv_pool,
+                    draft_kv_pool=draft_kv_pool,
                 )
                 if staging_slots is not None:
                     k_buffers, v_buffers, slot_layer_ids = staging_slots
