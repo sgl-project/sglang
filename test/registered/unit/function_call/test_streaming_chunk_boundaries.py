@@ -553,36 +553,15 @@ NOT_COVERED = {
 _LATER_CALLS_TO_CONTENT = "calls after the first go to content"
 _SECTION_END_DROPS_CALLS = "section end discards buffered calls"
 
-# Each step of these detectors sends at most one name or one argument diff, so
-# the rest of a chunk waits for the next chunk and is lost when the stream ends.
-_ONE_STEP_PER_CHUNK = "one step per chunk (#31915)"
 
 # (parser, mode) pairs that fail on main. Remove an entry when its fix lands.
 KNOWN_FAILURES = {
-    ("deepseekv3", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("deepseekv3", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("deepseekv31", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("deepseekv31", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("flint", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("glm", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("glm47", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("hermes", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
     ("hermes", "both_calls_in_one_chunk"): "`</tool_call>` leaks into content",
-    ("interns1", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("interns1", "one_token_per_chunk"): "drops a split start marker of call 2",
-    ("ling3", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("llama3", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("llama3", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("mimo", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("mistral", "one_call_per_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "both_calls_in_one_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "one_token_per_chunk"): _LATER_CALLS_TO_CONTENT,
-    ("qwen", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("qwen", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("step3", "one_call_per_chunk"): _SECTION_END_DROPS_CALLS,
     ("step3", "both_calls_in_one_chunk"): _SECTION_END_DROPS_CALLS,
-    ("trinity", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("trinity", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
 }
 
 _REQUEST = ChatCompletionRequest(
