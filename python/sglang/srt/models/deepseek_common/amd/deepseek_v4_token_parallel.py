@@ -1,4 +1,4 @@
-"""Token-parallel prefill for DeepSeek-V4.1 on ROCm gfx950 (opt-in; overlay v5).
+"""Token-parallel prefill for DeepSeek-V4.1 on ROCm gfx950 (opt-in).
 
 Under pure TP every rank repeats the per-token work of a layer for all T prefill
 rows: the Mega-mHC seams, the input projections (wqkv_a, the compressors' wkv /
@@ -15,7 +15,7 @@ Attention heads and MoE experts stay TP-sharded and run on all rows:
   gathered.
 - wo_b output: INT4 reduce-scatter (AITER #7444 at 3c77ea12e, side-loaded).
 - MoE input: the attention-to-FFN Mega-mHC seam emits MXFP8 on the local rows
-  (the bits fused_moe would compute, PF-57); router and top-k run on the local
+  (the bits fused_moe would compute); router and top-k run on the local
   rows; the MXFP8 rows, scales and top-k are all-gathered bit-exactly; experts
   and the fused shared expert run on all rows; INT4 reduce-scatter after.
 - Engram: the table lookup runs on all rows (as off), the wkv GEMM and the gate
@@ -52,10 +52,12 @@ ENV_MIN_TOKENS = "SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS"
 ENV_RS = "SGLANG_DSV4_TP_RS"
 # mxfp8 (default): the seam's MXFP8 MoE input is gathered; bf16: the bf16 rows (diagnostic).
 ENV_MOE_INPUT = "SGLANG_DSV4_TP_MOE_INPUT"
-# G3: a directory; every EXTEND forward writes its last-token final hidden states there (rank 0).
+# Equivalence check: a directory; every EXTEND forward writes its last-token final hidden
+# states there (rank 0).
 ENV_G3_DUMP = "SGLANG_DSV4_TP_G3_DUMP"
-# G3: a file holding 1 or 0; with ENV_ON=1, eligible forwards run token-parallel only while it
-# holds 1 on every rank (the ranks agree on each forward over the TP CPU group).
+# Equivalence check: a file holding 1 or 0; with ENV_ON=1, eligible forwards run
+# token-parallel only while it holds 1 on every rank (the ranks agree on each forward
+# over the TP CPU group).
 ENV_TOGGLE = "SGLANG_DSV4_TP_TOGGLE_FILE"
 
 LOG_PREFIX = "[dsv4-tp-v5]"
@@ -307,7 +309,7 @@ _FLY7444 = None
 
 def _fly7444_engine(group):
     """One #7444 QuickAllReduceInt4 per process for the reduce-scatters, separate
-    from the image's all-reduce engine. Built on first use (a collective over the
+    from the INT4 all-reduce engine. Built on first use (a collective over the
     TP CPU group); the first reduce_scatter runs compile_sp (also a collective)."""
     global _FLY7444
     if _FLY7444 is None:
@@ -475,7 +477,7 @@ def exit_token_parallel(forward_batch) -> None:
 
 
 def _static_ineligible(model) -> Optional[str]:
-    """Model-level reasons this overlay cannot run (checked once per model)."""
+    """Model-level reasons token-parallel prefill cannot run (checked once per model)."""
     cached = model.__dict__.get("_dsv4_tp_static")
     if cached is not None:
         return cached or None
@@ -708,8 +710,8 @@ _LAST_FORWARD_TP = [False]
 
 
 def _toggle_on(path: str) -> bool:
-    """G3's in-server switch: every rank reads the file, then the ranks take the minimum
-    over the TP CPU group, so they never disagree."""
+    """The equivalence check's in-server switch: every rank reads the file, then the
+    ranks take the minimum over the TP CPU group, so they never disagree."""
     import torch.distributed as dist
 
     from sglang.srt.runtime_context import get_parallel
@@ -1443,14 +1445,14 @@ def write_source_kv_and_gather_tail(
 
 
 # ---------------------------------------------------------------------------
-# G3: final hidden states of the last token of each request
+# Equivalence check: final hidden states of the last token of each request
 # ---------------------------------------------------------------------------
 
 _G3_SEQ = [0]
 
 
 def g3_dump(hidden_states: torch.Tensor, tail, forward_batch) -> None:
-    """With SGLANG_DSV4_TP_G3_DUMP set (both arms of G3), save the final normed
+    """With SGLANG_DSV4_TP_G3_DUMP set (both arms of the check), save the final normed
     hidden state of every request's last extend row of each EXTEND forward, on TP
     rank 0. Off when unset. Prefill-graph capture is skipped (it cannot copy host
     indices, and graph replays never run this Python code)."""
