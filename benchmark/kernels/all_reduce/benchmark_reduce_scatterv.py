@@ -46,7 +46,9 @@ def _make_op(
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     device = comm.device
     if name == "all_gather":
-        gathered = torch.empty(world * rows, hidden, dtype=torch.bfloat16, device=device)
+        gathered = torch.empty(
+            world * rows, hidden, dtype=torch.bfloat16, device=device
+        )
 
         def op(local: torch.Tensor) -> torch.Tensor:
             comm.all_gather(gathered, local)
