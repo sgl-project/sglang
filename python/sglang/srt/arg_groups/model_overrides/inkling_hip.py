@@ -1,14 +1,9 @@
-"""ROCm part of the inkling override declarations: the gfx950 guard, the MegaMoE
-refusal and exact all-reduces. inkling calls it on HIP; it is pure Python and never
-imports aiter."""
+"""ROCm part of the inkling override declarations: the gfx950 guard and the MegaMoE
+refusal. inkling calls it on HIP; it is pure Python and never imports aiter."""
 
-import logging
-import os
 from typing import Any
 
 from sglang.srt.runtime_context import get_platform
-
-logger = logging.getLogger(__name__)
 
 
 def rocm_overrides(cfg: Any) -> None:
@@ -23,9 +18,3 @@ def rocm_overrides(cfg: Any) -> None:
             "expert-parallel all-reduce. Drop --moe-a2a-backend / "
             "--moe-runner-backend megamoe."
         )
-    # the INT8 quick reduce the ROCm images export quantizes prefill all-reduces,
-    # which moves outputs off the exact-reduction reference
-    level = "ROCM_QUICK_REDUCE_QUANTIZATION"
-    if os.environ.get(level, "NONE") != "NONE":
-        logger.info(f"Inkling2 keeps exact all-reduces on ROCm: ignoring {level}")
-        os.environ[level] = "NONE"

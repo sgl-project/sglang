@@ -4,7 +4,6 @@ import base64
 import copy
 import io
 import json
-import os
 import sys
 from types import SimpleNamespace
 
@@ -657,7 +656,6 @@ def _rocm_overrides(
     *,
     hip=True,
     gfx95=True,
-    env=(),
     **server_args,
 ):
     """Runs Inkling2's model override for the release config on a faked platform."""
@@ -671,22 +669,9 @@ def _rocm_overrides(
     )
     monkeypatch.setattr(inkling, "get_platform", lambda: platform)
     monkeypatch.setattr(inkling_hip, "get_platform", lambda: platform)
-    # the override sets this on ROCm; preset it so nothing leaks to later tests
-    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
-    for name, value in env:
-        monkeypatch.setenv(name, value)
     hf_config = ModelConfig(str(tmp_path), trust_remote_code=False).hf_config
     args = ServerArgs(model_path=str(tmp_path), **server_args)
     return inkling._inkling_overrides(args, hf_config)
-
-
-@pytest.mark.parametrize("hip", [True, False])
-def test_rocm_keeps_exact_all_reduce(tmp_path, monkeypatch, release_config, hip):
-    """The ROCm image exports INT8 quick reduce, which moved Inkling2's long-prompt
-    outputs off the exact-reduction reference; ROCm turns it off."""
-    env = [("ROCM_QUICK_REDUCE_QUANTIZATION", "INT8")]
-    _rocm_overrides(tmp_path, monkeypatch, release_config, hip=hip, gfx95=hip, env=env)
-    assert os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] == ("NONE" if hip else "INT8")
 
 
 def test_rocm_requires_gfx950(tmp_path, monkeypatch, release_config):
