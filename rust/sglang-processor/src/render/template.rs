@@ -163,7 +163,7 @@ impl ChatFormatter {
         };
         let mut args = TemplateArgs::new(body, defaults);
         TemplateArgs::check_jinja_kwargs(&mut args.kwargs)?;
-        effort.apply(body, defaults, &mut args.kwargs)?;
+        effort.apply(body, defaults, &mut args.kwargs);
         let mut messages = text_messages(body, *content_parts).map_err(TemplateError::from)?;
         let continuing = args
             .continuing
@@ -444,8 +444,12 @@ mod tests {
             let (prompt, _) = formatter.render_text_jinja(&body, &defaults).unwrap();
             assert_eq!(prompt.as_str(), expected);
         }
-        body["reasoning_effort"] = json!("ultra");
-        assert!(formatter.render_text_jinja(&body, &defaults).is_err());
+        body["chat_template_kwargs"] = json!({});
+        for (effort, expected) in [(json!("ultra"), "ultra"), (json!(0.5), "0.5")] {
+            body["reasoning_effort"] = effort;
+            let (prompt, _) = formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+            assert_eq!(prompt.as_str(), expected);
+        }
     }
 
     #[test]
@@ -467,6 +471,38 @@ mod tests {
             body["chat_template_kwargs"] = kwargs;
             let (prompt, _) = formatter.render_text_jinja(&body, &defaults).unwrap();
             assert_eq!(prompt.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn text_jinja_prefers_explicit_default_off_to_nemotron_effort() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning_effort": "low",
+        });
+        for (default_off, expected) in [
+            (
+                "{% set enable_thinking = enable_thinking | default(false) %}",
+                "regular",
+            ),
+            (
+                "{% if not enable_thinking is defined %}{% set enable_thinking=False %}{% endif %}",
+                "regular",
+            ),
+            (
+                "{% if enable_thinking is not defined %}{% set enable_thinking = false %}{% endif %}",
+                "short",
+            ),
+        ] {
+            let formatter = jinja(&format!(
+                "{default_off}{}",
+                concat!(
+                    "{% set truncate_history_thinking = true %}",
+                    "{{ 'short' if low_effort|default(false) else 'regular' }}",
+                )
+            ));
+            let (prompt, _) = formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+            assert_eq!(prompt.as_str(), expected, "{default_off}");
         }
     }
 

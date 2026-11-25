@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::TemplateError;
+use super::thinking::{ThinkingPolicy, has_explicit_enable_thinking_default_false};
 
 /// Effort conventions that SGLang applies outside the Jinja template.
 #[derive(Clone, Copy, Default)]
@@ -17,14 +17,24 @@ pub enum JinjaEffort {
 }
 
 impl JinjaEffort {
-    pub(super) fn detect(template: &str) -> Self {
-        // Mirrors the corresponding rules in parser/template_detection.py.
-        if ["reasoning_effort", "reasoning_mode_token", "no_think"]
+    pub(super) fn detect(template: &str, policy: ThinkingPolicy) -> Self {
+        // Earlier rules in parser/template_detection.py take precedence.
+        if matches!(
+            policy,
+            ThinkingPolicy::Always | ThinkingPolicy::ReasoningEffort
+        ) || ["<ifm|think>", "<ifm|think_fast>", "reasoning_effort"]
+            .iter()
+            .all(|marker| template.contains(marker))
+        {
+            Self::None
+        } else if ["reasoning_effort", "reasoning_mode_token", "no_think"]
             .iter()
             .all(|marker| template.contains(marker))
         {
             Self::Hunyuan
-        } else if template.contains("low_effort") && template.contains("truncate_history_thinking")
+        } else if template.contains("low_effort")
+            && template.contains("truncate_history_thinking")
+            && !has_explicit_enable_thinking_default_false(template)
         {
             Self::Nemotron
         } else {
@@ -37,7 +47,7 @@ impl JinjaEffort {
         body: &Value,
         defaults: &HashMap<String, Value>,
         kwargs: &mut HashMap<String, Value>,
-    ) -> Result<(), TemplateError> {
+    ) {
         let own_effort = body["chat_template_kwargs"].get("reasoning_effort");
         let default_effort = || defaults.get("reasoning_effort");
         match self {
@@ -53,11 +63,11 @@ impl JinjaEffort {
                     (true, _) | (_, Some("medium" | "high" | "xhigh" | "max")) => "high",
                     (_, Some("none" | "no_think")) => "no_think",
                     (_, Some("minimal" | "low")) => "low",
-                    _ => {
-                        return Err(TemplateError::Renderer {
-                            message: format!("invalid Hunyuan reasoning_effort {effort}"),
-                        });
-                    }
+                    // The renderer does not know the worker's parser. Keep
+                    // the generic kwargs so templates that accept other values
+                    // can supply routing tokens. A matching Hunyuan worker
+                    // still validates the effort before using forwarded IDs.
+                    _ => return,
                 };
                 kwargs.insert("reasoning_effort".into(), normalized.into());
             }
@@ -73,7 +83,6 @@ impl JinjaEffort {
                 }
             }
         }
-        Ok(())
     }
 }
 

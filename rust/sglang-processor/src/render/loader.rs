@@ -209,10 +209,9 @@ impl ChatFormatter {
                 developer_errors,
                 content_parts: content_parts(),
                 message_context,
-                effort: source.map_or_else(
-                    super::reasoning::JinjaEffort::default,
-                    super::reasoning::JinjaEffort::detect,
-                ),
+                effort: source.map_or_else(super::reasoning::JinjaEffort::default, |source| {
+                    super::reasoning::JinjaEffort::detect(source, thinking.default_policy())
+                }),
             }
         })
     }

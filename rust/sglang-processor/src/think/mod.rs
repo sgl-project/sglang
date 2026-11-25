@@ -249,16 +249,21 @@ impl TagDetector {
         while let Some(rest) = processed.strip_prefix(self.start) {
             processed = rest;
         }
-        if !processed.contains(self.end) && !self.previous_content.contains(self.end) {
-            if let Some(idx) = self.find_tool_start(processed, "") {
+        let end = processed.split_once(self.end);
+        if !self.previous_content.contains(self.end) {
+            if let Some(idx) = self.find_tool_start(processed, "")
+                && end.is_none_or(|(reasoning, _)| idx < reasoning.len())
+            {
                 return (processed[..idx].to_owned(), processed[idx..].to_owned());
             }
-            return (
-                self.strip_partial_tool_start(processed, "").to_owned(),
-                String::new(),
-            );
+            if end.is_none() {
+                return (
+                    self.strip_partial_tool_start(processed, "").to_owned(),
+                    String::new(),
+                );
+            }
         }
-        match processed.split_once(self.end) {
+        match end {
             Some((reasoning, normal)) => (reasoning.to_owned(), normal.to_owned()),
             None => (String::new(), processed.to_owned()),
         }
@@ -293,19 +298,20 @@ impl TagDetector {
             self.stripped_think_start = true;
             self.in_reasoning = true;
         }
-        if self.in_reasoning
-            && let Some(end_idx) = current.find(self.end)
-        {
-            self.buffer.clear();
-            self.in_reasoning = false;
-            let normal = current[end_idx + self.end.len()..].to_owned();
-            return (current[..end_idx].to_owned(), normal);
-        }
         if self.in_reasoning {
-            if let Some(idx) = self.find_tool_start(&current, &self.streamed_reasoning_tail) {
+            let end_idx = current.find(self.end);
+            if let Some(idx) = self.find_tool_start(&current, &self.streamed_reasoning_tail)
+                && end_idx.is_none_or(|end| idx <= end)
+            {
                 self.buffer.clear();
                 self.in_reasoning = false;
                 return (current[..idx].to_owned(), current[idx..].to_owned());
+            }
+            if let Some(idx) = end_idx {
+                self.buffer.clear();
+                self.in_reasoning = false;
+                let normal = current[idx + self.end.len()..].to_owned();
+                return (current[..idx].to_owned(), normal);
             }
             if !self.stream_reasoning {
                 return Default::default();

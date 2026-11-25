@@ -19,7 +19,8 @@
     {"chunks": ["\n\n</think>\n\n", "Direct answer."]},
     {"chunks": ["No thinking at all."]},
     {"chunks": ["<think>\n\n</think>\n\n", "Thinking disabled."]},
-    {"chunks": ["a", "<", "/", "t", "h", "i", "n", "k", ">", "b"]}
+    {"chunks": ["a", "<", "/", "t", "h", "i", "n", "k", ">", "b"]},
+    {"chunks": ["<think>think<tool_call> payload</think> answer"]}
   ],
   "cases": [
     {
@@ -206,14 +207,14 @@
       "force": true,
       "stream": true,
       "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["mention <tool_call> inline", "ans"]
+      "unary": ["mention ", "<tool_call> inline</think>ans"]
     },
     {
       "input": 4,
       "force": true,
       "stream": false,
       "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["mention <tool_call> inline", "ans"]
+      "unary": ["mention ", "<tool_call> inline</think>ans"]
     },
     {
       "input": 4,
@@ -508,6 +509,34 @@
         ["", ""]
       ],
       "unary": ["", "a</think>b"]
+    },
+    {
+      "input": 11,
+      "force": true,
+      "stream": true,
+      "steps": [["think", "<tool_call> payload</think> answer"], ["", ""]],
+      "unary": ["think", "<tool_call> payload</think> answer"]
+    },
+    {
+      "input": 11,
+      "force": true,
+      "stream": false,
+      "steps": [["think", "<tool_call> payload</think> answer"], ["", ""]],
+      "unary": ["think", "<tool_call> payload</think> answer"]
+    },
+    {
+      "input": 11,
+      "force": false,
+      "stream": true,
+      "steps": [["think", "<tool_call> payload</think> answer"], ["", ""]],
+      "unary": ["think", "<tool_call> payload</think> answer"]
+    },
+    {
+      "input": 11,
+      "force": false,
+      "stream": false,
+      "steps": [["think", "<tool_call> payload</think> answer"], ["", ""]],
+      "unary": ["think", "<tool_call> payload</think> answer"]
     }
   ]
 }

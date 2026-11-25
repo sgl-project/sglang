@@ -187,6 +187,25 @@ fn jinja_code_tokens(template: &str) -> Option<Vec<String>> {
     Some(tokens)
 }
 
+/// The explicit default-off rule that precedes the Nemotron effort rule.
+pub(super) fn has_explicit_enable_thinking_default_false(template: &str) -> bool {
+    let key = "enable_thinking";
+    let mut blocks = template
+        .split("{%")
+        .skip(1)
+        .filter_map(|part| part.split_once("%}").map(|(code, _)| code));
+    let guarded_default = blocks.any(|code| {
+        code.split_whitespace()
+            .eq(["if", "not", key, "is", "defined"])
+    }) && blocks.any(|code| {
+        code.split_once('=').is_some_and(|(left, right)| {
+            left.split_whitespace().eq(["set", key]) && matches!(right.trim(), "false" | "False")
+        })
+    });
+    guarded_default
+        || jinja_code_tokens(template).is_some_and(|tokens| has_default_filter(&tokens, key, false))
+}
+
 fn detect_toggle_default(tokens: &[String], key: &str) -> Option<bool> {
     if has_default_filter(tokens, key, false) || has_guarded_default(tokens, key, false) {
         return Some(false);
