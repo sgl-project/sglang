@@ -1921,7 +1921,7 @@ class TritonAttnBackend(AttentionBackend):
         elif layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
-            o = torch.empty_like(q, dtype=layer.out_dtype or q.dtype)
+            o = torch.empty_like(q, dtype=getattr(layer, "out_dtype", None) or q.dtype)
         lse = (
             q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
             if return_lse
@@ -2623,7 +2623,10 @@ class TritonAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(
-                q, dtype=q.dtype if gate_sink else layer.out_dtype or q.dtype
+                q,
+                dtype=q.dtype
+                if gate_sink
+                else getattr(layer, "out_dtype", None) or q.dtype,
             )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
