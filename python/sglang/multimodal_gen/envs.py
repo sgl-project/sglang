@@ -75,7 +75,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND: str = "auto"
     # head groups for pipelining the Ulysses exchange against dense attention
     # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
-    # or over the collective one for MiniMax-H3 on aiter:
+    # or over the collective one for MiniMax-H3 on aiter, and for USPAttention's
+    # dense path on ROCm, where only N >= 2 enables it (-1 keeps the sequential
+    # exchange):
     # -1 picks the most groups that divide the heads per rank while each group's
     # call still fills the GPU (two on the collective path), and steps aside when
     # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces

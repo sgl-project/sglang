@@ -68,13 +68,17 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
     ring_attn,
+    ulysses_head_group_pipelined_attention,
     uncached_a2a_staging,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -1577,6 +1581,9 @@ class USPAttention(nn.Module):
             )
             if out is not None:
                 return out
+            out = self._rocm_head_group_pipelined(q, k, v, attend)
+            if out is not None:
+                return out
 
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1 and not qkv_pre_all_to_all:
@@ -1778,6 +1785,41 @@ class USPAttention(nn.Module):
             ),
             fill_all=fill_all,
         )
+
+    def _rocm_head_group_pipelined(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attend
+    ) -> torch.Tensor | None:
+        """ROCm: overlap the Ulysses exchanges with attention over head groups.
+
+        Opt-in with SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=<n> (n > 1; the
+        default auto value keeps the plain exchange on ROCm). The packed q/k/v
+        exchange of every head group is queued up front on the collective
+        stream, and group g's output exchange runs while group g + 1 attends.
+        Heads attend independently, so the result equals the sequential path's.
+        Returns None, so the caller runs the plain exchange, when it does not
+        apply (batch > 1, heads not divisible, compile or graph capture).
+        """
+        groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+        if (
+            groups <= 1
+            or not current_platform.is_rocm()
+            or not q.is_cuda
+            or q.shape[0] != 1
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        world_size = get_ulysses_parallel_world_size()
+        if q.shape[2] % (world_size * groups) != 0:
+            return None
+        out = ulysses_head_group_pipelined_attention(
+            q[0],
+            k[0],
+            v[0],
+            lambda qg, kg, vg: attend(qg[None], kg[None], vg[None])[0].contiguous(),
+            groups,
+        )
+        return out.unsqueeze(0)
 
     def _forward_ring_tail_pad(
         self,
