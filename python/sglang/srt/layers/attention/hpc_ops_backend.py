@@ -192,7 +192,7 @@ class HPCOpsAttnBackend(AttentionBackend):
                 f"num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}."
             )
 
-        self.max_context_len = model_runner.model_config.context_len
+        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         self.max_num_pages = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
