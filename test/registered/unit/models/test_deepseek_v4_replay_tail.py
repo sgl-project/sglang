@@ -1,6 +1,7 @@
 """DeepSeek-V4.1 decoder-replay tail: the state hand-off of its prefill-graph break,
 who gets the tail (CUDA always, ROCm breakable prefill graphs on opt-in), the break's
-shape threshold, and the KV store's row cut inside a tail graph."""
+shape threshold, the KV store's row cut inside a tail graph, and the HIP metadata flag
+that marks a graph captured with the tail."""
 
 import unittest
 from contextlib import ExitStack
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import DSV4Metadata
 from sglang.srt.models import deepseek_v4_replay_tail as replay_tail
 from sglang.srt.models.deepseek_v4_mhc import HcNormed, HcPending, HcState
 from sglang.srt.models.deepseek_v4_replay_tail import (
@@ -66,6 +68,32 @@ class TestDecoderReplayTailState(CustomTestCase):
         self.assertFalse(has_pre)
         self.assertEqual(len(leaves), 1)
         self.assertIsNone(rebuild(leaves).pre)
+
+    def test_rebuild_closes_over_no_state_tensor(self):
+        """The prefill-graph tail break keeps rebuild for the graph's lifetime,
+        so its closure must not pin the full-row state in the graph pool."""
+        rows = [torch.full((2, 3), v) for v in range(1, 6)]
+        for streams in (rows[0], HcPending(*rows[:4])):
+            for pre in (None, rows[4]):
+                with self.subTest(pending=type(streams).__name__, has_pre=pre):
+                    leaves, _, rebuild = _flatten_state(HcState(streams, pre))
+                    cells = [cell.cell_contents for cell in rebuild.__closure__]
+                    self.assertFalse(any(_holds_tensor(value) for value in cells))
+
+                    rebuilt = rebuild(leaves)
+                    self.assertIs(type(rebuilt.streams), type(streams))
+                    if isinstance(streams, HcPending):
+                        for actual, expected in zip(rebuilt.streams, streams):
+                            self.assertIs(actual, expected)
+                    else:
+                        self.assertIs(rebuilt.streams, streams)
+                    self.assertIs(rebuilt.pre, pre)
+
+
+def _holds_tensor(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    return isinstance(value, (tuple, list)) and any(_holds_tensor(v) for v in value)
 
 
 def _model(tail_writes_source_kv=True):
@@ -293,6 +321,30 @@ class TestHipTailMegaMhcSeams(CustomTestCase):
         self.assertEqual(self._boundaries(mega_mhc=True, prefill=True), ["seam"] * 2)
         self.assertEqual(self._boundaries(mega_mhc=True, prefill=False), ["fused"] * 2)
         self.assertEqual(self._boundaries(mega_mhc=False, prefill=True), ["fused"] * 2)
+
+
+class TestHipPrefillGraphTailFlag(CustomTestCase):
+    """HIP `DSV4Metadata.prefill_graph_tail`: off for a graph captured without the
+    tail, and kept when a low-ratio replay refreshes the captured metadata."""
+
+    @staticmethod
+    def _metadata(**kwargs) -> DSV4Metadata:
+        core = MagicMock(low_ratios=(1, 2))
+        return DSV4Metadata(core_attn_metadata=core, indexer_metadata=None, **kwargs)
+
+    def test_off_without_the_tail(self):
+        self.assertFalse(self._metadata().prefill_graph_tail)
+
+    def test_low_ratio_refresh_keeps_the_captured_flag(self):
+        captured = self._metadata(prefill_graph_tail=True)
+        live = self._metadata(low_ratio_req_indices=torch.arange(4))
+        captured.refresh_for_breakable_cuda_graph_replay_(live)
+        core = captured.core_attn_metadata
+        core.refresh_for_breakable_cuda_graph_replay_.assert_called_once_with(
+            live.core_attn_metadata
+        )
+        self.assertIs(captured.low_ratio_req_indices, live.low_ratio_req_indices)
+        self.assertTrue(captured.prefill_graph_tail)
 
 
 if __name__ == "__main__":

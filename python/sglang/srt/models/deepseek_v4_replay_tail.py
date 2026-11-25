@@ -138,11 +138,14 @@ def _flatten_state(state: HcState):
     assert pending or isinstance(streams, torch.Tensor), type(streams)
     has_pre = state.pre is not None
     leaves = list(streams) if pending else [streams]
+    num_streams = len(leaves)
     if has_pre:
         leaves.append(state.pre)
 
+    # Close over sizes only: the prefill-graph tail break holds rebuild for the
+    # graph's lifetime, so capturing `streams` would pin every captured shape's
+    # full-row residual state in the shared graph pool.
     def rebuild(tensors: List[torch.Tensor]) -> HcState:
-        num_streams = len(streams) if pending else 1
         rebuilt = HcPending(*tensors[:num_streams]) if pending else tensors[0]
         return HcState(rebuilt, tensors[num_streams] if has_pre else None)
 
