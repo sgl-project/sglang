@@ -556,6 +556,98 @@ class TestGlm5NextGate(_FusionGateCase):
             )
         self.assertIn("AITER on a gfx950", reason)
 
+    def _compressed_tensors(self, *, ignore_shared=True):
+        """A compressed-tensors export shaped like RedHatAI/GLM-5.3-Flash-NVFP4:
+        NVFP4 routed experts, optional BF16 shared experts in `ignore`, and
+        `forget_gate.{f_a_proj,f_b_proj}` ignore entries."""
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        ignore = [
+            "model.language_model.layers.0.self_attn.forget_gate.f_a_proj",
+            "model.language_model.layers.0.self_attn.forget_gate.f_b_proj",
+        ]
+        if ignore_shared:
+            ignore.extend(
+                f"model.language_model.layers.3.mlp.shared_experts.{proj}"
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            )
+        quant = CompressedTensorsConfig.from_config(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "nvfp4-pack-quantized",
+                        "input_activations": {
+                            "dynamic": "local",
+                            "group_size": 16,
+                            "num_bits": 4,
+                            "strategy": "tensor_group",
+                            "symmetric": True,
+                            "type": "float",
+                        },
+                        "output_activations": None,
+                        "targets": [
+                            r"re:.*\.layers\.(?:[3-9]|[1-3][0-9]|4[0-4])\.mlp\.experts\..*(gate|up|down)_proj$"
+                        ],
+                        "weights": {
+                            "dynamic": False,
+                            "group_size": 16,
+                            "num_bits": 4,
+                            "strategy": "tensor_group",
+                            "symmetric": True,
+                            "type": "float",
+                        },
+                    }
+                },
+                "ignore": ignore,
+            }
+        )
+        quant.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+        return quant
+
+    def test_cuda_compressed_tensors_mixed_shared_experts_disable_fusion(self):
+        import sglang.srt.models.glm5_next as glm5_next
+
+        self._seed()
+        a2a_backend = SimpleNamespace(is_deepep=lambda: False)
+        with (
+            unittest.mock.patch.object(glm5_next, "_is_cuda", True),
+            unittest.mock.patch.object(glm5_next, "_device_sm", 100),
+            unittest.mock.patch.object(
+                glm5_next, "get_moe_a2a_backend", return_value=a2a_backend
+            ),
+        ):
+            self.assertIn(
+                "higher precision",
+                self._reason(
+                    glm5_next.Glm5NextForConditionalGeneration,
+                    self._config(),
+                    self._compressed_tensors(ignore_shared=True),
+                ),
+            )
+            self.assertIsNone(
+                self._reason(
+                    glm5_next.Glm5NextForConditionalGeneration,
+                    self._config(),
+                    self._compressed_tensors(ignore_shared=False),
+                )
+            )
+
+    def test_forget_gate_ignore_entries_map_to_linear_attention_projections(self):
+        quant = self._compressed_tensors()
+        dummy = torch.nn.Linear(1, 1)
+        for proj in ("f_a_proj", "f_b_proj"):
+            with self.subTest(proj=proj):
+                self.assertIsNone(
+                    quant.get_linear_scheme(dummy, f"model.layers.0.self_attn.{proj}")
+                )
+
     def test_shared_checkpoint_weights_load_into_appended_expert_288(self):
         """Enabling fusion must not silently drop the separately named shared
         tensors; all three projections must reach the appended physical slot."""
