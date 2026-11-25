@@ -40,6 +40,7 @@ from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
 from sglang.kernels.ops.gemm.fp8_prefill_gemm import (
     fp8_prefill_gemm,
     fp8_prefill_gemm_applies,
+    preshuffle_weight,
     quantize_rows_fp8,
 )
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
@@ -430,6 +431,9 @@ _FINALIZE_PUSH_MAX_BYTES = 1 << 20
 # weight copies through aiter's CK GEMM from each weight's own minimum width (kernels/ops/gemm/fp8_prefill_gemm);
 # the O projection's copy and the pooler / unpooler copies exist for this path only.
 _PREFILL_DENSE_FP8 = _DENSE_FP8 and envs.SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8.get()
+_PREFILL_FP8_PRESHUFFLE = (
+    _PREFILL_DENSE_FP8 and envs.SGLANG_ROCM_MUSE_PREFILL_FP8_PRESHUFFLE.get()
+)
 # gfx1250 SP prefill: the BF16 dense GEMMs at the shard widths (Ulysses QKV+gate / O, pooler, unpooler) run the
 # hipBLASLt / rocBLAS solutions torch TunableOp picked for them on gfx1250; any GEMM without a row keeps the default
 # heuristic.
@@ -568,6 +572,20 @@ def _prefill_fp8_rows(forward_batch: ForwardBatch, rows: int) -> bool:
         and rows > _FP8_MAX_ROWS
         and forward_batch.forward_mode.is_extend_without_speculative()
     )
+
+
+def _stage_fp8_weight(linear):
+    """``linear.small_m_fp8_weight`` for a prefill GEMM; a pipeline stage keeps the full-width QKV / O copies in
+    the FlyDSL preshuffle layout, converted on first use (the loader makes them after ``post_load_weights``)."""
+    weight = linear.small_m_fp8_weight
+    if (
+        _PREFILL_FP8_PRESHUFFLE
+        and weight is not None
+        and len(weight) == 2
+        and get_parallel().pp_size > 1
+    ):
+        weight = linear.small_m_fp8_weight = preshuffle_weight(weight)
+    return weight
 
 
 def _dense_linear(
@@ -816,7 +834,7 @@ class MuseSpark1xAttention(nn.Module):
             kv_written = True
         else:
             qkv_fp8 = (
-                self.qkv_proj.small_m_fp8_weight
+                _stage_fp8_weight(self.qkv_proj)
                 if x_fp8 is not None or prefill_fp8
                 else None
             )
@@ -866,7 +884,7 @@ class MuseSpark1xAttention(nn.Module):
             )
         else:
             output = self._fused_o_norm_gate.forward(output, o_gate)
-        o_fp8 = self.o_proj.small_m_fp8_weight if prefill_fp8 else None
+        o_fp8 = _stage_fp8_weight(self.o_proj) if prefill_fp8 else None
         if prefill_fp8 and fp8_prefill_gemm_applies(output, o_fp8):
             xq, xs = quantize_rows_fp8(output)
             output = fp8_prefill_gemm(xq, xs, o_fp8)
@@ -2558,6 +2576,13 @@ class MuseSparkTextForCausalLM(nn.Module):
         if _PREFILL_DENSE_FP8:
             for moe in moe_layers:
                 _prepare_prefill_fp8_projections(moe)
+                if get_parallel().pp_size > 1 and _PREFILL_FP8_PRESHUFFLE:
+                    # The pooler's copy can be the joint router / pooler kernel's, which stays as it is.
+                    for proj in (moe.pre_expert_proj, moe.post_expert_proj):
+                        if proj is not None and proj.small_m_fp8_weight is not None:
+                            proj.small_m_fp8_weight = preshuffle_weight(
+                                proj.small_m_fp8_weight
+                            )
         for layer in self.model.layers:
             for residual in (
                 layer.post_attention_residual_gate,

@@ -114,6 +114,9 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
         cfg["num_warps"] = 8 if use_wide_bf16_m else 4
         cfg["BLOCK_M"] = 32 if mxfp4 and M <= 1024 else (128 if use_wide_bf16_m else 64)
         cfg["FLYDSL_K_UNROLL"] = (2 if M >= 4096 else 4) if mxfp4 else 1
+        if use_wide_bf16_m:
+            # Prefill widths: the wider N tile halves the workgroups that re-read each row block; same output bits.
+            cfg["BLOCK_N"] = 256
     if mxfp4 and M <= 1024:
         # Through M=1024 an MXFP4 launch is pure weight streaming: alignment
         # gives every local expert its own BLOCK_M tile, so no tile choice buys
