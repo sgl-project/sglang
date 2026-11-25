@@ -28,11 +28,15 @@ def dispatcher(capacity, mode=DeepEPMode.AUTO):
     return instance
 
 
-def model_with_dispatchers(*dispatchers):
+def model_with_dispatchers(*dispatchers, sharded=None):
     model = torch.nn.Module()
     for index, item in enumerate(dispatchers):
         layer = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(layer)
+        if sharded is not None:
+            layer.dispatch_input_boundary = SimpleNamespace(
+                input_on_attn_tp_slices=sharded
+            )
         layer.dispatcher = item
         model.add_module(str(index), layer)
     return model
@@ -50,7 +54,9 @@ class TestEagerAutotuneCapacity(CustomTestCase):
             spec_algorithm=SimpleNamespace(
                 is_none=lambda: True, is_speculative=lambda: False
             ),
-            model=model_with_dispatchers(dispatcher(256), dispatcher(128)),
+            model=model_with_dispatchers(
+                dispatcher(256), dispatcher(128), sharded=True
+            ),
             server_args=object(),
         )
         runner._alloc_dummy_decode_buffers = lambda bs, **kw: SimpleNamespace(
@@ -82,8 +88,8 @@ class TestEagerAutotuneCapacity(CustomTestCase):
             buffers, batch = runner._autotune_buffers()
             # The original 4096/TP4 rows exceed the instantiated 128-row bound.
             self.assertGreater(runner._eager_max_bs // 4, 128)
-            self.assertLessEqual(buffers.input_rows, 128)
-            self.assertEqual(batch, 128)
+            self.assertEqual(buffers.input_rows // 4, 128)
+            self.assertEqual(batch, 512)
             self.assertGreaterEqual(batch // 4, 16)
             self.assertEqual(runner._eager_max_bs, 4096)
             self.assertIs(runner._eager_registry, registry)
@@ -189,32 +195,67 @@ class TestEagerAutotuneCapacity(CustomTestCase):
         del wrapper._inners[0]._low_latency_dispatcher
         self.assertIsNone(wrapper.get_decode_token_capacity())
 
-    def test_alignment_and_probe_boundary(self):
-        select = eager._bf16_autotune_batch_size
-        for tp, bound, expected in (
-            (1, 127, 127),
-            (2, 127, 126),
-            (4, 127, 124),
-            (8, 128, 128),
-        ):
-            with self.subTest(tp=tp, bound=bound):
-                selected = select(
-                    model=model_with_dispatchers(dispatcher(bound)),
-                    batch_size=4096,
-                    alignment=tp,
-                    min_probe_rows=16,
+    def test_tp16_decode_capacity(self):
+        # At TP16 the 2,048-row batch fits exactly. An unaligned input can
+        # take the replicated path, so round it down before relying on TP.
+        for batch in (2048, 2047, 2049, 4096):
+            with self.subTest(batch=batch):
+                selected = eager._bf16_autotune_batch_size(
+                    model=model_with_dispatchers(dispatcher(128), sharded=True),
+                    batch_size=batch,
+                    attn_tp_size=16,
                 )
-                self.assertEqual(selected, expected)
-                self.assertLessEqual(selected, bound)
-                self.assertEqual(selected % tp, 0)
-                self.assertGreaterEqual(selected // tp, 16)
-        for bound in (0, -1, 63):
-            with self.subTest(bound=bound), self.assertRaises(ValueError):
+                self.assertEqual(selected, min(batch // 16, 128) * 16)
+
+    def test_replicated_and_unknown_inputs_use_per_rank_bound(self):
+        for sharded in (False, None):
+            with self.subTest(sharded=sharded):
+                model = model_with_dispatchers(dispatcher(128), sharded=sharded)
+                model.add_module(
+                    "sharded", model_with_dispatchers(dispatcher(32), sharded=True)
+                )
+                self.assertEqual(
+                    eager._bf16_autotune_batch_size(
+                        model=model, batch_size=2048, attn_tp_size=16
+                    ),
+                    128,
+                )
+
+    def test_small_capacity(self):
+        select = eager._bf16_autotune_batch_size
+        # A BF16 probe can use fewer than 16 rows when dispatch requires it.
+        self.assertEqual(
+            select(
+                model=model_with_dispatchers(dispatcher(7), sharded=True),
+                batch_size=2048,
+                attn_tp_size=16,
+            ),
+            112,
+        )
+        model = model_with_dispatchers(dispatcher(7))
+        model.add_module("sharded", model_with_dispatchers(dispatcher(3), sharded=True))
+        with patch(
+            "sglang.srt.layers.layer_boundary.layout.batches_are_unpadded",
+            return_value=True,
+        ):
+            self.assertEqual(select(model=model, batch_size=2048, attn_tp_size=16), 3)
+        with (
+            patch(
+                "sglang.srt.layers.layer_boundary.layout.batches_are_unpadded",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(ValueError, "TP-aligned"),
+        ):
+            select(model=model, batch_size=2048, attn_tp_size=16)
+        for bound in (0, -1):
+            with (
+                self.subTest(bound=bound),
+                self.assertRaisesRegex(ValueError, "positive"),
+            ):
                 select(
                     model=model_with_dispatchers(dispatcher(bound)),
-                    batch_size=4096,
-                    alignment=4,
-                    min_probe_rows=16,
+                    batch_size=2048,
+                    attn_tp_size=16,
                 )
 
     def test_safe_or_unadvertised_capacity_keeps_original_shape(self):
@@ -229,8 +270,7 @@ class TestEagerAutotuneCapacity(CustomTestCase):
                     eager._bf16_autotune_batch_size(
                         model=model_with_dispatchers(*layers),
                         batch_size=batch,
-                        alignment=4,
-                        min_probe_rows=16,
+                        attn_tp_size=4,
                     ),
                     batch,
                 )

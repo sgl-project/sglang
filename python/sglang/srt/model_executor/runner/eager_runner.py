@@ -69,29 +69,37 @@ if TYPE_CHECKING:
 
 
 def _bf16_autotune_batch_size(
-    *, model: torch.nn.Module, batch_size: int, alignment: int, min_probe_rows: int
+    *, model: torch.nn.Module, batch_size: int, attn_tp_size: int
 ) -> int:
+    from sglang.srt.layers.layer_boundary.layout import batches_are_unpadded
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-    capacity = batch_size
+    global_limit = per_rank_limit = batch_size
     for module in model.modules():
-        if isinstance(module, FusedMoE):
-            bound = module.dispatcher.get_decode_token_capacity()
-            if bound is not None:
-                if bound <= 0:
-                    raise ValueError(
-                        "Decode dispatcher token capacity must be positive"
-                    )
-                capacity = min(capacity, bound)
-    if capacity == batch_size:
+        if not isinstance(module, FusedMoE):
+            continue
+        bound = module.dispatcher.get_decode_token_capacity()
+        if bound is None or batch_size <= bound:
+            continue
+        if bound <= 0:
+            raise ValueError("Decode dispatcher token capacity must be positive")
+
+        # Only aligned batches take the ordinary TP-sliced FFN path. An
+        # unpadded remainder can send the entire batch to each dispatcher.
+        boundary = module.dispatch_input_boundary
+        sharded = boundary is not None and boundary.input_on_attn_tp_slices
+        global_bound = bound * attn_tp_size if sharded else bound
+        global_limit = min(global_limit, global_bound)
+        per_rank_limit = min(per_rank_limit, bound)
+
+    if batch_size <= per_rank_limit:
         return batch_size
-    # A global token bound is conservative for both replicated and TP-split inputs.
-    selected = capacity // alignment * alignment
-    if selected // alignment < min_probe_rows:
-        raise ValueError(
-            "Decode dispatcher capacity cannot retain the BF16 autotune probe rows"
-        )
-    return selected
+    aligned = global_limit // attn_tp_size * attn_tp_size
+    if aligned:
+        return aligned
+    if batches_are_unpadded():
+        return per_rank_limit
+    raise ValueError("Decode dispatcher cannot fit a TP-aligned batch")
 
 
 class EagerRunner(BaseRunner):
@@ -192,15 +200,10 @@ class EagerRunner(BaseRunner):
             and get_exec().moe.moe_a2a_backend == "deepep"
             and should_run_flashinfer_autotune(mr, require_bf16_only=True)
         ):
-            from sglang.srt.layers.quantization.unquant import (
-                _BF16_LOW_M_AUTOTUNE_MAX_M,
-            )
-
             batch_size = _bf16_autotune_batch_size(
                 model=mr.model,
                 batch_size=batch_size,
-                alignment=parallel.attn_tp_size,
-                min_probe_rows=_BF16_LOW_M_AUTOTUNE_MAX_M,
+                attn_tp_size=parallel.attn_tp_size,
             )
             if batch_size != self._eager_max_bs:
                 logger.info(
