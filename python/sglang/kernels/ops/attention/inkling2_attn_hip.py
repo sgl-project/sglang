@@ -350,6 +350,7 @@ def _rel_verify_split(
     far_end = 0
     if WINDOW < 0:
         far_end = tl.maximum(prefix - EXTENT + 1, 0) // BN * BN
+        far_end = tl.minimum(far_end, prefix // BN * BN)
     for start_n in range(s0, tl.minimum(s1, far_end), BN):
         qk, v = _prefix_tile(
             q, K_Buf, V_Buf, kv_indices, kv_start, start_n, kvh, d,

@@ -429,7 +429,7 @@ def test_rel_verify_attention_bidirectional_without_bias():
 
     torch.manual_seed(0)
     ext = 8
-    prefixes = (0, 5, 700, 3000)
+    prefixes = (0, 63, 700, 3000)
     batch = len(prefixes)
     pool = sum(prefixes) + 7
     k_buf = torch.randn(pool, HKV, D, device="cuda").bfloat16()
