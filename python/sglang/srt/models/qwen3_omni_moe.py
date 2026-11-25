@@ -192,7 +192,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         super().__init__(config)
 
         embed_dim = config.d_model
-        self.max_source_positions = config.max_source_positions
+        self.max_source_positions = getattr(config, "max_source_positions", 1500)
         self.n_window = config.n_window
         self.positional_embedding = SinusoidsPositionEmbedding(
             self.max_source_positions, embed_dim

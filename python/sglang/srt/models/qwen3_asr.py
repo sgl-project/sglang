@@ -43,6 +43,18 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @staticmethod
+    def _resolve_sub_configs(config: Qwen3ASRConfig):
+        holder = getattr(config, "thinker_config", None) or config
+        audio_config = getattr(holder, "audio_config", None)
+        if audio_config is None:
+            audio_config = Qwen3OmniMoeAudioEncoderConfig()
+            holder.audio_config = audio_config
+        text_config = getattr(holder, "text_config", None)
+        if text_config is None:
+            text_config = config.get_text_config()
+        return audio_config, text_config
+
     def __init__(
         self,
         config: Qwen3ASRConfig,
@@ -51,14 +63,11 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        thinker_config = config.thinker_config
+        audio_config, text_config = self._resolve_sub_configs(config)
 
-        if getattr(thinker_config, "audio_config", None) is None:
-            thinker_config.audio_config = Qwen3OmniMoeAudioEncoderConfig()
-
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(audio_config)
         self.language_model = Qwen3ForCausalLM(
-            thinker_config.text_config,
+            text_config,
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
@@ -138,6 +147,12 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        _, text_config = self._resolve_sub_configs(self.config)
+        tie_word_embeddings = getattr(
+            text_config,
+            "tie_word_embeddings",
+            getattr(self.config, "tie_word_embeddings", False),
+        )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -145,11 +160,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 continue
 
-            if (
-                getattr(
-                    self.config.thinker_config.text_config, "tie_word_embeddings", False
-                )
-                and "lm_head.weight" in name
+            if tie_word_embeddings and (
+                name == "lm_head.weight" or name.endswith(".lm_head.weight")
             ):
                 continue
 
@@ -162,6 +174,33 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 name = name.replace("thinker.lm_head.", "language_model.lm_head.", 1)
             elif name.startswith("thinker.model."):
                 name = name.replace("thinker.model.", "language_model.model.", 1)
+            elif name.startswith("model.audio_tower."):
+                name = name.replace("model.audio_tower.", "audio_tower.", 1)
+            elif name.startswith("model.multi_modal_projector.linear_1."):
+                name = name.replace(
+                    "model.multi_modal_projector.linear_1.", "audio_tower.proj1.", 1
+                )
+            elif name.startswith("model.multi_modal_projector.linear_2."):
+                name = name.replace(
+                    "model.multi_modal_projector.linear_2.", "audio_tower.proj2.", 1
+                )
+            elif name.startswith("model.language_model."):
+                name = name.replace("model.language_model.", "language_model.model.", 1)
+            elif name.startswith("lm_head."):
+                name = name.replace("lm_head.", "language_model.lm_head.", 1)
+
+            if (
+                tie_word_embeddings
+                and name == "language_model.model.embed_tokens.weight"
+                and "language_model.lm_head.weight" in params_dict
+                and params_dict["language_model.lm_head.weight"]
+                is not params_dict.get(name)
+            ):
+                lm_head_param = params_dict["language_model.lm_head.weight"]
+                lm_head_loader = getattr(
+                    lm_head_param, "weight_loader", default_weight_loader
+                )
+                lm_head_loader(lm_head_param, loaded_weight)
 
             is_audio = "audio_tower" in name
 
