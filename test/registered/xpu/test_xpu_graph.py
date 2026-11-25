@@ -47,8 +47,9 @@ class TestXPUGraph(CustomTestCase):
                 "decode": {"backend": "full", "bs": [1, 2]},
                 "prefill": {
                     "backend": "full",
-                    "bs": [64, 128],
+                    "bs": [64, 128, 256],
                     "full_prefill_max_req": 4,
+                    "max_context_size": 128,
                 },
             },
         )
@@ -75,7 +76,7 @@ class TestXPUGraph(CustomTestCase):
                 "The capital of Italy is Rome. The capital of Japan is Tokyo. "
                 "The capital of Spain is"
             )
-            * 2
+            * 6
         )
         base_p1 = (
             tokenizer.encode(
@@ -83,7 +84,7 @@ class TestXPUGraph(CustomTestCase):
                 "Three plus three equals six. Four plus four equals eight. "
                 "Five plus five equals"
             )
-            * 2
+            * 6
         )
         output_len = 8
 
@@ -230,12 +231,10 @@ class TestXPUGraph(CustomTestCase):
                     f"Decoded token IDs mismatch between full graph and eager for tok_len={tok_len}",
                 )
 
-        # Case 3: Prefix-cached extend (32 prefix + 32 new = 64 total tokens per request,
-        # 2 requests -> 64 extend tokens on bucket=64, cu_seqlens_q != cu_seqlens_k)
-        full_inputs = [base_p0[:64], base_p1[:64]]
-        cut_len = 32
-
-        def run_prefix_pass(use_graph: bool):
+        # Case 3: Prefix-cached extend verifying prefill context cap behavior:
+        # At cap (ctx=128 <= max_context_size 128): both prefix and suffix extends replay on bucket 128.
+        # Above cap (ctx=164 > max_context_size 128, tokens=200 in bucket 256): suffix extend falls back to eager.
+        def run_prefix_pass(full_inputs, cut_len: int, use_graph: bool):
             bench_runner.clear()
             prefix_inputs = [inp[:cut_len] for inp in full_inputs]
             reqs = prepare_synthetic_inputs_for_latency_test(
@@ -267,9 +266,9 @@ class TestXPUGraph(CustomTestCase):
                     saved_prefill.backend.replay = wrapped_prefill_replay
                     saved_decode.backend.replay = wrapped_decode_replay
 
-                # 1st extend: populate prefix KV cache (2 x 32 = 64 tokens)
+                # 1st extend: populate prefix KV cache
                 bench_runner.extend(reqs)
-                # 2nd extend: extend with cached prefix (prefix_len=32, extend_len=32)
+                # 2nd extend: extend with cached prefix
                 reqs = prepare_extend_inputs_for_correctness_test(
                     SimpleNamespace(cut_len=cut_len), full_inputs, reqs, torch_runner
                 )
@@ -296,44 +295,118 @@ class TestXPUGraph(CustomTestCase):
                 torch_runner.prefill_cuda_graph_runner = saved_prefill
                 torch_runner.decode_cuda_graph_runner = saved_decode
 
-        with self.subTest(case="prefix_extend", cut_len=cut_len, bucket=64):
+        # 3a. At cap: prefix 64 + suffix 64 = 128 context <= max_context_size 128 -> both replay
+        full_inputs_at_cap = [base_p0[:128], base_p1[:128]]
+        with self.subTest(case="prefix_extend_at_cap", cut_len=64, bucket=128):
             (
                 graph_logits,
                 graph_ids,
                 prefill_replays,
                 decode_replays,
-            ) = run_prefix_pass(use_graph=True)
+            ) = run_prefix_pass(full_inputs_at_cap, cut_len=64, use_graph=True)
             (
                 eager_logits,
                 eager_ids,
                 eager_prefill_replays,
                 eager_decode_replays,
-            ) = run_prefix_pass(use_graph=False)
+            ) = run_prefix_pass(full_inputs_at_cap, cut_len=64, use_graph=False)
 
             self.assertEqual(
                 [k.size for k in prefill_replays],
-                [64, 64],
-                "Expected both prefix and suffix extends to replay on bucket 64",
-            )
-            self.assertEqual(
-                [k.size for k in decode_replays],
-                [2] * (output_len - 1),
+                [128, 128],
+                "Expected both prefix and suffix extends to replay at the cap",
             )
             self.assertEqual(eager_prefill_replays, [])
-            self.assertEqual(eager_decode_replays, [])
-
             cos_sim = torch.nn.functional.cosine_similarity(
                 graph_logits, eager_logits, dim=-1
             )
-            self.assertTrue(
-                torch.all(cos_sim > 0.999).item(),
-                f"Prefix-extend prefill logits cosine similarity too low: {cos_sim}",
-            )
-            self.assertEqual(
+            self.assertTrue(torch.all(cos_sim > 0.999).item())
+            self.assertEqual(graph_ids, eager_ids)
+
+        # 3b. Above cap: prefix 64 + suffix 100 = 164 context > 128 cap -> suffix falls back to eager
+        full_inputs_above_cap = [base_p0[:164], base_p1[:164]]
+        with self.subTest(case="prefix_extend_above_cap", cut_len=64):
+            (
+                graph_logits,
                 graph_ids,
+                prefill_replays,
+                decode_replays,
+            ) = run_prefix_pass(full_inputs_above_cap, cut_len=64, use_graph=True)
+            (
+                eager_logits,
                 eager_ids,
-                "Decoded token IDs mismatch between full graph and eager on prefix extend",
+                eager_prefill_replays,
+                eager_decode_replays,
+            ) = run_prefix_pass(full_inputs_above_cap, cut_len=64, use_graph=False)
+
+            self.assertEqual(
+                [k.size for k in prefill_replays],
+                [128],
+                "Expected prefix to replay on bucket 128, but suffix to fall back to eager above cap",
             )
+            self.assertEqual(eager_prefill_replays, [])
+            cos_sim = torch.nn.functional.cosine_similarity(
+                graph_logits, eager_logits, dim=-1
+            )
+            self.assertTrue(torch.all(cos_sim > 0.999).item())
+            self.assertEqual(graph_ids, eager_ids)
+
+        # Case 4: Decode bucket boundary verification (short <= 4096 vs medium > 4096)
+        base_long = (base_p0 + base_p1) * 35
+        for tok_len, expected_variant in ((4000, "short"), (4100, "medium")):
+            with self.subTest(
+                case="decode_boundary", tok_len=tok_len, variant=expected_variant
+            ):
+                inputs = [base_long[:tok_len], base_long[:tok_len]]
+
+                def run_decode_boundary_pass(use_graph: bool):
+                    bench_runner.clear()
+                    reqs = prepare_synthetic_inputs_for_latency_test(
+                        batch_size=2, input_len=tok_len, custom_inputs=inputs
+                    )
+                    saved_decode = torch_runner.decode_cuda_graph_runner
+                    replays = []
+                    orig_replay = saved_decode.backend.replay
+
+                    def wrapped_replay(shape_key, *args, **kwargs):
+                        replays.append(shape_key)
+                        return orig_replay(shape_key, *args, **kwargs)
+
+                    try:
+                        if not use_graph:
+                            torch_runner.decode_cuda_graph_runner = None
+                        else:
+                            saved_decode.backend.replay = wrapped_replay
+
+                        next_token_ids, _, batch = bench_runner.extend(reqs)
+                        token_ids = []
+                        for _ in range(4):
+                            next_token_ids, _ = bench_runner.decode(
+                                next_token_ids, batch
+                            )
+                            token_ids.append(int(next_token_ids[0].item()))
+                        bench_runner.synchronize()
+                        return token_ids, replays
+                    finally:
+                        saved_decode.backend.replay = orig_replay
+                        torch_runner.decode_cuda_graph_runner = saved_decode
+
+                graph_tokens, decode_replays = run_decode_boundary_pass(use_graph=True)
+                eager_tokens, eager_decode_replays = run_decode_boundary_pass(
+                    use_graph=False
+                )
+
+                self.assertEqual(
+                    [getattr(k, "attention_variant", None) for k in decode_replays],
+                    [expected_variant] * 4,
+                    f"Expected decode replay to select variant {expected_variant} for tok_len={tok_len}",
+                )
+                self.assertEqual(eager_decode_replays, [])
+                self.assertEqual(
+                    graph_tokens,
+                    eager_tokens,
+                    f"Decoded token IDs mismatch on variant {expected_variant} for tok_len={tok_len}",
+                )
 
 
 if __name__ == "__main__":
