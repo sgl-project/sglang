@@ -267,6 +267,12 @@ _TAIL_MAX_TILES = 96
 # higher clock under the power cap
 _TAIL_MAX_WAVES = 6
 _TAIL_KEY_CHUNKS = 8
+# Head count the tail split's row boundary is planned for, in place of the call's own. Every
+# (row tile, head) of MHA v4 and every tail row are computed independently of the other heads, so
+# head-group calls planned for the heads of a wider call give that call's bytes: MiniMax-H3's
+# copy-engine pipeline runs 7 groups of 2 heads per rank, and 7 keeps them identical to the
+# 2-group collective pipeline (7 heads per call: rows [0, 37376) + a 381-row tail).
+_TAIL_SPLIT_HEADS = int(os.environ.get("SGLANG_DIFFUSION_AITER_TAIL_SPLIT_HEADS", "0"))
 
 
 @functools.lru_cache(maxsize=None)
@@ -630,7 +636,9 @@ class AITerImpl(AttentionImpl):
                     causal=self.causal,
                     how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
                 )[0]
-            elif full_rows := _tail_split_rows(used, query.shape[1], query.device):
+            elif full_rows := _tail_split_rows(
+                used, _TAIL_SPLIT_HEADS or query.shape[1], query.device
+            ):
                 output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
                 _tail_split_attention(
                     q, k, v, self.softmax_scale, output[:used], full_rows
