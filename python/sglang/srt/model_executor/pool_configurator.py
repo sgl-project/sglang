@@ -537,12 +537,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     element_size=kv_size,
                     start_layer=kvc.layer_info.start_layer,
                     is_draft_worker=kvc.is_draft_worker,
-                    indexer_layer_ids=(
-                        kvc.get_dsa_indexer_layer_ids()
-                        if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
-                        and is_deepseek_dsa(model_config.hf_config)
-                        else None
-                    ),
                 )
                 if offload_cell_size is not None:
                     return offload_cell_size

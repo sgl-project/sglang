@@ -103,7 +103,6 @@ def _make_model_runner(
     mr.modelslim_cache_layout = None
     mr.is_draft_worker = False
     mr.sparse_kv_budget_plan = None
-    mr._dsa_indexer_layer_ids = None
     mr.dflash_draft_cell_size_per_token = None
     mr.dflash_draft_loc_space_scale = 1
     mr.num_effective_layers = num_layers
@@ -190,11 +189,6 @@ def _make_model_runner(
         swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
         full_attention_layer_ids=list(mc.full_attention_layer_ids),
         draft_owns_its_depth=False,
-    )
-    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-
-    mr.get_dsa_indexer_layer_ids = lambda: (
-        KVCacheConfigurator.get_dsa_indexer_layer_ids(mr)
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1

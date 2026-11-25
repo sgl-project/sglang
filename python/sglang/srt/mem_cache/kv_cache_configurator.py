@@ -438,7 +438,6 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     sparse_kv_budget_plan: Optional[BudgetPlan] = field(default=None, init=False)
     sparse_kv_budget_finalized: bool = field(default=False, init=False)
-    _dsa_indexer_layer_ids: Optional[tuple[int, ...]] = field(default=None, init=False)
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
     extra_mamba_cache_bytes_per_request_row: int = 0
@@ -2498,27 +2497,6 @@ class KVCacheConfigurator:
             **pool_kwargs,
         )
         return token_to_kv_pool
-
-    def get_dsa_indexer_layer_ids(self) -> tuple[int, ...]:
-        """Use the same physical indexer layers for Ascend sizing and allocation."""
-        if self._dsa_indexer_layer_ids is None:
-            if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
-                self._dsa_indexer_layer_ids = tuple(
-                    layer_id
-                    for layer_id in range(
-                        self.layer_info.start_layer, self.layer_info.end_layer
-                    )
-                    if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-                )
-            else:
-                self._dsa_indexer_layer_ids = tuple(
-                    range(
-                        self.layer_info.start_layer,
-                        self.layer_info.start_layer
-                        + self.layer_info.num_effective_layers,
-                    )
-                )
-        return self._dsa_indexer_layer_ids
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (

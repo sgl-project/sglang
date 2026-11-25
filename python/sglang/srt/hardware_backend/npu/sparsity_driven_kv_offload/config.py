@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -148,7 +148,6 @@ def get_sparsity_driven_kv_offload_cell_size(
     element_size: int,
     start_layer: int = 0,
     is_draft_worker: bool = False,
-    indexer_layer_ids: Optional[Sequence[int]] = None,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
@@ -160,20 +159,17 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
-    if use_fused_sparse_kv_offload() and indexer_layer_ids is not None:
-        num_indexer_layers = len(indexer_layer_ids)
-    else:
-        from sglang.srt.mem_cache.kv_cache_configurator import (
-            _should_elide_dsa_index_k,
-        )
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        _should_elide_dsa_index_k,
+    )
 
-        if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
-            num_indexer_layers = sum(
-                not dsa_layer_skips_topk(model_config.hf_config, layer_id)
-                for layer_id in range(start_layer, start_layer + num_layers)
-            )
-        else:
-            num_indexer_layers = num_layers
+    if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
+        num_indexer_layers = sum(
+            not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+            for layer_id in range(start_layer, start_layer + num_layers)
+        )
+    else:
+        num_indexer_layers = num_layers
     return index_head_dim * element_size * num_indexer_layers
 
 
