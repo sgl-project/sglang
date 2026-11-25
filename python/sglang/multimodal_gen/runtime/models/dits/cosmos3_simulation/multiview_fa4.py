@@ -15,8 +15,8 @@ carries the id of its run; the answer for a pair is one bit at
 ``(q_run, k_run)``. The rules stay in Python, and this kernel never learns what
 a view or a frame is.
 
-Everything CuTe/CUTLASS is imported lazily: ``flash-attn-4`` is an optional
-Hopper/Blackwell-only dependency, and the multiview module must stay importable on
+Everything CuTe/CUTLASS is imported lazily: the vendored FA4 CuTe kernels are
+Hopper/Blackwell-only, and the multiview module must stay importable on
 CPU-only hosts.
 """
 
@@ -129,13 +129,16 @@ def _load_fa4() -> _Fa4Entry:
     try:
         import cutlass
         import cutlass.cute as cute
-        from flash_attn.cute import flash_attn_func
-        from flash_attn.cute import utils as fa_utils
-        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+        from sglang.kernels.ops.attention.flash_attn.cute import flash_attn_func
+        from sglang.kernels.ops.attention.flash_attn.cute import utils as fa_utils
+        from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (
+            BlockSparseTensorsTorch,
+        )
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            "Cosmos3 multiview backend='fa4' requires the FlashAttention-4 CuTe "
-            "package (flash-attn-4), which needs CUDA 13 and an SM90 or SM100 GPU. "
+            "Cosmos3 multiview backend='fa4' requires the vendored FlashAttention-4 "
+            "CuTe kernels, which need CUDA 13 and an SM90 or SM100 GPU. "
             f"Import failed: {exc}"
         ) from exc
 

@@ -22,19 +22,12 @@ from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     save_jsonl,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    ACTIVE_TEST_CLASS,
-    CONFIGMAP_NAME,
-    NAMESPACE,
-    SERVICE_PORT,
+    PdMixNodeMixin,
+    PdSepNodeMixin,
     check_role,
     kill_process_group,
-    launch_pd_mix_node,
-    launch_pd_separation_node,
-    launch_router,
-    query_configmap,
-    wait_for_prefill_decode_exit,
-    wait_server_ready,
 )
+from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -168,6 +161,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
+GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -231,6 +225,7 @@ TPOT_TOLERANCE_HIGH = 1.02  # +2%
 TTFT_TOLERANCE = 1.02  # +2%
 E2E_TOLERANCE = 1.02  # +2%
 OUTPUT_TOKEN_THROUGHPUT_TOLERANCE = 0.98  # -2%
+REQUEST_THROUGHPUT_TOLERANCE = 0.98  # -2%
 
 
 def _get_spec_num_draft_tokens(other_args):
@@ -404,6 +399,7 @@ def run_bench_serving(
       - cache_hit_rate_pct: overall KV hit rate across all tiers
       - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
       - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+      - storage_hit_rate_pct: L3 tier hit rate (HiCache storage backend)
     Thresholds for these tiers are declared on the test case as the
     min_hit_rate_pcts class attribute and enforced by assert_metrics,
     which requires cache_report=True to have any values to check.
@@ -630,6 +626,15 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
+                elif stripped_line.startswith(
+                    ("Storage:", "Storage (")
+                ) and stripped_line.endswith("%"):
+                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%" or
+                    # "Storage (MooncakeStore): 19.7%" when the engine that
+                    # served the request has a storage backend configured.
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["storage_hit_rate_pct"] = parts[-1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -964,6 +969,7 @@ def assert_metrics(self, metrics):
     # defensively instead of relying on class attributes.
     tpot = getattr(self, "tpot", None)
     output_token_throughput = getattr(self, "output_token_throughput", None)
+    request_throughput = getattr(self, "request_throughput", None)
     ttft = getattr(self, "ttft", None)
     mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
     if tpot and metrics.get("mean_tpot"):
@@ -997,6 +1003,17 @@ def assert_metrics(self, metrics):
         dump_metric(
             "ttft_baseline",
             float(ttft),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+    if request_throughput and metrics.get("request_throughput"):
+        dump_metric(
+            "request_throughput",
+            float(metrics["request_throughput"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "request_throughput_baseline",
+            float(request_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
     if mean_e2e_latency and metrics.get("mean_e2e_latency"):
@@ -1055,6 +1072,15 @@ def assert_metrics(self, metrics):
             float(metrics["mean_ttft"]),
             ttft * TTFT_TOLERANCE,
         )
+    if request_throughput:
+        self.assertIsNotNone(
+            metrics.get("request_throughput"),
+            "request_throughput not found in benchmark output while a baseline is set",
+        )
+        self.assertGreaterEqual(
+            float(metrics["request_throughput"]),
+            request_throughput * REQUEST_THROUGHPUT_TOLERANCE,
+        )
     if mean_e2e_latency:
         self.assertLessEqual(
             float(metrics["mean_e2e_latency"]),
@@ -1090,6 +1116,7 @@ def assert_metrics(self, metrics):
             "cache": "cache_hit_rate_pct",
             "device": "device_hit_rate_pct",
             "host": "host_hit_rate_pct",
+            "storage": "storage_hit_rate_pct",
         }
         unknown_tiers = sorted(set(min_hit_rate_pcts) - set(hit_rate_keys))
         if unknown_tiers:
@@ -1168,6 +1195,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
     # Baseline for accept_length / speculative-num-draft-tokens; None disables
     # the assertion.
     accept_rate = None
@@ -1304,6 +1332,11 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     def setUpClass(cls):
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Start the storage service first: it may export MOONCAKE_* variables
+        # that the server environment copy below has to pick up.
+        other_args = list(cls.other_args)
+        cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
+
         env = os.environ.copy()
         for key, value in env.items():
             logger.info(f"ENV_VAR_SYS {key}:{value}")
@@ -1311,8 +1344,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             for key, value in cls.envs.items():
                 logger.info(f"ENV_VAR_CASE {key}:{value}")
                 env[key] = value
-
-        other_args = list(cls.other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -1329,6 +1360,12 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
+            try:
+                kill_process_tree(storage_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during storage service teardown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
@@ -1392,8 +1429,10 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
+class TestNpuPerfMultiNodePdMixTestCaseBase(PdMixNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
+    keep_alive_time = MAX_SERVER_KEEP_ALIVE_TIME
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     dataset_name = "random"
@@ -1417,55 +1456,11 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
-
-    @classmethod
-    def setUpClass(cls):
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_mix_master_node()
-        cls.start_pd_mix_worker_node()
-
-    @classmethod
-    def tearDownClass(cls):
-        pass
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def start_pd_mix_master_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        wait_server_ready(f"{cls.base_url}/health")
-
-        logger.info(
-            f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def start_pd_mix_worker_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        sglang_thread.start()
-
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
-        )
-        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
     @retry()
     @check_role(allowed_roles=["master", "worker"])
@@ -1525,8 +1520,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             assert_metrics(self, metrics)
 
 
-class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
+class TestNpuPerfMultiNodePdSepTestCaseBase(PdSepNodeMixin, CustomTestCase):
     model_config = None
+    initialization_delay = SERVER_INITIALIZATION_DELAY
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
     dataset_name = "random"
@@ -1550,91 +1546,11 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
     pop_sglang_is_in_ci_for_gsp = False
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-
-        cls.start_pd_server()
-        cls.start_router_server()
-
-    @classmethod
-    def tearDownClass(cls):
-        logger.info("Start exec tearDownClass")
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-                for _ in range(60):
-                    if cls.process.poll() is not None:
-                        logger.info("Process fully exited")
-                        break
-                    time.sleep(1)
-                else:
-                    logger.warning("Process did NOT exit in time")
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-        logger.info("tearDownClass finished")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
-        logger.info(f"Starting router in thread...")
-        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
-        sglang_thread.daemon = True
-        sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        logger.info(f"Starting pd separation node...")
-        cls.process = launch_pd_separation_node(cls.model_config)
-        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
-
-        # Loop to check if the process is still running
-        while True:
-            configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
-            if configmap and configmap.data:
-                executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
-                if executing_class and executing_class != cls.__name__:
-                    logger.info(f"Retrieved ConfigMap data: {configmap.data}")
-                    logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
-                    return
-            if cls.process.poll() is None:
-                # Process is still running
-                time.sleep(30)
-            else:
-                # Process has exited
-                exit_code = cls.process.poll()
-                raise Exception(
-                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
-                )
 
     @retry()
     @check_role(allowed_roles=["router"])

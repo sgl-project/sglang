@@ -13,10 +13,9 @@
 # ==============================================================================
 """Shared helpers used by config, tokenizer, and processor modules."""
 
-import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, Union
+from typing import Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
@@ -38,6 +37,7 @@ from sglang.srt.configs.all_configs import (
     Dots3Config,
     DotsOCRConfig,
     DotsVLMConfig,
+    Ernie5_5_MoeConfig,
     ExaoneConfig,
     FalconH1Config,
     FalconMambaConfig,
@@ -47,6 +47,8 @@ from sglang.srt.configs.all_configs import (
     Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     HYV4Config,
+    HYV4FlashConfig,
+    HYV4FlashTextConfig,
     InklingAudioConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -100,6 +102,7 @@ from sglang.srt.configs.all_configs import (
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
+from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
@@ -127,6 +130,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig,
         DbrxConfig,
         ExaoneConfig,
+        Ernie5_5_MoeConfig,
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
@@ -155,6 +159,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         GigaChat35Config,
         GraniteMoeHybridConfig,
         HYV4Config,
+        HYV4FlashConfig,
+        HYV4FlashTextConfig,
         DotsVLMConfig,
         DotsOCRConfig,
         Dots3Config,
@@ -185,6 +191,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MiniCPMV4_6VisionConfig,
         MiniCPMV4_7Config,
         InklingModelConfig,
+        Inkling2MMConfig,
+        Inkling2ModelConfig,
         InklingAudioConfig,
         InklingVisionConfig,
         InklingMMConfig,
@@ -343,6 +351,7 @@ for _cosmos3_edge_config_cls in (
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -350,7 +359,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(
+        model_path, allow_patterns=allow_patterns, revision=revision
+    )
 
 
 def resolve_runai_obj_uri(model_name_or_path: str) -> str:
@@ -663,7 +674,7 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
 
 
 # ---------------------------------------------------------------------------
-# Context length / generation config / sparse attention
+# Context length / generation config
 # ---------------------------------------------------------------------------
 
 # Models don't use the same configuration key for determining the maximum
@@ -734,24 +745,6 @@ def get_generation_config(
             e,
         )
         return None
-
-
-# Qwen-1M related
-def get_sparse_attention_config(
-    model: str,
-    sparse_attention_config_filename: str = "sparse_attention_config.json",
-) -> Dict[str, Any]:
-    is_local = os.path.isdir(model)
-    if not is_local:
-        model = download_from_hf(model, allow_patterns=["*.json"])
-
-    config_file = os.path.join(model, sparse_attention_config_filename)
-    if not os.path.exists(config_file):
-        return {}
-
-    with open(config_file) as f:
-        config = json.load(f)
-    return config
 
 
 # ---------------------------------------------------------------------------

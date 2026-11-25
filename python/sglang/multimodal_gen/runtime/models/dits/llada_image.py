@@ -1398,7 +1398,6 @@ class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
             key: value for key, value in hf_config.items() if not key.startswith("_")
         }
         super().__init__(quant_config=quant_config, **init_kwargs)
-        self.sgl_config = config
         self.hidden_size = int(self.config.dim)
         self.num_attention_heads = int(self.config.n_heads)
         self.num_channels_latents = int(self.config.in_channels)

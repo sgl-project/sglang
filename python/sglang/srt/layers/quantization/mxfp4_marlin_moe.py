@@ -8,8 +8,9 @@ from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
+from sglang.srt.utils import log_info_on_rank0, round_up
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -18,8 +19,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
-    """Build the Marlin quant_info for an MXFP4 MoE layer.
+def build_marlin_moe_quant_info(
+    layer: Module, weight_bits: int = 4
+) -> MarlinMoeQuantInfo:
+    """Build Marlin quant_info for MXFP4 or MXFP8 MoE experts.
 
     Single source for the runner inputs shared by the marlin path of
     ``Mxfp4MoEMethod.apply`` and :class:`Mxfp4MarlinMoEMethod`, including
@@ -34,7 +37,7 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
         w2_scales=layer.w2_weight_scale,
         w13_g_idx_sort_indices=None,
         w2_g_idx_sort_indices=None,
-        weight_bits=4,
+        weight_bits=weight_bits,
         is_k_full=True,
         w13_bias=getattr(layer, "w13_weight_bias", None),
         w2_bias=getattr(layer, "w2_weight_bias", None),

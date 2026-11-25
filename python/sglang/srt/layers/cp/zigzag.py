@@ -59,8 +59,34 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.runtime_context import attention_backends, get_device, get_parallel
+from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
+
+# int32 elements per 16 bytes: attention kernels may specialize on alignment.
+_SEGMENT_ALIGN = 4
+
+
+def _lists_to_device(
+    lists: dict[str, list[int]], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Upload int32 host lists as 16-byte-aligned views of one device buffer.
+
+    A pageable ``torch.tensor(..., device=...)`` is a synchronous copy that
+    waits for queued work on the stream; ``async_h2d`` stages in pinned memory
+    so the copy is ordered on the current stream without blocking the host.
+    """
+    flat: list[int] = []
+    starts: list[int] = []
+    for values in lists.values():
+        starts.append(len(flat))
+        flat.extend(values)
+        flat.extend([0] * (-len(flat) % _SEGMENT_ALIGN))
+    buffer = async_h2d(flat, dtype=torch.int32, device=device)
+    return {
+        name: buffer[start : start + len(values)]
+        for (name, values), start in zip(lists.items(), starts)
+    }
 
 
 @dataclass
@@ -113,6 +139,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
     _prefill_backend_supported: Optional[bool] = None
+    _short_requests_allowed: bool = False
+
+    def allow_short_requests(self) -> None:
+        """Keep an EXTEND batch on CP when one of its requests extends by at least
+        2 x cp_size tokens.
+
+        A shorter request in that batch leaves some ranks' zigzag blocks empty, so
+        call this only when the prefill attention backend runs empty blocks. By
+        default one such request runs the whole batch without CP.
+        """
+        self._short_requests_allowed = True
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
@@ -122,10 +159,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             return False
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None and not all(
-            int(length) >= self.cp_size * 2 for length in extend_lens
-        ):
-            return False
+        if extend_lens:
+            lengths = [int(length) for length in extend_lens]
+            # Mixed-chunk decode rows keep the per-request rule.
+            short_ok = (
+                self._short_requests_allowed
+                and forward_mode is not None
+                and not forward_mode.is_mixed()
+            )
+            if (max(lengths) if short_ok else min(lengths)) < self.cp_size * 2:
+                return False
         return self._prefill_backend_supports_cp()
 
     def _prefill_backend_supports_cp(self) -> bool:
@@ -287,6 +330,20 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         assert sorted(cp_reverse_index) == list(range(bs * cp_segment_num))
         assert sum(per_rank_actual_token) == total_seq_lens
 
+        device_lists = {
+            "kv_len_prev_tensor": kv_len_prev_list,
+            "kv_len_next_tensor": kv_len_next_list,
+            "cu_seqlens_kv_prev_tensor": cu_kv_prev,
+            "cu_seqlens_kv_next_tensor": cu_kv_next,
+            "actual_seq_q_prev_tensor": actual_seq_q_prev_list,
+            "actual_seq_q_next_tensor": actual_seq_q_next_list,
+            "cu_seqlens_q_prev_tensor": cu_prev,
+            "cu_seqlens_q_next_tensor": cu_next,
+            "actual_seq_q_combined_tensor": actual_seq_q_combined_list,
+            "kv_len_combined_tensor": kv_len_combined_list,
+            "cu_seqlens_q_combined_tensor": cu_q_combined,
+            "cu_seqlens_kv_combined_tensor": cu_kv_combined,
+        }
         return ZigzagContextParallelMetadata(
             split_list=split_list,
             zigzag_index=zigzag_index,
@@ -294,42 +351,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             reverse_split_len=reverse_split_len,
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=max_rank_len,
-            kv_len_prev_tensor=torch.tensor(
-                kv_len_prev_list, device=device, dtype=torch.int32
-            ),
-            kv_len_next_tensor=torch.tensor(
-                kv_len_next_list, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_kv_prev_tensor=torch.tensor(
-                cu_kv_prev, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_kv_next_tensor=torch.tensor(
-                cu_kv_next, device=device, dtype=torch.int32
-            ),
-            actual_seq_q_prev_tensor=torch.tensor(
-                actual_seq_q_prev_list, device=device, dtype=torch.int32
-            ),
-            actual_seq_q_next_tensor=torch.tensor(
-                actual_seq_q_next_list, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_q_prev_tensor=torch.tensor(
-                cu_prev, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_q_next_tensor=torch.tensor(
-                cu_next, device=device, dtype=torch.int32
-            ),
-            actual_seq_q_combined_tensor=torch.tensor(
-                actual_seq_q_combined_list, device=device, dtype=torch.int32
-            ),
-            kv_len_combined_tensor=torch.tensor(
-                kv_len_combined_list, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_q_combined_tensor=torch.tensor(
-                cu_q_combined, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_kv_combined_tensor=torch.tensor(
-                cu_kv_combined, device=device, dtype=torch.int32
-            ),
+            **_lists_to_device(device_lists, device),
             total_q_prev_tokens=cu_prev[-1],
             total_q_next_tokens=cu_next[-1],
             max_seqlen_q_prev=(
@@ -425,10 +447,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         meta = forward_batch.attn_cp_metadata
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
+        queries = q if isinstance(q, tuple) else (q,)
 
         if attention_backend == CPAttentionBackendKind.FLASHINFER:
+            assert not isinstance(q, tuple)
             result = attn_fn(q[:logical_tokens])
         elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+            assert not isinstance(q, tuple)
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,
@@ -438,8 +463,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 use_zigzag_page_table=True,
             )
         else:
-            q_prev = q[: meta.total_q_prev_tokens]
-            q_next = q[meta.total_q_prev_tokens : logical_tokens]
+            # MLA passes separate query components to avoid concatenating them just
+            # to split the token dimension. Slice every component identically.
+            q_prev = tuple(t[: meta.total_q_prev_tokens] for t in queries)
+            q_next = tuple(
+                t[meta.total_q_prev_tokens : logical_tokens] for t in queries
+            )
+            if not isinstance(q, tuple):
+                q_prev, q_next = q_prev[0], q_next[0]
             result_prev = attn_fn(
                 q_prev,
                 meta.cu_seqlens_q_prev_tensor,
@@ -454,7 +485,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
-        pad_size = q.shape[0] - logical_tokens
+        pad_size = queries[0].shape[0] - logical_tokens
         assert pad_size >= 0
         if pad_size > 0:
             result = torch.cat(
@@ -468,15 +499,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
-        if swa_loc is not None:
-            swa_loc = swa_loc[: cache_loc.shape[0]]
         k_dim = k.shape[-1]
         v_dim = v.shape[-1]
         kv_cache = torch.cat([k, v], dim=-1).contiguous()
@@ -487,7 +511,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         value_cache_full = value_cache_full.contiguous()
         get_kv_layers().layer(layer.layer_id).store(
             layer,
-            KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
+            KVWriteLoc.for_layer(forward_batch, layer, window_locs=window_locs),
             key_cache_full,
             value_cache_full,
             layer.k_scale,

@@ -10,6 +10,7 @@ from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -25,7 +26,6 @@ from sglang.srt.models.qwen3_moe import (
 )
 from sglang.srt.models.utils import apply_qk_norm, enable_fused_set_kv_buffer
 from sglang.srt.runtime_context import attention_backends, get_exec, get_parallel
-from sglang.srt.utils import add_prefix, set_weight_attrs
 
 
 class FlintMLP(Qwen2MoeMLP):

@@ -84,7 +84,7 @@ def wo_a_fp8_block32_enabled() -> bool:
 
 
 def use_fused_qk_norm_rope(attn) -> bool:
-    return bool(envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get() and attn.q_head_norm)
+    return bool(attn.q_head_norm)
 
 
 def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
@@ -182,9 +182,23 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
+    # Whether the layer can take the fused boundary; fused_boundary_this_step picks
+    # the step's path. The AMD monokernel checks this at attach.
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+
+
+def fused_boundary_this_step(forward_batch) -> bool:
+    """Whether this step's hc_boundary_fused layers take the fused mHC boundary.
+
+    Mega-mHC runs the seam from forward_hc_pre_from_prev instead; running both would
+    apply the same post twice. _post_fusion takes Mega-mHC on prefill only, so every
+    other step keeps the fused boundary.
+    """
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
+        return True
+    return not forward_batch.forward_mode.is_extend_without_speculative()
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:

@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt.configs.points_v15_chat import POINTSV15ChatConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -18,7 +19,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionPatchMerger, Qwen2VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix
 
 
 class Qwen2VisionTransformerForNavitPOINTS(Qwen2VisionTransformer):
