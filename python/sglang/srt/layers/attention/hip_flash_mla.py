@@ -71,11 +71,13 @@ def aiter_sparse_decode_fwd(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     csr_cache: Optional[dict] = None,
+    q_rope_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **_,
 ):
     """aiter's gfx950 gluon sparse decode kernel (pa_decode_sparse) behind the
     flash_mla_with_kvcache shapes. Only -1 entries are skipped, so callers fold
-    topk_length into the index lists; inv_rope folds the model's inverse RoPE into the output."""
+    topk_length into the index lists; inv_rope folds the model's inverse RoPE into the output.
+    q_rope_freqs (interleaved layouts only): q is unroped and gets its RoPE in the q quant."""
     if hip_kv_layout_interleaved():
         from sglang.kernels.ops.attention.dsv4.opus_v41_attention_hip import (
             opus_v41_sparse_attention,
@@ -95,10 +97,12 @@ def aiter_sparse_decode_fwd(
                 extra_topk_length if extra_k_cache is not None else None
             ),
             csr_cache=csr_cache,
+            q_rope_freqs=q_rope_freqs,
         )
         if inv_rope is not None:
             _apply_inverse_rope(out, inv_rope)
         return out.view(b, s, h, d), None
+    assert q_rope_freqs is None, "only the interleaved route ropes q in its quant"
     if k_cache.shape[-1] in (
         KVLayout.V41.bytes_per_token,
         KVLayout.V41_FP4.bytes_per_token,

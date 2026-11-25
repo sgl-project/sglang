@@ -11,17 +11,36 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.q_rope_quant_hip import rope_fp8_grid_quantize
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quantize
 
 # up to this many query tokens every CSR program sums the preceding lengths itself
 _CSR_INLINE_MAX_TOKENS = 4096
+# past that, a scan kernel writes each row's offset inside its block of rows and the block
+# totals; a CSR program adds the totals of the preceding blocks
+_CSR_BLOCK_ROWS = 256
+_CSR_NUM_WARPS = 4
+
+
+@triton.jit
+def _csr_block_scan_kernel(
+    lengths_ptr, local_ptr, sums_ptr, n, WIDTH: tl.constexpr, BLOCK: tl.constexpr
+):
+    """Per block of rows: the exclusive prefix of the clamped lengths inside it, and its total."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(lengths_ptr + offs, mask=offs < n, other=0)
+    v = tl.minimum(tl.maximum(v, 0), WIDTH)
+    inc = tl.cumsum(v, axis=0)
+    tl.store(local_ptr + offs, inc - v, mask=offs < n)
+    tl.store(sums_ptr + tl.program_id(0), tl.sum(v))
 
 
 @triton.jit
 def _dense_to_csr_kernel(
     indices_ptr,
     lengths_ptr,
-    starts_ptr,
+    local_starts_ptr,
+    block_sums_ptr,
     out_indices_ptr,
     out_indptr_ptr,
     n,
@@ -30,6 +49,8 @@ def _dense_to_csr_kernel(
     BLOCK_W: tl.constexpr,
     BLOCK_N: tl.constexpr,
     INLINE_STARTS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCKS_POW2: tl.constexpr,
 ):
     """Row t: its first min(lengths[t], WIDTH) entries to out_indices[start:], negative
     entries (pad rows) clamped to row 0; out_indptr[t + 1] = start + that count."""
@@ -39,7 +60,10 @@ def _dense_to_csr_kernel(
         prev = tl.load(lengths_ptr + offs_n, mask=offs_n < t, other=0)
         start = tl.sum(tl.minimum(tl.maximum(prev, 0), WIDTH))
     else:
-        start = tl.load(starts_ptr + t)
+        b = t // BLOCK_ROWS
+        offs_b = tl.arange(0, BLOCKS_POW2)
+        start = tl.sum(tl.load(block_sums_ptr + offs_b, mask=offs_b < b, other=0))
+        start += tl.load(local_starts_ptr + t)
     length = tl.minimum(tl.maximum(tl.load(lengths_ptr + t), 0), WIDTH)
     for c in tl.static_range(0, WIDTH, BLOCK_W):
         offs = c + tl.arange(0, BLOCK_W)
@@ -72,15 +96,20 @@ def dense_to_csr(
         indptr.zero_()
         return out_indices, indptr
     inline = n <= _CSR_INLINE_MAX_TOKENS
+    blocks = triton.cdiv(n, _CSR_BLOCK_ROWS)
     if inline:
-        starts = lengths
+        local_starts = block_sums = lengths
     else:
-        clamped = lengths.clamp(0, width)
-        starts = (torch.cumsum(clamped, 0, dtype=torch.int32) - clamped).contiguous()
+        local_starts = torch.empty(n, dtype=torch.int32, device=indices.device)
+        block_sums = torch.empty(blocks, dtype=torch.int32, device=indices.device)
+        _csr_block_scan_kernel[(blocks,)](
+            lengths, local_starts, block_sums, n, WIDTH=width, BLOCK=_CSR_BLOCK_ROWS
+        )
     _dense_to_csr_kernel[(n,)](
         indices,
         lengths,
-        starts,
+        local_starts,
+        block_sums,
         out_indices,
         indptr,
         n,
@@ -89,7 +118,9 @@ def dense_to_csr(
         BLOCK_W=min(512, triton.next_power_of_2(width)),
         BLOCK_N=triton.next_power_of_2(n) if inline else 1,
         INLINE_STARTS=inline,
-        num_warps=4,
+        BLOCK_ROWS=_CSR_BLOCK_ROWS,
+        BLOCKS_POW2=1 if inline else triton.next_power_of_2(blocks),
+        num_warps=_CSR_NUM_WARPS,
     )
     return out_indices, indptr
 
@@ -137,17 +168,22 @@ def opus_v41_sparse_attention(
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     csr_cache: Optional[dict] = None,
+    q_rope_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """q [n, h, 512] bf16 over the first topk_length[t] slots of indices[t] in the SWA
     cache, then those of extra_indices[t] in the compressed cache; returns [n, h, 512] bf16.
-    csr_cache (one forward's dict) keeps the SWA lists' CSR, which every layer shares."""
+    csr_cache (one forward's dict) keeps the SWA lists' CSR, which every layer shares.
+    q_rope_freqs=(freqs_real, positions): q's rope tail is not yet rotated; the q quant does it."""
     mla_sparse_prefill_v41 = aiter_mla_sparse_prefill_v41()
 
     n, h, d = q.shape
     assert d == 512 and q.dtype == torch.bfloat16
     if n == 0:
         return torch.empty_like(q)
-    q8, q_scale = fp8_grid_quantize(q.reshape(n * h, d))
+    if q_rope_freqs is not None:
+        q8, q_scale = rope_fp8_grid_quantize(q, *q_rope_freqs)
+    else:
+        q8, q_scale = fp8_grid_quantize(q.reshape(n * h, d))
     q8 = q8.view(n, h, d)
     q_scale = q_scale.view(n, h, d // 32)
     swa_values, swa_scales = _rows(k_cache)
