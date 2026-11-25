@@ -17,22 +17,40 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruc
 
 By default, the metrics server will run on `127.0.0.1:30000`.
 
-2. Start the monitoring stack:
+2. Start the monitoring stack, choosing a Grafana admin password. Put the
+   password in a `.env` file next to `docker-compose.yaml` (the repository's
+   `.gitignore` already excludes `.env`), so every later `docker compose`
+   command (`ps`, `logs`, `down`) can read it too:
 
 ```bash
 cd examples/monitoring
+(umask 077; echo "GRAFANA_ADMIN_PASSWORD='<a strong password>'" > .env)
 docker compose up
 ```
+
+Exporting `GRAFANA_ADMIN_PASSWORD` in your shell works as well. Every
+`docker compose` command for this stack fails while the variable is unset.
+
+Grafana applies `GRAFANA_ADMIN_PASSWORD` only when it first creates its
+database. To change the password later, change it in Grafana under your
+profile, or reset it in place:
+
+```bash
+docker compose exec grafana grafana cli admin reset-admin-password '<new password>'
+```
+
+Then update `.env` to match. Do not change it by running `docker compose down`
+and starting again: this example does not persist Grafana's database or
+Prometheus's data, so that discards the dashboards, users and alert rules you
+created in Grafana and the metric history Prometheus collected.
 
 3. Access the monitoring interfaces:
    - Grafana: [http://localhost:3000](http://localhost:3000)
    - Prometheus: [http://localhost:9090](http://localhost:9090)
 
-Default Grafana login credentials:
-- Username: `admin`
-- Password: `admin`
+Log in to Grafana as `admin` with the password you set. Dashboards are also visible without logging in.
 
-You'll be prompted to change the password on first login.
+Grafana and Prometheus listen on `127.0.0.1` only. To view them from another machine, use an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 <host>`) instead of exposing the ports.
 
 4. The SGLang dashboard will be automatically available in the "SGLang Monitoring" folder.
 
