@@ -2033,6 +2033,110 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_llm_d_trust_preserves_top_level_input_ids(self):
+        """Trusted forwarding must still accept pretokenized chat from existing clients."""
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            for params in (None, {"do_remote_prefill": True}):
+                with self.subTest(params=params):
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        input_ids=[10, 20],
+                        kv_transfer_params=params,
+                    )
+                    adapted, _ = self.chat._convert_to_internal_request(
+                        req, self.fastapi_request
+                    )
+                    self.assertEqual(adapted.input_ids, [10, 20])
+
+    def test_llm_d_legacy_thinking_uses_worker_prefix(self):
+        """A legacy worker that inserts <think> must serve the complete prompt."""
+        self.template_manager.chat_template_name = "chatml"
+        self.chat.reasoning_parser = "deepseek-r1"
+        self.chat._reasoning_detector = ReasoningParser("deepseek-r1").detector
+        self.tm.model_config.token_id_vocab_size = 100
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            kv_transfer_params={"prompt_token_ids": [10, 20]},
+        )
+
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            actual = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertTrue(actual.prompt.endswith("<think>"))
+        self.assertEqual(actual.prompt_ids, [1, 2, 3, 4, 5])
+
+    def test_llm_d_vlm_preserves_text_tokenization_with_bos(self):
+        """A text-only VLM request still goes through its BOS-adding tokenizer."""
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.architectures = ["LlavaForConditionalGeneration"]
+        self.tm.model_config.token_id_vocab_size = 100
+        self.template_manager.chat_template_name = None
+        self.chat._prompt_text_round_trip_is_lossy = False
+        self.chat._tokenizer_auto_adds_specials = True
+        self.tm.tokenizer.apply_chat_template.return_value = "Hi"
+        self.tm.tokenizer.decode.return_value = "Hi"
+        self.basic_req.kv_transfer_params = {"prompt_token_ids": [20]}
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.text, "Hi")
+        self.assertIsNone(adapted.input_ids)
+
+    def test_llm_d_preserves_tool_parser_encoder(self):
+        """Forwarded checkpoint tokens must not replace a parser-selected prompt."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.model_config.hf_config.architectures = ["DeepseekV32ForCausalLM"]
+        self.tm.tokenizer.chat_template = "{{ messages[0].content }}"
+        self.tm.model_config.token_id_vocab_size = 100
+        self.chat.tool_call_parser = "deepseekv32"
+        self.chat.chat_encoding_spec = self.chat._resolve_chat_encoding_spec()
+        self.basic_req.kv_transfer_params = {"prompt_token_ids": [20]}
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            result = self.chat._process_messages(self.basic_req, is_multimodal=False)
+        self.assertEqual(result.prompt_ids, [1, 2, 3, 4, 5])
+        self.assertIn("<｜User｜>", self.tm.tokenizer.encode.call_args.args[0])
+
+    def test_llm_d_named_template_uses_worker_selection(self):
+        """An unlabelled forwarded prompt cannot override the selected HF template."""
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.token_id_vocab_size = 100
+        self.tm.tokenizer.apply_chat_template.return_value = [3, 4, 5]
+        self.chat._prompt_text_round_trip_is_lossy = True
+        self.basic_req.kv_transfer_params = {"prompt_token_ids": [20]}
+        with get_context().override_server_args(
+            hf_chat_template_name="rag", trust_llm_d_prompt_token_ids=True
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, [3, 4, 5])
+
+    def test_llm_d_beam_continuation_keeps_final_channel_opener(self):
+        """Forwarding a continuation must preserve Beam's answer-channel tokens."""
+        self.tm._config_overrides["reasoning_parser"] = "beam"
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.token_id_vocab_size = 100
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat._prompt_text_round_trip_is_lossy = True
+        self.tm.tokenizer.apply_chat_template.return_value = [10]
+        self.tm.tokenizer.decode.return_value = "<|start|>assistant"
+        self.tm.tokenizer.encode.side_effect = {
+            "<|channel|>final<|message|>The capital is ": [30, 20],
+            "The capital is ": [20],
+        }.__getitem__
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Capital?"},
+                {"role": "assistant", "content": "The capital is "},
+            ],
+            continue_final_message=True,
+            kv_transfer_params={"prompt_token_ids": [10, 20]},
+        )
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            result = self.chat._process_messages(request, False)
+        self.assertEqual(result.prompt_ids, [10, 30, 20])
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         _use_chat_encoding(self.chat, "kimi_k3")
         ret = [
@@ -2282,6 +2386,30 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(req.reasoning_effort, "medium")
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
+
+    def test_llm_d_hunyuan_tokens_require_matching_worker_parser(self):
+        """A Hunyuan prompt uses the worker's actual parser configuration."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.tm.tokenizer.encode.return_value = [1, 2, 3]
+        self.tm.model_config.token_id_vocab_size = 100
+
+        with get_context().override_server_args(trust_llm_d_prompt_token_ids=True):
+            for parser, expected in ((None, [1, 2, 3]), ("hunyuan", [10, 20])):
+                with self.subTest(parser=parser):
+                    self.chat.reasoning_parser = parser
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        reasoning_effort="none",
+                        kv_transfer_params={"prompt_token_ids": [10, 20]},
+                    )
+                    actual = self.chat._process_messages(request, is_multimodal=False)
+                    self.assertEqual(actual.prompt_ids, expected)
 
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"

@@ -1,0 +1,371 @@
+use std::collections::{HashMap, VecDeque};
+
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use serde_json::Value;
+use sglang_processor::dynamo_tokenizers::{DecodeStream, EncodeSegment, Tokenizer};
+use sglang_processor::{
+    ChatFormatter, ChatFormatterOptions, DynamoTokenizer, OneOrMany, TemplateArgs, TextTokenizer,
+};
+
+fn invalid(error: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+#[pyclass(frozen, module = "sglang_processor._native")]
+struct ChatProcessor {
+    formatter: ChatFormatter,
+    tokenizer: DynamoTokenizer,
+    default_kwargs: HashMap<String, Value>,
+}
+
+#[pymethods]
+impl ChatProcessor {
+    #[new]
+    #[pyo3(signature = (model_dir, chat_template=None, *, default_kwargs_json=None, tool_call_parser=None))]
+    fn new(
+        py: Python<'_>,
+        model_dir: String,
+        chat_template: Option<String>,
+        default_kwargs_json: Option<&str>,
+        tool_call_parser: Option<&str>,
+    ) -> PyResult<Self> {
+        py.detach(|| {
+            let (formatter, error) = ChatFormatterOptions {
+                tokenizer_path: model_dir.clone(),
+                model_path: model_dir.clone(),
+                chat_template,
+                ..Default::default()
+            }
+            .select_for_tool_parser(tool_call_parser);
+            Ok(Self {
+                formatter: formatter.ok_or_else(|| {
+                    invalid(error.unwrap_or_else(|| "missing chat template".into()))
+                })?,
+                default_kwargs: default_kwargs_json
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(invalid)?
+                    .unwrap_or_default(),
+                tokenizer: DynamoTokenizer::load(&model_dir, None).map_err(invalid)?,
+            })
+        })
+    }
+
+    #[getter]
+    fn template_stops(&self) -> Vec<String> {
+        match self.formatter.stop_strs() {
+            Some(OneOrMany::One(stop)) => vec![stop],
+            Some(OneOrMany::Many(stops)) => stops,
+            None => Vec::new(),
+        }
+    }
+
+    #[getter]
+    fn unreported_prompt_tokens(&self) -> u64 {
+        sglang_processor::openai::ChatModel::for_formatter(&self.formatter)
+            .unreported_prompt_tokens()
+    }
+
+    fn token_id(&self, token: &str) -> PyResult<Option<u32>> {
+        let tokenizer = self.tokenizer.tokenizer_without_specials();
+        if let Ok(id) = tokenizer.token_to_id(token) {
+            return Ok(id);
+        }
+        // Backends without vocabulary lookup can still encode a named special token.
+        let ids = tokenizer
+            .encode_segments(&[EncodeSegment::new(token, true)])
+            .map_err(invalid)?;
+        Ok(match ids.token_ids() {
+            &[id] if tokenizer.decode(&[id], false).map_err(invalid)?.as_str() == token => Some(id),
+            _ => None,
+        })
+    }
+
+    #[staticmethod]
+    fn supports_reasoning_parser(name: &str) -> bool {
+        sglang_processor::ReasoningStream::supports(name)
+    }
+
+    #[pyo3(signature = (prompt_tail, skip_special_tokens, reasoning_parser=None))]
+    fn decoder(
+        &self,
+        prompt_tail: Vec<u32>,
+        skip_special_tokens: bool,
+        reasoning_parser: Option<&str>,
+    ) -> Decoder {
+        let tokenizer = self.tokenizer.tokenizer_without_specials();
+        let framing = reasoning_parser
+            .filter(|_| skip_special_tokens)
+            .into_iter()
+            .flat_map(sglang_processor::ReasoningStream::framing)
+            .filter_map(|marker| {
+                let encoded = tokenizer
+                    .encode_segments(&[EncodeSegment::new(marker, true)])
+                    .ok()?;
+                let ids = encoded.token_ids();
+                let raw = tokenizer.decode(ids, false).ok()?;
+                let filtered = tokenizer.decode(ids, true).ok()?;
+                let first_id = *ids.first()?;
+                (raw.as_str() == marker && filtered.as_str() != marker).then(|| FramingMarker {
+                    first_id,
+                    text: marker,
+                    // K3 channel names after a skipped control token are
+                    // framing even when generation stops before the separator.
+                    discard_partial: reasoning_parser == Some("kimi_k3")
+                        && tokenizer
+                            .decode(&ids[..1], true)
+                            .is_ok_and(|s| s.as_str().is_empty()),
+                })
+            })
+            .collect();
+        Decoder {
+            tokenizer: tokenizer.clone(),
+            stream: tokenizer.decode_stream(&prompt_tail, skip_special_tokens),
+            framing,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Render and encode one serialized OpenAI chat request.
+    fn encode_chat(&self, py: Python<'_>, request_json: &[u8]) -> PyResult<Vec<u32>> {
+        py.detach(|| {
+            let body: Value = serde_json::from_slice(request_json).map_err(invalid)?;
+            self.encode_body(body)
+        })
+    }
+
+    fn encode_reasoning_chat(
+        &self,
+        py: Python<'_>,
+        request_json: &[u8],
+        name: &str,
+    ) -> PyResult<(Vec<u32>, ReasoningDecoder)> {
+        py.detach(|| {
+            let body: Value = serde_json::from_slice(request_json).map_err(invalid)?;
+            let mut options = self.reasoning_options(name, &body);
+            // The worker receives the request's thinking mode. GLM's rendered
+            // suffix below only adjusts how the output parser splits text.
+            let require_reasoning = options.force_reasoning.unwrap_or(false);
+            let check_glm_prompt = name == "glm45"
+                && body["continue_final_message"] != true
+                && body["add_generation_prompt"] != false;
+            let unary_text = (body["stream"] != true).then(String::new);
+            let ids = self.encode_body(body)?;
+            if check_glm_prompt && let Some(open) = self.glm_prompt_reasoning_open(&ids)? {
+                options.force_reasoning = Some(open);
+            }
+            let parser = sglang_processor::ReasoningStream::new(name, &options)
+                .ok_or_else(|| invalid(format!("unsupported reasoning parser {name}")))?;
+            Ok((
+                ids,
+                ReasoningDecoder {
+                    parser,
+                    unary_text,
+                    require_reasoning,
+                },
+            ))
+        })
+    }
+}
+
+impl ChatProcessor {
+    fn reasoning_options(&self, name: &str, body: &Value) -> sglang_processor::ReasoningOptions {
+        let model = sglang_processor::openai::ChatModel::for_formatter(&self.formatter);
+        let previous = body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .filter(|m| body["continue_final_message"] == true && m["role"] == "assistant");
+        sglang_processor::ReasoningOptions {
+            force_reasoning: model.request_thinking(Some(name), body, &self.default_kwargs),
+            previous_content: previous
+                .and_then(|m| m["content"].as_str())
+                .map(str::to_owned),
+            stream_reasoning: body["stream_reasoning"].as_bool().unwrap_or(true),
+            force_nonempty_content: body["chat_template_kwargs"]["force_nonempty_content"] == true,
+        }
+    }
+
+    /// GLM templates can open or close reasoning regardless of request flags.
+    /// Extend the decoded tail only when whitespace or a split marker requires it.
+    fn glm_prompt_reasoning_open(&self, ids: &[u32]) -> PyResult<Option<bool>> {
+        let mut width = 16;
+        loop {
+            let start = ids.len().saturating_sub(width);
+            let tail = self
+                .tokenizer
+                .tokenizer()
+                .decode(&ids[start..], false)
+                .map_err(invalid)?;
+            let suffix = tail.as_str().trim_end();
+            if suffix.ends_with("<think>") {
+                return Ok(Some(true));
+            }
+            if suffix.ends_with("</think>") {
+                return Ok(Some(false));
+            }
+            let suffix = suffix.trim_start_matches('\u{fffd}');
+            if start == 0 || !("<think>".ends_with(suffix) || "</think>".ends_with(suffix)) {
+                return Ok(None);
+            }
+            width *= 2;
+        }
+    }
+
+    fn encode_body(&self, mut body: Value) -> PyResult<Vec<u32>> {
+        let defaults = &self.default_kwargs;
+        let render_generic = |body: Value| {
+            let args = TemplateArgs::new(&body, defaults);
+            let typed = serde_json::from_value(body).map_err(invalid)?;
+            self.formatter
+                .render_template(&typed, &args)
+                .map_err(invalid)
+        };
+        if let Some(ids) = self.formatter.take_and_encode_request(&mut body, defaults) {
+            return ids.map_err(invalid);
+        }
+        // Only formatters without a model-specific request renderer use the
+        // generic template. A model-specific decline must reach the caller.
+        let (prompt, continuation) = match &self.formatter {
+            ChatFormatter::HuggingFace { .. } => {
+                match self.formatter.render_text_jinja(&body, defaults) {
+                    // Non-text callers retain the generic template's tool/media support.
+                    Err(sglang_processor::TemplateError::NeedsRenderFallback { .. }) => {
+                        render_generic(body)
+                    }
+                    rendered => rendered.map_err(invalid),
+                }
+            }
+            ChatFormatter::Native { .. }
+            | ChatFormatter::KimiK25 { .. }
+            | ChatFormatter::Legacy(_) => render_generic(body),
+            formatter => formatter.render_request(body, defaults).map_err(invalid),
+        }?;
+        let ids = if matches!(
+            self.formatter,
+            ChatFormatter::Legacy(_) | ChatFormatter::DeepSeekV32
+        ) {
+            // Both worker paths encode the prompt with tokenizer defaults.
+            self.tokenizer
+                .encode(prompt.as_str(), true)
+                .and_then(|mut ids| {
+                    self.tokenizer
+                        .append_chat_continuation(&mut ids, &continuation)?;
+                    Ok(ids)
+                })
+        } else {
+            let segments = prompt
+                .encode_segments()
+                .unwrap_or_else(|| vec![EncodeSegment::new(prompt.as_str(), true)]);
+            self.tokenizer.encode_chat(&segments, &continuation)
+        }
+        .map_err(invalid)?;
+        ids.into_iter()
+            .map(|id| u32::try_from(id).map_err(invalid))
+            .collect()
+    }
+}
+
+#[pyclass(module = "sglang_processor._native")]
+struct ReasoningDecoder {
+    parser: sglang_processor::ReasoningStream,
+    unary_text: Option<String>,
+    #[pyo3(get)]
+    require_reasoning: bool,
+}
+
+#[pymethods]
+impl ReasoningDecoder {
+    fn push(&mut self, text: &str, finished: bool) -> (String, String) {
+        let Some(buffer) = &mut self.unary_text else {
+            return self.parser.push(text, finished);
+        };
+        buffer.push_str(text);
+        if finished {
+            self.parser.parse(buffer)
+        } else {
+            Default::default()
+        }
+    }
+}
+
+struct FramingMarker {
+    first_id: u32,
+    text: &'static str,
+    discard_partial: bool,
+}
+
+/// One incremental decoder per generation. Token boundaries can split UTF-8.
+#[pyclass(module = "sglang_processor._native")]
+struct Decoder {
+    tokenizer: Tokenizer,
+    stream: DecodeStream,
+    framing: Vec<FramingMarker>,
+    pending: VecDeque<u32>,
+}
+
+#[pymethods]
+impl Decoder {
+    fn push(&mut self, ids: Vec<u32>, finished: bool) -> PyResult<String> {
+        let mut text = String::new();
+        if self.framing.is_empty() {
+            for id in ids {
+                text.extend(self.stream.step(id).map_err(invalid)?);
+            }
+        } else {
+            for id in ids {
+                self.pending.push_back(id);
+                self.decode_pending(false, &mut text)?;
+            }
+            if finished {
+                self.decode_pending(true, &mut text)?;
+            }
+        }
+        if finished {
+            text.extend(self.stream.finish().map_err(invalid)?);
+        }
+        Ok(text)
+    }
+}
+
+impl Decoder {
+    /// Pass complete parser markers through even when they span multiple
+    /// tokens. Decode every other token with the caller's normal skip setting.
+    fn decode_pending(&mut self, finished: bool, text: &mut String) -> PyResult<()> {
+        while let Some(&id) = self.pending.front() {
+            let mut candidates = self.framing.iter().filter(|m| m.first_id == id).peekable();
+            if candidates.peek().is_some() {
+                // The model can spell a channel name with several different
+                // token sequences after the same opening control token.
+                let raw = self
+                    .tokenizer
+                    .decode(self.pending.make_contiguous(), false)
+                    .map_err(invalid)?;
+                let spelling = raw.as_str();
+                if let Some(marker) = candidates.find(|m| m.text.starts_with(spelling)) {
+                    if marker.text == spelling {
+                        text.extend(self.stream.finish().map_err(invalid)?);
+                        text.push_str(marker.text);
+                        self.pending.clear();
+                        break;
+                    }
+                    if !finished {
+                        break;
+                    }
+                    if marker.discard_partial {
+                        self.pending.clear();
+                        break;
+                    }
+                }
+            }
+            self.pending.pop_front();
+            text.extend(self.stream.step(id).map_err(invalid)?);
+        }
+        Ok(())
+    }
+}
+
+#[pymodule]
+fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<ChatProcessor>()
+}

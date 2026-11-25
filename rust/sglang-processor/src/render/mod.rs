@@ -58,8 +58,7 @@ pub enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-/// A chat prompt formatter: either the model's HuggingFace Jinja template or a
-/// legacy SGLang conversation template.
+/// A model's chat formatter, selected from its template or native encoder.
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace {
@@ -68,11 +67,21 @@ pub enum ChatFormatter {
         /// The template's own errors for a developer turn, which Dynamo would
         /// render as a system turn instead.
         developer_errors: DeveloperErrors,
+        content_parts: Option<bool>,
+        message_context: String,
+        effort: reasoning::JinjaEffort,
+    },
+    /// A native Dynamo encoder selected by model identity, without a Jinja template.
+    Native {
+        formatter: PromptFormatter,
+        thinking: ThinkingTemplates,
     },
     KimiK25 {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
     },
+    /// DeepSeek-V3.2 without a checkpoint template.
+    DeepSeekV32,
     /// DeepSeek-V4 through deepseek-recipe, with the checkpoint tokenizer when known.
     DeepSeekV4(Option<Arc<DeepSeekTokenizer>>),
     /// DeepSeek-V4.1 through deepseek-recipe, with the checkpoint tokenizer when known.
@@ -142,7 +151,8 @@ impl ChatFormatter {
                     message: QWEN38_DEVELOPER_ERROR.to_owned(),
                 })
             }
-            ChatFormatter::Glm53(formatter)
+            ChatFormatter::Native { formatter, .. }
+            | ChatFormatter::Glm53(formatter)
             | ChatFormatter::MiniMaxM3 { formatter, .. }
             | ChatFormatter::Qwen38 { formatter, .. }
             | ChatFormatter::Step3p5 { formatter, .. } => render_oai(formatter, request),
@@ -173,6 +183,13 @@ impl ChatFormatter {
             }
             ChatFormatter::KimiK3 => {
                 KimiK3Formatter::new(true)
+                    .render_prompt(request)
+                    .map_err(|error| TemplateError::Renderer {
+                        message: error.to_string(),
+                    })
+            }
+            ChatFormatter::DeepSeekV32 => {
+                dynamo_renderer::deepseek::v32::DeepSeekV32Formatter::new_chat()
                     .render_prompt(request)
                     .map_err(|error| TemplateError::Renderer {
                         message: error.to_string(),
@@ -214,6 +231,9 @@ impl ChatFormatter {
     ) -> Result<(RenderedPrompt, String), TemplateError> {
         let text = |(prompt, prefix)| (RenderedPrompt::text(prompt), prefix);
         match self {
+            ChatFormatter::DeepSeekV32 => {
+                models::render_deepseek_v32(request, default_kwargs).map(text)
+            }
             // recipe renders a continued final message itself, so no prefix follows.
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
                 let v41 = matches!(self, ChatFormatter::DeepSeekV41(_));
@@ -265,10 +285,7 @@ impl ChatFormatter {
             .map(text),
             _ => Err(RenderError::Declined("this formatter's requests".into())),
         }
-        .map_err(|error| match error {
-            RenderError::Declined(message) => TemplateError::NeedsRenderFallback { message },
-            RenderError::Failed(message) => TemplateError::Renderer { message },
-        })
+        .map_err(TemplateError::from)
     }
 
     /// DeepSeek-V4 or V4.1 through deepseek-recipe; `tokenizer_json`, the
@@ -290,7 +307,17 @@ impl ChatFormatter {
     /// whose plain text never parses as special tokens. `None` for the others.
     pub fn encode_request(
         &self,
-        request: Value,
+        mut request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Option<Result<Vec<u32>, TemplateError>> {
+        self.take_and_encode_request(&mut request, default_kwargs)
+    }
+
+    /// Take the body only when the formatter has its own tokenizer. On `None`
+    /// the caller can render the original body without first making a copy.
+    pub fn take_and_encode_request(
+        &self,
+        request: &mut Value,
         default_kwargs: &HashMap<String, Value>,
     ) -> Option<Result<Vec<u32>, TemplateError>> {
         let tokenizer = match self {
@@ -300,7 +327,7 @@ impl ChatFormatter {
             _ => return None,
         };
         Some(
-            self.render_request(request, default_kwargs)
+            self.render_request(request.take(), default_kwargs)
                 .and_then(|(prompt, _)| {
                     tokenizer
                         .encode(&prompt)
@@ -339,7 +366,9 @@ impl ChatFormatter {
     pub fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
             ChatFormatter::HuggingFace { .. }
+            | ChatFormatter::Native { .. }
             | ChatFormatter::KimiK25 { .. }
+            | ChatFormatter::DeepSeekV32
             | ChatFormatter::DeepSeekV4(_)
             | ChatFormatter::DeepSeekV41(_)
             | ChatFormatter::Glm53(_)
@@ -357,6 +386,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::Glm53(_) => true,
             ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::Native { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
             | ChatFormatter::Step3p5 { thinking, .. } => {
                 thinking.default_policy() == ThinkingPolicy::Always
@@ -372,6 +402,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::Qwen38 { .. } => Some(("enable_thinking", true)),
             ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::Native { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
             | ChatFormatter::Step3p5 { thinking, .. } => match thinking.default_policy() {
                 ThinkingPolicy::TemplateToggle {
@@ -394,6 +425,7 @@ impl ChatFormatter {
     ) -> Option<bool> {
         match self {
             ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::Native { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
             | ChatFormatter::Qwen38 { thinking, .. }
             | ChatFormatter::Step3p5 { thinking, .. } => thinking
@@ -402,7 +434,9 @@ impl ChatFormatter {
             ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
+            ChatFormatter::DeepSeekV32
+            | ChatFormatter::DeepSeekV4(_)
+            | ChatFormatter::DeepSeekV41(_) => {
                 let enabled = deepseek_v4_thinking(
                     &serde_json::json!({ "chat_template_kwargs": args }),
                     &HashMap::new(),
@@ -511,6 +545,15 @@ pub(crate) enum RenderError {
     Declined(String),
     /// An invalid request, or one the template rejects.
     Failed(String),
+}
+
+impl From<RenderError> for TemplateError {
+    fn from(error: RenderError) -> Self {
+        match error {
+            RenderError::Declined(message) => Self::NeedsRenderFallback { message },
+            RenderError::Failed(message) => Self::Renderer { message },
+        }
+    }
 }
 
 impl From<String> for RenderError {

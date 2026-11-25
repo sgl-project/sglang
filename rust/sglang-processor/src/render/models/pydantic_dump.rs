@@ -33,31 +33,36 @@ pub(crate) fn split_continuation(messages: &mut Vec<Value>, continuing: bool) ->
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
-pub(super) fn engine_message(message: Value) -> Value {
-    let mut message = match message {
+pub(crate) fn engine_message(message: Value) -> Value {
+    let mut input = match message {
         Value::Object(message) => message,
         _ => Map::new(),
     };
-    let role = message
+    let role = input
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_lowercase();
-    let kept: &[&str] = if role == "user" {
-        &["content"]
-    } else {
-        &[
-            "content",
+    // model_dump() emits fields in declaration order, including when a
+    // template serializes the entire message with tojson.
+    let content = input.remove("content").filter(|value| !value.is_null());
+    let user = role == "user";
+    let mut message = Map::new();
+    message.insert("role".into(), role.into());
+    message.insert("content".into(), content.unwrap_or_else(|| "".into()));
+    if !user {
+        for key in [
             "tool_call_id",
             "name",
             "reasoning_content",
             "tool_calls",
             "tools",
-        ]
-    };
-    message.retain(|key, value| kept.contains(&key.as_str()) && !value.is_null());
-    message.insert("role".into(), role.into());
-    message.entry("content").or_insert_with(|| "".into());
+        ] {
+            if let Some(value) = input.remove(key).filter(|value| !value.is_null()) {
+                message.insert(key.into(), value);
+            }
+        }
+    }
     if let Some(Value::Array(calls)) = message.get_mut("tool_calls") {
         calls
             .iter_mut()

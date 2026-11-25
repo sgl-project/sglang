@@ -25,6 +25,25 @@ pub fn load_chat_formatter(
     model_type: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
+    let config_path = config_file.map(Path::new);
+    load_chat_formatter_in_dir(
+        config_path,
+        config_path
+            .and_then(Path::parent)
+            .or_else(|| model_path.map(Path::new)),
+        model_path,
+        model_type,
+        chat_template_arg,
+    )
+}
+
+pub(super) fn load_chat_formatter_in_dir(
+    config_path: Option<&Path>,
+    tokenizer_dir: Option<&Path>,
+    model_path: Option<&str>,
+    model_type: Option<&str>,
+    chat_template_arg: Option<&str>,
+) -> Result<ChatFormatter, TemplateError> {
     // Python resolves registry names before looking at the filesystem — and
     // before touching the tokenizer config, so a built-in name works even when
     // `tokenizer_config.json` is absent.
@@ -45,21 +64,26 @@ pub fn load_chat_formatter(
         return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
     }
 
-    // Every remaining source builds the HF renderer around the tokenizer
-    // config (the template itself, or the argument injected into it).
-    let Some(config_file) = config_file else {
-        return Err(TemplateError::MissingConfig);
+    let mut config = match config_path {
+        Some(path) => parse_json(
+            &read_to_string(path, "tokenizer config")?,
+            path,
+            "tokenizer config",
+        )?,
+        None => json!({}),
     };
-
-    let config_path = Path::new(config_file);
-    let config_text = read_to_string(config_path, "tokenizer config")?;
-    let mut config = parse_json(&config_text, config_path, "tokenizer config")?;
-
-    let Some(argument) = chat_template_arg else {
+    let discovered = if chat_template_arg.is_none() {
+        tokenizer_dir.and_then(crate::model_files::discover_chat_template_in_dir)
+    } else {
+        None
+    };
+    let Some(path) = chat_template_arg.map(Path::new).or(discovered.as_deref()) else {
+        if config_path.is_none() {
+            return Err(TemplateError::MissingConfig);
+        }
         return ChatFormatter::from_tokenizer_config_with_type(&config, model_type);
     };
 
-    let path = Path::new(argument);
     if !path.exists() {
         return Err(TemplateError::NotFound {
             path: path.to_path_buf(),
@@ -73,10 +97,19 @@ pub fn load_chat_formatter(
 
     if path.extension().and_then(|extension| extension.to_str()) == Some("jinja") {
         let template = read_to_string(path, "chat template")?;
-        set_chat_template(
-            &mut config,
-            Value::String(template.trim_matches('\n').replace("\\n", "\n")),
-        )?;
+        // HF reads checkpoint templates verbatim. Keep SGLang's escape
+        // handling for explicit files and the legacy loose-file fallback.
+        let hf_template = discovered.is_some()
+            && (path
+                .file_name()
+                .is_some_and(|name| name == "chat_template.jinja")
+                || path.parent() != tokenizer_dir);
+        let template = if hf_template {
+            template
+        } else {
+            template.trim_matches('\n').replace("\\n", "\n")
+        };
+        set_chat_template(&mut config, Value::String(template))?;
         return ChatFormatter::from_tokenizer_config_with_type(&config, model_type);
     }
 
@@ -143,13 +176,27 @@ impl ChatFormatter {
         config: &Value,
         model_type: Option<&str>,
     ) -> Result<Self, TemplateError> {
-        let glm53 = config["chat_template"].as_str().is_some_and(is_glm53);
+        // HF serializes named templates as [{name, template}, ...]. Python's
+        // TemplateManager selects the first entry before detecting its format.
+        // Dynamo expects [{default: source}, ...] instead, so resolve the HF
+        // selection before handing the config to it or wrapping the messages.
+        if let Some(entry) = config["chat_template"].as_array().and_then(|v| v.first())
+            && entry["name"].is_string()
+            && let Some(source) = entry["template"].as_str()
+        {
+            let mut config = config.clone();
+            config["chat_template"] = source.into();
+            return Self::from_tokenizer_config_with_type(&config, model_type);
+        }
+        let source = config["chat_template"].as_str();
+        let content_parts = || source.and_then(super::content_format::takes_content_parts);
+        let glm53 = source.is_some_and(is_glm53);
         let minimax_m3 = model_type.map_or_else(
-            || config["chat_template"].as_str().is_some_and(is_minimax_m3),
+            || source.is_some_and(is_minimax_m3),
             |model_type| model_type == "minimax_m3_vl",
         );
-        let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
-        let step3p5 = config["chat_template"].as_str().is_some_and(is_step3p5);
+        let qwen38 = source.filter(|t| is_qwen38(t));
+        let step3p5 = source.is_some_and(is_step3p5);
         let thinking = ThinkingTemplates::from_config(config);
         let mut render_config = config.clone();
         let message_context = if glm53 {
@@ -158,6 +205,8 @@ impl ChatFormatter {
             preserve_messages(&mut render_config, "__sglang_minimax_m3_messages")
         } else if qwen38.is_none() && step3p5 {
             preserve_messages(&mut render_config, "__sglang_step3p5_messages")
+        } else if qwen38.is_none() {
+            preserve_messages(&mut render_config, "__sglang_chat_messages")
         } else {
             String::new()
         };
@@ -181,12 +230,8 @@ impl ChatFormatter {
             Self::MiniMaxM3 {
                 formatter,
                 message_context,
-                xml_arguments: config["chat_template"]
-                    .as_str()
-                    .is_some_and(prints_arguments_as_xml),
-                content_parts: config["chat_template"]
-                    .as_str()
-                    .and_then(super::content_format::takes_content_parts),
+                xml_arguments: source.is_some_and(prints_arguments_as_xml),
+                content_parts: content_parts(),
             }
         } else if let Some(template) = qwen38 {
             Self::Qwen38 {
@@ -199,9 +244,7 @@ impl ChatFormatter {
                 formatter,
                 thinking,
                 message_context,
-                content_parts: config["chat_template"]
-                    .as_str()
-                    .and_then(super::content_format::takes_content_parts),
+                content_parts: content_parts(),
             }
         } else {
             let developer_errors = DeveloperErrors::probe(config, &formatter);
@@ -209,6 +252,11 @@ impl ChatFormatter {
                 formatter,
                 thinking,
                 developer_errors,
+                content_parts: content_parts(),
+                message_context,
+                effort: source.map_or_else(super::reasoning::JinjaEffort::default, |source| {
+                    super::reasoning::JinjaEffort::detect(source, thinking.default_policy())
+                }),
             }
         })
     }
@@ -354,6 +402,50 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    /// Named HF templates must render like Python's selected first template,
+    /// including normalization of text parts before the template sees them.
+    #[test]
+    fn named_hf_templates_render_text_and_parts() {
+        use std::collections::HashMap;
+
+        use serde_json::json;
+
+        for (source, expected) in [
+            (
+                "{% for m in messages %}{{ m.content }}{% endfor %}",
+                "hi there",
+            ),
+            (
+                "{% for m in messages %}{% if m.content is string %}{{ m.content }}{% else %}{% for part in m.content %}{{ part.text }}{% endfor %}{% endif %}{% endfor %}",
+                "hithere",
+            ),
+        ] {
+            for name in ["default", "custom"] {
+                let formatter = ChatFormatter::from_tokenizer_config(&json!({
+                    "chat_template": [
+                        {"name": name, "template": source},
+                        {"name": if name == "default" { "tool_use" } else { "default" },
+                         "template": "WRONG TEMPLATE"}
+                    ]
+                }))
+                .unwrap();
+                for (content, expected) in [
+                    (json!("hi there"), "hi there"),
+                    (
+                        json!([{"type":"text","text":"hi"}, {"type":"text","text":"there"}]),
+                        expected,
+                    ),
+                ] {
+                    let body = json!({"messages": [{"role":"user", "content":content}]});
+                    let (prompt, prefix) =
+                        formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+                    assert_eq!(prompt.as_str(), expected, "{name}: {source}");
+                    assert!(prefix.is_empty());
+                }
+            }
+        }
     }
 
     /// A DeepSeek-V3.2 checkpoint's own template wins over the native encoder, as in Python.

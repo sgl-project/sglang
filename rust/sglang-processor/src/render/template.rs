@@ -22,6 +22,40 @@ pub struct TemplateArgs {
 }
 
 impl TemplateArgs {
+    fn check_jinja_kwargs(kwargs: &mut HashMap<String, Value>) -> Result<(), TemplateError> {
+        if let Some(key) = [
+            "conversation",
+            "tools",
+            "add_generation_prompt",
+            "tokenize",
+            "return_dict",
+        ]
+        .into_iter()
+        .find(|key| kwargs.contains_key(*key))
+        {
+            return Err(TemplateError::Renderer {
+                message: format!(
+                    "chat_template_kwargs duplicates apply_chat_template argument {key}"
+                ),
+            });
+        }
+        // The HuggingFace call always opens a generation prompt and requests
+        // plain text or token IDs without an assistant mask.
+        for key in ["continue_final_message", "return_assistant_tokens_mask"] {
+            if kwargs
+                .remove(key)
+                .is_some_and(|value| minijinja::Value::from_serialize(value).is_true())
+            {
+                return Err(TemplateError::Renderer {
+                    message: format!(
+                        "chat_template_kwargs.{key} is incompatible with chat rendering"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The server `defaults`, under the request effort's thinking toggle, under its own
     /// `chat_template_kwargs`; a default effort wins (`_convert_to_internal_request`).
     pub fn new(body: &Value, defaults: &HashMap<String, Value>) -> Self {
@@ -51,7 +85,104 @@ impl TemplateArgs {
     }
 }
 
+/// Normalize text content before splitting an assistant continuation, as
+/// process_content_for_template_format does on the Python worker.
+pub(super) fn text_messages(
+    body: &Value,
+    content_parts: Option<bool>,
+) -> Result<Vec<Value>, super::RenderError> {
+    if body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(super::RenderError::Declined("chat tools".into()));
+    }
+    let mut messages: Vec<_> = body["messages"]
+        .as_array()
+        .ok_or_else(|| "expected chat messages".to_owned())?
+        .iter()
+        .cloned()
+        .map(super::models::engine_message)
+        .collect();
+    for message in &mut messages {
+        if !matches!(
+            message["role"].as_str(),
+            Some("system" | "assistant" | "user")
+        ) || message.get("tool_calls").is_some()
+            || message.get("tools").is_some()
+        {
+            return Err(super::RenderError::Declined(
+                "expected text chat without tools".into(),
+            ));
+        }
+        if let Some(parts) = message["content"].as_array() {
+            let mut texts = Vec::new();
+            for part in parts {
+                if part["type"] != "text" {
+                    return Err(super::RenderError::Declined("expected text parts".into()));
+                }
+                texts.push(
+                    part["text"]
+                        .as_str()
+                        .ok_or_else(|| "expected text part content".to_owned())?,
+                );
+            }
+            message["content"] =
+                if content_parts.ok_or_else(|| "unknown template content format".to_owned())? {
+                    texts
+                        .into_iter()
+                        .map(|text| json!({"type":"text","text":text}))
+                        .collect()
+                } else {
+                    texts.join(" ").into()
+                };
+        }
+    }
+    Ok(messages)
+}
+
 impl ChatFormatter {
+    /// Render plain text chat with the worker's original message order and
+    /// content shape. Dynamo's role and content rewrites precede template evaluation.
+    pub fn render_text_jinja(
+        &self,
+        body: &Value,
+        defaults: &HashMap<String, Value>,
+    ) -> Result<(RenderedPrompt, String), TemplateError> {
+        let Self::HuggingFace {
+            formatter,
+            content_parts,
+            message_context,
+            effort,
+            ..
+        } = self
+        else {
+            return Err(TemplateError::NeedsRenderFallback {
+                message: "expected a Jinja formatter".into(),
+            });
+        };
+        let mut args = TemplateArgs::new(body, defaults);
+        TemplateArgs::check_jinja_kwargs(&mut args.kwargs)?;
+        effort.apply(body, defaults, &mut args.kwargs);
+        let mut messages = text_messages(body, *content_parts).map_err(TemplateError::from)?;
+        let continuing = args
+            .continuing
+            .map_err(|message| TemplateError::Renderer { message })?;
+        let prefix = split_continuation(&mut messages, continuing);
+        if messages.is_empty() {
+            return Err(TemplateError::Renderer {
+                message: "no messages to render".into(),
+            });
+        }
+        args.kwargs
+            .insert(message_context.clone(), Value::Array(messages));
+        let request = super::models::PreservedRequest {
+            args: args.kwargs,
+            tools: None,
+        };
+        Ok((super::render_oai(formatter, &request)?, prefix))
+    }
+
     /// Render `request` through the formatter's own template as SGLang's chat
     /// layer does, returning the prompt and the `continue_final_message` text.
     pub fn render_template(
@@ -63,16 +194,30 @@ impl ChatFormatter {
             .continuing
             .clone()
             .map_err(|message| TemplateError::Renderer { message })?;
+        if let ChatFormatter::Legacy(formatter) = self {
+            // The worker encodes the entire continued conversation in one pass.
+            let prompt = formatter.render_with_continuation(request, continuing)?;
+            return Ok((RenderedPrompt::text(prompt), String::new()));
+        }
+        let mut kwargs = args.kwargs.clone();
+        // _render_and_encode_chat_template supplies these arguments itself.
+        if matches!(
+            self,
+            ChatFormatter::HuggingFace { .. } | ChatFormatter::KimiK25 { .. }
+        ) {
+            TemplateArgs::check_jinja_kwargs(&mut kwargs)?;
+        }
         let (messages, continuation) = match self {
-            ChatFormatter::Legacy(_) => None,
             // SGLang's K3 encoder splits a trailing assistant turn off only to continue it.
             ChatFormatter::KimiK3 if !continuing => None,
             _ => last_assistant_message(request, continuing)?,
         }
         .unzip();
-        let jinja = matches!(
+        let use_dumped_tools = matches!(
             self,
             ChatFormatter::HuggingFace { .. }
+                | ChatFormatter::Native { .. }
+                | ChatFormatter::DeepSeekV32
                 | ChatFormatter::Glm53(_)
                 | ChatFormatter::MiniMaxM3 { .. }
                 | ChatFormatter::Qwen38 { .. }
@@ -80,9 +225,9 @@ impl ChatFormatter {
         );
         let request = TemplateArgsRequest {
             request,
-            args: args.kwargs.clone(),
+            args: kwargs,
             messages,
-            tools: jinja.then(|| args.tools.clone()),
+            tools: use_dumped_tools.then(|| args.tools.clone()),
         };
         let prompt = self.render_prompt(&request)?;
         Ok((prompt, continuation.unwrap_or_default()))
@@ -158,10 +303,31 @@ fn last_assistant_message(
 mod tests {
     use serde_json::json;
 
+    use super::super::legacy::{LegacyFormatter, builtin_template};
     use super::*;
 
     fn jinja(template: &str) -> ChatFormatter {
         ChatFormatter::from_tokenizer_config(&json!({ "chat_template": template })).unwrap()
+    }
+
+    #[test]
+    fn text_jinja_serializes_messages_in_pydantic_field_order() {
+        let body = json!({"messages": [
+            {"content": "Hi", "role": "user"},
+            {"name": "helper", "role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+        ]});
+        let (prompt, _) = jinja("{{ messages|tojson }}")
+            .render_text_jinja(&body, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            prompt.as_str(),
+            concat!(
+                r#"[{"role": "user", "content": "Hi"}, "#,
+                r#"{"role": "assistant", "content": "Hello", "name": "helper"}, "#,
+                r#"{"role": "user", "content": "Again"}]"#
+            )
+        );
     }
 
     fn render(
@@ -216,6 +382,148 @@ mod tests {
         let request = serde_json::from_value(body.clone()).unwrap();
         let args = TemplateArgs::new(&body, &none);
         assert!(formatter.render_template(&request, &args).is_err());
+    }
+
+    #[test]
+    fn legacy_continuation_removes_the_assistant_turn_delimiters() {
+        for (name, expected) in [
+            ("llama-2", "[INST] Hi [/INST] Hel"),
+            ("phi-4-mm", "<|user|>Hi<|end|><|assistant|>Hel"),
+        ] {
+            let formatter = ChatFormatter::Legacy(Box::new(LegacyFormatter {
+                spec: builtin_template(name).unwrap(),
+            }));
+            let body = json!({"messages": trailing("Hel".into()), "continue_final_message": true});
+            let (prompt, continuation) = render(&formatter, body, &HashMap::new());
+            assert_eq!(prompt, expected, "{name}");
+            assert!(continuation.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn generic_jinja_rejects_duplicate_tokenizer_arguments() {
+        let formatter = jinja("{{ messages[0].content }}");
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        for key in [
+            "conversation",
+            "tools",
+            "add_generation_prompt",
+            "tokenize",
+            "return_dict",
+        ] {
+            let mut explicit = body.clone();
+            explicit["chat_template_kwargs"] = json!({key: false});
+            for (body, defaults) in [
+                (explicit, HashMap::new()),
+                (body.clone(), HashMap::from([(key.into(), false.into())])),
+            ] {
+                let request = serde_json::from_value(body.clone()).unwrap();
+                let args = TemplateArgs::new(&body, &defaults);
+                let Err(error) = formatter.render_template(&request, &args) else {
+                    panic!("accepted duplicate {key}");
+                };
+                assert!(error.to_string().contains(key), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn text_jinja_rejects_incompatible_tokenizer_options() {
+        let formatter = jinja(concat!(
+            "{{ messages[0].content }}",
+            "{% if continue_final_message is defined or return_assistant_tokens_mask is defined %}",
+            "leaked tokenizer option{% endif %}"
+        ));
+        let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        for key in ["continue_final_message", "return_assistant_tokens_mask"] {
+            body["chat_template_kwargs"] = json!({key: true});
+            let Err(error) = formatter.render_text_jinja(&body, &HashMap::new()) else {
+                panic!("accepted {key}");
+            };
+            assert!(error.to_string().contains(key), "{error}");
+            body["chat_template_kwargs"][key] = false.into();
+            let (prompt, _) = formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+            assert_eq!(prompt.as_str(), "Hi");
+        }
+    }
+
+    #[test]
+    fn text_jinja_normalizes_hunyuan_effort() {
+        let formatter = jinja("{% set reasoning_mode_token = 'no_think' %}{{ reasoning_effort }}");
+        let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        let defaults = HashMap::from([("reasoning_effort".into(), json!("none"))]);
+        for (root, nested, expected) in [
+            (Value::Null, json!({}), "no_think"),
+            (Value::Null, json!({"reasoning_effort":"minimal"}), "low"),
+            (json!("none"), json!({"reasoning_effort":"low"}), "no_think"),
+            (json!("xhigh"), json!({"reasoning_effort":"none"}), "high"),
+            (Value::Null, json!({"reasoning_effort":null}), "high"),
+        ] {
+            body["reasoning_effort"] = root;
+            body["chat_template_kwargs"] = nested;
+            let (prompt, _) = formatter.render_text_jinja(&body, &defaults).unwrap();
+            assert_eq!(prompt.as_str(), expected);
+        }
+        body["chat_template_kwargs"] = json!({});
+        for (effort, expected) in [(json!("ultra"), "ultra"), (json!(0.5), "0.5")] {
+            body["reasoning_effort"] = effort;
+            let (prompt, _) = formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+            assert_eq!(prompt.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn text_jinja_sets_nemotron_low_effort() {
+        let formatter = jinja(concat!(
+            "{% set truncate_history_thinking = true %}",
+            "{{ 'short' if low_effort|default(false) else 'regular' }}"
+        ));
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning_effort": "low",
+        });
+        let defaults = HashMap::from([("reasoning_effort".into(), json!("high"))]);
+        for (kwargs, expected) in [
+            (json!({}), "short"),
+            (json!({"low_effort":false}), "regular"),
+            (json!({"reasoning_effort":"high"}), "regular"),
+        ] {
+            body["chat_template_kwargs"] = kwargs;
+            let (prompt, _) = formatter.render_text_jinja(&body, &defaults).unwrap();
+            assert_eq!(prompt.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn text_jinja_prefers_explicit_default_off_to_nemotron_effort() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning_effort": "low",
+        });
+        for (default_off, expected) in [
+            (
+                "{% set enable_thinking = enable_thinking | default(false) %}",
+                "regular",
+            ),
+            (
+                "{% if not enable_thinking is defined %}{% set enable_thinking=False %}{% endif %}",
+                "regular",
+            ),
+            (
+                "{% if enable_thinking is not defined %}{% set enable_thinking = false %}{% endif %}",
+                "short",
+            ),
+        ] {
+            let formatter = jinja(&format!(
+                "{default_off}{}",
+                concat!(
+                    "{% set truncate_history_thinking = true %}",
+                    "{{ 'short' if low_effort|default(false) else 'regular' }}",
+                )
+            ));
+            let (prompt, _) = formatter.render_text_jinja(&body, &HashMap::new()).unwrap();
+            assert_eq!(prompt.as_str(), expected, "{default_off}");
+        }
     }
 
     /// A Jinja template sees the tools as Python's `Tool.model_dump()`, not as sent.

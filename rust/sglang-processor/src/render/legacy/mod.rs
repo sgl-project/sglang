@@ -95,6 +95,14 @@ pub struct LegacyFormatter {
 
 impl LegacyFormatter {
     pub(super) fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {
+        self.render_with_continuation(request, false)
+    }
+
+    pub(super) fn render_with_continuation(
+        &self,
+        request: &dyn OAIChatLikeRequest,
+        continue_final_message: bool,
+    ) -> Result<String, TemplateError> {
         let mut system_message = self.spec.system_message.clone();
         let mut messages: Vec<(String, String)> = Vec::new();
         let typed_messages = request
@@ -152,10 +160,33 @@ impl LegacyFormatter {
                 }
             }
         }
-        if request.should_add_generation_prompt() {
+        let continuing = continue_final_message
+            && matches!(
+                typed_messages.last(),
+                Some(ChatCompletionRequestMessage::Assistant(_))
+            );
+        if !continuing && request.should_add_generation_prompt() {
             messages.push((self.spec.roles.1.clone(), String::new()));
         }
-        self.render_prompt(&system_message, &messages)
+        let mut prompt = self.render_prompt(&system_message, &messages)?;
+        if continuing {
+            // _apply_conversation_template trims stops first, then separators.
+            let stops = match &self.spec.stop_str {
+                Some(OneOrMany::One(stop)) => std::slice::from_ref(stop),
+                Some(OneOrMany::Many(stops)) => stops.as_slice(),
+                None => &[],
+            };
+            for suffix in stops.iter().map(String::as_str).chain(
+                [Some(self.spec.sep.as_str()), self.spec.sep2.as_deref()]
+                    .into_iter()
+                    .flatten(),
+            ) {
+                if prompt.ends_with(suffix) {
+                    prompt.truncate(prompt.len() - suffix.len());
+                }
+            }
+        }
+        Ok(prompt)
     }
 
     fn render_prompt(

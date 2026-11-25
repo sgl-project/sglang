@@ -126,14 +126,14 @@
       "force": true,
       "stream": true,
       "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["mention <tool_call> inline", "ans"]
+      "unary": ["mention ", "<tool_call> inline</think>ans"]
     },
     {
       "input": 4,
       "force": true,
       "stream": false,
       "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["mention <tool_call> inline", "ans"]
+      "unary": ["mention ", "<tool_call> inline</think>ans"]
     },
     {
       "input": 4,

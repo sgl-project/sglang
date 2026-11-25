@@ -886,6 +886,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self._drain_content())
 
     def finish(self) -> StreamingParseResult:
+        if not self._tools_passthrough:
+            self._buffer = strip_partial_marker_suffix(self._buffer)
         streamed_chars = sum(map(len, self._streamed_reasoning))
         self._streamed_reasoning.clear()
         if not self._force_nonempty_content:

@@ -1,5 +1,6 @@
 //! Model-specific SGLang behaviour around Dynamo's formatters.
 
+mod deepseek_v32;
 mod deepseek_v4;
 mod glm53;
 mod kimi_k25;
@@ -19,6 +20,7 @@ pub(crate) use self::deepseek_v4::{
     continued_message as deepseek_v4_continued_message, parse_start as deepseek_v4_parse_start,
     special_tokens as deepseek_v4_special_tokens, task as deepseek_v4_task,
 };
+pub(super) use self::deepseek_v32::render as render_deepseek_v32;
 pub(super) use self::glm53::{is_glm53, render as render_glm53};
 pub(super) use self::kimi_k3::render as render_kimi_k3;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
@@ -27,10 +29,10 @@ pub(super) use self::minimax_m3::{
 };
 pub use self::pydantic_dump::continues_final_message;
 pub(crate) use self::pydantic_dump::pydantic_bool;
-pub(super) use self::pydantic_dump::{function_dump, split_continuation};
+pub(super) use self::pydantic_dump::{engine_message, function_dump, split_continuation};
 pub(super) use self::qwen38::{
     DEVELOPER_ERROR as QWEN38_DEVELOPER_ERROR, is_qwen38, render as render_qwen38,
     takes_content_parts,
 };
 pub(super) use self::step3p5::{is_step3p5, render as render_step3p5};
-pub(super) use self::template_context::preserve_messages;
+pub(super) use self::template_context::{PreservedRequest, preserve_messages};

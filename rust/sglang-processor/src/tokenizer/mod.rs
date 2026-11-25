@@ -21,6 +21,15 @@ pub trait TextTokenizer: Send + Sync {
         continuation: &str,
     ) -> Result<Vec<i32>, Error> {
         let mut ids = self.encode_segments(prompt, false)?;
+        self.append_chat_continuation(&mut ids, continuation)?;
+        Ok(ids)
+    }
+
+    fn append_chat_continuation(
+        &self,
+        ids: &mut Vec<i32>,
+        continuation: &str,
+    ) -> Result<(), Error> {
         if !continuation.is_empty() {
             let suffix = self.encode(continuation, true)?;
             let bos = self.bos_token_id();
@@ -29,7 +38,7 @@ pub trait TextTokenizer: Send + Sync {
                     .unwrap_or(&suffix),
             );
         }
-        Ok(ids)
+        Ok(())
     }
 
     fn encode_segments(
@@ -101,6 +110,11 @@ impl DynamoTokenizer {
         );
         tokenizer.bos = configured_bos(&tokenizer.without_specials, path, revision);
         Ok(tokenizer)
+    }
+
+    /// Encode literal output markers without adding sequence-level BOS/EOS.
+    pub fn tokenizer_without_specials(&self) -> &dynamo_tokenizers::Tokenizer {
+        &self.without_specials
     }
 
     /// The handle that adds the tokenizer's specials, which decoding shares.

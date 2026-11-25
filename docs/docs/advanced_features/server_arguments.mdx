@@ -1210,6 +1210,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-llm-d-prompt-token-ids`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accept <code>kv_transfer_params.prompt_token_ids</code> for single-candidate text chat on the Python HTTP worker. Restrict worker access to the trusted llm-d gateway. The worker renders locally when it needs its multimodal text processing, a parser-specific prompt prefix, an encoder selected by a tool parser override, or a template selected with <code>--hf-chat-template-name</code>. Pass the same <code>--tool-call-parser</code> to the llm-d renderer when it selects the worker’s encoder. See <a href="#named-chat-templates-with-llm-d">Named chat templates with llm-d</a> to check routing token IDs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flag</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--completion-template`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
@@ -1277,6 +1283,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
 </tbody>
 </table>
+
+### Named chat templates with llm-d
+
+With `--hf-chat-template-name`, the Python worker renders the selected Hugging Face template locally. The llm-d gateway uses the renderer’s token IDs for routing. If you pass the same `.jinja` file to the renderer with `--chat-template`, it strips leading and trailing newlines and expands literal `\n` sequences into newlines. This can change the routing IDs.
+
+To preserve the template source, pass the renderer a JSON file whose `chat_template` field contains the exact named template string. To verify the configuration, send the same text chat request (model, messages, and template arguments) to the renderer’s `POST /v1/chat/completions/render` and the worker’s `POST /v1/tokenize`. Compare the renderer’s `token_ids` with the worker’s `tokens` element by element.
 
 ## Data parallelism
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

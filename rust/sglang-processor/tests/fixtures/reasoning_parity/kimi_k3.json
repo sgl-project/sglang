@@ -834,14 +834,14 @@
       "input": 7,
       "force": true,
       "stream": true,
-      "steps": [["Cut off mid reas", ""], ["oning ", ""], ["", ""], ["<|close|>think", ""]],
+      "steps": [["Cut off mid reas", ""], ["oning ", ""], ["", ""], ["", ""]],
       "unary": ["Cut off mid reasoning ", ""]
     },
     {
       "input": 7,
       "force": true,
       "stream": false,
-      "steps": [["", ""], ["", ""], ["", ""], ["Cut off mid reasoning <|close|>think", ""]],
+      "steps": [["", ""], ["", ""], ["", ""], ["Cut off mid reasoning ", ""]],
       "unary": ["Cut off mid reasoning ", ""]
     },
     {
@@ -862,7 +862,7 @@
       "input": 8,
       "force": true,
       "stream": true,
-      "steps": [["Cut off ", ""], ["", ""], ["<|close|>", ""]],
+      "steps": [["Cut off ", ""], ["", ""], ["", ""]],
       "unary": ["Cut off ", ""]
     },
     {
@@ -877,7 +877,7 @@
       "input": 8,
       "force": true,
       "stream": false,
-      "steps": [["", ""], ["", ""], ["Cut off <|close|>", ""]],
+      "steps": [["", ""], ["", ""], ["Cut off ", ""]],
       "unary": ["Cut off ", ""]
     },
     {
@@ -885,14 +885,14 @@
       "force": true,
       "stream": false,
       "nonempty": true,
-      "steps": [["", ""], ["", ""], ["Cut off <|close|>", ""]],
+      "steps": [["", ""], ["", ""], ["Cut off ", ""]],
       "unary": ["Cut off ", ""]
     },
     {
       "input": 8,
       "force": false,
       "stream": true,
-      "steps": [["", "Cut off "], ["", ""], ["", "<|close|>"]],
+      "steps": [["", "Cut off "], ["", ""], ["", ""]],
       "unary": ["", "Cut off "]
     },
     {
@@ -907,7 +907,7 @@
       "input": 8,
       "force": false,
       "stream": false,
-      "steps": [["", "Cut off "], ["", ""], ["", "<|close|>"]],
+      "steps": [["", "Cut off "], ["", ""], ["", ""]],
       "unary": ["", "Cut off "]
     },
     {

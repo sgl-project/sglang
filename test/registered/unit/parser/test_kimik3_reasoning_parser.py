@@ -294,6 +294,18 @@ def _stream_with_finish(detector: KimiK3Detector, chunks: list[str]) -> tuple[st
 
 
 @pytest.mark.parametrize(
+    "suffix", ["<|close|>", "<|close|>response", RESPONSE_CLOSE, "<"]
+)
+def test_truncated_response_stream_matches_unary(suffix: str) -> None:
+    chunks = ["reason", THINK_CLOSE, RESPONSE_OPEN, "answer", suffix]
+    parsed = KimiK3Detector(force_reasoning=True).detect_and_parse("".join(chunks))
+    assert _stream_with_finish(KimiK3Detector(force_reasoning=True), chunks) == (
+        parsed.reasoning_text,
+        parsed.normal_text,
+    )
+
+
+@pytest.mark.parametrize(
     ("text", "reasoning", "content"),
     [
         (

@@ -112,7 +112,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
-from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.conversation import chat_templates, generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
     uses_hunyuan_reasoning_effort,
@@ -380,6 +380,22 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
         # a model-specific public processor option.
         config["_question"] = question
     return config or None
+
+
+def _chat_stops(template_stops, request: ChatCompletionRequest):
+    stop = [] if request.ignore_eos else copy.copy(template_stops or [])
+    if request.stop:
+        stop = [stop] if isinstance(stop, str) else list(stop)
+        stop.extend([request.stop] if isinstance(request.stop, str) else request.stop)
+    return stop
+
+
+def _continues_final_assistant(request: ChatCompletionRequest) -> bool:
+    return bool(
+        request.continue_final_message
+        and request.messages
+        and request.messages[-1].role == "assistant"
+    )
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -1182,18 +1198,19 @@ class OpenAIServingChat(OpenAIServingBase):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
 
-    def _can_reuse_text_only_prompt_ids(
-        self, processed_messages: MessageProcessingResult, is_multimodal: bool
-    ) -> bool:
-        # Moss-VL invokes its processor for text-only requests, and that processor
-        # requires the rendered text rather than pre-tokenized ids.
-        is_moss_vl = (
+    def _text_only_requires_mm_processor(self) -> bool:
+        # Moss-VL invokes its multimodal processor even for plain text.
+        return (
             "MossVLForConditionalGeneration"
             in self.tokenizer_manager.model_config.hf_config.architectures
         )
+
+    def _can_reuse_text_only_prompt_ids(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> bool:
         return (
             is_multimodal
-            and not is_moss_vl
+            and not self._text_only_requires_mm_processor()
             and self.chat_encoding_spec is None
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
@@ -1731,6 +1748,77 @@ class OpenAIServingChat(OpenAIServingBase):
             and issubclass(tool_detector, ResponseTemplateToolDetector)
         )
 
+    def _accept_llm_d_prompt(
+        self, request: ChatCompletionRequest, is_multimodal: bool
+    ) -> bool:
+        params = request.kv_transfer_params
+        if params is not None and not isinstance(params, dict):
+            raise ValueError("kv_transfer_params must be an object")
+        if params is None or "prompt_token_ids" not in params:
+            return False
+        ids = params["prompt_token_ids"]
+        vocab_size = self.tokenizer_manager.model_config.token_id_vocab_size
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or any(
+                type(token) is not int or not 0 <= token < vocab_size for token in ids
+            )
+        ):
+            raise ValueError(
+                "prompt_token_ids must be a nonempty list of in-vocabulary integers"
+            )
+        if request.input_ids is not None and request.input_ids != ids:
+            raise ValueError("input_ids and forwarded prompt_token_ids differ")
+        if (
+            self._effective_tools(request)
+            or request.n != 1
+            or any(
+                msg.role not in ("system", "user", "assistant")
+                or getattr(msg, "tool_calls", None)
+                or msg.content is None
+                or (
+                    isinstance(msg.content, list)
+                    and any(part.type != "text" for part in msg.content)
+                )
+                for msg in request.messages
+            )
+        ):
+            raise ValueError(
+                "Forwarded prompt_token_ids support only single-candidate text chat"
+            )
+        mm_needs_text = is_multimodal and (
+            self._text_only_requires_mm_processor()
+            or (
+                self._tokenizer_auto_adds_specials
+                and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
+            )
+        )
+        parser_frames_prefix = _continues_final_assistant(request) and isinstance(
+            self._reasoning_detector, ResponseTemplateReasoningDetector
+        )
+        # The forwarded IDs do not identify the encoder used by the renderer.
+        # A worker override can take precedence over the checkpoint's template.
+        parser_overrides_encoder = (
+            self.tool_call_parser
+            and self.chat_encoding_spec is not None
+            and self.chat_encoding_spec
+            != chat_encoding.resolve_chat_encoding_spec(
+                hf_config=self.tokenizer_manager.model_config.hf_config,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
+        )
+        if (
+            mm_needs_text
+            or parser_frames_prefix
+            or parser_overrides_encoder
+            or get_serving().hf_chat_template_name
+        ):
+            request.input_ids = None
+            return False
+        request.input_ids = ids
+        return True
+
     def _process_messages(
         self,
         request: ChatCompletionRequest,
@@ -1739,6 +1827,11 @@ class OpenAIServingChat(OpenAIServingBase):
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        forwarded = (
+            request.kv_transfer_params is not None
+            and get_serving().trust_llm_d_prompt_token_ids
+            and self._accept_llm_d_prompt(request, is_multimodal)
+        )
         if self.is_minimax_m3:
             # Settle the request's own thinking and effort first; server defaults
             # only fill what it left unset.
@@ -1755,8 +1848,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_minimax_m3:
             _normalize_minimax_m3_request(request)
 
+        reasoning_config = self.template_manager.reasoning_config
         normalize_hunyuan_reasoning_effort(
-            request, self.reasoning_parser, self.template_manager.reasoning_config
+            request, self.reasoning_parser, reasoning_config
         )
 
         # GptOss model needs to keep special tokens for harmony parsing
@@ -1766,6 +1860,24 @@ class OpenAIServingChat(OpenAIServingBase):
         self._patch_reasoning_skip_special_tokens(request)
 
         thinking_mode = self._get_reasoning_from_request(request)
+        if forwarded:
+            template = self.template_manager.chat_template_name
+            legacy_prefix = (
+                template is not None
+                and self._legacy_adds_think_prefix(request, thinking_mode)
+            )
+            hunyuan_parser_mismatch = (
+                template is None
+                and self.chat_encoding_spec is None
+                and reasoning_config is not None
+                and reasoning_config.special_case == "hunyuan_effort"
+                and self.reasoning_parser != "hunyuan"
+            )
+            if legacy_prefix or hunyuan_parser_mismatch:
+                # llm-d assumes the parser implied by a Hunyuan template and
+                # leaves worker-only legacy prefixes to the worker.
+                request.input_ids = None
+                forwarded = False
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
@@ -1896,6 +2008,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            stop = request.stop or []
+            if forwarded and (template := self.template_manager.chat_template_name):
+                stop = _chat_stops(chat_templates[template].stop_str, request)
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
@@ -1903,7 +2018,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data=None,
                 video_data=None,
                 modalities=[],
-                stop=request.stop or [],
+                stop=stop,
             )
         elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
@@ -2294,6 +2409,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return prompt_ids, decoded_prompt
 
+    def _legacy_adds_think_prefix(
+        self, request: ChatCompletionRequest, thinking_mode: bool
+    ) -> bool:
+        return (
+            thinking_mode
+            and not _continues_final_assistant(request)
+            and (
+                self._reasoning_detector is None
+                or not self._reasoning_detector.thinks_internally
+            )
+        )
+
     def _apply_conversation_template(
         self,
         request: ChatCompletionRequest,
@@ -2310,11 +2437,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # If we should continue the final assistant message, adjust the conversation.
-        if (
-            request.continue_final_message
-            and request.messages
-            and request.messages[-1].role == "assistant"
-        ):
+        if _continues_final_assistant(request):
             # Remove the auto-added blank assistant turn, if present.
             if conv.messages and conv.messages[-1][1] is None:
                 conv.messages.pop()
@@ -2333,9 +2456,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_reasoning_from_request(request) and (
-                self._reasoning_detector is None
-                or not self._reasoning_detector.thinks_internally
+            if self._legacy_adds_think_prefix(
+                request, self._get_reasoning_from_request(request)
             ):
                 # Models with thinks_internally=True think without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
@@ -2344,15 +2466,7 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data = conv.video_data if conv.video_data else None
         audio_data = conv.audio_data if conv.audio_data else None
         modalities = conv.modalities if conv.modalities else []
-        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
-
-        if request.stop:
-            # A template declares stop_str as a string, a tuple or a list.
-            stop = [stop] if isinstance(stop, str) else list(stop)
-            if isinstance(request.stop, str):
-                stop.append(request.stop)
-            else:
-                stop.extend(request.stop)
+        stop = _chat_stops(conv.stop_str, request)
 
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)

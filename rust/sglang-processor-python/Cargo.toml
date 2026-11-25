@@ -1,0 +1,15 @@
+[package]
+name = "sglang-processor-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3.workspace = true
+serde_json.workspace = true
+sglang-processor = { path = "../sglang-processor", default-features = false, features = ["render", "tokenizer", "openai"] }
