@@ -45,7 +45,7 @@ class WeightConfig(msgspec.Struct):
     torch_version: str  # torch.__version__ of the process that built the weights
 
 
-class LoadSpec(WeightConfig, frozen=True, kw_only=True):
+class LoadSpec(WeightConfig, frozen=True, kw_only=True, forbid_unknown_fields=True):
     """Inputs to the snapshot lookup key. Sources index snapshots by digest()."""
 
     checkpoint_id: str

@@ -62,14 +62,13 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
-from .config import build_cache_config
+from .config import build_cache_config, resolve_cache_quantization
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
-    get_quant_method_name,
     get_ready_path,
     get_socket_path,
     recv_msg,
@@ -324,12 +323,9 @@ class WeightCacheDaemon:
         # hash than what the engine computes from the original config.
         # ModelConfig always exposes hf_config/quantization directly;
         # quantization_config is the only genuinely-optional attribute.
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        quant_method = get_quant_method_name(
-            self.quantization or model_config.quantization
+        quant_method, quant_config = resolve_cache_quantization(
+            model_config, self.quantization
         )
-        if not quant_method and quant_config is not None:
-            quant_method = get_quant_method_name(quant_config)
 
         # Refuse unsupported quant methods before creating distributed groups
         # or touching model weights.

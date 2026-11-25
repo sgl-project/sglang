@@ -26,10 +26,9 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
-from .config import build_cache_config
+from .config import build_cache_config, resolve_cache_quantization
 from .protocol import (
     check_ipc_quant_support,
-    get_quant_method_name,
     get_socket_path,
     recv_msg,
     send_msg,
@@ -147,7 +146,7 @@ class WeightCacheModelLoader(BaseModelLoader):
         # unsupported model fails explicitly instead of silently disk-loading
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
-        quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
+        quant_method, engine_quant_config = resolve_cache_quantization(model_config)
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
@@ -290,20 +289,6 @@ class WeightCacheModelLoader(BaseModelLoader):
             f"[WeightCacheModelLoader] Started daemon-liveness watchdog for "
             f"pid={daemon_pid}"
         )
-
-    def _resolve_engine_quant(self, model_config):
-        """Return (quant_method, quant_config) matching the daemon's fingerprint.
-
-        Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
-        two can never drift apart. ModelConfig always exposes
-        hf_config/quantization directly; quantization_config is the only
-        genuinely-optional attribute.
-        """
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        quant_method = get_quant_method_name(model_config.quantization)
-        if not quant_method and quant_config is not None:
-            quant_method = get_quant_method_name(quant_config)
-        return quant_method, quant_config
 
     @staticmethod
     def _rebuild_stale_views(model):
@@ -573,7 +558,7 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
-            quant_method, quant_config = self._resolve_engine_quant(model_config)
+            quant_method, quant_config = resolve_cache_quantization(model_config)
             engine_config = build_cache_config(
                 model_config,
                 quant_method=quant_method,

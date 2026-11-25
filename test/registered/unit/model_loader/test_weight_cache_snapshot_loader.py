@@ -17,7 +17,7 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
-from sglang.srt.weight_cache.config import build_cache_config, build_load_spec
+from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot
 from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest, StorageMeta
 from sglang.srt.weight_cache.transport import WeightTransport
@@ -26,21 +26,21 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_MODEL_CONFIG = SimpleNamespace(
-    hf_config=SimpleNamespace(), model_path="m", quantization=None, dtype=torch.float32
-)
 _CPU = DeviceConfig("cpu")
 
 
-def _spec(
-    tp_rank: int,
-    tp_size: int = 2,
-    *,
-    hf_config=None,
-    model_path="m",
-    draft_model_idx=None,
-) -> LoadSpec:
-    hf_config = hf_config if hf_config is not None else PretrainedConfig()
+def _model_config(hf_config=None, model_path="m"):
+    return SimpleNamespace(
+        hf_config=PretrainedConfig() if hf_config is None else hf_config,
+        model_path=model_path,
+        revision=None,
+        quantization=None,
+        dtype=torch.float32,
+    )
+
+
+@contextlib.contextmanager
+def _topology(tp_rank=0, tp_size=2):
     with (
         get_parallel().override(
             tp_size=tp_size,
@@ -55,21 +55,27 @@ def _spec(
         ),
         mock.patch("sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1),
     ):
-        cache = build_cache_config(
-            SimpleNamespace(hf_config=hf_config, dtype=torch.float32),
-            quant_method="",
-            quant_config=None,
-            model_path=model_path,
-            revision=None,
-            ep_size=1,
-        )
+        yield
+
+
+def _spec(tp_rank, tp_size=2, *, hf_config=None, model_path="m", draft_model_idx=None):
+    with _topology(tp_rank, tp_size):
         return build_load_spec(
-            cache,
             checkpoint_id="rev1",
-            hf_config=hf_config,
+            model_config=_model_config(hf_config, model_path),
             load_config=LoadConfig(draft_model_idx=draft_model_idx),
             target_device=_CPU.device,
         )
+
+
+def _pre_load(loader, model_config, *, checkpoint_id="rev1"):
+    return snapshot_loader.pre_load_check(
+        loader=loader,
+        model_config=model_config,
+        checkpoint_id=checkpoint_id,
+        device_config=_CPU,
+        group=None,
+    )
 
 
 class _QuantMethod:
@@ -208,11 +214,19 @@ class TestSnapshotLoader(CustomTestCase):
         ):
             yield
 
-    def _publish(self, source, transport, spec=None):
-        model = source.load_model(model_config=_MODEL_CONFIG, device_config=_CPU)
+    def _publish(self, source, transport, model_config=None):
+        if model_config is None:
+            model_config = _model_config()
+        # Owner failure cases count the two publish votes independently of lookup.
+        with (
+            _topology(),
+            mock.patch.object(snapshot_loader, "vote", _vote_failing_at()),
+        ):
+            self.assertIsNone(_pre_load(source, model_config))
+        model = source.load_model(model_config=model_config, device_config=_CPU)
         exported = source.export_snapshot(model=model)
         manifest = source.publish_snapshot(
-            exported=exported, spec=spec or _spec(0), transport=transport, group=None
+            exported=exported, transport=transport, group=None
         )
         return model, manifest
 
@@ -242,6 +256,65 @@ class TestSnapshotLoader(CustomTestCase):
             manifest.storages, {"proj": StorageMeta(nbytes=16, device="cpu")}
         )
         self.assertEqual(source.announced, [manifest])
+
+    def test_reader_finds_owner_snapshot_under_the_pre_load_spec(self):
+        owner = _Source(LoadConfig(), owner=True)
+        reader = _Source(LoadConfig())
+        transport = _MemoryTransport()
+        model_config = _model_config()
+        registry = {}
+
+        def announce(*, spec, manifest):
+            registry[spec.digest()] = (manifest, transport)
+
+        def find(*, spec, device_config):
+            return registry.get(spec.digest())
+
+        with (
+            self._owner_parts(),
+            mock.patch.object(owner, "_announce", announce),
+            mock.patch.object(reader, "_find", find),
+            mock.patch.object(
+                _TinyModel,
+                "post_load_weights",
+                side_effect=lambda: setattr(model_config.hf_config, "hidden_size", 128),
+            ),
+            mock.patch.object(
+                snapshot_loader, "build_load_spec", wraps=build_load_spec
+            ) as build,
+        ):
+            _, manifest = self._publish(owner, transport, model_config)
+            self.assertEqual(model_config.hf_config.hidden_size, 128)
+            with _topology():
+                self.assertIs(_pre_load(reader, _model_config()), manifest)
+            self.assertEqual(build.call_count, 2)
+
+    def test_owner_rejects_an_export_from_a_previous_lookup(self):
+        owner = _Source(LoadConfig(), owner=True)
+        model_config = _model_config()
+        transport = _MemoryTransport()
+        vote = _vote_failing_at()
+        with (
+            self._owner_parts(vote=vote),
+            _topology(),
+            mock.patch.object(transport, "publish", wraps=transport.publish) as publish,
+        ):
+            _pre_load(owner, model_config, checkpoint_id="first")
+            model = owner.load_model(model_config=model_config, device_config=_CPU)
+            exported = owner.export_snapshot(model=model)
+            self.assertIsNone(exported.error)
+
+            _pre_load(owner, model_config, checkpoint_id="second")
+            self.assertEqual(len(vote.calls), 2)
+            with self.assertRaises(RuntimeError):
+                owner.publish_snapshot(
+                    exported=exported, transport=transport, group=None
+                )
+        self.assertEqual(len(vote.calls), 3)
+        self.assertIsNotNone(vote.calls[-1].error)
+        publish.assert_not_called()
+        self.assertTrue(transport.closed)
+        self.assertFalse(owner.announced)
 
     def test_every_rank_mints_the_version_from_all_attestations(self):
         gathered = [Ballot(payload=b"rank0"), Ballot(payload=b"rank1")]
@@ -297,7 +370,7 @@ class TestSnapshotLoader(CustomTestCase):
             mock.patch.object(load_diff, "record_construction", record),
         ):
             model = _Source(LoadConfig()).load_model(
-                model_config=_MODEL_CONFIG, device_config=_CPU
+                model_config=_model_config(), device_config=_CPU
             )
         self.assertFalse(model.training)
 
@@ -312,7 +385,12 @@ class TestSnapshotLoader(CustomTestCase):
         self.transport = _MemoryTransport(fetch_error=fetch_error)
         self.transport.published = {"proj": torch.zeros(16, dtype=torch.uint8)}
         source = _Source(LoadConfig(), found=(manifest, self.transport))
-        self.assertIs(source.lookup(spec=_spec(0), device_config=_CPU), manifest)
+        model_config = _model_config()
+        with (
+            _topology(),
+            mock.patch.object(snapshot_loader, "vote", _vote_failing_at()),
+        ):
+            self.assertIs(_pre_load(source, model_config), manifest)
 
         def install(*, skeleton, manifest, storages):
             if install_error is not None:
@@ -335,7 +413,7 @@ class TestSnapshotLoader(CustomTestCase):
             ),
             mock.patch.object(load_diff, "install", install),
         ):
-            return source.load_model(model_config=_MODEL_CONFIG, device_config=_CPU)
+            return source.load_model(model_config=model_config, device_config=_CPU)
 
     def test_reader_installs_without_post_processing(self):
         model = self._read()
@@ -357,6 +435,9 @@ class TestSnapshotLoader(CustomTestCase):
         self.assertEqual(
             msgspec.json.decode(msgspec.json.encode(spec), type=LoadSpec), spec
         )
+        unknown_field = {**msgspec.to_builtins(spec), "future_layout": "new"}
+        with self.assertRaisesRegex(msgspec.ValidationError, "future_layout"):
+            msgspec.json.decode(msgspec.json.encode(unknown_field), type=LoadSpec)
         for field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
             with self.subTest(field=field):
                 peer = msgspec.structs.replace(spec, **{field: 1})
@@ -394,20 +475,19 @@ class TestSnapshotLoader(CustomTestCase):
         failing = _Source(LoadConfig())
         failing._find = mock.Mock(side_effect=OSError("daemon socket refused"))
         found = _Source(LoadConfig(), found=(manifest, _MemoryTransport()))
-        loaders_and_specs = [
-            (_Source(LoadConfig()), _spec(0)),
-            (_Source(LoadConfig()), _spec(1)),
-            (failing, _spec(0)),
-            (found, _spec(1)),
-            (_Source(LoadConfig()), _spec(0, tp_size=4)),
+        cases = [
+            (_Source(LoadConfig()), 0, 2),
+            (_Source(LoadConfig()), 1, 2),
+            (failing, 0, 2),
+            (found, 1, 2),
+            (_Source(LoadConfig()), 0, 4),
         ]
         with mock.patch.object(
             snapshot_loader, "vote", lambda *, group, ballot: ballots.append(ballot)
         ):
-            for loader, spec in loaders_and_specs:
-                snapshot_loader.pre_load_check(
-                    loader=loader, spec=spec, device_config=_CPU, group=None
-                )
+            for loader, rank, size in cases:
+                with _topology(rank, size):
+                    _pre_load(loader, _model_config())
         self.assertEqual(ballots[0].agree, ballots[1].agree)
         self.assertIn("daemon socket refused", ballots[2].error)
         self.assertNotEqual(ballots[3].agree, ballots[0].agree)
@@ -416,12 +496,27 @@ class TestSnapshotLoader(CustomTestCase):
         # When the ranks reject the load, a rank that found a snapshot releases it.
         transport = _MemoryTransport()
         rejected = _Source(LoadConfig(), found=(manifest, transport))
-        with mock.patch.object(snapshot_loader, "vote", _vote_failing_at(1)):
+        with (
+            _topology(),
+            mock.patch.object(snapshot_loader, "vote", _vote_failing_at(1)),
+        ):
             with self.assertRaises(RuntimeError):
-                snapshot_loader.pre_load_check(
-                    loader=rejected, spec=_spec(0), device_config=_CPU, group=None
-                )
+                _pre_load(rejected, _model_config())
         self.assertTrue(transport.closed)
+
+    def test_pre_load_check_votes_on_build_failure_before_lookup(self):
+        source = _Source(LoadConfig())
+        vote = _vote_failing_at()
+        with (
+            _topology(),
+            mock.patch.object(source, "_find") as find,
+            mock.patch.object(snapshot_loader, "vote", vote),
+            self.assertRaisesRegex(RuntimeError, "checkpoint"),
+        ):
+            _pre_load(source, _model_config(), checkpoint_id="")
+        find.assert_not_called()
+        self.assertEqual(len(vote.calls), 1)
+        self.assertIn("checkpoint", vote.calls[0].error)
 
     def test_load_diff_and_validator_share_only_the_schema(self):
         # A validator built on load-diff's logic would only check what load-diff did.

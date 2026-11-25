@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Snapshot loading: the order every snapshot source follows (sgl-project/sglang#50943).
 
-Reader, on every rank: pre_load_check (lookup, vote), SnapshotLoader.load_model
-(fetch, install, validate), then the post-load vote. Owner: a raw load through
-SnapshotLoader.load_model, export_snapshot (export, attest), then publish_snapshot
-(publish, vote, announce, vote). This module only calls the parts in that order:
-the transport, the coordinator, load-diff and the validator.
+Owners and readers first call pre_load_check to build the spec, look up a
+snapshot and vote. A reader with a hit fetches, installs and validates it.
+After a miss, an owner loads raw, exports and attests the model, then publishes
+and announces it under the spec from the pre-load check.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.weight_cache import load_diff, validator
+from sglang.srt.weight_cache.config import build_load_spec
 from sglang.srt.weight_cache.coordinator import Ballot, vote
 from sglang.srt.weight_cache.schema import (
     LoadSpec,
@@ -47,27 +47,37 @@ if TYPE_CHECKING:
 def pre_load_check(
     *,
     loader: BaseModelLoader,
-    spec: LoadSpec,
+    model_config: ModelConfig,
+    checkpoint_id: str,
     device_config: DeviceConfig,
     group: GroupCoordinator,
 ) -> Optional[SnapshotManifest]:
-    """Every rank of ``group`` runs this before load_model: lookup, then vote.
+    """Build the spec and vote on the lookup before load_model on every rank.
 
     After it returns, every rank loads the same snapshot version, or every rank
-    loads raw.
+    loads raw. An owner publishes a raw load under the spec built here.
     """
-    manifest, error = None, None
+    spec, manifest, error = None, None, None
+    agree = b""
     try:
+        spec = build_load_spec(
+            model_config=model_config,
+            load_config=loader.load_config,
+            checkpoint_id=checkpoint_id,
+            target_device=device_config.device,
+        )
         manifest = loader.lookup(spec=spec, device_config=device_config)
+        version = manifest.version if manifest is not None else ""
+        agree = f"{spec.digest(include_rank=False)}/{version}".encode()
     except Exception as e:  # every rank must learn it before any rank moves on
         error = repr(e)
-    version = manifest.version if manifest is not None else ""
-    agree = f"{spec.digest(include_rank=False)}/{version}".encode()
     try:
         vote(group=group, ballot=Ballot(error=error, agree=agree))
     except BaseException:
         loader.close()
         raise
+    if error is None and isinstance(loader, SnapshotLoader):
+        loader._prepared_spec = spec
     return manifest
 
 
@@ -75,6 +85,7 @@ class Exported(msgspec.Struct, frozen=True, kw_only=True):
     """What one owner rank prepared to publish; it holds no reference to the model."""
 
     storages: dict[str, torch.Tensor]
+    spec: Optional[LoadSpec] = None
     load_diff: bytes = b""
     attestation: bytes = b""
     error: Optional[str] = None  # voted on by publish_snapshot
@@ -93,6 +104,7 @@ class SnapshotLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig, *, owner: bool = False):
         super().__init__(load_config)
         self._owner = owner
+        self._prepared_spec: Optional[LoadSpec] = None
         self._manifest: Optional[SnapshotManifest] = None
         self._transport: Optional[WeightTransport] = None
         self._storages: dict[str, torch.Tensor] = {}
@@ -137,6 +149,8 @@ class SnapshotLoader(BaseModelLoader):
         )
 
     def close(self) -> None:
+        self._prepared_spec = None
+        self._constructed = None
         if self._transport is not None:
             self._transport.close()
         self._manifest, self._transport, self._storages = None, None, {}
@@ -144,13 +158,15 @@ class SnapshotLoader(BaseModelLoader):
     def export_snapshot(self, *, model: nn.Module) -> Exported:
         """Owner: export and attest ``model``, which this loader loaded raw.
 
-        Every rank calls it before any forward pass and before the engine's
-        post-load steps. With a transport that consumes the storages (vmm_fd), the
-        caller then drops ``model`` and the caches holding its tensors, and calls
-        publish_snapshot.
+        Run pre_load_check before the raw load. Every rank exports before any
+        forward pass and before the engine's post-load steps. With a transport
+        that consumes the storages (vmm_fd), the caller then drops ``model``
+        and the caches holding its tensors, and calls publish_snapshot.
         """
         constructed, self._constructed = self._constructed, None
         try:
+            if self._prepared_spec is None:
+                raise RuntimeError("Run pre_load_check before the owner's raw load")
             if constructed is None or constructed[0] != id(model):
                 raise RuntimeError(
                     "Only a model that this owner built and loaded raw can publish"
@@ -162,28 +178,40 @@ class SnapshotLoader(BaseModelLoader):
             )
         except Exception as e:  # voted on in publish_snapshot, so no rank waits
             return Exported(storages={}, error=repr(e))
-        return Exported(storages=storages, load_diff=payload, attestation=attestation)
+        return Exported(
+            storages=storages,
+            spec=self._prepared_spec,
+            load_diff=payload,
+            attestation=attestation,
+        )
 
     def publish_snapshot(
         self,
         *,
         exported: Exported,
-        spec: LoadSpec,
         transport: WeightTransport,
         group: GroupCoordinator,
     ) -> SnapshotManifest:
-        """Owner: publish what export_snapshot prepared; all ranks call it together.
-
-        The version becomes findable only once every rank published and announced
-        it; otherwise every rank takes back what it published.
-        """
-        storages_meta = {
-            name: StorageMeta(nbytes=t.nbytes, device=t.device.type)
-            for name, t in exported.storages.items()
-        }
+        """Publish an export under its pre-load spec. All owner ranks vote together."""
+        spec = self._prepared_spec
+        agree = b""
+        storages_meta = {}
         error, source = exported.error, {}
         if error is None:
             try:
+                if spec is None:
+                    raise RuntimeError("Run pre_load_check before the owner's raw load")
+                if exported.spec is not spec:
+                    raise RuntimeError(
+                        "The export belongs to a different prepared load"
+                    )
+                agree = spec.digest(include_rank=False).encode()
+                # A transport may consume these storages even if it fails partway.
+                self._prepared_spec = None
+                storages_meta = {
+                    name: StorageMeta(nbytes=t.nbytes, device=t.device.type)
+                    for name, t in exported.storages.items()
+                }
                 source = transport.publish(storages=exported.storages)
             except Exception as e:
                 error = repr(e)
@@ -192,7 +220,7 @@ class SnapshotLoader(BaseModelLoader):
                 group=group,
                 ballot=Ballot(
                     error=error,
-                    agree=spec.digest(include_rank=False).encode(),
+                    agree=agree,
                     payload=hashlib.sha256(exported.attestation).digest(),
                 ),
             )
@@ -252,6 +280,7 @@ class SnapshotLoader(BaseModelLoader):
     def _load_raw(
         self, *, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
+        self._constructed = None
         raw_config = dataclasses.replace(
             self.load_config,
             load_format=self.load_config.fallback_load_format,
