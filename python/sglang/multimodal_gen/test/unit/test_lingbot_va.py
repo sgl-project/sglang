@@ -82,6 +82,20 @@ def test_grouped_flow_preserves_row_ownership_and_uses_the_prefix():
 
     prefix = torch.ones(7, 1)
     conditioned = chunk(1, prefix)
-    stage.denoise([conditioned])
+    prefix_inputs = []
+    noise = conditioned.actions[0, :7, 1, 0, 0].clone()
+
+    def observe_action_input(module, args, kwargs):
+        if kwargs.get("action"):
+            latents, timestep = args[:2]
+            prefix_inputs.append(
+                (latents[0, :7, 1, 0, 0].clone(), timestep[0, 1] / 1000)
+            )
+
+    with transformer.register_forward_pre_hook(observe_action_input, with_kwargs=True):
+        stage.denoise([conditioned])
     torch.testing.assert_close(output(conditioned)[0, :1], prefix.T)
-    assert not torch.allclose(output(conditioned)[0, 1:], output(left)[0, 1:])
+    assert len(prefix_inputs) == 2
+    midway, sigma = prefix_inputs[1]
+    assert 0 < sigma < 1
+    torch.testing.assert_close(midway, prefix[:, 0] * (1 - sigma) + noise * sigma)
