@@ -10,13 +10,18 @@ import logging
 import math
 from copy import copy
 from functools import lru_cache
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
@@ -48,10 +53,17 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_sm100_supported,
+    is_sm120,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +105,29 @@ def _npu_sparse_attention(
     return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
+def _extend_token_to_batch_idx(
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_cpu: Optional[List[int]],
+    batch_size: int,
+    device,
+) -> torch.Tensor:
+    """repeat_interleave(arange(batch_size), extend_seq_lens), sized from the host lens
+    when they line up; without them it reads the size back (a stream sync)."""
+    output_size = None
+    if (
+        extend_seq_lens_cpu is not None
+        and len(extend_seq_lens_cpu) == batch_size
+        and extend_seq_lens.dim() == 1
+        and extend_seq_lens.shape[0] == batch_size
+    ):
+        output_size = sum(int(x) for x in extend_seq_lens_cpu)
+    return torch.repeat_interleave(
+        torch.arange(batch_size, device=device, dtype=torch.int32),
+        extend_seq_lens.to(torch.long),
+        output_size=output_size,
+    )
+
+
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
@@ -107,6 +142,22 @@ def _resolve_trtllm_sparse_decode():
     except ImportError:
         return None
     return trtllm_batch_decode_with_kv_cache
+
+
+@lru_cache(maxsize=1)
+def _resolve_flydsl_sparse_decode():
+    """The fused gfx950 FlyDSL decode module, or None when off or unavailable."""
+    if not (envs.SGLANG_USE_AITER.get() and is_gfx95_supported()):
+        return None
+    try:
+        from aiter.ops.flydsl import qsa_sparse_decode as qsa_flydsl
+    except ImportError:
+        logger.warning(
+            "QSA FlyDSL decode requested but aiter.ops.flydsl.qsa_sparse_decode "
+            "is unavailable"
+        )
+        return None
+    return qsa_flydsl
 
 
 @lru_cache(maxsize=1)
@@ -190,6 +241,9 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # This field references the live request-pool table used by graph fallback
     # instead of the placeholder. Updates must preserve its storage for replay.
     req_to_token: Optional[torch.Tensor] = None
+    # token_slot_table translated to rows of the KV-shard scratch, during a
+    # KV-sharded extend.
+    kv_shard_slot_table: Optional[torch.Tensor] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -280,6 +334,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
+    _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -287,6 +342,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
+        # Logical-page KV sharding: the pool keeps only this rank's pages, so
+        # an extend reads the prefix from the shard scratch, which is planned
+        # from host lengths.
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        if self._kv_shard_pool is not None:
+            self.needs_cpu_seq_lens = True
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -327,6 +388,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
         self._trtllm_counters = {}
+        self._flydsl_decode_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
@@ -728,13 +790,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
-                token_to_batch_idx = torch.repeat_interleave(
-                    torch.arange(
-                        batch_size,
-                        device=sequence_lengths.device,
-                        dtype=torch.int32,
-                    ),
-                    extend_seq_lens.to(torch.long),
+                token_to_batch_idx = _extend_token_to_batch_idx(
+                    extend_seq_lens=extend_seq_lens,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    batch_size=batch_size,
+                    device=sequence_lengths.device,
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).
@@ -850,10 +910,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             # before this stream issues further collectives on the CP group.
             torch.cuda.current_stream().wait_stream(get_stream("qsa_cp_kv"))
             self._cp_kv_pending = None
+        sharded_extend = self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            pool=self._kv_shard_pool,
+            req_to_token=self.req_to_token,
+            forward_batch=forward_batch,
+        )
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
-        self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+        metadata = self._metadata_from_forward_batch(forward_batch)
+        if sharded_extend:
+            metadata = msgspec.structs.replace(
+                metadata,
+                kv_shard_slot_table=self._kv_shard_pool.translate_loc_to_scratch(
+                    metadata.token_slot_table
+                ).to(torch.int32),
+            )
+        self.forward_metadata = metadata
 
     def init_forward_metadata_out_graph(
         self,
@@ -1329,17 +1402,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
             return
         state = self._mtp_shared_sparse_indices
-        row_to_req = metadata.get_token_to_batch_idx().long()
-        row_req_pool_indices = metadata.req_pool_indices[
-            row_to_req[: topk_indices.shape[0]]
-        ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
-        req_rows = row_req_pool_indices[anchor_rows]
+        num_rows = topk_indices.shape[0]
+        row_to_req = metadata.get_token_to_batch_idx()[:num_rows].long()
+        # Each request's last row by scatter-max: nonzero() would read its size back
+        # (a stream sync); requests with no rows write the trash row.
+        last_row = torch.full_like(metadata.req_pool_indices, -1, dtype=torch.long)
+        rows = torch.arange(row_to_req.numel(), device=row_to_req.device)
+        last_row.scatter_reduce_(0, row_to_req, rows, "amax")
+        anchor_rows = last_row.clamp(min=0)
+        req_rows = torch.where(
+            last_row >= 0, metadata.req_pool_indices.long(), state.trash_row
+        )
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
-        state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
+        state.capture(
+            topk_indices.index_select(0, anchor_rows), req_rows, captured_lens, layer_id
+        )
 
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:
@@ -1646,11 +1723,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_indices = forward_batch.req_pool_indices
+        if self._kv_shard_pool is not None:
+            # The getters return the KV-shard scratch; address it by batch row.
+            req_to_token = self._resolve_metadata(forward_batch).kv_shard_slot_table
+            req_indices = torch.arange(
+                req_to_token.shape[0], dtype=req_indices.dtype, device=q.device
+            )
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.layer_router.read(layer.layer_id).key(),
             v=pool.layer_router.read(layer.layer_id).value(),
-            req_to_token=self.req_to_token_pool.req_to_token,
-            req_indices=forward_batch.req_pool_indices,
+            req_to_token=req_to_token,
+            req_indices=req_indices,
             cu_k=cu_seqlens_k,
             total_k=sum(sequence_lens),
             max_k=max(sequence_lens, default=1),
@@ -1697,12 +1782,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Prefill CP: this rank holds the query rows of its two zigzag blocks
         (all heads) and the K/V of the same rows. All-gather new K/V into global
         token order (also written to the KV pool so decode sees every token),
-        prepend each request's cached prefix from the replicated local KV pool,
-        then run the chunk-prefill sparse kernel with one entry per zigzag
-        block: q rows are contiguous per block, ``kv_lens`` is the block's
-        absolute end position (bottom-right causal), ``cu_k`` is the request's
-        base row in the packed full K/V, and ``topk_indices`` are per-request
-        logical positions exactly as in the non-CP path."""
+        prepend each request's cached prefix from the replicated local KV pool
+        (or the KV-shard scratch), then run the chunk-prefill sparse kernel
+        with one entry per zigzag block: q rows are contiguous per block,
+        ``kv_lens`` is the block's absolute end position (bottom-right causal),
+        ``cu_k`` is the request's base row in the packed full K/V, and
+        ``topk_indices`` are per-request logical positions exactly as in the
+        non-CP path."""
         strategy = get_cp_strategy()
         if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
             strategy_name = strategy.name if strategy is not None else "none"
@@ -1733,6 +1819,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu[: meta.bs]]
         prefix_lens = [seq - extend for seq, extend in zip(seq_lens, extend_lens)]
+        # Both cached-prefix paths read the pool getters, which expose the
+        # shard scratch during a sharded extend. Address it by scratch row.
+        slot_table = (
+            metadata.token_slot_table
+            if self._kv_shard_pool is None
+            else metadata.kv_shard_slot_table
+        )
         if any(prefix_lens) and save_kv_cache and q.is_cuda:
             # Every selected token, prefix or new, is in the pool now (the
             # gathered new K/V was just written), so read it in place instead of
@@ -1742,7 +1835,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q,
                 pool.layer_router.read(layer.layer_id).key(),
                 pool.layer_router.read(layer.layer_id).value(),
-                metadata.token_slot_table[: meta.bs],
+                slot_table[: meta.bs],
                 indices,
                 meta.cu_seqlens_q_combined_tensor,
                 meta.kv_len_combined_tensor,
@@ -1755,14 +1848,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if any(prefix_lens):
             # The all-gather contains only new tokens. Prefix K/V is already
-            # replicated on each CP rank; pack prefix + new tokens per request
-            # so absolute logical top-k indices address the full context.
+            # replicated on each CP rank (or assembled in the KV-shard
+            # scratch); pack prefix + new tokens per request so absolute
+            # logical top-k indices address the full context.
             pool = self.token_to_kv_pool
             k_buffer = pool.layer_router.read(layer.layer_id).key()
             v_buffer = pool.layer_router.read(layer.layer_id).value()
-            # Row i holds request i's req_to_token slots; indexing it by row
-            # avoids a device sync on req_pool_indices in every layer.
-            slot_table = metadata.token_slot_table
+            # Row i holds request i's slots, translated to the shard scratch
+            # when needed. Indexing by row avoids a device sync on
+            # req_pool_indices in every layer.
             k_parts, v_parts = [], []
             extend_start = 0
             for row, (prefix_len, extend_len) in enumerate(
@@ -1994,6 +2088,75 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_flydsl_fused_sparse(
+        self,
+        flydsl_decode,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """gfx950 sparse decode straight from the pool: no gather, KV split across CTAs.
+
+        Each query row is its own length-one sequence, so speculative verify rows
+        need nothing extra.
+        """
+        batch, topk = topk_indices.shape
+        num_kv_heads = k_buffer.shape[1]
+        num_splits = flydsl_decode.recommended_num_splits(
+            batch, num_kv_heads, topk, q.device
+        )
+        workspace = self._get_flydsl_decode_workspace(
+            flydsl_decode,
+            batch * q.shape[1] * num_splits,
+            q.shape[1],
+            num_kv_heads,
+            k_buffer.shape[2],
+            topk,
+            q.device,
+        )
+        output = flydsl_decode.flydsl_qsa_sparse_decode(
+            q.contiguous(),
+            k_buffer,
+            v_buffer,
+            self.req_to_token_pool.req_to_token,
+            (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            ),
+            topk_indices,
+            metadata.sequence_lengths,
+            layer.scaling,
+            num_splits=num_splits,
+            workspace=workspace,
+        )
+        return output.reshape(q.shape[0], -1)
+
+    def _get_flydsl_decode_workspace(
+        self, flydsl_decode, partials, num_q_heads, num_kv_heads, head_dim, topk, device
+    ):
+        # Sized once for every captured batch: graphs keep raw pointers to it, so
+        # it is never reallocated. A larger eager batch gets a per-call workspace.
+        if self._flydsl_decode_workspace is None:
+            capacity = max(
+                partials,
+                flydsl_decode.workspace_partials(
+                    self._cuda_graph_max_tokens, num_q_heads, num_kv_heads, topk, device
+                ),
+            )
+            self._flydsl_decode_workspace = (
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity * head_dim, dtype=torch.float32, device=device),
+            )
+        if self._flydsl_decode_workspace[0].numel() < partials:
+            return None
+        return self._flydsl_decode_workspace
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2052,6 +2215,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+            )
+
+        flydsl_decode = _resolve_flydsl_sparse_decode()
+        if flydsl_decode is not None and flydsl_decode.can_use_flydsl_qsa_sparse_decode(
+            q, k_buffer, v_buffer
+        ):
+            return self._forward_flydsl_fused_sparse(
+                flydsl_decode,
+                q,
+                k_buffer,
+                v_buffer,
+                layer,
+                forward_batch,
+                metadata,
+                topk_indices,
             )
 
         batch, topk = topk_indices.shape

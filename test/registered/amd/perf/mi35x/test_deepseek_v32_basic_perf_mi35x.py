@@ -4,7 +4,7 @@ This test benchmarks the DeepSeek-V3.2 model with basic TP=8 configuration on 8 
 
 The model path can be configured via DEEPSEEK_V32_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-mi35x-deepseek-v32-basic suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-deepseek-v32-basic suite
 
 Example usage:
     DEEPSEEK_V32_MODEL_PATH=deepseek-ai/DeepSeek-V3.2 python -m pytest test_deepseek_v32_basic_perf_mi35x.py -v
@@ -22,7 +22,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 # Register for AMD CI - DeepSeek-V3.2 basic benchmark (~90 min)
 register_amd_ci(
     est_time=5400,
-    suite="nightly-perf-8-gpu-mi35x-deepseek-v32-basic",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-deepseek-v32-basic",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

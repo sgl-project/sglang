@@ -1,5 +1,4 @@
 import logging
-import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -80,18 +79,14 @@ def _create_linear_attention_backend(runner, fallback):
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     if not runner.use_mla_backend:
+        from sglang.srt.beam_search.shared_context_backend import (
+            flashinfer_backend_cls,
+        )
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
 
-        # Init streams
-        if get_spec().speculative_algorithm == "EAGLE":
-            if (
-                not hasattr(runner, "plan_stream_for_flashinfer")
-                or not runner.plan_stream_for_flashinfer
-            ):
-                runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(
+        return flashinfer_backend_cls(FlashInferAttnBackend)(
             runner, init_new_workspace=runner.init_new_workspace
         )
     else:
@@ -202,17 +197,6 @@ def create_qsa_backend(runner):
     )
 
     return QwenSparseAttnBackend(runner)
-
-
-@register_attention_backend("nsa")
-def _create_nsa_compat(runner):
-    warnings.warn(
-        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
-        "The alias will be removed in a future release.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return create_dsa_backend(runner)
 
 
 @register_attention_backend("dsv4")
