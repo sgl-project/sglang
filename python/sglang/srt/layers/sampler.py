@@ -942,7 +942,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
 
         # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
         topk_all_mask = top_ks == TOP_K_ALL
-        top_ks.masked_fill_(topk_all_mask, probs.shape[1])
+        top_ks = top_ks.masked_fill(topk_all_mask, probs.shape[1])
         top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
             1, -1
         ) >= top_ks.view(-1, 1)

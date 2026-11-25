@@ -17,22 +17,20 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruc
 
 By default, the metrics server will run on `127.0.0.1:30000`.
 
-2. Start the monitoring stack:
+2. Start the monitoring stack, choosing a Grafana admin password:
 
 ```bash
 cd examples/monitoring
-docker compose up
+GRAFANA_ADMIN_PASSWORD='<a strong password>' docker compose up
 ```
 
 3. Access the monitoring interfaces:
    - Grafana: [http://localhost:3000](http://localhost:3000)
    - Prometheus: [http://localhost:9090](http://localhost:9090)
 
-Default Grafana login credentials:
-- Username: `admin`
-- Password: `admin`
+Log in to Grafana as `admin` with the password you set. Dashboards are also visible without logging in.
 
-You'll be prompted to change the password on first login.
+Grafana and Prometheus listen on `127.0.0.1` only. To view them from another machine, use an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 <host>`) instead of exposing the ports.
 
 4. The SGLang dashboard will be automatically available in the "SGLang Monitoring" folder.
 
