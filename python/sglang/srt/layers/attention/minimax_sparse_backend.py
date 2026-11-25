@@ -314,6 +314,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Without NPU kernels or the MSA decode plan, a TARGET_VERIFY step runs the
         # capture-safe decode kernels with one causal query per draft row.
         self._linear_verify = not self.is_npu and not self._use_msa_decode
+        # On ROCm a host seq_lens copy makes the overlap scheduler sync each step; linear
+        # decode / verify read it only for an eager step's KV bound.
+        self.needs_cpu_seq_lens = not (self.is_hip and self._linear_verify)
         self.dense_backend: Optional[AttentionBackend] = None
 
         self.index_topk_freq = (
@@ -467,6 +470,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
+            self._max_seqlen_k = self.max_context_len
+        elif forward_batch.seq_lens_cpu is None:
+            # GPU-only seq_lens (needs_cpu_seq_lens): the capture's bound.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
@@ -1906,6 +1912,9 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse.dense_backend = dense_backend
         self._builds_dense_metadata = not (
             is_hip() and _hip.dense_metadata_unused(sparse_backend)
+        )
+        self.needs_cpu_seq_lens = sparse_backend.needs_cpu_seq_lens or (
+            self._builds_dense_metadata and dense_backend.needs_cpu_seq_lens
         )
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
