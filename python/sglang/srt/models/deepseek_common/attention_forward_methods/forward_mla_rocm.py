@@ -608,7 +608,12 @@ class DeepseekMLARocmForwardMixin:
         # the q / kv norms, q_b: ``_mono_pre``) hands its outputs in.
         pre = self.__dict__.get("_mono_pre")
         if self.q_lora_rank is not None and pre is not None:
-            q = pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
+            num_q_heads = (
+                self.num_local_heads * self.dcp_size
+                if q_replicate_active
+                else self.num_local_heads
+            )
+            q = pre["q"].view(pre["q_lora"].shape[0], num_q_heads, self.qk_head_dim)
             latent_cache = pre["latent"]
             k_nope = pre["k_nope"].unsqueeze(1)
             q_lora = pre["q_lora"]

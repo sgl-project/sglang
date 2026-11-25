@@ -359,5 +359,123 @@ class TestGfx1250FusedRopeCall(_Gfx1250Case):
             torch.testing.assert_close(table[position], expected(position * inv_freq))
 
 
+class TestMonoPreQReplicateShape(CustomTestCase):
+    """_mono_pre reshapes replicated full-head Q iff q_replicate_active holds."""
+
+    def _run_prepare_to_split(
+        self,
+        *,
+        dcp_size: int,
+        q_rep_phase: bool,
+        has_qrep_weights: bool,
+        q_cols: int,
+        hidden=None,
+    ):
+        seen = {}
+        num_local_heads, qk_head_dim, rows = 12, 192, 16
+
+        class _StopAfterSplit(Exception):
+            pass
+
+        def _split(q, latent_cache):
+            seen["q_shape"] = tuple(q.shape)
+            raise _StopAfterSplit()
+
+        attn = SimpleNamespace(
+            q_lora_rank=1536,
+            num_local_heads=num_local_heads,
+            dcp_size=dcp_size,
+            qk_head_dim=qk_head_dim,
+            use_deep_gemm_bmm=False,
+            w_kc_qrep=torch.empty(1) if has_qrep_weights else None,
+            q_b_proj_qrep_weight=torch.empty(1) if has_qrep_weights else None,
+            layer_id=0,
+            is_dcp_q_replicate_phase=lambda fb: q_rep_phase,
+            should_run_indexer=lambda prev: False,
+            _split_q_nope_pe=_split,
+        )
+        attn.__dict__["_mono_pre"] = {
+            "q": torch.zeros(rows, q_cols, dtype=torch.bfloat16),
+            "latent": torch.zeros(rows, 576, dtype=torch.bfloat16),
+            "k_nope": torch.zeros(rows, 512, dtype=torch.bfloat16),
+            "q_lora": torch.zeros(rows, 1536, dtype=torch.bfloat16),
+        }
+        if hidden is None:
+            hidden = torch.zeros(rows, 7168, dtype=torch.bfloat16)
+        with mock.patch.object(
+            forward_mla_rocm, "maybe_capture_indexer_topk", return_value=None
+        ):
+            try:
+                forward_mla_rocm.DeepseekMLARocmForwardMixin.forward_absorb_rocm_prepare(
+                    attn,
+                    positions=torch.zeros(rows, dtype=torch.int64),
+                    hidden_states=hidden,
+                    forward_batch=SimpleNamespace(),
+                    zero_allocator=None,
+                )
+            except _StopAfterSplit:
+                pass
+        self.assertIn("q_shape", seen, "_split_q_nope_pe was not reached")
+        return seen["q_shape"]
+
+    def test_dcp8_inactive_phase_with_replicated_weights_uses_local_heads(self):
+        self.assertEqual(
+            self._run_prepare_to_split(
+                dcp_size=8,
+                q_rep_phase=False,
+                has_qrep_weights=True,
+                q_cols=12 * 192,
+            ),
+            (16, 12, 192),
+        )
+
+    def test_dcp8_active_phase_without_replicated_weights_uses_local_heads(self):
+        self.assertEqual(
+            self._run_prepare_to_split(
+                dcp_size=8,
+                q_rep_phase=True,
+                has_qrep_weights=False,
+                q_cols=12 * 192,
+            ),
+            (16, 12, 192),
+        )
+
+    def test_dcp_q_replicate_uses_full_heads(self):
+        self.assertEqual(
+            self._run_prepare_to_split(
+                dcp_size=8,
+                q_rep_phase=True,
+                has_qrep_weights=True,
+                q_cols=96 * 192,
+            ),
+            (16, 96, 192),
+        )
+
+    def test_tuple_hidden_states_uses_q_lora_row_count(self):
+        hidden_tuple = (
+            torch.zeros(16, 7168, dtype=torch.bfloat16),
+            torch.ones(16, 56, dtype=torch.float32),
+        )
+        self.assertEqual(
+            self._run_prepare_to_split(
+                dcp_size=8,
+                q_rep_phase=True,
+                has_qrep_weights=True,
+                q_cols=96 * 192,
+                hidden=hidden_tuple,
+            ),
+            (16, 96, 192),
+        )
+
+    def test_mismatched_q_width_raises_instead_of_silently_reshaping(self):
+        with self.assertRaises(RuntimeError):
+            self._run_prepare_to_split(
+                dcp_size=8,
+                q_rep_phase=True,
+                has_qrep_weights=True,
+                q_cols=12 * 192,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
