@@ -99,6 +99,18 @@ for _bk in ("torch", "cute_dsl", "helion"):
     )
 del _bk
 
+# DSA prefill ShardQ exchange: peer pushes into symmetric-memory buffers.
+for _fn in ("push_rows_to_peers", "push_cols_to_peers"):
+    register_kernel(
+        KernelSpec(
+            op=f"communication.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.communication.shard_q_push:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
 # Blackwell sequence-parallel GEMM collectives (tcgen05 CuTeDSL kernels).
 for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
     register_kernel(

@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     hadamard_preserved,
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
+    kv_balanced_row_bounds,
     resolve_fp8_mqa_logits_fn,
     resolve_fp8_paged_mqa_logits_fn,
     resolve_num_sms,
@@ -195,6 +196,7 @@ class _IndexerTpSplit(NamedTuple):
     row_lo: int
     row_hi: int
     rows_per_rank: List[int]
+    gather: bool = True  # False: rows stay local (backend ShardQ)
 
 
 if _is_cuda or _is_hip:
@@ -1903,7 +1905,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
         else:
             tp_split = self._indexer_tp_split(
-                forward_batch=forward_batch, q_offset=q_offset
+                forward_batch=forward_batch,
+                q_offset=q_offset,
+                shard_q_bounds=getattr(
+                    getattr(metadata, "attn_metadata", None), "shard_q_bounds", None
+                ),
             )
             if tp_split is None:
                 row_lo, row_hi = 0, q_offset
@@ -1984,7 +1990,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         dst, dst_base = topk_dst, 0
-        if tp_split is not None:
+        if tp_split is not None and tp_split.gather:
             if _use_aiter_gfx95:
                 gather_buf, dst = dsa_indexer_hip.tp_split_topk_rows(
                     tp_split, row_hi - row_lo, self.index_topk, device
@@ -2069,11 +2075,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dcp_all_gather_rows_(topk_dst, row_per, row_slot)
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
-        if tp_split is not None and _use_aiter_gfx95:
+        if tp_split is not None and tp_split.gather and _use_aiter_gfx95:
             dsa_indexer_hip.tp_split_gather_topk(
                 tp_split, gather_buf, topk_result[:q_offset]
             )
-        elif tp_split is not None:
+        elif tp_split is not None and tp_split.gather:
             # Rank order == row order, so the gather rebuilds rows [0, q_offset).
             tp_split.group.all_gatherv(
                 dst, sizes=tp_split.rows_per_rank, output=topk_result[:q_offset]
@@ -2142,10 +2148,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return k_fp8.contiguous(), k_scale.contiguous()
 
     def _indexer_tp_split(
-        self, forward_batch: ForwardBatch, q_offset: int
+        self,
+        forward_batch: ForwardBatch,
+        q_offset: int,
+        shard_q_bounds: Optional[List[int]] = None,
     ) -> Optional[_IndexerTpSplit]:
         # Every input is identical across the group, so all ranks take the same
         # branch and the all-gather cannot diverge.
+        if shard_q_bounds is not None:
+            # The backend's ShardQ attends this rank's rows only: score the same
+            # rows and keep the top-k local, with no gather.
+            group = get_parallel().attn_tp_group
+            rank = group.rank_in_group
+            sizes = [hi - lo for lo, hi in zip(shard_q_bounds, shard_q_bounds[1:])]
+            return _IndexerTpSplit(
+                group, shard_q_bounds[rank], shard_q_bounds[rank + 1], sizes, False
+            )
         if not (_is_cuda or _is_gfx95_supported) or self.tp_split_min_rows is None:
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
@@ -2169,11 +2187,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             return None
-        bounds = self._indexer_tp_split_bounds(
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            extend_lens=forward_batch.extend_seq_lens_cpu,
-            q_offset=q_offset,
-            tp=tp,
+        bounds = kv_balanced_row_bounds(
+            forward_batch.seq_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+            q_offset,
+            tp,
         )
         rank = group.rank_in_group
         print_info_once(
@@ -2182,33 +2200,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
         return _IndexerTpSplit(group, bounds[rank], bounds[rank + 1], sizes)
-
-    @staticmethod
-    def _indexer_tp_split_bounds(
-        seq_lens_cpu: torch.Tensor, extend_lens: List[int], q_offset: int, tp: int
-    ) -> List[int]:
-        # Contiguous row bounds 0 = b_0 < ... < b_tp = q_offset, balanced by each
-        # row's KV length (what logits and top-k cost scales with); host-only math.
-        seq = seq_lens_cpu.to(torch.int64)
-        if (
-            len(extend_lens) == seq.numel()
-            and sum(extend_lens) == q_offset
-            and min(extend_lens) >= 0
-        ):
-            ext = torch.tensor(extend_lens, dtype=torch.int64)
-            row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
-            row_pos = torch.arange(q_offset, dtype=torch.int64) - row_req_start
-            row_kv = torch.repeat_interleave(seq - ext, ext) + row_pos + 1
-            cum = torch.cumsum(row_kv.clamp_(min=1), 0)
-            targets = cum[-1] * torch.arange(1, tp, dtype=torch.int64) // tp
-            cuts = torch.searchsorted(cum, targets, right=True).tolist()
-        else:
-            cuts = [q_offset * r // tp for r in range(1, tp)]
-        bounds = [0]
-        for r, cut in enumerate(cuts, start=1):
-            bounds.append(min(max(cut, bounds[-1] + 1), q_offset - (tp - r)))
-        bounds.append(q_offset)
-        return bounds
 
     def _forward_cuda_k_only(
         self,

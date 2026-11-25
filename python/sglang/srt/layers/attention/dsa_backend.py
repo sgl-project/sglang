@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     List,
     Literal,
@@ -42,6 +43,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     gather_dequant_requant_fp8_paged_dsa,
 )
 from sglang.kernels.ops.attention.dsa.metadata import gather_physical_token_table
+from sglang.kernels.ops.attention.dsa.shard_q_layout import swap_leading_dims
 from sglang.kernels.ops.attention.dsa.transform_index import (
     prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
@@ -106,6 +108,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_cache_seqlens_may_be_padded,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    kv_balanced_row_bounds,
     pad_dsa_cache_seqlens,
     resolve_num_sms,
     resolve_paged_mqa_logits_metadata_fn,
@@ -120,6 +123,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
     trtllm_padded_heads,
 )
+from sglang.srt.layers.communication.shard_q_exchange import get_shard_q_exchange
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import (
     cp_live_store_rows,
@@ -437,6 +441,10 @@ class DSAMetadata:
     # DCP decode: [rows] valid local KV slots of each top-k row, written in
     # place by the indexer; layers that reuse the top-k reuse it too
     dcp_topk_length: Optional[torch.Tensor] = None
+    # Prefill ShardQ row bounds shared with the indexer (host list and device
+    # int32), or None when the batch stays replicated across the group.
+    shard_q_bounds: Optional[List[int]] = None
+    shard_q_bounds_gpu: Optional[torch.Tensor] = None
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -501,6 +509,11 @@ def uses_raw_fp8_dsa_kv_layout(backend: Optional[str]) -> bool:
     # The raw FP8 MLA cache layout: 576 B/token, no fp8_ds_mla tile scales.
     return backend in ("trtllm", "prims_ts")
 
+
+# A full-KV prims_ts prefill below this many rows keeps every row on every rank:
+# the q / output all-to-alls cost more than the replicated top-k reads.
+# Measured break-even on SM107 DCP8, 12 heads per rank, top-k 2048.
+_PRIMS_TS_SHARD_Q_MIN_ROWS = 2048
 
 # Largest head count the kernel has been measured at. Above it BLOCK_H=64/128
 # makes the [BLOCK_H, 512] fp32 accumulator spill or miss SM120's smem budget.
@@ -772,6 +785,7 @@ class DeepseekSparseAttnBackend(
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+    _prims_ts_prefill_shard_q: bool = False
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens, and the
@@ -986,6 +1000,28 @@ class DeepseekSparseAttnBackend(
                     max_rows=max_rows,
                     width=_padded_sparse_top_k(self.dsa_index_topk),
                 )
+        # ShardQ splits a full-KV prefill by rows over the ranks that hold the
+        # other heads of the same rows: the DCP group, which gathers the KV
+        # first, or without DCP the attention-TP group (MLA KV is replicated).
+        self._shard_q_world = (
+            self.attn_dcp_size
+            if self.attn_dcp_size > 1
+            else get_parallel().attn_tp_size
+        )
+        self._prims_ts_prefill_shard_q = (
+            self._prims_ts is not None
+            and self.dsa_prefill_impl == "prims_ts"
+            and self._shard_q_world > 1
+        )
+        self._shard_q_even_bounds: dict[int, torch.Tensor] = {}
+        if self._prims_ts_prefill_shard_q:
+            self._prims_ts.prepare(
+                heads=self.local_num_q_heads * self._shard_q_world,
+                max_rows=_prims_ts_prefill_max_rows(
+                    model_runner.model_config.context_len
+                ),
+                width=_padded_sparse_top_k(self.dsa_index_topk),
+            )
         self._trtllm_q_pad_graph: Optional[torch.Tensor] = None
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
             self.local_num_q_heads
@@ -1952,6 +1988,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            **self._prefill_shard_q_bounds(forward_batch, extend_seq_lens_cpu),
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
@@ -5030,6 +5067,30 @@ class DeepseekSparseAttnBackend(
             # Decode passes the full KV length; only the first top-k width
             # slots of a row hold its selected keys.
             lengths = torch.clamp(lengths, max=page_table_1.shape[1])
+        if (
+            is_prefill
+            and not partial
+            and self._prims_ts_prefill_shard_q
+            and (
+                metadata.shard_q_bounds is not None
+                or rows >= _PRIMS_TS_SHARD_Q_MIN_ROWS
+            )
+            # Without DCP only the peer-push exchange pays; over NCCL all-to-all
+            # the row split is slower than the replicated prefill.
+            and (
+                self.attn_dcp_size > 1
+                or get_shard_q_exchange(self._shard_q_group()[0]) is not None
+            )
+        ):
+            return self._forward_prims_ts_shard_q(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                indices=page_table_1,
+                lengths=lengths,
+                layer=layer,
+                k_scale=k_scale,
+                metadata=metadata,
+            )
         out, lse = self._prims_ts.forward(
             q=q_all,
             kv_cache=kv_cache,
@@ -5046,6 +5107,163 @@ class DeepseekSparseAttnBackend(
                 [lse, lse.new_full((row_plan.q_pad_rows, lse.shape[1]), -torch.inf)]
             )
         return out, lse
+
+    def _shard_q_group(self) -> tuple[Any, int]:
+        """The head-sharded group ShardQ splits rows over, and this rank in it."""
+        if self.attn_dcp_size > 1:
+            return get_parallel().dcp_group.device_group, self.attn_dcp_rank
+        return get_parallel().attn_tp_group.device_group, get_parallel().attn_tp_rank
+
+    def _prefill_shard_q_bounds(
+        self, forward_batch: ForwardBatch, extend_lens: List[int]
+    ) -> dict:
+        """DSAMetadata's ShardQ bounds for an eager prefill: KV-balanced rows
+        the indexer scores locally, so its top-k is never gathered. Empty when
+        the batch stays replicated or the group has no symmetric memory."""
+        if (
+            not self._prims_ts_prefill_shard_q
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.seq_lens_cpu is None
+            or sum(extend_lens) < _PRIMS_TS_SHARD_Q_MIN_ROWS
+            or envs.SGLANG_DSA_TOPK_BROADCAST.get()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return {}
+        group, rank = self._shard_q_group()
+        # The indexer reads the bounds by attention-TP rank and then skips its
+        # top-k gather, so every attention-TP rank must take them or none.
+        if (
+            self._shard_q_world != get_parallel().attn_tp_size
+            or rank != get_parallel().attn_tp_rank
+            or get_shard_q_exchange(group) is None
+        ):
+            return {}
+        bounds = kv_balanced_row_bounds(
+            forward_batch.seq_lens_cpu,
+            extend_lens,
+            sum(extend_lens),
+            self._shard_q_world,
+        )
+        return {
+            "shard_q_bounds": bounds,
+            "shard_q_bounds_gpu": torch.tensor(
+                bounds, dtype=torch.int32, device=self.device
+            ),
+        }
+
+    def _forward_prims_ts_shard_q(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+        layer: RadixAttention,
+        k_scale: float,
+        metadata: DSAMetadata,
+    ) -> torch.Tensor:
+        """Full-KV prefill split by rows instead of heads: rank r of the
+        head-sharded group attends its row block with all world*H heads. The
+        kernel is bound by reading each row's top-k KV, which every rank
+        otherwise reads in full. q_all [rows, H, 576] E4M3 with this rank's
+        heads; returns [rows, H, 512]."""
+        world = self._shard_q_world
+        group, rank = self._shard_q_group()
+        rows = q_all.shape[0]
+        exchange = get_shard_q_exchange(group)
+        if exchange is None:
+            return self._forward_prims_ts_shard_q_nccl(
+                q_all, indices, lengths, kv_cache, layer, k_scale, group, rank
+            )
+        if metadata.shard_q_bounds is not None:
+            bounds, bounds_gpu = metadata.shard_q_bounds, metadata.shard_q_bounds_gpu
+            assert bounds[-1] == rows, (bounds[-1], rows)
+        else:
+            per = -(-rows // world)
+            bounds = [min(r * per, rows) for r in range(world + 1)]
+            bounds_gpu = self._shard_q_even_bounds.get(rows)
+            if bounds_gpu is None:
+                bounds_gpu = torch.tensor(bounds, dtype=torch.int32, device=self.device)
+                self._shard_q_even_bounds[rows] = bounds_gpu
+        lo, hi = bounds[rank], bounds[rank + 1]
+        q_rows = exchange.exchange_q(
+            q_all,
+            bounds_gpu,
+            max_count=max(b - a for a, b in zip(bounds, bounds[1:])),
+            count=hi - lo,
+        )
+        out, _ = self._prims_ts.forward(
+            q=q_rows,
+            kv_cache=kv_cache,
+            indices=indices[lo:hi],
+            lengths=lengths[lo:hi],
+            sm_scale=layer.scaling,
+            kv_scale=k_scale,
+        )
+        return exchange.exchange_out(out, row0=lo, rows=rows)
+
+    def _forward_prims_ts_shard_q_nccl(
+        self, q_all, indices, lengths, kv_cache, layer, k_scale, group, rank
+    ) -> torch.Tensor:
+        """ShardQ without symmetric memory: even row blocks by all-to-all."""
+        world = self._shard_q_world
+        rows = q_all.shape[0]
+        per = -(-rows // world)
+        q_rows = self._shard_q_scatter_nccl(q_all, group, world, per)
+        start, stop = min(rank * per, rows), min((rank + 1) * per, rows)
+        idx, lens = indices[start:stop], lengths[start:stop]
+        if stop - start < per:
+            # Padding rows select no keys: zero output, never read back.
+            idx = torch.cat(
+                [idx, idx.new_full((per - (stop - start), idx.shape[1]), -1)]
+            )
+            lens = torch.cat([lens, lens.new_zeros(per - (stop - start))])
+        out, _ = self._prims_ts.forward(
+            q=q_rows,
+            kv_cache=kv_cache,
+            indices=idx,
+            lengths=lens,
+            sm_scale=layer.scaling,
+            kv_scale=k_scale,
+        )
+        return self._shard_q_gather_nccl(out, group, world, rows)
+
+    @staticmethod
+    def _shard_q_scatter_nccl(
+        q_all: torch.Tensor, group, world: int, per: int
+    ) -> torch.Tensor:
+        """[rows, H, D] head-sharded q -> [per, world * H, D] row block, by
+        all-to-all and a re-layout (no symmetric memory)."""
+        rows, heads, head_dim = q_all.shape
+        q_send = q_all.contiguous()
+        if per * world != rows:
+            q_send = torch.cat(
+                [q_send, q_send.new_zeros(per * world - rows, heads, head_dim)]
+            )
+        # Row block s goes to rank s; block r of the result holds rank r's heads.
+        q_recv = torch.empty_like(q_send)
+        torch.distributed.all_to_all_single(
+            q_recv.view(torch.uint8), q_send.view(torch.uint8), group=group
+        )
+        return swap_leading_dims(
+            q_recv.view(world, per, heads, head_dim),
+            q_recv.new_empty((per, world, heads, head_dim)),
+        ).view(per, world * heads, head_dim)
+
+    @staticmethod
+    def _shard_q_gather_nccl(
+        out: torch.Tensor, group, world: int, rows: int
+    ) -> torch.Tensor:
+        """[per, world * H, Dv] row block -> this rank's heads of every row."""
+        per, all_heads, v_dim = out.shape
+        heads = all_heads // world
+        out_send = swap_leading_dims(
+            out.view(per, world, heads, v_dim),
+            out.new_empty((world, per, heads, v_dim)),
+        )
+        out_recv = torch.empty_like(out_send)
+        torch.distributed.all_to_all_single(out_recv, out_send, group=group)
+        return out_recv.view(per * world, heads, v_dim)[:rows]
 
     def _trtllm_q_fp8(
         self,
