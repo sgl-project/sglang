@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
+from parameterized import parameterized
 
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import (
@@ -21,7 +22,7 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestHiSparseHiCacheBuffer(CustomTestCase):
-    def _build(self, dtype=torch.bfloat16, *, attach=True):
+    def _build(self, dtype=torch.bfloat16, *, attach=True, host_layout="page_first"):
         size, page, layers = 1024, 64, 2
         self.pool = DSATokenToKVPool(
             size=size,
@@ -84,14 +85,18 @@ class TestHiSparseHiCacheBuffer(CustomTestCase):
             self.expected_index.append(index[pages].clone())
         host_size = 2 * size + page
         row_bytes = self.pool.kv_buffer[0].view(torch.uint8).stride(0)
-        # Layer-interleaved rows with padding exercise the runtime host stride.
-        self.host_storage = torch.zeros(
-            (host_size, layers, row_bytes + 16), dtype=torch.uint8, pin_memory=True
-        )
-        self.host = SimpleNamespace(
-            size=host_size,
-            data_refs=[self.host_storage[:, i, :row_bytes] for i in range(layers)],
-        )
+        if host_layout == "layer_first":
+            self.host_storage = torch.zeros(
+                (layers, host_size, row_bytes), dtype=torch.uint8, pin_memory=True
+            )
+            refs = list(self.host_storage.unbind(0))
+        else:
+            # Layer-interleaved rows with padding exercise the runtime host stride.
+            self.host_storage = torch.zeros(
+                (host_size, layers, row_bytes + 16), dtype=torch.uint8, pin_memory=True
+            )
+            refs = list(self.host_storage[:, :, :row_bytes].unbind(1))
+        self.host = SimpleNamespace(size=host_size, data_refs=refs)
         starts = torch.tensor([host_size - page, 0, 128, 256], device="cuda")
         self.host_tokens = (
             starts[:, None] + torch.arange(page, device="cuda")
@@ -250,9 +255,12 @@ class TestHiSparseHiCacheBuffer(CustomTestCase):
         backend.attn_dcp_size = 1
         return backend
 
-    def test_graph_replay_sees_late_host_binding_and_independent_index_metadata(self):
+    @parameterized.expand([("page_first",), ("layer_first",)])
+    def test_graph_replay_sees_late_host_binding_and_independent_index_metadata(
+        self, host_layout
+    ):
         """Captured swaps resolve a later host attachment and remapped index pages."""
-        self._build(torch.float8_e4m3fn, attach=False)
+        self._build(torch.float8_e4m3fn, attach=False, host_layout=host_layout)
         topk = torch.arange(128, dtype=torch.int32, device="cuda").view(2, 64)
         table = torch.empty((2, 4), dtype=torch.int32, device="cuda")
         locations = torch.empty_like(topk)

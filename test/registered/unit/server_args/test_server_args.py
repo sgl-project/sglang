@@ -2195,12 +2195,16 @@ class TestHiSparseHiCachePolicy(CustomTestCase):
 
     @override_platform(is_hip=False)
     def test_shared_host_mode_requires_compatible_ownership(self):
-        validate_hisparse_hicache(self._args())
+        for layout in ("page_first", "layer_first"):
+            with self.subTest(layout=layout):
+                validate_hisparse_hicache(self._args(hicache_mem_layout=layout))
         for overrides in (
             {"enable_hisparse": True},
             {"enable_hierarchical_cache": False},
             {"disable_radix_cache": True},
             {"hicache_write_policy": "write_through"},
+            {"hicache_mem_layout": "page_first_direct"},
+            {"hicache_mem_layout": "page_unified"},
             {"hicache_host_memory_mode": "buffer_only"},
             {"enable_streaming_session": True},
             {"disaggregation_mode": "decode"},

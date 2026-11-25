@@ -136,7 +136,10 @@ def validate_hisparse_hicache(server_args: ServerArgs) -> None:
         (cfg.enable_hierarchical_cache, "--enable-hierarchical-cache"),
         (not cfg.disable_radix_cache, "radix cache enabled"),
         (cfg.hicache_write_policy == "write_back", "--hicache-write-policy write_back"),
-        (cfg.hicache_mem_layout == "page_first", "--hicache-mem-layout page_first"),
+        (
+            cfg.hicache_mem_layout in ("page_first", "layer_first"),
+            "--hicache-mem-layout page_first or layer_first",
+        ),
         (cfg.hicache_host_memory_mode == "cache", "--hicache-host-memory-mode cache"),
         (cfg.page_size == 64, "--page-size 64"),
     )

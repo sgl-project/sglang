@@ -6,6 +6,7 @@ from array import array
 from types import SimpleNamespace
 
 import torch
+from parameterized import parameterized_class
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseHiCacheBackend
 from sglang.srt.managers.req_types import FINISH_LENGTH
@@ -29,6 +30,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
+@parameterized_class(("host_layout",), [("page_first",), ("layer_first",)])
 class TestHiSparseHiCache(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
@@ -37,7 +39,7 @@ class TestHiSparseHiCache(CustomTestCase):
             page_size=64,
             hicache_ratio=2,
             hicache_write_policy="write_back",
-            hicache_mem_layout="page_first",
+            hicache_mem_layout=self.host_layout,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -99,6 +101,7 @@ class TestHiSparseHiCache(CustomTestCase):
             cache=self.cache, allocator=self.allocator
         )
         self.coordinator.attach_tree(self.tree)
+        self.assertEqual(self.cache.host_pool.layout, self.host_layout)
 
     def _prefill(self, rid="a", length=256):
         req = Req(

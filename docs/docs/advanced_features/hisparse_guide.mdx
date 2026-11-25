@@ -23,6 +23,8 @@ model's [cookbook deployment](/cookbook/intro):
 --page-size 64
 ```
 
+You can also use `--hicache-mem-layout layer_first` to store host KV by layer.
+
 The HiCache backend supports chunked prefill and decode CUDA graphs. Hot slots are reserved
 before prefill and released when the request finishes. Resident KV is read
 directly from the GPU pool; hot slots are populated on demand after HiCache eviction.
