@@ -1725,7 +1725,7 @@
                 ]
               },
               {
-                "group": "VLA (Vision-Language-Action) Models",
+                "group": "Action Models (VLA · WAM)",
                 "pages": [
                   "cookbook/vla/intro",
                   {
@@ -1749,6 +1749,12 @@
                       "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
+                ]
+              },
+              {
+                "group": "By use case",
+                "pages": [
+                  "cookbook/use-cases/robotics-physical-ai"
                 ]
               },
               {
