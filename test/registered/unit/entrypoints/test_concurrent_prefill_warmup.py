@@ -228,6 +228,15 @@ class TestConcurrentPrefillRequests(CustomTestCase):
         rooms = [r.bootstrap_room for r in tm.requests]
         self.assertEqual(len(set(rooms)), len(rooms))
 
+    def test_tokenizer_workers_use_distinct_bootstrap_rooms(self):
+        """Every tokenizer worker runs this warmup at the same time against the
+        same PD prefill scheduler."""
+        workers = [_RecordingTokenizerManager() for _ in range(2)]
+        for tm in workers:
+            asyncio.run(concurrent_prefill("prefill", tm))
+        rooms = [{r.bootstrap_room for r in tm.requests} for tm in workers]
+        self.assertEqual(rooms[0] & rooms[1], set())
+
     def test_decode_server_sends_nothing(self):
         tm = _RecordingTokenizerManager()
         asyncio.run(concurrent_prefill("decode", tm))

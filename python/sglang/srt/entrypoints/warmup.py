@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
@@ -306,8 +307,10 @@ async def concurrent_prefill(
         )
         return
     vocab = min(2**16, tokenizer_manager.model_config.vocab_size)
-    # PD prefill servers need a bootstrap room; concurrent requests need distinct ones.
-    bootstrap_rooms = itertools.count()
+    # PD prefill servers need a bootstrap room; concurrent requests need
+    # distinct ones, also across tokenizer workers. Consecutive rooms keep
+    # follow_bootstrap_room DP dispatch even.
+    bootstrap_rooms = itertools.count(random.randrange(1 << 62))
 
     async def one(size, **kwargs):
         req = GenerateReqInput(
