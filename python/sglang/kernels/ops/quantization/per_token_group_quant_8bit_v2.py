@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -30,11 +29,6 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_module(in_dtype: torch.dtype, out_dtype: torch.dtype, use_pdl: bool) -> Module:
     args = make_cpp_args(in_dtype, out_dtype, use_pdl)
-    # Match the AOT sgl-kernel build so the FP8 scale division/rounding is
-    # bit-identical to sgl_per_token_group_quant_8bit_v2: the wheel ships an
-    # SM90 build compiled with -use_fast_math and a precise-math build for
-    # every other arch.
-    use_fast_math = current_arch().is_sm(9, 0)
     return load_jit(
         "per_token_group_quant_8bit_v2",
         *args,
@@ -45,7 +39,9 @@ def _jit_module(in_dtype: torch.dtype, out_dtype: torch.dtype, use_pdl: bool) ->
                 f"PerTokenGroupQuant8bitV2Kernel<{args}>::run",
             )
         ],
-        extra_cuda_cflags=["--use_fast_math"] if use_fast_math else [],
+        # Match the AOT sgl-kernel build (-use_fast_math) so the FP8 scale
+        # division/rounding is bit-identical to sgl_per_token_group_quant_8bit_v2.
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
