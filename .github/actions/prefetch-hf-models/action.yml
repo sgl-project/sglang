@@ -15,9 +15,8 @@ inputs:
 runs:
   using: composite
   steps:
-    # No token here: pip runs outside the PR checkout and without user-site,
-    # PYTHON* env, pip config, or PIP_* left on the persistent runner, and
-    # installs only the exact-pinned wheels listed, from pypi.org.
+    # No token here. -I and --isolated: no PR checkout on sys.path, and no
+    # user site, PYTHON*, pip config, or PIP_* left on the persistent runner.
     - name: Install prefetch dependencies
       if: inputs.repo-ids != ''
       shell: bash

@@ -1,15 +1,12 @@
 """Download Hugging Face repos into this runner's cache for a PR test job.
 
-PR test jobs run PR code on persistent runners, so the tests hold no HF token.
-This script runs first in the job, from a checkout of the workflow's own
-commit, with the token in its own step only. The repo ids come from the PR's
-check-changes job (scripts/ci/hf_repo_scan.py), so each is checked to be a
-well-formed id of a public model on the Hub and skipped otherwise.
+Runs from the workflow's own commit in the step that holds HF_TOKEN, before
+the job runs PR code. REPO_IDS comes from check-changes, which PR code
+controls, so an id that is not a public model on the Hub is skipped.
 
     REPO_IDS="org/model-a org/model-b" python3 -S prefetch_hf_models.py
 
-A download problem is a warning, never a failure: the test then fails the way
-it would have without the prefetch.
+A problem is a warning, never a failure.
 """
 
 import fnmatch

@@ -173,8 +173,7 @@ jobs:
         env:
           PARTITIONS: ${{ steps.partitions.outputs.partitions }}
         run: |
-          # `prefetch_repos={suite: [[repo ids of partition i], ...]}`, which
-          # each stage job downloads before it runs PR code without a token.
+          # `prefetch_repos={suite: [[repo ids of partition i], ...]}` for the stages.
           python3 scripts/ci/hf_repo_scan.py --partitions "$PARTITIONS" \
             --partition-model-file /tmp/partition-model.json \
             >> "$GITHUB_OUTPUT"

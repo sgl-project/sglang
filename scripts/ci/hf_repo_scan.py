@@ -174,8 +174,7 @@ class RepoIdScanner:
     ) -> Dict[str, Set[str]]:
         """`name -> repo ids` for the module-level names of ``path`` that name
         a repo: constants, and the classes and functions (fixtures, kits,
-        helpers) whose body or bases do. ``tree`` is the parsed ``path``,
-        when the caller has it."""
+        helpers) whose body or bases do."""
         if path in self.modules:
             return self.modules[path]
         table: Dict[str, Set[str]] = {}
