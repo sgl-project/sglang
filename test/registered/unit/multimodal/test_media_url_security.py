@@ -4,6 +4,7 @@ import http.server
 import os
 import socket
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +66,19 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"x" * (1024 * 1024 + 1))
+            return
+
+        if self.path == "/slow-drip":
+            # One byte every 0.3 s: each read finishes inside a per-read timeout.
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            try:
+                for _ in range(100):
+                    self.wfile.write(b"x")
+                    time.sleep(0.3)
+            except OSError:
+                pass
             return
 
         if self.path == "/redirect-loop":
@@ -214,6 +228,13 @@ class TestMediaURLSecurity(unittest.TestCase):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=1)
         with self.assertRaisesRegex(ValueError, "download limit"):
             download_remote_media(self._url("/chunked-oversized"), timeout=5)
+
+    def test_slow_drip_body_stops_at_the_total_deadline(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        start = time.monotonic()
+        with self.assertRaises(requests.exceptions.Timeout):
+            download_remote_media(self._url("/slow-drip"), timeout=1.0)
+        self.assertLess(time.monotonic() - start, 1.5)
 
     def test_invalid_allowlist_entries_are_rejected(self):
         for domain in (

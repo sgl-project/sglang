@@ -566,9 +566,9 @@ The server downloads them under the same policy and flags as the LLM server
   hostnames; an allowlisted host may resolve to a private address.
 - `--media-url-max-file-size-mb` caps one download. The default is `512`
   (videos), larger than the LLM server's `64`; `0` disables the limit.
-- `--media-url-timeout` is the time budget of one download, redirects
-  included. An image URL download stops when it runs out; other downloads
-  check it before each redirect and between body chunks.
+- `--media-url-timeout` is the time budget of one download, redirects and
+  body included. A download stops when it runs out, even when the server
+  sends the body slowly.
 
 Media downloads connect directly to the checked origin address, never through
 a proxy: when the server environment sets an HTTP(S) proxy, include trusted

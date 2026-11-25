@@ -1,7 +1,8 @@
 import base64
 import io
 import traceback
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import requests
@@ -90,6 +91,12 @@ def test_load_video_removes_downloaded_temp_file(
 
         def __init__(self):
             self.status_code = status_code
+            body = iter([payload])
+            self.raw = SimpleNamespace(
+                media_sock=Mock(),
+                isclosed=lambda: False,
+                read1=lambda amt, decode_content: next(body, b""),
+            )
 
         def __enter__(self):
             return self
@@ -100,9 +107,6 @@ def test_load_video_removes_downloaded_temp_file(
         def raise_for_status(self):
             if status_code >= 400:
                 raise requests.HTTPError(f"{status_code}", response=None)
-
-        def iter_content(self, chunk_size):
-            return iter([payload])
 
     monkeypatch.setattr(
         get_mm_http_session(), "get", lambda *args, **kwargs: Response()

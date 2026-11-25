@@ -3559,7 +3559,7 @@ This option does not disable required attention or MoE collectives, including ex
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--media-url-timeout`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds to download one remote media URL, redirects and body included, for every media type. When unset, <code>REQUEST_TIMEOUT</code> applies, else each loader's own default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds to download one remote media URL, redirects and body included, for every media type; a server that sends the body slowly is cut off when the budget runs out. When unset, <code>REQUEST_TIMEOUT</code> applies, else each loader's own default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>

@@ -146,7 +146,12 @@ class _FakeResponse:
         self.status_code = status_code
         self.headers = headers or {}
         self.url = "http://93.184.216.34/clip.mp4"
-        self._chunks = list(chunks)
+        body = iter(chunks)
+        self.raw = SimpleNamespace(
+            media_sock=mock.Mock(),
+            isclosed=lambda: False,
+            read1=lambda amt, decode_content: next(body, b""),
+        )
 
     def __enter__(self):
         return self
@@ -160,9 +165,6 @@ class _FakeResponse:
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.HTTPError(f"HTTP {self.status_code}")
-
-    def iter_content(self, chunk_size=8192):
-        yield from self._chunks
 
 
 class TestLoadVideoDownload:

@@ -3335,8 +3335,10 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.media_url_timeout,
             help="Time budget in seconds of one client-supplied media URL "
-            "download, redirects included, for every media type. When unset, "
-            "REQUEST_TIMEOUT applies, else each loader's default.",
+            "download, redirects and body included, for every media type; a "
+            "server that sends the body slowly is cut off when the budget runs "
+            "out. When unset, REQUEST_TIMEOUT applies, else each loader's "
+            "default.",
         )
 
         # LoRA

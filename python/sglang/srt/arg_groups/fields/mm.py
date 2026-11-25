@@ -127,8 +127,9 @@ class Mm(msgspec.Struct):
     media_url_timeout: A[
         Optional[float],
         "Seconds to download one client-supplied media URL, redirects and body "
-        "included, for every media type. When unset, REQUEST_TIMEOUT applies, "
-        "else each loader's default.",
+        "included, for every media type; a server that sends the body slowly "
+        "is cut off when the budget runs out. When unset, REQUEST_TIMEOUT "
+        "applies, else each loader's default.",
     ] = None
     allow_local_media_files: A[
         bool,

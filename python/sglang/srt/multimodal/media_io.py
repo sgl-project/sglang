@@ -37,6 +37,7 @@ import numpy as np
 import pybase64
 import requests
 import torch
+import urllib3
 from PIL import Image, ImageOps, UnidentifiedImageError
 from typing_extensions import Literal
 from urllib3.connection import HTTPConnection, HTTPSConnection
@@ -259,6 +260,14 @@ class _MediaConnection:
         finally:
             self.host = origin
 
+    def getresponse(self, *args, **kwargs):
+        # http.client drops self.sock once the response owns the socket; keep it
+        # so the body read can bound each socket read by the download deadline.
+        sock = self.sock
+        response = super().getresponse(*args, **kwargs)
+        response.media_sock = sock
+        return response
+
 
 class _MediaHTTPConnection(_MediaConnection, HTTPConnection):
     pass
@@ -412,11 +421,7 @@ def open_remote_media(url: str, timeout: float):
 
             def chunks():
                 total = 0
-                for chunk in response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    if time.monotonic() > deadline:
-                        raise requests.exceptions.Timeout("Media download timed out")
+                for chunk in _read_body_until(response, deadline):
                     total += len(chunk)
                     if max_bytes and total > max_bytes:
                         raise ValueError(
@@ -426,6 +431,36 @@ def open_remote_media(url: str, timeout: float):
 
             yield response.headers, chunks()
             return
+
+
+def _read_body_until(response: requests.Response, deadline: float):
+    """Yield the decoded body, failing once the total deadline passes.
+
+    Each socket read waits at most the time left, and ``read1`` returns what one
+    read brings, so a server that trickles bytes cannot outlast the deadline.
+    urllib3 errors are raised as the requests errors ``iter_content`` raises.
+    """
+    sock = response.raw.media_sock
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.exceptions.Timeout("Media download timed out")
+            if not response.raw.isclosed():
+                # http.client closes the socket once the whole body is read
+                sock.settimeout(remaining)
+            chunk = response.raw.read1(64 * 1024, decode_content=True)
+            if not chunk:
+                return
+            yield chunk
+    except urllib3.exceptions.ReadTimeoutError as e:
+        raise requests.exceptions.Timeout("Media download timed out") from e
+    except urllib3.exceptions.SSLError as e:
+        raise requests.exceptions.SSLError(e) from e
+    except urllib3.exceptions.DecodeError as e:
+        raise requests.exceptions.ContentDecodingError(e) from e
+    except urllib3.exceptions.ProtocolError as e:
+        raise requests.exceptions.ChunkedEncodingError(e) from e
 
 
 def download_remote_media(url: str, timeout: float) -> bytes:
