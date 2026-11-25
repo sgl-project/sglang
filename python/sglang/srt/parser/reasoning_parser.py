@@ -994,8 +994,6 @@ class Glm45Detector(BaseReasoningFormatDetector):
             thinks_internally=True,
             reasoning_default=reasoning_default,
             force_nonempty_content=force_nonempty_content,
-            continue_final_message=continue_final_message,
-            previous_content=previous_content,
         )
 
 
