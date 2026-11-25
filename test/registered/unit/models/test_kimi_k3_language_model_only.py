@@ -75,6 +75,23 @@ class TestKimiK3LanguageModelOnly(CustomTestCase):
                     model.load_weights(iter(checkpoint))
                 self.assertEqual([name for name, _ in streamed], ["model.norm.weight"])
 
+    def test_get_image_feature_raises_clear_error_without_vision_tower(self):
+        cases = (
+            (
+                dict(language_only=True, language_model_only=False),
+                "--encoder-urls",
+            ),
+            (
+                dict(language_only=False, language_model_only=True),
+                "--language-model-only",
+            ),
+        )
+        for flags, expected_msg in cases:
+            with self.subTest(**flags):
+                model, _, _ = self._build(**flags)
+                with self.assertRaisesRegex(ValueError, expected_msg):
+                    model.get_image_feature([])
+
     def test_multimodal_serving_still_builds_vision_modules(self):
         model, tower, projector = self._build(
             language_only=False, language_model_only=False

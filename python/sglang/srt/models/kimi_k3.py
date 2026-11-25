@@ -4509,6 +4509,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if self.vision_tower is None:
+            if self.config.language_only:
+                raise ValueError(
+                    "Kimi-K3 --language-only servers have no vision tower; "
+                    "image inputs need a reachable --encoder-urls encoder "
+                    "(and --enable-adaptive-dispatch-to-encoder is unsupported)"
+                )
+            raise ValueError(
+                "Kimi-K3 --language-model-only servers have no vision tower "
+                "and do not accept image inputs"
+            )
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         image_grid_thws = []
