@@ -36,7 +36,8 @@ class TestFlashAttentionReturnLse(CustomTestCase):
             req_pool = SimpleNamespace(
                 req_to_token=torch.arange(1, 65, device="cuda", dtype=torch.int32).view(
                     1, -1
-                )
+                ),
+                max_context_len=64,
             )
             runner = SimpleNamespace(
                 sliding_window_size=7,

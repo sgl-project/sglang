@@ -283,7 +283,7 @@ def _cpu_runner(*, model_head_dim):
     """The least ModelRunner FlashAttentionBackend.__init__ reads up to its
     model-level FA4 decisions, on the CPU device."""
     req_to_token_pool = SimpleNamespace(
-        size=4, req_to_token=torch.zeros(5, 16, dtype=torch.int32)
+        size=4, max_context_len=16, req_to_token=torch.zeros(5, 16, dtype=torch.int32)
     )
     token_to_kv_pool = SimpleNamespace(
         id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
