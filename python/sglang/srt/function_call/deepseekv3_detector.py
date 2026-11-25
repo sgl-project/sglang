@@ -61,7 +61,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
@@ -106,13 +106,11 @@ class DeepSeekV3Detector(BaseFormatDetector):
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
         calls: list[ToolCallItem] = []
         try:
+            # Non-greedy, so a buffer holding several calls matches the first one.
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+                pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```.*",
                 string=current_text,
                 flags=re.DOTALL,
             )
