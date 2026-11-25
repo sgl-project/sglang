@@ -816,7 +816,7 @@ async fn generate_single(
     req: GenerateRequest,
     held: Option<PendingGeneration>,
     stream: bool,
-    request: RequestState,
+    mut request: RequestState,
     received: ReceivedAs,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
@@ -827,7 +827,11 @@ async fn generate_single(
     };
     let mut call = match call {
         Ok(call) => call,
-        Err(error) => return native_core_error(error, stream),
+        // Refused before admission: the hook sees the failure the client gets.
+        Err(error) => {
+            request.fail(&error);
+            return native_core_error(error, stream);
+        }
     };
     let rid = call.public_id().to_owned();
     // Cumulative frames (SGLang default) vs per-step deltas.
@@ -922,7 +926,7 @@ async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
-    request_states: Vec<RequestState>,
+    mut request_states: Vec<RequestState>,
     received: ReceivedAs,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
@@ -930,7 +934,14 @@ async fn generate_batch(
     // every other in-flight request.
     let calls = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
-        Err(error) => return native_core_error(error, stream),
+        // The refusal refuses every item, before any was admitted: each
+        // item's hook sees it.
+        Err(error) => {
+            for request in &mut request_states {
+                request.fail(&error);
+            }
+            return native_core_error(error, stream);
+        }
     };
 
     if stream {
@@ -2109,7 +2120,9 @@ mod tests {
     /// anything is submitted, a batch's valid items included: native
     /// `/generate` with its 400 (a stream's error frame), and the OpenAI
     /// routes with their 400, unary even for a stream, as Python answers the
-    /// tokenizer manager's `ValueError` before the stream starts.
+    /// tokenizer manager's `ValueError` before the stream starts. A generate
+    /// hook sees each native request, every item of a batch, fail once with
+    /// the status and message the client gets.
     #[tokio::test]
     async fn generate_validator_refuses_every_ingress_before_submission() {
         let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
@@ -2143,7 +2156,9 @@ mod tests {
                 "stream": stream,
             })
         };
-        for (uri, body, status, error) in [
+        // The last field: how many requests a generate hook sees fail, each
+        // with the client's status and message (one per native batch item).
+        for (uri, body, status, error, hook_failures) in [
             (
                 "/generate",
                 generate(
@@ -2153,6 +2168,7 @@ mod tests {
                 ),
                 StatusCode::BAD_REQUEST,
                 &native,
+                2,
             ),
             (
                 "/generate",
@@ -2163,26 +2179,31 @@ mod tests {
                 ),
                 StatusCode::OK,
                 &native_stream,
+                2,
             ),
             (
                 "/generate",
                 generate(serde_json::json!("x"), serde_json::json!(2), false),
                 StatusCode::BAD_REQUEST,
                 &native,
+                1,
             ),
             (
                 "/v1/completions",
                 completion(false),
                 StatusCode::BAD_REQUEST,
                 &openai,
+                0,
             ),
             (
                 "/v1/completions",
                 completion(true),
                 StatusCode::BAD_REQUEST,
                 &openai,
+                0,
             ),
         ] {
+            let hook = TopPHook::default();
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
@@ -2210,7 +2231,7 @@ mod tests {
                 }),
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
-                generate_hook: None,
+                generate_hook: Some(Arc::new(hook.clone())),
                 openai_chat: None,
             });
             let case = format!("{uri} {body}");
@@ -2241,6 +2262,18 @@ mod tests {
             assert!(
                 intake_rx.is_empty(),
                 "{case}: an item reached the scheduler"
+            );
+            let failed: Vec<_> = hook
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["failed"].clone())
+                .collect();
+            assert_eq!(
+                failed,
+                vec![serde_json::json!([400, "top_logprobs_num 2"]); hook_failures],
+                "{case}"
             );
         }
     }
