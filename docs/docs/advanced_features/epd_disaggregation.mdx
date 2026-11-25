@@ -73,7 +73,11 @@ With an older E that omits its send timeout, P/PD uses its local
 `SGLANG_ENCODER_SEND_TIMEOUT`. Without a
 matching acknowledgement or a native write-completion notification, the memory
 stays registered in quarantine. Quarantine permits up to one additional
-destination per configured live slot before applying backpressure.
+destination per configured live slot before applying backpressure. P/PD
+reclaims a quarantined destination after
+`SGLANG_ENCODER_NIXL_QUARANTINE_SECS` (default 600 seconds), so an encoder that
+never returns does not hold receive slots until P/PD restarts. Set it to `0` to
+keep quarantined memory until a write-completion notification arrives.
 
 | Model family | Image | Video | Separate audio input |
 |---|---|---|---|

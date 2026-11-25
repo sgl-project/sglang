@@ -139,6 +139,7 @@ class NixlTarget:
         self._completed = False
         self._abandoned = False
         self._quarantined = False
+        self._quarantine_deadline = None
         self._one_shot = None
         pool = receiver._pool
         slot = pool.try_alloc(size) if pool is not None else None
@@ -189,10 +190,13 @@ class NixlTarget:
             self._receiver._reap()
 
     def quarantine(self):
-        """Stop RPC recovery. Only a late native WRITE notification can free this memory."""
+        """Stop RPC recovery. A native WRITE notification or the quarantine window frees this memory."""
         if self.tensor is not None and not self._quarantined:
             self._quarantined = True
             self._receiver._quarantined += 1
+            window = self._receiver._quarantine_secs
+            if window > 0:
+                self._quarantine_deadline = time.monotonic() + window
 
     def reaped(self):
         """Poll completion notifications while a Release fence is unavailable."""
@@ -204,7 +208,7 @@ class NixlTarget:
 class NixlReceiver:
     """Register the host embedding pool once and track outstanding remote writes."""
 
-    def __init__(self, capacity=32, *, pool_bytes=None):
+    def __init__(self, capacity=32, *, pool_bytes=None, quarantine_secs=None):
         from sglang.srt.disaggregation.encoder.receiver import EmbeddingPool
         from sglang.srt.environ import envs
 
@@ -214,6 +218,11 @@ class NixlReceiver:
             pool_bytes = envs.SGLANG_ENCODER_NIXL_POOL_SIZE_MB.get() * 1024**2
         if type(pool_bytes) is not int or pool_bytes < 0:
             raise ValueError("NIXL receiver pool size must be a nonnegative byte count")
+        if quarantine_secs is None:
+            quarantine_secs = envs.SGLANG_ENCODER_NIXL_QUARANTINE_SECS.get()
+        if not 0 <= quarantine_secs < math.inf:
+            raise ValueError("NIXL quarantine window must be a nonnegative duration")
+        self._quarantine_secs = quarantine_secs
         self._agent = _agent()
         self._capacity = capacity
         self._quarantined = 0
@@ -245,8 +254,23 @@ class NixlReceiver:
                 target = self._targets.get(message)
                 if target is not None:
                     target._completed = True
+        now = time.monotonic()
         for target in list(self._targets.values()):
-            if target._abandoned and target._completed:
+            if not target._abandoned:
+                continue
+            if target._completed:
+                target.close()
+            elif (
+                target._quarantine_deadline is not None
+                and now >= target._quarantine_deadline
+            ):
+                # The issuing encoder stayed unreachable past every transport
+                # timeout, so its posted WRITE can no longer land here.
+                logger.warning(
+                    "Reclaiming a NIXL destination quarantined for %.0f s without "
+                    "a WRITE notification",
+                    self._quarantine_secs,
+                )
                 target.close()
 
     def allocate(self, size):

@@ -153,6 +153,39 @@ class TestNixlEncoderTransfer(unittest.IsolatedAsyncioTestCase):
         replacement.close()
         second.close()  # A positive fence from its original issuer.
 
+    def test_quarantined_destination_is_reclaimed_after_its_window(self):
+        """A lost encoder must not occupy receiver slots until P restarts."""
+        agent = Mock()
+        agent.get_partial_agent_metadata.return_value = b"pool"
+        agent.get_new_notifs.return_value = {}
+        with patch.object(nixl, "_agent", return_value=agent):
+            receiver = nixl.NixlReceiver(capacity=1, pool_bytes=512, quarantine_secs=30)
+            pinned = nixl.NixlReceiver(capacity=1, pool_bytes=512, quarantine_secs=0)
+
+        with patch.object(nixl.time, "monotonic", return_value=100.0):
+            targets = []
+            for _ in range(2):
+                target = receiver.allocate(256)
+                target.abandon()
+                target.quarantine()
+                targets.append(target)
+            kept = pinned.allocate(256)
+            kept.abandon()
+            kept.quarantine()
+        address = targets[0].tensor.data_ptr()
+        with patch.object(nixl.time, "monotonic", return_value=129.0):
+            with self.assertRaisesRegex(RuntimeError, "no free transfer slots"):
+                receiver.allocate(1)
+        with patch.object(nixl.time, "monotonic", return_value=130.0):
+            replacement = receiver.allocate(256)
+            self.assertTrue(all(target.reaped() for target in targets))
+            self.assertEqual(receiver._quarantined, 0)
+            self.assertEqual(replacement.tensor.data_ptr(), address)
+            replacement.close()
+        with patch.object(nixl.time, "monotonic", return_value=1e9):
+            self.assertFalse(kept.reaped())
+        kept.close()
+
     def test_writer_reuses_peers_and_bounds_retired_receiver_instances(self):
         agent = Mock()
         agent.add_remote_agent.side_effect = bytes.decode
