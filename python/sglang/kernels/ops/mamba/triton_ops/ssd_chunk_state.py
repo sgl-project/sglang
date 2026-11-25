@@ -363,9 +363,9 @@ def _chunk_state_fwd_kernel(
     tl.store(states_ptrs, states, mask=c_mask)
 
 
+# In pool mode a row may read its initial state from the slot it overwrites, so each
+# autotuning trial must start from the original slots, not the last trial's.
 def _snapshot_out_slots(nargs, reset_only=False):
-    """In pool mode a row may read its initial state from the slot it overwrites, so
-    each autotuning trial must start from the original slots, not the last trial's."""
     if reset_only or not nargs.get("OUT_TO_POOL"):
         return
     slots = nargs["out_idx_ptr"].clamp(min=0).long()

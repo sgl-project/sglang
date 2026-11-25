@@ -11,11 +11,10 @@ from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 __all__ = ["autotune_cache_kwargs", "prune_oversized_tiles", "unused_index"]
 
 
+# Stand-in for an absent index or flag tensor: the autotune key holds every tensor
+# argument's dtype, so passing None would tune pool mode separately from the old path.
 @lru_cache(maxsize=None)
 def unused_index(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Stand-in for an absent index or flag tensor. Triton's autotune key holds the
-    dtype of every tensor argument, so passing this instead of None keeps the pool
-    and non-pool modes on one tuned config (and the same results)."""
     return torch.zeros(1, dtype=dtype, device=device)
 
 

@@ -1198,9 +1198,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 ]
 
 
+# The SSD kernels' in-pool reads and writes need each slot's [nheads, headdim, dstate]
+# state contiguous; page-major pools are not.
 def _ssm_slots_contiguous(ssm_state: torch.Tensor) -> bool:
-    """Each slot's [nheads, headdim, dstate] state is contiguous, which the SSD
-    kernels' in-pool state reads and writes require (page-major pools are not)."""
     _, _, headdim, dstate = ssm_state.shape
     return ssm_state.stride()[1:] == (headdim * dstate, dstate, 1)
 
