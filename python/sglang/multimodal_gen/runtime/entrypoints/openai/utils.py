@@ -428,7 +428,6 @@ async def save_image_to_path(
     image: Union[UploadFile, bytes, str],
     target_path: str,
     *,
-    prefer_remote_source: bool = False,
     uploads_root: str | None = None,
 ) -> str:
     if uploads_root is not None:
@@ -436,7 +435,6 @@ async def save_image_to_path(
     input_path = await _maybe_url_image(
         image,
         target_path,
-        prefer_remote_source=prefer_remote_source,
         uploads_root=uploads_root,
     )
     if input_path is None:
@@ -449,8 +447,6 @@ async def save_first_input_image(
     image_sources,
     request_id: str,
     uploads_dir: str,
-    *,
-    prefer_remote_source: bool = False,
 ) -> str | None:
     """Save the first input image from a list of sources and return its path."""
     image_list = merge_image_input_list(image_sources)
@@ -466,7 +462,6 @@ async def save_first_input_image(
     return await save_image_to_path(
         image,
         target_path,
-        prefer_remote_source=prefer_remote_source,
         uploads_root=uploads_dir,
     )
 
@@ -498,25 +493,17 @@ async def _maybe_url_image(
     img_url: str,
     target_path: str,
     *,
-    prefer_remote_source: bool = False,
     uploads_root: str | None = None,
 ) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Only bypass persistence when the caller explicitly disables input saves.
-        # Otherwise keep the prefetch outside the measured server stages.
-        if prefer_remote_source:
-            return img_url
-        # download image from URL and persist on disk
         input_path = await _save_url_image_to_path(
             img_url, target_path, uploads_root=uploads_root
         )
         return input_path
     elif img_url.startswith("data:image"):
-        if prefer_remote_source:
-            return img_url
         # encode image base64 url and persist on disk
         input_path = save_base64_image_to_path(
             img_url, target_path, uploads_root=uploads_root

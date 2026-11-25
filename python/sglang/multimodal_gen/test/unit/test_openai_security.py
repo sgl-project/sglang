@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import errno
 import io
 import ipaddress
@@ -245,21 +246,42 @@ def test_final_upload_path_cannot_follow_symlink_outside_root(tmp_path, image_so
     assert outside.read_bytes() == b"unchanged"
 
 
-@pytest.mark.parametrize(
-    "source", ["https://example.invalid/image.png", "data:image/png;base64,aW1hZ2U="]
-)
-def test_prefer_remote_source_still_avoids_disk_io(tmp_path, source):
-    root = tmp_path / "uploads"
-    saved = asyncio.run(
-        utils.save_image_to_path(
-            source,
-            str(root / "input"),
-            uploads_root=str(root),
-            prefer_remote_source=True,
-        )
+@pytest.mark.parametrize("persistent", [True, False])
+@pytest.mark.parametrize("as_url", [True, False])
+def test_input_storage_modes_admit_identical_bytes(
+    tmp_path, monkeypatch, persistent, as_url
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "navy").save(buffer, format="PNG")
+    data = buffer.getvalue()
+    _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda _: httpx.Response(
+            200, content=data, headers={"content-type": "image/png"}
+        ),
     )
-    assert saved == source
-    assert not root.exists()
+    source = (
+        "https://x.test/image.png"
+        if as_url
+        else "data:image/png;base64," + base64.b64encode(data).decode()
+    )
+    with utils.temp_dir_if_disabled(
+        str(tmp_path / "uploads") if persistent else None
+    ) as root:
+        path = Path(
+            asyncio.run(
+                utils.save_image_to_path(
+                    source, str(Path(root) / "input"), uploads_root=root
+                )
+            )
+        )
+        assert path.read_bytes() == data
+        with Image.open(path) as decoded:
+            assert decoded.getpixel((0, 0)) == (0, 0, 128)
+    assert path.exists() is persistent
 
 
 def test_video_upload_sanitizes_filename_and_preserves_metadata(tmp_path):
