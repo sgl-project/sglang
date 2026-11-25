@@ -200,5 +200,52 @@ class TestQuickAllReduceAiterDispatcher(CustomTestCase):
         self.assertTrue(quick_reduce.disabled)
 
 
+class TestQuickAllReduceHipFallback(CustomTestCase):
+    def test_disabled_dispatcher_serves_int4_from_the_hip_kernel(self):
+        """INT4 with no usable dispatcher still runs QuickReduce, on the HIP kernel."""
+        quick_reduce = _make_uninitialized_quick_reduce()
+        with (
+            patch.dict(
+                sys.modules,
+                {_AITER_QR_MODULE: _aiter_module(_DisabledAiterQuickAllReduce)},
+            ),
+            envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.override(True),
+            temp_set_env(ROCM_QUICK_REDUCE_QUANTIZATION="INT4"),
+            patch(f"{_QR_MODULE}.is_gfx95_supported", return_value=True),
+            patch.object(ops, "init_custom_qr", create=True, return_value=1) as init,
+            patch.object(ops, "qr_max_size", create=True, return_value=2048 * MB),
+            patch.object(ops, "qr_supports", create=True, return_value=True),
+            patch.object(QuickAllReduce, "create_shared_buffer"),
+        ):
+            quick_reduce.init_quick_all_reduce()
+
+            init.assert_called_once()
+            self.assertIsNone(quick_reduce._flydsl_int4)
+            self.assertFalse(quick_reduce.disabled)
+            for dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(dtype=dtype):
+                    self.assertTrue(
+                        quick_reduce.should_quick_allreduce(
+                            torch.empty(MB, dtype=dtype)
+                        )
+                    )
+        quick_reduce._ptr = 0  # nothing to destroy
+
+    def test_dtype_check_is_for_the_hip_kernel_only(self):
+        """The JIT build reduces bf16 only; the dispatcher path does not ask it."""
+        hip_quick_reduce = _make_dispatcher_quick_reduce(_FakeAiterQuickAllReduce())
+        hip_quick_reduce._flydsl_int4 = None
+        hip_quick_reduce._ptr = 1
+        fp16 = torch.empty(MB, dtype=torch.float16)
+        with patch.object(ops, "qr_supports", create=True, return_value=False):
+            self.assertFalse(hip_quick_reduce.should_quick_allreduce(fp16))
+
+            dispatcher_quick_reduce = _make_dispatcher_quick_reduce(
+                _FakeAiterQuickAllReduce()
+            )
+            self.assertTrue(dispatcher_quick_reduce.should_quick_allreduce(fp16))
+        hip_quick_reduce._ptr = 0  # nothing to destroy
+
+
 if __name__ == "__main__":
     unittest.main()
