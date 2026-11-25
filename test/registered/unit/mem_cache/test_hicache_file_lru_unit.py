@@ -181,10 +181,10 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
         self.assertEqual(len(b._evictor._lru), 0)
         self.assertEqual(b._evictor._total_bytes, 0)
 
-    def test_sharded_file_refuses_eviction_before_scanning_files(self):
+    def test_kv_sharded_store_refuses_eviction_before_scanning_files(self):
         config = replace(
             _make_config(extra_config={"max_size": 1}),
-            sharded_file=True,
+            kv_sharded_store=True,
             unified_suffixes=["ukv1-test_L0-1_H0"],
         )
         with (

@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
-from sglang.srt.arg_groups.kv_shard_hook import resolve_kv_shard_file_storage
+from sglang.srt.arg_groups.kv_shard_hook import check_kv_shard_storage
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -756,18 +756,21 @@ class HiCacheController:
                 "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
             ) from e
 
-        sharded_file = isinstance(
-            self.storage_host_pool, PageInterleaveHostPool
-        ) and resolve_kv_shard_file_storage(
-            storage_backend=storage_backend,
-            host_memory_mode=self.host_memory_mode,
-            key_scheme=key_scheme,
-        )
+        kv_sharded = isinstance(self.storage_host_pool, PageInterleaveHostPool)
+        if kv_sharded:
+            check_kv_shard_storage(
+                storage_backend=storage_backend,
+                host_memory_mode=self.host_memory_mode,
+                key_scheme=key_scheme,
+            )
+        # File uses the controller's owner-filtered I/O. Registered backends
+        # handle KV page ownership in their own I/O paths.
+        kv_sharded_store = kv_sharded and storage_backend == "file"
 
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config, sharded_file=sharded_file
+            model_name, storage_backend_extra_config, kv_sharded_store=kv_sharded_store
         )
         self.storage_backend_type = storage_backend
         from sglang.srt.mem_cache.utils import get_hash_str
@@ -833,9 +836,9 @@ class HiCacheController:
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
-            elif sharded_file:
-                self.page_get_func = self._sharded_file_page_get
-                self.page_set_func = self._sharded_file_page_set
+            elif kv_sharded_store:
+                self.page_get_func = self._kv_sharded_page_get
+                self.page_set_func = self._kv_sharded_page_set
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -921,7 +924,7 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         *,
-        sharded_file: bool = False,
+        kv_sharded_store: bool = False,
     ):
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
@@ -981,7 +984,7 @@ class HiCacheController:
             model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
         )
         storage_writer_override = None
-        if sharded_file:
+        if kv_sharded_store:
             # CP ranks own disjoint pages. With MLA and CP, elect one attention
             # TP replica per CP owner. With plain-TP MLA, TP ranks own the pages.
             storage_writer_override = (
@@ -1019,7 +1022,7 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
-            sharded_file=sharded_file,
+            kv_sharded_store=kv_sharded_store,
             storage_writer_override=storage_writer_override,
         )
 
@@ -1404,7 +1407,7 @@ class HiCacheController:
             count += 1
         return count
 
-    def _sharded_file_page_get(
+    def _kv_sharded_page_get(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
         positions, rows = self.storage_host_pool.owned_storage_pages(host_indices)
@@ -1717,9 +1720,7 @@ class HiCacheController:
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
-    def _sharded_file_page_set(
-        self, hash_values, host_indices, extra_info=None
-    ) -> bool:
+    def _kv_sharded_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         positions, rows = self.storage_host_pool.owned_storage_pages(host_indices)
         return not positions or self._generic_page_set(
             [hash_values[i] for i in positions], rows

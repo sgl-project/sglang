@@ -2490,7 +2490,7 @@ class TestShardedStorageAttach(CustomTestCase):
                     owner = cp_rank if cp_size > 1 else tp_rank
                     controller = self._controller(owner, is_mla=is_mla)
                     self._attach(controller, tp_rank, cp_rank=cp_rank, cp_size=cp_size)
-                    self.assertTrue(controller.storage_config.sharded_file)
+                    self.assertTrue(controller.storage_config.kv_sharded_store)
                     self.assertEqual(
                         controller.storage_config.is_storage_writer,
                         cp_rank * 2 + tp_rank in writers,
@@ -2589,7 +2589,7 @@ class TestShardedStorageAttach(CustomTestCase):
         with (
             unittest.mock.patch(
                 "sglang.srt.arg_groups.kv_shard_hook._KV_SHARD_STORAGE_BACKENDS",
-                {"dynamic"},
+                {"file", "dynamic"},
             ),
             unittest.mock.patch.object(
                 StorageBackendFactory, "create_backend"
@@ -2602,7 +2602,7 @@ class TestShardedStorageAttach(CustomTestCase):
         config = controller.storage_config
         create_backend.assert_called_once_with("dynamic", config, pool)
         self.assertEqual(config.model_name, "model-external-format-dtype_float16")
-        self.assertFalse(config.sharded_file)
+        self.assertFalse(config.kv_sharded_store)
         self.assertTrue(controller.backup_skip)
         self.assertEqual(controller.page_get_func, controller._generic_page_get)
         self.assertEqual(controller.page_set_func, controller._generic_page_set)

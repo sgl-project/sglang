@@ -54,7 +54,8 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
-    sharded_file: bool = False
+    # The controller filters storage I/O to pages owned by this rank.
+    kv_sharded_store: bool = False
     # Page-interleaved File storage elects writers according to page placement.
     storage_writer_override: Optional[bool] = None
 
@@ -996,7 +997,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
-            allow_eviction=not storage_config.sharded_file,
+            allow_eviction=not storage_config.kv_sharded_store,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

@@ -2698,7 +2698,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _uses_sharded_storage(self) -> bool:
         config = getattr(self.cache_controller, "storage_config", None)
-        return isinstance(config, HiCacheStorageConfig) and config.sharded_file
+        return isinstance(config, HiCacheStorageConfig) and config.kv_sharded_store
 
     def _prefetch_rotation_base(
         self, anchor_node_id: NodeId, prefetch_key: RadixKey
