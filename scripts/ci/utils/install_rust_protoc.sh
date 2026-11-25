@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install protoc and a Rust toolchain (rustup/cargo). Required by setuptools-rust
-# to build the bundled native gRPC extension (rust/sglang-grpc) when installing
+# to build the bundled Rust extensions (rust/sglang-mm, rust/sglang-server) when installing
 # the main `sglang` wheel from source. Idempotent — both helpers no-op if
 # already installed.
 #

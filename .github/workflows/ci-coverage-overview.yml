@@ -91,7 +91,7 @@ jobs:
 
       - name: Install Rust toolchain + protoc
         # Editable install of sglang triggers `build_rust` for the bundled
-        # native gRPC extension (rust/sglang-grpc). The 1-gpu-h100 runner
+        # Rust extensions (rust/sglang-mm, rust/sglang-server). The 1-gpu-h100 runner
         # image has no Rust toolchain by default, which is why this job has
         # been failing on every scheduled run. Use the same helper that
         # ci_install_dependency.sh uses so the install path matches the

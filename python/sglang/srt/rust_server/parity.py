@@ -85,7 +85,7 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT": "Python HTTP server (uvicorn) setting.",
     "fastapi_root_path": "Python HTTP server (FastAPI) setting.",
     "enable_http_worker_reuseport": "Python HTTP server (multi-worker) setting.",
-    "grpc_worker_threads": "Python gRPC server thread pool.",
+    "grpc_worker_threads": "Deprecated; the Python gRPC bridge it sized was removed.",
     # Routes the Rust server does not serve: their clients get a 404.
     "asr_max_concurrent_sessions": "/v1/realtime is not served.",
     "enable_response_store": "The Rust frontend serves /v1/responses without a store; stateful requests get Python's store-disabled refusal.",
