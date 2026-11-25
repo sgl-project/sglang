@@ -82,9 +82,12 @@ class TestGgufMoeWeights(CustomTestCase):
                     # The down projection has one input per original route, while
                     # its IDs retain [original_tokens, original_topk] shape.
                     down = inputs.repeat_interleave(2, dim=0)
+                    expected_down = ggml_moe_a8_vec(
+                        down, packed, ids, 1, quant_type, 17, 6
+                    )
                     torch.testing.assert_close(
                         gguf_moe_a8_vec(down, packed, ids, 1, quant_type, 17, 6),
-                        ggml_moe_a8_vec(down, packed, ids, 1, quant_type, 17, 6),
+                        expected_down,
                         rtol=0,
                         atol=0,
                     )
@@ -92,6 +95,9 @@ class TestGgufMoeWeights(CustomTestCase):
                     with torch.cuda.graph(graph):
                         captured = gguf_moe_a8_vec(
                             inputs, packed, ids, 2, quant_type, 17, 3
+                        )
+                        captured_down = gguf_moe_a8_vec(
+                            down, packed, ids, 1, quant_type, 17, 6
                         )
                     original_pointer = ids.data_ptr()
                     for routes in (
@@ -104,14 +110,22 @@ class TestGgufMoeWeights(CustomTestCase):
                         )
                         inputs.copy_(original)
                         inputs[(ids < 0).all(dim=1)] = float("nan")
+                        down.copy_(original.repeat_interleave(2, dim=0))
+                        down[(ids < 0).flatten()] = float("nan")
+                        # Neither projection may depend on prior output contents.
                         captured.fill_(float("nan"))
+                        captured_down.fill_(float("nan"))
                         graph.replay()
                         live = (ids >= 0).flatten()
-                        self.assertTrue(bool(torch.isfinite(captured).all()))
-                        self.assertEqual(int(torch.count_nonzero(captured[~live])), 0)
-                        torch.testing.assert_close(
-                            captured[live], expected[live], rtol=0, atol=0
-                        )
+                        for output, reference in (
+                            (captured, expected),
+                            (captured_down, expected_down),
+                        ):
+                            self.assertTrue(bool(torch.isfinite(output).all()))
+                            self.assertEqual(int(torch.count_nonzero(output[~live])), 0)
+                            torch.testing.assert_close(
+                                output[live], reference[live], rtol=0, atol=0
+                            )
                         self.assertEqual(ids.data_ptr(), original_pointer)
                     empty = gguf_moe_a8_vec(
                         inputs[:0], packed, ids[:0], 2, quant_type, 17, 0

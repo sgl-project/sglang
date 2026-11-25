@@ -66,7 +66,7 @@ GGUF_MOE_VEC_FORMAT(29, QK_K, block_iq1_m, moe_vec_iq1_m_q8_1_cuda);
 
 /// \brief Quantize input rows to Q8_1 and project compact GGUF expert routes.
 /// \param expert_ids Contiguous int32 routes; negative IDs write zero without reading operands.
-/// \param output Zero-initialized private output, matching the AOT vector projection lifetime.
+/// \param output Private output, fully overwritten for both active and negative expert IDs.
 /// \param quantized_input Private Q8_1 scratch, with the same padded-row format as the AOT ABI.
 template <typename scalar_t, int kQuantType>
 void gguf_moe_a8_vec(
