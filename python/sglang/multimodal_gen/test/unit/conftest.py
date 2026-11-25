@@ -31,6 +31,20 @@ def single_process_model_parallel():
         yield
 
 
+@pytest.fixture(scope="module")
+def srt_runtime(single_process_model_parallel):
+    """Publish what the diffusion GPU worker publishes for the srt layers it reuses."""
+    from sglang.srt.runtime_context import get_context, publish
+    from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+    if get_context()._server_args is None:
+        publish(
+            SrtServerArgs(model_path="dummy", tp_size=1),
+            role="diffusion_gpu_worker",
+        )
+    yield
+
+
 def _make_unit_server_args():
     dit_config = SimpleNamespace(
         hidden_size=64,

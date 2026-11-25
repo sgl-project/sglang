@@ -1674,6 +1674,7 @@ STANDALONE_FILES = {
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
         "../unit/test_nomas_parallel.py",
         "../unit/test_qwen3_encoder_graph_cuda.py",
+        "../unit/test_qwen3vl_srt_text.py",
         "../unit/test_qwen_image21_distributed.py",
         "../unit/test_text_encoding_cache.py",
     ],
@@ -1775,6 +1776,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../unit/test_nomas_parallel.py": 140.0,
         # 2x B300: 63 s, two spawned TP2 cases
         "../unit/test_qwen3_encoder_graph_cuda.py": 70.0,
+        # 4x B200: 6 s for the two spawned TP2 cases, plus process startup
+        "../unit/test_qwen3vl_srt_text.py": 40.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
         # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
         "../unit/test_text_encoding_cache.py": 120.0,

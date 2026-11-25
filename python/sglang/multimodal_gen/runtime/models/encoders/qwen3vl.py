@@ -32,6 +32,12 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_text import (
+    Qwen3VLTextModel as SrtQwen3VLTextModel,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_text import (
+    load_srt_text_weight,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionTransformer,
 )
@@ -40,7 +46,10 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 from sglang.srt.layers.layernorm import RMSNorm
 
@@ -677,6 +686,17 @@ class Qwen3VLTextModel(nn.Module):
         return hidden_states
 
 
+def _runs_on_srt_layers(quant_config, use_tensor_parallel: bool) -> bool:
+    """srt's Qwen3 kernels serve BF16 / FP16 checkpoints on CUDA. Quantized
+    checkpoints, FP32 and other platforms keep the in-tree stack."""
+    return (
+        quant_config is None
+        and use_tensor_parallel
+        and current_platform.is_cuda()
+        and torch.get_default_dtype() in (torch.bfloat16, torch.float16)
+    )
+
+
 class Qwen3VLModel(QwenVLModelBase):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {}
@@ -704,12 +724,19 @@ class Qwen3VLModel(QwenVLModelBase):
             quant_config=vision_quant_config,
             prefix=add_prefix("visual", prefix),
         )
-        self.language_model = Qwen3VLTextModel(
-            config.text_config,
-            quant_config=quant_config,
-            use_tensor_parallel=use_tensor_parallel,
-            prefix=add_prefix("language_model", prefix),
-        )
+        if _runs_on_srt_layers(quant_config, use_tensor_parallel):
+            self.language_model = SrtQwen3VLTextModel(
+                config.text_config,
+                prefix=add_prefix("language_model", prefix),
+                deepstack_visual_indexes=config.vision_config.deepstack_visual_indexes,
+            )
+        else:
+            self.language_model = Qwen3VLTextModel(
+                config.text_config,
+                quant_config=quant_config,
+                use_tensor_parallel=use_tensor_parallel,
+                prefix=add_prefix("language_model", prefix),
+            )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
 
@@ -1200,11 +1227,19 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         loaded_params: set[str] = set()
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        srt_text = isinstance(
+            getattr(self.model, "language_model", None), SrtQwen3VLTextModel
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "visual." in name:
                 name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
+            if srt_text and name.startswith("model.language_model."):
+                loaded_params.add(
+                    load_srt_text_weight(params_dict, name, loaded_weight)
+                )
+                continue
 
             try:
                 param = params_dict[name]
