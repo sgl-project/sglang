@@ -34,6 +34,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     _build_dsa_token_shard_plan,
     dsa_token_shard_cumulative_query_lens,
@@ -168,17 +171,21 @@ class TestDsaTokenShardPlan(CustomTestCase):
         )
 
 
-class TestTokenShardRefusesDcp(CustomTestCase):
-    """DCP's DSA path all-gathers the query across the DCP group and expects
-    every token's head-sharded row; a token slice would be merged wrong."""
+class TestTokenShardUnderDcp(CustomTestCase):
+    """A DCP extend that gathers the query expects every token's head-sharded
+    row, so a token slice would be merged wrong; one that gathers the KV (the
+    NPU metadata carries a gather plan) leaves the query free to shard. The
+    gathered KV's lengths are cumulative, so several requests shard only
+    crop-free, when every prefix reaches index_topk."""
 
-    def _plan(self, dcp_enabled):
+    def _plan(self, dcp_enabled, metadata=None, num_requests=1):
         batch = types.SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens_cpu=[16384],
-            extend_prefix_lens_cpu=[0],
-            input_ids=torch.zeros(16384, dtype=torch.int64),
+            extend_seq_lens_cpu=[16384] * num_requests,
+            extend_prefix_lens_cpu=[0] * num_requests,
+            input_ids=torch.zeros(16384 * num_requests, dtype=torch.int64),
             attn_cp_metadata=None,
+            attn_dcp_metadata=metadata,
         )
         with get_parallel().override(
             attn_tp_size=16, attn_tp_rank=3, dcp_enabled=dcp_enabled
@@ -188,8 +195,35 @@ class TestTokenShardRefusesDcp(CustomTestCase):
     def test_planned_without_dcp(self):
         self.assertIsNotNone(self._plan(dcp_enabled=False))
 
-    def test_refused_under_dcp(self):
+    def test_refused_when_dcp_gathers_the_query(self):
         self.assertIsNone(self._plan(dcp_enabled=True))
+
+    def test_refused_when_the_extend_gathers_nothing(self):
+        # Target verify carries the metadata without a gather plan; the plan
+        # field, not the metadata's presence, is what admits the shard.
+        self.assertIsNone(
+            self._plan(dcp_enabled=True, metadata=NPUDecodeContextParallelMetadata())
+        )
+
+    def test_planned_when_dcp_gathers_the_kv(self):
+        # A single request keeps the causal crop and shortens its key length
+        # to this rank's last attended token.
+        metadata = NPUDecodeContextParallelMetadata(extend_gather_plan=object())
+        self.assertIsNotNone(self._plan(dcp_enabled=True, metadata=metadata))
+
+    def test_multi_request_needs_the_extend_crop_free(self):
+        # Without the crop, shortened cumulative lengths would move the next
+        # request's start; with it, full lengths stay causal.
+        crop_free = NPUDecodeContextParallelMetadata(
+            extend_gather_plan=object(), extend_crop_free=True
+        )
+        self.assertIsNotNone(
+            self._plan(dcp_enabled=True, metadata=crop_free, num_requests=2)
+        )
+        cropped = NPUDecodeContextParallelMetadata(extend_gather_plan=object())
+        self.assertIsNone(
+            self._plan(dcp_enabled=True, metadata=cropped, num_requests=2)
+        )
 
 
 class TestTokenShardRefusesPrefillCp(CustomTestCase):

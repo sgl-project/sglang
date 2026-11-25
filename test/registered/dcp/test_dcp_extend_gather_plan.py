@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu import dcp_extend_gather
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
     build_dcp_extend_gather_plan,
+    dcp_extend_crop_free,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
     plan_dcp_extend_gather,
@@ -330,6 +331,29 @@ class TestBuildDcpExtendGatherPlanDecides(CustomTestCase):
         self.assertIsNone(self._build(self._batch(), prefill_cp=True))
 
 
+class TestDcpExtendCropFree(CustomTestCase):
+    """When every prefix reaches ``index_topk`` the top-k can no longer take a
+    future key, so the gathered-KV operator may drop its causal crop
+    (sparse_mode 0). One prefix token short and the crop is the only thing
+    keeping the result causal -- a wrong True here is a silent accuracy bug,
+    not a crash."""
+
+    def test_every_prefix_at_index_topk_is_crop_free(self):
+        # Boundary: prefix 2047 puts the first extend token at position 2047,
+        # which already reaches the 2048-key top-k, so no future key is ever
+        # reachable and the crop is redundant.
+        self.assertTrue(dcp_extend_crop_free([2047, 4096], 2048))
+
+    def test_a_prefix_under_index_topk_keeps_the_crop(self):
+        self.assertFalse(dcp_extend_crop_free([2046, 4096], 2048))
+        # A prefix-less request still attends within its own extend tokens, and
+        # under index_topk the top-k takes them all: the crop stays.
+        self.assertFalse(dcp_extend_crop_free([0, 4096], 2048))
+
+    def test_no_indexer_means_no_crop_free(self):
+        self.assertFalse(dcp_extend_crop_free([4096], None))
+
+
 class TestDcpExtendGatherBuffer(CustomTestCase):
     """Pins ``dcp_extend_gather_buffer``, the reuse the gather allocates from.
 
@@ -356,6 +380,16 @@ class TestDcpExtendGatherBuffer(CustomTestCase):
         first = dcp_extend_gather_buffer("latent", self.ref, 1024)
         second = dcp_extend_gather_buffer("latent", self.ref, 1024)
         self.assertEqual(first.data_ptr(), second.data_ptr())
+
+    def test_packed_buffer_reuses_capacity_and_returns_exact_rows(self):
+        first = dcp_extend_gather_buffer("packed_latent_0", self.ref, 32768)
+        within_bucket = dcp_extend_gather_buffer("packed_latent_0", self.ref, 131072)
+        grown = dcp_extend_gather_buffer("packed_latent_0", self.ref, 131073)
+        self.assertEqual(first.data_ptr(), within_bucket.data_ptr())
+        self.assertNotEqual(within_bucket.data_ptr(), grown.data_ptr())
+        self.assertEqual(
+            (len(first), len(within_bucket), len(grown)), (32768, 131072, 131073)
+        )
 
     def test_the_result_is_a_view_and_writes_reach_the_next_caller(self):
         # The gather writes through the returned tensor (index_select(out=...)).

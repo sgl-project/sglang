@@ -38,17 +38,24 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_key_lens,
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
     get_dsa_token_shard_plan,
 )
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import DsaTokenShardPlan
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
+from sglang.srt.layers.dcp.layout import (
+    dcp_packed_kv_lens,
+    dcp_packed_read_plan,
+    get_dcp_chain_spec_lens,
+    get_dcp_lens,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1508,7 +1515,9 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor],
         layer: RadixAttention,
         actual_seq_qlen: torch.Tensor,
+        forward_batch: ForwardBatch,
         dcp_metadata: NPUDecodeContextParallelMetadata,
+        dsa_token_shard_plan: Optional[DsaTokenShardPlan],
     ) -> torch.Tensor:
         """DCP extend over the context the model gathered, one contiguous run
         per request: TND keys, cumulative lengths, no block table.
@@ -1526,6 +1535,38 @@ class AscendAttnBackend(AttentionBackend):
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
         seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
+        sparse_mode = 3
+        packed_plan = None
+        if dsa_token_shard_plan is None:
+            # The shard's shortened cumulative lengths describe the TND layout;
+            # packed rows are the collective's own order and cannot address a
+            # token-sliced query, so the packed read stands down per forward.
+            packed_plan = dcp_packed_read_plan(
+                forward_batch,
+                topk_indices.shape[-1] if topk_indices is not None else None,
+            )
+        if packed_plan is not None:
+            # C1: the buffer is the all-gather's own rank-major output, so a
+            # row's index no longer says anything about its position -- and
+            # both conventions below are about position. The top-k was remapped
+            # to rows by the model, the whole buffer is one request, and the
+            # operator's causal crop has to go: sparse_mode 3 aligns query i to
+            # key K - Q + i, which is meaningless once the keys are permuted.
+            # Causality is not lost, it moves upstream to the indexer.
+            seq_lengths_kv = dcp_packed_kv_lens(
+                forward_batch, packed_plan, q_nope.device
+            )
+            sparse_mode = 0
+        elif dsa_token_shard_plan is not None:
+            if dcp_metadata.extend_crop_free:
+                # Full per-request KV lengths, no crop: no request's start moves.
+                sparse_mode = 0
+            else:
+                # Lengths double as request boundaries: shortening is safe only
+                # for a single request, and the plan refuses more.
+                seq_lengths_kv = dsa_token_shard_cumulative_key_lens(
+                    forward_batch, dsa_token_shard_plan, q_nope.device
+                )
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=key_nope,
@@ -1546,7 +1587,7 @@ class AscendAttnBackend(AttentionBackend):
             # table is omitted, not passed as None: to a tiling function the two
             # are not always the same thing.
             layout_kv="TND",
-            sparse_mode=3,
+            sparse_mode=sparse_mode,
             attention_mode=2,
             return_softmax_lse=False,
         )
@@ -2239,7 +2280,9 @@ class AscendAttnBackend(AttentionBackend):
                     topk_indices,
                     layer,
                     actual_seq_qlen,
+                    forward_batch,
                     dcp_metadata,
+                    dsa_token_shard_plan,
                 )
 
             if topk_indices is not None:

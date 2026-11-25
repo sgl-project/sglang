@@ -102,14 +102,26 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 # (128 KiB of payload at world_size 8).
 _FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
 _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+_enable_npu_pg_priority = envs.SGLANG_NPU_ENABLE_PG_PRIORITY.get()
 
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
-    if group_name is not None and "moe" not in group_name:
+    # HCCL options for the default group, MoE groups, the attention-TP group,
+    # and DCP, whose per-layer exchange also needs a tuned buffer. The
+    # attention-TP group is D2v2: it carries the current-chunk exchange that
+    # feeds every layer's indexer, so it is critical path and gets the
+    # high-priority treatment below.
+    is_dcp = group_name == "dcp"
+    is_attn_tp = group_name == "attention_tp"
+    if (
+        group_name is not None
+        and "moe" not in group_name
+        and not is_dcp
+        and not is_attn_tp
+    ):
         return None
 
     import torch_npu
@@ -119,6 +131,25 @@ def get_torch_distributed_pg_options(group_name=None):
         os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
     )
     options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    # D2v2: the critical-path collectives -- the attention-TP chunk exchange
+    # that feeds every layer's indexer, and the MoE dispatch/combine -- get
+    # their HCCL communication on a HIGH-priority stream, so the AIV scheduler
+    # serves them ahead of background work such as the DCP context-gather
+    # prefetch. The DCP group deliberately keeps the default priority (that is
+    # the gather that must yield). Fail-soft: a torch_npu build whose Options
+    # lack the field logs once and runs unboosted.
+    is_moe = group_name is not None and "moe" in group_name
+    if _enable_npu_pg_priority and not is_dcp and (is_attn_tp or is_moe):
+        try:
+            options.is_high_priority_stream = True
+        except (AttributeError, TypeError) as err:
+            logger.warning(
+                "DCP pg priority: this torch_npu build's "
+                "ProcessGroupHCCL.Options has no is_high_priority_stream "
+                "(%s); group %r runs at default priority",
+                err,
+                group_name,
+            )
     return options
 
 
@@ -1408,6 +1439,31 @@ class GroupCoordinator:
             # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
+
+    def all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> "Optional[torch._C._distributed_c10d.Work]":
+        """Async sibling of all_gather_into_tensor: returns a Work handle.
+
+        The collective is enqueued on the current stream and the host does not
+        block, so the compute enqueued between this call and handle.wait() runs
+        while the communication engine moves the bytes (the overlap the DCP
+        extend gather uses to hide the SFA KV all-gather under the
+        LightningIndexer, the vLLM-Ascend SFA pattern). The caller must keep the
+        handle alive until the gathered data is consumed, then synchronise with
+        handle.wait() before any reader of ``output``. Platforms without an
+        async path degrade to the synchronous collective and return None; with
+        world_size 1 there is nothing to gather.
+        """
+        if self.world_size == 1:
+            output.copy_(input)
+            return None
+        if _is_npu:
+            return torch.distributed.all_gather_into_tensor(
+                output, input, group=self.device_group, async_op=True
+            )
+        self.all_gather_into_tensor(output, input)
+        return None
 
     def all_gather(
         self,

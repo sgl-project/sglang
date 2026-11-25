@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.dcp.layout import dcp_local_row, get_dcp_lens
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import ceil_align, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -71,6 +72,42 @@ class NPUDecodeContextParallelMetadata(DecodeContextParallelMetadata):
     # The current layer's gathered (latent, rope) KV. NPU keeps the two apart
     # in the pool and in npu_sparse_flash_attention, so not dcp_kv_buffer.
     extend_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Whether the gathered-KV operator may drop its causal crop (sparse_mode
+    # 0), computed once at prepare: only when every prefix reaches index_topk.
+    # The token shard, the packed read and the sparse operator read it.
+    extend_crop_free: bool = False
+    # Per-forward state of the piece-path gather prefetch; owned by
+    # _DcpGatherPrefetch in deepseek_v2_attention_mla_npu.
+    gather_prefetch_state: Optional[object] = None
+    # The packed-read path runs its once-per-forward write plan on the first
+    # layer; this records that it has.
+    packed_write_planned: bool = False
+    # DcpPackedReadPlan for this forward, owned by dcp_packed_read_plan in
+    # layers/dcp/layout.py. None = packed read not applicable.
+    packed_read_plan: Optional[object] = None
+    # True once packed_read_plan has been computed for this forward.
+    packed_read_plan_done: bool = False
+    # Cached rank-major kv lens for the packed read; see dcp_packed_kv_lens.
+    packed_kv_lens: Optional[torch.Tensor] = None
+
+
+def dcp_extend_crop_free(prefix_lens: Sequence[int], index_topk: Optional[int]) -> bool:
+    """May an extend over the gathered KV drop the operator's causal crop?
+
+    Only if every prefix reaches ``index_topk``: below it the top-k takes every
+    key, so the crop is what keeps the result causal.
+    """
+    ok = bool(
+        index_topk is not None
+        and prefix_lens
+        and all(p + 1 >= index_topk for p in prefix_lens)
+    )
+    if not ok and index_topk is not None and prefix_lens:
+        print_info_once(
+            f"DCP extend keeps the operator's causal crop: a request here has a "
+            f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)})"
+        )
+    return ok
 
 
 # Above this many new tokens a DSA extend gathers the KV whatever the bytes say.
@@ -114,6 +151,11 @@ def dcp_extend_gathers_kv(
 # Reusable device buffers for the extend gather, keyed by purpose, dtype, device
 # and row shape. See dcp_extend_gather_buffer.
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
+_DCP_PACKED_BUFFER_BUCKET_ROWS = 131_072
+
+
+def dcp_packed_gather_capacity(rows: int) -> int:
+    return ceil_align(rows, _DCP_PACKED_BUFFER_BUCKET_ROWS)
 
 
 def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
@@ -129,12 +171,19 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
         # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None
-        buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+        # Packed buffers grow through the prefix one chunk at a time.
+        capacity = (
+            dcp_packed_gather_capacity(rows) if name.startswith("packed_") else rows
+        )
+        buf = torch.empty(
+            (capacity, *ref.shape[1:]), dtype=ref.dtype, device=ref.device
+        )
         _dcp_extend_gather_buffers[key] = buf
         logger.info(
-            "DCP extend gather buffer %r reserved: %d rows, %.3f GiB",
+            "DCP extend gather buffer %r reserved: %d rows (alloc %d), %.3f GiB",
             name,
             rows,
+            capacity,
             buf.numel() * buf.element_size() / (1 << 30),
         )
     return buf[:rows]
