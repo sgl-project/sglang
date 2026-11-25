@@ -13,15 +13,14 @@
 # ==============================================================================
 """
 Memory-efficient attention for decoding.
-It supports page size = 1.
 """
 
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+import functools
 import logging
-import math
 from typing import NamedTuple, Optional, Tuple
 
 import torch
@@ -32,15 +31,38 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_device_core_count,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
 )
 
+# Above this split budget the grouped stage 1 may loop over splits in a fixed number
+# of blocks per (request, head tile) instead of launching one block per split.
+_MAX_SPLIT_PROGRAMS = 32
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _device_core_count(device_index: int) -> int:
+    return get_device_core_count(device_index)
+
+
+def _split_programs(
+    batch: int, head_tiles: int, max_kv_splits: int, core_count: int
+) -> int:
+    """Blocks per (request, head tile) for the grouped stage 1, or 0 for one block
+    per split. Looping is used only when enough blocks remain to cover the device,
+    so a budget sized by the core count (normal-mode MLA) keeps one block per split
+    at small batch. Every split is computed the same way for any block count."""
+    programs = max(
+        _MAX_SPLIT_PROGRAMS,
+        triton.next_power_of_2(triton.cdiv(core_count, batch * head_tiles)),
+    )
+    return programs if programs < max_kv_splits else 0
 
 
 _MIN_BLOCK_KV = 32
@@ -568,6 +590,7 @@ def _fwd_grouped_kernel_stage1(
     USE_FORCED: tl.constexpr = False,
     uneven_batch=None,
     ROTATE_BATCH: tl.constexpr = False,
+    SPLIT_STRIDE: tl.constexpr = 0,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -631,12 +654,6 @@ def _fwd_grouped_kernel_stage1(
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
-    split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-
-    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
-    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     # Hoist loop-invariant base offsets
     base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
@@ -645,148 +662,171 @@ def _fwd_grouped_kernel_stage1(
     if not HAS_MLA:
         base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
 
-    if split_kv_end > split_kv_start:
-        q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
-        # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
-        # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
-        # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
-        # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
-        # On all other platforms keep the original downcast of q to the KV dtype.
-        # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-        if IS_GFX1250:
-            q_k = q
-        else:
-            q_k = q.to(K_Buffer.dtype.element_ty)
-        if BLOCK_DPE > 0:
-            qpe = tl.load(
-                Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+    # With SPLIT_STRIDE > 0 the grid has SPLIT_STRIDE programs per (request, head
+    # tile) instead of one per split, and each takes the splits split_kv_id,
+    # split_kv_id + SPLIT_STRIDE, ... up to the request's own count. Every split is
+    # computed and stored exactly as with one program per split.
+    if SPLIT_STRIDE > 0:
+        split_last = kv_splits
+        split_step: tl.constexpr = SPLIT_STRIDE
+    else:
+        split_last = split_kv_id + 1
+        split_step: tl.constexpr = 1
+    split_first = split_kv_id
+    for split_kv_id in tl.range(split_first, split_last, split_step):
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+        e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+        if split_kv_end > split_kv_start:
+            q = tl.load(
+                Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0
             )
-        for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
-                other=0,
-            )
-            # Page-aware KV address math (see _fwd_kernel_stage1).
-            if PAGE_SIZE == 1:
-                offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-            else:
-                page_id = kv_loc // PAGE_SIZE
-                tok_in_p = kv_loc % PAGE_SIZE
-                offs_buf_k = (
-                    page_id[None, :] * stride_buf_kpage
-                    + tok_in_p[None, :] * stride_buf_ktok
-                    + base_offs_k
-                )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
+            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+            # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
+            # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
+            # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
+            # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
+            # On all other platforms keep the original downcast of q to the KV dtype.
+            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
             if IS_GFX1250:
-                qk = tl.dot(q_k, k.to(q_k.dtype))
+                q_k = q
             else:
-                qk = tl.dot(q_k, k)
+                q_k = q.to(K_Buffer.dtype.element_ty)
             if BLOCK_DPE > 0:
+                qpe = tl.load(
+                    Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+                )
+            for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=offs_n < split_kv_end,
+                    other=0,
+                )
+                # Page-aware KV address math (see _fwd_kernel_stage1).
                 if PAGE_SIZE == 1:
-                    offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
                 else:
-                    offs_buf_kpe = (
+                    page_id = kv_loc // PAGE_SIZE
+                    tok_in_p = kv_loc % PAGE_SIZE
+                    offs_buf_k = (
                         page_id[None, :] * stride_buf_kpage
                         + tok_in_p[None, :] * stride_buf_ktok
-                        + base_offs_kpe
+                        + base_offs_k
                     )
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe.to(qpe.dtype))
-            qk *= sm_scale_withk
-
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
-
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
-
-            if SCORE_MOD is not None:
-                qk = SCORE_MOD(
-                    qk,
-                    cur_batch_seq_len - 1,
-                    offs_n[None, :],
-                    cur_batch,
-                    cur_head[:, None],
-                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
-                    Aux0,
-                    aux0_stride_t,
-                    aux0_stride_h,
-                    aux0_len,
-                )
-
-            qk = tl.where(
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-            )
-            if HAS_MLA:
-                v = tl.trans(k)
-            else:
-                if PAGE_SIZE == 1:
-                    offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                if IS_GFX1250:
+                    qk = tl.dot(q_k, k.to(q_k.dtype))
                 else:
-                    offs_buf_v = (
-                        page_id[:, None] * stride_buf_vpage
-                        + tok_in_p[:, None] * stride_buf_vtok
-                        + base_offs_v
+                    qk = tl.dot(q_k, k)
+                if BLOCK_DPE > 0:
+                    if PAGE_SIZE == 1:
+                        offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    else:
+                        offs_buf_kpe = (
+                            page_id[None, :] * stride_buf_kpage
+                            + tok_in_p[None, :] * stride_buf_ktok
+                            + base_offs_kpe
+                        )
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
                     )
-                v = tl.load(
-                    V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                    other=0.0,
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                qk *= sm_scale_withk
+
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
+
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
+
+                if SCORE_MOD is not None:
+                    qk = SCORE_MOD(
+                        qk,
+                        cur_batch_seq_len - 1,
+                        offs_n[None, :],
+                        cur_batch,
+                        cur_head[:, None],
+                        mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        Aux0,
+                        aux0_stride_t,
+                        aux0_stride_h,
+                        aux0_len,
+                    )
+
+                qk = tl.where(
+                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                    qk,
+                    float("-inf"),
                 )
+                if HAS_MLA:
+                    v = tl.trans(k)
+                else:
+                    if PAGE_SIZE == 1:
+                        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                    else:
+                        offs_buf_v = (
+                            page_id[:, None] * stride_buf_vpage
+                            + tok_in_p[:, None] * stride_buf_vtok
+                            + base_offs_v
+                        )
+                    v = tl.load(
+                        V_Buffer + offs_buf_v,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=0.0,
+                    )
 
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
-            # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
-            # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
-            # attention idealized). On other platforms restore the p.to(v.dtype) cast.
-            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
-            if IS_GFX1250:
-                acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
-            else:
-                acc += tl.dot(p.to(v.dtype), v)
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc *= re_scale[:, None]
+                # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+                # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+                # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+                # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+                if IS_GFX1250:
+                    acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                else:
+                    acc += tl.dot(p.to(v.dtype), v)
 
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
 
-        offs_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head[:, None] * stride_mid_oh
-            + split_kv_id * stride_mid_os
-            + offs_dv[None, :]
-        )
+            offs_mid_o = (
+                cur_batch * stride_mid_ob
+                + cur_head[:, None] * stride_mid_oh
+                + split_kv_id * stride_mid_os
+                + offs_dv[None, :]
+            )
 
-        tl.store(
-            Att_Out + offs_mid_o,
-            acc / e_sum[:, None],
-            mask=(mask_h[:, None]) & (mask_dv[None, :]),
-        )
+            tl.store(
+                Att_Out + offs_mid_o,
+                acc / e_sum[:, None],
+                mask=(mask_h[:, None]) & (mask_dv[None, :]),
+            )
 
-        offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
-        ) // Lv
+            offs_mid_o_1 = (
+                cur_batch * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            ) // Lv
 
-        tl.store(
-            Att_Lse + offs_mid_o_1,
-            e_max + tl.log(e_sum),
-            mask=mask_h,
-        )
+            tl.store(
+                Att_Lse + offs_mid_o_1,
+                e_max + tl.log(e_sum),
+                mask=mask_h,
+            )
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -863,7 +903,15 @@ def _decode_grouped_att_m_fwd(
         )
 
     # Blocks at or above the split count return immediately, so the grid shrinks too.
-    grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)
+    # A large split budget (deterministic mode sizes it by the context length) would
+    # launch mostly empty blocks; enough blocks to cover the device then loop over the
+    # splits.
+    split_stride = 0
+    if not forced_kv_splits and MAX_KV_SPLITS > _MAX_SPLIT_PROGRAMS:
+        split_stride = _split_programs(
+            batch, head_tiles, MAX_KV_SPLITS, _device_core_count(q.device.index or 0)
+        )
+    grid = (batch, head_tiles, forced_kv_splits or split_stride or MAX_KV_SPLITS)
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
@@ -926,6 +974,7 @@ def _decode_grouped_att_m_fwd(
         USE_FORCED=forced_kv_splits > 0,
         uneven_batch=uneven_batch,
         ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
+        SPLIT_STRIDE=split_stride,
         **extra_kargs,
     )
 
@@ -951,6 +1000,7 @@ def _fwd_kernel_stage2(
     HAS_SINK: tl.constexpr,
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
+    DYNAMIC_SPLIT_END: tl.constexpr = False,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -973,6 +1023,13 @@ def _fwd_kernel_stage2(
     else:
         kv_splits = tl.load(num_kv_splits + cur_batch)
         SPLIT_END: tl.constexpr = MAX_KV_SPLITS
+    # DYNAMIC_SPLIT_END (deterministic mode): stop at the request's own split count
+    # instead of walking the empty tail of a large budget. The partials are merged in
+    # the same order, but the dynamic bound can move the result a few ULP (above).
+    if DYNAMIC_SPLIT_END:
+        split_end = kv_splits
+    else:
+        split_end = SPLIT_END
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -987,7 +1044,7 @@ def _fwd_kernel_stage2(
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
 
-    for split_kv_id in tl.range(0, SPLIT_END, num_stages=2):
+    for split_kv_id in tl.range(0, split_end, num_stages=2):
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -1030,6 +1087,7 @@ def _decode_softmax_reducev_fwd(
     sinks=None,
     use_pdl=False,
     forced_kv_splits: int = 0,
+    stop_at_request_splits: bool = False,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -1065,6 +1123,7 @@ def _decode_softmax_reducev_fwd(
         HAS_SINK=HAS_SINK,
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
+        DYNAMIC_SPLIT_END=stop_at_request_splits and not forced_kv_splits,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -1092,6 +1151,7 @@ def decode_attention_fwd_normal(
     score_mod=None,
     aux_tensors=None,
     uneven_batch=None,
+    stop_at_request_splits: bool = False,
 ):
     _decode_att_m_fwd(
         q,
@@ -1122,6 +1182,7 @@ def decode_attention_fwd_normal(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        stop_at_request_splits=stop_at_request_splits,
     )
 
 
@@ -1147,6 +1208,7 @@ def decode_attention_fwd_grouped(
     score_mod=None,
     aux_tensors=None,
     uneven_batch=None,
+    stop_at_request_splits: bool = False,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1184,6 +1246,7 @@ def decode_attention_fwd_grouped(
         sinks,
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
+        stop_at_request_splits=stop_at_request_splits,
     )
 
 
@@ -1215,7 +1278,12 @@ def decode_attention_fwd(
     lean_Op=None,
     lean_locks=None,
     uneven_batch=None,
+    stop_at_request_splits: bool = False,
 ):
+    """``stop_at_request_splits``: the merge walks each request's own split count
+    instead of the whole budget. It skips the empty tail of a large budget
+    (deterministic mode sizes it by the context length) but can move the result a
+    few ULP (see ``_fwd_kernel_stage2``), so only deterministic mode turns it on."""
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
@@ -1287,6 +1355,7 @@ def decode_attention_fwd(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
+            stop_at_request_splits=stop_at_request_splits,
         )
     else:
         # GQA/MQA/MLA
@@ -1312,6 +1381,7 @@ def decode_attention_fwd(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
+            stop_at_request_splits=stop_at_request_splits,
         )
 
 
@@ -1411,12 +1481,6 @@ def cal_num_split_wgs(
     )
     max_ctas_allowed = tl.maximum(tl.cast(num_splits - 1, tl.int32), zero_i)
     ctas_to_use = tl.minimum(ctas_needed, max_ctas_allowed)
-    k = ctas_to_use
-    cap_by_k = tl.where(
-        k <= ctas_high_avail,
-        k * cap_high,
-        total_high_capacity + (k - ctas_high_avail) * cap_low,
-    )
     last_cta = start_cta + ctas_to_use
     last_cta = tl.where(ctas_to_use == 0, start_cta - 1, last_cta)
     return last_cta
@@ -1465,7 +1529,6 @@ def _lean_attention_decode_kernel(
     num_query_heads: tl.constexpr,
     num_rows: tl.constexpr,
     xcd_programs: tl.constexpr,
-    max_output_tile_cnt: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
@@ -1519,7 +1582,7 @@ def _lean_attention_decode_kernel(
         cta_end_tile_gid = iter + (max_tiles_per_wg - 1)
 
     # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
-    # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
+    # Triton compiler crashes in the Coalesce pass.
     while iter < cta_end_tile_gid:
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
@@ -1783,13 +1846,13 @@ def lean_capture_policy(
     seq-len based :func:`lean_decode_seqlen_gate` always sees ``avg_len == 1`` and returns
     ``False`` -- baking the *standard* kernel into every captured graph. Since the default
     (auto) path replays those captured graphs, keying the bake on ``seq_lens_sum`` makes
-    Lean a no-op under CUDA graphs. But Lean's *fixed* 512-CTA persistent grid derives its
+    Lean a no-op under CUDA graphs. But Lean's *fixed* persistent grid derives its
     work schedule on-device from ``kv_indptr`` read at replay (work-stealing), so a baked
     Lean graph still adapts to the real per-step raggedness. The bake decision therefore
     keys only on capture-time-known signals -- ``batch``, the standard kernel's head-tile
     parallelism (``tiles``), and ``is_mla`` -- calibrated to the realistic (ragged) regime.
 
-    Thresholds from ``CALIBRATION.md`` (MI355X, triton 3.7.0, CUDA graphs on, seed 42):
+    Thresholds measured on MI355X (triton 3.7.0, CUDA graphs on, seed 42):
 
     * MLA (``is_mla``): bake at ``batch >= 8``. ``b1`` is a catastrophic 0.40-0.55x loss
       (the ~128-query-head decode already saturates the CUs, so Lean's fixed grid is pure
@@ -1823,11 +1886,9 @@ def lean_decode_seqlen_gate(
     """Cheap host-side pre-gate for Lean decode (no GPU sync).
 
     Lean Attention only beats the standard decode kernel for long-enough sequences; for
-    short context it both loses and would pay a ``kv_indptr[batch].item()`` host-sync in
-    :func:`decode_attention_fwd` just to discover it should fall back. The attention backend
-    calls this first, using host-side metadata it already has (``num_q_heads``,
-    ``kv_group_num``, ``seq_lens_sum``, ``batch``), so short-context decode skips Lean
-    entirely without a sync.
+    short context it loses. The attention backend calls this first, using host-side
+    metadata it already has (``num_q_heads``, ``kv_group_num``, ``seq_lens_sum``,
+    ``batch``), so short-context decode skips Lean entirely without a sync.
 
     What actually drives the Lean-vs-SplitK crossover is how well the standard grouped
     kernel already fills the device, i.e. its query-head **parallelism**, not ``kv_group_num``.
@@ -1838,8 +1899,8 @@ def lean_decode_seqlen_gate(
     fixed persistent-grid overhead. Keying the threshold on ``kv_group_num`` alone mispredicts
     this badly: e.g. Llama-3-70B at TP=8 (8 query heads/GPU, ``kv_group_num`` still 8) is 4x
     SLOWER under Lean at 32K, yet the old gate enabled it there. So we tier the base threshold
-    on ``tiles`` instead. Thresholds are the crossovers measured by ``benchmark/lean_gate_sweep.py``
-    on MI355X (256 CUs); they should scale with the device CU count on other GPUs.
+    on ``tiles`` instead. Thresholds are the crossovers measured on MI355X (256 CUs);
+    they should scale with the device CU count on other GPUs.
 
     MLA layers (``is_mla``, i.e. ``qk_head_dim != v_head_dim``) are gated on ``batch`` rather
     than average length: their Lean win is driven by batch raggedness (work-stealing across
@@ -1952,10 +2013,11 @@ def _lean_decode_launch_params(num_kv_heads, kv_group_num):
     """Lean decode launch parameters that depend only on shape (no seqlen, no sync).
 
     Returns ``(total_programs, XCD_REMAP, NUM_XCDS)``. ``total_programs`` is the fixed
-    persistent-grid size (2× device CU count for better occupancy, rounded to a whole
-    number of XCDs when the XCD remap is active). The per-call tile schedule is computed
-    inside the kernel from ``kv_indptr``. Shared by :func:`decode_attention_fwd` and the
-    test so the grid/XCD decision stays in sync with the kernel.
+    persistent-grid size (device CU count times ``SGLANG_FORCE_LEAN_GRID_CU_MULT``,
+    rounded to a whole number of XCDs when the XCD remap is active). The per-call tile
+    schedule is computed inside the kernel from ``kv_indptr``. Shared by
+    :func:`decode_attention_fwd` and the test so the grid/XCD decision stays in sync
+    with the kernel.
     """
     num_head_blocks = (kv_group_num + _LEAN_BLOCK_M - 1) // _LEAN_BLOCK_M
     # XCD remap for ROCm only when rows are one-per-kv-head and divisible by 8.
@@ -1992,7 +2054,7 @@ def _decode_lean_attention_fwd(
 ):
     """Wrapper for Lean Attention kernel.
 
-    ``total_programs`` is the fixed persistent-grid size (2× device CU count). The kernel
+    ``total_programs`` is the fixed persistent-grid size. The kernel
     derives its own tile schedule from ``kv_indptr`` on-device, so no host sync is needed and
     the launch is CUDA-graph capturable. ``Mp``, ``Lp``, ``Op``, ``locks`` are pre-allocated
     persistent-grid partial-result buffers reused across decode steps. ``page_size``
@@ -2037,8 +2099,6 @@ def _decode_lean_attention_fwd(
     batch_num_block_n = (
         torch.cumsum(tiles_per_batch, dim=0).to(torch.int32).contiguous()
     )
-
-    max_output_tile_cnt = math.ceil((head_num * batch) / total_programs) + 4
 
     # Page-aware KV strides. For a 3-D buffer these synthesize page/tok strides so the
     # PAGE_SIZE>1 math collapses to the contiguous slot address; for a 4-D paged buffer they
@@ -2088,7 +2148,6 @@ def _decode_lean_attention_fwd(
         num_query_heads=head_num,
         num_rows=num_rows,
         xcd_programs=xcd_programs,
-        max_output_tile_cnt=max_output_tile_cnt,
         Lk=Lk,
         Lv=Lv,
         num_warps=4,
