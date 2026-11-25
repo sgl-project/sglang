@@ -42,7 +42,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -365,9 +364,16 @@ def mix_stats_from_state(
     state: HcState,
     stats_stream: Optional[torch.cuda.Stream] = None,
 ) -> HcTriplet:
-    """Reuse the triplet already computed by the NPU combine when available.
+    """``mix_stats``, unless the combine already stashed the triplet.
 
-    The target and draft both pass these coefficients to the following post.
+    The NPU combine (``mhc_pre_dpskv4``, see ``_npu_combine_premix``) predicts
+    this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
+    ``state.stats``.  This consumes the fused operator's coefficients exactly
+    like the target model does (``precomputed=state.stats`` through
+    ``run_attn_post`` / ``run_moe_post``), so the draft and the target run the
+    same operator; re-predicting would take the CUDA-only sinkhorn path, which
+    has no Ascend implementation.  Every other platform leaves ``state.stats``
+    unset, so this lands on plain ``mix_stats`` there.
     """
     if state.stats is not None:
         return state.stats
@@ -543,7 +549,7 @@ def _npu_combine_premix(
     x: torch.Tensor,
     apply_pre: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Fuse the previous pre-mix and current coefficient prediction on NPU.
+    """Single-pass NPU mHC pre-mix and coefficient prediction.
 
     ``combine`` collapses the streams and ``mix_stats`` predicts the triplet in
     two steps elsewhere; the AscendC kernel does both in one launch -- it folds
@@ -570,23 +576,6 @@ def _npu_combine_premix(
         # one-hot (stream 0 on its own).
         apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
         apply_pre[:, 0] = 1.0
-    if not is_npu_arch35():
-        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn_v2
-
-        y, post_mix, comb, pre = mhc_pre_sinkhorn_v2(
-            x.contiguous(),
-            hc.fn,
-            hc.scale,
-            hc.base,
-            cfg.mult,
-            cfg.sinkhorn_iters,
-            cfg.eps,
-            cfg.rms_eps,
-            pre_mix=apply_pre.contiguous(),
-        )
-        state.stats = (pre, post_mix, comb.view(x.shape[0], cfg.mult, cfg.mult))
-        return hc.norm(y)
-
     from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
 
     y, post_mix, comb, pre = mhc_pre_dpskv4(
@@ -600,7 +589,6 @@ def _npu_combine_premix(
         cfg.rms_eps,
         pre_mix=apply_pre,
         return_pre=True,
-        impl="cann_recipes_infer_cann920",
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)

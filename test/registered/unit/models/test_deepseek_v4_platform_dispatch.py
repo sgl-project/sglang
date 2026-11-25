@@ -251,7 +251,7 @@ class TestStageLifecycle(unittest.TestCase):
 
 
 class TestNpuMhcSeam(unittest.TestCase):
-    """V4.1 lagged pre-mix and coefficient routing on NPU."""
+    """V4.1 (lagged pre-mix) mHC on NPU: two CANN ops plus a plain collapse."""
 
     MULT, HIDDEN = 4, 8
 
@@ -298,7 +298,6 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -318,7 +317,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         # The previous pre-mix is folded in and the pre-mix is requested back.
         self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
         self.assertIs(seen["kwargs"]["return_pre"], True)
-        self.assertEqual(seen["kwargs"]["impl"], "cann_recipes_infer_cann920")
+        self.assertNotIn("impl", seen["kwargs"])
         # ``mix_stats`` is skipped: the post reads the stashed coefficients.
         pre, post_mix, comb = state.stats
         torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
@@ -345,7 +344,6 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -359,36 +357,6 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(pre_mix.dtype, torch.float32)
         torch.testing.assert_close(pre_mix, expected)
 
-    def test_non_arch35_v41_mhc_pre_defaults_to_cann_v2(self):
-        hc = self._sub_layer()
-        x = self._residual()
-        post = torch.ones(2, 4)
-        flat_comb = torch.arange(32, dtype=torch.float32).view(2, 16)
-        current = torch.full((2, 4), 0.5)
-        kernel = Mock(return_value=(x[:, 0], post, flat_comb, current))
-        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
-        stub.mhc_pre_sinkhorn_v2 = kernel
-
-        with (
-            patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=False),
-            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
-        ):
-            for previous in (None, torch.rand(2, 4)):
-                state = mhc.HcState(x, pre=previous)
-                torch.testing.assert_close(mhc.combine(hc, state), x[:, 0])
-                call = kernel.call_args
-                expected = (
-                    torch.tensor([[1.0, 0, 0, 0]]).expand(2, -1)
-                    if previous is None
-                    else previous
-                )
-                torch.testing.assert_close(call.kwargs["pre_mix"], expected)
-                pre, post_mix, comb = state.stats
-                self.assertIs(pre, current)
-                self.assertIs(post_mix, post)
-                torch.testing.assert_close(comb, flat_comb.view(2, 4, 4))
-
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
         x = self._residual()[:0]
@@ -399,7 +367,6 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
         stub.mhc_pre_dpskv4 = boom
-        stub.mhc_pre_sinkhorn_v2 = boom
         with (
             patch.object(mhc, "_is_npu", True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
@@ -424,7 +391,6 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
             patch.object(
                 torch,
                 "ops",
