@@ -32,7 +32,8 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
-        "num_stages": 4
+        "num_stages": 4,
+        "USE_TMA": false
     },
     "16": {
         "BLOCK_SIZE_M": 16,
@@ -58,7 +59,8 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
-        "num_stages": 3
+        "num_stages": 3,
+        "USE_TMA": false
     },
     "48": {
         "BLOCK_SIZE_M": 16,
