@@ -1017,6 +1017,57 @@ class TestRenderedPrompt(_EncodeCase):
         self.assertEqual(results, {"first": whole(first), "bad": whole(bad)})
         self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
 
+    def test_overlapping_requests_do_not_keep_the_checks_running(self):
+        # A burst where every request overlaps a running check: once the
+        # first checks pass, later prompts take the split ids even while a
+        # prompt that arrived during those checks is still comparing.
+        self.assertIsNotNone(ppe._plan_for(self.tokenizer)[2])
+        whole = self.tokenizer.encode
+        burst = [f"<|user|>burst {i}<|assistant|>" for i in range(4)]
+        held = {text: (threading.Event(), threading.Event()) for text in burst}
+        for _, proceed in held.values():
+            self.addCleanup(proceed.set)
+        compared = []
+
+        def held_whole_encode(text, **kwargs):
+            compared.append(text)
+            if text in held:
+                entered, proceed = held[text]
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return whole(text, **kwargs)
+
+        results = {}
+
+        def run(text):
+            results[text] = list(ppe.encode_rendered_prompt(self.tokenizer, text))
+
+        threads = {text: threading.Thread(target=run, args=(text,)) for text in burst}
+        with unittest.mock.patch.object(
+            self.tokenizer, "encode", side_effect=held_whole_encode
+        ):
+            for text in burst:
+                threads[text].start()
+                self.assertTrue(held[text][0].wait(10))
+            state = ppe._rendered_checks(self.tokenizer)
+            self.assertEqual(state.pending, ppe._RENDERED_PROMPT_CHECKS)
+            for text in burst[: ppe._RENDERED_PROMPT_CHECKS]:
+                held[text][1].set()
+                threads[text].join()
+            # The rest of the burst is still comparing.
+            self.assertEqual(state.pending, 0)
+            later = "<|user|>later<|assistant|>"
+            self.assertEqual(
+                list(ppe.encode_rendered_prompt(self.tokenizer, later)), whole(later)
+            )
+            self.assertNotIn(later, compared)
+            for text in burst[ppe._RENDERED_PROMPT_CHECKS :]:
+                held[text][1].set()
+                threads[text].join()
+        self.assertEqual(results, {text: whole(text) for text in burst})
+        self.assertEqual(state.pending, 0)
+        self.assertFalse(state.failed)
+
     def test_gates_use_parallel_prompt_encode(self):
         text = "<|user|>" + "hello world " * 50 + "<|assistant|>"
         cases = {"no plan": (_tokenizer(_metaspace), 0, True)}

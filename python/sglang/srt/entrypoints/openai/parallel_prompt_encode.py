@@ -490,7 +490,8 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=N
 
 class _RenderedPromptChecks:
     """Per tokenizer: prompts that passed the check against a whole encode,
-    checks still running, and whether one found a mismatch (terminal)."""
+    registered checks still running, and whether a check found a mismatch
+    (terminal)."""
 
     def __init__(self):
         self.passed = 0
@@ -529,7 +530,9 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
     conversation are then encoded once. The first prompts per tokenizer, and
     any prompt that arrives while one of them is still being checked, are
     checked against a whole encode and return it; a mismatch disables the
-    split for good, also for prompts already split but not yet returned."""
+    split for good, also for prompts already split but not yet returned. Only
+    the first prompts register their check, so overlapping requests cannot
+    keep the checks running past them."""
     encode_kwargs = encode_kwargs or {}
     plan = None
     if (
@@ -551,11 +554,16 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
     with _rendered_prompt_checks_lock:
         state = _rendered_checks(tokenizer)
         failed = state.failed
-        # Unchecked only once enough prompts passed and no check is running:
-        # a mismatch a running check finds then reaches every prompt that has
-        # not returned yet.
+        # Unchecked only once enough prompts passed and no registered check
+        # is running: a mismatch such a check finds then reaches every prompt
+        # that has not returned yet.
         check = not failed and (state.pending or state.passed < _RENDERED_PROMPT_CHECKS)
-        if check:
+        # Only the first prompts register (count as pending until they
+        # finish). Prompts arriving while those run are still compared and
+        # return the whole encode, but nothing waits for them, so a burst of
+        # overlapping requests cannot hold `pending` up.
+        register = check and state.passed + state.pending < _RENDERED_PROMPT_CHECKS
+        if register:
             state.pending += 1
     if failed:
         return tokenizer.encode(text, **encode_kwargs)
@@ -567,7 +575,8 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
         matched = list(ids) == list(expected)
     finally:
         with _rendered_prompt_checks_lock:
-            state.pending -= 1
+            if register:
+                state.pending -= 1
             if matched:
                 state.passed += 1
             elif matched is False:
