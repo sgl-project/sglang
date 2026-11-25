@@ -90,10 +90,10 @@ class TestMamba2ReplaySSMSpec(CustomTestCase):
                 expected[:, track_slots[i]] = intermediate[:, i, track_steps[i]]
             expected[:, slots[i]] = intermediate[:, i, last_step[i]]
 
-        rows = num_reqs + 1
-        x_ring = torch.zeros(NUM_LAYERS, rows, T, HV, V, device="cuda").bfloat16()
-        b_ring = torch.zeros(NUM_LAYERS, rows, T, G, K, device="cuda").bfloat16()
-        dt_ring = torch.zeros(NUM_LAYERS, rows, T, HV, device="cuda")
+        rows, ring_t = num_reqs + 1, T + 2
+        x_ring = torch.zeros(NUM_LAYERS, rows, ring_t, HV, V, device="cuda").bfloat16()
+        b_ring = torch.zeros(NUM_LAYERS, rows, ring_t, G, K, device="cuda").bfloat16()
+        dt_ring = torch.zeros(NUM_LAYERS, rows, ring_t, HV, device="cuda")
         decay_ring = torch.zeros_like(dt_ring)
         actual = temporal.clone()
         for l, layer in enumerate(layers):
