@@ -64,7 +64,6 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.custom_op import register_custom_op
 
 # Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
 # post-load transforms and dummy initialization; 127 is the neutral scale (1.0).
@@ -204,7 +203,7 @@ if TYPE_CHECKING:
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -266,30 +265,6 @@ def _dequant_mxfp4_to_bf16(packed: torch.Tensor, scale: torch.Tensor) -> torch.T
 
         return mxfp4_dequant(packed, scale)
     return _dequant_mxfp4_to_bf16_torch(packed, scale)
-
-
-def _dequant_mxfp4_fake(
-    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
-) -> torch.Tensor:
-    return torch.empty(
-        (*x.shape[:-1], x.shape[-1] * 2), dtype=float_dtype, device=x.device
-    )
-
-
-@register_custom_op(fake_impl=_dequant_mxfp4_fake)
-def dequant_mxfp4(
-    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
-) -> torch.Tensor:
-    try:
-        from quark.torch.kernel import mx
-    except ImportError as err:
-        raise ImportError(
-            "The package `amd-quark` is required to use "
-            "MX-FP4 models. Please install it with `pip install "
-            "amd-quark`."
-        ) from err
-
-    return mx.dq_mxfp4(x, scale, float_dtype)
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -379,7 +354,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__()
 
         self.prefix = prefix
-        self.topk_indices_dtype = None
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
@@ -728,8 +702,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm120_cutlass(layer)
             return
         if self.use_flashinfer:
-            # Per-expert buffers are local (create_weights uses num_local_experts);
-            # the global self.num_experts here breaks EP>1. Mirrors the SM90 path.
+            # Per-expert buffers are local (create_weights receives num_local_experts).
             E = layer.num_local_experts
             _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
             _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
@@ -1162,7 +1135,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         K_pad = self._padded_hidden
         # Use the local expert count (matches the existing buffer allocation in
         # create_weights) so the SM90 cutlass path remains correct under
-        # Expert Parallelism. `self.num_experts` is the *global* count.
+        # Expert Parallelism.
         E = layer.num_local_experts
         device = layer.w13_weight.device
         bias_dtype = layer.w13_weight_bias.dtype
@@ -1809,9 +1782,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -1847,12 +1817,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-
-        # Add the quantization method used (per tensor/grouped/channel)
-        # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
 
         layer.w13_input_scale = None
         layer.w2_input_scale = None
@@ -1909,8 +1873,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "Online MXFP4 MoE quantization runs only on the aiter MoE runner; "
+                f"--moe-runner-backend {moe_runner_backend.value} with "
+                f"--moe-a2a-backend {get_moe_a2a_backend().value} does not select it."
+            )
 
     def apply(
         self,
