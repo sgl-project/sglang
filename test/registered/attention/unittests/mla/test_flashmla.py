@@ -6,9 +6,15 @@ import triton
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
+    MLA_ATOL,
+    MLA_RTOL,
     MLAAttentionCase,
     build_mla_attention_fixture,
+    expected_mla_fixture_output,
+    mla_attention_reference_with_custom_mask,
+    mla_fixture_inputs,
     run_mla_attention_case,
+    run_mla_forward,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     _init_cuda_graph_capture_metadata,
@@ -19,6 +25,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
     run_mla_eagle_draft_cuda_graph_runner_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    _make_custom_masks,
     _make_eagle_verify_input,
     _prepare_target_verify_batch,
     run_mla_eagle_verify_case,
@@ -435,6 +442,122 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             "branch (M16) reduces the slice width below this expected "
             "value for the configured page-boundary prefix lens.",
         )
+
+    # A draft step's query sits step + 1 tokens past the committed prefix
+    # `draft_forward` passes to every step as `seq_lens`. Prefixes around
+    # PAGE_SIZE make a dropped step count lose a page as well as keys.
+    DRAFT_STEP_CASE = MLAAttentionCase(
+        name="draft_step_decode_flashmla_page_boundary",
+        backend="flashmla",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        page_size=FLASHMLA_PAGE_SIZE,
+        prefix_lens=(62, 63, 64),
+    )
+    # Step 3 of a context just short of a page: committed 253 reads 257 tokens, a
+    # page past the context's own table. The fixture's request rows hold the tail.
+    DRAFT_STEP_NEAR_CONTEXT_LIMIT_CASE = MLAAttentionCase(
+        name="draft_step_decode_flashmla_near_context_limit",
+        backend="flashmla",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        page_size=FLASHMLA_PAGE_SIZE,
+        prefix_lens=(255, 256, 256),
+    )
+
+    def _run_draft_step(
+        self, step: int, *, graph_metadata: bool, near_context_limit: bool = False
+    ):
+        from sglang.srt.layers.attention.flashmla_backend import (
+            FlashMLAMultiStepDraftBackend,
+        )
+
+        fixture = build_mla_attention_fixture(
+            self,
+            self.DRAFT_STEP_NEAR_CONTEXT_LIMIT_CASE
+            if near_context_limit
+            else self.DRAFT_STEP_CASE,
+            **{
+                **MLA_SHAPE_KWARGS,
+                "max_context_len": 320 if near_context_limit else 256,
+            },
+        )
+        backend = FlashMLAMultiStepDraftBackend(
+            fixture.runner, topk=1, speculative_num_steps=step + 2
+        ).attn_backends[step]
+        if near_context_limit:
+            backend.max_context_len = 255
+        batch = fixture.forward_batch
+        batch.seq_lens = batch.seq_lens - (step + 1)
+        batch.seq_lens_cpu = batch.seq_lens_cpu - (step + 1)
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        bs = batch.batch_size
+        with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+            if graph_metadata:
+                _init_cuda_graph_capture_metadata(backend, bs, batch)
+                _init_cuda_graph_replay_metadata(backend, bs, batch)
+            else:
+                backend.init_forward_metadata(batch)
+            actual = fixture.actual_module(fixture.input_hidden, batch)
+        torch.testing.assert_close(
+            actual, expected_mla_fixture_output(fixture), atol=MLA_ATOL, rtol=MLA_RTOL
+        )
+
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
+    def test_draft_steps_attend_their_own_tokens(self):
+        """Each multi-step draft backend decodes over the committed prefix plus
+        its own and the earlier steps' draft tokens, eagerly and from graph
+        metadata; a step that reads only the committed prefix drops them."""
+        for step in range(3):
+            for graph_metadata in (False, True):
+                with self.subTest(step=step, graph_metadata=graph_metadata):
+                    self._run_draft_step(step, graph_metadata=graph_metadata)
+
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
+    def test_a_draft_step_near_the_context_limit_fits_its_graph_table(self):
+        self._run_draft_step(3, graph_metadata=True, near_context_limit=True)
+
+    # A verify of 8 drafts on a context just short of a page: committed 249-253 reads
+    # up to 261 tokens, a page past the 4 the context's own table holds.
+    VERIFY_NEAR_CONTEXT_LIMIT_CASE = MLAAttentionCase(
+        name="eagle_verify_flashmla_near_context_limit",
+        backend="flashmla",
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        num_heads=4,
+        page_size=FLASHMLA_PAGE_SIZE,
+        prefix_lens=(249, 251, 253),
+        extend_lens=(8, 8, 8),
+    )
+
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
+    def test_a_verify_near_the_context_limit_fits_its_graph_table(self):
+        """Attention from graph metadata matches the reference over every draft, with
+        the graph's table sized for a 255-token context and request rows of 320."""
+        case = self.VERIFY_NEAR_CONTEXT_LIMIT_CASE
+        fixture = build_mla_attention_fixture(
+            self, case, **{**MLA_SHAPE_KWARGS, "max_context_len": 320}
+        )
+        batch = fixture.forward_batch
+        device = fixture.runner.device
+        _prepare_target_verify_batch(batch, case, device)
+        batch.spec_info = _make_eagle_verify_input(case, batch, topk=1, device=device)
+        masks_by_req, _ = _make_custom_masks(case, topk=1, device=device)
+        inputs = mla_fixture_inputs(fixture)
+        expected = mla_attention_reference_with_custom_mask(
+            fixture.reference_module,
+            case,
+            inputs["prefix_hidden"],
+            inputs["input_hidden"],
+            masks_by_req,
+        )
+        backend = fixture.backend
+        backend.max_context_len = 255
+        bs = batch.batch_size
+        with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+            _init_cuda_graph_capture_metadata(backend, bs, batch)
+            _init_cuda_graph_replay_metadata(backend, bs, batch)
+            actual = run_mla_forward(fixture, batch, inputs)
+        torch.testing.assert_close(actual, expected, atol=MLA_ATOL, rtol=MLA_RTOL)
 
 
 if __name__ == "__main__":

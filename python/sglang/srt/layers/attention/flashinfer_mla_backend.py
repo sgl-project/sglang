@@ -237,12 +237,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     # graphs key their wrappers by token tier (_verify_graph_key).
     supports_ragged_verify_graph: bool = True
 
+    # The draft step a multi-step draft backend runs this instance for; None for
+    # every other use, this class's own included: that wrapper passes each step
+    # lengths that already hold its draft tokens.
+    speculative_step_id: Optional[int] = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        speculative_step_id: Optional[int] = None,
     ):
         super().__init__()
 
@@ -252,6 +258,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         # The paged MLA wrappers fix the mask when they plan a batch.
         self.causal = _planned_causal(model_runner.model)
+        self.speculative_step_id = speculative_step_id
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -447,6 +454,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 ragged_verify_layout=ragged_layout,
             )
+
+    def _draft_step_tokens(self, forward_mode: ForwardMode) -> int:
+        """Tokens a draft step's decode reads past the committed prefix: the
+        earlier steps' drafts and its own, which `draft_forward` writes but
+        keeps out of `seq_lens`."""
+        if self.speculative_step_id is None or not forward_mode.is_decode_or_idle():
+            return 0
+        return self.speculative_step_id + 1
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1414,11 +1429,15 @@ class FlashInferMLAMultiStepDraftBackend:
         def call_fn(i, _forward_batch):
             # Each draft step reads the prefix plus its own proposed tokens.
             # Keep the replay planner's host lengths in the same token domain.
-            inner_fb.seq_lens = forward_batch.seq_lens + i + 1
-            inner_fb.seq_lens_sum = (
-                forward_batch.seq_lens_sum + forward_batch.batch_size * (i + 1)
+            # A step backend given its id adds them itself.
+            step_tokens = (
+                0 if self.attn_backends[i].speculative_step_id is not None else i + 1
             )
-            inner_fb.seq_lens_cpu = forward_batch.seq_lens_cpu + i + 1
+            inner_fb.seq_lens = forward_batch.seq_lens + step_tokens
+            inner_fb.seq_lens_sum = (
+                forward_batch.seq_lens_sum + forward_batch.batch_size * step_tokens
+            )
+            inner_fb.seq_lens_cpu = forward_batch.seq_lens_cpu + step_tokens
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
