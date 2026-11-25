@@ -180,7 +180,6 @@ class TestPPPrefillLoopAppliesChunkedAbort(CustomTestCase):
         sched.running_mbs = [SimpleNamespace(reqs=[])]
         sched.last_mbs = [None]
         sched.process_bootstrapped_queue = Mock()
-        sched._pp_pd_get_prefill_transferred_ids = Mock(return_value={})
         sched._pp_commit_comm_work = Mock()
         sched.process_prefill_chunk = Mock()
         sched._process_hicache_events = Mock()
