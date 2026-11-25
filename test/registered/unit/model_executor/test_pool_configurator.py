@@ -672,19 +672,15 @@ class TestHybridSWAConfigurator(CustomTestCase):
             cfg = create_memory_pool_configurator(mr)
             config = cfg.calculate_pool_sizes(available, page_size=4)
 
-        # Overlap off keeps the reserve too: decode_alloc = get_decode_reserve()
-        # + page - 1 = 2 * max(ceil((3 + 3) / 4) * 4 * topk(2), 5) + 3 = 35.
-        # trailing = 8 + 20 + page(4) = 32; per req = 32 + 35 = 67. Global
-        # prefill = 1*chunk(4) + page(4) = 8. cap = 67 * 2 + 8 = 142, aligned
-        # up to the page: 144.
+        # decode_alloc = reach = 2 * max(2 pages * 4 * topk 2, 5) + 3 = 35;
+        # per req = trailing 32 + 35 = 67; cap = 67 * 2 + chunk 4 + page 4 = 142,
+        # page-aligned to 144.
         self.assertEqual(config.swa_max_total_num_tokens, 144)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
     def test_swa_request_cap_with_overlap_counts_two_chunks(self):
-        # Overlap on: decode_alloc = get_decode_reserve() + page - 1 =
-        # 2 * max(steps*topk, max_draft) + 0 = 2 * max(6, 5) = 12 (page=1).
-        # trailing = 8 + 20 + page(1) = 29; per req = 29 + 12 = 41. Global prefill =
-        # 2*chunk(4) + page(1) = 9; cap = 41 * 2 + 9 = 91.
+        # decode_alloc = reach = 2 * max(6, 5) = 12 (page 1); per req = trailing
+        # 29 + 12 = 41; cap = 41 * 2 + 2 chunks * 4 + page 1 = 91.
         available = 1_000_000
         mr = _make_model_runner(
             self,

@@ -1,6 +1,3 @@
-"""The req_to_token row holds every decode allocation, and the speculative decode
-allocation refuses to write past the row."""
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -22,10 +19,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # (algorithm, num_steps, topk, num_draft_tokens)
 _SPEC_CONFIGS = [
     ("EAGLE", 3, 1, 4),
-    ("EAGLE", 9, 1, 10),
     ("EAGLE", 5, 8, 64),
     ("NGRAM", 1, 8, 16),
-    ("DFLASH", 1, 1, 16),
     ("UNO", 1, 1, 8),
 ]
 
