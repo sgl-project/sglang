@@ -26,7 +26,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
-from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 
@@ -245,21 +244,19 @@ class TestHeldRowAdmission(CustomTestCase):
         return built.exception.args[0], adders[0]
 
     def _admit_beside_chunk(self, chunk_continues):
-        # 4096 tokens left in the chunk and 4096 waiting: the class boundary
-        # halves twice to 2048, and the budget doubles once to 2048.
-        policy = SchedulePolicy(
+        class _Policy(SchedulePolicy):
+            def _shortest_prefill_by_arrival(self, r):
+                return self._shortest_prefill_work(r) >= 2048
+
+            def prefill_token_budget(self, *, page_size, align):
+                return 2048
+
+        policy = _Policy(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
-            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
-                chunked_prefill_size=8192,
-                halving_chunks=0.5,
-                decay_start_chunks=0,
-                budget_min_ratio=0.125,
-                budget_doubling_chunks=1,
-            ),
         )
         chunk = _Req(holds_row=True, rid="chunk", input_len=6096, prefix_len=2000)
         small = _Req(holds_row=False, rid="small", input_len=500)
@@ -272,7 +269,7 @@ class TestHeldRowAdmission(CustomTestCase):
             )
         return [req.rid for req in can_run_list], adder
 
-    def test_adder_gets_the_load_scaled_budget(self):
+    def test_adder_gets_the_policy_token_budget(self):
         _, adder = self._admit_beside_chunk(chunk_continues=True)
         self.assertEqual(adder.rem_input_tokens, 2048)
         self.assertEqual(adder.rem_chunk_tokens, 2048)
