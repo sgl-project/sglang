@@ -217,8 +217,10 @@ struct SiluAndMulClampParams {
   const void* __restrict__ input;
   void* __restrict__ output;
   float swiglu_limit;
+  uint32_t num_tokens;
   uint32_t out_vecs;
   uint32_t blocks_per_row;
+  uint32_t rows_per_block;
 };
 
 template <typename DType2>
@@ -239,16 +241,24 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   constexpr auto kVecSize = 16 / sizeof(DType);
   static_assert(kVecSize % 2 == 0 && kVecSize > 0);
   using Vec = AlignedVector<DType2, kVecSize / 2>;
-  const auto row = blockIdx.x / params.blocks_per_row;
-  const auto block_in_row = blockIdx.x % params.blocks_per_row;
-  const auto vec_id = block_in_row * blockDim.x + threadIdx.x;
+  uint32_t row;
+  uint32_t vec_id;
+  if (params.rows_per_block > 1) {
+    row = blockIdx.x * params.rows_per_block + threadIdx.x / params.out_vecs;
+    vec_id = threadIdx.x % params.out_vecs;
+  } else {
+    row = blockIdx.x / params.blocks_per_row;
+    const auto block_in_row = blockIdx.x % params.blocks_per_row;
+    vec_id = block_in_row * blockDim.x + threadIdx.x;
+  }
   const float limit = params.swiglu_limit;
 
   PDLWaitPrimary<kUsePDL>();
-  if (vec_id < params.out_vecs) {
+  if (row < params.num_tokens && vec_id < params.out_vecs) {
     const auto input = static_cast<const Vec*>(params.input);
     auto output = static_cast<Vec*>(params.output);
-    const auto input_row = row * 2 * params.out_vecs;
+    const auto input_row = static_cast<int64_t>(row) * 2 * params.out_vecs;
+    const auto out_row = static_cast<int64_t>(row) * params.out_vecs;
     const auto gate = input[input_row + vec_id];
     const auto up = input[input_row + params.out_vecs + vec_id];
     Vec out;
@@ -258,7 +268,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
       out[i] = cast<DType2>(silu_and_mul<true>(to_bf16x2(gate[i]), to_bf16x2(up[i]), limit));
     }
 
-    output[row * params.out_vecs + vec_id] = out;
+    output[out_row + vec_id] = out;
   }
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -398,20 +408,36 @@ struct SiluAndMulClampKernel {
     constexpr uint32_t kVecSize = 16 / sizeof(DType);
     const auto out_dim = static_cast<uint32_t>(H.unwrap());
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
     RuntimeCheck(out_dim > 0, "out_dim must be positive");
     RuntimeCheck(out_dim % kVecSize == 0, "out_dim must be divisible by vector size");
     const auto out_vecs = out_dim / kVecSize;
-    const auto num_threads = std::min(out_vecs, 1024u);
-    const auto blocks_per_row = host::div_ceil(out_vecs, num_threads);
+    uint32_t num_threads;
+    uint32_t blocks_per_row;
+    uint32_t rows_per_block;
+    uint32_t num_blocks;
+    if (out_vecs < 256u) {
+      rows_per_block = std::min(num_tokens, 256u / out_vecs);
+      num_threads = rows_per_block * out_vecs;
+      blocks_per_row = 1u;
+      num_blocks = host::div_ceil(num_tokens, rows_per_block);
+    } else {
+      rows_per_block = 1u;
+      num_threads = std::min(out_vecs, 1024u);
+      blocks_per_row = host::div_ceil(out_vecs, num_threads);
+      num_blocks = num_tokens * blocks_per_row;
+    }
 
     const auto params = SiluAndMulClampParams{
         .input = input.data_ptr(),
         .output = output.data_ptr(),
         .swiglu_limit = static_cast<float>(swiglu_limit),
+        .num_tokens = num_tokens,
         .out_vecs = out_vecs,
         .blocks_per_row = blocks_per_row,
+        .rows_per_block = rows_per_block,
     };
-    LaunchKernel(num_tokens * blocks_per_row, num_threads, device.unwrap())  //
+    LaunchKernel(num_blocks, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
