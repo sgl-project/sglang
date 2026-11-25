@@ -8,7 +8,7 @@ from unittest import mock
 import torch
 
 import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     _PoolRangePlan,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,7 +29,11 @@ class TestStorageSuffix(CustomTestCase):
         # rank has to name the same object or the store holds tp_size copies.
         suffixes = {
             _storage_suffix(
-                rank_replicated=True, tp_rank=rank, attn_cp_rank=0, pp_rank=0
+                rank_replicated=True,
+                tp_rank=rank,
+                tp_size=8,
+                attn_cp_rank=0,
+                pp_rank=0,
             )
             for rank in range(8)
         }
@@ -37,23 +42,66 @@ class TestStorageSuffix(CustomTestCase):
     def test_sharded_group_keeps_one_keyspace_per_rank(self):
         suffixes = [
             _storage_suffix(
-                rank_replicated=False, tp_rank=rank, attn_cp_rank=0, pp_rank=0
+                rank_replicated=False,
+                tp_rank=rank,
+                tp_size=8,
+                attn_cp_rank=0,
+                pp_rank=0,
             )
             for rank in range(8)
         ]
         self.assertEqual(len(set(suffixes)), 8)
-        self.assertEqual(suffixes[3], "tp3_cp0_pp0")
+        self.assertEqual(suffixes[3], "tp3of8_cp0_pp0")
+        self.assertEqual(
+            _storage_suffix(
+                rank_replicated=False,
+                tp_rank=3,
+                tp_size=4,
+                attn_cp_rank=0,
+                pp_rank=0,
+            ),
+            "tp3of4_cp0_pp0",
+        )
 
     def test_cp_and_pp_shard_even_when_replicated(self):
         # CP shards the sequence and PP shards layers, so neither may collapse.
         self.assertEqual(
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=2),
+            _storage_suffix(
+                rank_replicated=True, tp_rank=0, tp_size=1, attn_cp_rank=1, pp_rank=2
+            ),
             "cp1_pp2",
         )
         self.assertNotEqual(
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=0),
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
+            _storage_suffix(
+                rank_replicated=True, tp_rank=0, tp_size=1, attn_cp_rank=0, pp_rank=0
+            ),
+            _storage_suffix(
+                rank_replicated=True, tp_rank=0, tp_size=1, attn_cp_rank=1, pp_rank=0
+            ),
         )
+
+
+class TestDirectLinkerKeys(CustomTestCase):
+    def test_keys_carry_the_page_layout(self):
+        entry = DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=None,
+            components=[[torch.zeros((4, 8), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        store = SimpleNamespace(
+            registered_pools={PoolName.SWA: entry},
+            kv_rank_suffix="tp0of2_cp0_pp0",
+            config_prefix=None,
+        )
+        keys, multiplier = UMBPStore._get_hybrid_page_component_keys(
+            store, ["p0"], PoolTransfer(name=PoolName.SWA, keys=["p0"])
+        )
+        self.assertEqual(multiplier, 1)
+        self.assertEqual(keys, [f"p0_tp0of2_cp0_pp0_{PoolName.SWA}_{entry.key_tag}"])
 
 
 class TestPackedDraftRanges(CustomTestCase):

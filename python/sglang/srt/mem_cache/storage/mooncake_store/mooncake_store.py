@@ -1236,7 +1236,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             pool_suffix = getattr(self, "pool_suffixes", {}).get(
                 transfer.name, self.mla_suffix
             )
-            suffix = f"_{pool_suffix}_{object_name}"
+            suffix = f"_{pool_suffix}_{object_name}_{host_pool.key_tag}"
             return [f"{page_key}{suffix}" for page_key in page_keys], 1
 
         # Suffix order must match get_page_buffer_meta() for one page, because

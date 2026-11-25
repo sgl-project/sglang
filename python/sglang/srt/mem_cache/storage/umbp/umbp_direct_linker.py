@@ -45,7 +45,12 @@ RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
 
 def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    tp_size: int,
+    attn_cp_rank: int,
+    pp_rank: int,
 ) -> str:
     # A rank-replicated group (MLA / DSA) holds byte-identical pages on every
     # attention TP rank, so a tp term stores tp_size copies of the same page.
@@ -53,7 +58,7 @@ def _storage_suffix(
     # tier is private to its rank and a standalone server is per node.
     parts = []
     if not rank_replicated:
-        parts.append(f"tp{tp_rank}")
+        parts.append(f"tp{tp_rank}of{tp_size}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
@@ -170,9 +175,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         distributed = (
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
-        tp_rank = 0
+        tp_rank, tp_size = 0, 1
         if distributed:
             tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+            tp_size = torch.distributed.get_world_size(group=params.tp_cache_group)
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=self.page_size,
@@ -316,6 +322,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             rank_suffix = _storage_suffix(
                 rank_replicated=rank_replicated,
                 tp_rank=tp_rank,
+                tp_size=tp_size,
                 attn_cp_rank=params.attn_cp_rank,
                 pp_rank=params.pp_rank,
             )

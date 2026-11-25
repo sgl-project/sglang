@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -1398,6 +1399,8 @@ class UMBPStore(HiCacheStorage):
         else:
             suffixes = [f"_{mha_suffix}_{pool_name}"]
 
+        if isinstance(host_pool, DevicePoolEntry):
+            suffixes = [f"{suffix}_{host_pool.key_tag}" for suffix in suffixes]
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
         ]

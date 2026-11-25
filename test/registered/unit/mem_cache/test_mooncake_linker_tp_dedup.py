@@ -1,10 +1,15 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+import torch
+
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     _storage_sharing,
+    _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,6 +76,45 @@ class TestStorageSharing(CustomTestCase):
                 offload,
                 _REPLICATED | {PoolName.MAMBA} if rank < 8 else {PoolName.MAMBA},
             )
+
+    def test_sharded_keys_carry_the_tp_width(self):
+        for tp_size in (4, 8):
+            self.assertEqual(
+                _storage_suffix(
+                    rank_replicated=False,
+                    tp_rank=1,
+                    tp_size=tp_size,
+                    attn_cp_rank=0,
+                    pp_rank=0,
+                ),
+                f"tp1of{tp_size}_cp0_pp0",
+            )
+            suffixes, _, _ = _sharing(tp_rank=1, tp_size=tp_size, dcp_size=2)
+            self.assertEqual(suffixes[PoolName.KV], "tpshared_v1_dcp2r1_cp0_pp0")
+
+    def test_direct_linker_keys_carry_the_page_layout(self):
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((4, 8), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        store = SimpleNamespace(
+            unified_suffixes=None,
+            registered_pools={PoolName.KV: entry},
+            pool_suffixes={},
+            mla_suffix="cp0_pp0",
+        )
+        keys, multiplier = MooncakeStore._get_hybrid_page_component_keys(
+            store, ["p0", "p1"], PoolTransfer(name=PoolName.KV, keys=["p0", "p1"])
+        )
+        self.assertEqual(multiplier, 1)
+        self.assertEqual(
+            keys, [f"p0_cp0_pp0_k_{entry.key_tag}", f"p1_cp0_pp0_k_{entry.key_tag}"]
+        )
 
     def test_non_owner_rank_offloads_nothing(self):
         _, offload, _ = _sharing(tp_rank=3, tp_size=8, offload_owner=False)
