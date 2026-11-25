@@ -40,9 +40,9 @@ import torch
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
+from sglang.srt.sampling.verify_accept import ChainAccept
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
-    AcceptOuts,
     DsparkVerifyEpilogue,
     StaticVerifyIO,
     accept_draft_tokens,
@@ -161,7 +161,7 @@ class DsparkSamplingAcceptGraph:
         # Set by run(): whether this step's region committed the engram history.
         self.committed_engram = False
 
-    def run(self, *, bs: int, target_logits: torch.Tensor) -> Optional[AcceptOuts]:
+    def run(self, *, bs: int, target_logits: torch.Tensor) -> Optional[ChainAccept]:
         """This step's accept through the region, or None when the step must take the
         eager path. Reads only host state every TP rank holds identically."""
         if self.disabled:

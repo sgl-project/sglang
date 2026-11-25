@@ -147,8 +147,8 @@ class TestInGraphBlockAcceptLens(unittest.TestCase):
     commit_lens + cap_trim_lens."""
 
     def test_matches_eager_sum(self):
+        from sglang.srt.sampling.verify_accept import ChainAccept
         from sglang.srt.speculative.dspark_components.dspark_verify import (
-            AcceptOuts,
             build_accept_outs,
         )
         from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
@@ -167,7 +167,7 @@ class TestInGraphBlockAcceptLens(unittest.TestCase):
             sync_site=list(SpecTpSyncSite)[0],
         )
         eager = build_accept_outs(**kw)
-        out = AcceptOuts(
+        out = ChainAccept(
             correct_len=torch.zeros(bs, dtype=torch.int64),
             bonus=torch.zeros(bs, dtype=torch.int64),
             cap_trim_lens=torch.zeros(bs, dtype=torch.int32),

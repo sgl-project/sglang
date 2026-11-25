@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
-from sglang.srt.sampling.verify_accept import VerifyAccept
+from sglang.srt.sampling.verify_accept import ChainAccept, VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -76,7 +76,6 @@ from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph impor
     DsparkSamplingAcceptGraph,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
-    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
@@ -583,7 +582,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         *,
         features: torch.Tensor,
-        accept: AcceptOuts,
+        accept: ChainAccept,
         layout: Optional[RaggedVerifyLayout],
     ) -> None:
         bs = features.shape[0]
@@ -1251,19 +1250,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-            # The graph accepts never run with a custom logit processor: it
-            # adjusts the logits. correct_len stays the accept core's for the
-            # acceptance estimators, so on a capped row it no longer matches
-            # bonus and commit_lens.
-            accept.commit_lens, accept.bonus, accept.new_seq_lens = (
-                verify.cap_chain_accept(
-                    out_tokens=accept.out_tokens,
-                    commit_lens=accept.commit_lens,
-                    bonus=accept.bonus,
-                    prefix_lens=prefix_lens,
-                    new_seq_lens=accept.new_seq_lens,
-                )
-            )
+            # The graph accepts never run with a custom logit processor: the
+            # processor adjusts the logits.
+            verify.cap_chain_accept(accept, prefix_lens=prefix_lens)
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
             logits_output=logits_output,

@@ -49,7 +49,7 @@ def _dflash_draw(monkeypatch):
             draft_input=object(),
             prefix_lens=torch.tensor([3]),
             bs=1,
-        )[1].item()
+        ).commit_lens.item()
 
     return draw
 

@@ -69,21 +69,21 @@ class TestDFlashRaggedVerify(CustomTestCase):
         )
 
         full = _selector_accept(candidates, target_tokens, None)
-        self.assertEqual(full[0].tolist(), [4, 1, 4])
-        self.assertEqual(full[2].tolist(), [20, 21, 23])
+        self.assertEqual(full.correct_len.tolist(), [4, 1, 4])
+        self.assertEqual(full.bonus.tolist(), [20, 21, 23])
 
-        accept_len, commit_lens, bonus, out_tokens, _, cap_trim_lens = _selector_accept(
+        accept = _selector_accept(
             candidates,
             target_tokens,
             torch.tensor([3, 5, 1], dtype=torch.int32, device=DEVICE),
         )
         # Each request accepts at most verify_len - 1 drafts and takes its bonus
         # from its last verified row; the cutoff trims the rest.
-        self.assertEqual(accept_len.tolist(), [2, 1, 0])
-        self.assertEqual(bonus.tolist(), [3, 21, 10])
-        self.assertEqual(cap_trim_lens.tolist(), [2, 0, 4])
-        self.assertEqual(commit_lens.tolist(), [3, 2, 1])
-        self.assertEqual(out_tokens[0, :3].tolist(), [1, 2, 3])
+        self.assertEqual(accept.correct_len.tolist(), [2, 1, 0])
+        self.assertEqual(accept.bonus.tolist(), [3, 21, 10])
+        self.assertEqual(accept.cap_trim_lens.tolist(), [2, 0, 4])
+        self.assertEqual(accept.commit_lens.tolist(), [3, 2, 1])
+        self.assertEqual(accept.out_tokens[0, :3].tolist(), [1, 2, 3])
 
     def test_relay_resolves_the_lagged_copy_while_it_is_in_flight(self):
         lag = overlap_utils.CONFIDENCE_RELAY_RING_LAG

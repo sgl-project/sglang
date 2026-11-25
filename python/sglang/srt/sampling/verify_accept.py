@@ -31,3 +31,21 @@ class VerifyAccept(msgspec.Struct, frozen=True):
             return self.accept_index >= 0
         positions = torch.arange(self.tokens.shape[1], device=self.tokens.device)
         return positions < self.accept_lens[:, None]
+
+
+class ChainAccept(msgspec.Struct):
+    """A chain verify's (DFlash, DSpark) accept, per request: the first
+    ``correct_len`` drafts match the target, ``bonus`` follows them, and the
+    first ``commit_lens`` tokens of ``out_tokens`` [bs, width] commit. A
+    request capped by ``VerifyStep.cap_chain_accept`` commits one token, not
+    ``correct_len + 1``; ``correct_len`` stays the accept kernel's, for the
+    acceptance estimators."""
+
+    correct_len: torch.Tensor
+    bonus: torch.Tensor
+    commit_lens: torch.Tensor
+    out_tokens: torch.Tensor
+    # The accepted drafts a planned verify length cut; None without a cutoff.
+    cap_trim_lens: Optional[torch.Tensor] = None
+    # prefix_lens + commit_lens; None when the accept did not compute it.
+    new_seq_lens: Optional[torch.Tensor] = None
