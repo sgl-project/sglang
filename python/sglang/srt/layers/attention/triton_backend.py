@@ -851,7 +851,12 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
-        if _is_hip:
+        # The fused ROCm fill covers one window rail and packs the read stream itself.
+        if (
+            _is_hip
+            and self.mla_dcp_window_verify is None
+            and len(self.window_lengths) <= 1
+        ):
             return _hip.update_target_verify_buffers(
                 self, plan, bs, seq_lens, spec_info, req_pool_indices
             )
@@ -2707,6 +2712,7 @@ class TritonAttnBackend(AttentionBackend):
             self.enable_deterministic
             or envs.SGLANG_DISABLE_LEAN_ATTENTION.get()
             or return_lse
+            or gate_sink is not None
         ):
             enable_lean = False
         else:
