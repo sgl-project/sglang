@@ -1575,7 +1575,9 @@ class MQALayer(MqaAttentionBase):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
-        if self.indexer is not None and hasattr(self.indexer.compressor, "fp4_cos"):
+        if isinstance(self.indexer, C4Indexer) and hasattr(
+            self.indexer.compressor, "fp4_cos"
+        ):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
@@ -4227,6 +4229,7 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4256,7 +4259,7 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    if _is_hip and source.hc_boundary_fused:
+                    if fused_step and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
                         source_x = fused_boundary_attn_input(source, state)
                     else:
@@ -4394,7 +4397,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
+                    if fused_step and self.layers[i].hc_boundary_fused:
                         state = forward_layer_fused_boundary(
                             self,
                             i,
